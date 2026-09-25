@@ -4922,6 +4922,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{ .context = self, .acquire = acquireControlProofBackingV2 };
     }
 
+    pub fn controlProofProviderV3(self: *ProvisionedKernelOwnerSource) abi.completion_pool.ControlProviderV3 {
+        return .{ .context = self, .acquire = acquireControlProofBackingV3 };
+    }
+
     /// Borrow an already installed owner only. This path runs under DATA Raft
     /// serialization and must not perform catalog refresh, root open, or install.
     fn installedCompletionOwner(self: *ProvisionedKernelOwnerSource, group_id: u64) !Lease {
@@ -4957,6 +4961,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         var lease = self.installedCompletionOwner(group_id) catch |err| return kernel_error_identity.statusFromError(err);
         defer lease.deinit();
         output.* = lease.owner().acquireControlProofLeaseV2(group_id, node_id) catch |err| return kernel_error_identity.statusFromError(err);
+        return .ok;
+    }
+
+    fn acquireControlProofBackingV3(raw: ?*anyopaque, group_id: u64, node_id: u64, output: *abi.completion_pool.ControlLeaseV3) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(raw orelse return .invalid_argument));
+        var lease = self.installedCompletionOwner(group_id) catch |err| return kernel_error_identity.statusFromError(err);
+        defer lease.deinit();
+        output.* = lease.owner().acquireControlProofLeaseV3(group_id, node_id) catch |err| return kernel_error_identity.statusFromError(err);
         return .ok;
     }
 

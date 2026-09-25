@@ -271,6 +271,11 @@ pub const DurableControlOwner = struct {
     identity: completion.AcceptedIdentity,
     slot_index: usize,
 };
+pub const DurableControlOwnerV3 = struct {
+    begin: completion.AcceptedIdentity,
+    latest: completion.AcceptedIdentity,
+    slot_index: usize,
+};
 pub const DurableObservation = struct {
     expected: completion.AcceptedIdentity,
     present: bool,
@@ -432,6 +437,7 @@ pub fn Pool(comptime Backend: type) type {
             output_pin: Backend.CompletionRunPathPin,
             declaration: control_begin.Declaration,
             begin: completion.AcceptedIdentity,
+            latest: ?completion.AcceptedIdentity = null,
             pending: ?completion.AcceptedIdentity = null,
             transition: ?control_transition.Transition = null,
         };
@@ -1176,6 +1182,7 @@ pub fn Pool(comptime Backend: type) type {
             backend.mutable.publishPrepared(&candidate);
             backend.syncTrackedInMemoryStateUsageCurrentLocked();
             self.progress = identity;
+            active.latest = identity;
             try self.io.storage().deleteFileAbsolute(self.control_accepted_paths[owner_index]);
             try self.io.storage().syncParentAbsolute(self.control_accepted_paths[owner_index]);
             active.pending = null;
@@ -2022,7 +2029,7 @@ pub fn Pool(comptime Backend: type) type {
             var borrow = try self.compiler.tryBorrow();
             defer borrow.release() catch unreachable;
             const alloc = try borrow.allocator();
-            const active = self.control_owners[0] orelse return error.InvalidCompletionSlot;
+            const active = &self.control_owners[0].?;
             const id = active.declaration.txn_id;
             const ns: ?[]const u8 = if (self.config.namespace == .docs) "docs" else null;
             const record_key = try std.mem.concat(alloc, u8, &.{ control_shape.records_prefix, &id });
@@ -2044,16 +2051,42 @@ pub fn Pool(comptime Backend: type) type {
             const progress_value = try self.point(backend, alloc, ns, &control_record.progressKey(id));
             defer progress_value.deinit(alloc);
             const row = record_value.value orelse return error.InvalidCompletionSlot;
-            if (row.len != control_shape.txn_record_v6_size or row[0] != 0 or row[49] != 0 or
+            if (row.len != control_shape.txn_record_v6_size or row[49] != 0 or
                 row[50] != @intFromBool(active.declaration.coordinator) or
-                row[51] != @intFromBool(active.declaration.retain_terminal) or row[52] != 0 or
-                resolved.value != null or owner_value.value != null or receipt_value.value != null or progress_value.value != null)
+                row[51] != @intFromBool(active.declaration.retain_terminal) or receipt_value.value != null)
                 return error.CompletionRecoveryCapacityRequired;
             if (!std.meta.eql(try control_record.Participants.fromEncodedList(participants.value orelse return error.InvalidCompletionSlot), active.declaration.participants))
                 return error.InvalidCompletionSlot;
             const applied = self.progress orelse return error.CompletionRecoveryCapacityRequired;
-            if (applied.index < active.begin.index or
-                (applied.index == active.begin.index and !std.meta.eql(applied, active.begin)))
+            var latest = active.begin;
+            if (progress_value.value) |wire| {
+                const progress = try control_record.Progress.decode(wire);
+                const owner_record = self.controlOwnerRecord(0);
+                try progress.verifyOwner(owner_record);
+                const actual_owner = owner_value.value orelse return error.InvalidCompletionSlot;
+                if (!std.mem.eql(u8, actual_owner, &try owner_record.encode()) or
+                    progress.phase == .begin or progress.decision == .none or
+                    row[0] != @intFromEnum(progress.decision) or row[52] != 1 or
+                    progress.acknowledged >= active.declaration.participants.count)
+                    return error.InvalidCompletionSlot;
+                switch (progress.phase) {
+                    .decision => if (resolved.value != null) return error.InvalidCompletionSlot,
+                    .acknowledgement => {
+                        const encoded = resolved.value orelse return error.InvalidCompletionSlot;
+                        if (std.mem.allEqual(u8, &progress.ack_bitmap, 0) or
+                            !std.mem.eql(u8, &progress.resolved_digest, &control_transition.resolvedDigest(encoded)) or
+                            !std.mem.eql(u8, &progress.ack_bitmap, &try control_transition.resolvedBitmap(participants.value.?, encoded)))
+                            return error.InvalidCompletionSlot;
+                    },
+                    else => return error.InvalidCompletionSlot,
+                }
+                latest = .{ .term = progress.latest.term, .index = progress.latest.index, .digest = progress.latest.digest };
+                active.latest = latest;
+            } else if (row[0] != 0 or row[52] != 0 or resolved.value != null or owner_value.value != null) {
+                return error.CompletionRecoveryCapacityRequired;
+            }
+            if (applied.index < latest.index or
+                (applied.index == latest.index and !std.meta.eql(applied, latest)))
                 return error.CompletionRecoveryCapacityRequired;
         }
 
@@ -2137,6 +2170,16 @@ pub fn Pool(comptime Backend: type) type {
             return out[0..count];
         }
 
+        pub fn durableControlOwnersV3(self: *const Self, out: *[control_record.max_owners]DurableControlOwnerV3) ![]const DurableControlOwnerV3 {
+            if (self.failed or !self.restored) return error.RecoveryRequired;
+            var count: usize = 0;
+            for (self.control_owners, 0..) |owner, slot_index| if (owner) |active| {
+                out[count] = .{ .begin = active.begin, .latest = active.latest orelse active.begin, .slot_index = slot_index };
+                count += 1;
+            };
+            return out[0..count];
+        }
+
         /// A complete persisted suffix can attest an exact live BEGIN. This
         /// stage never retires or restores a control owner: absent, replaced,
         /// or compacted entries still require a separate native receipt and
@@ -2165,6 +2208,32 @@ pub fn Pool(comptime Backend: type) type {
                     return error.RecoveryRequired;
             }
             for (seen[0..log.observations.len]) |matched| if (!matched) return error.InvalidCompletionSlot;
+        }
+
+        pub fn reconcileControlDurableLogV3(self: *const Self, begins: DurableLog, latest: DurableLog) !void {
+            if (begins.mode != latest.mode or begins.compacted_index != latest.compacted_index or
+                begins.compacted_term != latest.compacted_term or begins.last_index != latest.last_index or
+                begins.commit_index != latest.commit_index) return error.InvalidCompletionSlot;
+            try self.reconcileControlDurableLog(begins);
+            var owners: [control_record.max_owners]DurableControlOwnerV3 = undefined;
+            const active = try self.durableControlOwnersV3(&owners);
+            if (active.len != latest.observations.len) return error.InvalidCompletionSlot;
+            var seen: [control_record.max_owners]bool = @splat(false);
+            for (active) |owner| {
+                const observation = for (latest.observations, 0..) |candidate, i| {
+                    if (!std.meta.eql(candidate.expected, owner.latest)) continue;
+                    if (seen[i]) return error.InvalidCompletionSlot;
+                    seen[i] = true;
+                    break candidate;
+                } else return error.InvalidCompletionSlot;
+                if (!observation.present or owner.latest.index <= latest.compacted_index or
+                    owner.latest.index > latest.last_index or observation.observed_term != owner.latest.term or
+                    !std.mem.eql(u8, &observation.observed_digest, &owner.latest.digest))
+                    return error.RecoveryRequired;
+                if (latest.mode == .startup_complete and owner.latest.index > latest.commit_index)
+                    return error.RecoveryRequired;
+            }
+            for (seen[0..latest.observations.len]) |matched| if (!matched) return error.InvalidCompletionSlot;
         }
 
         /// Only accepted, never-applied ownership can be retired by durable log

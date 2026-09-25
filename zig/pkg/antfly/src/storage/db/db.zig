@@ -28382,6 +28382,17 @@ pub const DB = struct {
         return @import("../completion_native_guard.zig").Guard(DB).controlLeaseV2(stable, group_id, node_id);
     }
 
+    pub fn acquireControlCompletionLeaseV3(self: *DB, group_id: u64, node_id: u64) !@import("kernel_owner_abi").completion_pool.ControlLeaseV3 {
+        const stable = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const backend = self.core.primary_store_owner.lsmBackend() orelse return error.NotFound;
+            if (backend.completion_pool == null) return error.NotFound;
+            break :blk self.async_context.completion_pool_owner orelse return error.CompletionAdmissionUnavailable;
+        };
+        return @import("../completion_native_guard.zig").Guard(DB).controlLeaseV3(stable, group_id, node_id);
+    }
+
     pub fn attestCompletionBacking(self: *DB, group_id: u64, node_id: u64) !@import("kernel_owner_abi").completion_pool.NativeAttestation {
         const stable = self.async_context.completion_pool_owner orelse return error.CompletionAdmissionUnavailable;
         return @import("../completion_native_guard.zig").Guard(DB).attest(stable, group_id, node_id);
@@ -144372,6 +144383,8 @@ test "workload admission physical completion restores one BEGIN owner after exac
     };
     const id: transactions_mod.TxnId = @splat(218);
     var begin_digest: [32]u8 = undefined;
+    var decision_digest: [32]u8 = undefined;
+    var ack_digest: [32]u8 = undefined;
     var output_run_id: u64 = 0;
     {
         var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), options);
@@ -144520,6 +144533,7 @@ test "workload admission physical completion restores one BEGIN owner after exac
             }, @splat(19), "restored-owner-decision", &.{});
         };
         defer alloc.free(decision_wire);
+        decision_digest = @import("../../common/completion_entry_protocol.zig").payloadDigest(decision_wire);
         const lease = try db.acquireCompletionLease(2, 7);
         defer lease.vtable.release(lease.context);
         const payloads = [_]abi.Bytes{.{ .ptr = decision_wire.ptr, .len = decision_wire.len }};
@@ -144534,6 +144548,114 @@ test "workload admission physical completion restores one BEGIN owner after exac
         lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = 2, .last_index = 2, .payloads = proposal.proposals });
         try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 2, payloads[0]));
         try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
+    }
+    {
+        var db = try DB.open(alloc, path, reopen);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const pool = db.core.primary_store_owner.lsmBackend().?.completion_pool.?;
+        try std.testing.expect(pool.restored_control_pending and !pool.ready);
+        try std.testing.expectEqual(@as(u64, 2), pool.control_owners[0].?.latest.?.index);
+        const old_lease = try db.acquireControlCompletionLeaseV2(2, 7);
+        defer old_lease.vtable.release(old_lease.context);
+        var old_proof: abi.ControlDurableLogV2 = .{
+            .mode = .startup_complete,
+            .last_index = 2,
+            .commit_index = 2,
+            .count = 1,
+            .document = .{ .mode = .startup_complete, .last_index = 2, .commit_index = 2 },
+        };
+        old_proof.observations[0] = .{ .expected = .{ .term = 1, .index = 1, .payload_digest = begin_digest }, .present = 1, .observed_term = 1, .observed_digest = begin_digest };
+        try std.testing.expectEqual(runtime_failure_abi.Status.completion_admission_unavailable, old_lease.vtable.reconcile_durable(old_lease.context, &old_proof));
+        try std.testing.expect(!pool.ready);
+        const lease = try db.acquireControlCompletionLeaseV3(2, 7);
+        defer lease.vtable.release(lease.context);
+        var owners: abi.ControlDurableOwnersV3 = .{};
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_owners(lease.context, &owners));
+        try std.testing.expectEqual(@as(u32, 1), owners.count);
+        var proof: abi.ControlDurableLogV3 = .{
+            .mode = .startup_complete,
+            .last_index = 2,
+            .commit_index = 2,
+            .count = 1,
+            .document = .{ .mode = .startup_complete, .last_index = 2, .commit_index = 2 },
+        };
+        proof.begins[0] = .{ .expected = owners.owners[0].begin, .present = 1, .observed_term = 1, .observed_digest = begin_digest };
+        proof.latest[0] = .{ .expected = owners.owners[0].latest, .present = 1, .observed_term = 1, .observed_digest = decision_digest };
+        proof.latest[0].observed_digest[0] ^= 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, lease.vtable.reconcile_durable(lease.context, &proof));
+        try std.testing.expect(!pool.ready);
+        proof.latest[0].observed_digest[0] ^= 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable(lease.context, &proof));
+        try std.testing.expect(pool.ready and !pool.restored_control_pending);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
+        const remote = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+        defer alloc.free(remote);
+        var manager = try transactions_mod.TxnManager.init(alloc, db.core.store);
+        defer manager.deinit();
+        manager.completion_limits = .{
+            .max_transaction_bytes = db.core.table_catalog.transaction_admission_bytes,
+            .max_count = db.core.table_catalog.transaction_recovery_max_count,
+            .max_bytes = db.core.table_catalog.transaction_recovery_max_bytes,
+        };
+        const ack_wire = blk: {
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            break :blk try manager.compileControlMutation(alloc, &read, .{
+                .txn_id = id,
+                .action = .{ .acknowledge = remote },
+            }, .{
+                .group_id = binding.identity.group_id,
+                .incarnation = binding.identity.incarnation,
+                .policy_digest = binding.identity.policy_digest,
+                .schema_catalog_digest = binding.schema_catalog_digest,
+                .previous_term = 1,
+                .previous_index = 2,
+            }, @splat(19), "restored-owner-ack", &.{});
+        };
+        defer alloc.free(ack_wire);
+        ack_digest = @import("../../common/completion_entry_protocol.zig").payloadDigest(ack_wire);
+        const apply_lease = try db.acquireCompletionLease(2, 7);
+        defer apply_lease.vtable.release(apply_lease.context);
+        const payloads = [_]abi.Bytes{.{ .ptr = ack_wire.ptr, .len = ack_wire.len }};
+        const proposal: abi.Check = .{
+            .kind = .proposal,
+            .new_work_allowed = 1,
+            .state = .{ .term = 1, .applied_term = 1, .applied_term_known = 1, .applied_index = 2, .last_index = 2 },
+            .proposals = .{ .ptr = &payloads, .len = 1 },
+        };
+        var result: abi.CheckResult = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, apply_lease.vtable.check(apply_lease.context, &proposal, &result));
+        apply_lease.vtable.proposal_result(apply_lease.context, &.{ .state = proposal.state, .first_index = 3, .last_index = 3, .payloads = proposal.proposals });
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, apply_lease.vtable.apply_accepted.?(apply_lease.context, 1, 3, payloads[0]));
+    }
+    {
+        var db = try DB.open(alloc, path, reopen);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const pool = db.core.primary_store_owner.lsmBackend().?.completion_pool.?;
+        try std.testing.expect(pool.restored_control_pending and !pool.ready);
+        const lease = try db.acquireControlCompletionLeaseV3(2, 7);
+        defer lease.vtable.release(lease.context);
+        var owners: abi.ControlDurableOwnersV3 = .{};
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_owners(lease.context, &owners));
+        try std.testing.expectEqual(@as(u64, 3), owners.owners[0].latest.index);
+        var proof: abi.ControlDurableLogV3 = .{
+            .mode = .startup_complete,
+            .last_index = 3,
+            .commit_index = 3,
+            .count = 1,
+            .document = .{ .mode = .startup_complete, .last_index = 3, .commit_index = 3 },
+        };
+        proof.begins[0] = .{ .expected = owners.owners[0].begin, .present = 1, .observed_term = 1, .observed_digest = begin_digest };
+        proof.latest[0] = .{ .expected = owners.owners[0].latest, .present = 1, .observed_term = 1, .observed_digest = ack_digest };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable(lease.context, &proof));
+        try std.testing.expect(pool.ready and !pool.restored_control_pending);
+        const progress_bytes = (try db.core.getStoreValue(alloc, &@import("../lsm_backend/completion_control_record.zig").progressKey(id))).?;
+        defer alloc.free(progress_bytes);
+        const progress = try @import("../lsm_backend/completion_control_record.zig").Progress.decode(progress_bytes);
+        try std.testing.expectEqual(@as(u32, 1), progress.acknowledged);
+        try std.testing.expectEqual(@as(u64, 3), progress.latest.index);
     }
     // The local owner guard alone is enough to make a missing manifest an
     // unsafe startup, even if the installation guard is also absent.

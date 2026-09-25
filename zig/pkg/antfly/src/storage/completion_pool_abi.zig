@@ -247,6 +247,48 @@ pub const ControlProviderV2 = extern struct {
     context: ?*anyopaque,
     acquire: *const fn (?*anyopaque, u64, u64, *ControlLeaseV2) callconv(.c) failure.Status,
 };
+/// A separate ABI preserves the v2 layout while binding each retained BEGIN
+/// and its latest locally applied control transition to one DATA WAL image.
+pub const control_proof_abi_version_v3: u32 = 3;
+pub const ControlDurableOwnerV3 = extern struct {
+    begin: Progress = .{},
+    latest: Progress = .{},
+    slot_index: u32 = 0,
+    reserved: u32 = 0,
+};
+pub const ControlDurableOwnersV3 = extern struct {
+    version: u32 = control_proof_abi_version_v3,
+    count: u32 = 0,
+    reserved: u64 = 0,
+    owners: [max_durable_controls]ControlDurableOwnerV3 = @splat(.{}),
+};
+pub const ControlDurableLogV3 = extern struct {
+    version: u32 = control_proof_abi_version_v3,
+    mode: ReconcileMode,
+    compacted_index: u64 = 0,
+    compacted_term: u64 = 0,
+    last_index: u64 = 0,
+    commit_index: u64 = 0,
+    count: u32 = 0,
+    reserved: u32 = 0,
+    begins: [max_durable_controls]DurableObservation = @splat(.{}),
+    latest: [max_durable_controls]DurableObservation = @splat(.{}),
+    document: DurableLog = .{ .mode = .startup_complete },
+};
+pub const ControlVTableV3 = extern struct {
+    release: *const fn (?*anyopaque) callconv(.c) void,
+    durable_owners: *const fn (?*anyopaque, *ControlDurableOwnersV3) callconv(.c) failure.Status,
+    reconcile_durable: *const fn (?*anyopaque, *const ControlDurableLogV3) callconv(.c) failure.Status,
+};
+pub const ControlLeaseV3 = extern struct {
+    identity: Identity,
+    context: ?*anyopaque,
+    vtable: *const ControlVTableV3,
+};
+pub const ControlProviderV3 = extern struct {
+    context: ?*anyopaque,
+    acquire: *const fn (?*anyopaque, u64, u64, *ControlLeaseV3) callconv(.c) failure.Status,
+};
 test "workload admission completion pool v1 durable ABI layout remains unchanged" {
     const std = @import("std");
     try std.testing.expectEqual(@as(usize, 240), @sizeOf(DurableCells));
