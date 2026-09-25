@@ -387,24 +387,56 @@ and 1.8–3.6× on head-only training, with raw-bit-identical weights and
 optimizer moments through 100 updates (small model, synthetic fixtures;
 v39 in `CUDA.md`).
 
+### Backend order
+
+Development is **Metal first**, with CPU as the reference. The development
+machines are Apple silicon (M4 Max, 36 GiB, where Laya's fine-tunes already
+run), and Metal training kernels ship to customers who fine-tune on Macs.
+
+- **CPU:** every new op gets a host kernel as its reference and fallback,
+  backward included, for gradient checks. Laya's flash-style host segment
+  attention (`linalg.segmentAttentionHost`) is the starting point. CPU
+  *training* speed is not a target; CPU performance matters for serving.
+- **Metal:** the performance target for steps 1–2 and the pilot.
+- **CUDA:** each op implements the same `ComputeBackend` contract, parity
+  tests, and fixtures as its Metal version, ported before step 4.
+
+**Why step 4 probably needs CUDA (estimate, not measured).** Training costs
+about 6 × parameters × tokens. ModernBERT-large (395M) on 300k examples of
+512 tokens is about 3.6e17 FLOPs per epoch. An M4 Max GPU peaks around
+15–18 TFLOPS in FP32; at 30% utilization that is roughly a day per epoch,
+and the full run (several epochs, ablations, the 2k–8k stage) would take
+weeks. A CUDA GPU running BF16 is one to two orders of magnitude faster (the
+L4 used in `CUDA.md` is about 120 TFLOPS in BF16). Today's Metal trainer is
+well below 30% utilization because attention is materialized: Laya's
+2,000-decision fine-tune took 56 minutes. Step 4 therefore runs on CUDA
+unless the Metal trainer, measured after gaps 1–2, turns out fast enough.
+
 ### Gaps, in priority order
 
-1. **Fused ModernBERT training attention, forward and backward, on CUDA and
-   Metal.** Plain attention in `lib/ml` (`Builder.sdpa`) is decomposed for
-   backward, so scores are fully materialized; that is why the Laya trainer
-   admits about 2k tokens at batch 1. The kernel needs RoPE at explicit
-   logical positions, the 128-token sliding window for local layers,
-   variable-length packing (no padding), and the per-query segment ranges
-   the inference-side segment attention already takes. It is the ModernBERT
-   counterpart of `debertaTrainingAttentionBackwardV1`, and it also unblocks
-   Laya's long-context step (LAYA.md step 2c) and packed training.
-2. **BF16 training** with FP32 master weights. There is none today: the only
-   mixed-precision path was MLX-only and was removed with the MLX backend.
-3. **The fused chunker on the resident Metal and CUDA paths.** Its
-   production lane is a CPU smoke test today.
-4. **Allocation and synchronization discipline on the ModernBERT graph**, the
+1. **Fused ModernBERT training attention, forward and backward: Metal and a
+   CPU reference first, then CUDA before step 4.** Plain attention in
+   `lib/ml` (`Builder.sdpa`) is decomposed for backward, so scores are fully
+   materialized; that is why the Laya trainer admits about 2k tokens at
+   batch 1. The kernel needs RoPE at explicit logical positions, the
+   128-token sliding window for local layers, variable-length packing (no
+   padding), and the per-query segment ranges the inference-side segment
+   attention already takes. It is a `ComputeBackend` op, like
+   `segmentAttention`, and the ModernBERT counterpart of
+   `debertaTrainingAttentionBackwardV1`. It also unblocks Laya's
+   long-context step (LAYA.md step 2c) and packed training.
+2. **The fused chunker on the resident Metal path** (CUDA later). Its
+   production lane is a CPU smoke test today, and the step 1 pilot runs
+   locally.
+3. **Allocation and synchronization discipline on the ModernBERT graph**, the
    same kind of work that made the GLiNER2.5 CUDA trainer faster than
    PyTorch. Profile each new path before optimizing, as `CUDA.md` requires.
+4. **BF16 training** with FP32 master weights. There is none today: the only
+   mixed-precision path was MLX-only and was removed with the MLX backend.
+   On CUDA it is a large speedup and belongs with the step 4 port. On Apple
+   GPUs the certain gain is memory and bandwidth; whether BF16 arithmetic is
+   faster than FP32 there is unverified, so measure on Metal before
+   investing.
 5. **Device all-reduce.** `collective_ops.allReduceSum` stages through the
    host (download, sum, upload). Needed only when a run needs more than one
    GPU.
@@ -433,22 +465,23 @@ v39 in `CUDA.md`).
 ## Plan
 
 Each step has a gate. A step starts only after the previous gate passes.
-Steps 2 and 3 are infrastructure and can run alongside step 1.
+Step 2 is infrastructure and runs alongside step 1; step 3 is needed only
+before step 4.
 
 | Step | Work | Gate |
 | --- | --- | --- |
 | 0. Baselines | Score Decide, `gliner2.5-base`, released Laya, and packed Laya on one harness: typed-decisions, Banking77, CLINC150, AG News, SST-5 (accuracy, soft CE, ECE), zero-shot NER (CrossNER, MIT) F1, and the `testdata/gliner25` pipeline cases. Time `gliner2.5-base` (native boundary core) against Laya's ModernBERT at 64, 512, and 2k tokens on CPU and Metal. Decide runs in PyTorch through `gliner2`. | None; this sets the targets. Record them here |
 | 0b. Constrained decoder | Port upstream's constraint AST and decoders into the extract API, scoring-backend agnostic | Decisions equal upstream's on its tests; Laya and GLiNER backends both use it |
-| 1. Native pilot | Put the GLiNER2.5 boundary heads and `classifier` (and span heads, for the Decision 4 ablation) on the fused chunker's ModernBERT-base training graph at 512 tokens. Distill from the step-0 teachers' targets on a small dataset. Compare with `gliner2.5-base`, which is about the same size. Uses no new kernels; moving the graph onto a resident backend is in scope if CPU is too slow | Within about 2 points of `gliner2.5-base` on gold; ECE no worse; top-1 agreement and span F1 against the teachers reported. If the student is more than 2–3 points behind, stop and keep DeBERTa for short extraction and classification. Head choice: entity F1 split into 8 words or fewer and longer, relation F1, and agreement with each teacher; keep boundary heads unless span heads win clearly on short entities and long entities are rare in our data |
-| 2. Fused ModernBERT training attention | Gap 1 above, on CUDA and Metal | Gradient parity with a PyTorch reference, as for the DeBERTa kernel; memory linear in sequence length; Laya trains at 8k tokens |
-| 3. BF16 training | Gap 2 above | Loss curve within tolerance of FP32 over a fixed number of updates; final evaluation within 0.5 points (the `CUDA.md` quality bar) |
-| 4. Full distillation | `antenna-large` (ModernBERT-large) and `antenna-multilingual` (mmBERT-base) on the full dataset, then a 2k–8k long-context stage with windowed-teacher and LLM-teacher labels | Within about 2 points of the teachers on gold at 512 tokens; better than windowed `gliner2.5-base` on long documents |
+| 1. Native pilot (Metal) | Put the GLiNER2.5 boundary heads and `classifier` (and span heads, for the Decision 4 ablation) on the fused chunker's ModernBERT-base training graph at 512 tokens, on resident Metal (gap 2). Distill from the step-0 teachers' targets on a small dataset. Compare with `gliner2.5-base`, which is about the same size. Needs no new attention kernel | Within about 2 points of `gliner2.5-base` on gold; ECE no worse; top-1 agreement and span F1 against the teachers reported. If the student is more than 2–3 points behind, stop and keep DeBERTa for short extraction and classification. Head choice: entity F1 split into 8 words or fewer and longer, relation F1, and agreement with each teacher; keep boundary heads unless span heads win clearly on short entities and long entities are rare in our data |
+| 2. Fused ModernBERT training attention (Metal, CPU reference) | Gap 1 above | Gradient parity with a PyTorch reference, as for the DeBERTa kernel, on Metal and CPU; memory linear in sequence length; Laya trains at 8k tokens on Metal. Then measure Metal training throughput on ModernBERT-large to decide where step 4 runs |
+| 3. CUDA port and BF16 | Port the step-2 kernel and the resident fused-chunker graph to CUDA under the same contract; add BF16 with FP32 master weights (gap 4). Skip if step 2 shows Metal is fast enough for step 4 | CUDA gradient parity with the Metal and CPU paths; BF16 loss curve within tolerance of FP32 over a fixed number of updates; final evaluation within 0.5 points (the `CUDA.md` quality bar) |
+| 4. Full distillation (CUDA, or Metal if fast enough) | `antenna-large` (ModernBERT-large) and `antenna-multilingual` (mmBERT-base) on the full dataset, then a 2k–8k long-context stage with windowed-teacher and LLM-teacher labels | Within about 2 points of the teachers on gold at 512 tokens; better than windowed `gliner2.5-base` on long documents |
 | 5. Native serving | Generalize `gliner_boundary.Backbone` and the boundary engine to ModernBERT and mmBERT; converter; oracle fixtures and parity under the `testdata/gliner25` policy; a qualification row through the two-tier gate ([GLINER25.md](../gliner2/GLINER25.md)) | Parity with the trained checkpoint within the existing boundary tolerances; qualification row reviewed |
 | 6. Decision head | Laya head on the Antenna trunk, trained with the extraction distillation losses kept on as an anchor | Within noise of packed Laya on typed-decisions; extraction metrics unchanged |
 | 7. Embedding and chunk heads | The fused chunker's heads and losses on the Antenna trunk; choose among the three layouts above by measurement | Embedding: retrieval on the 10k Wikipedia set within an agreed tolerance of the teacher embedder. Chunking: retrieval with learned chunks no worse than fixed chunking. Extraction metrics unchanged |
 | 8. Tree-packed trunk | Schema-blind text trunk with task branches, reusing Laya's packer, segment attention, and trunk cache | Extraction F1 and classification within noise of the unpacked Antenna, the same gate as LAYA.md step 0 |
 
-Gaps 4 and 5 (allocation discipline, device all-reduce) are taken on when
+Gaps 3 and 5 (allocation discipline, device all-reduce) are taken on when
 profiling or run size calls for them, each with its own benchmark evidence.
 
 Independent of Antenna, serving span checkpoints (Decide) through the
@@ -468,8 +501,11 @@ the critical path because step 0 can score Decide in PyTorch.
   training attention (step 2). Until it lands, native training is limited to
   about 2k tokens at batch 1, which is enough for step 1 and the 512-token
   stage of step 4.
-- **Pilot backend:** the fused chunker trains on CPU today. If the step 1
-  pilot is too slow there, moving it to a resident backend comes first.
+- **Pilot backend:** the fused chunker trains on CPU today; moving it to
+  resident Metal (gap 2) comes before the step 1 pilot.
+- **Compute for step 4:** the per-epoch estimate under
+  [Backend order](#backend-order) is unmeasured. Step 2 ends with a real
+  Metal throughput measurement that decides between Metal and CUDA.
 - **Vendor figures:** Decide's benchmark and latency numbers are Fastino's.
   Step 0 replaces them with ours.
 - **Multilingual teachers:** `gliner2.5-multi-v1` is base size; whether it is
