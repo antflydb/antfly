@@ -230,6 +230,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         initial_range: ?db_types.ByteRange = null,
         identity: descriptor_contract.Identity,
         restore: ?@import("../storage/restore_identity.zig").Identity = null,
+        initial_child_bootstrap_json: ?[]u8 = null,
 
         pub fn view(self: *const LoadedDescriptor) descriptor_contract.Descriptor {
             return .{
@@ -240,6 +241,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .table_storage = self.table_storage,
                 .initial_range = self.initial_range,
                 .restore = self.restore,
+                .initial_child_bootstrap_json = self.initial_child_bootstrap_json orelse "",
             };
         }
 
@@ -249,6 +251,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             alloc.free(self.indexes_json);
             descriptor_contract.freeInitialRange(alloc, self.initial_range);
             if (self.restore) |*identity| identity.deinit(alloc);
+            if (self.initial_child_bootstrap_json) |value| alloc.free(value);
             self.* = undefined;
         }
     };
@@ -2454,6 +2457,49 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
     ) !LoadedDescriptor {
         return self.loadDescriptorWithDeadline(alloc, group_id, table_name, null);
+    }
+
+    /// Only an exact metadata-authorized hidden child may obtain a Raft
+    /// descriptor without a public catalog route. The bootstrap travels in
+    /// the committed entry so follower apply uses the same private identity.
+    pub fn loadInitialChildDescriptor(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        expected: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap,
+    ) !LoadedDescriptor {
+        try expected.validate();
+        var lease = try self.acquirePreparedOwner(group_id, table_name);
+        defer lease.deinit();
+        const entry = lease.entry;
+        if (entry.initial_child_bootstrap_json.len == 0 or
+            entry.identity.table_id != expected.namespace.table_id or
+            entry.identity.shard_id != expected.namespace.shard_id or
+            entry.identity.range_id != expected.namespace.range_id)
+            return error.InitialChildPublicationChanged;
+        var stored = std.json.parseFromSlice(@TypeOf(expected), alloc, entry.initial_child_bootstrap_json, .{ .ignore_unknown_fields = false }) catch return error.InvalidInitialChildPublication;
+        defer stored.deinit();
+        if (!stored.value.eql(expected)) return error.InitialChildPublicationChanged;
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        errdefer alloc.free(path);
+        const schema_json = try alloc.dupe(u8, entry.schema_json);
+        errdefer alloc.free(schema_json);
+        const indexes_json = try alloc.dupe(u8, entry.indexes_json);
+        errdefer alloc.free(indexes_json);
+        const initial_range = try descriptor_contract.cloneInitialRange(alloc, entry.initial_range);
+        errdefer descriptor_contract.freeInitialRange(alloc, initial_range);
+        const bootstrap_json = try alloc.dupe(u8, entry.initial_child_bootstrap_json);
+        return .{
+            .path = path,
+            .schema_json = schema_json,
+            .indexes_json = indexes_json,
+            .table_storage = entry.table_storage,
+            .generation = entry.generation,
+            .initial_range = initial_range,
+            .identity = entry.identity,
+            .initial_child_bootstrap_json = bootstrap_json,
+        };
     }
 
     fn loadDescriptorWithDeadline(
@@ -5763,6 +5809,42 @@ test "committed catch-up retains newer durable schema across an older pinned des
     try std.testing.expect(std.mem.indexOf(u8, second.bytes(), "second") != null);
 }
 
+test "hidden initial child descriptor requires exact private bootstrap" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    const Bootstrap = @import("../storage/db/relational_initial_child_publication.zig").Bootstrap;
+    const expected: Bootstrap = .{
+        .plan_id = .{1} ** 16,
+        .plan_digest = .{2} ** 32,
+        .namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 },
+        .schema_version = 1,
+        .schema_digest = .{3} ** 32,
+        .public_schema_json_digest = .{4} ** 32,
+        .catalog_digest = .{5} ** 32,
+    };
+    const bootstrap_json = try std.json.Stringify.valueAlloc(alloc, expected, .{});
+    defer alloc.free(bootstrap_json);
+    try source.primeInitialChildOwner(1, "hidden", .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 7, .shard_id = 8, .range_id = 9 },
+        .initial_range = .{ .start = "", .end = "" },
+        .initial_child_bootstrap_json = bootstrap_json,
+    });
+    try std.testing.expectError(error.TableNotFound, source.loadDescriptor(alloc, 1, "hidden"));
+    var loaded = try source.loadInitialChildDescriptor(alloc, 1, "hidden", expected);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqualStrings(bootstrap_json, loaded.view().initial_child_bootstrap_json);
+    try std.testing.expect(loaded.view().identity.eql(.{ .table_id = 7, .shard_id = 8, .range_id = 9 }));
+    var wrong = expected;
+    wrong.plan_id = .{6} ** 16;
+    try std.testing.expectError(error.InitialChildPublicationChanged, source.loadInitialChildDescriptor(alloc, 1, "hidden", wrong));
+}
+
 test "committed catch-up does not reconcile an older index-only descriptor" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6025,6 +6107,7 @@ test "owner descriptor changes close admission before draining existing readers"
             .schema_json = @constCast("old schema"),
             .indexes_json = @constCast("{}"),
             .restore_bootstrap_json = @constCast(""),
+            .initial_child_bootstrap_json = @constCast(""),
             .owner = undefined,
             .active_users = 1,
             .resident = true,
@@ -6070,6 +6153,7 @@ test "owner descriptor changes do not retire a live owner for an older schema ve
             .schema_json = @constCast("{\"version\":7,\"default_type\":\"_default\"}"),
             .indexes_json = @constCast("{}"),
             .restore_bootstrap_json = @constCast(""),
+            .initial_child_bootstrap_json = @constCast(""),
             .owner = undefined,
             .active_users = 1,
             .resident = true,
@@ -6105,6 +6189,7 @@ test "scheduled repair admission yields to readers and reuses exact configured g
         .schema_json = @constCast("schema"),
         .indexes_json = @constCast("indexes"),
         .restore_bootstrap_json = @constCast(""),
+        .initial_child_bootstrap_json = @constCast(""),
         .owner = undefined,
         .active_users = 1,
         .resident = true,

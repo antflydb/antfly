@@ -636,9 +636,13 @@ Initial MATCH PARTIAL support-index installation now reserves the parent
 descriptor, hidden child identity, locks, and durable work in one metadata
 transaction. The hosted path now seals parent support, places a private child
 group, and admits a local Raft leader from a paired public/private metadata
-cut. The mounted lifecycle still stalls in `provisioning_child` without a child
-receipt; the private owner/control apply boundary and rollback fault matrix
-remain unproven, so initial MATCH PARTIAL CREATE stays publicly guarded.
+cut. Hidden-child topology proposals now carry an exact private compiled-owner
+descriptor through Raft instead of resolving an unpublished public table, and
+skip the public dense-repair admission probe only for that no-document-write
+control. The mounted lifecycle still stalls in `provisioning_child` without a
+child receipt after these changes; the private owner/control apply boundary and
+rollback fault matrix remain unproven, so initial MATCH PARTIAL CREATE stays
+publicly guarded.
 Standalone cancellation has an exact hidden-owner retirement
 path and a checksummed local intent. Its self-FK two-range crash/restart and
 terminal cold-root tests pass, but this does not retire offline hosted replicas:

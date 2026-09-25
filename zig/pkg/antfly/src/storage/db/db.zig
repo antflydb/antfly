@@ -656,6 +656,10 @@ pub const OpenOptions = struct {
     /// backfill could resume with the previously persisted (or schema-less)
     /// mapper before the provisioner got a chance to call `setSchema`.
     schema_before_index_load: ?SchemaBeforeIndexLoad = null,
+    /// An ordinary catalog-authoritative owner must retry when its pinned
+    /// schema predates the durable root. Historical Raft apply may retain the
+    /// newer schema while replaying an older entry's mutation.
+    reject_stale_schema_before_index_load: bool = false,
     identity_namespace: ?doc_identity.Namespace = null,
     /// Immutable authenticated deployment ownership, not selected by a source
     /// request. Decoders/library opens may leave this unset.
@@ -6413,6 +6417,18 @@ pub const DB = struct {
             );
             core_owned = false;
             core_owner_initialized = true;
+            // Reject a stale catalog-authoritative descriptor as soon as the
+            // durable schema is known, before binding source authority or
+            // starting any owner-side maintenance. Historical Raft apply is
+            // allowed to replay against the newer on-disk schema instead.
+            if (opts.reject_stale_schema_before_index_load) {
+                if (opts.schema_before_index_load) |prepared_schema| {
+                    if (core_owner.schema) |durable_schema| {
+                        if (durable_schema.version > prepared_schema.runtime_schema.version)
+                            return error.SchemaVersionRegression;
+                    }
+                }
+            }
             core_owner.identity_visibility.summary = try doc_identity.visibilitySummaryFromStore(core_owner.store);
             const policy_secret = if (opts.secret_store) |store|
                 try store.getOwned(alloc, "antfly.trusted_principal.secret")
@@ -6556,6 +6572,7 @@ pub const DB = struct {
                 // Keep that newer epoch; the older entry's native applied
                 // marker decides whether it still needs its data mutation.
                 if (db.core.schema != null and db.core.schema.?.version > prepared_schema.runtime_schema.version) {
+                    if (opts.reject_stale_schema_before_index_load) return error.SchemaVersionRegression;
                     std.log.debug("owner open retains newer durable schema path={s} durable_version={d} descriptor_version={d}", .{
                         path, db.core.schema.?.version, prepared_schema.runtime_schema.version,
                     });

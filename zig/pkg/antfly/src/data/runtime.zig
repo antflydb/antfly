@@ -399,6 +399,9 @@ const DataRaftBatchRoute = struct {
     /// Immutable catalog authority selected with the public mutation. This is
     /// forwarded unchanged and consumed only by the confirmed Raft leader.
     write_route_fence: ?antfly.metadata_api.CatalogRouteFence = null,
+    /// Exact private bootstrap for an unpublished initial FK child. Only the
+    /// metadata-authorized initial-child control path may supply this.
+    initial_child_bootstrap: ?@import("../storage/db/relational_initial_child_publication.zig").Bootstrap = null,
 };
 
 const DataRaftBatchForwardState = struct {
@@ -10462,7 +10465,7 @@ pub const DataServer = struct {
                         .catalog_digest = catalog_digest,
                     } } };
                     if (leader_term) |term|
-                        try self.proposeRaftBatchGroup(alloc, group_id, table_name, batch, .{ .discovery = .cached, .required_local_term = term })
+                        try self.proposeRaftBatchGroup(alloc, group_id, table_name, batch, .{ .discovery = .cached, .required_local_term = term, .initial_child_bootstrap = private_bootstrap })
                     else
                         try (try self.ensureKernelOwnerSource()).applyInitialChildNative(scratch, group_id, table_name, private_bootstrap, batch, 1);
                 },
@@ -10482,7 +10485,7 @@ pub const DataServer = struct {
                         },
                     } };
                     if (leader_term) |term|
-                        try self.proposeRaftBatchGroup(alloc, group_id, table_name, batch, .{ .discovery = .cached, .required_local_term = term })
+                        try self.proposeRaftBatchGroup(alloc, group_id, table_name, batch, .{ .discovery = .cached, .required_local_term = term, .initial_child_bootstrap = private_bootstrap })
                     else
                         try (try self.ensureKernelOwnerSource()).applyInitialChildNative(scratch, group_id, table_name, private_bootstrap, batch, if (request.action == .release) 2 else 3);
                 },
@@ -11835,11 +11838,18 @@ pub const DataServer = struct {
                         route.visibility_cancellation,
                     );
                 }
-                if (req.restore_staging_scope == null) try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
+                // The unpublished child has no public write route. Its
+                // topology control carries no document mutation, and the
+                // exact private owner was checked before reaching Raft.
+                if (req.restore_staging_scope == null and route.initial_child_bootstrap == null)
+                    try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
                 if (comptime linked_storage) {
                     if (restore_owner_descriptor == null) {
                         const owner_source = try self.ensureKernelOwnerSource();
-                        storage_owner_descriptor = try owner_source.loadDescriptor(alloc, group_id, table_name);
+                        storage_owner_descriptor = if (route.initial_child_bootstrap) |bootstrap|
+                            try owner_source.loadInitialChildDescriptor(alloc, group_id, table_name, bootstrap)
+                        else
+                            try owner_source.loadDescriptor(alloc, group_id, table_name);
                     }
                 }
             }
