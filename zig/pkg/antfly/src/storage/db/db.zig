@@ -144782,17 +144782,19 @@ test "workload admission physical completion final named ACK checkpoints retaine
     const storage_io = @import("../lsm_backend/storage_io.zig");
     const Fault = struct {
         var fired: bool = false;
+        var point_to_fail: storage_io.CompletionIoFault = .append_sync;
         fn fail(point: storage_io.CompletionIoFault, file: []const u8) bool {
-            const match = point == .append_sync and std.mem.endsWith(u8, file, ".journal");
+            const match = point == point_to_fail and std.mem.endsWith(u8, file, ".journal");
             if (match) fired = true;
             return match;
         }
     };
-    for (0..4) |scenario| {
+    for (0..5) |scenario| {
         defer pool_module.test_control_checkpoint_fault = null;
         defer storage_io.test_completion_io_fault = null;
         pool_module.test_control_checkpoint_fault_hit = false;
         Fault.fired = false;
+        Fault.point_to_fail = if (scenario == 4) .partial_append else .append_sync;
         var tmp = try TestDirectory.init("completion-terminal-control-ack");
         defer tmp.cleanup();
         const path = std.mem.span(tmp.path().ptr);
@@ -144906,12 +144908,12 @@ test "workload admission physical completion final named ACK checkpoints retaine
                 const prior_runs = backend.runs.count();
                 lease.vtable.proposal_result(lease.context, &.{ .state = check.state, .first_index = accepted_index, .last_index = accepted_index, .payloads = check.proposals });
                 if (step == 2 and scenario != 0) {
-                    if (scenario == 3) storage_io.test_completion_io_fault = Fault.fail else pool_module.test_control_checkpoint_fault = if (scenario == 1) .after_manifest else .after_wal_reset;
+                    if (scenario >= 3) storage_io.test_completion_io_fault = Fault.fail else pool_module.test_control_checkpoint_fault = if (scenario == 1) .after_manifest else .after_wal_reset;
                 }
                 const applied = lease.vtable.apply_accepted.?(lease.context, 1, accepted_index, payloads[0]);
                 if (step == 2 and scenario != 0) {
                     try std.testing.expect(applied != runtime_failure_abi.Status.ok);
-                    try std.testing.expect(if (scenario == 3) Fault.fired else pool_module.test_control_checkpoint_fault_hit);
+                    try std.testing.expect(if (scenario >= 3) Fault.fired else pool_module.test_control_checkpoint_fault_hit);
                     try std.testing.expect(pool.failed);
                     try std.testing.expect(try control_guard.hasAny(backend.storage.?, alloc, backend.root_dir.?));
                     continue;
