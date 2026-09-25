@@ -1904,7 +1904,13 @@ pub fn configureStorageKernelOwnerDbAtOpen(
             null;
         defer if (descriptor_schema) |*parsed| parsed.deinit(alloc);
         const descriptor_version: u32 = if (descriptor_schema) |parsed| parsed.version else 0;
-        if (descriptor_version < durable_schema.version) return;
+        if (descriptor_version < durable_schema.version) {
+            // Only an immutable Raft entry may reopen through an older pinned
+            // descriptor. An ordinary owner must retry with current catalog
+            // authority rather than silently accepting a stale open.
+            if (historical_raft_apply) return;
+            return error.StorageBusy;
+        }
     }
     if (schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
     if (indexes_json.len > 0) {

@@ -51,6 +51,15 @@ test "opaque owner retries a stale schema descriptor without regressing durable 
     var stale = options;
     stale.schema_json = .fromSlice("{\"version\":1}");
     try std.testing.expectError(error.StorageBusy, client.Owner.open(stale));
+    var historical = stale;
+    historical.historical_raft_apply = 1;
+    {
+        var owner = try client.Owner.open(historical);
+        defer owner.deinit();
+        var row = try owner.lookupJson("docs", "{\"key\":\"a\"}");
+        defer row.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, row.bytes(), "\"n\":1") != null);
+    }
     {
         var owner = try client.Owner.open(options);
         defer owner.deinit();
