@@ -227,7 +227,7 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
             try result.append(a, .{ .node_id = id, .value = value });
         }
     }
-    for (built.dropouts.items) |entry| {
+    for (built.sites.dropouts.items) |entry| {
         const shape = graph.node(entry.node).output_shape;
         const mask = try a.alloc(f32, @intCast(shape.numElements().?));
         for (mask) |*v| v.* = if (!training) 1 else if (random.float(f32) < entry.probability) 0 else 1 / (1 - entry.probability);

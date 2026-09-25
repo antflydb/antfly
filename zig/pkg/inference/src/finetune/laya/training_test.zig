@@ -90,7 +90,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     defer binding.deinit();
     const combined = try std.mem.concat(scratch, interpreter.RuntimeInput, &.{ binding.inputs, runtime });
     const trace = platform.env.getenv("ANTFLY_LAYA_TRACE") != null;
-    if (trace) for (program.built.traces.items) |entry| {
+    if (trace) for (program.built.sites.traces.items) |entry| {
         try program.graph.markOutput(entry.node);
         try program.gradients.graph.markOutput(program.gradients.id_map[entry.node]);
     };
@@ -159,7 +159,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
 fn compareTraces(a: std.mem.Allocator, root: []const u8, program: *const train.Program, cb: *const @import("../../ops/ops.zig").ComputeBackend, outputs: []const @import("../../ops/ops.zig").CT, phase: []const u8) !void {
     var reader = try safetensors.MMapReader.openFileAbsolute(a, try std.fmt.allocPrint(a, "{s}/activations.safetensors", .{root}));
     defer reader.deinit();
-    for (program.built.traces.items, outputs) |entry, output| {
+    for (program.built.sites.traces.items, outputs) |entry, output| {
         var expected = try reader.readTensor(entry.name);
         defer expected.deinit();
         const actual = try cb.toFloat32(output, a);
