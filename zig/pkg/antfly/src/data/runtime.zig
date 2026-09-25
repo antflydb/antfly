@@ -16606,6 +16606,10 @@ pub const DataServer = struct {
             error.UnknownGroup,
             error.LmdbUnexpected,
             error.Corrupted,
+            // Inventory collection and publication read local owner state and
+            // remote metadata. A failed read cannot publish a partial report;
+            // the worker keeps the dirty bit and retries from a fresh snapshot.
+            error.ReadFailed,
             error.StaleLocalGroupStatusGeneration,
             => {},
             error.UnknownStore => {
@@ -30606,6 +30610,16 @@ fn consumerTests() type {
             try server.runStoreStatusRoundOnly();
             try std.testing.expect(server.store_report_publisher.cursor != null);
             try std.testing.expect(fake.observations.load(.acquire) > observations);
+            // A transient read failure while collecting the next inventory
+            // must not terminate the data process or publish a partial report.
+            server.handleStoreReportFailure(error.ReadFailed);
+            try std.testing.expectEqual(@intFromError(error.ReadFailed), server.store_report_failure.load(.acquire));
+            try server.reportStoreStatusForControl(.full);
+            try std.testing.expectEqual(@as(u16, 0), server.store_report_failure.load(.acquire));
+            try std.testing.expect(server.store_status_dirty.load(.acquire));
+            server.store_report_update_retry_at_ms = 0;
+            try server.runStoreStatusRoundOnly();
+            try std.testing.expect(server.store_report_publisher.cursor != null);
             // Ownership invalidation before a queued heartbeat requires repair,
             // never publication of the cached generation or a fatal control error.
             server.invalidateLocalGroupStatusCache();

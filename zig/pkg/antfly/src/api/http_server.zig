@@ -572,10 +572,16 @@ fn restoreRetryDelayNs(err: anyerror, job_id: u64, attempt_id: u64) u64 {
 }
 
 fn restoreRewriteStepError(err: anyerror) anyerror {
-    // A source or target owner may briefly return 503 while leadership or
-    // routing settles. The rewrite cursor is already durable: keep this
-    // attempt and retry the same step instead of backing off a new attempt.
-    return if (err == error.RestoreValidationPending) error.RestoreStagingWait else err;
+    // A source or target owner may briefly be unroutable while its group
+    // elects a leader. Source observations are read-only; routed source writes
+    // distinguish non-proposal from an unknown outcome. Every rewrite step
+    // resumes from durable source and target receipts.
+    // Keep the same attempt: requeueing it durably on every election gap adds
+    // metadata WAL commits and eventually exponential backoff to the outage.
+    return switch (err) {
+        error.RestoreValidationPending, error.GroupLeaderUnavailable => error.RestoreStagingWait,
+        else => err,
+    };
 }
 
 fn waitForRestoreCutoverFence(
@@ -613,6 +619,10 @@ test "restore cutover readiness waits without exponential retry" {
     try std.testing.expect(restoreRetryDelayNs(error.RestoreValidationPending, 42, 8) > restore_staging_wait_ns);
     try std.testing.expect(restoreJobErrorIsRetryable(error.RestoreStagingWait));
     try std.testing.expectEqual(error.RestoreStagingWait, restoreRewriteStepError(error.RestoreValidationPending));
+    try std.testing.expectEqual(error.RestoreStagingWait, restoreRewriteStepError(error.GroupLeaderUnavailable));
+    // An RPC whose outcome is unknown must retain its distinct error so the
+    // owner receipt can be reconciled; it is not a pre-dispatch routing gap.
+    try std.testing.expectEqual(error.RaftBatchWriteOutcomeUnknown, restoreRewriteStepError(error.RaftBatchWriteOutcomeUnknown));
     try std.testing.expectEqual(error.RestoreStagingScopeChanged, restoreRewriteStepError(error.RestoreStagingScopeChanged));
 }
 
