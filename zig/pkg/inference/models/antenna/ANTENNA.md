@@ -33,18 +33,19 @@ trail following), as this model is one encoder with many heads.
 - The GLiNER2 heads' outputs are indexed by **words, labels, and tasks, never
   by tokenizer pieces**. A ModernBERT student can therefore be distilled
   directly from DeBERTa teachers' outputs.
-- Much of Antenna already exists in our tree. The fused chunker
-  (`src/finetune/fused_chunker*.zig`) is a ModernBERT encoder with a
-  chunk-boundary head and an embedding head, trained natively with InfoNCE,
-  Matryoshka dimensions, cross-batch negatives, and SPLADE. Antenna is that
-  trunk plus the GLiNER2.5 heads plus Laya's decision head.
+- Much of Antenna's training stack already exists. Laya's ModernBERT
+  training graph (`src/finetune/laya/graph.zig`) already trains on resident
+  Metal, and the GLiNER2.5 boundary trainer already separates its encoder
+  from its heads. Antenna is a shared ModernBERT trunk extracted from Laya,
+  with the GLiNER2.5 heads on it, then Laya's decision head, then embedding
+  and chunking heads modelled on the fused chunker's.
 - Training is **Zig-first**. PyTorch serves only as the parity oracle and to
   run the two span teachers we do not serve natively. The main missing piece
   is a fused ModernBERT training attention (forward and backward), which
   also removes Laya's ~2k-token training cap.
-- The plan starts with a small native distillation on the fused chunker's
-  existing ModernBERT-base graph at 512 tokens, which needs no new kernels,
-  so the quality question is answered before the kernel work.
+- The plan starts with a small native distillation: GLiNER2.5 boundary heads
+  on the extracted ModernBERT trunk at 512 tokens on Metal. That needs no new
+  kernels, so the quality question is answered before the kernel work.
 
 ## Background
 
@@ -103,7 +104,7 @@ document chunker. Boundary and span checkpoints are not interchangeable.
 | GLiNER2.5 boundary core | `fastino/gliner2.5-{small,base,multi}-v1` (`boundary`) | Learned `classifier` over `[L]` states (`classifyNative`) | DeBERTa only: `Backbone` is `small`/`base`/`multi` with hard-coded hidden and vocabulary sizes | `src/architectures/gliner/boundary_*.zig`, `src/models/gliner_boundary.zig`, [GLINER25.md](../gliner2/GLINER25.md) |
 | GLiNER2 fine-tuning | span checkpoints | trains `classifier` | DeBERTa (`deberta_graph`) | `src/finetune/gliner2_real_autodiff.zig`, [FINETUNING.md](../gliner2/FINETUNING.md) |
 | Laya | `convaiinnovations/laya*` | decision head | ModernBERT-large / mmBERT-base; tree packing, segment attention, trunk cache | [LAYA.md](../laya/LAYA.md) |
-| Fused chunker (training only) | own checkpoints (`fused_chunker_embedder/v1alpha1`) | per-token chunk-boundary MLP; embedding head with late-chunking mean pool; optional SPLADE | ModernBERT-base | `src/finetune/fused_chunker*.zig`, [finetuning/FINETUNING.md](../../finetuning/FINETUNING.md#training-features-by-model-family) |
+| Fused chunker (training scaffolding) | own checkpoints (`fused_chunker_embedder/v1alpha1`) | per-token chunk-boundary MLP; embedding head with late-chunking mean pool; optional SPLADE | ModernBERT-base (legacy weight layout) | `src/finetune/fused_chunker*.zig`, [finetuning/FINETUNING.md](../../finetuning/FINETUNING.md#training-features-by-model-family) |
 
 Two consequences:
 
@@ -120,8 +121,22 @@ Two consequences:
   cost, not a cap.
 
 `pipelines/chunking.zig`, the served chunker, is fixed-size text splitting
-with no model. The fused chunker is trainable but not yet served (its
-production lane is a CPU smoke test, [finetuning/CLI.md](../../finetuning/CLI.md)).
+with no model. The fused chunker is not served, and its trainer is
+scaffolding rather than a working pipeline (read 2026-09-25):
+
+- The production trainer runs the encoder eagerly with no backward, so only
+  the boundary MLP head learns (`train/train_fused_chunker.zig`). Its "LoRA"
+  applies the head-input gradient to every layer's Q/V projections, which is
+  not backpropagation (`graph/segmented_encoder.zig`).
+- The contrastive path receives all-zero chunk embeddings and discards its
+  gradient, so InfoNCE, Matryoshka, and cross-batch negatives teach nothing
+  yet (`fused_chunker_train.zig`). Hard negatives are dropped. SPLADE trains
+  only its own projection.
+- It runs on CPU only, and its graph encoder (`architectures/modern_bert_graph.zig`)
+  uses full attention in every layer, one RoPE theta, and a legacy weight
+  layout that a stock Hugging Face ModernBERT checkpoint does not match.
+
+Its head designs and host loss code are reusable; its trainer is not.
 
 ### How GLiNER2 compares with tree-packed Laya
 
@@ -212,9 +227,14 @@ review.
 6. **Port the constrained decoder separately.** It consumes scores, so it can
    sit in `/ai/v1/extract` in front of any backend, Laya included, and does
    not wait on Antenna.
-7. **Build on the fused chunker; do not write new embedding and chunking
-   heads.** Its trunk is already ModernBERT, and its boundary and embedding
-   heads, losses, and training features are the ones Antenna needs.
+7. **Build on Laya's trunk and the GLiNER2.5 trainer, not the fused chunker's
+   trainer.** Laya's graph is the correct ModernBERT (Hugging Face weight
+   names, global and local layers, two RoPE tables) and already trains on
+   resident Metal. The GLiNER2.5 boundary trainer's heads read only routed
+   hidden states. The fused chunker contributes head designs (boundary MLP,
+   late-chunking pool, SPLADE) and host loss code (InfoNCE, Matryoshka,
+   cross-batch memory), rebuilt in the graph so their gradients reach the
+   encoder.
 8. **Train in Zig.** The training stack already has most of what the run
    needs (see [Training infrastructure](#training-infrastructure)), and the
    kernels we write for it are the kernels customer fine-tuning ships with.
@@ -246,10 +266,12 @@ text ─► ModernBERT / mmBERT encoder ─┬─► boundary extraction head   
   MLP, unchanged except for the encoder width they read.
 - **Decision head:** Laya's head ([LAYA.md](../laya/LAYA.md)), reading the
   shared encoder.
-- **Embedding and chunking:** the fused chunker's heads, unchanged: a
-  per-token two-layer boundary MLP, an embedding head with late-chunking
-  mean pooling per chunk, and an optional SPLADE sparse head. They train
-  with InfoNCE, Matryoshka dimensions, and cross-batch negatives. A learned
+- **Embedding and chunking:** the fused chunker's head designs: a per-token
+  two-layer boundary MLP, an embedding head with late-chunking mean pooling
+  per chunk, and an optional SPLADE sparse head, trained with InfoNCE,
+  Matryoshka dimensions, and cross-batch negatives. They are rebuilt in the
+  training graph (or seeded with a host-computed cotangent, as Laya's
+  objective is) so the gradient reaches the encoder. A learned
   attention pool is an ablation, not the default. Late-interaction
   (ColBERT-style) per-token vectors could come from the same states later.
 
@@ -374,7 +396,9 @@ Antenna trains natively. This inventory was taken from the tree on
 | Activation checkpointing and bounded recomputation | `lib/ml/src/graph/checkpoint.zig`, `src/graph/recomputed_training.zig` | |
 | Device-resident training on Metal and CUDA | `src/graph/resident_training_*.zig` | GLiNER2.5 and Laya |
 | Fused training attention with backward | `src/ops/cuda/gliner25.zig` (`debertaTrainingAttentionBackwardV1`) | **DeBERTa only**, CUDA |
-| Contrastive and embedding losses: InfoNCE, Matryoshka, cross-batch memory, SPLADE with FLOPS regularization, NEFTune | `src/finetune/fused_chunker_train.zig`, `infonce_cpu.zig` | fused chunker |
+| Host contrastive and embedding losses: InfoNCE, Matryoshka, cross-batch memory, SPLADE with FLOPS regularization, NEFTune | `src/finetune/fused_chunker_train.zig`, `infonce_cpu.zig` | loss code only; not yet connected to a trained encoder (see Background) |
+| ModernBERT training graph on resident Metal | `src/finetune/laya/graph.zig`, `training.zig`, `job.zig` | Hugging Face layout, global and local layers, runtime RoPE tables and masks; attention materialized, capped at `batch·S²·heads ≤ 64Mi` |
+| Encoder-independent boundary heads and losses | `src/finetune/gliner/boundary_encoder_graph.zig` (`RoutedNodes`), `boundary_train_step.zig` | encoder is one builder call; DeBERTa-specific today |
 | Data-parallel training | `src/graph/distributed_training.zig`, `collective_ops.zig` | wired for ColQwen2 and Gemma4 |
 | PJRT (XLA) training path | `src/graph/pjrt_*` | ColQwen2 and Gemma4 |
 | Native GLiNER2.5 inference | `src/architectures/gliner/boundary_*.zig` | at least 2.3× PyTorch on CUDA in every benchmark case ([scripts/gliner25/CUDA.md](../../scripts/gliner25/CUDA.md)) |
@@ -425,9 +449,13 @@ unless the Metal trainer, measured after gaps 1–2, turns out fast enough.
    `segmentAttention`, and the ModernBERT counterpart of
    `debertaTrainingAttentionBackwardV1`. It also unblocks Laya's
    long-context step (LAYA.md step 2c) and packed training.
-2. **The fused chunker on the resident Metal path** (CUDA later). Its
-   production lane is a CPU smoke test today, and the step 1 pilot runs
-   locally.
+2. **A shared ModernBERT training trunk, and the GLiNER2.5 boundary trainer
+   on it.** Extract the trunk from `laya/graph.zig`. Then make the boundary
+   trainer's encoder config a choice of DeBERTa or ModernBERT, switch the
+   encoder in `boundary_encoder_graph`, add a byte-level BPE tokenizer
+   profile, and let PEFT handle bias-free linears. Start with the
+   materialized attention profile and no layer recompute. The step 1 pilot
+   needs this.
 3. **Allocation and synchronization discipline on the ModernBERT graph**, the
    same kind of work that made the GLiNER2.5 CUDA trainer faster than
    PyTorch. Profile each new path before optimizing, as `CUDA.md` requires.
@@ -472,13 +500,13 @@ before step 4.
 | --- | --- | --- |
 | 0. Baselines | Score Decide, `gliner2.5-base`, released Laya, and packed Laya on one harness: typed-decisions, Banking77, CLINC150, AG News, SST-5 (accuracy, soft CE, ECE), zero-shot NER (CrossNER, MIT) F1, and the `testdata/gliner25` pipeline cases. Time `gliner2.5-base` (native boundary core) against Laya's ModernBERT at 64, 512, and 2k tokens on CPU and Metal. Decide runs in PyTorch through `gliner2`. | None; this sets the targets. Record them here |
 | 0b. Constrained decoder | Port upstream's constraint AST and decoders into the extract API, scoring-backend agnostic | Decisions equal upstream's on its tests; Laya and GLiNER backends both use it |
-| 1. Native pilot (Metal) | Put the GLiNER2.5 boundary heads and `classifier` (and span heads, for the Decision 4 ablation) on the fused chunker's ModernBERT-base training graph at 512 tokens, on resident Metal (gap 2). Distill from the step-0 teachers' targets on a small dataset. Compare with `gliner2.5-base`, which is about the same size. Needs no new attention kernel | Within about 2 points of `gliner2.5-base` on gold; ECE no worse; top-1 agreement and span F1 against the teachers reported. If the student is more than 2–3 points behind, stop and keep DeBERTa for short extraction and classification. Head choice: entity F1 split into 8 words or fewer and longer, relation F1, and agreement with each teacher; keep boundary heads unless span heads win clearly on short entities and long entities are rare in our data |
+| 1. Native pilot (Metal) | Put the GLiNER2.5 boundary heads and `classifier` (and span heads, for the Decision 4 ablation) on the shared ModernBERT-base training trunk at 512 tokens, on resident Metal (gap 2). Distill from the step-0 teachers' targets on a small dataset. Compare with `gliner2.5-base`, which is about the same size. Needs no new attention kernel | Within about 2 points of `gliner2.5-base` on gold; ECE no worse; top-1 agreement and span F1 against the teachers reported. If the student is more than 2–3 points behind, stop and keep DeBERTa for short extraction and classification. Head choice: entity F1 split into 8 words or fewer and longer, relation F1, and agreement with each teacher; keep boundary heads unless span heads win clearly on short entities and long entities are rare in our data |
 | 2. Fused ModernBERT training attention (Metal, CPU reference) | Gap 1 above | Gradient parity with a PyTorch reference, as for the DeBERTa kernel, on Metal and CPU; memory linear in sequence length; Laya trains at 8k tokens on Metal. Then measure Metal training throughput on ModernBERT-large to decide where step 4 runs |
-| 3. CUDA port and BF16 | Port the step-2 kernel and the resident fused-chunker graph to CUDA under the same contract; add BF16 with FP32 master weights (gap 4). Skip if step 2 shows Metal is fast enough for step 4 | CUDA gradient parity with the Metal and CPU paths; BF16 loss curve within tolerance of FP32 over a fixed number of updates; final evaluation within 0.5 points (the `CUDA.md` quality bar) |
+| 3. CUDA port and BF16 | Port the step-2 kernel to CUDA under the same contract (the boundary trainer already runs on resident CUDA); add BF16 with FP32 master weights (gap 4). Skip if step 2 shows Metal is fast enough for step 4 | CUDA gradient parity with the Metal and CPU paths; BF16 loss curve within tolerance of FP32 over a fixed number of updates; final evaluation within 0.5 points (the `CUDA.md` quality bar) |
 | 4. Full distillation (CUDA, or Metal if fast enough) | `antenna-large` (ModernBERT-large) and `antenna-multilingual` (mmBERT-base) on the full dataset, then a 2k–8k long-context stage with windowed-teacher and LLM-teacher labels | Within about 2 points of the teachers on gold at 512 tokens; better than windowed `gliner2.5-base` on long documents |
 | 5. Native serving | Generalize `gliner_boundary.Backbone` and the boundary engine to ModernBERT and mmBERT; converter; oracle fixtures and parity under the `testdata/gliner25` policy; a qualification row through the two-tier gate ([GLINER25.md](../gliner2/GLINER25.md)) | Parity with the trained checkpoint within the existing boundary tolerances; qualification row reviewed |
 | 6. Decision head | Laya head on the Antenna trunk, trained with the extraction distillation losses kept on as an anchor | Within noise of packed Laya on typed-decisions; extraction metrics unchanged |
-| 7. Embedding and chunk heads | The fused chunker's heads and losses on the Antenna trunk; choose among the three layouts above by measurement | Embedding: retrieval on the 10k Wikipedia set within an agreed tolerance of the teacher embedder. Chunking: retrieval with learned chunks no worse than fixed chunking. Extraction metrics unchanged |
+| 7. Embedding and chunk heads | The fused chunker's head designs and losses, rebuilt in the Antenna training graph; choose among the three layouts above by measurement | Embedding: retrieval on the 10k Wikipedia set within an agreed tolerance of the teacher embedder. Chunking: retrieval with learned chunks no worse than fixed chunking. Extraction metrics unchanged |
 | 8. Tree-packed trunk | Schema-blind text trunk with task branches, reusing Laya's packer, segment attention, and trunk cache | Extraction F1 and classification within noise of the unpacked Antenna, the same gate as LAYA.md step 0 |
 
 Gaps 3 and 5 (allocation discipline, device all-reduce) are taken on when
@@ -501,8 +529,12 @@ the critical path because step 0 can score Decide in PyTorch.
   training attention (step 2). Until it lands, native training is limited to
   about 2k tokens at batch 1, which is enough for step 1 and the 512-token
   stage of step 4.
-- **Pilot backend:** the fused chunker trains on CPU today; moving it to
-  resident Metal (gap 2) comes before the step 1 pilot.
+- **Per-word tokenization:** the GLiNER2.5 processor encodes each word on
+  its own. SentencePiece adds its word marker to every word, but
+  ModernBERT's byte-level BPE (`add_prefix_space=false`) produces the
+  no-leading-space form, as at the start of a sentence, which is off the
+  pretraining distribution. Check what upstream does and pin the choice in
+  a fixture before training. Also confirm that id 0 is a valid pad id.
 - **Compute for step 4:** the per-epoch estimate under
   [Backend order](#backend-order) is unmeasured. Step 2 ends with a real
   Metal throughput measurement that decides between Metal and CUDA.
