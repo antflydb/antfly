@@ -516,6 +516,65 @@ Independent of Antenna, serving span checkpoints (Decide) through the
 learned `classifier` would fix the legacy classification path. It is not on
 the critical path because step 0 can score Decide in PyTorch.
 
+## Status (2026-09-25)
+
+### Step 0: baselines (done)
+
+Full tables, commands and pins:
+[work-log/completed/inference/antenna/2026-09-25-baselines.md](../../../../../work-log/completed/inference/antenna/2026-09-25-baselines.md).
+Seeded subsamples (500 classification records, 300 NER sentences per
+dataset) carry roughly ±2–4 points of noise. "In-domain" means the pilot's
+training datasets (Banking77, AG News, CrossNER AI/literature/music, MIT
+Restaurant); "held-out" is CLINC150, SST-5, typed-decisions, CrossNER
+politics/science, MIT Movie.
+
+| Mean | Decide | gliner2.5-base | gliner2-large |
+| --- | ---: | ---: | ---: |
+| In-domain classification accuracy | 0.734 | 0.728 | 0.714 |
+| In-domain NER F1 | 0.506 | 0.543 | 0.550 |
+| Held-out classification accuracy | 0.504 | 0.483 | 0.519 |
+| Held-out NER F1 | 0.534 | 0.515 | 0.544 |
+
+Decide is the best calibrated (typed-decisions ECE 0.106 against 0.30–0.36
+for the other GLiNER models). Encoder latency at 64/512/2,048 tokens:
+gliner2.5-base 29/292/3,534 ms on CPU and 224/324/873 ms on Metal; Laya's
+ModernBERT-large 311/1,473/12,720 ms and 209/781/4,903 ms (encoders of
+different sizes; see the report for caveats).
+
+### Step 1: pipeline (done) and pilot (running)
+
+- `scripts/antenna/init_student.py` builds the student: pretrained
+  `answerdotai/ModernBERT-base` (pinned) with fresh published heads, 158.8M
+  parameters. The native training source loads it, and the processor
+  matches upstream's token ids with its tokenizer.
+- `scripts/antenna/teacher_targets.py` writes training rows from the
+  in-domain train splits: classification rows with soft per-label targets
+  `0.5 * gold + 0.5 * sigmoid(Decide logit)` over sampled label subsets,
+  entity rows with gold spans. Training rows accept `probabilities`, which
+  replace the 0/1 classification targets.
+- `antfly-inference finetune train gliner25` trains a ModernBERT source on
+  resident Metal and exports a portable model that upstream
+  `AutoExtractor` loads, so `scripts/antenna/baselines.py` evaluates it.
+- ModernBERT-base needs job budgets above the small-DeBERTa defaults (see
+  `scripts/antenna/README.md`). On a shared machine the job's live-memory
+  admission can refuse it; the admission's dynamic reserve is 9.66 GB on a
+  36 GB Mac.
+- The span-versus-boundary head ablation (Decision 4) is not run: span heads
+  exist natively only on DeBERTa.
+
+### Step 2: fused ModernBERT training attention (done)
+
+A fused op computes global and sliding-window attention with linear storage
+(per-row logsumexp, backward replay), CPU reference and Metal kernels.
+Laya's gradient parity against PyTorch holds with it (2.1e-6 CPU and Metal),
+as does the ModernBERT boundary encoder's (1.3e-5 CPU, 1.4e-5 Metal). A
+4,096-token step runs on Metal past the old 64Mi score cap. On the released
+Laya checkpoint, a resident Metal step at 2,048 tokens takes 25 s fused
+against 65 s materialized. The materialized profile stays the default; Laya
+selects `attention: fused_v1`, and the ModernBERT boundary encoder uses it
+under `replay_tiled_v1`. With head dropout above 0, Laya's decision head
+still materializes its attention.
+
 ## Risks and open questions
 
 - **Quality:** DeBERTa-v3 is strong on short-context NER and classification.
