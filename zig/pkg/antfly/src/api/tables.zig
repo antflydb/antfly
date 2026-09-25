@@ -22,6 +22,7 @@ const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/selected_root.zig").db;
 const indexes_openapi = @import("antfly_indexes_openapi");
+const indexes_api = @import("indexes.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const schema_openapi = @import("antfly_schema_openapi");
 const schema_mod = @import("../schema/mod.zig");
@@ -2408,7 +2409,9 @@ fn parseTableIndexes(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
 ) !std.json.ArrayHashMap(indexes_openapi.CreatedIndex) {
-    const canonical_json = try encodeTableIndexesObject(alloc, indexes_json);
+    // Use the same credential-free, legacy-aware projection as index reads.
+    // Stored optional metadata may not satisfy the current CreatedIndex schema.
+    const canonical_json = try indexes_api.encodeIndexConfigMap(alloc, indexes_json);
     defer alloc.free(canonical_json);
     return try std.json.parseFromSliceLeaky(std.json.ArrayHashMap(indexes_openapi.CreatedIndex), alloc, canonical_json, .{
         .allocate = .alloc_always,
@@ -2573,34 +2576,6 @@ fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }
 
-fn encodeTableIndexesObject(alloc: std.mem.Allocator, indexes_json: []const u8) ![]u8 {
-    const source = if (indexes_json.len > 0) indexes_json else default_indexes_json;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidTableIndexMetadata,
-    };
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(alloc);
-    try out.append(alloc, '{');
-    var first = true;
-    var it = root.iterator();
-    while (it.next()) |entry| {
-        // Reserved metadata sections are not index configs; the provisioner
-        // reads them from the stored indexes_json.
-        if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
-        if (!first) try out.append(alloc, ',');
-        first = false;
-        try appendJsonString(alloc, &out, entry.key_ptr.*);
-        try out.append(alloc, ':');
-        try appendCanonicalIndexConfig(alloc, &out, entry.key_ptr.*, entry.value_ptr.*);
-    }
-    try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
-}
-
 fn isReservedIndexMetadataEntry(name: []const u8) bool {
     return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
 }
@@ -2638,44 +2613,6 @@ const ApiIndexType = enum {
     graph,
     algebraic,
 };
-
-fn appendCanonicalIndexConfig(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    index_name: []const u8,
-    config: std.json.Value,
-) !void {
-    if (config != .object) return error.InvalidTableIndexMetadata;
-    const index_type = inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata;
-
-    try out.append(alloc, '{');
-    try appendJsonString(alloc, out, "name");
-    try out.append(alloc, ':');
-    try appendJsonString(alloc, out, index_name);
-    if (config.object.get("type") == null) {
-        try out.append(alloc, ',');
-        try appendJsonString(alloc, out, "type");
-        try out.append(alloc, ':');
-        try appendJsonString(alloc, out, switch (index_type) {
-            .full_text => "full_text",
-            .embeddings => "embeddings",
-            .graph => "graph",
-            .algebraic => "algebraic",
-        });
-    }
-
-    var it = config.object.iterator();
-    while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "name")) continue;
-        try out.append(alloc, ',');
-        try appendJsonString(alloc, out, entry.key_ptr.*);
-        try out.append(alloc, ':');
-        const encoded = try stringifyJsonValue(alloc, entry.value_ptr.*);
-        defer alloc.free(encoded);
-        try out.appendSlice(alloc, encoded);
-    }
-    try out.append(alloc, '}');
-}
 
 fn buildCanonicalIndexConfigValue(
     alloc: std.mem.Allocator,
@@ -4461,6 +4398,69 @@ test "metadata.table status encoder honors storage status overrides" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_direct_entry_count\":118") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_fallback_backend_mutable_count\":128") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_fallback_below_threshold_count\":129") != null);
+}
+
+test "metadata.table status uses public index projection for legacy graph artifacts" {
+    const indexes_json =
+        \\{
+        \\  "full_text_index_v0": {"type":"full_text"},
+        \\  "enrichments": [{"name":"units","kind":"asset","field":"url","producer_json":"private-producer"}],
+        \\  "legacy_graph": {"type":"graph","artifact":{"name":"units","kind":"asset","field":"url","producer_json":"private-producer"},"source":{"artifact":"units","format":"extraction_relation","path":"$.edges[*]"},"edge_types":[{"name":"mentions"}]},
+        \\  "canonical_graph": {"type":"graph","artifact":{"name":"relations","kind":"asset","source":{"type":"field","value":"body"},"producer_json":"private-producer"},"sources":[{"artifact":"relations"}],"edge_types":[{"name":"mentions"}]},
+        \\  "vectors": {"type":"embeddings","dimension":3,"embedding_name":"dense","enrichments":[{"name":"dense","kind":"embedding","field":"body","producer_json":"private-producer"}],"embedder":{"provider":"openai","model":"example","api_key":"private-key"}}
+        \\}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+            .{ .table_id = 7, .name = "docs", .indexes_json = indexes_json, .replication_sources_json = "[]", .placement_role = "data" },
+            .{ .table_id = 8, .name = "plain", .indexes_json = default_indexes_json, .replication_sources_json = "[]", .placement_role = "data" },
+        })[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const single = (try encodeSingleTableStatus(std.testing.allocator, &snapshot, "docs")).?;
+    defer std.testing.allocator.free(single);
+    const listed = try encodeTableList(std.testing.allocator, &snapshot, null);
+    defer std.testing.allocator.free(listed);
+    for ([_][]const u8{ single, listed }) |response| {
+        try std.testing.expect(std.mem.indexOf(u8, response, "private-producer") == null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "private-key") == null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "producer_json") == null);
+    }
+    var parsed_single = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, single, .{});
+    defer parsed_single.deinit();
+    var parsed_list = try std.json.parseFromSlice([]metadata_openapi.TableStatus, std.testing.allocator, listed, .{});
+    defer parsed_list.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_list.value.len);
+    try std.testing.expectEqualStrings("plain", parsed_list.value[1].name);
+    try std.testing.expectEqualStrings("docs", parsed_list.value[0].name);
+    const listed_configs = parsed_list.value[0].indexes.map;
+    try std.testing.expectEqual(parsed_single.value.indexes.map.count(), listed_configs.count());
+    var configs_iter = parsed_single.value.indexes.map.iterator();
+    while (configs_iter.next()) |entry| {
+        try std.testing.expectEqualDeep(entry.value_ptr.*, listed_configs.get(entry.key_ptr.*).?);
+    }
+
+    const configs = parsed_single.value.indexes.map;
+    try std.testing.expectEqual(@as(usize, 4), configs.count());
+    const legacy = configs.get("legacy_graph").?.created_graph_index;
+    // Match index GET/list: omit the incompatible optional producer object,
+    // retain the canonical graph source, and leave stored/runtime config alone.
+    try std.testing.expect(legacy.artifact == null);
+    try std.testing.expectEqualStrings("units", legacy.sources.?[0].artifact);
+    try std.testing.expectEqualStrings("$.edges[*]", legacy.sources.?[0].path.?);
+    try std.testing.expectEqualStrings("mentions", legacy.edge_types.?[0].name);
+    const canonical = configs.get("canonical_graph").?.created_graph_index;
+    try std.testing.expectEqualStrings("field", canonical.artifact.?.source.type);
+    try std.testing.expectEqualStrings("body", canonical.artifact.?.source.value);
+    const vectors = configs.get("vectors").?.created_embeddings_index;
+    try std.testing.expectEqualStrings("dense", vectors.enrichments.?[0].name);
+    try std.testing.expectEqual(indexes_openapi.EnrichmentKind.embedding, vectors.enrichments.?[0].kind);
 }
 
 test "metadata.table status encoder canonicalizes embeddings indexes independent of JSON key order" {
