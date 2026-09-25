@@ -176,6 +176,23 @@ fn runWithWorkspace(comptime Backend: type, pool: anytype, backend: *Backend, sc
     for (pool.guard_paths) |path| try addSpec(&specs, &spec_count, path, completion.limits.max_encoded_bytes + completion.guard.header_bytes, false, true);
     for (pool.accepted_paths) |path| try addSpec(&specs, &spec_count, path, @import("completion_pool.zig").max_accepted_bytes, false, true);
     for (pool.control_accepted_paths) |path| try addSpec(&specs, &spec_count, path, @import("completion_control_accepted.zig").max_bytes, false, true);
+    // Idle rebinding must preserve the retained control owner's prepaid
+    // terminal output and guard permissions. A BEGIN may have survived the
+    // document-only maintenance cycle before transition staging is enabled.
+    var control_paths: [@import("completion_control_record.zig").max_owners * 2][]u8 = undefined;
+    var control_path_count: usize = 0;
+    defer for (control_paths[0..control_path_count]) |path| control.free(path);
+    if (pool.config.control_owner_staging) {
+        const control_guard = @import("completion_control_guard.zig");
+        for (0..pool.control_output_ids.len) |i| {
+            control_paths[control_path_count] = try repository.runPath(control, root, pool.control_output_ids[i]);
+            control_path_count += 1;
+            try addSpec(&specs, &spec_count, control_paths[control_path_count - 1], completion.limits.flush_bytes, false, true);
+            control_paths[control_path_count] = try std.fs.path.join(control, &.{ root, control_guard.filenames[i] });
+            control_path_count += 1;
+            try addSpec(&specs, &spec_count, control_paths[control_path_count - 1], control_guard.max_bytes, false, true);
+        }
+    }
     var wal_paths: [3][]u8 = undefined;
     var wal_count: usize = 0;
     defer for (wal_paths[0..wal_count]) |path| control.free(path);

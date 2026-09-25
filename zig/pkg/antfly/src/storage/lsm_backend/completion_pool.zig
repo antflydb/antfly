@@ -13,6 +13,7 @@ const completion = @import("completion_runtime.zig");
 const storage_io = @import("storage_io.zig");
 const repository = @import("repository.zig");
 const manifest_set = @import("manifest_set.zig");
+const manifest = @import("../lsm/manifest.zig");
 const table_file = @import("../lsm/table_file.zig");
 const resources = @import("../resource_manager.zig");
 const abi = @import("kernel_owner_abi").completion_pool;
@@ -42,6 +43,9 @@ pub const accepted_filenames = [_][]const u8{
 };
 pub const publication_per_cell = 8 * 1024 * 1024;
 pub const control_bytes = 8 * 1024 * 1024;
+pub const ControlCheckpointFault = enum { after_manifest, after_wal_reset };
+pub var test_control_checkpoint_fault: ?ControlCheckpointFault = null;
+pub var test_control_checkpoint_fault_hit: bool = false;
 pub const accepted_header_bytes = 192;
 pub const max_accepted_bytes = accepted_header_bytes + entry_codec.max_wire_bytes;
 
@@ -672,6 +676,7 @@ pub fn Pool(comptime Backend: type) type {
                 self.cell_count += 1;
             }
             backend.next_run_id = @max(backend.next_run_id, next_after_control);
+            if (config.control_owner_staging) try self.bindControlOutputPaths(backend);
             return self;
         }
 
@@ -691,6 +696,31 @@ pub fn Pool(comptime Backend: type) type {
 
         /// Internal opt-in for a freshly installed pool. No DATA service path
         /// calls this while replicated activation remains disabled.
+        fn bindControlOutputPaths(self: *Self, backend: *Backend) !void {
+            const alloc = self.control.allocator();
+            var specs: [storage_io.NativeCompletionIo.max_prepared_files]storage_io.NativeCompletionIo.FileSpec = undefined;
+            var count: usize = 0;
+            for (self.io.files) |file| {
+                specs[count] = .{ .path = file.final, .max_bytes = file.max_bytes, .allow_append = file.allow_append, .allow_delete = file.allow_delete };
+                count += 1;
+            }
+            var paths: [control_record.max_owners * 2][]u8 = undefined;
+            var path_count: usize = 0;
+            defer for (paths[0..path_count]) |path| alloc.free(path);
+            for (0..control_record.max_owners) |i| {
+                if (count + 2 > specs.len) return error.CompletionFileCapacityExceeded;
+                paths[path_count] = try repository.runPath(alloc, backend.root_dir.?, self.control_output_ids[i]);
+                specs[count] = .{ .path = paths[path_count], .max_bytes = completion.limits.flush_bytes, .allow_delete = true };
+                count += 1;
+                path_count += 1;
+                paths[path_count] = try std.fs.path.join(alloc, &.{ backend.root_dir.?, control_guard.filenames[i] });
+                specs[count] = .{ .path = paths[path_count], .max_bytes = control_guard.max_bytes, .allow_delete = true };
+                count += 1;
+                path_count += 1;
+            }
+            try self.io.replacePreparedFiles(alloc, specs[0..count]);
+        }
+
         pub fn enableControlOwnerStaging(self: *Self, backend: *Backend) !void {
             if (self.config.control_owner_staging) return;
             if (!self.ready or self.failed or !self.restored or self.hasAcceptedDebt()) return error.CompletionReservationBusy;
@@ -700,6 +730,7 @@ pub fn Pool(comptime Backend: type) type {
             const first = backend.next_run_id;
             const next = std.math.add(u64, first, control_record.max_owners) catch return error.CompletionReservationBusy;
             for (&self.control_output_ids, 0..) |*id, i| id.* = first + @as(u64, @intCast(i));
+            try self.bindControlOutputPaths(backend);
             backend.next_run_id = next;
             self.config.control_owner_staging = true;
         }
@@ -868,6 +899,8 @@ pub fn Pool(comptime Backend: type) type {
             if (self.control_owners[target.slot_index] == null) return error.InvalidCompletionSlot;
             const active = &self.control_owners[target.slot_index].?;
             if (active.pending != null or active.held.accepted_len != 0) return error.CompletionReservationBusy;
+            for (self.control_owners, 0..) |owner, i| if (i != target.slot_index and owner != null and owner.?.pending != null)
+                return error.CompletionReservationBusy;
             for (self.cells[0..self.cell_count]) |cell| {
                 if (cell.phase == .accepted or (cell.phase == .prepared and !cell.slot.retired)) return error.CompletionReservationBusy;
             }
@@ -878,6 +911,19 @@ pub fn Pool(comptime Backend: type) type {
                     if (active.declaration.participants.count > control_record.progress_bitmap_bits or
                         ack.participant_index >= active.declaration.participants.count)
                         return error.UnsupportedCompletionProfile;
+                    if (ack.count == active.declaration.participants.count) {
+                        // The first terminal checkpoint owns exactly one
+                        // output and cannot borrow another owner's guard or
+                        // an accepted document's still-unpublished WAL.
+                        for (self.control_owners, 0..) |owner, i| if (i != target.slot_index and owner != null)
+                            return error.CompletionReservationBusy;
+                        for (self.cells[0..self.cell_count]) |cell| if (cell.phase == .accepted or cell.phase == .prepared)
+                            return error.CompletionReservationBusy;
+                        if (backend.hasDurableCompletions() or backend.activeImmutableMemtableCount() != 0 or backend.runs.count() >= self.config.shape.max_runs or
+                            try journalNeedsMaintenance(try self.io.storage().fileSize(self.journal_path), self.config.shape.max_record_bytes, 1))
+                            return error.CompletionReservationBusy;
+                        _ = try backend.planningDirectory();
+                    }
                 },
             }
             try self.certifyActiveControls(backend, .{});
@@ -914,9 +960,8 @@ pub fn Pool(comptime Backend: type) type {
             return target.slot_index;
         }
 
-        /// First metadata decision only. The accepted sidecar survives any
-        /// uncertain append; restart remains fenced until restoration is
-        /// installed. No generic Slot or additional output run is consumed.
+        /// The accepted sidecar survives uncertain append. A terminal ACK is
+        /// checkpointed to its retained output before its BEGIN guard retires.
         pub fn applyOwnedControlTransition(self: *Self, backend: *Backend, identity: completion.AcceptedIdentity) !bool {
             if (self.failed or !self.restored or backend.manifest_recovery_required) return error.RecoveryRequired;
             const owner_index: usize = blk: {
@@ -994,12 +1039,13 @@ pub fn Pool(comptime Backend: type) type {
             };
             try progress.verifyOwner(owner_record);
             const progress_value = try progress.encode();
+            const terminal = progress.phase == .acknowledgement and progress.acknowledged == owner_record.participants.count;
             switch (transition) {
                 .decision => {
                     const owner_value = try owner_record.encode();
                     try incoming.upsert(alloc, ns, &control_record.ownerKey(active.declaration.txn_id), &owner_value, false);
                 },
-                .acknowledgement => {},
+                .acknowledgement => if (terminal) try incoming.upsert(alloc, ns, &control_record.ownerKey(active.declaration.txn_id), "", true),
             }
             try incoming.upsert(alloc, ns, &control_record.progressKey(active.declaration.txn_id), &progress_value, false);
             const marker = identity.encode();
@@ -1034,8 +1080,117 @@ pub fn Pool(comptime Backend: type) type {
             active.pending = null;
             active.transition = null;
             active.held.accepted_len = 0;
+            if (terminal) try self.checkpointTerminalControlOwner(backend, alloc, owner_index);
             self.failed = false;
             return true;
+        }
+
+        /// One retained owner spends its predeclared output after the final
+        /// ACK's canonical rows, v3 receipt, and owner tombstone share one WAL
+        /// record. Manifest publication precedes WAL reset and guard unlink.
+        /// Any failure retains the guard (or fences the process if unlink was
+        /// uncertain); restart still refuses an unresolved guarded owner.
+        fn checkpointTerminalControlOwner(self: *Self, backend: *Backend, alloc: Allocator, owner_index: usize) !void {
+            const active = &self.control_owners[owner_index].?;
+            for (self.control_owners, 0..) |owner, i| if (i != owner_index and owner != null)
+                return error.CompletionReservationBusy;
+            const output_id = self.control_output_ids[owner_index];
+            const output_path = active.output_pin.path orelse return error.InvalidCompletionSlot;
+            var current = try backend.mutable.snapshot(alloc);
+            defer current.deinit(alloc);
+            const writer_limits: maintenance.Limits = .{
+                .max_metadata_bytes = self.config.shape.max_metadata_bytes,
+                .max_output_metadata_bytes = self.config.shape.max_metadata_bytes,
+                .max_record_bytes = self.config.shape.max_record_bytes,
+                .max_output_file_bytes = completion.limits.flush_bytes,
+            };
+            var manifest_attempted = false;
+            errdefer if (!manifest_attempted) self.io.storage().deleteFileAbsolute(output_path) catch {};
+            var built = try maintenance.buildStateDrain(alloc, self.io.storage(), backend.root_dir.?, &.{&current}, output_id, writer_limits);
+            defer built.deinit(alloc);
+            const pub_alloc = active.held.publication.allocator();
+            var run = try repository.cloneRunCompactionSnapshot(pub_alloc, built);
+            run.metadata_allocator = pub_alloc;
+            var run_owned = true;
+            defer if (run_owned) run.deinit(backend.allocator);
+            var candidate = backend.runs.fork();
+            var candidate_owned = true;
+            defer if (candidate_owned) candidate.deinit(backend.allocator);
+            try candidate.append(pub_alloc, run);
+            run_owned = false;
+            const directory = try backend.run_directory.?.fork(pub_alloc);
+            var directory_owned = true;
+            defer if (directory_owned) directory.destroy(backend.allocator);
+            const View = struct {
+                allocator: Allocator,
+                options: @TypeOf(backend.options),
+                pub fn retainRunSnapshotRef(_: *@This(), item: *repository.Run) !void {
+                    try Backend.retainRunSnapshotRef(undefined, item);
+                }
+                pub fn releaseDirectoryRunSnapshotRef(item: *repository.Run) void {
+                    Backend.releaseDirectoryRunSnapshotRef(item);
+                }
+            };
+            var view = View{ .allocator = pub_alloc, .options = backend.options };
+            try directory.put(&view, candidate.find(&run).?.*);
+            const durable_directory = try directory.fork(pub_alloc);
+            var durable_owned = true;
+            defer if (durable_owned) durable_directory.destroy(backend.allocator);
+            var meta = repository.runMeta(run);
+            meta.path = repository.manifestRelativePath(backend.root_dir.?, meta.path);
+            const sequence = try std.math.add(u64, backend.manifest_journal.sequence.?, 1);
+            const frame = try manifest.encodeSingleRunJournalFrameAlloc(alloc, sequence, backend.next_run_id, meta);
+            defer alloc.free(frame);
+            manifest_attempted = true;
+            try self.io.storage().appendFileAbsolute(alloc, self.journal_path, frame, true);
+            if (@import("builtin").is_test and test_control_checkpoint_fault == .after_manifest) {
+                test_control_checkpoint_fault_hit = true;
+                return error.RecoveryRequired;
+            }
+            backend.invalidateMutableReadSnapshot();
+            backend.invalidateReadVersion();
+            std.mem.swap(@TypeOf(backend.runs), &backend.runs, &candidate);
+            candidate.deinit(backend.allocator);
+            candidate_owned = false;
+            backend.publishRunDirectory(directory);
+            directory_owned = false;
+            backend.publishManifestDirectory(durable_directory);
+            durable_owned = false;
+            backend.mutable.deinit(backend.allocator);
+            backend.mutable = .{};
+            backend.mutable_wal_range = .{};
+            backend.manifest_journal.sequence = sequence;
+            backend.manifest_journal.bytes += frame.len;
+            backend.manifest_journal.edit_bytes += frame.len;
+            backend.manifest_journal.next_run_id = backend.next_run_id;
+            backend.manifest_dirty = false;
+            backend.manifest_unpublished_wire_bytes = 0;
+            backend.manifest_pending_mutation_bytes = 0;
+            backend.clearPublishedWalLogicalDebtLocked();
+            backend.syncTrackedInMemoryStateUsageCurrentLocked();
+            try wal.protectedReset(self.io.storage(), alloc, backend.root_dir.?);
+            if (@import("builtin").is_test and test_control_checkpoint_fault == .after_wal_reset) {
+                test_control_checkpoint_fault_hit = true;
+                return error.RecoveryRequired;
+            }
+            backend.wal_retention.primary = .{ .oldest_retained_segment = 1, .current_segment = 1 };
+            backend.wal_retention.replay = .{ .current_segment = 1 };
+            backend.wal_retention.primary_ns = backend.writeStatsNowNs();
+            backend.wal_retention.replay_ns = backend.writeStatsNowNs();
+            try restoreWalCredits(self, backend);
+            self.wal_pin.manager.observeUsage(.lsm_wal_retention, &backend.tracked_wal_retention_bytes, 0);
+            const guard_path = try std.fs.path.join(alloc, &.{ backend.root_dir.?, control_guard.filenames[owner_index] });
+            defer alloc.free(guard_path);
+            try self.io.storage().deleteFileAbsolute(guard_path);
+            try self.io.storage().syncParentAbsolute(guard_path);
+            active.output_pin.release();
+            active.held.destroy();
+            self.control_owners[owner_index] = null;
+            // The run frontier and mutable baseline changed. Requalification
+            // must precede any further admission in this staged process.
+            self.ready = false;
+            self.capacity_certified = false;
+            self.maintenance_pending = true;
         }
 
         /// Allocate independent control debt before publishing the accepted
@@ -1043,6 +1198,8 @@ pub fn Pool(comptime Backend: type) type {
         /// startup obligation; runnable restore and control transitions remain
         /// disabled until the complete lifecycle is installed.
         fn stageControlBegin(self: *Self, backend: *Backend, declaration: control_begin.Declaration, identity: completion.AcceptedIdentity, envelope: []const u8, growth: capacity.Cost) !void {
+            for (self.control_owners) |owner| if (owner) |active| if (active.pending != null)
+                return error.CompletionReservationBusy;
             const slot = for (self.control_owners, 0..) |owner, i| {
                 if (owner) |active| if (std.mem.eql(u8, &active.declaration.txn_id, &declaration.txn_id)) return error.CompletionReservationBusy;
                 if (owner == null) break i;
@@ -1172,6 +1329,7 @@ pub fn Pool(comptime Backend: type) type {
         pub fn checkOrdinary(self: *Self, backend: *Backend, incoming: anytype) !void {
             if (self.maintenance_active) return error.CompletionReservationBusy;
             if (self.failed or !self.restored) return error.RecoveryRequired;
+            if (self.control_transition_staging and !self.capacity_certified) return error.CompletionReservationBusy;
             for (self.control_owners) |owner| if (owner) |active| {
                 // Phase A has no certified pressure-relief output while a
                 // decision is runnable. Keep its physical envelope exclusive.

@@ -236,7 +236,7 @@ pub fn certifyCohort(base: Base, inputs: []const OwnerInput, limits: Limits) !Ce
         .max_metadata_bytes = try size(limits.format.metadata_bytes),
         .max_output_metadata_bytes = limits.single_drain_metadata_bytes,
         .max_record_bytes = limits.max_record_bytes,
-        .max_output_file_bytes = try size(limits.format.file_bytes),
+        .max_output_file_bytes = @min(try size(limits.format.file_bytes), @as(usize, @intCast(@import("completion_runtime.zig").limits.flush_bytes))),
     };
     const workspace = try maintenance.workspaceRequirement(result.total_cost, @max(result.format.frontier_bytes, result.current_frontier_bytes), result.format.outputs, writer_limits);
     result.maintenance_workspace_bytes = workspace.total;
