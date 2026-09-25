@@ -20,6 +20,26 @@ this requested implementation/correctness scope.
 
 ## Current work
 
+- A volatile, test-only control transition gate now accepts the first decision
+  for a staged BEGIN into an exact durable sidecar before Raft acceptance. Its
+  retained owner prepays the canonical decision, native owner/progress rows,
+  document applied marker, and group progress in one WAL batch; uncertainty
+  fences admission, exact duplicate apply is idempotent, and restart remains
+  fail-closed. The focused durable gate passed 49/49 after merging main.
+- The same staged owner now applies named ACKs with a v3 progress receipt. Its
+  208-byte row carries an exact 96-bit participant bitmap, checked against the
+  canonical resolved list before admission and apply. A real four-owner DB
+  fixture covers out-of-order ACKs and duplicate rejection; the durable gate
+  passed 49/49, the workload gate 309/309 owning and 392 broad tests with one
+  skip, and the v3 capacity fixture passed 1/1. The staged path rejects cohorts
+  above 96 participants. Production activation remains disabled; final
+  checkpoint/owner retirement, runnable restoration, and failure-injected
+  replicated ACK recovery remain open.
+- A coordinator regression now reuses a stable transaction ID, BEGIN timestamp,
+  and participant cohort with different writes after an ambiguous committed
+  status. It remains `CommitDecisionUnknown` without prepare, resolve, or
+  abort; the API transaction gate passed 95/95. A durable write-set binding is
+  still required before identity-bearing status can authorize a retry.
 - A direct rejection of a staged native BEGIN now retires its exact accepted
   sidecar and control guard before refunding the retained owner. A real DB
   reopen succeeds afterward. Generic completion cells reject metadata
