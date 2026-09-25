@@ -97,12 +97,14 @@ const View = struct {
     identity: bundle.Identity,
     parameters: []const run.Parameter,
     sidecars: [4][]const u8,
+    /// Selects the config-derived inventory for a ModernBERT source.
+    encoder: model.EncoderConfig = std.mem.zeroes(model.EncoderConfig),
 
-    fn of(source: *const source_mod.Source) !View {
+    fn of(a: Allocator, source: *const source_mod.Source) !View {
         if (source.config.backbone != source.identity.backbone) return error.InvalidBoundaryTrainingSource;
-        var result = View{ .identity = source.identity, .parameters = source.parameters, .sidecars = undefined };
+        var result = View{ .identity = source.identity, .parameters = source.parameters, .sidecars = undefined, .encoder = source.config.encoder };
         for (&result.sidecars, 0..) |*bytes, index| bytes.* = try source.sidecar(index);
-        try validateSourceMetadata(result, null);
+        try validateSourceMetadata(a, result, null);
         return result;
     }
 };
@@ -155,7 +157,7 @@ const AllocationGate = struct {
 /// Bounded read-only metadata preflight. This validates complete slot names,
 /// shapes and the run-level layout; export additionally scans every FP32 value.
 pub fn estimateSnapshot(a: Allocator, source: *const source_mod.Source, snapshot: Snapshot, limits: Limits, control: ?Control) !Estimate {
-    return estimateView(a, try View.of(source), snapshot, limits, control);
+    return estimateView(a, try View.of(a, source), snapshot, limits, control);
 }
 
 fn estimateView(a: Allocator, source: View, snapshot: Snapshot, limits: Limits, control: ?Control) !Estimate {
@@ -170,7 +172,7 @@ fn estimateView(a: Allocator, source: View, snapshot: Snapshot, limits: Limits, 
 }
 
 pub fn exportSnapshot(a: Allocator, io: std.Io, source: *const source_mod.Source, output: []const u8, snapshot: Snapshot, limits: Limits, control: ?Control) !Result {
-    return exportView(a, io, try View.of(source), output, snapshot, limits, control);
+    return exportView(a, io, try View.of(a, source), output, snapshot, limits, control);
 }
 
 fn exportView(a: Allocator, io: std.Io, source: View, output: []const u8, snapshot: Snapshot, limits: Limits, control: ?Control) !Result {
@@ -272,7 +274,7 @@ fn prepare(a: Allocator, source: View, snapshot: Snapshot, limits: Limits, contr
     if (snapshot.slots.len == 0 or snapshot.slots.len > limits.max_slots) return error.InvalidBoundaryTrainingSnapshot;
     if (snapshot.base_model_name_or_path) |name| if (name.len == 0 or name.len > 4096 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidBoundaryTrainingSnapshot;
     try validateSourceIdentity(source);
-    if (snapshot.mode == .full or snapshot.mode == .heads) try validateSourceMetadata(source, control);
+    if (snapshot.mode == .full or snapshot.mode == .heads) try validateSourceMetadata(a, source, control);
     for (snapshot.slots, 0..) |slot, index| {
         try check(control);
         if (slot.name.len == 0 or slot.name.len > 1024) return error.InvalidBoundaryTrainingSnapshot;
@@ -365,9 +367,11 @@ fn prepare(a: Allocator, source: View, snapshot: Snapshot, limits: Limits, contr
     } };
 }
 
-fn validateSourceMetadata(source: View, control: ?Control) !void {
+fn validateSourceMetadata(a: Allocator, source: View, control: ?Control) !void {
     try validateSourceIdentity(source);
-    const expected = policy.specs(source.identity.backbone);
+    var derived: ?policy.Derived = if (source.identity.backbone == .modern_bert) try policy.modernBertSpecs(a, source.encoder) else null;
+    defer if (derived) |*value| value.deinit();
+    const expected = if (derived) |value| value.specs else policy.specs(source.identity.backbone);
     if (source.parameters.len != expected.len or source.identity.weight.size_bytes == 0) return error.InvalidBoundaryTrainingSource;
     for (source.parameters, expected) |parameter, spec| {
         try check(control);

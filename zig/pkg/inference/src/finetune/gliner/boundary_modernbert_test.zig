@@ -342,3 +342,24 @@ test "GLiNER2.5 ModernBERT checkpoint trains full and heads jobs on resident Met
         std.debug.print("ModernBERT checkpoint {s} job on resident Metal: {d} steps, first loss={d}\n", .{ @tagName(mode), steps, first_loss.? });
     }
 }
+
+// A real student checkpoint (scripts/antenna/init_student.py): the training
+// source accepts it, and the native processor reproduces upstream's ids and
+// routes with the pretrained tokenizer (NFC, full byte-level BPE vocabulary).
+test "GLiNER2.5 ModernBERT student checkpoint loads and tokenizes as upstream" {
+    const a = std.testing.allocator;
+    const directory = platform.env.getenv("ANTFLY_GLINER25_MODERNBERT_STUDENT") orelse return error.SkipZigTest;
+    const source = try sources.Source.open(a, compat.io(), directory, .{}, null);
+    defer source.deinit();
+    try std.testing.expectEqual(@import("../../models/gliner_boundary.zig").Backbone.modern_bert, source.config.backbone);
+    const pin_path = try std.fs.path.join(a, &.{ directory, "processor.json" });
+    defer a.free(pin_path);
+    const pin_bytes = try @import("../../util/c_file.zig").readFile(a, pin_path);
+    defer a.free(pin_bytes);
+    var pin = try loadPin(a, pin_bytes);
+    defer pin.deinit();
+    var prepared = try Prepared.init(a, source.tokenizer(), &pin.value);
+    defer prepared.deinit(a);
+    try expectProcessorPin(&pin.value, &prepared.batch);
+    std.debug.print("ModernBERT student: {d} tensors, vocabulary {d}, hidden {d}, {d} layers\n", .{ source.parameter_count, source.config.encoder.vocab_size, source.config.encoder.hidden_size, source.config.encoder.num_hidden_layers });
+}

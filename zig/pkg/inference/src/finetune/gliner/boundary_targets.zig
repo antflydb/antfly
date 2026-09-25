@@ -19,7 +19,8 @@ pub const Span = loss.Span;
 pub const Source = struct { start: usize, end: usize, unit: offsets_mod.OffsetUnit = .utf8_bytes };
 pub const Attribute = struct { group: usize, labels: []const usize };
 pub const Entity = struct { entity_type: usize, source: Source, attributes: []const Attribute = &.{} };
-pub const Classification = struct { task: usize, labels: []const usize };
+/// `probabilities`, in declared label order, replace the 0/1 targets.
+pub const Classification = struct { task: usize, labels: []const usize, probabilities: ?[]const f32 = null };
 /// One distinct value can have several explicit alternative occurrences.
 /// A choice points to the declared enum and its synthetic scoring position.
 pub const Value = union(enum) { document: []const Source, choice: usize };
@@ -436,10 +437,11 @@ pub fn compileBatch(a: Allocator, samples: []const processor.Sample, schemas: []
                 if (label >= task.labels.len or contains(classification.labels[0..j], label)) return error.InvalidBoundaryTrainingTargets;
                 selected[classification.task] |= @as(constraints.Selection, 1) << @as(std.math.Log2Int(constraints.Selection), @intCast(label));
             }
+            if (classification.probabilities) |probabilities| if (probabilities.len != task.labels.len) return error.InvalidBoundaryTrainingTargets;
             for (task.labels, 0..) |_, label| {
                 const index_ = b * classification_width + try compiler.classRoute(sample, classification.task, label);
                 classification_mask[index_] = true;
-                classification_targets[index_] = if (contains(classification.labels, label)) 1 else 0;
+                classification_targets[index_] = if (classification.probabilities) |probabilities| probabilities[label] else if (contains(classification.labels, label)) 1 else 0;
             }
         }
         if (schema.classification_constraints.roots.len > 0) {

@@ -554,17 +554,21 @@ fn validateLoadedTokenizer(a: Allocator, loaded: *HfTokenizer, config: model.Con
 
 /// ModernBERT's byte-level BPE. The processor tokenizes each word alone, as
 /// upstream's `tokenizer.tokenize(word)` does, so every setting that changes
-/// an isolated word's pieces is pinned: no normalizer, the GPT-2 byte-level
-/// pre-tokenizer without a prefix space, and a deterministic BPE. The post
-/// processor is never applied to schema or text fragments.
+/// an isolated word's pieces is pinned: no normalizer or NFC alone (as
+/// answerdotai/ModernBERT ships), the GPT-2 byte-level pre-tokenizer without
+/// a prefix space, and a deterministic BPE. The post processor is never
+/// applied to schema or text fragments.
 fn validateModernBertTokenizer(a: Allocator, bytes: []const u8, config_bytes: []const u8, config: model.Config, control: ?Control) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error" });
     defer parsed.deinit();
     const root = try object(parsed.value);
     try requireKeys(root, &.{ "version", "truncation", "padding", "model", "normalizer", "pre_tokenizer", "decoder", "post_processor", "added_tokens" });
     try requireString(root, "version", "1.0");
-    if ((try item(root, "padding")) != .null or (try item(root, "truncation")) != .null or (try item(root, "normalizer")) != .null)
-        return error.UnsupportedBoundaryTrainingTokenizer;
+    if ((try item(root, "padding")) != .null or (try item(root, "truncation")) != .null) return error.UnsupportedBoundaryTrainingTokenizer;
+    const normalizer = try item(root, "normalizer");
+    if (normalizer != .null) try requireJson(a, normalizer,
+        \\{"type":"NFC"}
+    );
     try requireJson(a, try item(root, "pre_tokenizer"),
         \\{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}
     );
