@@ -27326,6 +27326,7 @@ pub const MatchNoneQuery = struct {
     }
 };
 
+/// Match a phrase using the field's analyzer. On a `substring` companion, one or two words match contained text across token separators. Three or more words are rejected because the suffix index cannot verify their word boundaries; lookups over 32 bytes are also rejected.
 pub const MatchPhraseQuery = struct {
     match_phrase: []const u8,
     field: ?[]const u8 = null,
@@ -27381,7 +27382,7 @@ pub const MatchPhraseQuery = struct {
     }
 };
 
-/// Analyze the text with the field's analyzer and match any of the resulting terms. On a `substring` companion field (`fieldName._substring`) the text is lowercased and matched as a contained substring instead: `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`. `match_phrase` on a companion behaves the same way.
+/// Analyze the text with the field's analyzer and match any of the resulting terms. On a `substring` companion field (`fieldName._substring`) the text is lowercased and matched as a contained substring instead: `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`. Substring lookups require at least two bytes and reject a token or adjacent token pair longer than 32 bytes.
 pub const MatchQuery = struct {
     match: []const u8,
     field: ?[]const u8 = null,

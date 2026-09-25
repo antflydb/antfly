@@ -30753,7 +30753,9 @@ components:
 
         `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
 
-        `match_phrase` on a companion behaves the same way.
+        Substring lookups require at least two bytes and reject a token or
+
+        adjacent token pair longer than 32 bytes.
       properties:
         match:
           type: string
@@ -30804,6 +30806,14 @@ components:
             - auto
     MatchPhraseQuery:
       type: object
+      description: >
+        Match a phrase using the field's analyzer. On a `substring` companion,
+
+        one or two words match contained text across token separators. Three
+
+        or more words are rejected because the suffix index cannot verify
+
+        their word boundaries; lookups over 32 bytes are also rejected.
       properties:
         match_phrase:
           type: string

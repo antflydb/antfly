@@ -40284,13 +40284,7 @@ pub const DB = struct {
         if (req.defer_hierarchy_child_hydration) return;
         if (result.hits.len == 0) return;
 
-        // Every text clause the request carries contributes highlights: the
-        // primary full-text query and each named full-text query.
-        var text_queries = std.ArrayListUnmanaged(types.TextQuery).empty;
-        defer text_queries.deinit(alloc);
-        if (req.full_text) |query| try text_queries.append(alloc, query);
-        for (req.full_text_queries) |named| try text_queries.append(alloc, named.query);
-        if (text_queries.items.len == 0) return;
+        if (req.full_text == null and req.full_text_queries.len == 0) return;
 
         // `_source` may already be projected down to the requested fields (or
         // omitted entirely), so highlight from the unprojected documents in
@@ -40313,18 +40307,49 @@ pub const DB = struct {
             }
         }
 
-        const entry = self.core.textIndexEntry(req.primary_text_index_name orelse req.index_name) orelse
-            self.core.textIndexEntry(null) orelse return;
-        entry.lockAnalysisShared();
-        defer entry.unlockAnalysisShared();
-        try db_query_search.attachHighlights(
+        var indexed_queries = std.ArrayListUnmanaged(db_query_search.HighlightQuery).empty;
+        defer indexed_queries.deinit(alloc);
+        var locked_entries = std.ArrayListUnmanaged(*index_manager_mod.IndexManager.TextIndex).empty;
+        defer {
+            for (locked_entries.items) |entry| entry.unlockAnalysisShared();
+            locked_entries.deinit(alloc);
+        }
+        if (req.full_text_queries.len > 0) {
+            // Composed search executes named queries on their own indexes.
+            for (req.full_text_queries) |named| {
+                const entry = self.core.textIndexEntry(named.index_name) orelse continue;
+                var already_locked = false;
+                for (locked_entries.items) |locked| {
+                    if (locked == entry) already_locked = true;
+                }
+                if (!already_locked) {
+                    try locked_entries.append(alloc, entry);
+                    entry.lockAnalysisShared();
+                }
+                try indexed_queries.append(alloc, .{
+                    .query = named.query,
+                    .text_analysis = entry.text_analysis,
+                    .runtime_schema = entry.runtime_schema,
+                });
+            }
+        } else if (req.full_text) |query| {
+            const entry = self.core.textIndexEntry(req.primary_text_index_name orelse req.index_name) orelse
+                self.core.textIndexEntry(null) orelse return;
+            try locked_entries.append(alloc, entry);
+            entry.lockAnalysisShared();
+            try indexed_queries.append(alloc, .{
+                .query = query,
+                .text_analysis = entry.text_analysis,
+                .runtime_schema = entry.runtime_schema,
+            });
+        }
+        if (indexed_queries.items.len == 0) return;
+        try db_query_search.attachHighlightsWithIndexQueries(
             alloc,
             options,
-            text_queries.items,
+            indexed_queries.items,
             result.hits,
             sources,
-            entry.text_analysis,
-            entry.runtime_schema,
         );
     }
 

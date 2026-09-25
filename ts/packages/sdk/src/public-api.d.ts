@@ -15940,7 +15940,8 @@ export interface components {
          *     resulting terms. On a `substring` companion field (`fieldName._substring`)
          *     the text is lowercased and matched as a contained substring instead:
          *     `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
-         *     `match_phrase` on a companion behaves the same way.
+         *     Substring lookups require at least two bytes and reject a token or
+         *     adjacent token pair longer than 32 bytes.
          */
         MatchQuery: {
             match: string;
@@ -15960,6 +15961,12 @@ export interface components {
         };
         /** @description The fuzziness of the query. Can be an integer or "auto". */
         Fuzziness: number | "auto";
+        /**
+         * @description Match a phrase using the field's analyzer. On a `substring` companion,
+         *     one or two words match contained text across token separators. Three
+         *     or more words are rejected because the suffix index cannot verify
+         *     their word boundaries; lookups over 32 bytes are also rejected.
+         */
         MatchPhraseQuery: {
             match_phrase: string;
             field?: string;

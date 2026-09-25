@@ -154,7 +154,7 @@ pub fn highlightMatchers(
 
         var match_count: u32 = 0;
         for (spans.items) |other| {
-            if (other.start >= win_start and other.end <= win_end) match_count += 1;
+            if (other.start < win_end and other.end > win_start) match_count += 1;
         }
         try windows.append(alloc, .{ .start = win_start, .end = win_end, .score = match_count });
     }
@@ -196,10 +196,10 @@ pub fn highlightMatchers(
         var fragment_spans = std.ArrayListUnmanaged(Span).empty;
         defer fragment_spans.deinit(alloc);
         for (spans.items) |span| {
-            if (span.start >= win.start and span.end <= win.end) {
+            if (span.start < win.end and span.end > win.start) {
                 try fragment_spans.append(alloc, .{
-                    .start = span.start - win.start,
-                    .end = span.end - win.start,
+                    .start = @max(span.start, win.start) - win.start,
+                    .end = @min(span.end, win.end) - win.start,
                 });
             }
         }
@@ -483,6 +483,18 @@ test "keyword matchers highlight a whole value across three words" {
 
     const wrong_case = try highlightMatchers(alloc, text, &.{.{ .literal = "new york city" }}, &analysis_mod.simple_analyzer, 1, 100);
     try std.testing.expectEqual(@as(usize, 0), wrong_case.len);
+}
+
+test "highlight clips a match wider than its fragment" {
+    const alloc = std.testing.allocator;
+    const text = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
+    const fragments = try highlightMatchers(alloc, text, &.{.{ .literal = text }}, &analysis_mod.keyword_analyzer, 1, 32);
+    defer freeFragments(alloc, fragments);
+    try std.testing.expectEqual(@as(usize, 1), fragments.len);
+    try std.testing.expectEqual(@as(usize, 32), fragments[0].text.len);
+    try std.testing.expectEqual(@as(usize, 1), fragments[0].highlights.len);
+    try std.testing.expectEqual(@as(u32, 0), fragments[0].highlights[0].start);
+    try std.testing.expectEqual(@as(u32, 32), fragments[0].highlights[0].end);
 }
 
 test "highlight prefix wildcard fuzzy and regexp matchers mark whole tokens" {

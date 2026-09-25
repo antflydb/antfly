@@ -17989,6 +17989,13 @@ const highlight_regex_mod = @import("../../../search/regex.zig");
 const HighlightMatcherEntry = struct {
     field: []const u8,
     matcher: highlight_mod.Matcher,
+    query_index: usize = 0,
+};
+
+pub const HighlightQuery = struct {
+    query: types.TextQuery,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
 };
 
 const highlight_companion_suffixes = [_][]const u8{
@@ -18107,7 +18114,35 @@ fn appendHighlightFragments(
 ) !void {
     const found = try highlight_mod.highlightMatchers(alloc, text, matchers, analyzer, max_fragments, fragment_size);
     defer highlight_mod.freeFragments(alloc, found);
-    for (found) |fragment| {
+    fragment_loop: for (found) |fragment| {
+        for (fragments.items) |*existing| {
+            if (existing.offset != fragment.offset or existing.item != item or
+                !std.mem.eql(u8, existing.text, fragment.text)) continue;
+
+            var combined = std.ArrayListUnmanaged(types.HighlightSpan).empty;
+            defer combined.deinit(alloc);
+            try combined.appendSlice(alloc, existing.spans);
+            for (fragment.highlights) |span| {
+                const candidate: types.HighlightSpan = .{ .start = span.start, .end = span.end };
+                var seen = false;
+                for (combined.items) |prior| {
+                    if (prior.start == candidate.start and prior.end == candidate.end) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) try combined.append(alloc, candidate);
+            }
+            const merged = try combined.toOwnedSlice(alloc);
+            alloc.free(existing.spans);
+            existing.spans = merged;
+            std.mem.sort(types.HighlightSpan, existing.spans, {}, struct {
+                fn lessThan(_: void, a: types.HighlightSpan, b: types.HighlightSpan) bool {
+                    return if (a.start == b.start) a.end < b.end else a.start < b.start;
+                }
+            }.lessThan);
+            continue :fragment_loop;
+        }
         const owned_text = try alloc.dupe(u8, fragment.text);
         errdefer alloc.free(owned_text);
         const spans = try alloc.alloc(types.HighlightSpan, fragment.highlights.len);
@@ -18140,14 +18175,35 @@ pub fn attachHighlights(
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !void {
+    const indexed_queries = try alloc.alloc(HighlightQuery, text_queries.len);
+    defer alloc.free(indexed_queries);
+    for (text_queries, indexed_queries) |query, *indexed| indexed.* = .{
+        .query = query,
+        .text_analysis = text_analysis,
+        .runtime_schema = runtime_schema,
+    };
+    return attachHighlightsWithIndexQueries(alloc, options, indexed_queries, hits, sources);
+}
+
+/// Keep each query's index analysis with its matchers. Named full-text queries
+/// may use different indexes (and analyzers) for the same stored field.
+pub fn attachHighlightsWithIndexQueries(
+    alloc: Allocator,
+    options: types.HighlightRequest,
+    indexed_queries: []const HighlightQuery,
+    hits: []types.SearchHit,
+    sources: ?[]const ?[]u8,
+) !void {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var entries = std.ArrayListUnmanaged(HighlightMatcherEntry).empty;
-    for (text_queries) |text_query| {
-        const lowered = try textQueryToSearchQuery(arena, text_query, text_analysis, runtime_schema);
+    for (indexed_queries, 0..) |indexed, index| {
+        const lowered = try textQueryToSearchQuery(arena, indexed.query, indexed.text_analysis, indexed.runtime_schema);
+        const start = entries.items.len;
         try collectHighlightMatchers(arena, lowered, &entries);
+        for (entries.items[start..]) |*entry| entry.query_index = index;
     }
     if (entries.items.len == 0) return;
 
@@ -18193,25 +18249,28 @@ pub fn attachHighlights(
         }
         for (fields.items) |field| {
             const value = jsonValueAtDottedPath(parsed, field) orelse continue;
-            var matchers = std.ArrayListUnmanaged(highlight_mod.Matcher).empty;
-            for (entries.items) |entry| {
-                if (std.mem.eql(u8, entry.field, field)) try matchers.append(hit_arena, entry.matcher);
-            }
-            if (matchers.items.len == 0) continue;
-            const analyzer = (resolveQueryAnalyzer(field, null, text_analysis, runtime_schema) catch null) orelse &analysis_mod.default_analyzer;
-
             var fragments = std.ArrayListUnmanaged(types.HighlightFragment).empty;
             errdefer {
                 for (fragments.items) |*fragment| types.freeHighlightFragment(alloc, fragment);
                 fragments.deinit(alloc);
             }
-            switch (value) {
-                .string => |text| try appendHighlightFragments(alloc, &fragments, text, null, matchers.items, analyzer, max_fragments, fragment_size),
-                .array => |items| for (items.items, 0..) |item, index| {
-                    if (item != .string) continue;
-                    try appendHighlightFragments(alloc, &fragments, item.string, @intCast(index), matchers.items, analyzer, max_fragments, fragment_size);
-                },
-                else => {},
+            for (indexed_queries, 0..) |indexed, query_index| {
+                var matchers = std.ArrayListUnmanaged(highlight_mod.Matcher).empty;
+                for (entries.items) |entry| {
+                    if (entry.query_index == query_index and std.mem.eql(u8, entry.field, field)) {
+                        try matchers.append(hit_arena, entry.matcher);
+                    }
+                }
+                if (matchers.items.len == 0) continue;
+                const analyzer = (resolveQueryAnalyzer(field, null, indexed.text_analysis, indexed.runtime_schema) catch null) orelse &analysis_mod.default_analyzer;
+                switch (value) {
+                    .string => |text| try appendHighlightFragments(alloc, &fragments, text, null, matchers.items, analyzer, max_fragments, fragment_size),
+                    .array => |items| for (items.items, 0..) |item, item_index| {
+                        if (item != .string) continue;
+                        try appendHighlightFragments(alloc, &fragments, item.string, @intCast(item_index), matchers.items, analyzer, max_fragments, fragment_size);
+                    },
+                    else => {},
+                }
             }
             if (fragments.items.len == 0) continue;
             const owned_field = try alloc.dupe(u8, field);
@@ -18315,6 +18374,41 @@ test "attachHighlights marks analyzed, prefix, and substring matches on stored s
     try attachHighlights(alloc, .{ .fields = &only_title }, &.{query}, &projected, &full_sources, text_analysis, null);
     try std.testing.expectEqual(@as(usize, 1), projected[0].highlights.len);
     try std.testing.expectEqualStrings("title", projected[0].highlights[0].field);
+}
+
+test "named highlight queries use their own index analyzers" {
+    const alloc = std.testing.allocator;
+    var hits = [_]types.SearchHit{.{
+        .id = try alloc.dupe(u8, "doc:1"),
+        .stored_data = try alloc.dupe(u8, "{\"title\":\"Handbook Runner\"}"),
+    }};
+    defer hits[0].deinit(alloc);
+
+    const indexed_queries = [_]HighlightQuery{
+        .{
+            .query = .{ .match = .{ .field = "title", .text = "runner" } },
+            .text_analysis = .{ .field_analyzers = &.{.{ .field_name = "title", .analyzer_name = "simple" }} },
+            .runtime_schema = null,
+        },
+        .{
+            .query = .{ .match = .{ .field = "title", .text = "handbooks" } },
+            .text_analysis = .{ .field_analyzers = &.{.{ .field_name = "title", .analyzer_name = "standard" }} },
+            .runtime_schema = null,
+        },
+    };
+    try attachHighlightsWithIndexQueries(alloc, .{ .fragment_size = 64, .max_fragments = 2 }, &indexed_queries, &hits, null);
+    try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+    try std.testing.expectEqual(@as(usize, 1), hits[0].highlights[0].fragments.len);
+    var saw_handbook = false;
+    var saw_runner = false;
+    for (hits[0].highlights[0].fragments) |fragment| {
+        for (fragment.spans) |span| {
+            const marked = fragment.text[span.start..span.end];
+            if (std.mem.eql(u8, marked, "Handbook")) saw_handbook = true;
+            if (std.mem.eql(u8, marked, "Runner")) saw_runner = true;
+        }
+    }
+    try std.testing.expect(saw_handbook and saw_runner);
 }
 
 /// The analyzer to apply to *query* text for a field. A substring companion is
