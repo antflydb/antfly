@@ -36,6 +36,7 @@ class RegressionEvidenceTests(unittest.TestCase):
                 "from pathlib import Path\n"
                 "path = next((arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--junitxml=')), None)\n"
                 "if path is None: print('stub invoked without junit'); sys.exit(0)\n"
+                "print('stub invoked with junit')\n"
                 "mode = os.environ['STUB_JUNIT_MODE']\n"
                 "if mode != 'missing':\n"
                 "    child = '<skipped/>' if mode == 'skip' or (mode == 'normal-skip' and '/normal/' in path) else ''\n"
@@ -76,11 +77,13 @@ class RegressionEvidenceTests(unittest.TestCase):
                 for p in reports.rglob("*.xml")
             }
 
-    def test_without_report_directory_supports_empty_argument_array(self):
+    def test_without_report_directory_still_validates_junit_evidence(self):
         result, reports = self.run_loop(report=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("stub invoked without junit", result.stdout)
+        self.assertIn("stub invoked with junit", result.stdout)
         self.assertEqual(reports, {})
+        skipped, _ = self.run_loop(mode="skip", report=False)
+        self.assertEqual(skipped.returncode, 1, skipped.stdout + skipped.stderr)
 
     def test_cancellation_stops_parallel_workers_and_their_servers(self):
         with tempfile.TemporaryDirectory() as directory:

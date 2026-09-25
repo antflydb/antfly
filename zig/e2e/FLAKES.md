@@ -1,5 +1,58 @@
 # Zig E2E flakes
 
+## 2026-09-25: schema rewrite reply-loss recovery retries under leader churn
+
+[PR #882's recovery-0 job](https://github.com/antflydb/antfly/actions/runs/36173392068/job/108211921323)
+failed `test_schema_rewrite_recovers_dependency_cohort[publication-reply_loss]`:
+after 180 seconds the restore was still running at attempt 9, with zero of two
+tables published and `GroupLeaderUnavailable` during the rewrite tail. Two
+metadata nodes reported `metadata leader unavailable`. Retained metadata logs
+showed individual WAL syncs taking 0.5–1.5 seconds, even for small records.
+Those syncs explain some delayed Raft rounds, but the logs do not prove why
+the data-group leader remained unavailable or that storage was the only cause.
+
+The rewrite worker previously classified `GroupLeaderUnavailable` as a generic
+execution failure. Each transient route gap durably requeued a new job attempt,
+adding metadata consensus writes and eventually multi-second exponential
+backoff during the same outage. Source reads are observations; routed source
+writes distinguish non-proposal from unknown outcomes, and rewrite work resumes
+from durable source and target receipts. The worker now treats a route gap as a
+bounded continuation of the same attempt. Unknown write outcomes retain their
+distinct classification. Neither Raft durability nor the test deadline changes.
+
+The unchanged server passed 2/2 local reproductions on two workers; it did not
+reproduce the CI leadership stall. The focused Zig rewrite suite passes all
+three tests, including the retry classification regression. The first post-fix
+two-worker, two-repetition loop passed 3/4. The fourth run reached the rewrite's
+validating phase before data-4 exited with `ReadFailed` from background store
+report collection. Metadata still had a stable term-1 leader and all three
+snapshot probes succeeded. This is a distinct failure, not evidence that the
+leader-gap continuation failed.
+
+Background inventory collection and publication read local owner state and
+remote metadata. A failed collection publishes no partial report, marks status
+dirty, and retries from a fresh snapshot. Propagating its `ReadFailed` to the
+control supervisor needlessly removes a data voter. The store-report error
+handler now keeps the process running for this read failure, like its existing transient storage
+errors. A deterministic worker regression injects `ReadFailed`, checks that no
+fatal error escapes and the dirty bit survives, then completes a fresh report.
+Persistent read failures remain logged and keep the report dirty.
+
+With both fixes, the same two-worker, two-repetition flake loop passed 4/4
+executed cases (zero skips, errors, or failures). The focused data-runtime
+report-worker regression passed, as did all 42 restore-job store tests and all
+three rewrite-driver tests. The local soak exercises the full cohort rewrite
+and reply loss but did not reproduce CI's prolonged metadata WAL latency; a clean
+local result cannot establish that the underlying slow-sync availability
+problem has been eliminated.
+
+```sh
+SKIP_BUILD=1 ANTFLY_E2E_ENV_LOADED=1 \
+  ANTFLY_E2E_REGRESSION_WORKERS=2 ANTFLY_E2E_REGRESSION_REPEATS=2 \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  'e2e/antfly/test_relational_integrity_recovery.py::test_schema_rewrite_recovers_dependency_cohort[publication-reply_loss]'
+```
+
 ## 2026-09-24: recovery shard quorum stalls in run 36028793026
 
 [The recovery-1 job](https://github.com/antflydb/antfly/actions/runs/36028793026/job/107754773721)

@@ -121,6 +121,58 @@ def test_process_slot_configuration_rejects_non_positive_values(slots: int) -> N
         pytest_configure(config)  # type: ignore[arg-type]
 
 
+def test_process_worker_configuration_rejects_non_positive_values() -> None:
+    options = {"e2e_process_slots": 2, "e2e_process_workers": 0}
+    config = SimpleNamespace(
+        getoption=lambda name, default=None: options.get(name, default)
+    )
+
+    with pytest.raises(
+        pytest.UsageError,
+        match="--e2e-process-workers must be a positive integer",
+    ):
+        pytest_configure(config)  # type: ignore[arg-type]
+
+
+def test_one_process_worker_allows_mixed_group_and_parallel_light_work(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 2
+    scheduler.process_workers = 1
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    owner = FakeWorker()
+    other = FakeWorker()
+    persistent_scope = (
+        f"{PERSISTENT_PROCESS_GROUP_PREFIX}serverless_runtime--module--owner"
+    )
+    mixed_scope = f"{MIXED_PROCESS_GROUP_PREFIX}serverless_runtime--module--mixed"
+    stateful_scope = f"{PROCESS_GROUP_PREFIX}test--stateful"
+    light_scope = "light--test--pending"
+    scheduler.assigned_work = {
+        owner: {persistent_scope: {"test_owner.py::test_started": True}},
+        other: {},
+    }
+    scheduler._persistent_processes = {owner: {"serverless_runtime"}}
+    scheduler.workqueue = OrderedDict(
+        {
+            mixed_scope: {"test_mixed.py::test_both": False},
+            stateful_scope: {"test_stateful.py::test_run": False},
+            light_scope: {"test_light.py::test_run": False},
+        }
+    )
+
+    assert scheduler._next_eligible_scope(owner) == mixed_scope
+    assert scheduler._next_eligible_scope(other) == light_scope
+    scheduler.workqueue = OrderedDict(
+        {stateful_scope: {"test_stateful.py::test_run": False}}
+    )
+    assert scheduler._retire_unused_session_worker(owner) is False
+    assert owner.shutting_down is False
+    scheduler._persistent_processes.clear()
+    assert scheduler._next_eligible_scope(other) == stateful_scope
+
+
 def test_parallel_configuration_rejects_incompatible_distribution_mode() -> None:
     options = {
         "e2e_process_slots": 2,

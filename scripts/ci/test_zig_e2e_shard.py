@@ -91,6 +91,8 @@ class ShardTests(unittest.TestCase):
         for shard in shards.SHARDS[1:]:
             self.assertIn(f"shard: {shard}", base)
         self.assertIn("ANTFLY_E2E_SHARD: ${{ matrix.shard }}", base)
+        self.assertIn('ANTFLY_E2E_PROCESS_SLOTS: "2"', base)
+        self.assertIn('ANTFLY_E2E_PROCESS_WORKERS: "1"', base)
         self.assertNotIn("continue-on-error:", base)
         self.assertIn(
             "needs: [admission, changes, e2e-base-build, e2e-base-tests]", workflow
