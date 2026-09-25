@@ -62,6 +62,20 @@ fn parsePromotionDocument(a: std.mem.Allocator, raw: []const u8) !std.json.Value
     return value;
 }
 
+fn normalizePromotionAliases(a: std.mem.Allocator, value: *std.json.Value) !void {
+    switch (value.*) {
+        .string => |alias| {
+            var aliases = std.json.Array.init(a);
+            try aliases.append(.{ .string = alias });
+            value.* = .{ .array = aliases };
+        },
+        .array => |aliases| for (aliases.items) |alias| {
+            if (alias != .string) return error.InvalidEntityPromotionDocument;
+        },
+        else => return error.InvalidEntityPromotionDocument,
+    }
+}
+
 /// Keep the destination's curated values, fill missing fields from the old
 /// document, and union aliases contributed by either document or this work.
 fn mergePromotionDocument(a: std.mem.Allocator, destination: *std.json.Value, source: std.json.Value) !void {
@@ -69,21 +83,28 @@ fn mergePromotionDocument(a: std.mem.Allocator, destination: *std.json.Value, so
     var fields = source.object.iterator();
     while (fields.next()) |field| {
         const name = field.key_ptr.*;
-        const incoming = field.value_ptr.*;
-        if (destination.object.getPtr(name)) |existing| {
-            if (std.mem.eql(u8, name, "aliases") and existing.* == .array and incoming == .array) {
+        var incoming = field.value_ptr.*;
+        if (std.mem.eql(u8, name, "aliases")) {
+            try normalizePromotionAliases(a, &incoming);
+            if (destination.object.getPtr(name)) |existing| {
+                try normalizePromotionAliases(a, existing);
                 for (incoming.array.items) |alias| {
-                    if (alias != .string) return error.InvalidEntityPromotionDocument;
                     var present = false;
                     for (existing.array.items) |current| {
-                        if (current == .string and std.mem.eql(u8, current.string, alias.string)) {
+                        if (std.mem.eql(u8, current.string, alias.string)) {
                             present = true;
                             break;
                         }
                     }
                     if (!present) try existing.array.append(.{ .string = alias.string });
                 }
-            } else if (existing.* == .object and incoming == .object) {
+            } else {
+                try destination.object.put(a, name, incoming);
+            }
+            continue;
+        }
+        if (destination.object.getPtr(name)) |existing| {
+            if (existing.* == .object and incoming == .object) {
                 try mergePromotionDocument(a, existing, incoming);
             }
         } else {
@@ -704,6 +725,8 @@ test "DistributedEntitySink deletes an old pinned copy while moving a key" {
         old_reads: usize = 0,
         new_reads: usize = 0,
         old_exists: bool = true,
+        scalar_aliases: bool = false,
+        invalid_aliases: bool = false,
 
         fn lookup(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) anyerror!?table_reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -713,10 +736,13 @@ test "DistributedEntitySink deletes an old pinned copy while moving a key" {
             if (std.mem.eql(u8, table, "table:old")) {
                 self.old_reads += 1;
                 if (!self.old_exists) return null;
+                if (self.scalar_aliases) return .{ .json = try a.dupe(u8, "{\"aliases\":\"A. Lovelace\",\"curator_note\":true}"), .version = 7 };
                 return .{ .json = try a.dupe(u8, "{\"canonical_name\":\"Curated Ada\",\"aliases\":[\"A. Lovelace\"],\"curator_note\":{\"reviewed\":true},\"merged_into\":\"person/other\"}"), .version = 7 };
             }
             try testing.expectEqualStrings("table:new", table);
             self.new_reads += 1;
+            if (self.invalid_aliases) return .{ .json = try a.dupe(u8, "{\"aliases\":42}"), .version = 3 };
+            if (self.scalar_aliases) return .{ .json = try a.dupe(u8, "{\"aliases\":\"Countess Ada\",\"new_note\":true}"), .version = 3 };
             return .{ .json = try a.dupe(u8, "{\"canonical_name\":\"New Ada\",\"aliases\":[\"Countess Ada\"],\"new_note\":true,\"merged_into_table\":\"other_people\"}"), .version = 3 };
         }
 
@@ -785,6 +811,28 @@ test "DistributedEntitySink deletes an old pinned copy while moving a key" {
     try testing.expectEqual(@as(usize, 1), missing_fake.deletes.items.len);
     try testing.expectEqualStrings("person/ada", missing_fake.deletes.items[0]);
     try testing.expectEqualSlices(u64, &.{ 0, 3 }, missing_fake.predicate_versions.items);
+
+    var scalar_reads = FakeReads{ .scalar_aliases = true };
+    var scalar_fake = FakeTableWriteSource{ .alloc = alloc, .table = "table:old", .other_table = "table:new", .support_commit_batch = true };
+    defer scalar_fake.deinit();
+    var scalar_sink = DistributedEntitySink{ .writes = scalar_fake.source(), .reads = scalar_reads.source(), .atomic_batch_required = true };
+    const move_entries: []const db_mod.EntityUpsert = &.{
+        .{ .table = "entities", .storage_table = "table:old", .key = "person/ada", .delete = true },
+        .{ .table = "entities", .storage_table = "table:new", .key = "person/ada", .doc_json = "{\"aliases\":[\"Ada\"]}" },
+    };
+    try scalar_sink.entitySink().upsertBatch(alloc, move_entries);
+    try @import("antfly-json").testing.expectSubsetJsonText(
+        alloc,
+        "{\"aliases\":[\"Countess Ada\",\"A. Lovelace\",\"Ada\"],\"curator_note\":true,\"new_note\":true}",
+        scalar_fake.write_docs.items[0],
+    );
+
+    var invalid_reads = FakeReads{ .invalid_aliases = true };
+    var invalid_fake = FakeTableWriteSource{ .alloc = alloc, .table = "table:old", .other_table = "table:new", .support_commit_batch = true };
+    defer invalid_fake.deinit();
+    var invalid_sink = DistributedEntitySink{ .writes = invalid_fake.source(), .reads = invalid_reads.source(), .atomic_batch_required = true };
+    try testing.expectError(error.InvalidEntityPromotionDocument, invalid_sink.entitySink().upsertBatch(alloc, move_entries));
+    try testing.expectEqual(@as(usize, 0), invalid_fake.commit_batch_calls);
 }
 
 test "DistributedEntitySink batch commit remains compatible with transaction-only sources" {
