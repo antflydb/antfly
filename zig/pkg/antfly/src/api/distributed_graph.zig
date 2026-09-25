@@ -15256,6 +15256,8 @@ test "distributed graph retries once on topology change and succeeds" {
         cancelled: std.atomic.Value(bool) = .init(false),
         cancel_on_hydration: bool = false,
         retry_first_expand: bool = true,
+        socket_io: ?std.Io = null,
+        socket_address: ?std.Io.net.IpAddress = null,
         lifecycle_counts: [@typeInfo(LifecyclePhase).@"enum".fields.len]u32 =
             .{0} ** @typeInfo(LifecyclePhase).@"enum".fields.len,
         lifecycle_valid: bool = true,
@@ -15401,6 +15403,23 @@ test "distributed graph retries once on topology change and succeeds" {
             try std.testing.expectEqual(@as(u64, 22), group_id);
             try std.testing.expect(req.topology_epoch != 0);
             state.hydrate_calls += 1;
+            if (state.socket_address) |address| {
+                const httpx = @import("httpx");
+                var socket = try httpx.Socket.connect(address, state.socket_io.?);
+                defer socket.close();
+                try socket.setRecvTimeout(5_000);
+                try socket.sendAll("GET /worker HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+                var response: [8192]u8 = undefined;
+                var used: usize = 0;
+                while (true) {
+                    if (used == response.len) return error.TestUnexpectedResult;
+                    const received = try socket.recv(response[used..]);
+                    if (received == 0) break;
+                    used += received;
+                }
+                const start = (std.mem.indexOf(u8, response[0..used], "\r\n\r\n") orelse return error.TestUnexpectedResult) + 4;
+                return try parseGraphHydrateResponse(alloc, response[start..used]);
+            }
             const hits = try alloc.alloc(db_mod.types.SearchHit, 1);
             hits[0] = .{
                 .id = try alloc.dupe(u8, "doc:b"),
@@ -15480,6 +15499,119 @@ test "distributed graph retries once on topology change and succeeds" {
     try std.testing.expectEqual(@as(u32, 1), cancelled_state.expand_calls);
     try std.testing.expectEqual(@as(u32, 1), cancelled_state.hydrate_calls);
     try std.testing.expectEqual(@as(u32, 1), cancelled_state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_completed)]);
+
+    // A real socket peer can finish after the coordinator's original request
+    // has ended. The returned wire payload must never become a graph result.
+    if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .freestanding) {
+        const httpx = @import("httpx");
+        const SocketFixture = struct {
+            const Mode = enum { cancel, timeout };
+            const Self = @This();
+            body: []const u8,
+            entered: std.atomic.Value(bool) = .init(false),
+            release: std.atomic.Value(bool) = .init(false),
+            calls: std.atomic.Value(usize) = .init(0),
+
+            fn handle(self: *Self, ctx: *httpx.Context) !httpx.Response {
+                _ = self.calls.fetchAdd(1, .acq_rel);
+                self.entered.store(true, .release);
+                while (!self.release.load(.acquire)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                return ctx.text(self.body);
+            }
+
+            const Coordinator = struct {
+                state: *TestState,
+                request: db_mod.types.SearchRequest,
+                source: db_mod.types.SearchResult,
+                result_error: ?anyerror = null,
+                published: bool = false,
+
+                fn run(self: *@This()) void {
+                    const output = executeCrossRange(
+                        std.testing.allocator,
+                        FakeCatalog.iface(self.state),
+                        FakeWorker.iface(self.state),
+                        "docs",
+                        self.request,
+                        self.source,
+                        .read_index,
+                    ) catch |err| {
+                        self.result_error = err;
+                        return;
+                    };
+                    defer {
+                        for (output) |*result| result.deinit(std.testing.allocator);
+                        std.testing.allocator.free(output);
+                    }
+                    self.published = true;
+                }
+            };
+
+            fn runMode(mode: Mode, request: db_mod.types.SearchRequest, source: db_mod.types.SearchResult) !void {
+                const alloc = std.testing.allocator;
+                var server_io = std.Io.Threaded.init(alloc, .{});
+                defer server_io.deinit();
+                var client_io = std.Io.Threaded.init(alloc, .{});
+                defer client_io.deinit();
+                var hit = [_]db_mod.types.SearchHit{.{ .id = @constCast("doc:b"), .stored_data = @constCast("{\"title\":\"beta\"}") }};
+                const body = try encodeGraphHydrateResponse(alloc, .{ .hits = &hit });
+                defer alloc.free(body);
+                var fixture = Self{ .body = body };
+                var server = httpx.Server.initWithConfig(alloc, server_io.io(), .{ .host = "127.0.0.1", .port = 0, .max_connections = 2, .max_request_tasks = 2 });
+                defer server.deinit();
+                try server.get("/worker", httpx.Handler.bind(&fixture, Self.handle));
+                var listener = httpx.ListenerTask.init(&server);
+                try listener.start();
+                defer {
+                    fixture.release.store(true, .release);
+                    listener.requestStop();
+                    listener.join() catch {};
+                }
+                var socket_state = TestState{
+                    .phase = 1,
+                    .retry_first_expand = false,
+                    .socket_io = client_io.io(),
+                    .socket_address = server.boundAddress() orelse return error.TestUnexpectedResult,
+                };
+                var controlled = request;
+                controlled.cancellation = CancellationToken.fromAtomic(&socket_state.cancelled);
+                if (mode == .timeout) controlled.execution_deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+                var coordinator = Coordinator{ .state = &socket_state, .request = controlled, .source = source };
+                var future = std.Io.async(client_io.io(), Coordinator.run, .{&coordinator});
+                var awaited = false;
+                defer if (!awaited) {
+                    fixture.release.store(true, .release);
+                    future.await(client_io.io());
+                };
+                for (0..5_000) |_| {
+                    if (fixture.entered.load(.acquire)) break;
+                    try client_io.io().sleep(.fromMilliseconds(1), .awake);
+                }
+                try std.testing.expect(fixture.entered.load(.acquire));
+                switch (mode) {
+                    .cancel => socket_state.cancelled.store(true, .release),
+                    .timeout => while (platform_time.monotonicNs() < controlled.execution_deadline_ns.?)
+                        try client_io.io().sleep(.fromMilliseconds(1), .awake),
+                }
+                fixture.release.store(true, .release);
+                future.await(client_io.io());
+                awaited = true;
+                try std.testing.expectEqual(if (mode == .cancel) error.Cancelled else error.Timeout, coordinator.result_error orelse return error.TestUnexpectedResult);
+                try std.testing.expect(!coordinator.published);
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.acquire));
+                try std.testing.expectEqual(@as(u32, 1), socket_state.expand_calls);
+                try std.testing.expectEqual(@as(u32, 1), socket_state.hydrate_calls);
+                for (0..5_000) |_| {
+                    if (server.runtimeStats().active_connections == 0 and server.runtimeStats().active_requests == 0) break;
+                    try client_io.io().sleep(.fromMilliseconds(1), .awake);
+                }
+                try std.testing.expectEqual(@as(usize, 0), server.runtimeStats().active_connections);
+                try std.testing.expectEqual(@as(usize, 0), server.runtimeStats().active_requests);
+            }
+        };
+        try SocketFixture.runMode(.cancel, req, base_result);
+        try SocketFixture.runMode(.timeout, req, base_result);
+    }
 }
 
 test "distributed graph stops after single retry on repeated topology churn" {
