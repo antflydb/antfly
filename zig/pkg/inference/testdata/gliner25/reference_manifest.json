@@ -52,6 +52,14 @@
       "sha256": "b39a7775a0ba1381742a166c219f706c4780513523c5ccec2479a0ab2dbd52e9",
       "size_bytes": 32861
     },
+    "modernbert_tokenizer/processor.json": {
+      "sha256": "6a01450296a80a91f1e14230e6fcd70dd9af2a54857b06692a5e2f469faa45b2",
+      "size_bytes": 5858
+    },
+    "modernbert_tokenizer/tokenizer.json": {
+      "sha256": "5e3d365b715d5ee23f4ccd7188f43e5ae24bf0a22ff5582ce7261c0fdcd94dd0",
+      "size_bytes": 16602
+    },
     "multi_reference/capture.json": {
       "sha256": "53c1d3faa316ed981298a6dc98fb47070147fe3fd4880f6b647f93c2fc49900e",
       "size_bytes": 48431
@@ -158,6 +166,10 @@
     "generate_pipeline_cases.py": {
       "sha256": "fea2e43265bab863094566c126db8252fd8b462231f59f665701eb956e6ba16f",
       "size_bytes": 11490
+    },
+    "modernbert_reference.py": {
+      "sha256": "6f7ea4258e0e580731d8133ff14777b0e1f7f5825e65659de789c4ebebfcdb7e",
+      "size_bytes": 11413
     },
     "oracle.py": {
       "sha256": "61bbf4544a21111dbfbd643ed2392b1d9723498493b3fa6832154d6e1dc42752",

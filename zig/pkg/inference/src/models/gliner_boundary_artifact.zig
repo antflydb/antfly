@@ -18,12 +18,79 @@ pub const Precision = enum { fp32, fp16_encoder, q8_0, q4_k, q4_0 };
 pub const Role = enum { encoder_matrix, protected_encoder, extraction_head };
 pub const Summary = struct { tensors: usize, parameters: u64, stored_bytes: u64 };
 
+/// Static published inventories. A ModernBERT inventory depends on its
+/// config (`modernBertSpecs`), so it has none here.
 pub fn specs(backbone: model.Backbone) []const inventory.Spec {
     return switch (backbone) {
         .base => &inventory.base,
         .small => &inventory.small,
         .multi => &inventory.multi,
+        .modern_bert => &.{},
     };
+}
+
+/// A ModernBERT checkpoint's exact inventory, sorted by name: the encoder's
+/// Hugging Face tensors derived from its config, and the published boundary
+/// heads re-dimensioned for its width. Each head dimension is `k * hidden + c`
+/// with `k` and `c` solved from the base (768) and small (384) inventories,
+/// which share one head configuration; a non-integer fit is rejected.
+/// Registration order follows `named_parameters`: encoder, then heads.
+pub const Derived = struct {
+    arena: std.heap.ArenaAllocator,
+    specs: []const inventory.Spec,
+
+    pub fn deinit(self: *Derived) void {
+        self.arena.deinit();
+    }
+};
+
+pub fn modernBertSpecs(allocator: std.mem.Allocator, encoder: model.EncoderConfig) !Derived {
+    if (encoder.family != .modern_bert or encoder.num_hidden_layers == 0 or encoder.hidden_size == 0) return error.UnsupportedGlinerBoundaryEncoder;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const h: i64 = encoder.hidden_size;
+    var list = std.ArrayListUnmanaged(inventory.Spec).empty;
+    var order: u16 = 0;
+    const Add = struct {
+        fn add(al: std.mem.Allocator, out: *std.ArrayListUnmanaged(inventory.Spec), next: *u16, name: []const u8, shape: []const i64) !void {
+            try out.append(al, .{ .name = name, .shape = try al.dupe(i64, shape), .registration_order = next.* });
+            next.* += 1;
+        }
+    };
+    try Add.add(a, &list, &order, "encoder.embeddings.tok_embeddings.weight", &.{ encoder.vocab_size, h });
+    try Add.add(a, &list, &order, "encoder.embeddings.norm.weight", &.{h});
+    for (0..encoder.num_hidden_layers) |layer| {
+        if (layer != 0) try Add.add(a, &list, &order, try std.fmt.allocPrint(a, "encoder.layers.{d}.attn_norm.weight", .{layer}), &.{h});
+        try Add.add(a, &list, &order, try std.fmt.allocPrint(a, "encoder.layers.{d}.attn.Wqkv.weight", .{layer}), &.{ 3 * h, h });
+        try Add.add(a, &list, &order, try std.fmt.allocPrint(a, "encoder.layers.{d}.attn.Wo.weight", .{layer}), &.{ h, h });
+        try Add.add(a, &list, &order, try std.fmt.allocPrint(a, "encoder.layers.{d}.mlp_norm.weight", .{layer}), &.{h});
+        try Add.add(a, &list, &order, try std.fmt.allocPrint(a, "encoder.layers.{d}.mlp.Wi.weight", .{layer}), &.{ 2 * @as(i64, encoder.intermediate_size), h });
+        try Add.add(a, &list, &order, try std.fmt.allocPrint(a, "encoder.layers.{d}.mlp.Wo.weight", .{layer}), &.{ h, encoder.intermediate_size });
+    }
+    try Add.add(a, &list, &order, "encoder.final_norm.weight", &.{h});
+    const encoder_count = order;
+    const published_heads: u16 = 198; // first head registration ordinal in every published inventory
+    for (inventory.base) |spec| {
+        if (std.mem.startsWith(u8, spec.name, "encoder.")) continue;
+        const small = inventory.small[find(&inventory.small, spec.name) orelse return error.InvalidGlinerBoundaryTensorShape];
+        if (small.shape.len != spec.shape.len or small.registration_order != spec.registration_order or spec.registration_order < published_heads)
+            return error.InvalidGlinerBoundaryTensorShape;
+        const shape = try a.alloc(i64, spec.shape.len);
+        for (shape, spec.shape, small.shape) |*out, base_dim, small_dim| {
+            const scale = std.math.divExact(i64, base_dim - small_dim, 768 - 384) catch return error.InvalidGlinerBoundaryTensorShape;
+            const offset = base_dim - scale * 768;
+            if (scale < 0 or offset < 0) return error.InvalidGlinerBoundaryTensorShape;
+            out.* = scale * h + offset;
+        }
+        try list.append(a, .{ .name = spec.name, .shape = shape, .registration_order = encoder_count + (spec.registration_order - published_heads) });
+    }
+    std.mem.sort(inventory.Spec, list.items, {}, struct {
+        fn less(_: void, lhs: inventory.Spec, rhs: inventory.Spec) bool {
+            return std.mem.order(u8, lhs.name, rhs.name) == .lt;
+        }
+    }.less);
+    return .{ .arena = arena, .specs = list.items };
 }
 
 pub fn role(spec: inventory.Spec) Role {
@@ -36,7 +103,9 @@ pub fn role(spec: inventory.Spec) Role {
 }
 
 pub fn validatePrecision(backbone: model.Backbone, precision: Precision) !void {
-    if ((backbone == .small and precision == .q4_k) or (backbone != .small and precision == .q4_0))
+    // ModernBERT checkpoints are FP32 training sources only.
+    if ((backbone == .modern_bert and precision != .fp32) or
+        (backbone == .small and precision == .q4_k) or (backbone != .small and precision == .q4_0))
         return error.UnsupportedGlinerBoundaryPrecision;
 }
 
@@ -94,10 +163,23 @@ pub fn tensorBytes(spec: inventory.Spec, kind: gguf.KnownTensorType) !u64 {
     return gguf.byteLen(.{ .known = kind }, dimensions[0..spec.shape.len]) orelse error.InvalidGlinerBoundaryTensorShape;
 }
 
+/// Validates against a static published inventory. ModernBERT checkpoints
+/// have no static inventory; use `validateDerived`.
 pub fn validate(allocator: std.mem.Allocator, backbone: model.Backbone, precision: Precision, descriptors: []const access.Descriptor, control: ?Control) !Summary {
+    if (backbone == .modern_bert) return error.UnsupportedGlinerBoundaryEncoder;
+    return validateAgainst(allocator, backbone, specs(backbone), precision, descriptors, control);
+}
+
+/// Validates a ModernBERT FP32 checkpoint against its config-derived inventory.
+pub fn validateDerived(allocator: std.mem.Allocator, encoder: model.EncoderConfig, descriptors: []const access.Descriptor, control: ?Control) !Summary {
+    var derived = try modernBertSpecs(allocator, encoder);
+    defer derived.deinit();
+    return validateAgainst(allocator, .modern_bert, derived.specs, .fp32, descriptors, control);
+}
+
+fn validateAgainst(allocator: std.mem.Allocator, backbone: model.Backbone, expected: []const inventory.Spec, precision: Precision, descriptors: []const access.Descriptor, control: ?Control) !Summary {
     if (control) |c| try c.check();
     try validatePrecision(backbone, precision);
-    const expected = specs(backbone);
     if (descriptors.len != expected.len) return error.IncompleteGlinerBoundaryTensorInventory;
     const seen = try allocator.alloc(bool, expected.len);
     defer allocator.free(seen);
@@ -171,4 +253,41 @@ test "gliner boundary artifact rejects missing duplicate reshaped and silently q
     descriptors[0] = first;
     descriptors[0].byte_len += 4;
     try std.testing.expectError(error.InvalidGlinerBoundaryTensorByteLength, validate(a, .small, .fp32, descriptors, null));
+}
+
+test "gliner boundary ModernBERT inventory reproduces the published heads at base width and validates exactly" {
+    const a = std.testing.allocator;
+    var encoder = std.mem.zeroes(model.EncoderConfig);
+    encoder.family = .modern_bert;
+    encoder.hidden_size = 768;
+    encoder.intermediate_size = 1152;
+    encoder.num_hidden_layers = 3;
+    encoder.num_attention_heads = 12;
+    encoder.vocab_size = 50368;
+    var derived = try modernBertSpecs(a, encoder);
+    defer derived.deinit();
+    // 2 embedding tensors, 5 per layer plus attn_norm after layer 0, final norm; 136 heads.
+    try std.testing.expectEqual(@as(usize, 2 + 3 * 6 - 1 + 1 + 136), derived.specs.len);
+    for (derived.specs[1..], derived.specs[0 .. derived.specs.len - 1]) |spec, previous| try std.testing.expect(std.mem.order(u8, previous.name, spec.name) == .lt);
+    // At the base width, every head equals the published base inventory.
+    var heads: usize = 0;
+    for (inventory.base) |spec| {
+        if (std.mem.startsWith(u8, spec.name, "encoder.")) continue;
+        const index = find(derived.specs, spec.name) orelse return error.MissingTestTensor;
+        try std.testing.expectEqualSlices(i64, spec.shape, derived.specs[index].shape);
+        heads += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 136), heads);
+    const rows = derived.specs[find(derived.specs, "encoder.layers.2.mlp.Wi.weight").?];
+    try std.testing.expectEqualSlices(i64, &.{ 2304, 768 }, rows.shape);
+    try std.testing.expect(find(derived.specs, "encoder.layers.0.attn_norm.weight") == null);
+
+    const descriptors = try a.alloc(access.Descriptor, derived.specs.len);
+    defer a.free(descriptors);
+    for (derived.specs, descriptors) |spec, *descriptor| descriptor.* = .{ .name = spec.name, .shape = spec.shape, .encoding = .{ .dense = .f32 }, .byte_len = @intCast(try tensorBytes(spec, .F32)), .quantized = false };
+    _ = try validateDerived(a, encoder, descriptors, null);
+    try std.testing.expectError(error.IncompleteGlinerBoundaryTensorInventory, validateDerived(a, encoder, descriptors[1..], null));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryEncoder, validate(a, .modern_bert, .fp32, descriptors, null));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryPrecision, validatePrecision(.modern_bert, .q8_0));
+    try std.testing.expectEqual(@as(usize, 0), specs(.modern_bert).len);
 }

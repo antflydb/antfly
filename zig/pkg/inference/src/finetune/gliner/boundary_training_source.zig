@@ -139,7 +139,10 @@ pub const Source = struct {
             if (expected.backbone != self.config.backbone) return error.GlinerBoundaryArtifactMismatch;
             for (expected.sidecars, 1..) |pin, index| try verifyDigest(self.blobs[index].?.digest, pin);
         }
-        try validateTokenizer(a, self.blobs[3].?.bytes, self.blobs[4].?.bytes, self.config, control);
+        if (self.config.backbone == .modern_bert)
+            try validateModernBertTokenizer(a, self.blobs[3].?.bytes, self.blobs[4].?.bytes, self.config, control)
+        else
+            try validateTokenizer(a, self.blobs[3].?.bytes, self.blobs[4].?.bytes, self.config, control);
         self.blobs[0] = try snapshot(a, io, opened.files[0].?, opened.stats[0], options.limits, true, control);
         if (options.expected_identity) |expected| try verifyDigest(self.blobs[0].?.digest, expected.weight);
         const weights = self.blobs[0].?.bytes;
@@ -156,11 +159,17 @@ pub const Source = struct {
             const meta = entry.value_ptr.*;
             descriptors[index] = .{ .name = entry.key_ptr.*, .shape = meta.shape, .encoding = .{ .dense = meta.dtype }, .byte_len = @intCast(meta.data_end - meta.data_start), .quantized = false };
         }
-        _ = try artifact.validate(a, self.config.backbone, .fp32, descriptors, control);
+        _ = if (self.config.backbone == .modern_bert)
+            try artifact.validateDerived(a, self.config.encoder, descriptors, control)
+        else
+            try artifact.validate(a, self.config.backbone, .fp32, descriptors, control);
         try self.buildStore(data_offset, control);
         try check(control);
         self.tokenizer_owner = try HfTokenizer.loadFromBytesWithOptions(a, self.blobs[3].?.bytes, .{ .strict_unigram_normalizer = true });
-        try validateLoadedTokenizer(a, self.tokenizer_owner.?, self.config, control);
+        if (self.config.backbone == .modern_bert)
+            try validateLoadedModernBertTokenizer(a, self.tokenizer_owner.?, self.config, control)
+        else
+            try validateLoadedTokenizer(a, self.tokenizer_owner.?, self.config, control);
         self.identity = .{ .backbone = self.config.backbone, .precision = .fp32, .weight = self.blobs[0].?.digest, .sidecars = undefined };
         for (&self.identity.sidecars, 1..) |*digest, file_index| digest.* = self.blobs[file_index].?.digest;
         try check(control);
@@ -543,6 +552,81 @@ fn validateLoadedTokenizer(a: Allocator, loaded: *HfTokenizer, config: model.Con
     }
 }
 
+/// ModernBERT's byte-level BPE. The processor tokenizes each word alone, as
+/// upstream's `tokenizer.tokenize(word)` does, so every setting that changes
+/// an isolated word's pieces is pinned: no normalizer, the GPT-2 byte-level
+/// pre-tokenizer without a prefix space, and a deterministic BPE. The post
+/// processor is never applied to schema or text fragments.
+fn validateModernBertTokenizer(a: Allocator, bytes: []const u8, config_bytes: []const u8, config: model.Config, control: ?Control) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error" });
+    defer parsed.deinit();
+    const root = try object(parsed.value);
+    try requireKeys(root, &.{ "version", "truncation", "padding", "model", "normalizer", "pre_tokenizer", "decoder", "post_processor", "added_tokens" });
+    try requireString(root, "version", "1.0");
+    if ((try item(root, "padding")) != .null or (try item(root, "truncation")) != .null or (try item(root, "normalizer")) != .null)
+        return error.UnsupportedBoundaryTrainingTokenizer;
+    try requireJson(a, try item(root, "pre_tokenizer"),
+        \\{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}
+    );
+    const bpe = try object(try item(root, "model"));
+    try requireString(bpe, "type", "BPE");
+    try requireBool(bpe, "byte_fallback", false);
+    try requireBool(bpe, "fuse_unk", false);
+    try requireBool(bpe, "ignore_merges", false);
+    for ([_][]const u8{ "dropout", "continuing_subword_prefix", "end_of_word_suffix" }) |name|
+        if ((try item(bpe, name)) != .null) return error.UnsupportedBoundaryTrainingTokenizer;
+    const vocabulary = try item(bpe, "vocab");
+    if (vocabulary != .object or vocabulary.object.count() == 0) return error.InvalidBoundaryTrainingTokenizer;
+    var ids = vocabulary.object.iterator();
+    var index: usize = 0;
+    while (ids.next()) |entry| : (index += 1) {
+        if (index % 1024 == 0) try check(control);
+        const id = entry.value_ptr.*;
+        if (id != .integer or id.integer < 0 or id.integer >= config.encoder.vocab_size) return error.InvalidBoundaryTrainingTokenizer;
+    }
+    const added = try item(root, "added_tokens");
+    if (added != .array) return error.InvalidBoundaryTrainingTokenizer;
+    var seen = std.AutoHashMapUnmanaged(i64, void){};
+    defer seen.deinit(a);
+    var marker_seen = [_]bool{false} ** markers.len;
+    for (added.array.items) |value| {
+        try check(control);
+        const token = try object(value);
+        const id = try item(token, "id");
+        const content = try item(token, "content");
+        if (id != .integer or id.integer < 0 or id.integer >= config.encoder.vocab_size or content != .string or content.string.len == 0) return error.InvalidBoundaryTrainingTokenizer;
+        if ((try seen.getOrPut(a, id.integer)).found_existing) return error.InvalidBoundaryTrainingTokenizer;
+        for (markers, &marker_seen) |name, *found| if (std.mem.eql(u8, name, content.string)) {
+            if (found.*) return error.InvalidBoundaryTrainingTokenizer;
+            found.* = true;
+            try requireBool(token, "special", true);
+            for ([_][]const u8{ "single_word", "lstrip", "rstrip", "normalized" }) |flag| try requireBool(token, flag, false);
+        };
+    }
+    for (marker_seen) |found| if (!found) return error.InvalidBoundaryTrainingTokenizer;
+    const tokenizer_config = try std.json.parseFromSlice(std.json.Value, a, config_bytes, .{ .duplicate_field_behavior = .@"error" });
+    defer tokenizer_config.deinit();
+    const metadata = try object(tokenizer_config.value);
+    try requireString(metadata, "tokenizer_class", "PreTrainedTokenizerFast");
+    try check(control);
+}
+
+fn validateLoadedModernBertTokenizer(a: Allocator, loaded: *HfTokenizer, config: model.Config, control: ?Control) !void {
+    const tokenizer = loaded.tokenizer();
+    // Upstream resizes the embeddings to the tokenizer, markers included.
+    if (loaded.model_type != .bpe or loaded.pre_tokenizer_type != .byte_level or tokenizer.vocabSize() != config.encoder.vocab_size)
+        return error.InvalidBoundaryTrainingTokenizer;
+    var marker_ids: [markers.len]i32 = undefined;
+    for (markers, &marker_ids) |name, *marker_id| {
+        try check(control);
+        const encoded = try tokenizer.encode(a, name);
+        defer a.free(encoded);
+        if (encoded.len != 1 or !loaded.special_token_ids.contains(encoded[0])) return error.InvalidBoundaryTrainingTokenizer;
+        marker_id.* = encoded[0];
+    }
+    for (marker_ids, 0..) |id, i| for (marker_ids[i + 1 ..]) |other| if (id == other) return error.InvalidBoundaryTrainingTokenizer;
+}
+
 fn item(obj: std.json.ObjectMap, key: []const u8) !std.json.Value {
     return obj.get(key) orelse error.InvalidBoundaryTrainingTokenizer;
 }
@@ -845,4 +929,31 @@ test "boundary training source accepts pinned architecture configs and preflight
 
 test {
     _ = @import("boundary_training_source_test.zig");
+}
+
+test "boundary training source accepts the ModernBERT byte-level BPE profile and rejects a prefix space or a missing marker" {
+    const a = std.testing.allocator;
+    const fixtures = @import("../../architectures/gliner/boundary_parity_test.zig");
+    const bytes = try fixtures.fixtureBytes(a, "modernbert_tokenizer/tokenizer.json");
+    defer a.free(bytes);
+    const tokenizer_config = "{\"tokenizer_class\":\"PreTrainedTokenizerFast\"}";
+    var config = std.mem.zeroes(model.Config);
+    config.backbone = .modern_bert;
+    config.encoder.family = .modern_bert;
+    config.encoder.vocab_size = 394;
+    try validateModernBertTokenizer(a, bytes, tokenizer_config, config, null);
+    const loaded = try HfTokenizer.loadFromBytes(a, bytes);
+    defer loaded.tokenizer().deinitTokenizer();
+    try validateLoadedModernBertTokenizer(a, loaded, config, null);
+    for ([_][2][]const u8{
+        .{ "\"add_prefix_space\": false", "\"add_prefix_space\": true" },
+        .{ "\"[SEP_TEXT]\"", "\"[SEP_TXT]\"" },
+    }) |change| {
+        const changed = try std.mem.replaceOwned(u8, a, bytes, change[0], change[1]);
+        defer a.free(changed);
+        try std.testing.expect(!std.mem.eql(u8, changed, bytes));
+        if (validateModernBertTokenizer(a, changed, tokenizer_config, config, null)) |_| return error.TestExpectedError else |_| {}
+    }
+    config.encoder.vocab_size = 393; // the embedding no longer covers every token
+    try std.testing.expectError(error.InvalidBoundaryTrainingTokenizer, validateModernBertTokenizer(a, bytes, tokenizer_config, config, null));
 }

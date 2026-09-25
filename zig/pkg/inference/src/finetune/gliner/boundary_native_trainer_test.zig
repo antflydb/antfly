@@ -100,9 +100,6 @@ fn exerciseWithActivation(a: std.mem.Allocator, execution: controller.Execution,
 }
 
 fn exerciseWithBoundaryAttention(a: std.mem.Allocator, execution: controller.Execution, attention_profile: step.AttentionProfile, activation_profile: step.ActivationProfile, fused_boundary: bool) !void {
-    var samples = try dataset(a);
-    defer samples.deinit();
-    var tokenizer = helper.TestTokenizer{};
     var config = helper.config();
     if (fused_boundary) {
         config.head.boundary_dim = 32;
@@ -110,6 +107,22 @@ fn exerciseWithBoundaryAttention(a: std.mem.Allocator, execution: controller.Exe
         config.head.dropout = 0;
     }
     if (activation_profile == .layer_recompute_v1) config.encoder.num_hidden_layers = 2;
+    return exerciseConfig(a, execution, attention_profile, activation_profile, fused_boundary, config);
+}
+
+/// A two-layer ModernBERT trunk (one global, one local layer) under the same
+/// full and heads-only jobs, cancellation, limits, and durable resume.
+fn exerciseModernBert(a: std.mem.Allocator, execution: controller.Execution) !void {
+    var config = helper.config();
+    config.backbone = .modern_bert;
+    config.encoder = .{ .hidden_size = 4, .intermediate_size = 8, .num_hidden_layers = 2, .num_attention_heads = 2, .vocab_size = 512, .max_position_embeddings = 256, .position_buckets = 0, .layer_norm_eps = 1e-5, .hidden_dropout_prob = 0, .attention_probs_dropout_prob = 0, .pad_token_id = 0, .family = .modern_bert, .global_rope_theta = 160000, .local_rope_theta = 10000, .local_attention_window = 8, .global_attn_every_n_layers = 2 };
+    return exerciseConfig(a, execution, .materialized_v1, .retained_v1, false, config);
+}
+
+fn exerciseConfig(a: std.mem.Allocator, execution: controller.Execution, attention_profile: step.AttentionProfile, activation_profile: step.ActivationProfile, fused_boundary: bool, config: @import("../../models/gliner_boundary.zig").Config) !void {
+    var samples = try dataset(a);
+    defer samples.deinit();
+    var tokenizer = helper.TestTokenizer{};
     var first = try samples.sample(0, null, null);
     defer first.deinit();
     var prepared = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = first.row.text, .schema = &first.schema }}, .{});
@@ -140,7 +153,9 @@ fn exerciseWithBoundaryAttention(a: std.mem.Allocator, execution: controller.Exe
         for (dims, shape.dims[0..shape.rank_]) |*dim, size| dim.* = @intCast(size);
         // The zero-dropout classifier removes Sequential index two. Preserve
         // the released canonical name, as the real source/benchmark loader does.
-        const canonical = if (std.mem.eql(u8, name, "classifier.2.weight")) "classifier.3.weight" else if (std.mem.eql(u8, name, "classifier.2.bias")) "classifier.3.bias" else if (std.mem.startsWith(u8, name, "embeddings.") or std.mem.startsWith(u8, name, "encoder.")) try std.fmt.allocPrint(scratch, "encoder.{s}", .{name}) else name;
+        const encoder_name = std.mem.startsWith(u8, name, "embeddings.") or std.mem.startsWith(u8, name, "encoder.") or
+            (config.encoder.family == .modern_bert and (std.mem.startsWith(u8, name, "layers.") or std.mem.startsWith(u8, name, "final_norm.")));
+        const canonical = if (std.mem.eql(u8, name, "classifier.2.weight")) "classifier.3.weight" else if (std.mem.eql(u8, name, "classifier.2.bias")) "classifier.3.bias" else if (encoder_name) try std.fmt.allocPrint(scratch, "encoder.{s}", .{name}) else name;
         try parameters.append(scratch, .{ .name = name, .canonical_name = canonical, .dimensions = dims, .values = tensor.asFloat32(), .kind = .original });
     }
     const source = bundle.Identity{ .backbone = config.backbone, .precision = .fp32, .weight = bundle.Digest.of("immutable tiny test weights"), .sidecars = .{ bundle.Digest.of("model"), bundle.Digest.of("encoder"), bundle.Digest.of("tokenizer"), bundle.Digest.of("tokenizer config") } };
@@ -324,6 +339,16 @@ fn exerciseWithBoundaryAttention(a: std.mem.Allocator, execution: controller.Exe
             }
         }
     }
+}
+
+test "boundary native trainer composes ModernBERT full and heads jobs with cancellation and durable partial resume" {
+    try exerciseModernBert(std.testing.allocator, .native);
+}
+
+test "boundary native trainer resident Metal composes ModernBERT full and heads jobs with exact durable resume" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    try exerciseModernBert(std.testing.allocator, .resident_metal);
 }
 
 test "boundary native trainer composes immutable batches full and heads training cancellation and durable partial resume" {
