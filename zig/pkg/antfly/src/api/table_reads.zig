@@ -7420,15 +7420,59 @@ const TextStatsFanoutSlot = struct {
     fields: []const distributed_stats_mod.TextFieldStats = &.{},
     err: ?anyerror = null,
 
-    fn init() TextStatsFanoutSlot {
+    fn init(backing: std.mem.Allocator) TextStatsFanoutSlot {
         return .{
-            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .arena = std.heap.ArenaAllocator.init(backing),
         };
     }
 
     fn deinit(self: *TextStatsFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
+    }
+};
+
+// Parallel text-stat workers retain response and decoded field arrays until
+// merge. The caller allocator may be an unsynchronized request arena, so all
+// worker arenas share one serialized parent to keep that scratch admitted.
+const TextStatsFanoutBacking = struct {
+    parent: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.parent.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        self.parent.rawFree(memory, alignment, ret_addr);
     }
 };
 
@@ -7466,10 +7510,10 @@ const PreflightFanoutSlot = struct {
     }
 };
 
-fn initTextStatsFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]TextStatsFanoutSlot {
+fn initTextStatsFanoutSlots(alloc: std.mem.Allocator, backing: std.mem.Allocator, count: usize) ![]TextStatsFanoutSlot {
     const slots = try alloc.alloc(TextStatsFanoutSlot, count);
     errdefer alloc.free(slots);
-    for (slots) |*slot| slot.* = .init();
+    for (slots) |*slot| slot.* = .init(backing);
     return slots;
 }
 
@@ -7512,7 +7556,8 @@ fn collectProvisionedSearchRequestTextStatsParallel(
     body: []const u8,
 ) ![]const distributed_stats_mod.TextFieldStats {
     const start_ns = platform_time.monotonicNs();
-    const slots = try initTextStatsFanoutSlots(alloc, group_ids.len);
+    var backing = TextStatsFanoutBacking{ .parent = alloc };
+    const slots = try initTextStatsFanoutSlots(alloc, backing.allocator(), group_ids.len);
     defer deinitTextStatsFanoutSlots(alloc, slots);
 
     const Fiber = struct {
@@ -7596,7 +7641,8 @@ fn collectHostedSearchRequestTextStatsParallel(
     const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency, .fromRequest(req));
     defer deinitHostedShardRoutes(alloc, routes);
 
-    const slots = try initTextStatsFanoutSlots(alloc, group_ids.len);
+    var backing = TextStatsFanoutBacking{ .parent = alloc };
+    const slots = try initTextStatsFanoutSlots(alloc, backing.allocator(), group_ids.len);
     defer deinitTextStatsFanoutSlots(alloc, slots);
 
     const Fiber = struct {
@@ -25139,6 +25185,57 @@ fn consumerTests() type {
             };
             const plan = try algebraicDistributedTensorProgramForRequestAlloc(alloc, &index, request, &.{});
             try std.testing.expect(plan == null);
+        }
+
+        test "parallel text stats fanout charges retained response scratch to request quota" {
+            const Fixture = struct {
+                calls: std.atomic.Value(usize) = .init(0),
+
+                fn textStats(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64, _: []const u8, _: []const u8) !?query_api.QueryResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    _ = self.calls.fetchAdd(1, .acq_rel);
+                    // One worker fits; two retained responses exceed quota.
+                    const scratch = try alloc.alloc(u8, 600 * 1024);
+                    @memset(scratch, 'x');
+                    return .{ .json = try alloc.dupe(u8, "{\"fields\":[]}") };
+                }
+            };
+
+            const storage = try std.testing.allocator.alloc(u8, 1024 * 1024);
+            defer std.testing.allocator.free(storage);
+            var quota = std.heap.FixedBufferAllocator.init(storage);
+            var fixture: Fixture = .{};
+            var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(2) });
+            defer threaded.deinit();
+            const io = threaded.io();
+            var source = ProvisionedTableReadSource.init("unused", undefined, undefined);
+            source.local_read_source = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .text_stats_group_local = Fixture.textStats } };
+            try std.testing.expectError(error.OutOfMemory, collectProvisionedSearchRequestTextStatsParallel(
+                &source,
+                quota.allocator(),
+                io,
+                2,
+                &.{ 1, 2 },
+                "docs",
+                "{}",
+            ));
+            try std.testing.expectEqual(@as(usize, 2), fixture.calls.load(.acquire));
+
+            const larger_storage = try std.testing.allocator.alloc(u8, 2 * 1024 * 1024);
+            defer std.testing.allocator.free(larger_storage);
+            var larger_quota = std.heap.FixedBufferAllocator.init(larger_storage);
+            const merged = try collectProvisionedSearchRequestTextStatsParallel(
+                &source,
+                larger_quota.allocator(),
+                io,
+                2,
+                &.{ 1, 2 },
+                "docs",
+                "{}",
+            );
+            defer distributed_stats_mod.deinitTextFieldStats(larger_quota.allocator(), merged);
+            try std.testing.expectEqual(@as(usize, 0), merged.len);
+            try std.testing.expectEqual(@as(usize, 4), fixture.calls.load(.acquire));
         }
 
         test "merge distributed text stats sums shard corpus stats by field and term" {

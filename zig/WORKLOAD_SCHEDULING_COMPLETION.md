@@ -341,9 +341,11 @@ replica progress'`. Evidence: `/tmp/workload-invalid-participant-data1.log`.
 | --- | --- | --- |
 | Public joined query through `distributed_join.executeSupportedJoinedPublicTableQueryRequest` and `appendJoinReadJobs` | Up to eight right-side reads use per-worker result arenas backed by one synchronized wrapper over the caller's request allocator. Parsed responses stay in those arenas; cloned hits and final output use the same caller allocator. | Each wave joins before inspecting errors, cloning hits, or releasing arenas. A late failed wave publishes no partial join. The focused join gate passed 2/2, including a 1 MiB quota against two 600 KiB worker allocations, with no leaks. |
 | Relational transaction preparation through `relational_integrity_commit.prepareModeInternal` and `Builder.preloadWork` | The preparation arena uses the caller allocator. Up to eight primary-read response arenas share a synchronized wrapper over that preparation allocator; successful observations are copied into builder work only after the wave succeeds. | The worker wave joins before the request deadline/cancellation check, local-admission retry, and work publication. The API transaction gate passed 96/96, including a 1 MiB quota against two 600 KiB lookup responses and existing retry/cancellation tests, with no leaks. |
+| Distributed text-stat collection through `table_reads.collectProvisionedSearchRequestTextStatsParallel` and its hosted variant | Per-shard response and decoded-field arenas now share a synchronized wrapper over the caller allocator; merged stats use that same caller allocator. | Every wave joins before error inspection and merge. The focused quota gate passed 1/1 with a 1 MiB caller budget and two 600 KiB worker allocations, with no leaks. These helpers do not yet make an explicit post-wave request-cancellation check. |
 
-These are scoped ownership proofs for the named paths. Other query operators,
-background helpers, and real mixed-runtime saturation remain item-7 work.
+These are scoped ownership proofs for the named paths. Search and preflight
+fanout slot arenas remain page-backed; other query operators, background
+helpers, and real mixed-runtime saturation remain item-7 work.
 
 ## Current integration evidence and boundaries
 
