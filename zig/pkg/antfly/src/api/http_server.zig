@@ -13156,6 +13156,7 @@ pub const ApiHttpServer = struct {
             error.PortableImportRecoveryRequired,
             error.PortableRuntimeActivationPending,
             error.StorageBusy,
+            error.StorageKernelOwnerStaleDescriptor,
             error.StorageReadTemporarilyUnavailable,
             error.RestoreStagingInProgress,
             error.ConcurrencyUnavailable,
@@ -13316,16 +13317,16 @@ pub const ApiHttpServer = struct {
         while (true) {
             try ensureTableOperationActive(request);
             return source.lookup(alloc, table_name, key, opts, consistency) catch |err| switch (err) {
-                error.StorageReadTemporarilyUnavailable => {
+                error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor => {
                     const now_ns = retryMonotonicNs(retry_io);
-                    if (retry_timeout_ns == 0) return err;
+                    if (retry_timeout_ns == 0) return error.StorageReadTemporarilyUnavailable;
                     const sleep_ns = boundedRetrySleepNs(
                         retry_deadline_ns,
                         now_ns,
                         start_ns,
                         retry_timeout_ns,
                         retry_poll_ns,
-                    ) orelse return err;
+                    ) orelse return error.StorageReadTemporarilyUnavailable;
                     if (sleep_ns == 0) return error.DeadlineExceeded;
                     try sleepNsCancellable(retry_io, sleep_ns, request.cancellation);
                     continue;
@@ -13462,6 +13463,7 @@ pub const ApiHttpServer = struct {
                 error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
                 error.PersistentDescriptorAdmissionExhausted,
                 error.StorageBusy,
+                error.StorageKernelOwnerStaleDescriptor,
                 error.StorageReadTemporarilyUnavailable,
                 error.ConcurrencyUnavailable,
                 => return error.StorageReadTemporarilyUnavailable,
@@ -13538,6 +13540,7 @@ pub const ApiHttpServer = struct {
             error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageBusy,
+            error.StorageKernelOwnerStaleDescriptor,
             error.StorageReadTemporarilyUnavailable,
             error.ConcurrencyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
@@ -13646,6 +13649,7 @@ pub const ApiHttpServer = struct {
             error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageBusy,
+            error.StorageKernelOwnerStaleDescriptor,
             error.StorageReadTemporarilyUnavailable,
             error.ConcurrencyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
@@ -16154,7 +16158,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
@@ -16180,7 +16184,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest list failed table={s} doc={s} err={}", .{ table_name, doc_key, err });
@@ -19372,7 +19376,7 @@ pub const ApiHttpServer = struct {
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .read_requires_primary),
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .standby_read_unavailable),
             error.DistributedQueryUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .distributed_query_unavailable),
-            error.StorageBusy, error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
+            error.StorageBusy, error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor, error.ConcurrencyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
             error.InvalidManifest,
             error.InvalidTableFile,
             error.TableBlockChecksumMismatch,
@@ -28514,6 +28518,7 @@ test "api http point lookup retries bounded local readiness races" {
     };
     const FakeReads = struct {
         attempts: u32 = 0,
+        first_error: anyerror = error.StorageReadTemporarilyUnavailable,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{ .ptr = self, .vtable = &.{
@@ -28535,7 +28540,7 @@ test "api http point lookup retries bounded local readiness races" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("doc:1", key);
             self.attempts += 1;
-            if (self.attempts == 1) return error.StorageReadTemporarilyUnavailable;
+            if (self.attempts == 1) return self.first_error;
             return .{
                 .json = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
                 .version = 7,
@@ -28560,29 +28565,45 @@ test "api http point lookup retries bounded local readiness races" {
         }
     };
 
-    var reads = FakeReads{};
-    var server = ApiHttpServer.init(
+    for ([_]anyerror{ error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor }) |first_error| {
+        var reads = FakeReads{ .first_error = first_error };
+        var server = ApiHttpServer.init(
+            std.testing.allocator,
+            .{},
+            FakeStatus.source(),
+            reads.source(),
+            DummyWrites.source(),
+        );
+        defer server.deinit();
+        var response = (try server.lookupWithReadinessRetry(
+            std.testing.allocator,
+            reads.source(),
+            "docs",
+            "doc:1",
+            .{},
+            .read_index,
+            .{},
+        )).?;
+        defer response.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+        try std.testing.expectEqual(@as(u64, 7), response.version);
+        try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", response.json);
+    }
+
+    var stale_reads = FakeReads{ .first_error = error.StorageKernelOwnerStaleDescriptor };
+    var read_only_server = ApiHttpServer.init(std.testing.allocator, .{}, FakeStatus.source(), stale_reads.source(), null);
+    defer read_only_server.deinit();
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, read_only_server.lookupWithReadinessRetry(
         std.testing.allocator,
-        .{},
-        FakeStatus.source(),
-        reads.source(),
-        DummyWrites.source(),
-    );
-    defer server.deinit();
-    var response = (try server.lookupWithReadinessRetry(
-        std.testing.allocator,
-        reads.source(),
+        stale_reads.source(),
         "docs",
         "doc:1",
         .{},
         .read_index,
         .{},
-    )).?;
-    defer response.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
-    try std.testing.expectEqual(@as(u64, 7), response.version);
-    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", response.json);
+    ));
+    try std.testing.expectEqual(@as(u32, 1), stale_reads.attempts);
 }
 
 test "api http transient read retry honors expired request deadline before source query" {
@@ -40115,6 +40136,8 @@ test "api http server preserves public query availability errors" {
                     .lookup = lookup,
                     .scan = scan,
                     .query = query,
+                    .document_artifact_manifest = artifactManifest,
+                    .document_artifact_manifests = artifactManifests,
                 },
             };
         }
@@ -40153,6 +40176,16 @@ test "api http server preserves public query availability errors" {
             try std.testing.expectEqualStrings("docs", table_name);
             return self.query_error;
         }
+
+        fn artifactManifest(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.query_error;
+        }
+
+        fn artifactManifests(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.query_error;
+        }
     };
 
     const cases = [_]struct {
@@ -40169,6 +40202,7 @@ test "api http server preserves public query availability errors" {
         .{ .query_error = error.DistributedQueryUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
         .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "", .json = true, .unavailable_code = "read_requires_primary", .unavailable_message = "read requires primary" },
         .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
+        .{ .query_error = error.StorageKernelOwnerStaleDescriptor, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
         .{ .query_error = error.StorageBusy, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
         .{ .query_error = error.IndexRebuilding, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
         .{ .query_error = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
@@ -40183,6 +40217,11 @@ test "api http server preserves public query availability errors" {
         var reads = FakeReads{ .query_error = case.query_error };
         var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
         defer server.deinit();
+
+        if (case.query_error == error.StorageKernelOwnerStaleDescriptor) {
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ApiHttpServer.executePublicDocumentArtifactManifest(&server, alloc, "docs", "doc:a", "chunks", .{}));
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ApiHttpServer.executePublicDocumentArtifactManifests(&server, alloc, "docs", "doc:a", .{}));
+        }
 
         var resp = try server.handlePublicTableQuery("docs",
             \\{"query":{"match_all":{}}}
