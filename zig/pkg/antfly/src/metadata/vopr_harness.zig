@@ -4904,9 +4904,13 @@ pub const MetadataHttpClusterVopr = struct {
     ) !bool {
         var rounds: usize = 0;
         while (rounds < max_rounds) : (rounds += 1) {
+            // Predicates may inspect every node before stepAll has a chance
+            // to reject a slot left empty by a failed replacement.
+            for (self.cluster.node_live) |live| if (!live) return error.SimulationNodeUnavailable;
             if (try predicate(self, context)) return true;
             try self.stepAll();
         }
+        for (self.cluster.node_live) |live| if (!live) return error.SimulationNodeUnavailable;
         return try predicate(self, context);
     }
 
@@ -4988,6 +4992,7 @@ pub const MetadataHttpClusterVopr = struct {
         desired: raft_host.HostedReplicaStatus,
         max_rounds: usize,
     ) !bool {
+        if (index >= self.cluster.nodes.len) return error.InvalidNodeIndex;
         var ctx = MetadataNodeGroupStatusProgressContext{
             .index = index,
             .group_id = group_id,
@@ -5507,6 +5512,9 @@ test "metadata wrapper rejects empty node startup and restores external ownershi
     try std.testing.expect(!cluster.cluster.node_live[0]);
     try std.testing.expectEqual(@as(usize, 0), cluster.virtual_network.routes.count());
     try std.testing.expectError(error.SimulationNodeUnavailable, cluster.startAll());
+    try std.testing.expectError(error.SimulationNodeUnavailable, cluster.waitForGroupStatus(1, .active, 1));
+    try std.testing.expectError(error.SimulationNodeUnavailable, cluster.waitForNodeGroupStatus(0, 1, .active, 0));
+    try std.testing.expectError(error.InvalidNodeIndex, cluster.waitForNodeGroupStatus(1, 1, .active, 0));
     cluster.setDataPlaneOwnership(.external);
 
     failing.fail_index = std.math.maxInt(usize);
