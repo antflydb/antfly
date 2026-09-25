@@ -75,7 +75,11 @@ const distributed_txn = @import("distributed_txn.zig");
 const distributed_txn_contract = @import("distributed_txn_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
+const research_agent = @import("research_agent.zig");
+const research_jobs = @import("research_jobs.zig");
 const web_search = @import("web_search.zig");
+const web_fetch = @import("web_fetch.zig");
+const scraping = @import("antfly_scraping");
 const generating_runtime = @import("../generating/mod.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
@@ -642,6 +646,207 @@ test "httpx retrieval SSE writes before generation and preserves terminal outcom
         try std.testing.expectEqual(state.fail_generation, std.mem.indexOf(u8, state.bytes.items, "GenerationFailed") != null);
         if (!state.fail_generation) try std.testing.expect(std.mem.indexOf(u8, state.bytes.items, "한국어") != null);
     }
+}
+
+/// Request-scoped database, web and fetch capabilities for native agents.
+/// Shared by the retrieval and research handlers so both run under the same
+/// authorization, deadline and cancellation.
+const AgentQueryRunner = struct {
+    server: *ApiHttpServer,
+    source: table_reads.TableReadSource,
+    query_embedding_security_scope: ApiHttpServer.QueryEmbeddingSecurityScope,
+    authenticated_identity: ?AuthenticatedIdentity,
+    request_context: managed_embedder.RequestContext,
+
+    fn iface(runner: *@This()) retrieval_agent.QueryRunner {
+        return .{
+            .ptr = runner,
+            .vtable = &.{
+                .build_query = buildQuery,
+                .authorize_query = authorizeQuery,
+                .run_query = runQuery,
+                .prepare_web_search = prepareWebSearch,
+                .web_search = searchWeb,
+                .fetch_url = fetchUrl,
+                .scan_key_page = runScanKeyPage,
+                .probe_incoming_edges = probeIncomingEdges,
+            },
+            .io = runner.server.agentConcurrencyIo(),
+        };
+    }
+
+    fn fetchUrl(ptr: *anyopaque, arena: std.mem.Allocator, config: web_fetch.Config, url: []const u8) !web_fetch.Download {
+        const runner: *@This() = @ptrCast(@alignCast(ptr));
+        try runner.request_context.check();
+        return fetchAgentUrl(arena, runner.request_context, config, url);
+    }
+
+    fn prepareWebSearch(ptr: *anyopaque, arena: std.mem.Allocator, options: web_search.Options) !web_search.Config {
+        const runner: *@This() = @ptrCast(@alignCast(ptr));
+        return web_search.resolve(arena, runner.server.cfg.node_config, options);
+    }
+
+    fn searchWeb(ptr: *anyopaque, arena: std.mem.Allocator, config: web_search.Config, query: []const u8) ![]const metadata_openapi.QueryHit {
+        const runner: *@This() = @ptrCast(@alignCast(ptr));
+        try runner.request_context.check();
+        var client = httpx.Client.initWithConfig(arena, runner.request_context.io, .{ .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        const cancellation = if (runner.request_context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null;
+        return web_search.search(arena, &client, runner.server.cfg.secret_store, config, query, runner.request_context.deadline_ns orelse (platform_time.monotonicNs() +| config.timeout_ms * std.time.ns_per_ms), cancellation);
+    }
+
+    fn buildQuery(ptr: *anyopaque, a: std.mem.Allocator, request: metadata_openapi.QueryBuilderRequest, generator: query_builder_agent.GenerationRunner) !metadata_openapi.QueryBuilderResult {
+        const runner: *@This() = @ptrCast(@alignCast(ptr));
+        return runner.server.buildRetrievalQuery(a, request, runner.authenticated_identity, runner.request_context, generator);
+    }
+
+    fn authorizeQuery(
+        ptr: *anyopaque,
+        table_name: []const u8,
+        discovers_tree_roots: bool,
+    ) !void {
+        const runner: *@This() = @ptrCast(@alignCast(ptr));
+        const identity = runner.authenticated_identity orelse return;
+        if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
+            return error.Forbidden;
+        // Physical reverse-index probes do not carry row filters. Keep
+        // explicit-key and query-seeded tree traversal available, but
+        // fail closed for structural root discovery.
+        if (discovers_tree_roots and http_server_mod.effectiveRowFilterJson(identity, table_name) != null)
+            return error.Forbidden;
+    }
+
+    fn runQuery(
+        ptr: *anyopaque,
+        a: std.mem.Allocator,
+        table_name: []const u8,
+        query_json: []const u8,
+    ) !query_api.QueryResponse {
+        const runner: *@This() = @ptrCast(@alignCast(ptr));
+        try runner.request_context.check();
+        return runner.server.executeCatalogRetrievalQuery(a, .{
+            .deadline_ns = runner.request_context.deadline_ns,
+            .cancellation = runner.request_context.cancellation orelse .none,
+        }, table_name, query_json, runner.authenticated_identity);
+    }
+
+    fn runScanKeyPage(
+        ptr: *anyopaque,
+        a: std.mem.Allocator,
+        logical_name: []const u8,
+        after_key: []const u8,
+        limit: u32,
+        filter_query_json: ?[]const u8,
+        exclusion_query_json: ?[]const u8,
+    ) !retrieval_agent.QueryRunner.KeyPage {
+        const runner: *@This() = @ptrCast(@alignCast(ptr));
+        try runner.request_context.check();
+        var catalog_identity = try http_server_mod.cloneCatalogIdentity(runner.server.alloc, runner.authenticated_identity);
+        defer if (catalog_identity) |*owned| owned.deinit(runner.server.alloc);
+        const table_name = try runner.server.resolveCatalogNameAlloc(a, .{
+            .deadline_ns = runner.request_context.deadline_ns,
+            .cancellation = runner.request_context.cancellation orelse .none,
+        }, logical_name, &catalog_identity);
+        defer a.free(table_name);
+        if (catalog_identity) |identity| {
+            if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
+                return error.Forbidden;
+        }
+        return try runner.server.scanRetrievalKeyPage(
+            a,
+            runner.source,
+            table_name,
+            after_key,
+            limit,
+            filter_query_json,
+            exclusion_query_json,
+            catalog_identity,
+        );
+    }
+
+    fn probeIncomingEdges(
+        ptr: *anyopaque,
+        a: std.mem.Allocator,
+        logical_name: []const u8,
+        index_name: []const u8,
+        keys: []const []const u8,
+    ) ![]bool {
+        const runner: *@This() = @ptrCast(@alignCast(ptr));
+        try runner.request_context.check();
+        var catalog_identity = try http_server_mod.cloneCatalogIdentity(runner.server.alloc, runner.authenticated_identity);
+        defer if (catalog_identity) |*owned| owned.deinit(runner.server.alloc);
+        const table_name = try runner.server.resolveCatalogNameAlloc(a, .{
+            .deadline_ns = runner.request_context.deadline_ns,
+            .cancellation = runner.request_context.cancellation orelse .none,
+        }, logical_name, &catalog_identity);
+        defer a.free(table_name);
+        if (catalog_identity) |identity| {
+            if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
+                return error.Forbidden;
+            if (http_server_mod.effectiveRowFilterJson(identity, table_name) != null)
+                return error.Forbidden;
+        }
+        return try runner.server.probeRetrievalIncomingEdges(
+            a,
+            runner.source,
+            table_name,
+            index_name,
+            keys,
+        );
+    }
+};
+
+/// Request-scoped generation for native agents. Every model round is a
+/// cancellation and deadline boundary.
+const AgentGenerationRunner = struct {
+    antfly_provider: ?managed_embedder.AntflyProvider,
+    secret_store: ?*common_secrets.FileStore,
+    io: std.Io,
+    request_context: managed_embedder.RequestContext,
+    inference_api_key: ?[]const u8,
+
+    fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
+        return .{
+            .ptr = runner,
+            .vtable = &.{ .execute_chain = executeChain },
+        };
+    }
+
+    fn executeChain(
+        ptr: *anyopaque,
+        a: std.mem.Allocator,
+        chain: []const generating_runtime.ChainLink,
+        messages: []const generating_runtime.ChatMessage,
+    ) !generating_runtime.GenerateResult {
+        const runner: *@This() = @ptrCast(@alignCast(ptr));
+        // Each model round is a cancellation and deadline boundary.
+        try runner.request_context.check();
+        var client = httpx.Client.initWithConfig(a, runner.io, .{ .keep_alive = false });
+        defer client.deinit();
+        return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .request_context = runner.request_context }, messages);
+    }
+};
+
+/// Agent fetch downloads use the shared remote-content controls with
+/// private-address blocking always on. Admission (allowed hosts or earlier
+/// search results) happened before this call; redirects are re-validated
+/// per hop by the downloader.
+fn fetchAgentUrl(arena: std.mem.Allocator, request_context: managed_embedder.RequestContext, config: web_fetch.Config, url: []const u8) !web_fetch.Download {
+    const security = scraping.ContentSecurityConfig{
+        .block_private_ips = true,
+        .max_download_size_bytes = config.max_download_bytes,
+        .download_timeout_seconds = @intCast(@max(1, config.timeout_ms / std.time.ms_per_s)),
+    };
+    const remaining_ms = (try request_context.remainingTimeoutMs()) orelse config.timeout_ms;
+    const outcome = try scraping.downloadContentOutcomeAllocWithContext(arena, .{
+        .io = request_context.io,
+        .timeout_ms = @min(config.timeout_ms, remaining_ms),
+        .cancellation = if (request_context.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null,
+    }, url, &security, null);
+    return switch (outcome) {
+        .ok => |downloaded| .{ .content_type = downloaded.content_type, .data = downloaded.data },
+        .http_error => error.FetchHttpError,
+    };
 }
 
 pub const AntflyApiHandler = struct {
@@ -5026,9 +5231,21 @@ pub const AntflyApiHandler = struct {
     }
 
     fn agentRequestContext(self: *AntflyApiHandler, ctx: *httpx.Context) managed_embedder.RequestContext {
+        return self.agentRequestContextWithTimeout(ctx, null);
+    }
+
+    /// Agent deadline: the transport deadline when present, otherwise the
+    /// agent's declared budget (default five minutes). A declared budget never
+    /// extends a transport deadline.
+    fn agentRequestContextWithTimeout(self: *AntflyApiHandler, ctx: *httpx.Context, timeout_ms: ?u64) managed_embedder.RequestContext {
+        const now = platform_time.monotonicNs();
+        const deadline_ns = if (timeout_ms) |ms| blk: {
+            const declared = now +| ms *| std.time.ns_per_ms;
+            break :blk if (ctx.application_deadline_ns) |transport| @min(transport, declared) else declared;
+        } else ctx.application_deadline_ns orelse now +| 5 * std.time.ns_per_min;
         return .{
             .io = self.api_server.inferenceIo(),
-            .deadline_ns = ctx.application_deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
+            .deadline_ns = deadline_ns,
             .cancellation = .{ .ptr = ctx, .is_cancelled_fn = struct {
                 fn cancelled(raw: *const anyopaque) bool {
                     const context: *const httpx.Context = @ptrCast(@alignCast(raw));
@@ -5059,169 +5276,8 @@ pub const AntflyApiHandler = struct {
         if (try self.acquirePublicOperation(ctx, "retrievalAgent")) |response| return response;
         defer self.releasePublicOperation("retrievalAgent");
 
-        const RetrievalQueryRunner = struct {
-            server: *ApiHttpServer,
-            source: table_reads.TableReadSource,
-            query_embedding_security_scope: ApiHttpServer.QueryEmbeddingSecurityScope,
-            authenticated_identity: ?AuthenticatedIdentity,
-            request_context: managed_embedder.RequestContext,
-
-            fn iface(runner: *@This()) retrieval_agent.QueryRunner {
-                return .{
-                    .ptr = runner,
-                    .vtable = &.{
-                        .build_query = buildQuery,
-                        .authorize_query = authorizeQuery,
-                        .run_query = runQuery,
-                        .prepare_web_search = prepareWebSearch,
-                        .web_search = searchWeb,
-                        .scan_key_page = runScanKeyPage,
-                        .probe_incoming_edges = probeIncomingEdges,
-                    },
-                };
-            }
-
-            fn prepareWebSearch(ptr: *anyopaque, arena: std.mem.Allocator, options: web_search.Options) !web_search.Config {
-                const runner: *@This() = @ptrCast(@alignCast(ptr));
-                return web_search.resolve(arena, runner.server.cfg.node_config, options);
-            }
-
-            fn searchWeb(ptr: *anyopaque, arena: std.mem.Allocator, config: web_search.Config, query: []const u8) ![]const metadata_openapi.QueryHit {
-                const runner: *@This() = @ptrCast(@alignCast(ptr));
-                try runner.request_context.check();
-                var client = httpx.Client.initWithConfig(arena, runner.request_context.io, .{ .retry_policy = .{ .max_retries = 0 } });
-                defer client.deinit();
-                const cancellation = if (runner.request_context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null;
-                return web_search.search(arena, &client, runner.server.cfg.secret_store, config, query, runner.request_context.deadline_ns orelse (platform_time.monotonicNs() +| config.timeout_ms * std.time.ns_per_ms), cancellation);
-            }
-
-            fn buildQuery(ptr: *anyopaque, a: std.mem.Allocator, request: metadata_openapi.QueryBuilderRequest, generator: query_builder_agent.GenerationRunner) !metadata_openapi.QueryBuilderResult {
-                const runner: *@This() = @ptrCast(@alignCast(ptr));
-                return runner.server.buildRetrievalQuery(a, request, runner.authenticated_identity, runner.request_context, generator);
-            }
-
-            fn authorizeQuery(
-                ptr: *anyopaque,
-                table_name: []const u8,
-                discovers_tree_roots: bool,
-            ) !void {
-                const runner: *@This() = @ptrCast(@alignCast(ptr));
-                const identity = runner.authenticated_identity orelse return;
-                if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
-                    return error.Forbidden;
-                // Physical reverse-index probes do not carry row filters. Keep
-                // explicit-key and query-seeded tree traversal available, but
-                // fail closed for structural root discovery.
-                if (discovers_tree_roots and http_server_mod.effectiveRowFilterJson(identity, table_name) != null)
-                    return error.Forbidden;
-            }
-
-            fn runQuery(
-                ptr: *anyopaque,
-                a: std.mem.Allocator,
-                table_name: []const u8,
-                query_json: []const u8,
-            ) !query_api.QueryResponse {
-                const runner: *@This() = @ptrCast(@alignCast(ptr));
-                try runner.request_context.check();
-                return runner.server.executeCatalogRetrievalQuery(a, .{
-                    .deadline_ns = runner.request_context.deadline_ns,
-                    .cancellation = runner.request_context.cancellation orelse .none,
-                }, table_name, query_json, runner.authenticated_identity);
-            }
-
-            fn runScanKeyPage(
-                ptr: *anyopaque,
-                a: std.mem.Allocator,
-                logical_name: []const u8,
-                after_key: []const u8,
-                limit: u32,
-                filter_query_json: ?[]const u8,
-                exclusion_query_json: ?[]const u8,
-            ) !retrieval_agent.QueryRunner.KeyPage {
-                const runner: *@This() = @ptrCast(@alignCast(ptr));
-                try runner.request_context.check();
-                var catalog_identity = try http_server_mod.cloneCatalogIdentity(runner.server.alloc, runner.authenticated_identity);
-                defer if (catalog_identity) |*owned| owned.deinit(runner.server.alloc);
-                const table_name = try runner.server.resolveCatalogNameAlloc(a, .{
-                    .deadline_ns = runner.request_context.deadline_ns,
-                    .cancellation = runner.request_context.cancellation orelse .none,
-                }, logical_name, &catalog_identity);
-                defer a.free(table_name);
-                if (catalog_identity) |identity| {
-                    if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
-                        return error.Forbidden;
-                }
-                return try runner.server.scanRetrievalKeyPage(
-                    a,
-                    runner.source,
-                    table_name,
-                    after_key,
-                    limit,
-                    filter_query_json,
-                    exclusion_query_json,
-                    catalog_identity,
-                );
-            }
-
-            fn probeIncomingEdges(
-                ptr: *anyopaque,
-                a: std.mem.Allocator,
-                logical_name: []const u8,
-                index_name: []const u8,
-                keys: []const []const u8,
-            ) ![]bool {
-                const runner: *@This() = @ptrCast(@alignCast(ptr));
-                try runner.request_context.check();
-                var catalog_identity = try http_server_mod.cloneCatalogIdentity(runner.server.alloc, runner.authenticated_identity);
-                defer if (catalog_identity) |*owned| owned.deinit(runner.server.alloc);
-                const table_name = try runner.server.resolveCatalogNameAlloc(a, .{
-                    .deadline_ns = runner.request_context.deadline_ns,
-                    .cancellation = runner.request_context.cancellation orelse .none,
-                }, logical_name, &catalog_identity);
-                defer a.free(table_name);
-                if (catalog_identity) |identity| {
-                    if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
-                        return error.Forbidden;
-                    if (http_server_mod.effectiveRowFilterJson(identity, table_name) != null)
-                        return error.Forbidden;
-                }
-                return try runner.server.probeRetrievalIncomingEdges(
-                    a,
-                    runner.source,
-                    table_name,
-                    index_name,
-                    keys,
-                );
-            }
-        };
-
-        const RetrievalGenerationRunner = struct {
-            antfly_provider: ?managed_embedder.AntflyProvider,
-            secret_store: ?*common_secrets.FileStore,
-            io: std.Io,
-            request_context: managed_embedder.RequestContext,
-            inference_api_key: ?[]const u8,
-
-            fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
-                return .{
-                    .ptr = runner,
-                    .vtable = &.{ .execute_chain = executeChain },
-                };
-            }
-
-            fn executeChain(
-                ptr: *anyopaque,
-                a: std.mem.Allocator,
-                chain: []const generating_runtime.ChainLink,
-                messages: []const generating_runtime.ChatMessage,
-            ) !generating_runtime.GenerateResult {
-                const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var client = httpx.Client.initWithConfig(a, runner.io, .{ .keep_alive = false });
-                defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .request_context = runner.request_context }, messages);
-            }
-        };
+        const RetrievalQueryRunner = AgentQueryRunner;
+        const RetrievalGenerationRunner = AgentGenerationRunner;
         var generation_runner = RetrievalGenerationRunner{
             .antfly_provider = self.api_server.antfly_provider,
             .secret_store = self.api_server.cfg.secret_store,
@@ -5323,6 +5379,236 @@ pub const AntflyApiHandler = struct {
             .allocate = .alloc_always,
         });
         return ctx.openApiJson(response);
+    }
+
+    const AgentRunners = struct {
+        query: AgentQueryRunner,
+        generation: AgentGenerationRunner,
+
+        fn setContext(self: *AgentRunners, context: managed_embedder.RequestContext) void {
+            self.query.request_context = context;
+            self.generation.request_context = context;
+        }
+    };
+
+    fn agentRunners(self: *AntflyApiHandler, ctx: *httpx.Context, source: table_reads.TableReadSource, identity: ?AuthenticatedIdentity, timeout_ms: ?u64) AgentRunners {
+        const request_context = self.agentRequestContextWithTimeout(ctx, timeout_ms);
+        return .{
+            .query = .{
+                .server = self.api_server,
+                .source = source,
+                .query_embedding_security_scope = ApiHttpServer.queryEmbeddingSecurityScope(identity),
+                .authenticated_identity = identity,
+                .request_context = request_context,
+            },
+            .generation = .{
+                .antfly_provider = self.api_server.antfly_provider,
+                .secret_store = self.api_server.cfg.secret_store,
+                .io = self.api_server.inferenceIo(),
+                .request_context = request_context,
+                .inference_api_key = self.api_server.cfg.inference_api_key,
+            },
+        };
+    }
+
+    fn researchErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.InvalidResearchAgentRequest, error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => jsonErrorResponse(ctx, 400, "invalid research agent request"),
+            error.InlineCredentialNotAllowed => jsonErrorResponse(ctx, 400, "durable research jobs must reference credentials through the secret store, environment or server connections"),
+            error.InvalidResearchState => jsonErrorResponse(ctx, 400, "research_state was modified or issued by another server; send it back unmodified, or use durable jobs to resume across restarts"),
+            error.UnsupportedAgentToolProvider => jsonErrorResponse(ctx, 400, "agent tools require an Antfly or OpenAI tool-capable generator"),
+            error.MissingGenerationConfig => jsonErrorResponse(ctx, 422, "research requires a top-level generator or chain, or generators for plan, research and write"),
+            error.Forbidden => jsonErrorResponse(ctx, 403, "forbidden"),
+            error.TableNotFound => jsonErrorResponse(ctx, 404, "not found"),
+            error.TooManyActiveJobs => jsonErrorResponse(ctx, 429, "too many active research jobs"),
+            error.RateLimit => jsonErrorResponse(ctx, 429, "agent generation rate limited"),
+            error.GenerateRequestFailed, error.EmptyResponse => jsonErrorResponse(ctx, 502, "agent generation failed"),
+            error.GenerationCapacityUnavailable => blk: {
+                try ctx.setHeader("Retry-After", "1");
+                break :blk ctx.status(503).json(connections_api.generationCapacityFailure());
+            },
+            else => {
+                if (try respondQueryOperationalError(ctx, err)) |response| return response;
+                std.log.err("public research failed err={}", .{err});
+                return err;
+            },
+        };
+    }
+
+    fn researchOwner(identity: ?AuthenticatedIdentity) []const u8 {
+        return if (identity) |value| value.username else "";
+    }
+
+    fn researchJobResponse(ctx: *httpx.Context, status: u16, record: research_jobs.Record) !httpx.Response {
+        const encoded = try research_jobs.jobJson(ctx.allocator, record);
+        if (status == 202) {
+            try ctx.setHeader("Location", try std.fmt.allocPrint(ctx.allocator, "/db/v1/agents/research/jobs/{s}", .{record.job_id}));
+            try ctx.setHeader("Retry-After", "1");
+        }
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.status(status);
+        _ = ctx.response.body(encoded);
+        return ctx.response.build();
+    }
+
+    pub fn researchAgent(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var diagnostic_context: query_request_diagnostics.Context = .{};
+        const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
+        defer diagnostic_scope.deinit();
+        query_request_diagnostics.reset();
+
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const source = self.api_server.table_reads orelse return jsonErrorResponse(ctx, 404, "not found");
+        const body_data = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "invalid research agent request");
+        if (try self.acquirePublicOperation(ctx, "researchAgent")) |response| return response;
+        defer self.releasePublicOperation("researchAgent");
+
+        var runners = self.agentRunners(ctx, source, authenticated_identity, research_agent.deadlineMs(alloc, body_data));
+        var sink = RetrievalSseSink{ .context = ctx };
+        const response = research_agent.execute(alloc, runners.query.iface(), runners.generation.iface(), body_data, sink.iface(), .{
+            .deadline_ns = runners.generation.request_context.deadline_ns,
+            .state_key = try self.api_server.researchStateKey(ctx.io),
+        }) catch |err| {
+            if (sink.writer != null) {
+                if (sink.failed or ctx.isCancellationRequested()) return err;
+                try sink.emitError();
+                try sink.close();
+                return ctx.response.build();
+            }
+            return researchErrorResponse(ctx, err);
+        };
+        defer alloc.free(response.body);
+        if (sink.writer != null) {
+            try sink.close();
+            return ctx.response.build();
+        }
+        try ctx.setHeader("content-type", response.content_type);
+        _ = ctx.response.body(response.body);
+        return ctx.response.build();
+    }
+
+    pub fn startResearchJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const source = self.api_server.table_reads orelse return jsonErrorResponse(ctx, 404, "not found");
+        const body_data = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "invalid research job request");
+        if (try self.acquirePublicOperation(ctx, "startResearchJob")) |response| return response;
+        defer self.releasePublicOperation("startResearchJob");
+
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+        const start = std.json.parseFromSliceLeaky(metadata_openapi.ResearchJobStartRequest, arena, body_data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch
+            return jsonErrorResponse(ctx, 400, "invalid research job request");
+        const raw = std.json.parseFromSliceLeaky(std.json.Value, arena, body_data, .{ .allocate = .alloc_always }) catch
+            return jsonErrorResponse(ctx, 400, "invalid research job request");
+        const raw_request = raw.object.get("request") orelse return jsonErrorResponse(ctx, 400, "invalid research job request");
+        research_jobs.validateRequest(arena, raw_request) catch |err| return researchErrorResponse(ctx, err);
+        const request_json = try research_jobs.normalizeRequest(arena, raw_request);
+        // Validate and authorize now so a bad job fails at creation.
+        const parsed = research_agent.parseRequest(arena, request_json) catch |err| return researchErrorResponse(ctx, err);
+        _ = research_agent.Budget.fromRequest(parsed.request.budget) catch |err| return researchErrorResponse(ctx, err);
+        // A job's stored state is trusted from here on, so a client-carried
+        // checkpoint must verify before it is stored.
+        research_agent.verifyRequestState(arena, parsed, try self.api_server.researchStateKey(ctx.io)) catch |err| return researchErrorResponse(ctx, err);
+        var runners = self.agentRunners(ctx, source, authenticated_identity, research_agent.deadlineMs(arena, request_json));
+        for (parsed.request.queries) |query| {
+            const table = query.table orelse return jsonErrorResponse(ctx, 400, "invalid research job request");
+            runners.query.iface().authorizeQuery(table, false) catch |err| return researchErrorResponse(ctx, err);
+        }
+
+        var entropy: [16]u8 = undefined;
+        try ctx.io.randomSecure(&entropy);
+        var id_buf: [36]u8 = undefined;
+        const job_id = research_jobs.formatJobId(&id_buf, entropy);
+        const owner = researchOwner(authenticated_identity);
+        const created = self.api_server.research_job_store.create(alloc, job_id, owner, start.request.query, request_json) catch |err| return researchErrorResponse(ctx, err);
+        alloc.free(created);
+        const phases: usize = @intCast(std.math.clamp(start.advance orelse 0, 0, 10));
+        const record = if (phases > 0)
+            try self.advanceStoredResearchJob(ctx, arena, &runners, job_id, owner, phases)
+        else
+            (try self.api_server.research_job_store.load(arena, job_id, owner)).?;
+        return researchJobResponse(ctx, 202, record);
+    }
+
+    /// Claim, run and checkpoint up to `phases` phases. The lease covers the
+    /// longest permitted pass so a crashed advance is superseded, never a
+    /// live one.
+    fn advanceStoredResearchJob(self: *AntflyApiHandler, ctx: *httpx.Context, arena: std.mem.Allocator, runners: *AgentRunners, job_id: []const u8, owner: []const u8, phases: usize) !research_jobs.Record {
+        const store = &self.api_server.research_job_store;
+        const lease_ms = research_agent.max_deadline_ms + 60_000;
+        const claim = (try store.begin(arena, job_id, owner, lease_ms)) orelse return error.NotFound;
+        const claimed = switch (claim) {
+            .started => |record| record,
+            .terminal, .busy => |record| return record,
+        };
+        const deadline_ms = research_agent.deadlineMs(arena, claimed.request);
+        runners.setContext(self.agentRequestContextWithTimeout(ctx, deadline_ms));
+        return research_jobs.advanceClaimed(store, arena, runners.query.iface(), runners.generation.iface(), claimed, phases, runners.query.request_context.deadline_ns, lease_ms);
+    }
+
+    pub fn getResearchJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (!research_jobs.validJobId(job_id)) return jsonErrorResponse(ctx, 404, "not found");
+        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena_impl.deinit();
+        const record = (try self.api_server.research_job_store.load(arena_impl.allocator(), job_id, researchOwner(authenticated_identity))) orelse
+            return jsonErrorResponse(ctx, 404, "not found");
+        return researchJobResponse(ctx, 200, record);
+    }
+
+    pub fn advanceResearchJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (!research_jobs.validJobId(job_id)) return jsonErrorResponse(ctx, 404, "not found");
+        const source = self.api_server.table_reads orelse return jsonErrorResponse(ctx, 404, "not found");
+        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+        var phases: usize = 1;
+        if (try ctx.body()) |body| if (std.mem.trim(u8, body, " \t\r\n").len > 0) {
+            const parsed = std.json.parseFromSliceLeaky(metadata_openapi.ResearchJobAdvanceRequest, arena, body, .{ .ignore_unknown_fields = true }) catch
+                return jsonErrorResponse(ctx, 400, "invalid research job advance request");
+            if (parsed.max_phases) |value| {
+                if (value < 1 or value > 10) return jsonErrorResponse(ctx, 400, "max_phases must be between 1 and 10");
+                phases = @intCast(value);
+            }
+        };
+        const owner = researchOwner(authenticated_identity);
+        const existing = (try self.api_server.research_job_store.load(arena, job_id, owner)) orelse return jsonErrorResponse(ctx, 404, "not found");
+        if (existing.terminal()) return researchJobResponse(ctx, 200, existing);
+        if (existing.state == .running and research_jobs.nowMillis() < existing.lease_until_ms) return researchJobResponse(ctx, 409, existing);
+        if (try self.acquirePublicOperation(ctx, "advanceResearchJob")) |response| return response;
+        defer self.releasePublicOperation("advanceResearchJob");
+        var runners = self.agentRunners(ctx, source, authenticated_identity, null);
+        const record = self.advanceStoredResearchJob(ctx, arena, &runners, job_id, owner, phases) catch |err| switch (err) {
+            error.NotFound => return jsonErrorResponse(ctx, 404, "not found"),
+            else => return err,
+        };
+        // Lost a race with another advance that holds the lease.
+        if (record.state == .running) return researchJobResponse(ctx, 409, record);
+        return researchJobResponse(ctx, if (record.terminal()) 200 else 202, record);
+    }
+
+    pub fn cancelResearchJob(self: *AntflyApiHandler, ctx: *httpx.Context, job_id: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (!research_jobs.validJobId(job_id)) return jsonErrorResponse(ctx, 404, "not found");
+        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena_impl.deinit();
+        const record = (try self.api_server.research_job_store.requestCancel(arena_impl.allocator(), job_id, researchOwner(authenticated_identity))) orelse
+            return jsonErrorResponse(ctx, 404, "not found");
+        return researchJobResponse(ctx, 200, record);
     }
 
     fn catalogResource(self: *AntflyApiHandler, ctx: *httpx.Context, action: ?system_catalog.Action) !httpx.Response {

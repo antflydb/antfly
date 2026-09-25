@@ -19,10 +19,11 @@ const index_readiness = @import("index_readiness.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const subcommand = args.next() orelse {
-        cli.fatal("agents requires a subcommand: retrieval, query-builder", .{});
+        cli.fatal("agents requires a subcommand: retrieval, research, query-builder", .{});
     };
 
     if (std.mem.eql(u8, subcommand, "retrieval")) return retrieval(allocator, io, client, args);
+    if (std.mem.eql(u8, subcommand, "research")) return research(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "query-builder")) return queryBuilder(allocator, io, client, args);
 
     cli.fatal("unknown agents subcommand: {s}", .{subcommand});
@@ -326,6 +327,198 @@ const StreamingSseWriter = struct {
         self.detector.push(bytes);
     }
 };
+
+fn parseBudgetValue(args: *std.process.Args.Iterator, slot: *?i64, flag: []const u8) void {
+    if (slot.* != null) cli.fatal("{s} may only be provided once", .{flag});
+    const raw = args.next() orelse cli.fatal("{s} requires a value", .{flag});
+    slot.* = std.fmt.parseInt(i64, raw, 10) catch cli.fatal("invalid {s} value: {s}", .{ flag, raw });
+}
+
+/// `antfly agents research`: run the research agent synchronously (SSE or
+/// JSON), or as a durable job advanced phase by phase with `--job`.
+fn research(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+    var question: ?[]const u8 = null;
+    var table_name: ?[]const u8 = null;
+    var generator_json: ?[]const u8 = null;
+    var full_text_search: ?[]const u8 = null;
+    var semantic_search: ?[]const u8 = null;
+    var indexes_str: ?[]const u8 = null;
+    var fields_str: ?[]const u8 = null;
+    var web_connection: ?[]const u8 = null;
+    var fetch_hosts: ?[]const u8 = null;
+    var outline_str: ?[]const u8 = null;
+    var instructions: ?[]const u8 = null;
+    var knowledge: ?[]const u8 = null;
+    var resume_job: ?[]const u8 = null;
+    var max_rounds: ?i64 = null;
+    var max_sub_questions: ?i64 = null;
+    var max_parallel: ?i64 = null;
+    var researcher_iterations: ?i64 = null;
+    var max_llm_calls: ?i64 = null;
+    var deadline_ms: ?i64 = null;
+    var limit: ?i64 = null;
+    var verify = false;
+    var job = false;
+    var streaming = true;
+    var streaming_set = false;
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--query") or std.mem.eql(u8, arg, "--question") or std.mem.eql(u8, arg, "--prompt")) {
+            takeUniqueValue(args, &question, arg);
+        } else if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
+            takeUniqueValue(args, &table_name, arg);
+        } else if (std.mem.eql(u8, arg, "--generator")) {
+            takeUniqueValue(args, &generator_json, arg);
+        } else if (std.mem.eql(u8, arg, "--full-text-search")) {
+            takeUniqueValue(args, &full_text_search, arg);
+        } else if (std.mem.eql(u8, arg, "--semantic-search")) {
+            takeUniqueValue(args, &semantic_search, arg);
+        } else if (std.mem.eql(u8, arg, "--indexes") or std.mem.eql(u8, arg, "-i")) {
+            takeUniqueValue(args, &indexes_str, arg);
+        } else if (std.mem.eql(u8, arg, "--fields")) {
+            takeUniqueValue(args, &fields_str, arg);
+        } else if (std.mem.eql(u8, arg, "--web-search-connection")) {
+            takeUniqueValue(args, &web_connection, arg);
+        } else if (std.mem.eql(u8, arg, "--fetch-allowed-hosts")) {
+            takeUniqueValue(args, &fetch_hosts, arg);
+        } else if (std.mem.eql(u8, arg, "--outline")) {
+            takeUniqueValue(args, &outline_str, arg);
+        } else if (std.mem.eql(u8, arg, "--instructions")) {
+            takeUniqueValue(args, &instructions, arg);
+        } else if (std.mem.eql(u8, arg, "--agent-knowledge")) {
+            takeUniqueValue(args, &knowledge, arg);
+        } else if (std.mem.eql(u8, arg, "--resume-job")) {
+            takeUniqueValue(args, &resume_job, arg);
+        } else if (std.mem.eql(u8, arg, "--max-rounds")) {
+            parseBudgetValue(args, &max_rounds, arg);
+        } else if (std.mem.eql(u8, arg, "--max-sub-questions")) {
+            parseBudgetValue(args, &max_sub_questions, arg);
+        } else if (std.mem.eql(u8, arg, "--max-parallel")) {
+            parseBudgetValue(args, &max_parallel, arg);
+        } else if (std.mem.eql(u8, arg, "--researcher-iterations")) {
+            parseBudgetValue(args, &researcher_iterations, arg);
+        } else if (std.mem.eql(u8, arg, "--max-llm-calls")) {
+            parseBudgetValue(args, &max_llm_calls, arg);
+        } else if (std.mem.eql(u8, arg, "--deadline-ms")) {
+            parseBudgetValue(args, &deadline_ms, arg);
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            parseBudgetValue(args, &limit, arg);
+        } else if (std.mem.eql(u8, arg, "--verify")) {
+            takeUniqueSwitch(&verify, arg);
+        } else if (std.mem.eql(u8, arg, "--job")) {
+            takeUniqueSwitch(&job, arg);
+        } else if (std.mem.eql(u8, arg, "--streaming") or std.mem.eql(u8, arg, "--no-streaming")) {
+            takeUniqueSwitch(&streaming_set, arg);
+            streaming = std.mem.eql(u8, arg, "--streaming");
+        } else {
+            cli.fatal("unknown agents research flag: {s}", .{arg});
+        }
+    }
+
+    if (resume_job) |job_id| return advanceResearchJobUntilDone(allocator, io, client, job_id);
+    const q = question orelse cli.fatal("--query is required", .{});
+    const gen_json = generator_json orelse cli.fatal("--generator is required", .{});
+    if (table_name == null and web_connection == null) cli.fatal("--table or --web-search-connection is required", .{});
+    if (job and streaming_set) cli.fatal("streaming flags do not apply to --job", .{});
+
+    var generator_value = parseJsonArg(antfly_client.types.GeneratorConfig, allocator, "--generator", gen_json);
+    defer generator_value.deinit();
+    var full_text_value: ?std.json.Parsed(antfly_client.types.RawQuery) = null;
+    defer if (full_text_value) |*parsed| parsed.deinit();
+    if (full_text_search) |text| full_text_value = buildFullTextSearchValue(allocator, text);
+    const fields = if (fields_str) |raw| try cli.splitCommaListAlloc(allocator, raw) else null;
+    defer if (fields) |slice| allocator.free(slice);
+    const indexes = if (indexes_str) |raw| try cli.splitCommaListAlloc(allocator, raw) else null;
+    defer if (indexes) |slice| allocator.free(slice);
+    const outline = if (outline_str) |raw| try cli.splitCommaListAlloc(allocator, raw) else null;
+    defer if (outline) |slice| allocator.free(slice);
+    const hosts = if (fetch_hosts) |raw| try cli.splitCommaListAlloc(allocator, raw) else null;
+    defer if (hosts) |slice| allocator.free(slice);
+
+    const queries = [_]antfly_client.types.QueryRequest{.{
+        .table = table_name,
+        .full_text_search = if (full_text_value) |*parsed| parsed.value else null,
+        .semantic_search = semantic_search,
+        .indexes = indexes,
+        .fields = fields,
+        .limit = limit orelse 8,
+    }};
+    const body = antfly_client.types.ResearchAgentRequest{
+        .query = q,
+        .queries = if (table_name != null) queries[0..] else &.{},
+        .agent_knowledge = knowledge,
+        .generator = generator_value.value,
+        .tools = if (web_connection != null or hosts != null) .{
+            .web_search_connection = web_connection,
+            .fetch_config = if (hosts) |list| .{ .allowed_hosts = list } else null,
+        } else null,
+        .budget = .{
+            .max_rounds = max_rounds,
+            .max_sub_questions = max_sub_questions,
+            .max_parallel = max_parallel,
+            .researcher_iterations = researcher_iterations,
+            .max_llm_calls = max_llm_calls,
+            .deadline_ms = deadline_ms,
+        },
+        .steps = .{
+            .write = .{ .outline = outline, .instructions = instructions },
+            .verify = if (verify) .{ .enabled = true } else null,
+        },
+        .stream = if (job) false else streaming,
+    };
+
+    if (job) {
+        var started = try client.startResearchJob(.{ .request = body, .advance = 1 });
+        defer started.deinit();
+        const record = started.data orelse return error.ResearchAgentResponseError;
+        const job_id = try allocator.dupe(u8, record.value.job_id);
+        defer allocator.free(job_id);
+        std.debug.print("research job {s}: {s} (phase {s})\n", .{ job_id, @tagName(record.value.state), @tagName(record.value.phase) });
+        return advanceResearchJobUntilDone(allocator, io, client, job_id);
+    }
+    if (streaming) {
+        var output = StreamingSseWriter{ .io = io };
+        var resp = try client.researchAgentToWriter(body, &output);
+        defer resp.deinit();
+        output.detector.finish();
+        cli.writeStdout(io, "\n");
+        const is_sse = if (resp.content_type) |value| std.mem.startsWith(u8, value, "text/event-stream") else false;
+        if (resp.status_code >= 300 or !is_sse or output.detector.failed()) return error.ResearchAgentResponseError;
+        return;
+    }
+    var resp = try client.researchAgent(body);
+    defer resp.deinit();
+    if (resp.body) |response_body| {
+        cli.writeStdout(io, response_body);
+        cli.writeStdout(io, "\n");
+    }
+    if (resp.status_code >= 300 or !try retrievalCompleted(allocator, resp.body)) return error.ResearchAgentResponseError;
+}
+
+/// Advance one phase per request until the job is terminal, reporting each
+/// checkpoint on stderr and the final job (with its report) on stdout.
+fn advanceResearchJobUntilDone(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, job_id: []const u8) !void {
+    while (true) {
+        var advanced = try client.advanceResearchJob(job_id, 1);
+        defer advanced.deinit();
+        const record = advanced.data orelse return error.ResearchAgentResponseError;
+        const state = record.value.state;
+        if (advanced.status_code == 409) {
+            std.debug.print("research job {s}: another advance is running; waiting\n", .{job_id});
+            io.sleep(.fromSeconds(2), .awake) catch {};
+            continue;
+        }
+        std.debug.print("research job {s}: {s} (phase {s}, advances {d})\n", .{ job_id, @tagName(state), @tagName(record.value.phase), record.value.advances orelse 0 });
+        switch (state) {
+            .queued, .running => continue,
+            .succeeded, .failed, .cancelled => {
+                try cli.writeJson(allocator, io, record.value);
+                if (state != .succeeded) return error.ResearchAgentResponseError;
+                return;
+            },
+        }
+    }
+}
 
 fn queryBuilder(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var intent: ?[]const u8 = null;
