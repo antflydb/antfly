@@ -38,16 +38,23 @@ const CT = compute.CT;
 
 pub const Options = struct {
     max_response_bytes: usize = 64 * 1024 * 1024,
-    /// Upstream span inference applies no max_len; the relative-position
-    /// encoder accepts any length, so this is purely a work ceiling.
-    processor: processor.Options = .{ .max_sequence_tokens = 4096, .max_batch_tokens = 4096 },
+    /// `max_sequence_tokens` is the hard per-sequence ceiling. It defaults to
+    /// DeBERTa-v3's 512 pretraining positions, the same cap the legacy span
+    /// route applies; beyond it the Metal encoder leaves flash attention and
+    /// materializes full score matrices. The server passes the model's
+    /// max_position_embeddings.
+    processor: processor.Options = .{ .max_sequence_tokens = 512, .max_batch_tokens = 512 },
     /// Split classification tasks across sequences so each sequence (its task
     /// prompts plus the full text) stays within this many tokens, repeating
-    /// the text rather than truncating it. DeBERTa-v3 was pretrained at 512
-    /// positions. When some task's prompt plus the text alone already exceeds
-    /// the budget no split can reach it, so the item runs as one sequence
-    /// (upstream behavior). Zero disables splitting.
+    /// the text rather than truncating it. When some task's prompt plus the
+    /// text alone already exceeds it no split can reach it, so the item runs
+    /// as one sequence, still bounded by `processor.max_sequence_tokens`.
+    /// Zero disables splitting (upstream behavior).
     max_prompt_tokens: usize = 512,
+    /// Each split sequence re-encodes the full text; bound that amplification.
+    max_sequences_per_item: usize = 8,
+    /// Encoded tokens across every sequence of the request.
+    max_request_tokens: usize = 64 * 1024,
     pipeline: pipeline.Options = .{},
     control: ?Control = null,
     failure: ?*wire.FailureContext = null,
@@ -113,9 +120,9 @@ pub fn classificationLogitsProfiled(
     const attention_mask = try allocator.alloc(i64, seq_len);
     defer allocator.free(attention_mask);
     @memset(attention_mask, 1);
-    const mirrors = deberta_mod.glinerPrefersWeightMirrors(config);
-    cb.preferEagerQuantMirrors(mirrors);
-    const hidden = try deberta_arch.forwardCtProfiled(cb, allocator, config, sample.input_ids, attention_mask, 1, seq_len, mirrors, if (profile) |p| &p.encoder else null);
+    // Same encoder and head mirror policy as the session's legacy span route.
+    cb.preferEagerQuantMirrors(true);
+    const hidden = try deberta_arch.forwardCtProfiled(cb, allocator, config, sample.input_ids, attention_mask, 1, seq_len, deberta_mod.glinerPrefersWeightMirrors(config), if (profile) |p| &p.encoder else null);
     defer cb.free(hidden);
     if (profile) |p| {
         try cb.evalTensor(hidden);
@@ -246,23 +253,94 @@ fn classificationView(compiled: *const schema_mod.CompiledSchema, range: TaskRan
     return view;
 }
 
-const PromptLength = struct {
-    allocator: Allocator,
-    tokenizer: Tokenizer,
-    item: *const wire.Item,
-    options: processor.Options,
+/// Prompt lengths for contiguous task ranges without re-tokenizing the text
+/// per candidate. The processor encodes every group fragment independently of
+/// the text and joins groups with one `[SEP_STRUCT]`, so a range's length is
+/// the sum of its groups, plus separators, plus the (range-independent) text
+/// part. Group costs are measured against an empty text; the text part once.
+const PromptLengths = struct {
+    /// Length of task i alone with an empty text.
+    alone_empty: []usize,
+    /// Empty-text part (`[SEP_TEXT]` plus the synthetic period).
+    empty_text: usize,
+    /// Length of task 0 with the real text.
+    first_with_text: usize,
 
-    fn measure(self: *const PromptLength, start: usize, end: usize) anyerror!usize {
-        const view = classificationView(&self.item.compiled, .{ .start = start, .end = end });
-        var prepared = processor.prepare(self.allocator, self.tokenizer, &.{.{ .text = self.item.text, .schema = &view }}, self.options) catch |err| switch (err) {
-            // Over the hard sequence ceiling: certainly over any budget.
-            error.BoundarySequenceLimitExceeded, error.BoundaryBatchLimitExceeded => return std.math.maxInt(usize),
-            else => return err,
+    fn init(allocator: Allocator, tokenizer: Tokenizer, item: *const wire.Item, options: processor.Options) !PromptLengths {
+        const count = item.compiled.schema.classifications.len;
+        const alone = try allocator.alloc(usize, count);
+        errdefer allocator.free(alone);
+        for (alone, 0..) |*length, i| length.* = try preparedLength(allocator, tokenizer, item, "", .{ .start = i, .end = i + 1 }, options);
+        const empty_text = if (count >= 2) blk: {
+            const pair = try preparedLength(allocator, tokenizer, item, "", .{ .start = 0, .end = 2 }, options);
+            // pair = (alone0 - E) + (alone1 - E) + 1 + E
+            break :blk std.math.sub(usize, alone[0] + alone[1] + 1, pair) catch return error.InvalidExtractionOutput;
+        } else 0;
+        return .{
+            .alone_empty = alone,
+            .empty_text = empty_text,
+            .first_with_text = try preparedLength(allocator, tokenizer, item, item.text, .{ .start = 0, .end = 1 }, options),
         };
-        defer prepared.deinit();
-        return prepared.samples[0].input_ids.len;
+    }
+
+    fn deinit(self: *PromptLengths, allocator: Allocator) void {
+        allocator.free(self.alone_empty);
+        self.* = undefined;
+    }
+
+    fn measure(self: *const PromptLengths, start: usize, end: usize) anyerror!usize {
+        const n = end - start;
+        var total = self.first_with_text + (n - 1) - self.alone_empty[0];
+        for (self.alone_empty[start..end]) |length| total += length;
+        return total - (n - 1) * self.empty_text;
     }
 };
+
+fn preparedLength(allocator: Allocator, tokenizer: Tokenizer, item: *const wire.Item, text: []const u8, range: TaskRange, options: processor.Options) !usize {
+    const view = classificationView(&item.compiled, range);
+    var prepared = try processor.prepare(allocator, tokenizer, &.{.{ .text = text, .schema = &view }}, options);
+    defer prepared.deinit();
+    return prepared.samples[0].input_ids.len;
+}
+
+/// Tokenized sequences of one item, one per contiguous task range.
+pub const PreparedItem = struct {
+    ranges: []TaskRange,
+    batches: []processor.PreparedBatch,
+    prompt_tokens: usize,
+
+    fn deinit(self: *PreparedItem, allocator: Allocator) void {
+        for (self.batches) |*batch| batch.deinit();
+        allocator.free(self.batches);
+        allocator.free(self.ranges);
+        self.* = undefined;
+    }
+};
+
+/// Tokenizes and splits one item. Needs no backend or model lock.
+pub fn prepareItem(allocator: Allocator, tokenizer: Tokenizer, item: *const wire.Item, processor_options: processor.Options, options: Options) !PreparedItem {
+    const classifications = item.compiled.schema.classifications;
+    var lengths = try PromptLengths.init(allocator, tokenizer, item, processor_options);
+    defer lengths.deinit(allocator);
+    const ranges = try planTaskRanges(allocator, classifications.len, options.max_prompt_tokens, &lengths, PromptLengths.measure);
+    errdefer allocator.free(ranges);
+    if (ranges.len > options.max_sequences_per_item) return error.ExtractionSchemaLimitExceeded;
+    const batches = try allocator.alloc(processor.PreparedBatch, ranges.len);
+    var prepared: usize = 0;
+    errdefer {
+        for (batches[0..prepared]) |*batch| batch.deinit();
+        allocator.free(batches);
+    }
+    var prompt_tokens: usize = 0;
+    for (ranges, batches) |range, *batch| {
+        const view = classificationView(&item.compiled, range);
+        // Enforces processor_options.max_sequence_tokens on every sequence.
+        batch.* = try processor.prepare(allocator, tokenizer, &.{.{ .text = item.text, .schema = &view }}, processor_options);
+        prepared += 1;
+        prompt_tokens = try std.math.add(usize, prompt_tokens, batch.samples[0].input_ids.len);
+    }
+    return .{ .ranges = ranges, .batches = batches, .prompt_tokens = prompt_tokens };
+}
 
 pub const ItemLogits = struct {
     rows: [][]f64,
@@ -275,40 +353,27 @@ pub const ItemLogits = struct {
     }
 };
 
-/// Classifier logits for every task of `item`, grouped in schema order, using
-/// as many sequences as `max_prompt_tokens` requires.
-pub fn itemClassificationLogits(
+/// Classifier logits for every task of a prepared item, grouped in schema order.
+pub fn preparedItemLogits(
     cb: *const compute.ComputeBackend,
     allocator: Allocator,
     config: deberta_mod.Config,
-    tokenizer: Tokenizer,
     item: *const wire.Item,
-    processor_options: processor.Options,
-    max_prompt_tokens: usize,
+    prepared_item: *const PreparedItem,
     profile: ?*Profile,
 ) !ItemLogits {
     const classifications = item.compiled.schema.classifications;
-    const measure = PromptLength{ .allocator = allocator, .tokenizer = tokenizer, .item = item, .options = processor_options };
-    const ranges = try planTaskRanges(allocator, classifications.len, max_prompt_tokens, &measure, PromptLength.measure);
-    defer allocator.free(ranges);
-
     const rows = try allocator.alloc([]f64, classifications.len);
     var built: usize = 0;
     errdefer {
         for (rows[0..built]) |row| allocator.free(row);
         allocator.free(rows);
     }
-    var prompt_tokens: usize = 0;
-    for (ranges) |range| {
-        const view = classificationView(&item.compiled, range);
-        var prepared = try processor.prepare(allocator, tokenizer, &.{.{ .text = item.text, .schema = &view }}, processor_options);
-        defer prepared.deinit();
-        const sample = prepared.samples[0];
-        prompt_tokens = try std.math.add(usize, prompt_tokens, sample.input_ids.len);
+    for (prepared_item.ranges, prepared_item.batches) |range, batch| {
         const counts = try allocator.alloc(usize, range.end - range.start);
         defer allocator.free(counts);
         for (classifications[range.start..range.end], counts) |classification, *count| count.* = classification.task.labels.len;
-        const chunk_rows = try classificationLogitsProfiled(cb, allocator, config, sample, counts, profile);
+        const chunk_rows = try classificationLogitsProfiled(cb, allocator, config, batch.samples[0], counts, profile);
         defer allocator.free(chunk_rows);
         for (chunk_rows) |row| {
             rows[built] = row;
@@ -316,28 +381,112 @@ pub fn itemClassificationLogits(
         }
     }
     if (built != rows.len) return error.InvalidExtractionOutput;
-    return .{ .rows = rows, .prompt_tokens = prompt_tokens, .sequences = ranges.len };
+    return .{ .rows = rows, .prompt_tokens = prepared_item.prompt_tokens, .sequences = prepared_item.ranges.len };
 }
 
-/// The caller owns the managed backend, model lock and admission for the
-/// complete execution, including serialization and cleanup.
-pub fn execute(cb: *const compute.ComputeBackend, allocator: Allocator, config: deberta_mod.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) ![]u8 {
-    if (cb.kind() != .native and cb.kind() != .metal) return error.UnsupportedExtractionBackend;
+/// Classifier logits for every task of `item`, grouped in schema order, using
+/// as many sequences as `options.max_prompt_tokens` requires.
+pub fn itemClassificationLogits(
+    cb: *const compute.ComputeBackend,
+    allocator: Allocator,
+    config: deberta_mod.Config,
+    tokenizer: Tokenizer,
+    item: *const wire.Item,
+    options: Options,
+    profile: ?*Profile,
+) !ItemLogits {
+    var prepared_item = try prepareItem(allocator, tokenizer, item, item.options.preprocessing(options.processor), options);
+    defer prepared_item.deinit(allocator);
+    return preparedItemLogits(cb, allocator, config, item, &prepared_item, profile);
+}
+
+/// Conservative device scratch for one sequence of `tokens` on `config`:
+/// hidden-sized activations, the FFN intermediate, disentangled-attention
+/// score/c2p/p2c matrices (as if materialized), relative-position tables and
+/// the classifier head. Sequences run serially, so this bounds a request.
+pub fn deviceScratchUpperBound(config: deberta_mod.Config, tokens: usize) !usize {
+    const h: usize = config.hidden_size;
+    const i: usize = config.intermediate_size;
+    const heads: usize = config.num_attention_heads;
+    const buckets: usize = config.position_buckets;
+    const f = @sizeOf(f32);
+    var total: usize = 0;
+    total = try std.math.add(usize, total, try std.math.mul(usize, 8 * f, try std.math.mul(usize, tokens, h)));
+    total = try std.math.add(usize, total, try std.math.mul(usize, 2 * f, try std.math.mul(usize, tokens, i)));
+    total = try std.math.add(usize, total, try std.math.mul(usize, 3 * f * heads, try std.math.mul(usize, tokens, tokens)));
+    total = try std.math.add(usize, total, try std.math.mul(usize, 4 * f, try std.math.mul(usize, buckets, h)));
+    total = try std.math.add(usize, total, try std.math.mul(usize, 2 * f, try std.math.mul(usize, tokens, h)));
+    // Allocator rounding and transient copies.
+    return std.math.mul(usize, total, 2);
+}
+
+/// Longest planned sequence, for executor-contract token validation and
+/// device admission.
+pub fn maxPlannedSequenceTokens(request_plan: *const Plan) usize {
+    var longest: usize = 0;
+    for (request_plan.items) |item| for (item.batches) |batch| {
+        longest = @max(longest, batch.samples[0].input_ids.len);
+    };
+    return longest;
+}
+
+test "gliner span v2 device scratch bound covers a large 512-token sequence" {
+    const large = deberta_mod.Config{ .hidden_size = 1024, .num_hidden_layers = 24, .num_attention_heads = 16, .intermediate_size = 4096 };
+    const bytes = try deviceScratchUpperBound(large, 512);
+    // Materialized 16-head 512x512 scores alone are 16 MiB per matrix.
+    try std.testing.expect(bytes >= 3 * 16 * 512 * 512 * 4);
+    try std.testing.expect(bytes < 512 * 1024 * 1024);
+}
+
+/// Tokenized, split request. Built before the model lock is taken.
+pub const Plan = struct {
+    items: []PreparedItem,
+    prompt_tokens: usize,
+
+    pub fn deinit(self: *Plan, allocator: Allocator) void {
+        for (self.items) |*item| item.deinit(allocator);
+        allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
+/// Preflight, tokenization and splitting for the whole request, including
+/// the request-wide encoded-token budget. Uses only the tokenizer.
+pub fn plan(allocator: Allocator, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !Plan {
     try preflight(request, options);
-    var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);
-    defer writer.deinit();
-    try writer.begin(request.model);
+    const items = try allocator.alloc(PreparedItem, request.items.len);
+    var prepared: usize = 0;
+    errdefer {
+        for (items[0..prepared]) |*item| item.deinit(allocator);
+        allocator.free(items);
+    }
     var prompt_tokens: usize = 0;
-    var remaining_values = options.pipeline.max_output_values;
-    for (request.items, 0..) |item, index| {
-        if (remaining_values == 0) return error.ExtractionOutputLimitExceeded;
+    for (request.items, items, 0..) |*item, *out, index| {
         try progress(options, index, "tokenizing");
         var processor_options = item.options.preprocessing(options.processor);
         processor_options.control = options.control;
+        out.* = try prepareItem(allocator, tokenizer, item, processor_options, options);
+        prepared += 1;
+        prompt_tokens = std.math.add(usize, prompt_tokens, out.prompt_tokens) catch return error.ExtractionRequestLimitExceeded;
+        if (prompt_tokens > options.max_request_tokens) return error.ExtractionRequestLimitExceeded;
+    }
+    return .{ .items = items, .prompt_tokens = prompt_tokens };
+}
+
+/// Runs a plan built by `plan` for the same request. The caller owns the
+/// managed backend, model lock and admission for the complete execution.
+pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, config: deberta_mod.Config, request: *const wire.Request, request_plan: *const Plan, options: Options) ![]u8 {
+    if (cb.kind() != .native and cb.kind() != .metal) return error.UnsupportedExtractionBackend;
+    if (request_plan.items.len != request.items.len) return error.InvalidExtractionInput;
+    var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);
+    defer writer.deinit();
+    try writer.begin(request.model);
+    var remaining_values = options.pipeline.max_output_values;
+    for (request.items, request_plan.items, 0..) |*item, *prepared_item, index| {
+        if (remaining_values == 0) return error.ExtractionOutputLimitExceeded;
         try progress(options, index, "encoder");
-        var logits = try itemClassificationLogits(cb, allocator, config, tokenizer, &item, processor_options, options.max_prompt_tokens, null);
+        var logits = try preparedItemLogits(cb, allocator, config, item, prepared_item, null);
         defer logits.deinit(allocator);
-        prompt_tokens = try std.math.add(usize, prompt_tokens, logits.prompt_tokens);
         const const_rows = try allocator.alloc([]const f64, logits.rows.len);
         defer allocator.free(const_rows);
         for (logits.rows, const_rows) |row, *out| out.* = row;
@@ -352,10 +501,16 @@ pub fn execute(cb: *const compute.ComputeBackend, allocator: Allocator, config: 
         remaining_values -= presented.output_values;
 
         try progress(options, index, "serializing");
-        try writer.append(item, .{ .classifications = presented.classifications, .classification_solver = presented.diagnostics });
+        try writer.append(item.*, .{ .classifications = presented.classifications, .classification_solver = presented.diagnostics });
     }
     try progress(options, null, "serializing");
-    return writer.finish(prompt_tokens);
+    return writer.finish(request_plan.prompt_tokens);
+}
+
+pub fn execute(cb: *const compute.ComputeBackend, allocator: Allocator, config: deberta_mod.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) ![]u8 {
+    var request_plan = try plan(allocator, tokenizer, request, options);
+    defer request_plan.deinit(allocator);
+    return executePlanned(cb, allocator, config, request, &request_plan, options);
 }
 
 test "gliner span v2 task split is greedy, contiguous and never splits an unreachable budget" {
@@ -404,6 +559,34 @@ test "gliner span v2 preflight accepts classification and rejects span tasks" {
     , .{});
     defer mixed.deinit();
     try std.testing.expectError(error.UnsupportedGlinerSpanV2Task, preflight(&mixed, .{}));
+}
+
+fn jsonNumber(value: std.json.Value) f64 {
+    return switch (value) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => std.math.nan(f64),
+    };
+}
+
+fn thresholdMargin(logits: []const std.json.Value, threshold: f64) f64 {
+    const cut = @log(threshold / (1 - threshold));
+    var margin = std.math.inf(f64);
+    for (logits) |value| margin = @min(margin, @abs(jsonNumber(value) - cut));
+    return margin;
+}
+
+fn topTwoMargin(logits: []const std.json.Value) f64 {
+    var first = -std.math.inf(f64);
+    var second = -std.math.inf(f64);
+    for (logits) |value| {
+        const logit = jsonNumber(value);
+        if (logit > first) {
+            second = first;
+            first = logit;
+        } else if (logit > second) second = logit;
+    }
+    return first - second;
 }
 
 // Parity against testdata/gliner25/decide/cases.json, captured from upstream
@@ -488,7 +671,20 @@ fn testDecideParity(directory: []const u8, metal: bool, logit_tolerance: f64) !v
         var presented = try pipeline.presentClassifications(a, &item.compiled, const_rows, 1.0, item.options.native(.{}));
         defer presented.deinit();
         const expected_result = case.get("result").?.object;
-        for (presented.classifications) |classification| {
+        try std.testing.expectEqual(expected_result.count(), presented.classifications.len);
+        for (presented.classifications, expected_rows, item.compiled.schema.classifications) |classification, expected_row, task| {
+            // A reference decision margin inside the logit tolerance is a
+            // genuine tie at this precision (e.g. Q8_0): the top-2 gap for a
+            // single-label task, the distance from the threshold for a
+            // multi-label one. Either outcome is acceptable there.
+            const margin = if (task.mode == .multi)
+                thresholdMargin(expected_row.array.items, task.task.threshold)
+            else
+                topTwoMargin(expected_row.array.items);
+            if (margin < 2 * logit_tolerance) {
+                std.debug.print("case {s} task {s}: near-tie (margin {d:.4}), decision not compared\n", .{ name, classification.name, margin });
+                continue;
+            }
             const expected = expected_result.get(classification.name).?;
             const expected_labels: []const std.json.Value = switch (expected) {
                 .array => |list| list.items,
@@ -660,9 +856,11 @@ test "gliner span v2 GLiNER2.5-Decide Metal latency profile" {
             }
         }.f;
         std.debug.print("decide {s} {s} tokens={d}: mean {d:.2}ms min {d:.2}ms prepare {d:.2}ms encoder {d:.2}ms head {d:.2}ms readback {d:.2}ms\n", .{
-            backend_name,                                                                 if (profiled) "profiled" else "unsynced",
-            token_count,
-            ms(total_ns, n), @as(f64, @floatFromInt(min_ns)) / 1e6, ms(prepare_ns, n), ms(profile.encoder_ns, n), ms(profile.head_ns, n), ms(profile.readback_ns, n),
+            backend_name,                          if (profiled) "profiled" else "unsynced",
+            token_count,                           ms(total_ns, n),
+            @as(f64, @floatFromInt(min_ns)) / 1e6, ms(prepare_ns, n),
+            ms(profile.encoder_ns, n),             ms(profile.head_ns, n),
+            ms(profile.readback_ns, n),
         });
         if (profiled) {
             const e = profile.encoder;
@@ -704,12 +902,22 @@ test "gliner span v2 GLiNER2.5-Decide splits an over-budget prompt across sequen
     var request = try wire.parseJson(a, raw, .{});
     defer request.deinit();
     const item = &request.items[0];
-    const processor_options = (Options{}).processor;
+    const processor_options = item.options.preprocessing((Options{}).processor);
 
-    var whole = try itemClassificationLogits(&managed.backend, a, config, tokenizer.tokenizer(), item, processor_options, 0, null);
+    // The additive length model must agree with real tokenization for every
+    // contiguous task range.
+    var lengths = try PromptLengths.init(a, tokenizer.tokenizer(), item, processor_options);
+    defer lengths.deinit(a);
+    const task_count = item.compiled.schema.classifications.len;
+    for (0..task_count) |start| for (start + 1..task_count + 1) |end| {
+        const actual = try preparedLength(a, tokenizer.tokenizer(), item, item.text, .{ .start = start, .end = end }, processor_options);
+        try std.testing.expectEqual(actual, try lengths.measure(start, end));
+    };
+
+    var whole = try itemClassificationLogits(&managed.backend, a, config, tokenizer.tokenizer(), item, .{ .max_prompt_tokens = 0 }, null);
     defer whole.deinit(a);
     const budget: usize = 400;
-    var split = try itemClassificationLogits(&managed.backend, a, config, tokenizer.tokenizer(), item, processor_options, budget, null);
+    var split = try itemClassificationLogits(&managed.backend, a, config, tokenizer.tokenizer(), item, .{ .max_prompt_tokens = budget }, null);
     defer split.deinit(a);
     std.debug.print("decide split: whole {d} tokens in {d} sequence, split {d} tokens in {d} sequences\n", .{ whole.prompt_tokens, whole.sequences, split.prompt_tokens, split.sequences });
     try std.testing.expect(whole.prompt_tokens > budget);
@@ -728,4 +936,66 @@ test "gliner span v2 GLiNER2.5-Decide splits an over-budget prompt across sequen
         }
     }
     std.debug.print("decide split: {d}/{d} top-label disagreements vs unsplit\n", .{ disagreements, whole.rows.len });
+    try std.testing.expectEqual(@as(usize, 0), disagreements);
+}
+
+test "gliner span v2 GLiNER2.5-Decide execute serves the wire response and enforces limits" {
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const factory = @import("../architectures/session_factory.zig");
+    const session = try factory.createNativeSession(a, directory);
+    defer session.close();
+    const config = try factory.getGlinerSpanConfig(session);
+    const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(tokenizer_path);
+    const tokenizer_bytes = try @import("../util/c_file.zig").readFile(a, tokenizer_path);
+    defer a.free(tokenizer_bytes);
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tokenizer.tokenizer().deinitTokenizer();
+    var managed = try factory.getManagedComputeBackend(session, a, null, null);
+    defer managed.deinit();
+
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"decide","schema":{"classifications":[
+        \\{"name":"intent","labels":["maintenance","room_change","checkout","billing","complaint","amenity_request"]},
+        \\{"name":"topics","labels":["hvac","billing","housekeeping","noise","safety"],"multi_label":true,"threshold":0.4}]},
+        \\"inputs":[{"content":"Guest in room 1408 says the AC has been out since yesterday and they want to move tonight or leave. They also asked for the incidentals hold to be released."}]}
+    , .{});
+    defer request.deinit();
+    const response = try execute(&managed.backend, a, config, tokenizer.tokenizer(), &request, .{});
+    defer a.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+    defer parsed.deinit();
+    const decisions = parsed.value.object.get("data").?.array.items[0].object.get("classifications").?.array.items;
+    try std.testing.expectEqualStrings("intent", decisions[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("room_change", decisions[0].object.get("label").?.string);
+    try std.testing.expectEqualStrings("topics", decisions[1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("hvac", decisions[1].object.get("label").?.string);
+    try std.testing.expect(parsed.value.object.get("usage").?.object.get("prompt_tokens").?.integer > 0);
+
+    // One sequence over the 512-token ceiling cannot run and cannot be split.
+    var long_text = std.ArrayListUnmanaged(u8).empty;
+    defer long_text.deinit(a);
+    try long_text.appendSlice(a, "{\"schema_version\":2,\"model\":\"decide\",\"schema\":{\"classifications\":[{\"name\":\"answer\",\"labels\":[\"yes\",\"no\"]}]},\"inputs\":[{\"content\":\"");
+    for (0..700) |_| try long_text.appendSlice(a, "word ");
+    try long_text.appendSlice(a, "\"}]}");
+    var too_long = try wire.parseJson(a, long_text.items, .{});
+    defer too_long.deinit();
+    try expectExecuteError(error.BoundarySequenceLimitExceeded, execute(&managed.backend, a, config, tokenizer.tokenizer(), &too_long, .{}));
+
+    // Splitting beyond the per-item sequence budget is rejected before
+    // encoding. A budget equal to the longer single-task prompt forces two
+    // sequences (both tasks together are longer still).
+    var lengths = try PromptLengths.init(a, tokenizer.tokenizer(), &request.items[0], request.items[0].options.preprocessing((Options{}).processor));
+    defer lengths.deinit(a);
+    const budget = @max(try lengths.measure(0, 1), try lengths.measure(1, 2));
+    try std.testing.expect(try lengths.measure(0, 2) > budget);
+    try expectExecuteError(error.ExtractionSchemaLimitExceeded, execute(&managed.backend, a, config, tokenizer.tokenizer(), &request, .{ .max_prompt_tokens = budget, .max_sequences_per_item = 1 }));
+}
+
+fn expectExecuteError(expected: anyerror, result: anyerror![]u8) !void {
+    if (result) |unexpected| {
+        std.testing.allocator.free(unexpected);
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expectEqual(expected, err);
 }

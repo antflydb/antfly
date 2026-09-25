@@ -30,19 +30,33 @@ writer. Only the encoder and head differ.
 - **Entities / relations**: the legacy span route (`schema_version` 1,
   `antfly inference extract`) with the CountLSTM v1 label projection.
 - **Long prompts**: every task's prompt is joined in front of the text in one
-  sequence (upstream early fusion). When the combined sequence exceeds 512
-  tokens (DeBERTa-v3's pretraining length) the executor splits the tasks
-  greedily, in schema order, across several sequences and repeats the full
-  text in each, rather than truncating the text. Logits are reassembled in
-  schema order and presented once, so cross-task constraints still apply. If
-  any single task's prompt plus the text alone exceeds 512, no split can reach
-  the budget, so the item runs as one sequence like upstream (hard ceiling
-  4096 tokens); long texts need text windowing, not task splitting. Below the
-  budget the route is identical to upstream. On an 8-task, 483-token support ticket split at a
+  sequence (upstream early fusion). Each sequence is capped at the model's
+  position budget (512 tokens for DeBERTa-v3), the same ceiling the legacy
+  span route applies. When the combined sequence exceeds 512 tokens the
+  executor splits the tasks greedily, in schema order, across several
+  sequences and repeats the full text in each, rather than truncating the
+  text. Logits are reassembled in schema order and presented once, so
+  cross-task constraints still apply. A text that does not fit in 512 tokens
+  with even one task is rejected (`413 EXTRACTION_LIMIT_EXCEEDED`); long texts
+  need text windowing, not task splitting. At most 8 sequences per input and
+  65,536 encoded tokens per request are accepted. Below 512 tokens the route
+  is identical to upstream. On an 8-task, 483-token support ticket split at a
   400-token budget, all 8 top labels matched the unsplit run.
+- **Upgrading schema-version-less requests**: a classification-only request
+  to a declared span checkpoint runs on `schema_version: 2`. A request-level
+  `options.threshold` is carried into every classification task that sets no
+  `threshold` of its own, preserving its v1 meaning; otherwise the upstream
+  per-task default of 0.5 applies. `hypothesis_template` (an NLI concept) is
+  rejected rather than ignored.
 - Mixed classification + span tasks in one `schema_version: 2` request, and
-  `long_document` windows, are rejected with
-  `UnsupportedGlinerSpanV2Task` / `UnsupportedGlinerSpanLongDocument`.
+  `long_document` windows, are rejected with `400
+  UNSUPPORTED_EXTRACTION_FEATURE`. Only checkpoints whose config declares
+  `"architecture": "span"` (gliner2 2.x) take this route; older span
+  checkpoints keep the prior unsupported-model response on
+  `schema_version: 2`.
+- Metal requests on this route are admitted like the boundary route: the
+  model's executor limits are validated and device scratch is leased before
+  the model lock is taken.
 
 ```bash
 curl -s localhost:8090/ai/v1/extract -H 'content-type: application/json' -d '{
@@ -79,21 +93,26 @@ that sidecar (`MissingGlinerEncoderConfig`) rather than assuming base size.
 ## Metal weight mirrors
 
 Base-size GLiNER encoders use bounded F16 weight mirrors on Metal. For the
-large encoder the policy depends on the artifact:
+large encoder the policy depends on whether the encoder matrices are already
+quantized (read from the GGUF tensor types at load):
 
-- **Q8_0 bundle**: no mirrors; the bundle's Q8_0 kernels run directly
-  (interleaved A/B on M4, 102 tokens: ~75 ms vs ~110 ms with mirrors, and
-  ~0.5 GB less live admission).
-- **F32 safetensors**: mirrors stay on. Without them Metal quantizes dense
-  weights to Q8_0 on the fly, which changes numerics (logit error 3e-2 vs
-  8e-4) without the user choosing a quantized artifact.
+- **Quantized bundle (e.g. Q8_0)**: no encoder mirrors; the bundle's own
+  kernels run directly (interleaved A/B on M4, 102 tokens: ~75 ms vs ~110 ms
+  with mirrors).
+- **Dense weights (F32 safetensors or a dense GGUF export)**: mirrors stay
+  on. Without them Metal stages dense matrices to Q8_0 on the fly, which
+  changes numerics (logit error 3e-2 vs 8e-4) without the user choosing a
+  quantized artifact.
 
-`TERMITE_METAL_GLINER_LARGE_WEIGHT_MIRRORS=1` forces mirrors for a large
-bundle.
+Every route over one session (classification, legacy entities, graph head)
+uses the same encoder policy; head mirrors stay on as before.
+`TERMITE_METAL_GLINER_LARGE_WEIGHT_MIRRORS=1` forces encoder mirrors for a
+large quantized bundle.
 
 ## Parity
 
-Reference: `gliner2==2.0.0`, captured by
+Reference: `gliner2==2.0.0` (torch 2.14.0, transformers 5.17.0; versions
+and model-file SHA-256s are recorded in the fixture), captured by
 `scripts/gliner25/decide_oracle.py` into `testdata/gliner25/decide/cases.json`
 (8 classification cases covering multi-task, multi-label, descriptions,
 prompts and ordinal labels, plus 2 entity cases).
@@ -102,7 +121,7 @@ prompts and ordinal labels, plus 2 entity cases).
 |---|---|---|---|
 | native F32 | exact | 4.8e-6 | 8/8 |
 | Metal F32 | exact | 8.1e-4 | 8/8 |
-| Metal Q8_0 bundle | exact | 3.1e-2 | 8/8 |
+| Metal Q8_0 bundle | exact | 3.1e-2 | 8/8 (tasks whose reference margin is inside the tolerance are reported as near-ties) |
 
 Entity spans (legacy route) match upstream on native and Metal F32 to
 four decimals; Q8_0 keeps every entity with confidence within 5e-3.

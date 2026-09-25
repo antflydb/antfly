@@ -2440,7 +2440,7 @@ fn detectArchitectureWithGgufFile(
                 const wrapper = try parseLegacyGlinerWrapper(allocator, config_bytes);
                 var cfg = try loadLegacyGlinerEncoderConfig(allocator, model_path, wrapper);
                 cfg.gliner_count_layer = wrapper.count_layer;
-                cfg.gliner_gguf_weights = mf.usesGgufWeights();
+                cfg.gliner_quantized_weights = try glinerGgufMatricesQuantized(allocator, mf, parsed_gguf);
                 try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
                 return .{ .gliner = cfg };
             }
@@ -2449,7 +2449,7 @@ fn detectArchitectureWithGgufFile(
                 // config.json and use antfly_inference_bundle/gliner_config sidecars
                 // to identify the GLiNER wrapper.
                 var cfg = try deberta_mod.parseConfig(allocator, config_bytes);
-                cfg.gliner_gguf_weights = mf.usesGgufWeights();
+                cfg.gliner_quantized_weights = try glinerGgufMatricesQuantized(allocator, mf, parsed_gguf);
                 try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
                 return .{ .gliner = cfg };
             }
@@ -2598,6 +2598,24 @@ fn loadLegacyGlinerEncoderConfig(allocator: std.mem.Allocator, model_path: []con
     const bytes = try snapshot.read(allocator, io, compat.cwd(), path, legacy_gliner_encoder_config_max_bytes, null);
     defer allocator.free(bytes);
     return deberta_mod.parseConfig(allocator, bytes);
+}
+
+/// Whether the selected GGUF stores its weight matrices quantized. A dense
+/// (`--format none`) export or a safetensors checkpoint returns false.
+fn glinerGgufMatricesQuantized(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest, parsed_gguf: ?*const gguf_mod.format.File) !bool {
+    if (!mf.usesGgufWeights()) return false;
+    if (parsed_gguf) |file| return ggufFileHasQuantizedMatrices(file);
+    const store = try tensor_store_mod.GgufStore.initAbsolute(allocator, mf.gguf_path.?);
+    defer store.tensorStore().deinit();
+    const file = store.tensorStore().ggufFile() orelse return false;
+    return ggufFileHasQuantizedMatrices(file);
+}
+
+fn ggufFileHasQuantizedMatrices(file: *const gguf_mod.format.File) bool {
+    for (file.tensors) |tensor| {
+        if (tensor.dimensions.len == 2 and tensor.tensor_type.isQuantized()) return true;
+    }
+    return false;
 }
 
 fn detectArchitectureFromOptionalGgufFile(
@@ -9054,9 +9072,8 @@ fn archRunImpl(
             // The GLiNER span head and DeBERTa encoder run encoder-shaped
             // quantized GEMMs. Bounded f16 mirrors avoid per-row quantized
             // setup while leaving other model sessions unchanged.
-            const mirrors = deberta_mod.glinerPrefersWeightMirrors(cfg);
-            cb.preferEagerQuantMirrors(mirrors);
-            const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, mirrors);
+            cb.preferEagerQuantMirrors(true);
+            const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, deberta_mod.glinerPrefersWeightMirrors(cfg));
             defer cb.free(hidden);
 
             // Eager head path -- keeps the encoder/head boundary on the

@@ -1,6 +1,16 @@
 {
  "model": "fastino/GLiNER2.5-Decide",
- "gliner2_version": "2.0.0",
+ "versions": {
+  "gliner2": "2.0.0",
+  "torch": "2.14.0",
+  "transformers": "5.17.0"
+ },
+ "model_files": {
+  "model.safetensors": "40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997",
+  "config.json": "e748e5b80575471c91b3f0dd00f513ba58242544fcb7e1236e0021e61abd7673",
+  "encoder_config/config.json": "bd32f1484ba5a199f7a63df44df3814b839fffcf6e64478323c4689868ef6015",
+  "tokenizer.json": "3ad87d9ffe669147063e70850927dd2da90249e2acc5c8527f1eb65df467bcc8"
+ },
  "classification": [
   {
    "name": "support_intent",
