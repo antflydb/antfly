@@ -327,6 +327,16 @@ no matching test. Command from `zig/`: `zig build antfly-data-runtime-test -j1
 -- --test-filter 'data raft apply records transaction conflicts without stopping
 replica progress'`. Evidence: `/tmp/workload-invalid-participant-data1.log`.
 
+## Operator ownership inventory (verified paths)
+
+| Entry point and helper | Transient and retained ownership | Join/cancellation boundary and evidence |
+| --- | --- | --- |
+| Public joined query through `distributed_join.executeSupportedJoinedPublicTableQueryRequest` and `appendJoinReadJobs` | Up to eight right-side reads use per-worker result arenas backed by one synchronized wrapper over the caller's request allocator. Parsed responses stay in those arenas; cloned hits and final output use the same caller allocator. | Each wave joins before inspecting errors, cloning hits, or releasing arenas. A late failed wave publishes no partial join. The focused join gate passed 2/2, including a 1 MiB quota against two 600 KiB worker allocations, with no leaks. |
+| Relational transaction preparation through `relational_integrity_commit.prepareModeInternal` and `Builder.preloadWork` | The preparation arena uses the caller allocator. Up to eight primary-read response arenas share a synchronized wrapper over that preparation allocator; successful observations are copied into builder work only after the wave succeeds. | The worker wave joins before the request deadline/cancellation check, local-admission retry, and work publication. The API transaction gate passed 96/96, including a 1 MiB quota against two 600 KiB lookup responses and existing retry/cancellation tests, with no leaks. |
+
+These are scoped ownership proofs for the named paths. Other query operators,
+background helpers, and real mixed-runtime saturation remain item-7 work.
+
 ## Current integration evidence and boundaries
 
 - Canonical single-phase envelopes use wire version 2 and require Raft batch
