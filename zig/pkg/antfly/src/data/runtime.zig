@@ -42731,6 +42731,59 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), public_server.runtimeStats().active_requests);
             try std.testing.expectEqual(@as(usize, 1), (try worker.usage()).attempts);
 
+            // Keep real native WAL/SST descriptors admitted while a foreground
+            // write waits on the same pool. This composes storage pressure with
+            // the live public socket, dispatch, and body limits above.
+            const repository = @import("../storage/lsm_backend/repository.zig");
+            const wal = @import("../storage/lsm_backend/wal.zig");
+            var root_buffer: [256]u8 = undefined;
+            const root_z = repository.tmpPath(&root_buffer, "combined-protected-status");
+            const root = std.mem.span(root_z);
+            defer repository.cleanupTmp(root_z);
+            const sst = try std.fmt.allocPrint(alloc, "{s}/runs/protected.sst", .{root});
+            defer alloc.free(sst);
+            const foreground_path = try std.fmt.allocPrint(alloc, "{s}/foreground.dat", .{root});
+            defer alloc.free(foreground_path);
+            var fd_pool = lsm_storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 2);
+            defer fd_pool.deinit();
+            var native = try lsm_storage_io.NativeStorage.initWithPool(alloc, .threaded, &fd_pool);
+            defer native.deinit();
+            try native.storage().createDirPath(root);
+            var wal_state: @import("../storage/lsm_backend/state.zig").State = .{};
+            defer wal_state.deinit(alloc);
+            try wal_state.upsert(alloc, .{}, "control", "committed", false);
+            var prepared = try wal.PreparedAppend.init(alloc, root, &wal_state, true, .{});
+            defer prepared.deinit();
+            const scope = try lsm_storage_io.NativeCompletionIo.createWithFiles(alloc, &native, root, &.{.{ .path = sst, .max_bytes = 64 }});
+            var scope_open = true;
+            defer if (scope_open) scope.deinit() catch unreachable;
+            const ForegroundWrite = struct {
+                storage: lsm_storage_io.Storage,
+                path: []const u8,
+                done: std.atomic.Value(bool) = .init(false),
+                failed: std.atomic.Value(bool) = .init(false),
+                fn run(self: *@This()) void {
+                    self.storage.writeFileAbsolute(self.path, "foreground") catch self.failed.store(true, .release);
+                    self.done.store(true, .release);
+                }
+            };
+            var foreground_write = ForegroundWrite{ .storage = native.storage(), .path = foreground_path };
+            var foreground_future = std.Io.async(io, ForegroundWrite.run, .{&foreground_write});
+            var foreground_awaited = false;
+            defer if (!foreground_awaited) {
+                if (scope_open) {
+                    scope.deinit() catch unreachable;
+                    scope_open = false;
+                }
+                foreground_future.await(io);
+            };
+            for (0..5_000) |_| {
+                if (fd_pool.snapshotStats().fd_admission_waiters == 1) break;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expectEqual(@as(usize, 1), fd_pool.snapshotStats().fd_admission_waiters);
+            try std.testing.expect(!foreground_write.done.load(.acquire));
+
             const token = try auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = issuer, .node_id = 7 }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             defer alloc.free(token);
             const frame = try protocol.signRequest(alloc, .{ .primary = secret, .issuer = issuer }, attempt);
@@ -42739,6 +42792,40 @@ fn consumerTests() type {
             try StatusProbe.run(alloc, protected_address, io, token, frame, attempt.attempt, secret, issuer);
             try std.testing.expectEqual(@as(usize, 3), public_server.runtimeStats().active_connections);
             try std.testing.expectEqual(@as(usize, 1), (try worker.usage()).attempts);
+            try std.testing.expectEqual(@as(usize, 1), fd_pool.snapshotStats().fd_admission_waiters);
+
+            const protected_storage = scope.storage();
+            const runs = try std.fmt.allocPrint(alloc, "{s}/runs", .{root});
+            defer alloc.free(runs);
+            try protected_storage.createDirPath(runs);
+            try std.testing.expect((try prepared.execute(protected_storage, alloc)) == .appended);
+            var sst_writer = try protected_storage.beginAtomicWrite(alloc, sst);
+            try sst_writer.appendSlice("protected-sst");
+            try sst_writer.finish();
+            try protected_storage.syncFileContentsAbsolute(sst);
+            try protected_storage.syncParentAbsolute(sst);
+            try std.testing.expectEqual(@as(usize, 1), fd_pool.snapshotStats().fd_admission_waiters);
+            try std.testing.expect(!foreground_write.done.load(.acquire));
+            try StatusProbe.run(alloc, protected_address, io, token, frame, attempt.attempt, secret, issuer);
+
+            try scope.deinit();
+            scope_open = false;
+            for (0..5_000) |_| {
+                if (foreground_write.done.load(.acquire)) break;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expect(foreground_write.done.load(.acquire));
+            foreground_future.await(io);
+            foreground_awaited = true;
+            try std.testing.expect(!foreground_write.failed.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), fd_pool.snapshotStats().fd_admission_waiters);
+            try std.testing.expectEqual(@as(usize, 0), fd_pool.snapshotStats().fd_admitted_descriptors);
+            const persisted_sst = try native.storage().readFileAlloc(alloc, sst, 64);
+            defer alloc.free(persisted_sst);
+            try std.testing.expectEqualStrings("protected-sst", persisted_sst);
+            const persisted_foreground = try native.storage().readFileAlloc(alloc, foreground_path, 64);
+            defer alloc.free(persisted_foreground);
+            try std.testing.expectEqualStrings("foreground", persisted_foreground);
 
             blocking.release.store(true, .release);
             slow.close();
