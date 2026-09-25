@@ -44,17 +44,15 @@ const param = trunk.param;
 
 pub fn validate(cfg: modern.Config, l: Layout, head_dropout: f32) !void {
     const lc = cfg.laya orelse return error.InvalidLayaConfig;
-    if (lc.head_layers > 16 or l.sequence > (if (lc.packing.enabled()) lc.packing.max_packed_len else lc.max_len) or
+    // The decision head uses 64-wide heads.
+    if (cfg.hidden_size < 64 or cfg.hidden_size % 64 != 0 or lc.head_layers > 16 or l.sequence > (if (lc.packing.enabled()) lc.packing.max_packed_len else lc.max_len) or
         l.questions < l.batch or l.questions > 512 or (!lc.packing.enabled() and l.questions != l.batch) or
         l.options < 2 or l.options > lc.maxOptions() or !std.math.isFinite(head_dropout) or head_dropout < 0 or head_dropout >= 1)
         return error.InvalidLayaTrainingLayout;
-    trunk.validate(cfg, .{ .batch = l.batch, .sequence = l.sequence }) catch |err| return switch (err) {
-        error.InvalidModernBertTrainingLayout => error.InvalidLayaTrainingLayout,
-        error.ModernBertTrainingAttentionLimitExceeded => error.LayaTrainingAttentionLimitExceeded,
-    };
-    // The decision head's 64-wide heads can outnumber the encoder's; bound its
-    // materialized attention too.
-    if (@as(u64, l.batch) * l.sequence * l.sequence * (cfg.hidden_size / 64) > 64 * 1024 * 1024)
+    trunk.validate(cfg, .{ .batch = l.batch, .sequence = l.sequence }) catch return error.InvalidLayaTrainingLayout;
+    // Bound the materialized reference attention of the encoder and of the
+    // decision head (whose 64-wide heads can outnumber the encoder's).
+    if (@as(u64, l.batch) * l.sequence * l.sequence * @max(cfg.num_attention_heads, cfg.hidden_size / 64) > 64 * 1024 * 1024)
         return error.LayaTrainingAttentionLimitExceeded;
 }
 
@@ -85,7 +83,7 @@ pub fn build(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32) !Built {
         .encoder_bias = result.inputs.encoder_bias,
         .local_bias = result.inputs.local_bias,
         .rope = result.inputs.rope,
-    });
+    }, "encoder.");
     const types = try param(b, "type_emb", "weight", &.{ 3, h });
     x = try b.add(x, try b.mul(try b.gather(types, result.inputs.kinds, Shape.init(.f32, &.{ n, h })), result.inputs.type_mask));
     for (0..lc.head_layers) |layer| {

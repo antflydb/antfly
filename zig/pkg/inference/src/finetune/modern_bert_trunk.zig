@@ -9,7 +9,12 @@
 //! Attention is expressed with primitives and materialized per head; masks
 //! and split-half RoPE tables are runtime inputs so callers can pad, pack, or
 //! restart positions (tree-packed rows) without rebuilding the graph. The
-//! caller owns input declaration and naming, and builds the host values.
+//! caller owns input declaration and naming, and builds the host values
+//! (`paddingBiases` and `ropeTables` cover unpacked, right-padded rows).
+//!
+//! Weight names are `{prefix}embeddings.tok_embeddings.weight`,
+//! `{prefix}layers.N.attn.Wqkv.weight`, and so on: Laya keeps the upstream
+//! `encoder.` prefix, while GLiNER2.5 graphs strip it by convention.
 const std = @import("std");
 const ml = @import("ml").graph;
 const modern = @import("../architectures/modern_bert.zig");
@@ -142,40 +147,76 @@ fn rope(b: *B, x: Id, tables: [2]Id, l: Layout, h: u32, d: u32) !Id {
     return b.reshape(try b.concat(first, second, 1), Shape.init(.f32, &.{ l.batch * l.sequence, h * d }));
 }
 
-/// Checks the configuration and layout the encoder supports, and bounds the
-/// materialized attention before any constant is allocated.
+/// Checks the configuration and layout the encoder supports. Callers bound
+/// the materialized attention (`attentionScoreElements`) under their own
+/// resource policy before building.
 pub fn validate(cfg: modern.Config, l: Layout) !void {
     if (cfg.checkpoint_layout != .huggingface_fused_qkv_no_bias or cfg.rope_interleaved or
-        cfg.hidden_size < 64 or cfg.hidden_size > 4096 or cfg.hidden_size % 64 != 0 or cfg.num_attention_heads == 0 or
+        cfg.hidden_size == 0 or cfg.hidden_size > 4096 or cfg.num_attention_heads == 0 or
         cfg.hidden_size % cfg.num_attention_heads != 0 or (cfg.hidden_size / cfg.num_attention_heads) % 2 != 0 or
         cfg.global_attn_every_n_layers == 0 or cfg.num_hidden_layers == 0 or cfg.num_hidden_layers > 128 or
         cfg.vocab_size == 0 or cfg.vocab_size > 1024 * 1024 or cfg.intermediate_size == 0 or cfg.intermediate_size > 32768 or
         !std.math.isFinite(cfg.global_rope_theta) or cfg.global_rope_theta <= 0 or !std.math.isFinite(cfg.local_rope_theta) or cfg.local_rope_theta <= 0 or
         !std.math.isFinite(cfg.layer_norm_eps) or cfg.layer_norm_eps <= 0 or
-        l.batch == 0 or l.batch > 128 or l.sequence == 0)
+        cfg.local_attention_window == 0 or l.batch == 0 or l.batch > 128 or l.sequence == 0)
         return error.InvalidModernBertTrainingLayout;
-    if (@as(u64, l.batch) * l.sequence * l.sequence * cfg.num_attention_heads > 64 * 1024 * 1024)
-        return error.ModernBertTrainingAttentionLimitExceeded;
+}
+
+/// Elements of one materialized `[B*heads,S,S]` score tensor.
+pub fn attentionScoreElements(cfg: modern.Config, l: Layout) u64 {
+    return @as(u64, l.batch) * l.sequence * l.sequence * cfg.num_attention_heads;
+}
+
+/// Global and local additive key masks, each `[B*heads,S,S]`, for unpacked
+/// rows whose valid keys are marked in `key_valid` (`[B*S]`). Every query may
+/// attend to every valid key of its row (the Hugging Face key-padding mask);
+/// the local plane also requires `|q - k| <= local_attention_window / 2`.
+pub fn paddingBiases(a: std.mem.Allocator, cfg: modern.Config, l: Layout, key_valid: []const bool) ![2][]f32 {
+    const head_count: usize = cfg.num_attention_heads;
+    const s: usize = l.sequence;
+    if (key_valid.len != @as(usize, l.batch) * s) return error.InvalidModernBertTrainingLayout;
+    const plane = s * s;
+    const global = try a.alloc(f32, l.batch * head_count * plane);
+    errdefer a.free(global);
+    const local = try a.alloc(f32, global.len);
+    const window: usize = cfg.local_attention_window / 2;
+    for (0..l.batch) |row| {
+        const g = global[row * head_count * plane ..][0..plane];
+        const w = local[row * head_count * plane ..][0..plane];
+        for (0..s) |q| for (0..s) |k| {
+            const visible = key_valid[row * s + k];
+            g[q * s + k] = if (visible) 0 else -1e9;
+            w[q * s + k] = if (visible and @max(q, k) - @min(q, k) <= window) 0 else -1e9;
+        };
+        for (1..head_count) |h| {
+            @memcpy(global[(row * head_count + h) * plane ..][0..plane], g);
+            @memcpy(local[(row * head_count + h) * plane ..][0..plane], w);
+        }
+    }
+    return .{ global, local };
 }
 
 /// Embeddings, `num_hidden_layers` pre-norm layers (global attention every
 /// `global_attn_every_n_layers`, local otherwise), and the final norm.
 /// Returns the `[batch*sequence, hidden]` hidden states. Traces the embedding
-/// norm, every layer output, and the final norm.
-pub fn encoder(b: *B, sites: *Sites, cfg: modern.Config, l: Layout, in: Inputs) !Id {
+/// norm, every layer output, and the final norm, in that order, under the
+/// same names as the weights.
+pub fn encoder(b: *B, sites: *Sites, cfg: modern.Config, l: Layout, in: Inputs, names_prefix: []const u8) !Id {
     try validate(cfg, l);
     const a = b.graph.allocator;
     const h = cfg.hidden_size;
     const n = l.batch * l.sequence;
     const nh = cfg.num_attention_heads;
-    const embedding = try param(b, "encoder.embeddings.tok_embeddings", "weight", &.{ cfg.vocab_size, h });
+    var root: [128]u8 = undefined;
+    const embedding = try param(b, try std.fmt.bufPrint(&root, "{s}embeddings.tok_embeddings", .{names_prefix}), "weight", &.{ cfg.vocab_size, h });
     var x = try b.gather(embedding, in.ids, Shape.init(.f32, &.{ n, h }));
-    x = try norm(b, x, "encoder.embeddings.norm", h, cfg.layer_norm_eps, false);
-    try sites.trace(a, "encoder.embeddings.norm", x);
+    const embedding_norm = try std.fmt.bufPrint(&root, "{s}embeddings.norm", .{names_prefix});
+    x = try norm(b, x, embedding_norm, h, cfg.layer_norm_eps, false);
+    try sites.trace(a, embedding_norm, x);
     for (0..cfg.num_hidden_layers) |layer| {
         var buffer: [128]u8 = undefined;
         var names: [256]u8 = undefined;
-        const prefix = try std.fmt.bufPrint(&buffer, "encoder.layers.{d}", .{layer});
+        const prefix = try std.fmt.bufPrint(&buffer, "{s}layers.{d}", .{ names_prefix, layer });
         const normalized = if (layer == 0) x else try norm(b, x, try std.fmt.bufPrint(&names, "{s}.attn_norm", .{prefix}), h, cfg.layer_norm_eps, false);
         const qkv = try linear(b, normalized, try std.fmt.bufPrint(&names, "{s}.attn.Wqkv", .{prefix}), n, h, h * 3, false);
         const global = layer % cfg.global_attn_every_n_layers == 0;
@@ -192,8 +233,9 @@ pub fn encoder(b: *B, sites: *Sites, cfg: modern.Config, l: Layout, in: Inputs) 
         x = try b.add(x, try linear(b, product, try std.fmt.bufPrint(&names, "{s}.mlp.Wo", .{prefix}), n, cfg.intermediate_size, h, false));
         try sites.trace(a, prefix, x);
     }
-    x = try norm(b, x, "encoder.final_norm", h, cfg.layer_norm_eps, false);
-    try sites.trace(a, "encoder.final_norm", x);
+    const final_norm = try std.fmt.bufPrint(&root, "{s}final_norm", .{names_prefix});
+    x = try norm(b, x, final_norm, h, cfg.layer_norm_eps, false);
+    try sites.trace(a, final_norm, x);
     return x;
 }
 
@@ -223,7 +265,7 @@ test "modern bert trunk keeps Hugging Face parameter names and differentiates ev
     const l = Layout{ .batch = 2, .sequence = 8 };
     var sites = Sites{ .prefix = "__t" };
     defer sites.deinit(a);
-    const hidden = try encoder(&b, &sites, test_config, l, try testInputs(&b, test_config, l));
+    const hidden = try encoder(&b, &sites, test_config, l, try testInputs(&b, test_config, l), "encoder.");
     try std.testing.expectEqual(@as(i64, 2 * 8 * 64), graph.node(hidden).output_shape.numElements().?);
     // Embedding norm, three layers, final norm; the encoder adds no dropout.
     try std.testing.expectEqual(@as(usize, 5), sites.traces.items.len);
@@ -260,11 +302,36 @@ test "modern bert trunk keeps Hugging Face parameter names and differentiates ev
     try std.testing.expectEqual(wrt.items.len, grads.param_grads.len);
 }
 
-test "modern bert trunk rejects unsupported layouts and oversized attention" {
+test "modern bert trunk rejects unsupported layouts and counts attention scores" {
     var bad = test_config;
     bad.checkpoint_layout = .separate_qkv_with_bias;
     try std.testing.expectError(error.InvalidModernBertTrainingLayout, validate(bad, .{ .batch = 1, .sequence = 8 }));
     try std.testing.expectError(error.InvalidModernBertTrainingLayout, validate(test_config, .{ .batch = 1, .sequence = 0 }));
-    // 1 * 8192^2 * 2 heads = 128Mi > 64Mi.
-    try std.testing.expectError(error.ModernBertTrainingAttentionLimitExceeded, validate(test_config, .{ .batch = 1, .sequence = 8192 }));
+    bad = test_config;
+    bad.hidden_size = 66; // head_dim 33 is odd, so split-half RoPE is undefined
+    try std.testing.expectError(error.InvalidModernBertTrainingLayout, validate(bad, .{ .batch = 1, .sequence = 8 }));
+    try std.testing.expectEqual(@as(u64, 2 * 8 * 8 * 2), attentionScoreElements(test_config, .{ .batch = 2, .sequence = 8 }));
+}
+
+test "modern bert trunk padding biases mask keys and the local window" {
+    const a = std.testing.allocator;
+    var cfg = test_config;
+    cfg.local_attention_window = 4; // +-2 positions
+    const valid = [_]bool{ true, true, true, true, true, false, true, true, true, true, true, true };
+    const planes = try paddingBiases(a, cfg, .{ .batch = 2, .sequence = 6 }, &valid);
+    defer for (planes) |plane| a.free(plane);
+    const s = 6;
+    const at = struct {
+        fn f(plane: []const f32, row: usize, head: usize, q: usize, k: usize) f32 {
+            return plane[((row * 2 + head) * s + q) * s + k];
+        }
+    }.f;
+    // Row 0 pads its last key for every query, including the padded query.
+    for (0..s) |q| try std.testing.expectEqual(@as(f32, -1e9), at(planes[0], 0, 1, q, 5));
+    try std.testing.expectEqual(@as(f32, 0), at(planes[0], 0, 1, 5, 0));
+    // The local plane keeps |q-k| <= 2 only.
+    try std.testing.expectEqual(@as(f32, 0), at(planes[1], 1, 0, 3, 1));
+    try std.testing.expectEqual(@as(f32, -1e9), at(planes[1], 1, 0, 3, 0));
+    try std.testing.expectEqual(@as(f32, 0), at(planes[0], 1, 0, 3, 0));
+    try std.testing.expectError(error.InvalidModernBertTrainingLayout, paddingBiases(a, cfg, .{ .batch = 1, .sequence = 6 }, &valid));
 }

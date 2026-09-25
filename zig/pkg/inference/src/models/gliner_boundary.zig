@@ -169,6 +169,11 @@ pub const HeadConfig = struct {
     }
 };
 
+/// DeBERTa-v3 is the only encoder of released GLiNER2.5 checkpoints and the
+/// only one inference and export support. ModernBERT is a training-only
+/// encoder for now (zig/pkg/inference/models/antenna/ANTENNA.md).
+pub const EncoderFamily = enum { deberta, modern_bert };
+
 pub const EncoderConfig = struct {
     hidden_size: u32,
     intermediate_size: u32,
@@ -176,11 +181,20 @@ pub const EncoderConfig = struct {
     num_attention_heads: u32,
     vocab_size: u32,
     max_position_embeddings: u32,
+    /// DeBERTa relative-position buckets; 0 for ModernBERT.
     position_buckets: u32,
     layer_norm_eps: f32,
     hidden_dropout_prob: f32,
     attention_probs_dropout_prob: f32,
     pad_token_id: u32,
+    family: EncoderFamily = .deberta,
+    // ModernBERT only: split-half RoPE for global and local layers, the local
+    // sliding window (total width, so each side sees half), and the global
+    // layer period.
+    global_rope_theta: f32 = 0,
+    local_rope_theta: f32 = 0,
+    local_attention_window: u32 = 0,
+    global_attn_every_n_layers: u32 = 0,
 
     pub fn toDeberta(self: EncoderConfig) deberta.Config {
         return .{
