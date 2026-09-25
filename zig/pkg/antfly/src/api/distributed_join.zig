@@ -4604,6 +4604,7 @@ fn executeRightJoinQueryParsedAlloc(
     query_value: std.json.Value,
     nested_foreign_leaf_join: bool,
 ) !std.json.Parsed(std.json.Value) {
+    try ctx.ensureExecutionDeadline();
     const query_body = try stringifyJsonValueAlloc(alloc, query_value);
     defer alloc.free(query_body);
 
@@ -4626,9 +4627,14 @@ fn executeRightJoinQueryParsedAlloc(
             return err;
         };
         defer right_result.deinit(alloc);
+        try ctx.ensureExecutionDeadline();
         break :blk try alloc.dupe(u8, right_result.json);
     };
     defer alloc.free(right_json);
+    // A worker may complete just as the original coordinator request expires.
+    // Reject its reply before parsing or widening a partial right-side page
+    // into a second remote query.
+    try ctx.ensureExecutionDeadline();
 
     return std.json.parseFromSlice(std.json.Value, alloc, right_json, .{}) catch return error.InternalFailure;
 }
@@ -6458,6 +6464,74 @@ test "distributed join context forwards one absolute deadline to every query cal
         error.TestDeadlineForwarded,
         ctx.buildOwnedSearchRequest(std.testing.allocator, "right", .null),
     );
+}
+
+test "distributed join rejects late right worker reply before widening partial page" {
+    const Fake = struct {
+        const Mode = enum { cancel, timeout };
+        calls: usize = 0,
+        now_ns: u64 = 0,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        mode: Mode = .cancel,
+
+        fn now(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.now_ns;
+        }
+
+        fn plain(ptr: *anyopaque, alloc: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, deadline: ?u64, cancellation: ?CancellationToken) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(deadline != null);
+            try std.testing.expect(cancellation != null);
+            switch (self.mode) {
+                .cancel => self.cancelled.store(true, .release),
+                .timeout => self.now_ns = 100,
+            }
+            // Without the post-reply check this partial page (one hit, two
+            // total) causes loadRightJoinQueryAlloc to issue another RPC.
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":2,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"a\",\"_source\":{}}]}}]}") };
+        }
+    };
+
+    var fake: Fake = .{};
+    const join = SupportedJoinRequest{
+        .right_table = @constCast("right"),
+        .left_field = @constCast("left_id"),
+        .right_field = @constCast("right_id"),
+    };
+    const source: table_reads.TableReadSource = undefined;
+    for ([_]Fake.Mode{ .cancel, .timeout }) |mode| {
+        fake.mode = mode;
+        fake.calls = 0;
+        fake.now_ns = 0;
+        fake.cancelled.store(false, .release);
+        var query_value = std.json.Value{ .object = std.json.ObjectMap.empty };
+        const ctx = JoinContext{
+            .ptr = &fake,
+            .vtable = &.{
+                .acquire_planning = undefined,
+                .execute_plain_query = Fake.plain,
+                .execute_query_dispatch = undefined,
+                .build_owned_search_request = undefined,
+                .ensure_foreign_registry = undefined,
+                .monotonic_now_ns = Fake.now,
+            },
+            .execution_deadline_ns = 100,
+            .cancellation = CancellationToken.fromAtomic(&fake.cancelled),
+        };
+        try std.testing.expectError(if (mode == .cancel) error.Cancelled else error.Timeout, loadRightJoinQueryAlloc(
+            ctx,
+            undefined,
+            std.testing.allocator,
+            source,
+            join,
+            &query_value,
+            false,
+            .{},
+        ));
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    }
 }
 
 test "workload admission distributed join transports relative budgets and rejects exhausted handoffs" {
