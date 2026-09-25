@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 64;
+pub const abi_version: u32 = 65;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -924,8 +924,10 @@ pub const ResolutionCandidateConfig = extern struct {
 
 pub const EntityUpsert = extern struct {
     table: BorrowedBytes = .{},
+    storage_table: BorrowedBytes = .{},
     key: BorrowedBytes = .{},
     doc_json: BorrowedBytes = .{},
+    delete: u8 = 0,
 };
 pub const EntityUpsertFn = *const fn (
     ?*anyopaque,
