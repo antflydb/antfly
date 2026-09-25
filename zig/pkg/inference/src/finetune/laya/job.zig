@@ -52,7 +52,25 @@ pub const Config = struct {
     /// Keep the token embeddings and the lowest N encoder layers at their
     /// source values. Backward work and optimizer state cover only the rest.
     freeze_layers: u32 = 0,
+    /// `fused_v1` trains without materialized attention scores (storage
+    /// linear in the sequence); the head stays materialized while
+    /// `head_dropout` is nonzero. Null is `materialized_v1`. Keep last: an
+    /// unset value is dropped from the run identity (see `runIdentityJson`).
+    attention: ?architecture.AttentionProfile = null,
 };
+
+/// The identity JSON of `c`. An unset `attention` (always the last field) is
+/// omitted, so runs from before the option keep their identity.
+fn runIdentityJson(w: *std.Io.Writer.Allocating, c: Config) ![]const u8 {
+    try std.json.Stringify.value(c, .{}, &w.writer);
+    const written = w.written();
+    const unset = ",\"attention\":null}";
+    if (c.attention == null and std.mem.endsWith(u8, written, unset)) {
+        w.shrinkRetainingCapacity(written.len - unset.len);
+        try w.writer.writeByte('}');
+    }
+    return w.written();
+}
 
 pub fn validate(c: Config) !void {
     if (c.version != 1 or c.epochs == 0 or c.epochs > 10000 or c.batch_size == 0 or c.batch_size > 128 or
@@ -103,6 +121,7 @@ const Cache = struct {
     config: modern.Config,
     dropout: f32,
     freeze_layers: u32 = 0,
+    attention: architecture.AttentionProfile = .materialized_v1,
     frozen: []const training.Frozen = &.{},
     program: ?training.Program = null,
     last: architecture.Layout = .{ .batch = 0, .sequence = 0, .options = 0, .questions = 0 },
@@ -111,7 +130,7 @@ const Cache = struct {
         if (self.program == null or !std.meta.eql(l, self.last)) {
             if (self.program) |*p| p.deinit();
             self.program = null;
-            self.program = try training.Program.initFrozen(self.allocator, self.config, l, self.dropout, self.freeze_layers);
+            self.program = try training.Program.initProfile(self.allocator, self.config, l, self.dropout, self.freeze_layers, self.attention);
             self.last = l;
         }
         self.program.?.frozen = self.frozen;
@@ -261,7 +280,7 @@ fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.jso
 
 // A shuffled batch can combine the longest sequence with any other record.
 // Admit a conservative bound for the entire split before backend allocation.
-fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32) !void {
+fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32, attention: architecture.AttentionProfile) !void {
     var layout = architecture.Layout{ .batch = @intCast(@min(batch_size, examples.len)), .sequence = 0, .options = 0, .questions = 0 };
     var questions: u32 = 0;
     for (examples) |e| {
@@ -272,7 +291,7 @@ fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_s
         for (e.ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidLayaTrainingToken;
     }
     layout.questions = @min(questions * layout.batch, 512);
-    try architecture.validate(cfg, layout, dropout);
+    try architecture.validateProfile(cfg, layout, dropout, attention);
 }
 
 const Cursor = struct {
@@ -370,10 +389,11 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
         try data.disjoint(a, train, calib);
         try data.disjoint(a, eval, calib);
     }
-    try admitExamples(encoder, train.examples, c.batch_size, c.head_dropout);
-    try admitExamples(encoder, eval.examples, 1, c.head_dropout);
-    if (calibration) |calib| try admitExamples(encoder, calib.examples, 1, c.head_dropout);
-    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = c.freeze_layers };
+    const attention = c.attention orelse .materialized_v1;
+    try admitExamples(encoder, train.examples, c.batch_size, c.head_dropout, attention);
+    try admitExamples(encoder, eval.examples, 1, c.head_dropout, attention);
+    if (calibration) |calib| try admitExamples(encoder, calib.examples, 1, c.head_dropout, attention);
+    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = c.freeze_layers, .attention = attention };
     defer cache.deinit();
     // Release the raw source snapshot before optimizer initialization/restore.
     // Only owned trainable values, frozen values, and export metadata survive.
@@ -401,8 +421,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
         identity_config.stop_after_microbatches = null;
         var json = std.Io.Writer.Allocating.init(a);
         defer json.deinit();
-        try std.json.Stringify.value(identity_config, .{}, &json.writer);
-        hash.update(json.written());
+        hash.update(try runIdentityJson(&json, identity_config));
         break :blk .{ .selected = selected, .export_tensors = export_tensors, .identity = hash.finalResult(), .weights_sha256 = data.digest(source_bytes) };
     };
     const selected = admitted.selected;
@@ -560,12 +579,30 @@ test "laya admission checks late long sequences and token vocabulary before trai
     const short = training.Example{ .ids = ids[0..2], .markers = &.{ 0, 1 }, .kind = .noul, .target = &.{ 1, 0 } };
     var long = short;
     long.ids = &ids;
-    try admitExamples(cfg, &.{ short, short }, 2, 0);
-    try admitExamples(cfg, &.{long}, 1, 0);
-    try std.testing.expectError(error.LayaTrainingAttentionLimitExceeded, admitExamples(cfg, &.{ short, short, long }, 2, 0));
+    try admitExamples(cfg, &.{ short, short }, 2, 0, .materialized_v1);
+    try admitExamples(cfg, &.{long}, 1, 0, .materialized_v1);
+    try std.testing.expectError(error.LayaTrainingAttentionLimitExceeded, admitExamples(cfg, &.{ short, short, long }, 2, 0, .materialized_v1));
+    // Fused attention stores no scores: the same batch is admitted, unless
+    // head dropout keeps the decision head materialized.
+    try admitExamples(cfg, &.{ short, short, long }, 2, 0, .fused_v1);
+    try std.testing.expectError(error.LayaTrainingAttentionLimitExceeded, admitExamples(cfg, &.{ short, short, long }, 2, 0.1, .fused_v1));
     var invalid = short;
     invalid.ids = &.{ 0, cfg.vocab_size };
-    try std.testing.expectError(error.InvalidLayaTrainingToken, admitExamples(cfg, &.{ short, invalid }, 1, 0));
+    try std.testing.expectError(error.InvalidLayaTrainingToken, admitExamples(cfg, &.{ short, invalid }, 1, 0, .materialized_v1));
+}
+
+test "laya run identity omits an unset attention profile" {
+    const base = Config{ .version = 1, .model_dir = "/m", .train_file = "/t", .eval_file = "/e", .output_dir = "" };
+    var unset = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer unset.deinit();
+    const json = try runIdentityJson(&unset, base);
+    try std.testing.expect(std.mem.indexOf(u8, json, "attention") == null);
+    try std.testing.expect(std.mem.endsWith(u8, json, "\"freeze_layers\":0}"));
+    var fused = base;
+    fused.attention = .fused_v1;
+    var set = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer set.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, try runIdentityJson(&set, fused), "\"attention\":\"fused_v1\"}"));
 }
 
 test "laya training rejects malformed encoder metadata instead of defaulting" {

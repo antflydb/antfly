@@ -31,6 +31,7 @@ const native = @import("../backends/native.zig");
 const activations_mod = @import("../backends/activations.zig");
 const deberta_tiled = @import("deberta_tiled_attention.zig");
 const deberta_training = @import("deberta_training_attention.zig");
+const modernbert_training = @import("modernbert_training_attention.zig");
 const LoadedWeight = @import("../models/weight_source.zig").LoadedWeight;
 const QuantizedStorage = @import("../models/weight_source.zig").QuantizedStorage;
 const runtime = @import("../runtime/root.zig");
@@ -4710,6 +4711,8 @@ pub const vtable_impl = ComputeBackend.VTable{
     .disentangledRelativeAttentionBackward = &disentangledRelativeAttentionBackwardOp,
     .debertaTrainingAttentionV1 = &debertaTrainingAttentionV1Op,
     .debertaTrainingAttentionBackwardV1 = &debertaTrainingAttentionBackwardV1Op,
+    .modernBertTrainingAttentionV1 = &modernBertTrainingAttentionV1Op,
+    .modernBertTrainingAttentionBackwardV1 = &modernBertTrainingAttentionBackwardV1Op,
     .windowedSelfAttention = &windowedSelfAttentionOp,
     .channelSelfAttention = &channelSelfAttentionOp,
     .tokenGridConv2d = &tokenGridConv2dOp,
@@ -35483,6 +35486,36 @@ fn debertaTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, relative: CT, 
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
     const shape = layout.gradientShape();
+    return self.withLogicalShape(result, shape.dims[0..shape.rank_]);
+}
+
+fn modernBertTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: modernbert_training.Attrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (control) |c| try c.check();
+    const layout = try attrs.layout();
+    const words = try debertaTrainingControl(control_i32, layout.controlShape());
+    const qkv_data = try debertaTrainingF32(self, qkv, layout.qkvShape());
+    defer if (qkv_data.owned) |data| self.allocator.free(data);
+    const output = try modernbert_training.forward(self.allocator, attrs, qkv_data.data, words, control);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    const shape = layout.outputShape();
+    return self.withLogicalShape(result, shape.dims[0..shape.rank_]);
+}
+
+fn modernBertTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, dout: CT, attrs: modernbert_training.Attrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (control) |c| try c.check();
+    const layout = try attrs.layout();
+    const words = try debertaTrainingControl(control_i32, layout.controlShape());
+    const qkv_data = try debertaTrainingF32(self, qkv, layout.qkvShape());
+    defer if (qkv_data.owned) |data| self.allocator.free(data);
+    const cotangent = try debertaTrainingF32(self, dout, layout.outputShape());
+    defer if (cotangent.owned) |data| self.allocator.free(data);
+    const output = try modernbert_training.backward(self.allocator, attrs, qkv_data.data, words, cotangent.data, control);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    const shape = layout.qkvShape();
     return self.withLogicalShape(result, shape.dims[0..shape.rank_]);
 }
 

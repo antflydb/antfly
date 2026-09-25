@@ -175,7 +175,13 @@ fn upload(a: Allocator, cb: *const ops.ComputeBackend, list: *std.ArrayListUnman
     };
 }
 
+/// Both encoder attention profiles: materialized scores, and the fused trunk
+/// attention (`replay_tiled_v1` for ModernBERT).
 fn parity(a: Allocator, cb: *const ops.ComputeBackend) !void {
+    for ([_]encoder_graph.AttentionProfile{ .materialized_v1, .replay_tiled_v1 }) |profile| try parityProfile(a, cb, profile);
+}
+
+fn parityProfile(a: Allocator, cb: *const ops.ComputeBackend, profile: encoder_graph.AttentionProfile) !void {
     var reference = try Reference.open(a);
     defer reference.deinit();
     const config = reference.source.config;
@@ -188,7 +194,7 @@ fn parity(a: Allocator, cb: *const ops.ComputeBackend) !void {
     var graph = ml.Graph.init(a);
     defer graph.deinit();
     var builder = ml.Builder.init(&graph);
-    var built = try encoder_graph.build(&builder, &config, layout, .eval, .{});
+    var built = try encoder_graph.buildWithProfile(&builder, &config, layout, .eval, profile, .{});
     defer built.deinit();
     const routed = [_]ml.NodeId{ built.nodes.text, built.nodes.queries, built.nodes.classifications };
     const kinds = [_][]const u8{ "text", "query", "cls" };
@@ -270,7 +276,7 @@ fn parity(a: Allocator, cb: *const ops.ComputeBackend) !void {
         try fixtures.expectFloats(expected, actual, 5e-5 + 0.002 * largest, 0);
         for (expected, actual) |want, got| worst = @max(worst, @abs(want - got));
     }
-    std.debug.print("ModernBERT boundary encoder ({s}): 20 gradient tensors, max absolute error={d}\n", .{ @tagName(cb.kind()), worst });
+    std.debug.print("ModernBERT boundary encoder ({s}, {s}): 20 gradient tensors, max absolute error={d}\n", .{ @tagName(cb.kind()), @tagName(profile), worst });
 }
 
 test "GLiNER2.5 ModernBERT encoder states and every encoder gradient match PyTorch" {

@@ -37,7 +37,10 @@ const Harness = struct {
     vtable: *@import("../../ops/ops.zig").ComputeBackend.VTable,
 
     fn init(a: std.mem.Allocator, scratch: std.mem.Allocator, dir: []const u8, config: modern.Config, examples: []const train.Example) !Harness {
-        var program = try train.Program.init(a, config, try train.bucketedLayout(examples, config), 0);
+        return initProfile(a, scratch, dir, config, examples, .materialized_v1);
+    }
+    fn initProfile(a: std.mem.Allocator, scratch: std.mem.Allocator, dir: []const u8, config: modern.Config, examples: []const train.Example, attention: @import("graph.zig").AttentionProfile) !Harness {
+        var program = try train.Program.initProfile(a, config, try train.bucketedLayout(examples, config), 0, 0, attention);
         errdefer program.deinit();
         var weights = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ dir, "model.safetensors" }));
         defer weights.deinit();
@@ -73,6 +76,14 @@ fn packedExample(a: std.mem.Allocator, row: tree.Row) !train.Example {
 }
 
 test "laya packed training graph matches packed serving logits, alone and in a padded batch" {
+    try packedMatchesServing(.materialized_v1);
+}
+
+test "laya packed fused-attention training graph matches packed serving logits, alone and in a padded batch" {
+    try packedMatchesServing(.fused_v1);
+}
+
+fn packedMatchesServing(attention: @import("graph.zig").AttentionProfile) !void {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -99,7 +110,7 @@ test "laya packed training graph matches packed serving logits, alone and in a p
         var worst: f32 = 0;
         // Each row alone, then both rows in one padded batch.
         for ([_][]const train.Example{ examples[0..1], examples[1..2], &examples }) |batch| {
-            var harness = try Harness.init(a, scratch, dir, config, batch);
+            var harness = try Harness.initProfile(a, scratch, dir, config, batch, attention);
             defer harness.deinit();
             const logits = try train.predict(a, &harness.program, &harness.trainer, config, batch);
             defer a.free(logits);
@@ -120,7 +131,7 @@ test "laya packed training graph matches packed serving logits, alone and in a p
             }
             try std.testing.expectEqual(@as(usize, l.questions), decision);
         }
-        std.debug.print("Laya packed {s}: training-graph vs serving max logit error={d}\n", .{ packing, worst });
+        std.debug.print("Laya packed {s} {s}: training-graph vs serving max logit error={d}\n", .{ packing, @tagName(attention), worst });
         try std.testing.expect(worst < 1e-4);
         try tmp.dir.deleteFile(std.testing.io, "model.safetensors");
     }

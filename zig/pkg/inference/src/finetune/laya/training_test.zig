@@ -43,6 +43,14 @@ test "laya training ReLU uses the PyTorch zero subgradient" {
 }
 
 test "laya training forward objective and every parameter gradient match PyTorch" {
+    try pytorchParity(.materialized_v1);
+}
+
+test "laya fused-attention training forward objective and every parameter gradient match PyTorch" {
+    try pytorchParity(.fused_v1);
+}
+
+fn pytorchParity(attention: @import("graph.zig").AttentionProfile) !void {
     const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -65,7 +73,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     for (examples, ref.sequences, ref.targets) |*dst, seq, target| dst.* = .{ .ids = seq.ids, .markers = seq.markers, .kind = @enumFromInt(seq.qtype), .target = target[0..seq.markers.len] };
     const config_path = try std.fmt.allocPrint(scratch, "{s}/model/config.json", .{root});
     const config = try modern.parseConfig(scratch, try files.readFile(scratch, config_path));
-    var program = try train.Program.init(a, config, try train.bucketedLayout(examples, config), 0);
+    var program = try train.Program.initProfile(a, config, try train.bucketedLayout(examples, config), 0, 0, attention);
     defer program.deinit();
     var weights = try safetensors.MMapReader.openFileAbsolute(a, try std.fmt.allocPrint(scratch, "{s}/model/model.safetensors", .{root}));
     defer weights.deinit();
@@ -152,8 +160,46 @@ test "laya training forward objective and every parameter gradient match PyTorch
             mismatches += 1;
         }
     }
-    std.debug.print("Laya {s}: {d} gradient tensors, max absolute error={d}\n", .{ @tagName(execution), program.wrt.len, worst });
+    std.debug.print("Laya {s} {s}: {d} gradient tensors, max absolute error={d}\n", .{ @tagName(execution), @tagName(attention), program.wrt.len, worst });
     try std.testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+// ANTFLY_LAYA_BENCH_MODEL=<model dir> ANTFLY_LAYA_BENCH_SEQ=2048
+// ANTFLY_LAYA_BENCH_ATTENTION=fused_v1 times full trainer steps on one
+// synthetic question. Run one profile per process so the peak RSS is its own.
+test "laya training step timing" {
+    const model_dir = platform.env.getenv("ANTFLY_LAYA_BENCH_MODEL") orelse return error.SkipZigTest;
+    const AttentionProfile = @import("graph.zig").AttentionProfile;
+    const attention = std.meta.stringToEnum(AttentionProfile, platform.env.getenv("ANTFLY_LAYA_BENCH_ATTENTION") orelse "fused_v1") orelse return error.InvalidLayaBenchAttention;
+    const sequence = try std.fmt.parseInt(u32, platform.env.getenv("ANTFLY_LAYA_BENCH_SEQ") orelse "512", 10);
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var config = try modern.parseConfig(scratch, try files.readFile(scratch, try std.fmt.allocPrint(scratch, "{s}/config.json", .{model_dir})));
+    config.laya.?.max_len = @max(config.laya.?.max_len, sequence);
+    const ids = try scratch.alloc(i64, sequence);
+    for (ids, 0..) |*id, i| id.* = @intCast(1000 + i % 20000);
+    const examples = [_]train.Example{.{ .ids = ids, .markers = &.{ 1, 2 }, .target = &.{ 1, 0 } }};
+    var program = try train.Program.initProfile(a, config, try train.bucketedLayout(&examples, config), 0, 0, attention);
+    defer program.deinit();
+    var weights = try safetensors.MMapReader.openFileAbsolute(a, try std.fmt.allocPrint(scratch, "{s}/model.safetensors", .{model_dir}));
+    defer weights.deinit();
+    const parameters = try train.parameters(scratch, &program.graph, &weights, 0);
+    const originals = try scratch.alloc(run.Parameter, parameters.len);
+    for (parameters, originals) |p, *o| o.* = .{ .name = p.name, .canonical_name = p.name, .dimensions = p.dimensions, .values = p.values, .kind = .original };
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    const owner = try backend.Owner.init(a, &store, originals, parameters, .resident_metal, .{}, null);
+    defer owner.deinit();
+    var trainer = try train.controller.Trainer.init(a, &owner.cb, parameters, .{ .execution = .resident_metal, .limits = .{ .max_state_bytes = 16 * 1024 * 1024 * 1024, .max_transaction_bytes = 16 * 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0.000025 } }, .{ .schedule = .{ .constant = 0.0001 } } } });
+    defer trainer.deinit();
+    _ = try train.step(a, &program, &trainer, config, &examples, .{}, 0);
+    const steps = 3;
+    const start = platform.time.monotonicNs();
+    for (0..steps) |i| _ = try train.step(a, &program, &trainer, config, &examples, .{}, i + 1);
+    const elapsed_ms = @as(f64, @floatFromInt(platform.time.monotonicNs() - start)) / 1e6 / steps;
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    std.debug.print("Laya step {s} seq={d}: {d:.1} ms/step, peak RSS {d} MiB\n", .{ @tagName(attention), sequence, elapsed_ms, @divTrunc(usage.maxrss, 1024 * 1024) });
 }
 
 fn compareTraces(a: std.mem.Allocator, root: []const u8, program: *const train.Program, cb: *const @import("../../ops/ops.zig").ComputeBackend, outputs: []const @import("../../ops/ops.zig").CT, phase: []const u8) !void {

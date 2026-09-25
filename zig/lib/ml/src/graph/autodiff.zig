@@ -957,6 +957,24 @@ fn applyVjp(
             // Token validity, bucket indices and RNG counters have no VJP.
         },
 
+        .fused_modernbert_training_attention_v1 => |attrs| {
+            const layout = try attrs.layout();
+            if (ins.len != 2) return error.InvalidModernBertTrainingAttentionShape;
+            for (ins) |id|
+                if (id == null_node or id >= g.nodes.items.len) return error.InvalidGraphDependency;
+            if (!g.node(ins[0]).output_shape.eq(layout.qkvShape()) or !g.node(ins[1]).output_shape.eq(layout.controlShape()) or
+                !n.output_shape.eq(layout.outputShape())) return error.InvalidModernBertTrainingAttentionShape;
+            const grad_qkv = try b.graph.addNode(.{
+                .op = .{ .fused_modernbert_training_attention_backward_v1 = attrs },
+                .output_shape = layout.qkvShape(),
+                .inputs = .{ ins[0], ins[1], adj, null_node },
+                .num_inputs = 3,
+                .vjp_alternate = null_node,
+            });
+            try accumulate(b, adjoints, ins[0], grad_qkv);
+            // Ranges and positions have no VJP.
+        },
+
         .fused_linear => |attrs| {
             // Preserve fused forward rounding while reusing the ordinary
             // matrix and reduction VJPs. Only explicitly retained FP32

@@ -7443,6 +7443,89 @@ pub fn decoderRuntimeFlorenceChannelAttentionF32Device(
     return finishDeviceOutput(&output_device, rc);
 }
 
+const modernbert_training_attention = @import("../ops/modernbert_training_attention.zig");
+
+/// POD ABI mirrored in metal_kernels.m and its MSL source.
+const ModernBertTrainingAttentionParams = extern struct {
+    tokens: u32,
+    seq_len: u32,
+    num_heads: u32,
+    head_dim: u32,
+    window: u32,
+    backward: u32,
+    scale: f32,
+    reserved0: u32 = 0,
+};
+comptime {
+    if (@sizeOf(ModernBertTrainingAttentionParams) != 32) @compileError("ModernBERT training attention Metal ABI mismatch");
+}
+
+/// ModernBERT training attention over device-resident packed [Q;K;V] and an
+/// i32 control the caller has validated (disjoint in-row ranges). Returns the
+/// output rows, or packed [dQ;dK;dV] when `d_out` is given. Output and scratch
+/// share one allocation and the result views it, so the scratch outlives any
+/// command frame the dispatch was encoded into.
+pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
+    self: anytype,
+    qkv: MetalTensor,
+    control_tensor: MetalTensor,
+    d_out: ?MetalTensor,
+    attrs: modernbert_training_attention.Attrs,
+    control: ?TrainingAttentionControl,
+) !MetalTensor {
+    if (!build_options.enable_metal) return error.UnsupportedModernBertTrainingAttentionProfile;
+    try trainingAttentionCheck(control);
+    const runtime = self.raw_decode_runtime orelse return error.UnsupportedModernBertTrainingAttentionProfile;
+    const layout = try attrs.layout();
+    const tokens: usize = @intCast(layout.tokens);
+    const hidden: usize = @intCast(layout.hidden);
+    const backward = d_out != null;
+    if (!qkv.isDevice() or qkv.dtype != .f32 or qkv.elemCount() != 3 * tokens * hidden or
+        !control_tensor.isDevice() or control_tensor.dtype != .i32 or control_tensor.elemCount() != 7 * tokens)
+        return error.InvalidModernBertTrainingAttentionShape;
+    if (d_out) |upstream| if (!upstream.isDevice() or upstream.dtype != .f32 or upstream.elemCount() != tokens * hidden)
+        return error.InvalidModernBertTrainingAttentionShape;
+    const output_elements = if (backward) 3 * tokens * hidden else tokens * hidden;
+    const output_bytes = try std.math.mul(usize, output_elements, @sizeOf(f32));
+    const total_bytes = try std.math.add(usize, output_bytes, try modernbert_training_attention.scratchBytes(attrs, backward));
+    const storage_shape = [_]i32{@intCast(total_bytes / @sizeOf(f32))};
+    var storage = try MetalTensor.deviceAllocate(runtime, total_bytes, .private, &storage_shape);
+    defer storage.deinit();
+    const params = ModernBertTrainingAttentionParams{
+        .tokens = @intCast(tokens),
+        .seq_len = attrs.seq_len,
+        .num_heads = attrs.num_heads,
+        .head_dim = attrs.head_dim,
+        .window = attrs.window,
+        .backward = @intFromBool(backward),
+        .scale = 1 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim))),
+    };
+    const rc = termite_metal_decode_runtime_modernbert_training_attention_v1(
+        runtime,
+        qkv.deviceHandle(),
+        qkv.deviceByteOffset(),
+        control_tensor.deviceHandle(),
+        control_tensor.deviceByteOffset(),
+        if (d_out) |upstream| upstream.deviceHandle() else null,
+        if (d_out) |upstream| upstream.deviceByteOffset() else 0,
+        storage.deviceHandle(),
+        storage.deviceByteOffset(),
+        storage.deviceHandle(),
+        storage.deviceByteOffset() + output_bytes,
+        &params,
+    );
+    switch (rc) {
+        0 => {},
+        -1 => return error.InvalidModernBertTrainingAttentionShape,
+        -2 => return error.UnsupportedModernBertTrainingAttentionProfile,
+        -5 => return error.MetalEncoderAllocationFailed,
+        else => return error.MetalModernBertTrainingAttentionFailed,
+    }
+    try trainingAttentionCheck(control);
+    const rows: i32 = @intCast(if (backward) 3 * tokens else tokens);
+    return storage.retainedView(0, output_bytes, &.{ rows, @intCast(hidden) });
+}
+
 const training_attention_device = @import("../ops/deberta_training_attention_device.zig");
 const TrainingAttentionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
@@ -19175,6 +19258,20 @@ pub extern fn termite_metal_decode_runtime_apply_rope_device(
     consecutive_pairs: u32,
     output_handle: ?*anyopaque,
     output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_modernbert_training_attention_v1(
+    runtime: ?*RawMetalDecodeRuntime,
+    qkv_handle: ?*anyopaque,
+    qkv_offset: usize,
+    control_handle: ?*anyopaque,
+    control_offset: usize,
+    dout_handle: ?*anyopaque,
+    dout_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+    scratch_handle: ?*anyopaque,
+    scratch_offset: usize,
+    params: *const ModernBertTrainingAttentionParams,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_sdpa_segments_f32_device(
     runtime: ?*RawMetalDecodeRuntime,

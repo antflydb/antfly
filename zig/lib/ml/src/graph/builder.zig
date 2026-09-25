@@ -733,6 +733,23 @@ pub const Builder = struct {
         return self.graph.addNode(.{ .op = .{ .fused_boundary_training_attention_v1 = attrs }, .output_shape = layout.savedShape(), .inputs = .{ qkv, mask, null_node, null_node }, .num_inputs = 2 });
     }
 
+    /// ModernBERT training attention over packed [Q;K;V] rows; see
+    /// `ModernBertTrainingAttentionAttrs`. The i32 control is nondifferentiable.
+    pub fn modernBertTrainingAttentionV1(self: *Builder, qkv: NodeId, control: NodeId, attrs: node_mod.ModernBertTrainingAttentionAttrs) !NodeId {
+        const layout = try attrs.layout();
+        for ([_]NodeId{ qkv, control }) |id|
+            if (id == null_node or id >= self.graph.nodes.items.len) return error.InvalidGraphDependency;
+        if (!self.graph.node(qkv).output_shape.eq(layout.qkvShape()) or !self.graph.node(control).output_shape.eq(layout.controlShape()))
+            return error.InvalidModernBertTrainingAttentionShape;
+        return self.graph.addNode(.{
+            .op = .{ .fused_modernbert_training_attention_v1 = attrs },
+            .output_shape = layout.outputShape(),
+            .inputs = .{ qkv, control, null_node, null_node },
+            .num_inputs = 2,
+            .vjp_alternate = null_node,
+        });
+    }
+
     /// Training-only tiled/replay attention. Integer control is immutable and
     /// nondifferentiable; its physical storage must remain i32 on all backends.
     pub fn debertaTrainingAttentionV1(

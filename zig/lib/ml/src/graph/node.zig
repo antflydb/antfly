@@ -466,6 +466,56 @@ pub const DebertaTrainingAttentionAttrs = struct {
     }
 };
 
+/// Training attention for the ModernBERT trunk without a materialized score
+/// tensor. Query row `i` (of `batch*seq_len`) may see key row `k` only when
+/// `k` lies in one of its three half-open ranges and, unless `window` is
+/// `maxInt(u32)`, `|position[i] - position[k]| <= window`. Ranges stay inside
+/// the query's own batch row, so padding, sliding windows and tree-packed
+/// segments share one contract (the inference `SegmentAttention` semantics).
+///
+/// Forward leaves are packed [Q;K;V] rows after RoPE and a physical i32
+/// control of `batch*seq_len*6` range bounds followed by `batch*seq_len`
+/// logical positions. A row with no visible key outputs zero. The scale is
+/// `1/sqrt(head_dim)`. The backward replays the softmax statistics instead of
+/// saving them, and returns the packed [dQ;dK;dV] gradient.
+pub const ModernBertTrainingAttentionAttrs = struct {
+    batch: u32,
+    seq_len: u32,
+    num_heads: u32,
+    head_dim: u32,
+    window: u32 = std.math.maxInt(u32),
+
+    pub const Layout = struct {
+        tokens: i64,
+        hidden: i64,
+        qkv_rows: i64,
+        control_elements: i64,
+
+        pub fn qkvShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.qkv_rows, self.hidden });
+        }
+        pub fn controlShape(self: Layout) Shape {
+            return Shape.init(.i32, &.{self.control_elements});
+        }
+        pub fn outputShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.tokens, self.hidden });
+        }
+    };
+
+    /// Shape validation only; backends validate the control contents.
+    pub fn layout(self: ModernBertTrainingAttentionAttrs) !Layout {
+        for ([_]u32{ self.batch, self.seq_len, self.num_heads, self.head_dim }) |dim|
+            if (dim == 0 or dim > std.math.maxInt(i32)) return error.InvalidModernBertTrainingAttentionShape;
+        const tokens = try std.math.mul(i64, self.batch, self.seq_len);
+        const hidden = try std.math.mul(i64, self.num_heads, self.head_dim);
+        const qkv_rows = try std.math.mul(i64, 3, tokens);
+        const control_elements = try std.math.mul(i64, 7, tokens);
+        if (qkv_rows > std.math.maxInt(i32) or control_elements > std.math.maxInt(i32)) return error.InvalidModernBertTrainingAttentionShape;
+        _ = try std.math.mul(i64, qkv_rows, hidden);
+        return .{ .tokens = tokens, .hidden = hidden, .qkv_rows = qkv_rows, .control_elements = control_elements };
+    }
+};
+
 pub const RopeAttrs = struct {
     seq_len: u32,
     head_dim: u32,
@@ -669,6 +719,8 @@ pub const OpCode = union(enum) {
     fused_disentangled_attention_backward: AttentionAttrs,
     fused_deberta_training_attention_v1: DebertaTrainingAttentionAttrs,
     fused_deberta_training_attention_backward_v1: DebertaTrainingAttentionAttrs,
+    fused_modernbert_training_attention_v1: ModernBertTrainingAttentionAttrs,
+    fused_modernbert_training_attention_backward_v1: ModernBertTrainingAttentionAttrs,
     fused_relative_position_bias: RelativePositionBiasAttrs,
     fused_rope: RopeAttrs,
     fused_conv1d: Conv1dAttrs,
