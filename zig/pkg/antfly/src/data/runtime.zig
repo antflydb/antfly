@@ -889,6 +889,7 @@ fn publicApiListenerConfig(
 fn publicApiHttpxConfig(
     cfg: antfly.raft.transport.StdHttpListenerConfig,
     http_runtime: ?*httpx.HttpRuntime,
+    process_memory_limit_bytes: usize,
 ) httpx.ServerConfig {
     const max_connections: u32 = if (cfg.max_connection_threads == 0)
         public_api_max_connection_threads
@@ -901,6 +902,18 @@ fn publicApiHttpxConfig(
     // Request-task capacity also covers bodyless reads and queued admission.
     // Increasing it must not multiply the maximum upload buffering envelope.
     const max_h1_bodies = @min(max_request_tasks, public_api_max_active_requests);
+    const legacy_body_budget = cfg.max_request_bytes *| @as(usize, max_h1_bodies);
+    // Public upload buffers share the DATA process with Raft, storage and the
+    // separately owned protected recovery listener. Allow three times the
+    // maximum body for geometric spare bytes plus old+new buffer overlap
+    // during growth. Larger known envelopes leave most memory outside this
+    // transport budget. This bounds buffers, not the global heap; other
+    // allocations need admission owners.
+    // A smaller known envelope is rejected before the public listener starts.
+    const body_budget = if (process_memory_limit_bytes == 0)
+        legacy_body_budget
+    else
+        @min(legacy_body_budget, @max(cfg.max_request_bytes *| 3, process_memory_limit_bytes / 8));
     return (httpx.ServerConfig{
         .host = cfg.bind_host,
         .port = cfg.bind_port,
@@ -908,7 +921,7 @@ fn publicApiHttpxConfig(
         .header_read_timeout_ms = cfg.header_read_timeout_ms,
         .body_read_timeout_ms = cfg.body_read_timeout_ms,
         .response_write_timeout_ms = cfg.header_read_timeout_ms,
-        .request_body_buffer_budget_bytes = cfg.max_request_bytes * @as(usize, max_h1_bodies),
+        .request_body_buffer_budget_bytes = body_budget,
         .max_h1_inflight_bodies = max_h1_bodies,
         .max_connections = max_connections,
         .max_request_tasks = max_request_tasks,
@@ -917,6 +930,11 @@ fn publicApiHttpxConfig(
         .reuse_address = cfg.reuse_address,
         .http_runtime = http_runtime,
     }).normalized();
+}
+
+fn validatePublicBodyMemoryEnvelope(cfg: antfly.raft.transport.StdHttpListenerConfig, process_memory_limit_bytes: usize) !void {
+    if (process_memory_limit_bytes != 0 and process_memory_limit_bytes < cfg.max_request_bytes *| 3)
+        return error.ProcessMemoryLimitTooSmallForPublicBody;
 }
 
 /// Structured owner for the data role's public HTTP transport. The handler
@@ -971,6 +989,7 @@ const DataPublicHttpRuntime = struct {
         backend_runtime: *backend_runtime_mod.BackendRuntime,
         http_runtime: *httpx.HttpRuntime,
         cfg: antfly.raft.transport.StdHttpListenerConfig,
+        process_memory_limit_bytes: usize,
         api_server: *antfly.public_api.kernel_bridge.ApiHttpServer,
         h1_disconnect_probe: ?httpx.H1DisconnectProbe,
     ) !*DataPublicHttpRuntime {
@@ -983,7 +1002,7 @@ const DataPublicHttpRuntime = struct {
             .api_server = api_server,
             .handler = try antfly.public_api.kernel_bridge.createHandler(api_server),
             .server = blk: {
-                var server_cfg = publicApiHttpxConfig(cfg, http_runtime);
+                var server_cfg = publicApiHttpxConfig(cfg, http_runtime, process_memory_limit_bytes);
                 if (!http_runtime.supportsH1DisconnectCancellation()) {
                     if (h1_disconnect_probe) |probe| {
                         server_cfg.h1_disconnect_probe = probe;
@@ -8572,6 +8591,7 @@ pub const DataServer = struct {
     /// Start only the production public API transport. Embedders and VOPR use
     /// this boundary when they own background scheduling themselves.
     pub fn startPublicHttp(self: *DataServer) !void {
+        try validatePublicBodyMemoryEnvelope(self.listener_cfg, @intCast(self.provisioned_storage.effective_memory_limit_bytes));
         _ = try self.ensureBackendRuntime();
         try self.initApiServer();
         if (self.listener == null) {
@@ -8582,6 +8602,7 @@ pub const DataServer = struct {
                 runtime,
                 http_runtime,
                 self.listener_cfg,
+                @intCast(self.provisioned_storage.effective_memory_limit_bytes),
                 &self.http_server.?,
                 self.h1_disconnect_probe,
             );
@@ -9161,7 +9182,7 @@ pub const DataServer = struct {
         if (self.owned_http_runtime) |runtime| return runtime;
         const runtime = try self.alloc.create(httpx.HttpRuntime);
         errdefer self.alloc.destroy(runtime);
-        const listener_config = publicApiHttpxConfig(self.listener_cfg, null);
+        const listener_config = publicApiHttpxConfig(self.listener_cfg, null, @intCast(self.provisioned_storage.effective_memory_limit_bytes));
         const borrowed_io: ?httpx.HttpRuntime.BorrowedIo = if (self.backend_runtime) |backend_runtime|
             if (backend_runtime.usesBorrowedIo()) .{
                 .listener = backend_runtime.controlIo() orelse backend_runtime.apiIo() orelse return error.BackendRuntimeUnavailable,
@@ -33823,18 +33844,18 @@ fn consumerTests() type {
             try std.testing.expectEqual(public_api_max_connection_threads, cfg.max_connection_threads);
             try std.testing.expectEqual(public_api_max_active_requests, cfg.max_active_requests);
 
-            const server_config = publicApiHttpxConfig(cfg, null);
+            const server_config = publicApiHttpxConfig(cfg, null, 0);
             try std.testing.expectEqual(public_api_max_connection_threads, server_config.max_connections);
             try std.testing.expectEqual(public_api_max_active_requests, server_config.max_request_tasks);
             try std.testing.expectEqual(public_api_max_active_requests, server_config.max_h1_inflight_bodies);
         }
 
         test "data public API listener carries configured ingress capacity without increasing upload buffers" {
-            const legacy = publicApiHttpxConfig(publicApiListenerConfig("127.0.0.1", 8080, .{}), null);
+            const legacy = publicApiHttpxConfig(publicApiListenerConfig("127.0.0.1", 8080, .{}), null, 0);
             const configured = publicApiHttpxConfig(publicApiListenerConfig("127.0.0.1", 8080, .{
                 .max_requests = 128,
                 .max_retained_bytes = 16 * 1024 * 1024,
-            }), null);
+            }), null, 0);
             try std.testing.expectEqual(@as(u32, 128), configured.max_request_tasks);
             try std.testing.expectEqual(@as(u32, 160), configured.max_connections);
             try std.testing.expectEqual(legacy.max_h1_inflight_bodies, configured.max_h1_inflight_bodies);
@@ -33843,10 +33864,48 @@ fn consumerTests() type {
             const largest = publicApiHttpxConfig(publicApiListenerConfig("127.0.0.1", 8080, .{
                 .max_requests = 65_536,
                 .max_retained_bytes = 16 * 1024 * 1024,
-            }), null);
+            }), null, 0);
             try std.testing.expectEqual(@as(u32, 65_536), largest.max_request_tasks);
             try std.testing.expectEqual(@as(u32, 65_568), largest.max_connections);
             try std.testing.expectEqual(legacy.request_body_buffer_budget_bytes, largest.request_body_buffer_budget_bytes);
+        }
+
+        test "data public upload buffering follows the process memory envelope" {
+            const cfg = publicApiListenerConfig("127.0.0.1", 8080, .{});
+            try validatePublicBodyMemoryEnvelope(cfg, 0);
+            try std.testing.expectError(error.ProcessMemoryLimitTooSmallForPublicBody, validatePublicBodyMemoryEnvelope(cfg, 64 * 1024 * 1024));
+            try std.testing.expectError(error.ProcessMemoryLimitTooSmallForPublicBody, validatePublicBodyMemoryEnvelope(cfg, 128 * 1024 * 1024));
+            try validatePublicBodyMemoryEnvelope(cfg, 192 * 1024 * 1024);
+            const legacy = publicApiHttpxConfig(cfg, null, 0);
+            const small = publicApiHttpxConfig(cfg, null, 512 * 1024 * 1024);
+            try std.testing.expectEqual(cfg.max_request_bytes, small.max_body_size);
+            try std.testing.expectEqual(3 * cfg.max_request_bytes, small.request_body_buffer_budget_bytes);
+            try std.testing.expectEqual(legacy.max_h1_inflight_bodies, small.max_h1_inflight_bodies);
+            try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), publicApiHttpxConfig(cfg, null, 2 * 1024 * 1024 * 1024).request_body_buffer_budget_bytes);
+            try std.testing.expectEqual(legacy.request_body_buffer_budget_bytes, publicApiHttpxConfig(cfg, null, 32 * 1024 * 1024 * 1024).request_body_buffer_budget_bytes);
+        }
+
+        test "data public upload budget completes one maximum-sized request" {
+            const alloc = std.testing.allocator;
+            const cfg = publicApiHttpxConfig(publicApiListenerConfig("127.0.0.1", 8080, .{}), null, 512 * 1024 * 1024);
+            var budget = httpx.SharedBodyBudget.init(cfg.request_body_buffer_budget_bytes);
+            var parser = httpx.Parser.init(alloc);
+            parser.max_body_size = cfg.max_body_size;
+            parser.body_budget = &budget;
+            defer parser.deinit();
+            _ = try parser.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+            const chunk = try alloc.alloc(u8, 1024 * 1024);
+            defer alloc.free(chunk);
+            @memset(chunk, 'x');
+            for (0..64) |_| {
+                _ = try parser.feed("100000\r\n");
+                _ = try parser.feed(chunk);
+                _ = try parser.feed("\r\n");
+            }
+            _ = try parser.feed("0\r\n\r\n");
+            try std.testing.expect(parser.isComplete());
+            try std.testing.expectEqual(cfg.max_body_size, parser.getBody().len);
+            try std.testing.expect(budget.stats().peak_in_use <= cfg.request_body_buffer_budget_bytes);
         }
 
         test "data descriptor factory separates bootstrap voters from transport peers" {
@@ -42513,12 +42572,19 @@ fn consumerTests() type {
             var public_server = httpx.Server.initWithConfig(alloc, public_io.io(), .{
                 .host = "127.0.0.1",
                 .port = 0,
+                .max_body_size = 4096,
+                .request_body_buffer_budget_bytes = 4096,
                 .max_connections = 1,
                 .max_request_tasks = 1,
                 .header_read_timeout_ms = 5_000,
                 .h1_disconnect_cancellation = .disabled,
             });
             defer public_server.deinit();
+            // A saturated public upload budget must not consume the protected
+            // listener's separate body allocation capacity.
+            try std.testing.expect(public_server.body_budget.tryReserve(4096));
+            defer public_server.body_budget.release(4096);
+            try std.testing.expect(!public_server.body_budget.tryReserve(1));
             var public_task = httpx.ListenerTask.init(&public_server);
             try public_task.start();
             defer {

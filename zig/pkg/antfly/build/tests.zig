@@ -70,6 +70,7 @@ pub const AddTestsOptions = struct {
 };
 pub const AddTestsResult = struct {
     linked_consumer_tests: []const *std.Build.Step.Compile,
+    data_runtime_implementation_tests: *std.Build.Step.Compile,
     storage_test_step: *std.Build.Step,
     vopr_soak_test_step: *std.Build.Step,
     storage_workload_soak_step: *std.Build.Step,
@@ -6324,6 +6325,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .compiled_recall_tests = compiled_recall_tests,
         .storage_test_step = lib_storage_test_step,
         .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable } }) catch @panic("OOM"),
+        .data_runtime_implementation_tests = data_tests_addTests_result.implementation,
     };
 }
 
