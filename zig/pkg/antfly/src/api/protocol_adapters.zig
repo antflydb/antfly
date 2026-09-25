@@ -1770,6 +1770,7 @@ fn buildA2aDispatcher(
     };
     contexts[2] = .{
         .server = server_ptr,
+        .parent_owner = parent_owner,
         .authorization = authorization,
         .query_embedding_security_scope = query_embedding_security_scope,
         .authenticated_identity = authenticated_identity,

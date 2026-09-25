@@ -6275,8 +6275,9 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const source = self.api_server.table_reads orelse return jsonErrorResponse(ctx, 404, "not found");
         const body_data = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "invalid research agent request");
-        if (try self.acquirePublicOperation(ctx, "researchAgent")) |response| return response;
-        defer self.releasePublicOperation("researchAgent");
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "researchAgent", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("researchAgent", &admission_lease);
 
         var runners = self.agentRunners(ctx, source, authenticated_identity, research_agent.deadlineMs(alloc, body_data));
         var sink = RetrievalSseSink{ .context = ctx };
@@ -6309,8 +6310,9 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const source = self.api_server.table_reads orelse return jsonErrorResponse(ctx, 404, "not found");
         const body_data = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "invalid research job request");
-        if (try self.acquirePublicOperation(ctx, "startResearchJob")) |response| return response;
-        defer self.releasePublicOperation("startResearchJob");
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "startResearchJob", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("startResearchJob", &admission_lease);
 
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
@@ -6399,8 +6401,9 @@ pub const AntflyApiHandler = struct {
         const existing = (try self.api_server.research_job_store.load(arena, job_id, owner)) orelse return jsonErrorResponse(ctx, 404, "not found");
         if (existing.terminal()) return researchJobResponse(ctx, 200, existing);
         if (existing.state == .running and research_jobs.nowMillis() < existing.lease_until_ms) return researchJobResponse(ctx, 409, existing);
-        if (try self.acquirePublicOperation(ctx, "advanceResearchJob")) |response| return response;
-        defer self.releasePublicOperation("advanceResearchJob");
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "advanceResearchJob", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("advanceResearchJob", &admission_lease);
         var runners = self.agentRunners(ctx, source, authenticated_identity, null);
         const record = self.advanceStoredResearchJob(ctx, arena, &runners, job_id, owner, phases) catch |err| switch (err) {
             error.NotFound => return jsonErrorResponse(ctx, 404, "not found"),
