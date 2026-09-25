@@ -29,15 +29,103 @@
 
 const std = @import("std");
 const db_mod = @import("../storage/db/selected_root.zig").db;
+const table_reads = @import("table_read_source.zig");
 const table_writes = @import("table_write_source.zig");
 const distributed_txn = @import("distributed_txn.zig");
 
 const EntitySink = db_mod.EntitySink;
 
+const PromotionTableBatch = struct {
+    transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
+    writes: std.ArrayListUnmanaged(db_mod.types.TransactionWrite) = .empty,
+    deletes: std.ArrayListUnmanaged([]const u8) = .empty,
+    predicates: std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate) = .empty,
+};
+
+fn promotionTableBatch(
+    a: std.mem.Allocator,
+    tables: *std.StringArrayHashMapUnmanaged(PromotionTableBatch),
+    physical: []const u8,
+) !*PromotionTableBatch {
+    const entry = try tables.getOrPut(a, physical);
+    if (!entry.found_existing) entry.value_ptr.* = .{};
+    return entry.value_ptr;
+}
+
+fn promotionDocumentIdentityAlloc(a: std.mem.Allocator, physical: []const u8, key: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}\x00{s}", .{ physical, key });
+}
+
+fn parsePromotionDocument(a: std.mem.Allocator, raw: []const u8) !std.json.Value {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return error.InvalidEntityPromotionDocument;
+    if (value != .object) return error.InvalidEntityPromotionDocument;
+    return value;
+}
+
+fn normalizePromotionAliases(a: std.mem.Allocator, value: *std.json.Value) !void {
+    switch (value.*) {
+        .string => |alias| {
+            var aliases = std.json.Array.init(a);
+            try aliases.append(.{ .string = alias });
+            value.* = .{ .array = aliases };
+        },
+        .array => |aliases| for (aliases.items) |alias| {
+            if (alias != .string) return error.InvalidEntityPromotionDocument;
+        },
+        else => return error.InvalidEntityPromotionDocument,
+    }
+}
+
+/// Keep the destination's curated values, fill missing fields from the old
+/// document, and union aliases contributed by either document or this work.
+fn mergePromotionDocument(a: std.mem.Allocator, destination: *std.json.Value, source: std.json.Value) !void {
+    if (destination.* != .object or source != .object) return error.InvalidEntityPromotionDocument;
+    var fields = source.object.iterator();
+    while (fields.next()) |field| {
+        const name = field.key_ptr.*;
+        var incoming = field.value_ptr.*;
+        if (std.mem.eql(u8, name, "aliases")) {
+            try normalizePromotionAliases(a, &incoming);
+            if (destination.object.getPtr(name)) |existing| {
+                try normalizePromotionAliases(a, existing);
+                for (incoming.array.items) |alias| {
+                    var present = false;
+                    for (existing.array.items) |current| {
+                        if (std.mem.eql(u8, current.string, alias.string)) {
+                            present = true;
+                            break;
+                        }
+                    }
+                    if (!present) try existing.array.append(.{ .string = alias.string });
+                }
+            } else {
+                try destination.object.put(a, name, incoming);
+            }
+            continue;
+        }
+        if (destination.object.getPtr(name)) |existing| {
+            if (existing.* == .object and incoming == .object) {
+                try mergePromotionDocument(a, existing, incoming);
+            }
+        } else {
+            try destination.object.put(a, name, incoming);
+        }
+    }
+}
+
+const PromotionMove = struct {
+    physical: []const u8,
+    key: []const u8,
+    document: std.json.Value,
+    version: u64,
+    digest: ?[32]u8,
+};
+
 /// Adapts the routing-aware `TableWriteSource` to the promoter's `EntitySink`.
 /// Holds only borrowed handles, so it must not outlive the write source.
 pub const DistributedEntitySink = struct {
     writes: table_writes.TableWriteSource,
+    reads: ?table_reads.TableReadSource = null,
     catalog_binding: ?@import("../system_catalog/domain.zig").BindingSource = null,
     /// Sync level for entity upserts. `write` (durable, not full-index) keeps
     /// promotion latency low; the entity shard indexes asynchronously.
@@ -83,32 +171,104 @@ pub const DistributedEntitySink = struct {
         // Preserve the resolution work unit's immutable destination through
         // deferred promotion. Older artifacts bind all missing destinations in
         // one metadata read; pinned artifacts never resolve a logical name again.
-        const TableBatch = struct {
-            physical: ?[]const u8 = null,
-            transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
-        };
-        var tables = std.StringArrayHashMapUnmanaged(TableBatch).empty;
+        // Resolve unpinned logical names once, then group by physical table.
+        // A re-key can redirect an old key in its original physical table and
+        // upsert the survivor in a new one in the same atomic batch.
+        var unpinned = std.StringArrayHashMapUnmanaged([]const u8).empty;
         for (entries) |e| {
-            const ops = try buildMergeOps(a, e.doc_json);
-            if (ops.len == 0) continue;
-            const entry = try tables.getOrPut(a, e.table);
-            if (!entry.found_existing) entry.value_ptr.* = .{ .physical = e.storage_table } else {
-                const previous = entry.value_ptr.physical;
-                if ((previous == null) != (e.storage_table == null) or
-                    (previous != null and !std.mem.eql(u8, previous.?, e.storage_table.?))) return error.EntityPromotionConflict;
+            if (e.storage_table == null) try unpinned.put(a, e.table, e.table);
+        }
+        if (unpinned.count() > 0 and self.catalog_binding != null) {
+            const physical = try self.catalog_binding.?.bind(a, unpinned.keys());
+            if (physical.len != unpinned.count()) return error.InvalidCatalogRecord;
+            for (unpinned.values(), physical) |*destination, target| destination.* = target;
+        }
+        var tables = std.StringArrayHashMapUnmanaged(PromotionTableBatch).empty;
+        var moves = std.StringArrayHashMapUnmanaged(PromotionMove).empty;
+        var seen_old = std.StringHashMapUnmanaged([]const u8).empty;
+        for (entries, 0..) |e, i| {
+            if (!e.delete) continue;
+            const survivor = if (i + 1 < entries.len) entries[i + 1] else return error.InvalidEntityPromotionMove;
+            if (survivor.delete or !std.mem.eql(u8, e.table, survivor.table) or !std.mem.eql(u8, e.key, survivor.key))
+                return error.InvalidEntityPromotionMove;
+            const old_physical = e.storage_table orelse return error.InvalidEntityPromotionMove;
+            const new_physical = survivor.storage_table orelse return error.InvalidEntityPromotionMove;
+            if (std.mem.eql(u8, old_physical, new_physical)) return error.InvalidEntityPromotionMove;
+            const reads = self.reads orelse return error.EntityPromotionReadUnavailable;
+            const target_id = try promotionDocumentIdentityAlloc(a, new_physical, e.key);
+            const move = try moves.getOrPut(a, target_id);
+            if (!move.found_existing) {
+                var current = try reads.lookup(a, new_physical, e.key, .{ .include_primary_digest = true }, .read_index);
+                defer if (current) |*row| row.deinit(a);
+                move.value_ptr.* = .{
+                    .physical = new_physical,
+                    .key = e.key,
+                    .document = if (current) |row| try parsePromotionDocument(a, row.json) else .{ .object = .empty },
+                    .version = if (current) |row| row.version else 0,
+                    .digest = if (current) |row| row.expected_content_digest else null,
+                };
             }
-            try entry.value_ptr.transforms.append(a, .{ .key = e.key, .operations = ops, .upsert = true });
+            const old_id = try promotionDocumentIdentityAlloc(a, old_physical, e.key);
+            if (seen_old.get(old_id)) |prior_target| {
+                if (!std.mem.eql(u8, prior_target, target_id)) return error.EntityPromotionConflict;
+                continue;
+            }
+            try seen_old.put(a, old_id, target_id);
+            var old = try reads.lookup(a, old_physical, e.key, .{ .include_primary_digest = true }, .read_index);
+            defer if (old) |*row| row.deinit(a);
+            if (old) |row| {
+                try mergePromotionDocument(a, &move.value_ptr.document, try parsePromotionDocument(a, row.json));
+            }
+            // Fence the observed absence too. Another promotion can recreate
+            // this old copy between the read and commit; the batch must then
+            // conflict and retry rather than advance state with a stranded row.
+            const batch = try promotionTableBatch(a, &tables, old_physical);
+            try batch.deletes.append(a, e.key);
+            try batch.predicates.append(a, .{
+                .key = e.key,
+                .expected_version = if (old) |row| row.version else 0,
+                .expected_content_digest = if (old) |row| row.expected_content_digest else null,
+            });
+        }
+        for (entries) |e| {
+            if (e.delete) continue;
+            const physical = e.storage_table orelse unpinned.get(e.table).?;
+            if (moves.count() != 0) {
+                const id = try promotionDocumentIdentityAlloc(a, physical, e.key);
+                if (moves.getPtr(id)) |move| {
+                    try mergePromotionDocument(a, &move.document, try parsePromotionDocument(a, e.doc_json));
+                    continue;
+                }
+            }
+            const ops = try buildMergeOps(a, e.doc_json);
+            if (ops.len != 0) {
+                const batch = try promotionTableBatch(a, &tables, physical);
+                try batch.transforms.append(a, .{ .key = e.key, .operations = ops, .upsert = true });
+            }
+        }
+        for (moves.values()) |*move| {
+            const batch = try promotionTableBatch(a, &tables, move.physical);
+            // The survivor is live even when either stored copy was a
+            // tombstone. Match the ordinary promotion transform's redirect
+            // clearing before replacing its complete document.
+            _ = move.document.object.swapRemove("merged_into");
+            _ = move.document.object.swapRemove("merged_into_table");
+            try batch.writes.append(a, .{ .key = move.key, .value = try std.json.Stringify.valueAlloc(a, move.document, .{}) });
+            try batch.predicates.append(a, .{ .key = move.key, .expected_version = move.version, .expected_content_digest = move.digest });
         }
         if (tables.count() == 0) return;
-        var missing = std.ArrayListUnmanaged([]const u8).empty;
-        for (tables.keys(), tables.values()) |name, batch| if (batch.physical == null) try missing.append(a, name);
-        if (missing.items.len > 0) {
-            const physical: []const []const u8 = if (self.catalog_binding) |binding| try binding.bind(a, missing.items) else missing.items;
-            if (physical.len != missing.items.len) return error.InvalidCatalogRecord;
-            for (missing.items, physical) |name, target| tables.getPtr(name).?.physical = target;
-        }
         var reqs = std.ArrayListUnmanaged(distributed_txn.TableCommitRequest).empty;
-        for (tables.values()) |batch| try reqs.append(a, .{ .table_name = batch.physical.?, .transforms = batch.transforms.items });
+        for (tables.keys(), tables.values()) |physical, batch| {
+            if (batch.transforms.items.len == 0 and batch.writes.items.len == 0 and batch.deletes.items.len == 0) continue;
+            try reqs.append(a, .{
+                .table_name = physical,
+                .transforms = batch.transforms.items,
+                .writes = batch.writes.items,
+                .deletes = batch.deletes.items,
+                .predicates = batch.predicates.items,
+            });
+        }
+        if (reqs.items.len == 0) return;
 
         // Promotion is a stateless, idempotent batch. Use the batch commit
         // contract so first-party sources can safely retry topology races and
@@ -213,6 +373,11 @@ fn buildMergeOps(a: std.mem.Allocator, doc_json: []const u8) ![]db_mod.types.Tra
     } else {
         try ops.append(a, .{ .op = .unset, .path = "merged_into", .value_json = null });
     }
+    if (obj.get("merged_into_table")) |v| {
+        if (v == .string) try ops.append(a, .{ .op = .set, .path = "merged_into_table", .value_json = try jsonStringAlloc(a, v.string) }) else try ops.append(a, .{ .op = .unset, .path = "merged_into_table", .value_json = null });
+    } else {
+        try ops.append(a, .{ .op = .unset, .path = "merged_into_table", .value_json = null });
+    }
     return try ops.toOwnedSlice(a);
 }
 
@@ -230,7 +395,13 @@ const testing = std.testing;
 const FakeTableWriteSource = struct {
     alloc: std.mem.Allocator,
     table: []const u8,
+    other_table: ?[]const u8 = null,
+    table_names: std.ArrayListUnmanaged([]u8) = .empty,
     keys: std.ArrayListUnmanaged([]u8) = .empty,
+    deletes: std.ArrayListUnmanaged([]u8) = .empty,
+    write_keys: std.ArrayListUnmanaged([]u8) = .empty,
+    write_docs: std.ArrayListUnmanaged([]u8) = .empty,
+    predicate_versions: std.ArrayListUnmanaged(u64) = .empty,
     transforms_json: std.ArrayListUnmanaged([]u8) = .empty,
     /// Set so the source advertises the transaction vtable method.
     support_transactions: bool = false,
@@ -240,9 +411,18 @@ const FakeTableWriteSource = struct {
     commit_batch_calls: usize = 0,
 
     fn deinit(self: *FakeTableWriteSource) void {
+        for (self.table_names.items) |name| self.alloc.free(name);
         for (self.keys.items) |k| self.alloc.free(k);
+        for (self.deletes.items) |key| self.alloc.free(key);
+        for (self.write_keys.items) |key| self.alloc.free(key);
+        for (self.write_docs.items) |doc| self.alloc.free(doc);
         for (self.transforms_json.items) |t| self.alloc.free(t);
         self.keys.deinit(self.alloc);
+        self.deletes.deinit(self.alloc);
+        self.write_keys.deinit(self.alloc);
+        self.write_docs.deinit(self.alloc);
+        self.predicate_versions.deinit(self.alloc);
+        self.table_names.deinit(self.alloc);
         self.transforms_json.deinit(self.alloc);
     }
 
@@ -273,8 +453,15 @@ const FakeTableWriteSource = struct {
         const self: *FakeTableWriteSource = @ptrCast(@alignCast(ptr));
         self.commit_calls += 1;
         for (tables) |t| {
-            if (!std.mem.eql(u8, t.table_name, self.table)) return null;
+            if (!self.serves(t.table_name)) return null;
+            try self.table_names.append(self.alloc, try self.alloc.dupe(u8, t.table_name));
             try recordTransforms(self, alloc, t.transforms);
+            for (t.deletes) |key| try self.deletes.append(self.alloc, try self.alloc.dupe(u8, key));
+            for (t.writes) |write| {
+                try self.write_keys.append(self.alloc, try self.alloc.dupe(u8, write.key));
+                try self.write_docs.append(self.alloc, try self.alloc.dupe(u8, write.value));
+            }
+            for (t.predicates) |predicate| try self.predicate_versions.append(self.alloc, predicate.expected_version);
         }
         return .{ .committed = .{ .participant_count = tables.len } };
     }
@@ -289,10 +476,22 @@ const FakeTableWriteSource = struct {
         const self: *FakeTableWriteSource = @ptrCast(@alignCast(ptr));
         self.commit_batch_calls += 1;
         for (tables) |t| {
-            if (!std.mem.eql(u8, t.table_name, self.table)) return null;
+            if (!self.serves(t.table_name)) return null;
+            try self.table_names.append(self.alloc, try self.alloc.dupe(u8, t.table_name));
             try recordTransforms(self, alloc, t.transforms);
+            for (t.deletes) |key| try self.deletes.append(self.alloc, try self.alloc.dupe(u8, key));
+            for (t.writes) |write| {
+                try self.write_keys.append(self.alloc, try self.alloc.dupe(u8, write.key));
+                try self.write_docs.append(self.alloc, try self.alloc.dupe(u8, write.value));
+            }
+            for (t.predicates) |predicate| try self.predicate_versions.append(self.alloc, predicate.expected_version);
         }
         return .{ .committed = .{ .participant_count = tables.len } };
+    }
+
+    fn serves(self: *const FakeTableWriteSource, name: []const u8) bool {
+        return std.mem.eql(u8, name, self.table) or
+            (self.other_table != null and std.mem.eql(u8, name, self.other_table.?));
     }
 
     fn recordTransforms(self: *FakeTableWriteSource, alloc: std.mem.Allocator, transforms: []const db_mod.types.DocumentTransform) anyerror!void {
@@ -361,7 +560,8 @@ test "DistributedEntitySink upserts a merge transform per entity" {
     try testing.expect(std.mem.indexOf(u8, ops, "add_to_set aliases=\"Ada Lovelace\"") != null);
     // A live promotion clears any stale redirect: the key is a current
     // canonical target.
-    try testing.expect(std.mem.indexOf(u8, ops, "unset merged_into") != null);
+    try testing.expect(std.mem.indexOf(u8, ops, "unset merged_into=;") != null);
+    try testing.expect(std.mem.indexOf(u8, ops, "unset merged_into_table=;") != null);
 }
 
 test "DistributedEntitySink overwrites the redirect for a merged tombstone" {
@@ -380,7 +580,19 @@ test "DistributedEntitySink overwrites the redirect for a merged tombstone" {
     );
     const ops = fake.transforms_json.items[0];
     try testing.expect(std.mem.indexOf(u8, ops, "set merged_into=\"event/canonical\"") != null);
-    try testing.expect(std.mem.indexOf(u8, ops, "unset merged_into") == null);
+    try testing.expect(std.mem.indexOf(u8, ops, "unset merged_into=;") == null);
+}
+
+test "DistributedEntitySink records a cross-table redirect" {
+    const alloc = testing.allocator;
+    var fake = FakeTableWriteSource{ .alloc = alloc, .table = "people" };
+    defer fake.deinit();
+    var sink_impl = DistributedEntitySink{ .writes = fake.source() };
+    try sink_impl.entitySink().upsert(alloc, "people", "person/ada",
+        \\{"entity_type":"person","merged_into":"person/ada","merged_into_table":"curated"}
+    );
+    const ops = fake.transforms_json.items[0];
+    try testing.expect(std.mem.indexOf(u8, ops, "set merged_into_table=\"curated\"") != null);
 }
 
 test "DistributedEntitySink fails closed on an unknown table" {
@@ -470,6 +682,157 @@ test "DistributedEntitySink atomic promotion batch prefers stateless batch commi
     try testing.expectEqualStrings("person/ada_lovelace", fake.keys.items[0]);
     try testing.expectEqualStrings("org/antfly", fake.keys.items[1]);
     try testing.expect(std.mem.indexOf(u8, fake.transforms_json.items[0], "add_to_set aliases=\"Ada Lovelace\"") != null);
+}
+
+test "DistributedEntitySink commits a re-key across pinned physical tables atomically" {
+    const alloc = testing.allocator;
+    var fake = FakeTableWriteSource{
+        .alloc = alloc,
+        .table = "table:old",
+        .other_table = "table:new",
+        .support_commit_batch = true,
+    };
+    defer fake.deinit();
+    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .atomic_batch_required = true };
+    const sink = sink_impl.entitySink();
+
+    try sink.upsertBatch(alloc, &.{
+        .{
+            .table = "events",
+            .storage_table = "table:old",
+            .key = "event/provisional",
+            .doc_json = "{\"entity_type\":\"event\",\"merged_into\":\"event/canonical\"}",
+        },
+        .{
+            .table = "events",
+            .storage_table = "table:new",
+            .key = "event/canonical",
+            .doc_json = "{\"entity_type\":\"event\",\"canonical_name\":\"Ada spoke.\"}",
+        },
+    });
+
+    try testing.expectEqual(@as(usize, 1), fake.commit_batch_calls);
+    try testing.expectEqual(@as(usize, 2), fake.table_names.items.len);
+    try testing.expectEqualStrings("table:old", fake.table_names.items[0]);
+    try testing.expectEqualStrings("table:new", fake.table_names.items[1]);
+    try testing.expectEqualStrings("event/provisional", fake.keys.items[0]);
+    try testing.expectEqualStrings("event/canonical", fake.keys.items[1]);
+}
+
+test "DistributedEntitySink deletes an old pinned copy while moving a key" {
+    const alloc = testing.allocator;
+    const FakeReads = struct {
+        old_reads: usize = 0,
+        new_reads: usize = 0,
+        old_exists: bool = true,
+        scalar_aliases: bool = false,
+        invalid_aliases: bool = false,
+
+        fn lookup(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) anyerror!?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try testing.expectEqualStrings("person/ada", key);
+            try testing.expect(opts.include_primary_digest);
+            try testing.expectEqual(@as(@TypeOf(consistency), .read_index), consistency);
+            if (std.mem.eql(u8, table, "table:old")) {
+                self.old_reads += 1;
+                if (!self.old_exists) return null;
+                if (self.scalar_aliases) return .{ .json = try a.dupe(u8, "{\"aliases\":\"A. Lovelace\",\"curator_note\":true}"), .version = 7 };
+                return .{ .json = try a.dupe(u8, "{\"canonical_name\":\"Curated Ada\",\"aliases\":[\"A. Lovelace\"],\"curator_note\":{\"reviewed\":true},\"merged_into\":\"person/other\"}"), .version = 7 };
+            }
+            try testing.expectEqualStrings("table:new", table);
+            self.new_reads += 1;
+            if (self.invalid_aliases) return .{ .json = try a.dupe(u8, "{\"aliases\":42}"), .version = 3 };
+            if (self.scalar_aliases) return .{ .json = try a.dupe(u8, "{\"aliases\":\"Countess Ada\",\"new_note\":true}"), .version = 3 };
+            return .{ .json = try a.dupe(u8, "{\"canonical_name\":\"New Ada\",\"aliases\":[\"Countess Ada\"],\"new_note\":true,\"merged_into_table\":\"other_people\"}"), .version = 3 };
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnexpectedPromotionScan;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) anyerror!?@import("query_response.zig").QueryResponse {
+            return error.UnexpectedPromotionQuery;
+        }
+
+        const vtable: table_reads.TableReadSource.VTable = .{ .lookup = lookup, .scan = scan, .query = query };
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+    };
+    var reads: FakeReads = .{};
+    var fake = FakeTableWriteSource{
+        .alloc = alloc,
+        .table = "table:old",
+        .other_table = "table:new",
+        .support_commit_batch = true,
+    };
+    defer fake.deinit();
+    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .reads = reads.source(), .atomic_batch_required = true };
+    try sink_impl.entitySink().upsertBatch(alloc, &.{
+        .{ .table = "entities", .storage_table = "table:old", .key = "person/ada", .delete = true },
+        .{ .table = "entities", .storage_table = "table:new", .key = "person/ada", .doc_json = "{\"canonical_name\":\"Ada\",\"aliases\":[\"Ada\"]}" },
+        .{ .table = "entities", .storage_table = "table:old", .key = "person/ada", .delete = true },
+        .{ .table = "entities", .storage_table = "table:new", .key = "person/ada", .doc_json = "{\"canonical_name\":\"Ada\",\"aliases\":[\"Ada Byron\"]}" },
+    });
+    try testing.expectEqual(@as(usize, 1), fake.commit_batch_calls);
+    try testing.expectEqual(@as(usize, 2), fake.table_names.items.len);
+    try testing.expectEqualStrings("table:old", fake.table_names.items[0]);
+    try testing.expectEqualStrings("table:new", fake.table_names.items[1]);
+    try testing.expectEqualStrings("person/ada", fake.deletes.items[0]);
+    try testing.expectEqual(@as(usize, 1), reads.old_reads);
+    try testing.expectEqual(@as(usize, 1), reads.new_reads);
+    try testing.expectEqual(@as(usize, 1), fake.write_keys.items.len);
+    try testing.expectEqualStrings("person/ada", fake.write_keys.items[0]);
+    try @import("antfly-json").testing.expectSubsetJsonText(
+        alloc,
+        "{\"canonical_name\":\"New Ada\",\"aliases\":[\"Countess Ada\",\"A. Lovelace\",\"Ada\",\"Ada Byron\"],\"curator_note\":{\"reviewed\":true},\"new_note\":true}",
+        fake.write_docs.items[0],
+    );
+    var moved = try std.json.parseFromSlice(std.json.Value, alloc, fake.write_docs.items[0], .{});
+    defer moved.deinit();
+    try testing.expect(moved.value.object.get("merged_into") == null);
+    try testing.expect(moved.value.object.get("merged_into_table") == null);
+    try testing.expectEqualSlices(u64, &.{ 7, 3 }, fake.predicate_versions.items);
+
+    var missing_reads = FakeReads{ .old_exists = false };
+    var missing_fake = FakeTableWriteSource{
+        .alloc = alloc,
+        .table = "table:old",
+        .other_table = "table:new",
+        .support_commit_batch = true,
+    };
+    defer missing_fake.deinit();
+    var missing_sink = DistributedEntitySink{ .writes = missing_fake.source(), .reads = missing_reads.source(), .atomic_batch_required = true };
+    try missing_sink.entitySink().upsertBatch(alloc, &.{
+        .{ .table = "entities", .storage_table = "table:old", .key = "person/ada", .delete = true },
+        .{ .table = "entities", .storage_table = "table:new", .key = "person/ada", .doc_json = "{\"canonical_name\":\"Ada\"}" },
+    });
+    try testing.expectEqual(@as(usize, 1), missing_reads.old_reads);
+    try testing.expectEqual(@as(usize, 1), missing_fake.deletes.items.len);
+    try testing.expectEqualStrings("person/ada", missing_fake.deletes.items[0]);
+    try testing.expectEqualSlices(u64, &.{ 0, 3 }, missing_fake.predicate_versions.items);
+
+    var scalar_reads = FakeReads{ .scalar_aliases = true };
+    var scalar_fake = FakeTableWriteSource{ .alloc = alloc, .table = "table:old", .other_table = "table:new", .support_commit_batch = true };
+    defer scalar_fake.deinit();
+    var scalar_sink = DistributedEntitySink{ .writes = scalar_fake.source(), .reads = scalar_reads.source(), .atomic_batch_required = true };
+    const move_entries: []const db_mod.EntityUpsert = &.{
+        .{ .table = "entities", .storage_table = "table:old", .key = "person/ada", .delete = true },
+        .{ .table = "entities", .storage_table = "table:new", .key = "person/ada", .doc_json = "{\"aliases\":[\"Ada\"]}" },
+    };
+    try scalar_sink.entitySink().upsertBatch(alloc, move_entries);
+    try @import("antfly-json").testing.expectSubsetJsonText(
+        alloc,
+        "{\"aliases\":[\"Countess Ada\",\"A. Lovelace\",\"Ada\"],\"curator_note\":true,\"new_note\":true}",
+        scalar_fake.write_docs.items[0],
+    );
+
+    var invalid_reads = FakeReads{ .invalid_aliases = true };
+    var invalid_fake = FakeTableWriteSource{ .alloc = alloc, .table = "table:old", .other_table = "table:new", .support_commit_batch = true };
+    defer invalid_fake.deinit();
+    var invalid_sink = DistributedEntitySink{ .writes = invalid_fake.source(), .reads = invalid_reads.source(), .atomic_batch_required = true };
+    try testing.expectError(error.InvalidEntityPromotionDocument, invalid_sink.entitySink().upsertBatch(alloc, move_entries));
+    try testing.expectEqual(@as(usize, 0), invalid_fake.commit_batch_calls);
 }
 
 test "DistributedEntitySink batch commit remains compatible with transaction-only sources" {

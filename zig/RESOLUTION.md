@@ -554,7 +554,7 @@ and both are served by the same seam:
    `scan` over `[prefix, prefixUpperBound)`, `nearest` -> a dense-vector `query`.
    The read source already resolves each group to local or remote and fans out,
    so blocking reuses all existing topology/transport instead of re-deriving it.
-   Unit-tested with a fake `TableReadSource` (`antfly-api-resolution-source-test`) and a
+   Unit-tested with a fake `TableReadSource` (`antfly-api-test` filtered by `DistributedCandidateSource`) and a
    fake `CandidateSource` (`antfly-storage-db-test`).
 3. **Serving-layer injection.** `DataServer.initApiServer` wraps
    `read_source.source()` in a `DistributedCandidateSource` (a long-lived
