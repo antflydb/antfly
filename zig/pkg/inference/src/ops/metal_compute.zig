@@ -11770,7 +11770,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 for (resolved[axis + 1 .. input_shape.len], axis + index_tensor.shape().len..) |dim, i| shape[i] = @intCast(dim);
                 var source = if (toBuf(input).integer_storage) try toBuf(input).metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(input);
                 defer source.deinit();
-                const result = (try metal_runtime.decoderRuntimeGatherTypedDevice(self.provider_impl, source, index_tensor, axis, shape[0..rank])) orelse return error.UnsupportedTensorType;
+                var result = (try metal_runtime.decoderRuntimeGatherTypedDevice(self.provider_impl, source, index_tensor, axis, shape[0..rank])) orelse return error.UnsupportedTensorType;
+                errdefer result.deinit();
                 return self.ctFromOwnedMetalTensor(result);
             }
             return self.hostFallbackGather(input, indices, axis, input_shape);

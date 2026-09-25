@@ -176,9 +176,19 @@ test "resident training Metal admission rejects invalid indices storage shapes a
     const bad = (try cb.fromInt32Shape(&.{-4}, &.{1})).?;
     defer cb.free(bad);
     try std.testing.expectError(error.IndexOutOfBounds, cb.primGather(source, bad, 0, &.{ 3, 2 }));
-    try std.testing.expectError(error.UnsupportedResidentTrainingPrimitive, cb.primGather(source, good, 1, &.{ 3, 2 }));
+    // Integer-index gathers run on the device along any axis (#825). Axis 1
+    // has extent 2, so index 2 is out of bounds there.
+    try std.testing.expectError(error.IndexOutOfBounds, cb.primGather(source, good, 1, &.{ 3, 2 }));
+    const columns = (try cb.fromInt32Shape(&.{ 1, 0, 1 }, &.{3})).?;
+    defer cb.free(columns);
+    const by_column = try cb.primGather(source, columns, 1, &.{ 3, 2 });
+    defer cb.free(by_column);
+    try expectFloats(&cb, by_column, &.{ 2, 1, 2, 4, 3, 4, 6, 5, 6 });
     try std.testing.expectError(error.UnsupportedResidentTrainingPrimitive, cb.primTranspose(good, &.{0}, &.{3}));
-    try std.testing.expectError(error.UnsupportedTensorType, cb.add(good, good));
+    // Integer elementwise arithmetic also stays on the device (#825).
+    const doubled = try cb.add(good, good);
+    defer cb.free(doubled);
+    try expectInts(&cb, doubled, &.{ 0, 2, 4 });
     try std.testing.expectError(error.InvalidResidentTrainingShape, cb.fromInt32Shape(&.{1}, &.{2}));
     try std.testing.expectError(error.InvalidResidentTrainingShape, cb.snapshotTensorShape(source, &.{7}));
     try std.testing.expectError(error.ResourceLimitExceeded, cb.residentTrainingPrimitive(&.{ .scatter_add = .{
