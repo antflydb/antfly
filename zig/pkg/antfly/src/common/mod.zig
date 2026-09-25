@@ -16,6 +16,7 @@ pub const provider_registry = @import("provider_registry.zig");
 pub const config = @import("config.zig");
 pub const vector_migration = @import("vector_migration.zig");
 pub const table_storage = @import("table_storage.zig");
+pub const durable_completion_policy = @import("durable_completion_policy.zig");
 pub const http = @import("http/mod.zig");
 pub const audio_runtime = @import("audio_runtime.zig");
 pub const secrets = @import("secrets.zig");

@@ -136,6 +136,7 @@ pub const admin = @import("admin/mod.zig");
 pub const extensions = @import("extensions/mod.zig");
 pub const public_api = @import("api/mod.zig");
 pub const metadata = @import("metadata/mod.zig");
+pub const metadata_completion_installation_protocol = @import("metadata/completion_installation_protocol.zig");
 pub const metadata_api = @import("metadata/api.zig");
 pub const metadata_admin = @import("metadata/admin.zig");
 pub const metadata_http_routes = @import("metadata/http_routes.zig");

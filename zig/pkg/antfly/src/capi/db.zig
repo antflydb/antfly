@@ -95,7 +95,7 @@ const kernel_runtime_services = antfly.kernel_runtime_services;
 
 const StorageOwnerContext = struct {
     durable_completion_enabled: bool = false,
-    durable_completion_authority: @import("../common/durable_completion_policy.zig").Authority = .none,
+    durable_completion_authority: antfly.common.durable_completion_policy.Authority = .none,
     allocator_bridge: ?kernel_runtime_services.memory.Allocator = null,
     io_receiver: ?kernel_runtime_services.executor.Receiver = null,
     alloc: Allocator,
@@ -3580,7 +3580,7 @@ pub fn storageOwnerContextCreate(
 ) callconv(.c) kernel_owner_abi.Status {
     out_context.* = null;
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    out_context.* = createStorageOwnerContext(.{ .context = request.* }) catch |err| return storageOwnerStatusFromError(err);
+    out_context.* = createStorageOwnerContext(.{ .context = request.* }, null) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }
 
@@ -3590,16 +3590,20 @@ pub fn storageOwnerContextCreateWithRuntime(
 ) callconv(.c) kernel_owner_abi.Status {
     out_context.* = null;
     if (request.version != kernel_runtime_services.abi_version or request._reserved != 0 or request.context.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    out_context.* = createStorageOwnerContext(request.*) catch |err| return storageOwnerStatusFromError(err);
+    out_context.* = createStorageOwnerContext(request.*, null) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }
 
 /// Keep fallible construction in an error union: errdefer does not run when
 /// an ABI function returns a scalar failure status.
-fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*StorageOwnerContext {
+fn createStorageOwnerContext(
+    services: kernel_runtime_services.Request,
+    test_native_storage_pool: ?*antfly.lsm_backend.storage_io.NativeStoragePool,
+) !*StorageOwnerContext {
+    if (!builtin.is_test and test_native_storage_pool != null) unreachable;
     const request = services.context;
     if (request.durable_completion_enabled > 1 or !std.mem.allEqual(u8, &request._completion_reserved, 0)) return error.InvalidConfig;
-    const completion_authority = std.enums.fromInt(@import("../common/durable_completion_policy.zig").Authority, request.durable_completion_authority) orelse return error.InvalidConfig;
+    const completion_authority = std.enums.fromInt(antfly.common.durable_completion_policy.Authority, request.durable_completion_authority) orelse return error.InvalidConfig;
     // Replicated authority is issued only by the committed apply protocol,
     // never by a generic context configuration call.
     if (completion_authority == .raft_apply) return error.InvalidConfig;
@@ -3664,6 +3668,7 @@ fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*Storag
         .backend = .manual,
         .borrowed_io = .{ .general = io.io() },
     };
+    runtime_config.test_native_storage_pool = test_native_storage_pool;
     context.backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, runtime_config);
     errdefer context.backend_runtime.deinit();
     context.resources.attachResourceManager();
@@ -3696,6 +3701,100 @@ fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*Storag
 pub fn storageOwnerContextDestroy(context: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
     const owner_context = asStorageOwnerContext(context) orelse return .ok;
     return if (owner_context.deinitIfIdle()) .ok else .busy;
+}
+
+test "capi physical owner shares an injected protected native fd pool" {
+    const storage_io = antfly.lsm_backend.storage_io;
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const sst = try std.fs.path.join(alloc, &.{ root, "protected.sst" });
+    defer alloc.free(sst);
+    const owner_path = try std.fs.path.join(alloc, &.{ root, "owner" });
+    defer alloc.free(owner_path);
+
+    var pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 16);
+    defer pool.deinit();
+    const context = try createStorageOwnerContext(.{}, &pool);
+    defer std.debug.assert(storageOwnerContextDestroy(context) == .ok);
+    try std.testing.expectEqual(&pool, context.backend_runtime.ptr().nativeStoragePool());
+
+    var native = try storage_io.NativeStorage.initWithPool(alloc, .threaded, &pool);
+    defer native.deinit();
+    const scope = try storage_io.NativeCompletionIo.createWithFiles(alloc, &native, root, &.{.{ .path = sst, .max_bytes = 64 }});
+    var scope_live = true;
+    defer if (scope_live) scope.deinit() catch unreachable;
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+    const foreground_permits = pool.snapshotStats().fd_admission_capacity - pool.snapshotStats().fd_persistent_reserve - 2;
+    try pool.reserveDescriptorsForTest(std.testing.io, foreground_permits);
+    var foreground_permits_live = true;
+    defer if (foreground_permits_live) pool.releaseDescriptorsForTest(std.testing.io, foreground_permits);
+
+    const Open = struct {
+        request: kernel_owner_abi.OpenRequest,
+        owner: ?*anyopaque = null,
+        status: kernel_owner_abi.Status = .internal,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.status = storageOwnerOpen(&self.request, &self.owner);
+            self.done.store(true, .release);
+        }
+    };
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var open = Open{ .request = .{
+        .context = context,
+        .path = .fromSlice(owner_path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7,
+    } };
+    var future = std.Io.async(io, Open.run, .{&open});
+    var awaited = false;
+    defer if (!awaited) {
+        if (scope_live) {
+            scope.deinit() catch unreachable;
+            scope_live = false;
+        }
+        future.await(io);
+        if (open.owner) |owner| storageOwnerClose(owner);
+    };
+    for (0..5_000) |_| {
+        if (open.done.load(.acquire) or pool.snapshotStats().fd_admission_waiters != 0) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const blocked = !open.done.load(.acquire);
+    try std.testing.expect(open.done.load(.acquire) or pool.snapshotStats().fd_admission_waiters != 0);
+    if (!blocked) try std.testing.expect(open.status != .ok);
+
+    // The compiled physical owner cannot claim a transient descriptor while
+    // foreground reservations fill the pool, but the protected scope still
+    // completes real I/O with its preowned pair.
+    const storage = scope.storage();
+    var writer = try storage.beginAtomicWrite(alloc, sst);
+    try writer.appendSlice("protected-flush");
+    try writer.finish();
+    try storage.syncFileContentsAbsolute(sst);
+    try storage.syncParentAbsolute(sst);
+    try std.testing.expectEqual(@as(u64, "protected-flush".len), try storage.fileSize(sst));
+    if (blocked) try std.testing.expect(!open.done.load(.acquire));
+
+    try scope.deinit();
+    scope_live = false;
+    pool.releaseDescriptorsForTest(std.testing.io, foreground_permits);
+    foreground_permits_live = false;
+    future.await(io);
+    awaited = true;
+    if (open.owner) |owner| storageOwnerClose(owner);
+    if (open.status != .ok) {
+        var retry: ?*anyopaque = null;
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerOpen(&open.request, &retry));
+        storageOwnerClose(retry);
+    }
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admission_waiters);
 }
 
 pub fn storageContextAttachInferenceProvider(
@@ -4636,7 +4735,7 @@ pub fn metadataApplyStoreProjection(
             const bounded = fixed.allocator();
             switch (request.kind) {
                 .capture_completion_activation => {
-                    const policy = std.json.parseFromSliceLeaky(@import("../common/table_storage.zig").TransactionRecovery, bounded, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+                    const policy = std.json.parseFromSliceLeaky(antfly.common.table_storage.TransactionRecovery, bounded, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
                     const value = handle.store.captureCompletionActivation(bounded, request.group_id, request.arg0, policy) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk completionProjectionBytes(alloc, out_json, value);
                 },
@@ -4647,7 +4746,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk completionProjectionBytes(alloc, out_json, encoded);
                 },
                 .completion_installation_response => {
-                    const protocol = @import("../metadata/completion_installation_protocol.zig");
+                    const protocol = antfly.metadata_completion_installation_protocol;
                     const Input = struct { query: protocol.Request, keys: protocol.Keys };
                     const input = std.json.parseFromSliceLeaky(Input, bounded, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
                     input.query.validate() catch |err| break :blk storageOwnerStatusFromError(err);
@@ -6054,7 +6153,7 @@ pub fn storageOwnerOpen(
     if (owner_context) |context| context.acquire();
     var context_borrowed = owner_context != null;
     defer if (context_borrowed) owner_context.?.release();
-    var completion_settings: ?std.json.Parsed(@import("../common/table_storage.zig").Settings) = null;
+    var completion_settings: ?std.json.Parsed(antfly.common.table_storage.Settings) = null;
     defer if (completion_settings) |*settings| settings.deinit();
     if (request.restore_bootstrap_json.len != 0 and request.completion_installation != null) return .invalid_argument;
     const completion_config = if (request.completion_installation) |binding| installed: {
@@ -6062,7 +6161,7 @@ pub fn storageOwnerOpen(
             binding.table_id != request.identity_table_id or binding.range_id != request.identity_range_id or
             request.completion_settings_json.len == 0 or request.completion_settings_json.len > 4096)
             return .invalid_argument;
-        completion_settings = std.json.parseFromSlice(@import("../common/table_storage.zig").Settings, alloc, request.completion_settings_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+        completion_settings = std.json.parseFromSlice(antfly.common.table_storage.Settings, alloc, request.completion_settings_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
         const io = owner_context.?.backend_runtime.ptr().filesystemIo() orelse return storageOwnerStatusFromError(error.ConcurrencyUnavailable);
         break :installed db_mod.DB.completionInstallationPreflight(alloc, io, path, binding.*, request.schema_json.slice(), request.completion_read_schema_json.slice(), request.indexes_json.slice()) catch |err| return storageOwnerStatusFromError(err);
     } else null;
@@ -6341,7 +6440,7 @@ pub fn storageOwnerInstallCompletion(owner: ?*anyopaque, request: *const kernel_
     const handle = asHandle(owner) orelse return .invalid_argument;
     if (request.reserved != 0 or request.binding.identity.group_id != handle.storage_owner_group_id or request.settings_json.len == 0 or request.settings_json.len > 4096)
         return .invalid_argument;
-    var settings = std.json.parseFromSlice(@import("../common/table_storage.zig").Settings, handle.alloc, request.settings_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+    var settings = std.json.parseFromSlice(antfly.common.table_storage.Settings, handle.alloc, request.settings_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
     defer settings.deinit();
     handle.db.installCompletionBinding(request.binding, request.schema_json.slice(), request.read_schema_json.slice(), request.indexes_json.slice(), settings.value) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
