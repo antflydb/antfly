@@ -156,14 +156,40 @@ review.
    unpublished. The teachers are Apache-2.0, and their outputs line up with
    a ModernBERT student word for word and label for label (see
    [Distillation](#distillation)).
-4. **Heads: the GLiNER2.5 boundary family, not the legacy span family
-   (proposed).** The boundary core is what we already serve natively, with
-   learned classification, relations, records, counts, abstention,
-   long-document windowing, and native CPU, Metal, and CUDA training.
-   Decide's value is in its classification head, whose outputs (one logit
-   per `[L]`) are the same shape in both families, so Decide can still teach
-   classification to a boundary student. Revisit if the PyTorch prototype
-   shows the span head distills measurably better.
+4. **Heads: the GLiNER2.5 boundary family, distilled from both head
+   families (proposed; settled by the step 1 ablation).** The choice only
+   affects extraction. Both families use the same `classifier`, a two-layer
+   MLP on the `[L]` states (upstream `models/boundary/model.py` calls
+   `self.classifier(choice_states)`, and our `classifyNative` reads
+   `classifier.0` and `classifier.2`), so Decide teaches classification to
+   either.
+
+   | | Span (GLiNER2, Decide) | Boundary (GLiNER2.5) |
+   | --- | --- | --- |
+   | Entity length | at most `max_width` = 8 words | any length within the window |
+   | Extraction cost | words × 8 × labels, dense | sparse top-k proposals (`candidate_budget` 192) |
+   | Structure | entities, structures via `[P]` and counts | also sparse relations, records, abstention, attributes |
+   | Distillation | dense, fixed grid; teacher and student score the same spans | teacher and student propose different candidates |
+   | Largest teacher | `gliner2-large-v1` and Decide, hidden 1024 (same as ModernBERT-large, so head weights can seed the student) | `gliner2.5-base` and `multi` (768), `small` (384) |
+   | Antfly runtime | legacy pipeline only; no learned classification | schema-v2 extraction, qualification gate, long-document windowing, CPU, Metal, and CUDA serving and training |
+
+   Boundary heads win on capability and fit our product path. Span heads win
+   on distillation: dense targets and large teachers. The hybrid keeps
+   boundary heads in the student and takes extraction targets from both
+   families:
+
+   - **Entities of 8 words or fewer:** any student candidate this short gets
+     a dense score from `gliner2-large-v1`. Use it rather than Decide, whose
+     decision post-training may have cost extraction quality (not checked).
+   - **Longer entities, relations, records:** from `gliner2.5-base`
+     (English) and `gliner2.5-multi` (multilingual).
+   - **Classification:** from Decide.
+
+   Upstream publishes no span-versus-boundary extraction quality comparison;
+   `docs/boundary_baseline.md` times proposals on untrained weights only.
+   Step 1 trains both head families on the same encoder and decides. Choose
+   span heads only if they win clearly on short entities and entities longer
+   than 8 words are rare in our data.
 5. **Name: Antenna.** Variants `antenna-large` (ModernBERT-large),
    `antenna-multilingual` (mmBERT-base), and later `antenna-base`. "GLiNER"
    stays out of the model name to avoid implying Fastino's endorsement.
@@ -264,7 +290,8 @@ Hidden-state matching is optional, and would need a word-level alignment.
 | Target | Teacher | Notes |
 | --- | --- | --- |
 | Classification | `fastino/GLiNER2.5-Decide` | per-label probabilities from `classifier` |
-| Extraction (English) | `fastino/gliner2.5-base-v1` (`72ac19b486cd4557424c8d61114e7530c243e9b0`) | same head family as the student |
+| Extraction, entities of 8 words or fewer | `fastino/gliner2-large-v1` (`bf90d758a5d482bbfc276041b8cb7b570e5318e3`) | span family, large; dense scores for every short candidate (Decision 4) |
+| Extraction (English): long entities, relations, records | `fastino/gliner2.5-base-v1` (`72ac19b486cd4557424c8d61114e7530c243e9b0`) | same head family as the student |
 | Extraction (multilingual) | `fastino/gliner2.5-multi-v1` (`aaecfe45db1d828c963717054ccb868e8ad1f1d5`) | mDeBERTa-based; covers `antenna-multilingual` |
 | Decisions | released Laya, or a packed Laya fine-tune | as in `prepare_laya_packed_distillation.py` |
 | Long documents | windowed teachers for extraction; an LLM teacher for document-level classification (LAYA.md step 2a) | |
@@ -275,15 +302,17 @@ Hidden-state matching is optional, and would need a word-level alignment.
 | Head | Student loss | Target |
 | --- | --- | --- |
 | `classifier` | BCE per label (as upstream) | teacher probabilities, blended with gold where it exists: `w·gold + (1−w)·teacher`, the rule in `prepare_laya_packed_distillation.py` |
-| Extraction | the boundary head's own losses | dense word-level targets where the head defines them; the teacher's scores over the teacher's candidates plus gold. Include confident negatives, which carry most of the signal |
+| Extraction | the boundary head's own losses | Candidates of 8 words or fewer: the span teacher's score for that (span, label), available for any candidate the student proposes. Longer candidates, relations, and records: dense word-level targets where the boundary head defines them, plus the boundary teacher's scores over its own candidates and gold. Include confident negatives, which carry most of the signal |
 | Counts | cross entropy | teacher count distribution |
 | Decisions | RLCD or soft cross entropy | Laya's calibrated distribution |
 
 Ablations once the baseline trains: logit mean-squared error instead of BCE
-on probabilities; copying teacher head weights into the student (both large
-models have hidden size 1024), with the heads frozen for a first stage so the
-encoder is pulled into the teacher's representation space; starting from
-Laya's encoder instead of raw ModernBERT-large.
+on probabilities; copying teacher head weights into the student where widths
+match (Decide's `classifier` and span heads into `antenna-large`, both 1024;
+the boundary heads of `gliner2.5-base` only into a 768-wide `antenna-base`),
+with the heads frozen for a first stage so the encoder is pulled into the
+teacher's representation space; starting from Laya's encoder instead of raw
+ModernBERT-large.
 
 ### Data
 
@@ -313,7 +342,7 @@ Each step has a gate. A step starts only after the previous gate passes.
 | --- | --- | --- |
 | 0. Baselines | Score Decide, `gliner2.5-base`, released Laya, and packed Laya on one harness: typed-decisions, Banking77, CLINC150, AG News, SST-5 (accuracy, soft CE, ECE), zero-shot NER (CrossNER, MIT) F1, and the `testdata/gliner25` pipeline cases. Time `gliner2.5-base` (native boundary core) against Laya's ModernBERT at 64, 512, and 2k tokens on CPU and Metal. Decide runs in PyTorch through `gliner2`. | None; this sets the targets. Record them here |
 | 0b. Constrained decoder | Port upstream's constraint AST and decoders into the extract API, scoring-backend agnostic | Decisions equal upstream's on its tests; Laya and GLiNER backends both use it |
-| 1. PyTorch prototype | Upstream `gliner2` boundary model with `model_name` = `answerdotai/ModernBERT-large` (upstream loads encoders with `AutoModel`; unverified for ModernBERT), teacher target dumps, distillation losses. Also a ModernBERT-base run against `gliner2.5-base` for a same-size comparison | Within about 2 points of the teacher's average on gold; ECE no worse; top-1 agreement and span F1 against the teacher reported. If the student is more than 2–3 points behind, stop and keep DeBERTa for short extraction and classification |
+| 1. PyTorch prototype | Upstream `gliner2` boundary model with `model_name` = `answerdotai/ModernBERT-large` (upstream loads encoders with `AutoModel`; unverified for ModernBERT), teacher target dumps, distillation losses. Also a ModernBERT-base run against `gliner2.5-base` for a same-size comparison. Head ablation: train span heads and boundary heads on the same encoder and data (Decision 4) | Within about 2 points of the teacher's average on gold; ECE no worse; top-1 agreement and span F1 against the teacher reported. If the student is more than 2–3 points behind, stop and keep DeBERTa for short extraction and classification. Head choice: entity F1 split into 8 words or fewer and longer, relation F1, and agreement with each teacher; keep boundary heads unless span heads win clearly on short entities and long entities are rare in our data |
 | 2. Long context | Windowed-teacher and LLM-teacher labels; train at 2k–8k | No loss at 512 tokens; better than windowed `gliner2.5-base` on long documents |
 | 3. Native runtime | Generalize `gliner_boundary.Backbone` and the boundary engine to a ModernBERT/mmBERT encoder; converter; oracle fixtures and parity under the `testdata/gliner25` policy; a qualification row through the two-tier gate ([GLINER25.md](../gliner2/GLINER25.md)); boundary heads on the ModernBERT training graph Laya uses | Parity with PyTorch within the existing boundary tolerances; qualification row reviewed |
 | 4. Decision head | Laya head on the Antenna trunk, trained with the extraction distillation losses kept on as an anchor | Within noise of packed Laya on typed-decisions; extraction metrics unchanged |
