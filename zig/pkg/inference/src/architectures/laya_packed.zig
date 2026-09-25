@@ -124,13 +124,15 @@ fn trunkRows(row: tree.Row) ?usize {
 }
 
 /// Trunk tensors stay on Metal devices across requests; elsewhere they are
-/// host f32 and re-uploaded per request (cheap on CPU).
+/// host memory and re-uploaded per request (cheap on CPU).
 fn deviceCache(cb: *const ops.ComputeBackend) bool {
     return build_options.enable_metal and cb.kind() == .metal;
 }
 
 const DeviceTrunk = if (build_options.enable_metal) struct {
+    /// `[layer][keys, values]`; half tensors when `half`.
     tensors: []MetalTensor,
+    half: bool,
 
     fn destroy(raw: ?*anyopaque, allocator: std.mem.Allocator) void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -141,7 +143,7 @@ const DeviceTrunk = if (build_options.enable_metal) struct {
 } else struct {};
 
 /// Encode the trunk alone (it never attends to a branch) and keep every
-/// encoder and head layer's keys and values in `entry`.
+/// encoder and head layer's keys and values in `entry`, at its precision.
 fn fillTrunk(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, ids: []const i64, entry: *trunk_cache.Entry, cache_allocator: std.mem.Allocator) !void {
     const n = cfg.num_hidden_layers;
     if (comptime build_options.enable_metal) if (deviceCache(cb)) {
@@ -154,45 +156,56 @@ fn fillTrunk(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Co
         const encoded = try modern.forwardCapturingCT(cb, a, cfg, ids, .{ .key_tensors = keys[0..n], .value_tensors = values[0..n] });
         defer cb.free(encoded);
         try head.captureTrunk(cb, a, laya, encoded, ids.len, cfg.hidden_size, .{ .key_tensors = keys[n..], .value_tensors = values[n..] });
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const half = entry.precision == .f16;
         const trunk = try cache_allocator.create(DeviceTrunk);
         errdefer cache_allocator.destroy(trunk);
-        trunk.tensors = try cache_allocator.alloc(MetalTensor, 2 * entry.layers);
+        trunk.* = .{ .tensors = try cache_allocator.alloc(MetalTensor, 2 * entry.layers), .half = half };
         var retained: usize = 0;
         errdefer {
             for (trunk.tensors[0..retained]) |*tensor| tensor.deinit();
             cache_allocator.free(trunk.tensors);
         }
-        // Interleave as [layer][keys, values].
         for (0..entry.layers) |layer| for ([_]?ops.CT{ keys[layer], values[layer] }) |tensor| {
-            trunk.tensors[retained] = (try metal_compute.MetalCompute.retainDenseDeviceTensor(tensor.?)) orelse return error.UnsupportedLayaDeviceCache;
+            trunk.tensors[retained] = (if (half)
+                try compute.deviceHalfCopy(tensor.?)
+            else
+                try metal_compute.MetalCompute.retainDenseDeviceTensor(tensor.?)) orelse return error.UnsupportedLayaDeviceCache;
             retained += 1;
         };
         entry.device = trunk;
         entry.device_deinit = DeviceTrunk.destroy;
         return;
     };
+    const width = ids.len * cfg.hidden_size;
+    const scratch = try a.alloc(f32, 2 * entry.layers * width);
+    defer a.free(scratch);
     const keys = try a.alloc([]f32, entry.layers);
     defer a.free(keys);
     const values = try a.alloc([]f32, entry.layers);
     defer a.free(values);
     for (keys, values, 0..) |*k, *v, layer| {
-        k.* = entry.slot(layer, .keys);
-        v.* = entry.slot(layer, .values);
+        k.* = scratch[(2 * layer) * width ..][0..width];
+        v.* = scratch[(2 * layer + 1) * width ..][0..width];
     }
     const encoded = try modern.forwardCapturingCT(cb, a, cfg, ids, .{ .keys = keys[0..n], .values = values[0..n] });
     defer cb.free(encoded);
     try head.captureTrunk(cb, a, laya, encoded, ids.len, cfg.hidden_size, .{ .keys = keys[n..], .values = values[n..] });
+    for (0..2 * entry.layers) |slot| entry.store(slot, scratch[slot * width ..][0..width]);
 }
 
-/// A request-local tensor for one cached trunk layer (`which` 0 = keys).
-fn trunkTensor(cb: *const ops.ComputeBackend, entry: *const trunk_cache.Entry, layer: usize, which: usize) !ops.CT {
+/// A request-local f32 tensor for one cached trunk layer (`which` 0 = keys).
+fn trunkTensor(cb: *const ops.ComputeBackend, a: std.mem.Allocator, entry: *const trunk_cache.Entry, layer: usize, which: usize) !ops.CT {
     if (comptime build_options.enable_metal) if (entry.device) |raw| {
         const trunk: *const DeviceTrunk = @ptrCast(@alignCast(raw));
         const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        return compute.ctFromRetainedDeviceTensor(&trunk.tensors[2 * layer + which]);
+        const tensor = &trunk.tensors[2 * layer + which];
+        return if (trunk.half) compute.ctFromHalfDeviceTensor(tensor) else compute.ctFromRetainedDeviceTensor(tensor);
     };
-    const block = [_]i32{ @intCast(entry.tokens), @intCast(entry.hidden) };
-    return cb.fromFloat32Shape(if (which == 0) entry.keys(layer) else entry.vals(layer), &block);
+    const values = try a.alloc(f32, entry.tokens * entry.hidden);
+    defer a.free(values);
+    entry.load(2 * layer + which, values);
+    return cb.fromFloat32Shape(values, &.{ @intCast(entry.tokens), @intCast(entry.hidden) });
 }
 
 fn forwardCached(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row, entry: *const trunk_cache.Entry) ![]Tensor {
@@ -212,8 +225,8 @@ fn forwardCached(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: moder
         cb.free(v);
     };
     for (keys, values, 0..) |*k, *v, layer| {
-        k.* = try trunkTensor(cb, entry, layer, 0);
-        v.* = trunkTensor(cb, entry, layer, 1) catch |err| {
+        k.* = try trunkTensor(cb, a, entry, layer, 0);
+        v.* = trunkTensor(cb, a, entry, layer, 1) catch |err| {
             cb.free(k.*);
             return err;
         };

@@ -1822,6 +1822,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return try tensor.retainedCopy();
     }
 
+    /// A new half-precision (2-byte `.i16` storage) device copy of a dense f32
+    /// `ct`, for compact caches. Null when `ct` is not on the device.
+    pub fn deviceHalfCopy(self: *MetalCompute, ct: CT) !?MetalTensor {
+        var source = (try retainDenseDeviceTensor(ct)) orelse return null;
+        defer source.deinit();
+        return metal_runtime.decoderRuntimeCastHalfDevice(self.provider_impl, source, true);
+    }
+
+    /// A request-local f32 tensor converted from a half device tensor.
+    pub fn ctFromHalfDeviceTensor(self: *MetalCompute, tensor: *const MetalTensor) !CT {
+        const converted = (try metal_runtime.decoderRuntimeCastHalfDevice(self.provider_impl, tensor.*, false)) orelse return error.UnsupportedTensorType;
+        return self.ctFromOwnedMetalTensor(converted);
+    }
+
     /// A request-local tensor over a retained device tensor; the caller keeps
     /// its own reference and frees the result with the compute backend.
     pub fn ctFromRetainedDeviceTensor(self: *MetalCompute, tensor: *const MetalTensor) !CT {
@@ -6799,6 +6813,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return result;
     }
 
+    fn residentTrainingAdopt(self: *MetalCompute, input: CT, shape: []const i32, limits: ops.resident_training.Limits) !CT {
+        const count = try ops.resident_training.shapeElements(i32, shape, limits);
+        const buf = toBuf(input);
+        if (bufHasAnyQuantizedStorage(buf) or buf.native_dense_bytes != null or buf.lazy_multiply != null or
+            buf.view_strides != null or buf.logical_view_strides != null or buf.view_index_map != null or
+            buf.view_base_offset != 0 or buf.integer_storage)
+            return error.UnsupportedResidentTrainingPrimitive;
+        const source = buf.metal_tensor orelse return error.ResidentTrainingRequiresDeviceTensor;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedResidentTrainingCapture;
+        if (!source.isDevice() or source.dtype != .f32 or source.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime)))
+            return error.ResidentTrainingRequiresDeviceTensor;
+        if (source.elemCount() != count or source.deviceByteLen() != count * 4) return error.InvalidResidentTrainingShape;
+        var copied = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), count * 4, .private, shape);
+        errdefer copied.deinit();
+        try source.copyInto(&copied);
+        return self.ctFromOwnedMetalTensor(copied);
+    }
+
     fn residentTrainingGather(self: *MetalCompute, input: CT, indices: CT, input_shape: []const i64, axis: u8, limits: ops.resident_training.Limits) !CT {
         if (axis != 0 or input_shape.len == 0) return error.UnsupportedResidentTrainingPrimitive;
         const source = try self.residentTrainingTensor(input, .f32, limits);
@@ -7136,6 +7168,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return switch (request.*) {
             .upload_f32 => |r| self.residentTrainingUpload(f32, r.values, r.shape, limits, false),
             .upload_i32 => |r| self.residentTrainingUpload(i32, r.values, r.shape, limits, true),
+            .adopt_f32 => |r| self.residentTrainingAdopt(r.input, r.shape, limits),
             .snapshot => |r| self.residentTrainingReshape(r.input, r.shape, limits, true),
             .reshape => |r| self.residentTrainingReshape(r.input, r.shape, limits, false),
             .gather => |r| self.residentTrainingGather(r.input, r.indices, r.input_shape, r.axis, limits),
@@ -11936,6 +11969,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
         }
+
+        // Strided slices (a Q/K/V split of `[rows, 3H]`, RoPE halves) stay on
+        // the device through the dtype-generic gather kernel, instead of
+        // downloading the whole input, slicing on the host, and uploading
+        // the result for the next op.
+        if (input_buf.metal_tensor) |*metal_tensor| if (metal_tensor.isDevice() and input_buf.view_strides == null and
+            input_buf.logical_view_strides == null and input_buf.view_index_map == null and input_buf.view_base_offset == 0 and
+            input_buf.lazy_multiply == null and !getenvBool("TERMITE_METAL_DISABLE_DEVICE_STRIDED_SLICE"))
+        {
+            if (@import("slice_plan.zig").Plan.init(in_shape, starts, limits, strides, input_shape)) |plan| {
+                if (plan.input_count == metal_tensor.elemCount()) {
+                    if (try metal_runtime.decoderRuntimeSliceTypedDevice(self.provider_impl, metal_tensor.*, plan)) |device_output| {
+                        return self.ctFromOwnedMetalTensor(device_output);
+                    }
+                }
+            } else |_| {}
+        };
 
         const input_host = try hostSliceForBuf(input_buf);
         const output = try self.allocator.alloc(f32, out_numel);

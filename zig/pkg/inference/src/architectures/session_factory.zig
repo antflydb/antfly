@@ -6549,6 +6549,16 @@ pub fn layaTrunkCacheStats(session: Session) ?@import("laya_trunk_cache.zig").St
     return cache.snapshot();
 }
 
+/// Choose f16 (default) or exact f32 entries for new trunk cache entries.
+pub fn setLayaTrunkCachePrecision(session: Session, precision: @import("laya_trunk_cache.zig").Precision) void {
+    if (session.vtable != &arch_vtable) return;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const cache = layaTrunkCache(self) orelse return;
+    platform.sync.lockYielding(&cache.mutex);
+    defer cache.mutex.unlock();
+    cache.precision = precision;
+}
+
 /// Replace a session's trunk cache budget (0 disables it) and minimum
 /// cached trunk length.
 pub fn setLayaTrunkCacheLimit(session: Session, limit_bytes: usize, min_tokens: usize) void {
@@ -7990,6 +8000,14 @@ pub fn configureSharedCacheAdmissionForSession(
 ) !void {
     if (session.vtable != &arch_vtable) return;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    // Packed Laya trunk entries are charged as KV memory on the device that
+    // holds them (models/laya/LAYA.md, "State cache").
+    if (isPackedLaya(self)) if (layaTrunkCache(self)) |trunk_cache| trunk_cache.configureAdmission(.{
+        .controller = controller,
+        .backend_class = backend_class,
+        .limits = limits,
+        .device = self.backend_type == .metal,
+    });
     const hard_budget = runtime.tier.cache.Budget{
         .host_limit_bytes = limits.host_limit_bytes,
         .backend_limit_bytes = limits.backend_limit_bytes,

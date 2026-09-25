@@ -41,7 +41,7 @@ const Harness = struct {
         errdefer program.deinit();
         var weights = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ dir, "model.safetensors" }));
         defer weights.deinit();
-        const parameters = try train.parameters(scratch, &program.graph, &weights);
+        const parameters = try train.parameters(scratch, &program.graph, &weights, 0);
         const originals = try scratch.alloc(run.Parameter, parameters.len);
         for (parameters, originals) |p, *o| o.* = .{ .name = p.name, .canonical_name = p.name, .dimensions = p.dimensions, .values = p.values, .kind = .original };
         const store = try scratch.create(native.WeightStore);

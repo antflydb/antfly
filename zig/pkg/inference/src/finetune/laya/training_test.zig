@@ -71,7 +71,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     defer weights.deinit();
     var expected_gradients = try safetensors.MMapReader.openFileAbsolute(a, try std.fmt.allocPrint(scratch, "{s}/gradients.safetensors", .{root}));
     defer expected_gradients.deinit();
-    const parameters = try train.parameters(scratch, &program.graph, &weights);
+    const parameters = try train.parameters(scratch, &program.graph, &weights, 0);
     const originals = try scratch.alloc(run.Parameter, parameters.len);
     for (parameters, originals) |p, *o| o.* = .{ .name = p.name, .canonical_name = p.name, .dimensions = p.dimensions, .values = p.values, .kind = .original };
     var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
@@ -94,7 +94,8 @@ test "laya training forward objective and every parameter gradient match PyTorch
         try program.graph.markOutput(entry.node);
         try program.gradients.graph.markOutput(program.gradients.id_map[entry.node]);
     };
-    var forward = try interpreter.execute(a, &program.graph, cb, .{ .runtime_inputs = combined, .strict_integer_constants = true });
+    // The trainer's execution path (a batched command frame on Metal).
+    var forward = try train.executeFramed(a, &program.graph, cb, combined);
     defer forward.deinit(cb);
     if (trace) try compareTraces(scratch, root, &program, cb, forward.outputs[1..], "forward");
     const logits = try cb.toFloat32(forward.outputs[0], scratch);
@@ -122,7 +123,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     const seed = try cb.fromFloat32Shape(cotangent, &.{ @intCast(l.questions), @intCast(l.options) });
     defer cb.free(seed);
     backward_inputs[combined.len] = .{ .node_id = program.gradients.id_map[program.seed], .value = seed };
-    var backward = try interpreter.execute(a, &program.gradients.graph, cb, .{ .runtime_inputs = backward_inputs, .strict_integer_constants = true });
+    var backward = try train.executeFramed(a, &program.gradients.graph, cb, backward_inputs);
     defer backward.deinit(cb);
     if (trace) try compareTraces(scratch, root, &program, cb, backward.outputs[program.wrt.len..], "backward");
     var worst: f32 = 0;
@@ -218,6 +219,57 @@ test "laya training interrupted accumulation resumes to identical serving weight
     defer session.close();
     const exported = factory.getLayaConfig(session) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(f32, 1), exported.scale(.choice, 3));
+}
+
+test "laya training with frozen lower layers keeps them exact and trains the rest" {
+    const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
+    const job = @import("job.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const directory = try temp.dir.realPathFileAlloc(io, ".", scratch);
+    const c = job.Config{
+        .model_dir = try std.fs.path.join(scratch, &.{ root, "model" }),
+        .train_file = try std.fs.path.join(scratch, &.{ root, "train.jsonl" }),
+        .eval_file = try std.fs.path.join(scratch, &.{ root, "eval.jsonl" }),
+        .output_dir = try std.fs.path.join(scratch, &.{ directory, "frozen" }),
+        .backend = if (platform.env.getenv("ANTFLY_LAYA_METAL") != null) .metal else .cpu,
+        .epochs = 1,
+        .batch_size = 2,
+        .encoder_lr = 0.001,
+        .head_lr = 0.001,
+        .freeze_layers = 1,
+    };
+    try job.execute(a, io, c);
+    var source = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ root, "model", "model.safetensors" }));
+    defer source.deinit();
+    var exported = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" }));
+    defer exported.deinit();
+    var frozen_count: usize = 0;
+    var trainable_moved = false;
+    var names = source.header.tensors.iterator();
+    while (names.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (!std.mem.startsWith(u8, name, "encoder.")) continue;
+        var before = try source.readTensor(name);
+        defer before.deinit();
+        var after = try exported.readTensor(name);
+        defer after.deinit();
+        const want = try train.floatValues(scratch, before);
+        const got = try train.floatValues(scratch, after);
+        if (train.frozen(name, c.freeze_layers)) {
+            frozen_count += 1;
+            try std.testing.expectEqualSlices(f32, want, got);
+        } else if (std.mem.startsWith(u8, name, "encoder.layers.") and !std.mem.eql(f32, want, got)) {
+            trainable_moved = true;
+        }
+    }
+    try std.testing.expect(frozen_count > 0);
+    try std.testing.expect(trainable_moved);
 }
 
 test "laya finetuned export probabilities and tokenization match PyTorch" {
@@ -332,4 +384,15 @@ test "laya finetuned export probabilities and tokenization match PyTorch" {
         }
     }
     std.debug.print("Laya finetuned export backend={s}, max probability error={d}\n", .{ @tagName(session.backend()), worst });
+}
+
+test "laya frozen layers cover embeddings and the lowest encoder layers only" {
+    try std.testing.expect(!train.frozen("encoder.embeddings.tok_embeddings.weight", 0));
+    try std.testing.expect(train.frozen("encoder.embeddings.tok_embeddings.weight", 1));
+    try std.testing.expect(train.frozen("encoder.embeddings.norm.weight", 2));
+    try std.testing.expect(train.frozen("encoder.layers.1.attn.Wqkv.weight", 2));
+    try std.testing.expect(!train.frozen("encoder.layers.2.attn.Wqkv.weight", 2));
+    try std.testing.expect(!train.frozen("encoder.layers.12.mlp.Wo.weight", 2));
+    try std.testing.expect(!train.frozen("encoder.final_norm.weight", 22));
+    try std.testing.expect(!train.frozen("head.layers.0.attn.Wqkv.weight", 22));
 }

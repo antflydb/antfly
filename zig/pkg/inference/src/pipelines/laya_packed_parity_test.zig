@@ -74,7 +74,8 @@ test "laya packed rows and decisions match the independent PyTorch oracle" {
             try std.testing.expectEqualSlices(i64, case.row.anchors, row.anchors);
             try std.testing.expectEqual(case.row.width, row.width);
             for (case.row.markers, 0..) |expected, qi| try std.testing.expectEqualSlices(i64, expected, row.markers[qi * row.width ..][0..row.width]);
-            // Full rows, then the state cache: a miss followed by a hit.
+            // Full rows, then the exact (f32) state cache: a miss followed by a hit.
+            factory.setLayaTrunkCachePrecision(session, .f32);
             for ([_]usize{ @import("../architectures/laya_trunk_cache.zig").default_min_tokens, 1, 1 }) |min_tokens| {
                 factory.setLayaTrunkCacheLimit(session, 64 * 1024 * 1024, min_tokens);
                 const result = try pipeline.execute(s, session, tok, cfg, &.{

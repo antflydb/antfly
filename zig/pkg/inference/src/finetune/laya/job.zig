@@ -49,6 +49,9 @@ pub const Config = struct {
     /// keeps the source checkpoint's layout; released checkpoints are unpacked.
     packing: ?model.PackingMode = null,
     max_packed_len: ?u32 = null,
+    /// Keep the token embeddings and the lowest N encoder layers at their
+    /// source values. Backward work and optimizer state cover only the rest.
+    freeze_layers: u32 = 0,
 };
 
 pub fn validate(c: Config) !void {
@@ -99,6 +102,8 @@ const Cache = struct {
     allocator: std.mem.Allocator,
     config: modern.Config,
     dropout: f32,
+    freeze_layers: u32 = 0,
+    frozen: []const training.Frozen = &.{},
     program: ?training.Program = null,
     last: architecture.Layout = .{ .batch = 0, .sequence = 0, .options = 0, .questions = 0 },
     fn get(self: *Cache, examples: []const training.Example) !*training.Program {
@@ -106,9 +111,10 @@ const Cache = struct {
         if (self.program == null or !std.meta.eql(l, self.last)) {
             if (self.program) |*p| p.deinit();
             self.program = null;
-            self.program = try training.Program.init(self.allocator, self.config, l, self.dropout);
+            self.program = try training.Program.initFrozen(self.allocator, self.config, l, self.dropout, self.freeze_layers);
             self.last = l;
         }
+        self.program.?.frozen = self.frozen;
         return &self.program.?;
     }
     fn deinit(self: *Cache) void {
@@ -342,6 +348,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
     const source_laya = encoder.laya orelse return error.InvalidLayaConfig;
     encoder.laya.?.packing = try packing(c, source_laya);
     const laya = encoder.laya.?;
+    if (c.freeze_layers > encoder.num_hidden_layers) return error.InvalidLayaJob;
     for ([_][]const u8{ "attention_bias", "mlp_bias", "norm_bias" }) |key| if (config_json.value.object.get(key)) |v| {
         if (v != .bool or v.bool) return error.UnsupportedLayaEncoderBias;
     };
@@ -366,7 +373,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
     try admitExamples(encoder, train.examples, c.batch_size, c.head_dropout);
     try admitExamples(encoder, eval.examples, 1, c.head_dropout);
     if (calibration) |calib| try admitExamples(encoder, calib.examples, 1, c.head_dropout);
-    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout };
+    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = c.freeze_layers };
     defer cache.deinit();
     // Release the raw source snapshot before optimizer initialization/restore.
     // Only owned trainable values, frozen values, and export metadata survive.
@@ -378,7 +385,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
         try @import("../../models/laya.zig").validateReader(&source, laya, encoder);
         if (source.header.tensors.get("temperature")) |meta| if (!std.mem.eql(i64, meta.shape, &.{3})) return error.InvalidLayaWeights;
         const initial = try cache.get(train.examples[0..@min(train.examples.len, c.batch_size)]);
-        const selected = try training.parameters(permanent, &initial.graph, &source);
+        const selected = try training.parameters(permanent, &initial.graph, &source, c.freeze_layers);
         const export_tensors = try exportInputs(permanent, &source, selected);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly-laya-training/v1");
@@ -407,6 +414,25 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
     defer owner.deinit();
     var cpu_vtable: @import("../../ops/ops.zig").ComputeBackend.VTable = undefined;
     @import("cpu.zig").install(&owner.cb, &cpu_vtable);
+    // Frozen values come from the source snapshot already kept for export,
+    // uploaded once in the trainer's storage (resident on Metal).
+    var frozen: std.ArrayListUnmanaged(training.Frozen) = .empty;
+    defer {
+        for (frozen.items) |f| owner.cb.free(f.value);
+        frozen.deinit(a);
+    }
+    for (admitted.export_tensors) |t| if (training.frozen(t.name, c.freeze_layers)) {
+        var dims: [8]i32 = undefined;
+        if (t.shape.len > dims.len or t.data.len == 0) return error.InvalidLayaWeights;
+        for (t.shape, dims[0..t.shape.len]) |dim, *dst| dst.* = std.math.cast(i32, dim) orelse return error.InvalidLayaWeights;
+        const value = if (execution == .native)
+            try owner.cb.fromFloat32Shape(t.data, dims[0..t.shape.len])
+        else
+            try owner.cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = t.data, .shape = dims[0..t.shape.len] } }, .{});
+        errdefer owner.cb.free(value);
+        try frozen.append(a, .{ .name = t.name, .value = value });
+    };
+    cache.frozen = frozen.items;
     const batches = std.math.divCeil(usize, train.examples.len, c.batch_size) catch unreachable;
     const updates = std.math.divCeil(usize, batches, c.gradient_accumulation) catch unreachable;
     const steps = std.math.cast(u32, updates * c.epochs) orelse return error.InvalidLayaJob;

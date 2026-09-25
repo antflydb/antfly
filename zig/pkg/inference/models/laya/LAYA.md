@@ -246,14 +246,20 @@ keys and values plus their own. A miss first encodes the trunk alone, which is
 exact for the same reason, and fills the cache. The same state's later rows
 and later requests then hit it. The API and the pipeline are unchanged.
 
-- **Storage:** on Metal, entries are retained device tensors captured in place
-  (`MetalCompute.retainDenseDeviceTensor`), so a hit uploads nothing. On CPU
-  they are host f32.
-- **Budget:** `ANTFLY_LAYA_TRUNK_CACHE_MB` (default 256; 0 disables). An entry
-  costs `2 · (encoder + head layers) · T · hidden · 4` bytes, about 100 MB for
-  a 400-token state on the released checkpoint. So the default holds only a
-  couple of long states. Pinned entries are never evicted. The memory is
-  outside model admission, like the native dequantization cache.
+- **Storage:** entries are f16 by default. On Metal they are device tensors
+  converted in place on the GPU (`MetalCompute.deviceHalfCopy`), so neither a
+  miss nor a hit touches the host. On CPU they are host f16. An entry costs
+  `2 · (encoder + head layers) · T · hidden · 2` bytes, about 50 MB for a
+  400-token state on the released checkpoint. f16 changes cached logits by at
+  most ~5.5e-4 against the full row. `ANTFLY_LAYA_TRUNK_CACHE_DTYPE=f32` keeps
+  f32 (exact, twice the memory).
+- **Budget and admission:** `ANTFLY_LAYA_TRUNK_CACHE_MB` (default 256; 0
+  disables) bounds the cache. Every entry also holds a lease from the
+  session's model admission controller, charged as backend KV bytes on Metal
+  and host KV bytes on CPU. When admission refuses, the cache evicts its least
+  recently used unpinned entry and retries. If that is not enough, the state
+  is served without caching and counted in `refusals`. Pinned entries are
+  never evicted.
 - **Short states:** trunks under 96 tokens are not cached
   (`default_min_tokens`). Re-encoding them costs less than the cached path's
   fixed overhead.
@@ -350,7 +356,8 @@ antfly inference finetune train laya job.json
    upstream would truncate keep their gold target, so the student is never
    taught a distribution computed from a different state. Provenance and
    hashes are written to `<output>.json`.
-3. **Train** with `packing` set and a held-out calibration split. The RLCD
+3. **Train** with `packing` set and a held-out calibration split. Add
+   `freeze_layers` to trade adaptation of the lower encoder for step time. The RLCD
    objective is a strictly proper scoring reward with Gaussian logit
    exploration (`finetune/laya/objective.zig`). Soft CE is also supported.
 4. **Accept** the packed model only if, on the same eval split, it matches the
@@ -416,23 +423,77 @@ Packed training took 3.4× less wall time, and packed evaluation processed
 - **Candidate mode:** not yet qualified. Its target, Banking77, is still to
   run.
 
-**Training throughput.** Steady state on this machine: ~5–6 s per unpacked
-decision, and ~6–9 s per packed case of five decisions. Several things turned
-up along the way:
+**Training throughput (as measured for step 0).** Steady state on this
+machine: ~5–6 s per unpacked decision, and ~6–9 s per packed case of five
+decisions. See [Trainer throughput](#trainer-throughput) for what changed
+since. Several things turned up along the way:
 
 - **Bucketing:** sequences are bucketed to 64 tokens and options to 4 so
   compiled programs are reused. Parity is unchanged, but it did not shorten
   steps, so graph construction is not the bottleneck.
 - **Batch size:** `batch_size` 4 raised throughput only from 0.88 to 1.16
   decisions/s, and 8 gave 1.10. Cost grows about linearly with tokens.
-- **Where the time goes:** the time is per-token work in the trainer's
-  materialized attention and host/device traffic, not per-step overhead.
+- **Where the time goes:** a profile of the Metal trainer showed ~61% of the
+  main thread waiting on a GPU synchronization after each op, ~11% slicing on
+  the host, and ~13% downloading gradients and uploading them again for the
+  optimizer.
 - **Environment:** peak memory is ~27.5 GB. A concurrent 10 GB Zig build got
   the trainer SIGKILLed. macOS also throttles a trainer launched from a
   background shell (nice 5, background scheduling policy, display sleep) to a
   few steps per hour; run it in the foreground or clear the policy
   (`taskpolicy -B -p <pid>`) and keep the display awake. The raw logs are in
   the work log.
+
+### Trainer throughput
+
+Measured 2026-09-25 on the same machine: packed question mode, batch size 1,
+14 microbatches of the step-0 training subset (`td/prof.json` from
+`scripts/laya/prepare_laya_training_data.sh`), median step after two warm-up
+steps, ReleaseFast.
+
+| Trainer | Median step | Speedup |
+| --- | ---: | ---: |
+| Step-0 trainer (per-op synchronization, host slicing, gradient round trip) | 8.55 s | 1× |
+| + strided slices on the device | 6.43 s | 1.3× |
+| + gradients kept on the device (unframed) | 5.34 s | 1.6× |
+| + one command frame per forward and per backward | **2.02 s** | **4.2×** |
+| + `freeze_layers: 11` (half the encoder) | 1.41 s | 6.1× |
+| + `freeze_layers: 18` | 1.17 s | 7.3× |
+
+The first four losses are identical in every configuration without frozen
+layers. Frozen runs share the first loss and then diverge, as expected.
+Freezing saves less than its share of layers, because the forward and the
+decision head still run in full.
+
+- **Device slices:** strided slices of device tensors now run on the GPU
+  (`slice_plan` on `decoderRuntimeSliceTypedDevice`) instead of downloading.
+- **Gradients on the device:** the resident optimizer takes a device copy of
+  each dense gradient (`resident_training.Request.adopt_f32`). It falls back
+  to download and upload only for host-backed gradients.
+- **Command frames:** `training.executeFramed` runs each forward and backward
+  graph in one Metal command frame and synchronizes once at the end.
+  `ANTFLY_LAYA_TRAIN_UNFRAMED=1` restores per-op submission.
+- **Frozen lower layers:** `freeze_layers: N` in the job keeps the token
+  embeddings and encoder layers `0..N-1` at their source values. They are not
+  differentiated, have no optimizer state, and are exported unchanged. The
+  backward graph stops at layer N. The forward still runs every layer.
+
+Framing exposed a bug in the Metal runtime's in-frame buffer reuse. Buffers
+freed during a frame went into a reuse pool whatever their storage mode, and a
+later private allocation could receive a shared one. An upload into shared
+storage is an immediate host copy, so the previous owner's still-queued GPU
+writes landed on top of the new data when the frame ran. In the trainer this
+corrupted the index arrays of the embedding-gradient scatter and produced
+NaN updates. It showed up only in framed runs, and flushing after almost any
+op hid it. The pool now takes private buffers only
+(`metal_runtime.zig`, "metal in-frame buffer reuse never hands a
+host-writable buffer to a private request").
+
+Raw per-step logs and the investigation are in
+[`work-log/completed/inference/laya/2026-09-25-trainer-throughput.md`](../../../../../work-log/completed/inference/laya/2026-09-25-trainer-throughput.md).
+
+Segment attention in the training graph (which step 2c needs anyway) and LoRA
+remain open. Batching still helps little, because cost is per token.
 
 ## Verification
 
@@ -454,21 +515,26 @@ All numbers are from 2026-09-24 on an Apple M4 Max (36 GiB), Zig 0.16.0.
 | State cache through a real session: oracle decisions on a miss and on a hit | `pipelines/laya_packed_parity_test.zig` | max probability error 1.2e-7 (CPU and Metal) |
 | Session cache hits across pipeline requests; a disabled cache returns the same decisions | same | 1 miss, 1 hit; < 1e-5 |
 | Cache pinning, LRU eviction, oversize entries | `architectures/laya_trunk_cache.zig` | unit test |
+| f16 and f32 cache slots; admission charged per entry, refused entries evict LRU and retry | same | unit test |
+| f16 state cache against the full row | `pipelines/laya_packed_test.zig` | max logit error ≤ 5.5e-4 (CPU and Metal); f32 ≤ 1.7e-6 |
+| Framed Metal training: forward, objective and all 45 gradients match PyTorch | `finetune/laya/training_test.zig` | max error 1.9e-6 |
+| Frozen lower layers are exported bit-identical; trainable layers move | same | exact (CPU and Metal) |
 | CPU segment kernel equals dense masked softmax (three ranges, window, fewer queries than keys) | `lib/linalg/src/attention.zig` | < 1e-5 |
 | Segment attention equals dense tree-masked attention on the session backend, all queries and branch queries only | `pipelines/laya_packed_test.zig` | 2.4e-7 (CPU), 3.6e-7 (Metal) |
 
-Reproduce the fixture-backed tests:
+Reproduce the fixture-backed tests. The fixtures are regenerated from pinned
+inputs rather than committed:
 
 ```bash
-curl -sfLo common.py https://raw.githubusercontent.com/NandhaKishorM/laya/6a5819129eb220570792e417e49723d697efd76f/laya/common.py
-cd scripts/laya
-uv run --script laya_reference.py --common ../../common.py --output /tmp/laya-ref
-uv run --script laya_training_reference.py --fixture /tmp/laya-ref --common ../../common.py
-uv run --script laya_packed_reference.py --fixture /tmp/laya-ref --common ../../common.py
-cd ../../zig/pkg/inference
-ANTFLY_LAYA_REFERENCE=/tmp/laya-ref zig build test -- --test-filter "laya"
-ANTFLY_LAYA_REFERENCE=/tmp/laya-ref ANTFLY_LAYA_BACKEND=metal ANTFLY_LAYA_METAL=1 zig build test -- --test-filter "laya"
+scripts/laya/prepare_laya_fixtures.sh .tmp/laya
+cd zig/pkg/inference
+ANTFLY_LAYA_REFERENCE=$PWD/../../../.tmp/laya/ref zig build test -- --test-filter "laya"
+ANTFLY_LAYA_REFERENCE=$PWD/../../../.tmp/laya/ref ANTFLY_LAYA_BACKEND=metal ANTFLY_LAYA_METAL=1 zig build test -- --test-filter "laya"
 ```
+
+`scripts/laya/prepare_laya_training_data.sh` rebuilds the released checkpoint,
+the typed-decisions splits and subsets used in [Accuracy](#accuracy-step-0),
+and the trainer timing job.
 
 ### Cost
 
@@ -552,9 +618,8 @@ Other open items:
 
 - **Very many options:** candidate branches cannot compare options before the
   softmax (step 2b).
-- **Cache memory:** the state cache stores f32. f16 storage or eviction tied to
-  model admission would let it hold more states.
-- **Trainer throughput:** steps are bound by per-token work (materialized
-  attention, host/device traffic), not per-step overhead. Segment attention
-  with a backward pass in the training graph, device-resident gradients, and
-  LoRA or frozen lower layers are the next levers, alongside step 2c.
+- **Trainer throughput:** device slices, device-resident gradients, command
+  frames and frozen lower layers are done
+  ([Trainer throughput](#trainer-throughput)). Segment attention with a
+  backward pass in the training graph, alongside step 2c, and LoRA are next.
+  A qualification run with frozen layers has not been done.

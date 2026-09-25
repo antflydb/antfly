@@ -10670,8 +10670,9 @@ static NSString *termite_metal_shader_source(void) {
            "        case 4: integer = ((device const short *)input)[gid]; break;\n"
            "        case 5: case 6: integer = input[gid]; break;\n"
            "    }\n"
-           "    float floating = p[1] == 0u ? ((device const float *)input)[gid] : float(integer);\n"
+           "    float floating = p[1] == 0u ? ((device const float *)input)[gid] : (p[1] == 7u ? float(((device const half *)input)[gid]) : float(integer));\n"
            "    if (p[2] == 0u) { ((device float *)output)[gid] = floating; return; }\n"
+           "    if (p[2] == 7u) { ((device half *)output)[gid] = half(floating); return; }\n"
            "    if (p[2] == 6u) { output[gid] = p[1] == 0u ? uchar(floating != 0.0f) : uchar(integer != 0); return; }\n"
            "    if (p[1] == 0u) integer = long(floating);\n"
            "    switch (p[2]) {\n"
@@ -45294,8 +45295,10 @@ int termite_metal_decode_runtime_integer_binary_device(termite_metal_decode_runt
 }
 
 int termite_metal_decode_runtime_cast_typed_device(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, void *output_handle, size_t output_offset, size_t count, uint32_t source_dtype, uint32_t target_dtype) {
-    if (!runtime || !input_handle || !output_handle || source_dtype > 6 || target_dtype > 6 || count > UINT32_MAX) return -1;
-    const size_t widths[] = {4, 4, 8, 1, 2, 1, 1};
+    // Code 7 is IEEE half, used for compact float storage (packed Laya trunk
+    // cache); tensors hold it in 2-byte storage and cast back before use.
+    if (!runtime || !input_handle || !output_handle || source_dtype > 7 || target_dtype > 7 || count > UINT32_MAX) return -1;
+    const size_t widths[] = {4, 4, 8, 1, 2, 1, 1, 2};
     @autoreleasepool {
         id<MTLBuffer> input = (__bridge id<MTLBuffer>)input_handle;
         id<MTLBuffer> output = (__bridge id<MTLBuffer>)output_handle;
@@ -62270,8 +62273,13 @@ void termite_metal_decode_runtime_release_buffer(termite_metal_decode_runtime *r
     // reuse instead of just frame-retaining it. The pool keeps the handle's
     // +1, so the buffer stays alive for the in-flight frame AND is available
     // to satisfy a later same-frame allocation.
+    // Only private buffers are pooled. The GPU is their only writer, so a
+    // same-frame reuse is ordered after the previous owner's queued commands.
+    // A shared buffer can be written by the host immediately (an upload is a
+    // memcpy), which would land before those queued commands run.
     if (runtime != NULL && runtime->active_frame_cb != nil &&
-        termite_metal_buffer_reuse_enabled(runtime)) {
+        termite_metal_buffer_reuse_enabled(runtime) &&
+        ((__bridge id<MTLBuffer>)handle).storageMode == MTLStorageModePrivate) {
         if (runtime->frame_reuse_pool_len >= runtime->frame_reuse_pool_cap) {
             size_t new_cap = runtime->frame_reuse_pool_cap == 0 ? 256 : runtime->frame_reuse_pool_cap * 2;
             void **grown = realloc(runtime->frame_reuse_pool, new_cap * sizeof(void *));

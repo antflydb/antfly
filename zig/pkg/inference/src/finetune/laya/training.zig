@@ -66,13 +66,44 @@ pub fn floatValues(a: std.mem.Allocator, tensor: Tensor) ![]f32 {
     return values;
 }
 
+/// Whether `name` stays at its source value when the lowest `layers` encoder
+/// layers are frozen. Freezing any layer also freezes the token embeddings
+/// beneath it. Gradients stop at the first trainable layer.
+pub fn frozen(name: []const u8, layers: u32) bool {
+    if (layers == 0) return false;
+    if (std.mem.startsWith(u8, name, "encoder.embeddings.")) return true;
+    const prefix = "encoder.layers.";
+    if (!std.mem.startsWith(u8, name, prefix)) return false;
+    const rest = name[prefix.len..];
+    const end = std.mem.indexOfScalar(u8, rest, '.') orelse return false;
+    const index = std.fmt.parseInt(u32, rest[0..end], 10) catch return false;
+    return index < layers;
+}
+
+/// A frozen parameter's value, owned by the caller for the whole run and
+/// bound by name into every program. It is never updated or freed by a step.
+pub const Frozen = struct { name: []const u8, value: ops.CT };
+
+fn bindFrozen(a: std.mem.Allocator, graph: *const ml.Graph, values: []const Frozen) ![]interpreter.RuntimeInput {
+    var result: std.ArrayListUnmanaged(interpreter.RuntimeInput) = .empty;
+    for (graph.parameters.items) |id| {
+        const name = graph.parameterName(graph.node(id));
+        for (values) |f| if (std.mem.eql(u8, f.name, name)) {
+            try result.append(a, .{ .node_id = id, .value = f.value });
+            break;
+        };
+    }
+    return result.toOwnedSlice(a);
+}
+
 /// All returned storage belongs to a caller-owned arena.
-pub fn parameters(a: std.mem.Allocator, graph: *const ml.Graph, reader: *const tensors.MMapReader) ![]controller.Parameter {
+/// Trainable parameters, excluding those frozen by `freeze_layers`.
+pub fn parameters(a: std.mem.Allocator, graph: *const ml.Graph, reader: *const tensors.MMapReader, freeze_layers: u32) ![]controller.Parameter {
     var out: std.ArrayListUnmanaged(controller.Parameter) = .empty;
     for (graph.parameters.items) |id| {
         const node = graph.node(id);
         const name = graph.parameterName(node);
-        if (std.mem.startsWith(u8, name, "__")) continue;
+        if (std.mem.startsWith(u8, name, "__") or frozen(name, freeze_layers)) continue;
         var tensor = try reader.readTensor(name);
         defer tensor.deinit();
         const shape = node.output_shape;
@@ -215,8 +246,16 @@ pub const Program = struct {
     seed: ml.NodeId,
     wrt: []ml.NodeId,
     gradients: ml.autodiff.GradientResult,
+    /// Values bound for parameters outside `wrt`; borrowed, set by the owner.
+    frozen: []const Frozen = &.{},
 
     pub fn init(a: std.mem.Allocator, cfg: modern.Config, l: architecture.Layout, dropout: f32) !Program {
+        return initFrozen(a, cfg, l, dropout, 0);
+    }
+
+    /// Differentiates only the parameters above the lowest `freeze_layers`
+    /// encoder layers; bind the rest through `frozen`.
+    pub fn initFrozen(a: std.mem.Allocator, cfg: modern.Config, l: architecture.Layout, dropout: f32, freeze_layers: u32) !Program {
         var graph = ml.Graph.init(a);
         errdefer graph.deinit();
         var builder = ml.Builder.init(&graph);
@@ -226,7 +265,10 @@ pub const Program = struct {
         const seed = try builder.parameter("__laya_cotangent", graph.node(built.logits).output_shape);
         var ids: std.ArrayListUnmanaged(ml.NodeId) = .empty;
         defer ids.deinit(a);
-        for (graph.parameters.items) |id| if (!std.mem.startsWith(u8, graph.parameterName(graph.node(id)), "__")) try ids.append(a, id);
+        for (graph.parameters.items) |id| {
+            const name = graph.parameterName(graph.node(id));
+            if (!std.mem.startsWith(u8, name, "__") and !frozen(name, freeze_layers)) try ids.append(a, id);
+        }
         const wrt = try ids.toOwnedSlice(a);
         errdefer a.free(wrt);
         var gradients = try ml.autodiff.gradientWithSeeds(a, &graph, &.{.{ .output = built.logits, .cotangent = seed }}, wrt, .{ .require_all_gradients = true });
@@ -245,6 +287,22 @@ pub const Program = struct {
 
 pub const Report = struct { loss: f32, ce: f32, policy: f32, reward: f32, optimizer: controller.Result };
 
+/// Run a graph with its device work batched into one command frame on
+/// Metal, rather than a submit-and-wait per node, then synchronize once.
+/// ANTFLY_LAYA_TRAIN_UNFRAMED restores per-node submission.
+pub fn executeFramed(a: std.mem.Allocator, graph: *const ml.Graph, cb: *const ops.ComputeBackend, runtime_inputs: []const interpreter.RuntimeInput) !interpreter.ExecutionResult {
+    const framed = cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame() and
+        !@import("antfly_platform").env.getenvBool("ANTFLY_LAYA_TRAIN_UNFRAMED") and try cb.decoderRuntimeBeginFrame();
+    errdefer if (framed) cb.decoderRuntimeCancelFrame() catch {};
+    const result = try interpreter.execute(a, graph, cb, .{ .runtime_inputs = runtime_inputs, .strict_integer_constants = true });
+    if (framed) cb.decoderRuntimeSubmitAndWaitFrame() catch |err| {
+        var owned = result;
+        owned.deinit(cb);
+        return err;
+    };
+    return result;
+}
+
 /// A whole forward/backward pair uses the same immutable weights and dropout
 /// masks. The trainer publishes an update only after the binding is released.
 pub fn step(a: std.mem.Allocator, program: *Program, trainer: *controller.Trainer, cfg: modern.Config, examples: []const Example, loss_cfg: objective.Config, seed_value: u64) !Report {
@@ -258,8 +316,8 @@ pub fn step(a: std.mem.Allocator, program: *Program, trainer: *controller.Traine
     var binding = try trainer.bind(&program.graph, null);
     var bound = true;
     defer if (bound) binding.deinit();
-    const combined = try std.mem.concat(scratch, interpreter.RuntimeInput, &.{ binding.inputs, runtime });
-    var forward = try interpreter.execute(a, &program.graph, cb, .{ .runtime_inputs = combined, .strict_integer_constants = true });
+    const combined = try std.mem.concat(scratch, interpreter.RuntimeInput, &.{ binding.inputs, try bindFrozen(scratch, &program.graph, program.frozen), runtime });
+    var forward = try executeFramed(a, &program.graph, cb, combined);
     defer forward.deinit(cb);
     const logits = try cb.toFloat32(forward.outputs[0], scratch);
     const l = try bucketedLayout(examples, cfg);
@@ -273,7 +331,7 @@ pub fn step(a: std.mem.Allocator, program: *Program, trainer: *controller.Traine
     const cotangent = try cb.fromFloat32Shape(loss.gradient, &.{ @intCast(l.questions), @intCast(l.options) });
     defer cb.free(cotangent);
     backward_inputs[combined.len] = .{ .node_id = program.gradients.id_map[program.seed], .value = cotangent };
-    var backward = try interpreter.execute(a, &program.gradients.graph, cb, .{ .runtime_inputs = backward_inputs, .strict_integer_constants = true });
+    var backward = try executeFramed(a, &program.gradients.graph, cb, backward_inputs);
     defer backward.deinit(cb);
     // Results own their gradient tensors; freeing parameter/input bindings does
     // not invalidate these outputs. No optimizer mutation occurs with a tape live.
@@ -287,16 +345,22 @@ pub fn step(a: std.mem.Allocator, program: *Program, trainer: *controller.Traine
         const gradients = try scratch.alloc(controller.ResidentGradient, program.wrt.len);
         var uploaded: usize = 0;
         defer for (gradients[0..uploaded]) |gradient| cb.free(gradient.value.tensor);
-        // The materialized interpreter can return host-backed CTs for some
-        // VJPs. Resident AdamW must receive tensors owned by this provider.
-        // Admit that transfer explicitly; never relabel a foreign CT.
+        // Resident AdamW must receive tensors owned by this provider. A dense
+        // device gradient is copied on the GPU; the materialized interpreter
+        // can also return host-backed CTs for some VJPs, which are uploaded.
+        // Either way the transfer is explicit; a foreign CT is never relabeled.
         for (program.wrt, backward.outputs, gradients) |id, output, *gradient| {
-            const values = try cb.toFloat32(output, a);
-            defer a.free(values);
             const shape = program.graph.node(id).output_shape;
             var dims: [8]i32 = undefined;
             for (shape.dims[0..shape.rank()], 0..) |dim, i| dims[i] = @intCast(dim);
-            const owned = try cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = values, .shape = dims[0..shape.rank()] } }, .{});
+            const owned = cb.residentTrainingPrimitive(&.{ .adopt_f32 = .{ .input = output, .shape = dims[0..shape.rank()] } }, .{}) catch |err| switch (err) {
+                error.UnsupportedResidentTrainingPrimitive, error.ResidentTrainingRequiresDeviceTensor => upload: {
+                    const values = try cb.toFloat32(output, a);
+                    defer a.free(values);
+                    break :upload try cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = values, .shape = dims[0..shape.rank()] } }, .{});
+                },
+                else => return err,
+            };
             gradient.* = .{ .name = program.graph.parameterName(program.graph.node(id)), .value = .{ .tensor = owned } };
             uploaded += 1;
         }
@@ -315,8 +379,8 @@ pub fn predict(a: std.mem.Allocator, program: *Program, trainer: *controller.Tra
     defer for (runtime) |input| cb.free(input.value);
     var binding = try trainer.bind(&program.graph, null);
     defer binding.deinit();
-    const combined = try std.mem.concat(scratch, interpreter.RuntimeInput, &.{ binding.inputs, runtime });
-    var result = try interpreter.execute(a, &program.graph, cb, .{ .runtime_inputs = combined, .strict_integer_constants = true });
+    const combined = try std.mem.concat(scratch, interpreter.RuntimeInput, &.{ binding.inputs, try bindFrozen(scratch, &program.graph, program.frozen), runtime });
+    var result = try executeFramed(a, &program.graph, cb, combined);
     defer result.deinit(cb);
     return cb.toFloat32(result.outputs[0], a);
 }

@@ -305,13 +305,14 @@ test "laya packed trunk cache reuses the state exactly across rows and requests"
     var words = synthetic.WordTokenizer{};
     const tok = words.tokenizer();
     const trunk_cache = @import("../architectures/laya_trunk_cache.zig");
-    for ([_][]const u8{ "{\"mode\":\"question\"}", "{\"mode\":\"candidate\"}" }) |packing| {
+    for ([_][]const u8{ "{\"mode\":\"question\"}", "{\"mode\":\"candidate\"}" }) |packing| for ([_]trunk_cache.Precision{ .f32, .f16 }) |precision| {
         var fixture = try Fixture.init(std.testing.allocator, packing);
         defer fixture.deinit(std.testing.allocator);
         var cache = trunk_cache.Cache.init(std.testing.allocator, 64 * 1024 * 1024);
         defer cache.deinit();
         // The synthetic state is short; cache it anyway.
         cache.min_tokens = 1;
+        cache.precision = precision;
         var worst: f32 = 0;
         // Miss (fills the cache), then hits with different question sets.
         for ([_][]const pipeline.Question{ &questions, questions[1..], questions[0..1] }) |subset| {
@@ -325,11 +326,12 @@ test "laya packed trunk cache reuses the state exactly across rows and requests"
             worst = @max(worst, try maxError(full[1], cached[1].asFloat32()));
         }
         const stats = cache.snapshot();
-        std.debug.print("Laya packed {s}: cached vs full max error={d}, hits={d} misses={d} bytes={d}\n", .{ packing, worst, stats.hits, stats.misses, stats.bytes });
-        try std.testing.expect(worst < 1e-5);
+        std.debug.print("Laya packed {s} {s}: cached vs full max error={d}, hits={d} misses={d} bytes={d}\n", .{ packing, @tagName(precision), worst, stats.hits, stats.misses, stats.bytes });
+        // f32 entries are exact; f16 entries round the trunk keys and values.
+        try std.testing.expect(worst < if (precision == .f32) @as(f32, 1e-5) else 5e-3);
         try std.testing.expectEqual(@as(u64, 2), stats.hits);
         try std.testing.expectEqual(@as(u64, 1), stats.misses);
-    }
+    };
 }
 
 test "laya packed session caches the trunk across pipeline requests" {
@@ -341,6 +343,7 @@ test "laya packed session caches the trunk across pipeline requests" {
     var fixture = try Fixture.init(std.testing.allocator, "{\"mode\":\"question\"}");
     defer fixture.deinit(std.testing.allocator);
     factory.setLayaTrunkCacheLimit(fixture.session, 64 * 1024 * 1024, 1);
+    factory.setLayaTrunkCachePrecision(fixture.session, .f32);
     const first = try pipeline.execute(a, fixture.session, tok, fixture.cfg, &.{.{ .text = state_text, .question = questions[0] }}, null);
     const second = try pipeline.execute(a, fixture.session, tok, fixture.cfg, &.{ .{ .text = state_text, .question = questions[1] }, .{ .text = state_text, .question = questions[0] } }, null);
     const stats = factory.layaTrunkCacheStats(fixture.session).?;
