@@ -55,6 +55,7 @@ pub const Matcher = union(enum) {
     pub const Fuzzy = struct {
         term: []const u8,
         max_edits: u8,
+        prefix_len: u8 = 0,
     };
 
     pub const Regexp = struct {
@@ -227,7 +228,14 @@ fn collectMatchSpans(
                 .term => |term| if (std.mem.eql(u8, tok.term, term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
                 .prefix => |prefix| if (std.mem.startsWith(u8, tok.term, prefix)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
                 .wildcard => |pattern| if (wildcard_mod.match(pattern, tok.term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
-                .fuzzy => |fuzzy| if (boundedEditDistance(tok.term, fuzzy.term, fuzzy.max_edits) <= fuzzy.max_edits) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
+                .fuzzy => |fuzzy| {
+                    const prefix_len: usize = fuzzy.prefix_len;
+                    if (tok.term.len < prefix_len or fuzzy.term.len < prefix_len or
+                        !std.mem.eql(u8, tok.term[0..prefix_len], fuzzy.term[0..prefix_len])) continue;
+                    if (try boundedEditDistance(alloc, tok.term, fuzzy.term, fuzzy.max_edits) <= fuzzy.max_edits) {
+                        try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte });
+                    }
+                },
                 .regexp => |regexp| if (regex_mod.matchesCompiled(regexp.pattern, regexp.compiled, tok.term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
                 .contains => {},
                 .literal, .literal_prefix => {},
@@ -333,12 +341,19 @@ fn utf8Ceil(text: []const u8, index: u32) u32 {
 }
 
 /// Levenshtein distance capped at `limit + 1` so long tokens bail out early.
-fn boundedEditDistance(a: []const u8, b: []const u8, limit: u8) u32 {
+fn boundedEditDistance(alloc: Allocator, a: []const u8, b: []const u8, limit: u8) !u32 {
     const cap: u32 = @as(u32, limit) + 1;
-    if (a.len > b.len + cap or b.len > a.len + cap) return cap;
-    if (a.len > 64 or b.len > 64) return if (std.mem.eql(u8, a, b)) 0 else cap;
-    var prev: [65]u32 = undefined;
-    var curr: [65]u32 = undefined;
+    if (std.mem.eql(u8, a, b)) return 0;
+    if (a.len > b.len and a.len - b.len > cap) return cap;
+    if (b.len > a.len and b.len - a.len > cap) return cap;
+    var stack_prev: [65]u32 = undefined;
+    var stack_curr: [65]u32 = undefined;
+    const heap_prev = if (b.len > 64) try alloc.alloc(u32, b.len + 1) else null;
+    defer if (heap_prev) |items| alloc.free(items);
+    const heap_curr = if (b.len > 64) try alloc.alloc(u32, b.len + 1) else null;
+    defer if (heap_curr) |items| alloc.free(items);
+    var prev = if (heap_prev) |items| items else stack_prev[0..];
+    var curr = if (heap_curr) |items| items else stack_curr[0..];
     for (0..b.len + 1) |j| prev[j] = @intCast(j);
     for (a, 1..) |ca, i| {
         curr[0] = @intCast(i);
@@ -349,7 +364,7 @@ fn boundedEditDistance(a: []const u8, b: []const u8, limit: u8) u32 {
             row_min = @min(row_min, curr[j]);
         }
         if (row_min > limit) return cap;
-        @memcpy(prev[0 .. b.len + 1], curr[0 .. b.len + 1]);
+        std.mem.swap([]u32, &prev, &curr);
     }
     return prev[b.len];
 }
@@ -544,6 +559,25 @@ test "substring highlights include repeated and crossing occurrences" {
     const crossing = try highlightMatchers(alloc, "foobarfoo bar", &.{.{ .contains = "foobar" }}, &analysis_mod.simple_analyzer, 1, 100);
     defer freeFragments(alloc, crossing);
     try std.testing.expectEqualStrings("foobarfoo bar", crossing[0].text[crossing[0].highlights[0].start..crossing[0].highlights[0].end]);
+}
+
+test "fuzzy highlights respect prefixes and long tokens" {
+    const alloc = std.testing.allocator;
+    const prefixed = try highlightMatchers(alloc, "cat bat", &.{.{ .fuzzy = .{ .term = "cat", .max_edits = 1, .prefix_len = 1 } }}, &analysis_mod.simple_analyzer, 1, 100);
+    defer freeFragments(alloc, prefixed);
+    try std.testing.expectEqual(@as(usize, 1), prefixed.len);
+    try std.testing.expectEqual(@as(usize, 1), prefixed[0].highlights.len);
+    try std.testing.expectEqualStrings("cat", prefixed[0].text[prefixed[0].highlights[0].start..prefixed[0].highlights[0].end]);
+
+    const query = [_]u8{'a'} ** 65;
+    var source = query;
+    source[64] = 'b';
+    const long = try highlightMatchers(alloc, &source, &.{.{ .fuzzy = .{ .term = &query, .max_edits = 1 } }}, &analysis_mod.simple_analyzer, 1, 100);
+    defer freeFragments(alloc, long);
+    try std.testing.expectEqual(@as(usize, 1), long.len);
+    try std.testing.expectEqual(@as(usize, 1), long[0].highlights.len);
+    try std.testing.expectEqual(@as(u32, 0), long[0].highlights[0].start);
+    try std.testing.expectEqual(@as(u32, 65), long[0].highlights[0].end);
 }
 
 test "highlight prefix wildcard fuzzy and regexp matchers mark whole tokens" {

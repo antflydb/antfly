@@ -18030,6 +18030,11 @@ fn highlightAutoFuzziness(term: []const u8) u8 {
     return 2;
 }
 
+fn highlightPhraseMatcher(term: []const u8, max_edits: u8, auto_fuzzy: bool) highlight_mod.Matcher {
+    const edits = if (auto_fuzzy) highlightAutoFuzziness(term) else max_edits;
+    return if (edits == 0) .{ .term = term } else .{ .fuzzy = .{ .term = term, .max_edits = edits } };
+}
+
 /// Collect one highlight matcher per positive text clause of a lowered
 /// query. Negative clauses (`must_not`) never highlight.
 fn collectHighlightMatchers(
@@ -18049,23 +18054,27 @@ fn collectHighlightMatchers(
         .phrase => |phrase| {
             const analyzer = phrase.analyzer orelse &analysis_mod.default_analyzer;
             const tokens = try analyzer.analyze(arena, phrase.text);
-            for (tokens) |token| try out.append(arena, .{ .field = highlightRootField(phrase.field), .matcher = .{ .term = token.term } });
+            for (tokens) |token| try out.append(arena, .{
+                .field = highlightRootField(phrase.field),
+                .matcher = highlightPhraseMatcher(token.term, phrase.max_edits, phrase.auto_fuzzy),
+            });
         },
         .term => |term| try out.append(arena, .{
             .field = highlightRootField(term.field),
             .matcher = if (highlightFieldIsKeyword(term.field)) .{ .literal = term.term } else if (highlightFieldIsSubstring(term.field)) .{ .contains = term.term } else .{ .term = term.term },
         }),
         .term_phrase => |phrase| for (phrase.terms) |term| {
-            try out.append(arena, .{ .field = highlightRootField(phrase.field), .matcher = .{ .term = term } });
+            try out.append(arena, .{ .field = highlightRootField(phrase.field), .matcher = highlightPhraseMatcher(term, phrase.max_edits, phrase.auto_fuzzy) });
         },
         .multi_phrase => |phrase| for (phrase.terms) |alternatives| for (alternatives) |term| {
-            try out.append(arena, .{ .field = highlightRootField(phrase.field), .matcher = .{ .term = term } });
+            try out.append(arena, .{ .field = highlightRootField(phrase.field), .matcher = highlightPhraseMatcher(term, phrase.max_edits, phrase.auto_fuzzy) });
         },
         .fuzzy => |fuzzy| try out.append(arena, .{
             .field = highlightRootField(fuzzy.field),
             .matcher = .{ .fuzzy = .{
                 .term = fuzzy.term,
                 .max_edits = if (fuzzy.auto_fuzzy) highlightAutoFuzziness(fuzzy.term) else fuzzy.max_edits,
+                .prefix_len = fuzzy.prefix_len,
             } },
         }),
         .prefix => |prefix| try out.append(arena, .{
@@ -18521,6 +18530,30 @@ test "limited highlight window retains nearby matches from other queries" {
     try std.testing.expectEqual(@as(usize, 1), hits[0].highlights[0].fragments.len);
     const spans = hits[0].highlights[0].fragments[0].spans;
     try std.testing.expectEqual(@as(usize, 2), spans.len);
+}
+
+test "fuzzy phrase clauses highlight matched surface terms" {
+    const alloc = std.testing.allocator;
+    const terms = [_][]const u8{ "colour", "world" };
+    const multi_terms = [_][]const []const u8{ &.{"colour"}, &.{"world"} };
+    const queries = [_]types.TextQuery{
+        .{ .match_phrase = .{ .field = "title", .text = "colour world", .max_edits = 1 } },
+        .{ .phrase = .{ .field = "title", .terms = &terms, .max_edits = 1 } },
+        .{ .multi_phrase = .{ .field = "title", .terms = &multi_terms, .max_edits = 1 } },
+        .{ .match_phrase = .{ .field = "title", .text = "colour world", .auto_fuzzy = true } },
+    };
+    for (queries) |query| {
+        var hits = [_]types.SearchHit{.{
+            .id = try alloc.dupe(u8, "doc:1"),
+            .stored_data = try alloc.dupe(u8, "{\"title\":\"color world\"}"),
+        }};
+        defer hits[0].deinit(alloc);
+        try attachHighlights(alloc, .{ .fragment_size = 64 }, &.{query}, &hits, null, .{}, null);
+        try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+        const fragment = hits[0].highlights[0].fragments[0];
+        try std.testing.expectEqual(@as(usize, 2), fragment.spans.len);
+        try std.testing.expectEqualStrings("color", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
+    }
 }
 
 /// The analyzer to apply to *query* text for a field. A substring companion is

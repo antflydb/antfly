@@ -14,14 +14,18 @@ T = TypeVar("T", bound="MatchPhraseQuery")
 
 @_attrs_define
 class MatchPhraseQuery:
-    """
-    Attributes:
-        match_phrase (str):
-        field (str | Unset):
-        analyzer (str | Unset):
-        boost (float | None | Unset): A floating-point number used to decrease or increase the relevance scores of a
-            query.
-        fuzziness (FuzzinessType1 | int | Unset): The fuzziness of the query. Can be an integer or "auto".
+    """Match a phrase using the field's analyzer. On a `substring` companion,
+    one or two words match contained text across token separators. Three
+    or more words are rejected because the suffix index cannot verify
+    their word boundaries; lookups over 32 bytes are also rejected.
+
+        Attributes:
+            match_phrase (str):
+            field (str | Unset):
+            analyzer (str | Unset):
+            boost (float | None | Unset): A floating-point number used to decrease or increase the relevance scores of a
+                query.
+            fuzziness (FuzzinessType1 | int | Unset): The fuzziness of the query. Can be an integer or "auto".
     """
 
     match_phrase: str
