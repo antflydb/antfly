@@ -56,7 +56,7 @@ jobs:
       github.run_attempt == 1) }}
     needs: admission
     name: sdks-ci
-    runs-on: arc-antfly-standard
+    runs-on: arc-antfly-standard-runtime
     timeout-minutes: 60
     outputs:
       antfarm_e2e: ${{ steps.scopes.outputs.antfarm_e2e }}
@@ -231,26 +231,26 @@ jobs:
     name: Antfarm Playwright
     needs: [admission, sdks]
     timeout-minutes: 60
-    runs-on: arc-antfly-heavy
-    env:
-      PNPM_STORE_PATH: /mnt/cache/pnpm-store
+    runs-on: arc-antfly-heavy-runtime
     defaults:
       run:
         working-directory: ts
     steps:
       - name: Configure cache directories
         run: |
+          pnpm_store_path="${RUNNER_TEMP}/pnpm-store"
           playwright_browsers_path="${RUNNER_TEMP}/playwright-browsers"
           xdg_cache_home="${RUNNER_TEMP}/xdg"
           tmpdir="${RUNNER_TEMP}/tmp"
 
           {
+            echo "PNPM_STORE_PATH=${pnpm_store_path}"
             echo "PLAYWRIGHT_BROWSERS_PATH=${playwright_browsers_path}"
             echo "XDG_CACHE_HOME=${xdg_cache_home}"
             echo "TMPDIR=${tmpdir}"
           } >> "$GITHUB_ENV"
 
-          mkdir -p "$PNPM_STORE_PATH" "$playwright_browsers_path" "$xdg_cache_home" "$tmpdir"
+          mkdir -p "$pnpm_store_path" "$playwright_browsers_path" "$xdg_cache_home" "$tmpdir"
         working-directory: .
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

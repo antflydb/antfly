@@ -821,6 +821,131 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/agents/research": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Research Agent - Bounded multi-phase research with a cited report
+         * @description Runs a bounded research state machine:
+         *     plan → research (parallel retrieval researchers) → reflect → … → write → verify
+         *
+         *     Every researcher is an ordinary retrieval-agent run over the request's
+         *     authorized queries, so authorization, mandatory predicates and tool
+         *     policy are identical to `/agents/retrieval`. Researchers return
+         *     compressed findings; the writer only sees findings and a deduplicated
+         *     evidence registry, and the server validates every `[E#]` citation.
+         *
+         *     All work is bounded by `budget`. Send `research_state` back to resume
+         *     or extend a run. For runs longer than one request, use
+         *     `/agents/research/jobs`.
+         *
+         *     **SSE Event Types:** the retrieval-agent events are reused.
+         *     `step_progress` carries `phase` values `plan`, `sub_question_started`,
+         *     `finding`, `reflection`, `section` and `verification`. Report text
+         *     streams as `generation`. `done` carries the authoritative
+         *     ResearchAgentResult.
+         */
+        post: operations["researchAgent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/agents/research/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a durable research job
+         * @description Persists a research request as a durable job that advances one bounded
+         *     phase at a time. Each phase checkpoints its research_state, so a job
+         *     survives server restarts and can be resumed by any caller holding the
+         *     same identity. Jobs are scoped to the authenticated principal.
+         */
+        post: operations["startResearchJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/agents/research/jobs/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        /** Get a durable research job */
+        get: operations["getResearchJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/agents/research/jobs/{jobId}/advance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Advance a durable research job
+         * @description Runs up to `max_phases` bounded research phases and persists the
+         *     checkpoint after each one. Concurrent advances of the same job are
+         *     rejected with 409.
+         */
+        post: operations["advanceResearchJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/agents/research/jobs/{jobId}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel a durable research job */
+        post: operations["cancelResearchJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables": {
         parameters: {
             query?: never;
@@ -8753,6 +8878,473 @@ export interface components {
             followup_questions?: string[];
             /** @description Evaluation results when steps.eval was configured */
             eval_result?: components["schemas"]["EvalResult"];
+        };
+        /**
+         * @description Research state-machine phase. `plan` decomposes the question,
+         *     `research` runs one bounded round of retrieval researchers, `reflect`
+         *     decides whether another round is needed, `write` produces the cited
+         *     report, `verify` checks citations, and `done` is terminal.
+         * @enum {string}
+         */
+        ResearchPhase: "plan" | "research" | "reflect" | "write" | "verify" | "done";
+        /**
+         * @description Declared upper bounds for one research run. The worst-case LLM and
+         *     tool-call cost is computable before execution; requests whose worst
+         *     case exceeds the server ceiling are rejected, not clamped.
+         */
+        ResearchBudget: {
+            /**
+             * @description Maximum research rounds (plan or reflect, then fan-out).
+             * @default 2
+             */
+            max_rounds?: number;
+            /**
+             * @description Maximum sub-questions researched per round.
+             * @default 4
+             */
+            max_sub_questions?: number;
+            /**
+             * @description Maximum researchers in flight at once.
+             * @default 2
+             */
+            max_parallel?: number;
+            /**
+             * @description Model-generation rounds available to each researcher.
+             * @default 6
+             */
+            researcher_iterations?: number;
+            /**
+             * @description Tool calls available to each researcher.
+             * @default 8
+             */
+            researcher_tool_calls?: number;
+            /**
+             * @description Hard cap on model calls across every role in the run.
+             * @default 80
+             */
+            max_llm_calls?: number;
+            /**
+             * @description Hard cap on tool calls across every researcher in the run.
+             * @default 120
+             */
+            max_tool_calls?: number;
+            /**
+             * @description Maximum distinct evidence items retained in the registry.
+             * @default 80
+             */
+            max_evidence?: number;
+            /**
+             * @description Output token budget for the report writer.
+             * @default 4000
+             */
+            max_report_tokens?: number;
+            /**
+             * @description Wall-clock budget for a synchronous run or a single job advance.
+             * @default 600000
+             */
+            deadline_ms?: number;
+        };
+        /** @description Configuration for one research role. Generator and chain default to the top-level request values. */
+        ResearchStepConfig: {
+            /** @description Whether the step runs. Defaults vary by step. */
+            enabled?: boolean;
+            /** @description Generator for this role. */
+            generator?: components["schemas"]["GeneratorConfig"];
+            /** @description Chain of generators for this role. */
+            chain?: components["schemas"]["ChainLink"][];
+            /** @description Additional role instructions. They cannot change authorized tables, filters, tools or budgets. */
+            instructions?: string;
+        };
+        /**
+         * @description Configuration for researchers. Every researcher is a bounded retrieval
+         *     agent run over the request's authorized queries. `tools` narrows the
+         *     top-level tools policy and cannot widen it.
+         */
+        ResearchRetrievalStepConfig: {
+            /** @description Generator for researchers. Defaults to the top-level generator. */
+            generator?: components["schemas"]["GeneratorConfig"];
+            /** @description Chain of generators for researchers. */
+            chain?: components["schemas"]["ChainLink"][];
+            /** @description Additional researcher instructions. */
+            instructions?: string;
+            /** @description Researcher tool policy. Narrows the top-level tools policy. */
+            tools?: components["schemas"]["ChatToolsConfig"];
+            /** @description Optional tree or graph navigation available to each researcher. */
+            navigation?: components["schemas"]["RetrievalNavigationConfig"];
+        };
+        /** @description Configuration for the report writer. */
+        ResearchWriteStepConfig: {
+            /** @description Generator for the writer. Defaults to the top-level generator. */
+            generator?: components["schemas"]["GeneratorConfig"];
+            /** @description Chain of generators for the writer. */
+            chain?: components["schemas"]["ChainLink"][];
+            /** @description Additional writer instructions, for example audience or tone. */
+            instructions?: string;
+            /** @description Optional caller-supplied section headings. When omitted the writer chooses them. */
+            outline?: string[];
+        };
+        /** @description Per-role configuration for the research agent. */
+        ResearchAgentSteps: {
+            /** @description Planner that writes the research brief and sub-questions. Always runs unless research_state carries a plan. */
+            plan?: components["schemas"]["ResearchStepConfig"];
+            /** @description Researcher configuration. */
+            research?: components["schemas"]["ResearchRetrievalStepConfig"];
+            /** @description Gap analysis after each round. Enabled by default when budget.max_rounds > 1. */
+            reflect?: components["schemas"]["ResearchStepConfig"];
+            /** @description Report writer. */
+            write?: components["schemas"]["ResearchWriteStepConfig"];
+            /** @description Optional model check that cited evidence supports each section. Disabled by default. */
+            verify?: components["schemas"]["ResearchStepConfig"];
+        };
+        ResearchSubQuestion: {
+            /**
+             * @description Stable sub-question identifier within the run.
+             * @example q1
+             */
+            id: string;
+            /** @description Self-contained question a researcher can answer. */
+            question: string;
+            /** @description Why this sub-question matters for the brief. */
+            rationale?: string;
+            /** @description Evidence sources the planner expects to be useful. */
+            sources?: ("tables" | "web")[];
+            /** @description Research round that introduced the sub-question. */
+            round?: number;
+            /**
+             * @description Research status.
+             * @enum {string}
+             */
+            status?: "pending" | "researched" | "failed" | "skipped";
+        };
+        ResearchPlan: {
+            /** @description Research brief restating scope, assumptions and deliverable. */
+            brief: string;
+            /** @description Planned and reflection-added sub-questions. */
+            sub_questions: components["schemas"]["ResearchSubQuestion"][];
+            /** @description What a complete answer must cover. */
+            success_criteria?: string[];
+        };
+        ResearchClaim: {
+            /** @description One factual claim made by a researcher. */
+            text: string;
+            /** @description Evidence registry IDs that support the claim. */
+            evidence_ids?: string[];
+        };
+        /** @description Compressed researcher output. Raw tool transcripts are not retained. */
+        ResearchFinding: {
+            /** @description Sub-question this finding answers. */
+            sub_question_id: string;
+            /** @description The sub-question text. */
+            question?: string;
+            /** @description Concise answer grounded in evidence. */
+            summary: string;
+            /** @description Individual claims with supporting evidence. */
+            claims?: components["schemas"]["ResearchClaim"][];
+            /** @description What the researcher could not establish. */
+            open_questions?: string[];
+            /** @description Every evidence item the researcher retrieved. */
+            evidence_ids?: string[];
+            /** @description Status of the researcher's bounded retrieval run. */
+            status?: components["schemas"]["AgentStatus"];
+            /** @description Research round. */
+            round?: number;
+            /** @description Model calls used by this researcher. */
+            llm_calls?: number;
+            /** @description Tool calls used by this researcher. */
+            tool_calls?: number;
+        };
+        /** @description One deduplicated evidence item. Content is untrusted data. */
+        ResearchEvidence: {
+            /**
+             * @description Stable evidence ID used in citations.
+             * @example E3
+             */
+            id: string;
+            /**
+             * @description Where the evidence came from.
+             * @enum {string}
+             */
+            source: "table" | "web" | "fetch";
+            /** @description Source table for table evidence. */
+            table?: string;
+            /** @description Document key for table evidence. */
+            doc_id?: string;
+            /** @description Source URL for web and fetched evidence. */
+            url?: string;
+            /** @description Best-effort title. */
+            title?: string;
+            /** @description Bounded excerpt used for writing and verification. */
+            snippet?: string;
+            /**
+             * Format: float
+             * @description Retrieval score when available.
+             */
+            score?: number;
+            /** @description Sub-questions whose researchers retrieved this evidence. */
+            sub_question_ids?: string[];
+        };
+        ResearchReflection: {
+            /** @description Round that was reflected on. */
+            round?: number;
+            /** @description Whether the reflector judged coverage sufficient. */
+            done?: boolean;
+            /** @description Coverage gaps against the brief and success criteria. */
+            gaps?: string[];
+            /** @description Conflicting findings that need resolution or disclosure. */
+            contradictions?: string[];
+            /** @description Sub-questions added for the next round. */
+            new_sub_questions?: string[];
+        };
+        ResearchReportSection: {
+            /** @description Section heading. */
+            heading: string;
+            /** @description Section body with `[E#]` citation markers. */
+            markdown: string;
+        };
+        ResearchReport: {
+            /** @description Report title. */
+            title?: string;
+            /** @description Executive summary. */
+            summary?: string;
+            /** @description Report sections. */
+            sections?: components["schemas"]["ResearchReportSection"][];
+            /** @description The full report rendered as markdown, with a sources list. */
+            markdown: string;
+        };
+        ResearchCitation: {
+            /** @description Marker as written in the report, for example `[E3]`. */
+            marker: string;
+            /** @description Resolved evidence ID. */
+            evidence_id: string;
+            /** @description Section containing the marker. -1 is the summary. */
+            section_index?: number;
+            /** @description Number of occurrences in that section. */
+            count?: number;
+        };
+        ResearchUnsupportedClaim: {
+            /** @description Section containing the claim. */
+            section_index?: number;
+            /** @description Claim text. */
+            text?: string;
+            /** @description Evidence the claim cited. */
+            evidence_ids?: string[];
+            /** @description Why the claim is unsupported. */
+            reason?: string;
+        };
+        ResearchVerification: {
+            /** @description Number of sections checked. */
+            checked_sections?: number;
+            /** @description Citation markers that did not resolve to evidence and were removed. */
+            unresolved_markers?: string[];
+            /** @description Sections without any resolvable citation. */
+            uncited_sections?: number[];
+            /** @description Claims the verifier judged unsupported by their cited evidence. */
+            unsupported?: components["schemas"]["ResearchUnsupportedClaim"][];
+            /**
+             * Format: float
+             * @description Share of checked claims judged supported.
+             */
+            supported_ratio?: number;
+        };
+        ResearchUsage: {
+            /** @description Model calls across every role. */
+            llm_calls?: number;
+            /** @description Tool calls across every researcher. */
+            tool_calls?: number;
+            /** @description Researcher executions. */
+            researcher_runs?: number;
+            /** @description Research rounds completed. */
+            rounds?: number;
+            /** @description Evidence items in the registry. */
+            evidence_count?: number;
+            /**
+             * Format: int64
+             * @description Wall-clock time consumed so far.
+             */
+            elapsed_ms?: number;
+        };
+        /**
+         * @description Client-carried continuation state. Sending it back resumes the run at
+         *     `phase` without repeating completed work. It never contains raw tool
+         *     transcripts, credentials or connection settings. Evidence snippets are
+         *     bounded excerpts of documents the caller was authorized to read; every
+         *     resumed request is re-authorized.
+         *
+         *     The server signs the state it returns (`signature`) and rejects a
+         *     state whose signature does not verify, so a client cannot alter a
+         *     checkpoint, including its budget counters. Send the state back
+         *     unmodified. Signatures are valid across a cluster that shares an
+         *     internal service secret, otherwise only on the server that issued them
+         *     and until it restarts; use durable jobs to resume across restarts.
+         */
+        ResearchState: {
+            /** @description Server signature over this state. Do not modify the state. */
+            signature?: string;
+            phase: components["schemas"]["ResearchPhase"];
+            /** @description Completed research rounds. */
+            round?: number;
+            plan?: components["schemas"]["ResearchPlan"];
+            findings?: components["schemas"]["ResearchFinding"][];
+            evidence?: components["schemas"]["ResearchEvidence"][];
+            reflections?: components["schemas"]["ResearchReflection"][];
+            report?: components["schemas"]["ResearchReport"];
+            citations?: components["schemas"]["ResearchCitation"][];
+            verification?: components["schemas"]["ResearchVerification"];
+            usage?: components["schemas"]["ResearchUsage"];
+        };
+        ResearchIncompleteDetails: {
+            /**
+             * @description Why the run stopped:
+             *     - max_rounds: research rounds were exhausted before the reflector was satisfied (the report is still written)
+             *     - max_llm_calls / max_tool_calls: a hard budget was exhausted
+             *     - deadline: the wall-clock budget elapsed
+             *     - no_evidence: researchers found no evidence to write from
+             *     - clarification_required: the planner needs a user decision
+             *     - cancelled: a durable job was cancelled
+             *     - phase_limit: a job advance stopped after its requested number of phases
+             * @enum {string}
+             */
+            reason: "max_rounds" | "max_llm_calls" | "max_tool_calls" | "deadline" | "no_evidence" | "clarification_required" | "cancelled" | "phase_limit";
+            /** @description Human-readable detail. */
+            message?: string;
+        };
+        /**
+         * @description Request for the research agent. The agent plans sub-questions, runs a
+         *     bounded retrieval researcher per sub-question in parallel, reflects on
+         *     coverage, and writes a long-form report whose `[E#]` citations resolve
+         *     to a deduplicated evidence registry.
+         *
+         *     Researchers are ordinary retrieval-agent runs over `queries` with the
+         *     same authorization, mandatory predicates and tool policy. They cannot
+         *     widen tables, filters, tools or budgets.
+         */
+        ResearchAgentRequest: {
+            /**
+             * @description The research question.
+             * @example How do Antfly's hybrid search and reranking interact, and what are the tuning trade-offs?
+             */
+            query: string;
+            /**
+             * @description Authorized table scopes, as for the retrieval agent. `filter_query`
+             *     and `exclusion_query` are mandatory predicates for every researcher.
+             *     May be empty when web search is enabled.
+             */
+            queries: components["schemas"]["QueryRequest"][];
+            /** @description Optional conversational context. */
+            messages?: components["schemas"]["ChatMessage"][];
+            /** @description Domain context for every role. */
+            agent_knowledge?: string;
+            /** @description Mandatory filters applied to every researcher search. */
+            accumulated_filters?: components["schemas"]["FilterSpec"][];
+            /** @description Correlation identifier echoed back to the client. */
+            session_id?: string;
+            /** @description Structured user answers for client-carried continuation. */
+            decisions?: components["schemas"]["AgentDecision"][];
+            /**
+             * @description If true, the planner may return clarification questions instead of a plan.
+             * @default false
+             */
+            interactive?: boolean;
+            /** @description Default generator for every role. */
+            generator?: components["schemas"]["GeneratorConfig"];
+            /** @description Default chain of generators for every role. */
+            chain?: components["schemas"]["ChainLink"][];
+            /** @description Default tool policy for researchers, for example `web_search` and `fetch`. */
+            tools?: components["schemas"]["ChatToolsConfig"];
+            steps?: components["schemas"]["ResearchAgentSteps"];
+            budget?: components["schemas"]["ResearchBudget"];
+            /** @description Continuation state returned by an earlier run. */
+            research_state?: components["schemas"]["ResearchState"];
+            /** @description Per-researcher tool-result context budget in tokens. */
+            max_context_tokens?: number;
+            /** @description Tokens reserved from max_context_tokens for prompts and answers. */
+            reserve_tokens?: number;
+            /**
+             * @description Enable SSE streaming vs JSON response.
+             * @default true
+             */
+            stream?: boolean;
+        };
+        /** @description Result from the research agent. */
+        ResearchAgentResult: {
+            /**
+             * @description Unique response ID.
+             * @example resr_cr3ig20h5tbs73e3ahrg
+             */
+            id?: string;
+            /** @description Writer model. */
+            model?: string;
+            /**
+             * Format: int64
+             * @description Unix timestamp (seconds) when the response was created.
+             */
+            created_at?: number;
+            status: components["schemas"]["AgentStatus"];
+            incomplete_details?: components["schemas"]["ResearchIncompleteDetails"];
+            phase?: components["schemas"]["ResearchPhase"];
+            usage?: components["schemas"]["ResearchUsage"];
+            plan?: components["schemas"]["ResearchPlan"];
+            findings?: components["schemas"]["ResearchFinding"][];
+            evidence?: components["schemas"]["ResearchEvidence"][];
+            reflections?: components["schemas"]["ResearchReflection"][];
+            report?: components["schemas"]["ResearchReport"];
+            citations?: components["schemas"]["ResearchCitation"][];
+            verification?: components["schemas"]["ResearchVerification"];
+            research_state: components["schemas"]["ResearchState"];
+            /** @description Execution trace. */
+            steps?: components["schemas"]["AgentStep"][];
+            /** @description Clarification questions when status is clarification_required. */
+            questions?: components["schemas"]["AgentQuestion"][];
+            /** @description Echoed correlation identifier. */
+            session_id?: string;
+        };
+        /**
+         * @description Durable research job lifecycle state.
+         * @enum {string}
+         */
+        ResearchJobState: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+        ResearchJobStartRequest: {
+            /**
+             * @description The research request. `stream` is ignored. Durable jobs persist the
+             *     request, so generators must reference credentials through the
+             *     secret store, environment or server connections rather than inline
+             *     API keys.
+             */
+            request: components["schemas"]["ResearchAgentRequest"];
+            /**
+             * @description Number of phases to run before the start call returns.
+             * @default 0
+             */
+            advance?: number;
+        };
+        ResearchJobAdvanceRequest: {
+            /**
+             * @description Maximum phases to run in this advance. Each phase checkpoints before the next starts.
+             * @default 1
+             */
+            max_phases?: number;
+        };
+        ResearchJob: {
+            /** @description Job identifier. */
+            job_id: string;
+            state: components["schemas"]["ResearchJobState"];
+            phase: components["schemas"]["ResearchPhase"];
+            /** @description The research question. */
+            query?: string;
+            /** @description Completed advance calls. */
+            advances?: number;
+            /** @description Whether cancellation was requested. */
+            cancel_requested?: boolean;
+            /** @description Last advance error, if any. */
+            last_error?: string;
+            /** Format: int64 */
+            created_at_ms?: number;
+            /** Format: int64 */
+            updated_at_ms?: number;
+            /** Format: int64 */
+            expires_at_ms?: number;
+            /** @description Latest checkpointed result, including research_state. */
+            result?: components["schemas"]["ResearchAgentResult"];
         };
         /**
          * @deprecated
@@ -20670,6 +21262,190 @@ export interface operations {
             502: components["responses"]["QueryBadGateway"];
             503: components["responses"]["AgentTemporarilyUnavailable"];
             504: components["responses"]["QueryGatewayTimeout"];
+        };
+    };
+    researchAgent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResearchAgentRequest"];
+            };
+        };
+        responses: {
+            /** @description Research agent response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                    "application/json": components["schemas"]["ResearchAgentResult"];
+                };
+            };
+            /** @description Invalid research agent request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The caller lacks read permission on a requested table or tool connection */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["QueryPayloadTooLarge"];
+            422: components["responses"]["QueryUnprocessable"];
+            429: components["responses"]["QueryRateLimited"];
+            500: components["responses"]["InternalServerError"];
+            502: components["responses"]["QueryBadGateway"];
+            503: components["responses"]["AgentTemporarilyUnavailable"];
+            504: components["responses"]["QueryGatewayTimeout"];
+        };
+    };
+    startResearchJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResearchJobStartRequest"];
+            };
+        };
+        responses: {
+            /** @description Research job durably accepted */
+            202: {
+                headers: {
+                    /** @description Relative URL of the durable research job resource. */
+                    Location?: string;
+                    /** @description Suggested delay in seconds before the next advance or poll. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description The caller lacks read permission on a requested table or tool connection */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["QueryRateLimited"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getResearchJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Research job status and latest checkpoint */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    advanceResearchJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResearchJobAdvanceRequest"];
+            };
+        };
+        responses: {
+            /** @description Research job was already terminal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            /** @description Research job advanced */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["QueryRateLimited"];
+            500: components["responses"]["InternalServerError"];
+            502: components["responses"]["QueryBadGateway"];
+            503: components["responses"]["AgentTemporarilyUnavailable"];
+        };
+    };
+    cancelResearchJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Research job cancelled or already terminal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
         };
     };
     listTables: {

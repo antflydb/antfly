@@ -3810,6 +3810,25 @@ pub fn runFromIterator(
         else
             &local_restore_job_store.?;
     }
+    // Research jobs checkpoint every phase so a restart resumes them from the
+    // last completed phase. Local standalone keeps them in a dedicated LSM
+    // root; Lite has no reserved namespace for them yet and keeps them in
+    // memory.
+    const research_job_root = if (lite_backend == null)
+        try std.fmt.allocPrint(alloc, "{s}/api-research-jobs", .{resolved.replica_root_dir})
+    else
+        null;
+    defer if (research_job_root) |path| alloc.free(path);
+    var research_job_backend: ?antfly.lsm_backend.BackendHandle = if (research_job_root) |path|
+        try antfly.lsm_backend.BackendHandle.open(alloc, path, .{})
+    else
+        null;
+    defer if (research_job_backend) |*backend| backend.close();
+    var research_job_store: ?antfly.storage_backend_erased.Store = if (research_job_backend) |*backend|
+        try backend.backend.runtimeStore(alloc, .{ .name = "system/api-research-jobs" })
+    else
+        null;
+    defer if (research_job_store) |*store| store.deinit();
     // Incoming reverse-route observations are an exact, fenced directory, not
     // disposable cache state: retain one latest generation per logical graph
     // key so restarts and L1 eviction do not reintroduce all-shard probes.
@@ -4378,7 +4397,8 @@ pub fn runFromIterator(
             .user_manager = if (user_manager) |*manager| manager else null,
             .session_store = if (lite_session_store) |*store| store else if (native_sessions) |*store| store else null,
             .remote_attempt_exclusive_owner = if (session_backend) |*backend| backend.backend.root_writer_lock != null else false,
-            .restore_job_store = restore_job_store,
+            .restore_job_store = if (local_metadata.lifecycle_store == null) restore_job_store else null,
+            .research_job_store = if (research_job_store) |*store| store else null,
             .incoming_graph_route_store = incoming_graph_route_store,
             .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,

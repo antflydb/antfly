@@ -6564,6 +6564,8 @@ pub const DataServer = struct {
         }
         var owned_restore_job_store_path: ?[]u8 = null;
         defer if (owned_restore_job_store_path) |path| self.alloc.free(path);
+        var owned_research_job_store_path: ?[]u8 = null;
+        defer if (owned_research_job_store_path) |path| self.alloc.free(path);
         // Only filesystem builds can use the legacy LMDB registry. Standalone
         // lifecycle jobs already belong to the durable metadata owner.
         if (comptime build_options.lmdb_enabled) {
@@ -6576,6 +6578,15 @@ pub const DataServer = struct {
             {
                 owned_restore_job_store_path = try std.fmt.allocPrint(self.alloc, "{s}/api-restore-jobs", .{self.write_source.replica_root_dir});
                 api_server_cfg.restore_job_store_path = owned_restore_job_store_path;
+            }
+            // Research jobs checkpoint every phase so a restart resumes them.
+            if (api_server_cfg.research_job_store_path == null and
+                api_server_cfg.session_store_path == null and
+                self.status_source.standalone_hot_standby == null and
+                api_server_cfg.deployment_mode != .serverless)
+            {
+                owned_research_job_store_path = try std.fmt.allocPrint(self.alloc, "{s}/api-research-jobs", .{self.write_source.replica_root_dir});
+                api_server_cfg.research_job_store_path = owned_research_job_store_path;
             }
         }
         api_server_cfg.shard_ops = self.localShardOperationAdapter();
