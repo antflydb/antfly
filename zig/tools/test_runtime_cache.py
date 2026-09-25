@@ -290,6 +290,7 @@ class RuntimeCacheTest(unittest.TestCase):
             text=True,
             capture_output=True,
             timeout=60,
+            check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(cached.read_bytes(), fresh.read_bytes())
@@ -364,7 +365,7 @@ class RuntimeCacheTest(unittest.TestCase):
                 product = "cache-inference" if standalone else "cache-probe"
                 targets = (product, "cache-pjrt-tests")
 
-                def assert_product(output, rebuilt=False):
+                def assert_product(output, rebuilt=False, standalone=standalone):
                     if standalone:
                         status = "success" if rebuilt else "cached"
                         self.assertRegex(
