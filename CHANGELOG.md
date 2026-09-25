@@ -16,6 +16,24 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **Research agent** — `POST /agents/research` plans a question into
+  sub-questions, researches them in parallel with the retrieval agent, reflects
+  on coverage, and writes a sectioned report whose `[E#]` citations resolve to a
+  deduplicated evidence registry. Unresolvable citation markers are removed and
+  reported, and an optional verify step checks cited statements against their
+  evidence. Every limit is declared in `budget` and is cumulative across
+  resumes; `research_state` carries a run forward. Durable jobs
+  (`/agents/research/jobs`, with `advance` and `cancel`) checkpoint after every
+  phase, are scoped to the authenticated user, and survive restarts in local
+  standalone mode. Available from the CLI (`antfly agents research`, `--job`),
+  the Go and TypeScript SDKs, `@antfly/components` (`useResearchStream`,
+  `ResearchReport`), evalaf, and as the A2A `research` skill.
+- **Retrieval agent `fetch` tool** — agents can read full web pages. Fetch is
+  opt-in and admits only URLs returned by `web_search` in the same run or on
+  `fetch_config.allowed_hosts`; private addresses are always blocked. Tool
+  results are budgeted in estimated tokens instead of bytes, and every model
+  round checks the request deadline and cancellation.
+
 - **One rerank endpoint for text and images** — `POST /ai/v1/rerank` takes
   `documents`, where each entry is a string or an array of text and image
   content parts, the same format generation and embedding use. Documents with

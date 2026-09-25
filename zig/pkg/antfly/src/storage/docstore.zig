@@ -1703,6 +1703,7 @@ pub const DocStore = struct {
     pub const TransactionalGuard = struct {
         ptr: *anyopaque,
         validate: *const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror!void,
+        validate_at_commit: ?*const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror!void = null,
     };
 
     fn putBatchWithReplayOnceWithOptions(
@@ -1820,7 +1821,8 @@ pub const DocStore = struct {
         // Recheck immediately before commit. A guard may contain a wall-clock
         // lease expiry, and building a large replay value can outlive the tenure
         // even though no competing writer can modify the record mid-transaction.
-        if (transactional_guard) |guard| try guard.validate(guard.ptr, self.alloc, &txn);
+        if (transactional_guard) |guard| if (guard.validate_at_commit) |validate|
+            try validate(guard.ptr, self.alloc, &txn);
         try batch.commit();
         return promoted_bytes;
     }
