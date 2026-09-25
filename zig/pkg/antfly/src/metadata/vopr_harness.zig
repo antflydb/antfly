@@ -4775,9 +4775,13 @@ pub const MetadataHttpClusterVopr = struct {
         self: *MetadataHttpClusterVopr,
         ownership: DataPlaneOwnership,
     ) void {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
         if (ownership == .external and self.data_plane_ownership != .external) {
-            for (0..self.cluster.nodes.len) |index|
+            for (0..self.cluster.nodes.len) |index| {
+                if (!self.cluster.node_live[index]) continue;
                 self.cluster.node(index).disableTransitionOps();
+            }
         }
         self.data_plane_ownership = ownership;
         @memset(self.placement_intent_hash_valid, false);
@@ -4921,6 +4925,7 @@ pub const MetadataHttpClusterVopr = struct {
     pub fn restartNode(self: *MetadataHttpClusterVopr, index: usize) !void {
         self.scheduler_gate.lock();
         defer self.scheduler_gate.unlock();
+        if (index >= self.cluster.nodes.len) return error.InvalidNodeIndex;
         if (self.teardown_requested) return error.Canceled;
         self.restart_in_progress[index] = true;
         defer self.restart_in_progress[index] = false;
@@ -4929,6 +4934,7 @@ pub const MetadataHttpClusterVopr = struct {
             self.cluster.nodes[index].runtime.svc.beginTransportShutdown();
             return error.Canceled;
         }
+        if (self.data_plane_ownership == .external) self.cluster.node(index).disableTransitionOps();
         self.reconcile_leases[index] = metadata_reconcile_lease.State.init(self.cluster.configs[index].host.http.host.local_node_id, .{
             .lease_ttl_ms = 2_000,
             .clock = self.manual_clock.clock(),
@@ -5426,6 +5432,9 @@ pub const MetadataHttpClusterVopr = struct {
     }
 
     fn registerVirtualNodes(self: *MetadataHttpClusterVopr) !void {
+        // Do not publish a partial route set when an earlier replacement
+        // failed and left its slot empty.
+        for (self.cluster.node_live) |live| if (!live) return error.SimulationNodeUnavailable;
         for (0..self.cluster.nodes.len) |i| try self.registerVirtualNode(i);
     }
 
@@ -5460,6 +5469,52 @@ test "failed node replacement leaves a drainable empty slot" {
     try cluster.restartNode(0);
     try std.testing.expect(cluster.node_live[0]);
     try std.testing.expectEqual(@as(usize, 1), cluster.network.routes.count());
+    cluster.stopAll();
+}
+
+test "metadata wrapper rejects empty node startup and restores external ownership after retry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{.{
+        .host = .{ .http = .{
+            .host = .{ .local_node_id = 1 },
+            .transport = .{ .snapshot = .{ .root_dir = root } },
+        } },
+    }};
+    var split_runtime = VoprSplitRuntime{};
+    defer split_runtime.deinit();
+    var merge_runtime = VoprMergeRuntime{};
+    defer merge_runtime.deinit();
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{.{ .service = .{
+        .transition_runtime = .{
+            .split = split_runtime.iface(),
+            .merge = merge_runtime.iface(),
+        },
+    } }};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var cluster = try MetadataHttpClusterVopr.init(failing.allocator(), 1, &configs, &deps);
+    defer cluster.deinit();
+    try std.testing.expect(cluster.cluster.node(0).runtime.svc.transition_svc != null);
+    cluster.setDataPlaneOwnership(.external);
+    try std.testing.expect(cluster.cluster.node(0).runtime.svc.transition_svc == null);
+    try cluster.startAll();
+
+    try std.testing.expectError(error.InvalidNodeIndex, cluster.restartNode(1));
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, cluster.restartNode(0));
+    try std.testing.expect(!cluster.cluster.node_live[0]);
+    try std.testing.expectEqual(@as(usize, 0), cluster.virtual_network.routes.count());
+    try std.testing.expectError(error.SimulationNodeUnavailable, cluster.startAll());
+    cluster.setDataPlaneOwnership(.external);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try cluster.restartNode(0);
+    try cluster.startAll();
+    try std.testing.expect(cluster.cluster.node_live[0]);
+    try std.testing.expectEqual(@as(usize, 1), cluster.virtual_network.routes.count());
+    try std.testing.expect(cluster.cluster.node(0).runtime.svc.transition_svc == null);
     cluster.stopAll();
 }
 
