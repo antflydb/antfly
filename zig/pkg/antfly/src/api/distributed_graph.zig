@@ -2299,6 +2299,10 @@ fn executeCrossRangeOnce(
         };
         initialized += 1;
     }
+    // The last worker reply may have completed just before cancellation or
+    // deadline expiry. Keep the original request active through publication,
+    // including result-only postprocessing after the final RPC.
+    try worker.ensureActive();
     return results;
 }
 
@@ -15249,6 +15253,9 @@ test "distributed graph retries once on topology change and succeeds" {
         phase: u32 = 0,
         expand_calls: u32 = 0,
         hydrate_calls: u32 = 0,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        cancel_on_hydration: bool = false,
+        retry_first_expand: bool = true,
         lifecycle_counts: [@typeInfo(LifecyclePhase).@"enum".fields.len]u32 =
             .{0} ** @typeInfo(LifecyclePhase).@"enum".fields.len,
         lifecycle_valid: bool = true,
@@ -15325,7 +15332,11 @@ test "distributed graph retries once on topology change and succeeds" {
                         std.mem.eql(u8, "walk", event.query_name) and
                         event.depth == 1 and event.result_count == 1;
                 },
-                .hydration_started, .hydration_completed => state.lifecycle_valid = state.lifecycle_valid and std.mem.eql(u8, "walk", event.query_name),
+                .hydration_started, .hydration_completed => {
+                    state.lifecycle_valid = state.lifecycle_valid and std.mem.eql(u8, "walk", event.query_name);
+                    if (event.phase == .hydration_completed and state.cancel_on_hydration)
+                        state.cancelled.store(true, .release);
+                },
                 // A scheduled fanout batch may contain one group.
                 .hydration_fanout_started => state.lifecycle_valid = state.lifecycle_valid and event.group_count > 0,
                 .attempt_failed => {
@@ -15347,7 +15358,7 @@ test "distributed graph retries once on topology change and succeeds" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(@as(usize, 1), req.frontier.len);
             state.expand_calls += 1;
-            if (state.expand_calls == 1) {
+            if (state.retry_first_expand and state.expand_calls == 1) {
                 state.phase = 1;
                 return error.TopologyChanged;
             }
@@ -15450,6 +15461,25 @@ test "distributed graph retries once on topology change and succeeds" {
     try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_started)]);
     try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_completed)]);
     try std.testing.expect(state.lifecycle_valid);
+
+    // Cancel after the final hydration reply, when there is no further RPC
+    // whose post-reply check could catch it. The coordinator must not publish
+    // the otherwise complete graph result.
+    var cancelled_state = TestState{ .phase = 1, .cancel_on_hydration = true, .retry_first_expand = false };
+    var cancelled_req = req;
+    cancelled_req.cancellation = CancellationToken.fromAtomic(&cancelled_state.cancelled);
+    try std.testing.expectError(error.Cancelled, executeCrossRange(
+        std.testing.allocator,
+        FakeCatalog.iface(&cancelled_state),
+        FakeWorker.iface(&cancelled_state),
+        "docs",
+        cancelled_req,
+        base_result,
+        .read_index,
+    ));
+    try std.testing.expectEqual(@as(u32, 1), cancelled_state.expand_calls);
+    try std.testing.expectEqual(@as(u32, 1), cancelled_state.hydrate_calls);
+    try std.testing.expectEqual(@as(u32, 1), cancelled_state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_completed)]);
 }
 
 test "distributed graph stops after single retry on repeated topology churn" {

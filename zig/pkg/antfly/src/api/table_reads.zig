@@ -17418,7 +17418,7 @@ fn consumerTests() type {
                 var executor = Executor{ .failure = failure };
                 const source: http_common.RequestExecutor = .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } };
                 const expected = switch (failure) {
-                    error.ConcurrencyUnavailable, error.Canceled, error.Timeout, error.InternalFailure => failure,
+                    error.Canceled, error.Timeout, error.InternalFailure => failure,
                     else => error.StorageReadTemporarilyUnavailable,
                 };
                 try std.testing.expectError(expected, lookupRemote(source, std.testing.allocator, "http://127.0.0.1:1", 7, "entities", "person/ada_lovelace", .{}, .read_index));
