@@ -15286,7 +15286,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
@@ -15312,7 +15312,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest list failed table={s} doc={s} err={}", .{ table_name, doc_key, err });
@@ -39020,6 +39020,8 @@ test "api http server preserves public query availability errors" {
                     .lookup = lookup,
                     .scan = scan,
                     .query = query,
+                    .document_artifact_manifest = artifactManifest,
+                    .document_artifact_manifests = artifactManifests,
                 },
             };
         }
@@ -39058,6 +39060,16 @@ test "api http server preserves public query availability errors" {
             try std.testing.expectEqualStrings("docs", table_name);
             return self.query_error;
         }
+
+        fn artifactManifest(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.query_error;
+        }
+
+        fn artifactManifests(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.query_error;
+        }
     };
 
     const cases = [_]struct {
@@ -39089,6 +39101,11 @@ test "api http server preserves public query availability errors" {
         var reads = FakeReads{ .query_error = case.query_error };
         var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
         defer server.deinit();
+
+        if (case.query_error == error.StorageKernelOwnerStaleDescriptor) {
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ApiHttpServer.executePublicDocumentArtifactManifest(&server, alloc, "docs", "doc:a", "chunks", .{}));
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ApiHttpServer.executePublicDocumentArtifactManifests(&server, alloc, "docs", "doc:a", .{}));
+        }
 
         var resp = try server.handlePublicTableQuery("docs",
             \\{"query":{"match_all":{}}}
