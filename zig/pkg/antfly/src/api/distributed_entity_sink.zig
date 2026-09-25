@@ -197,10 +197,17 @@ pub const DistributedEntitySink = struct {
             defer if (old) |*row| row.deinit(a);
             if (old) |row| {
                 try mergePromotionDocument(a, &move.value_ptr.document, try parsePromotionDocument(a, row.json));
-                const batch = try promotionTableBatch(a, &tables, old_physical);
-                try batch.deletes.append(a, e.key);
-                try batch.predicates.append(a, .{ .key = e.key, .expected_version = row.version, .expected_content_digest = row.expected_content_digest });
             }
+            // Fence the observed absence too. Another promotion can recreate
+            // this old copy between the read and commit; the batch must then
+            // conflict and retry rather than advance state with a stranded row.
+            const batch = try promotionTableBatch(a, &tables, old_physical);
+            try batch.deletes.append(a, e.key);
+            try batch.predicates.append(a, .{
+                .key = e.key,
+                .expected_version = if (old) |row| row.version else 0,
+                .expected_content_digest = if (old) |row| row.expected_content_digest else null,
+            });
         }
         for (entries) |e| {
             if (e.delete) continue;
@@ -696,6 +703,7 @@ test "DistributedEntitySink deletes an old pinned copy while moving a key" {
     const FakeReads = struct {
         old_reads: usize = 0,
         new_reads: usize = 0,
+        old_exists: bool = true,
 
         fn lookup(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) anyerror!?table_reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -704,6 +712,7 @@ test "DistributedEntitySink deletes an old pinned copy while moving a key" {
             try testing.expectEqual(@as(@TypeOf(consistency), .read_index), consistency);
             if (std.mem.eql(u8, table, "table:old")) {
                 self.old_reads += 1;
+                if (!self.old_exists) return null;
                 return .{ .json = try a.dupe(u8, "{\"canonical_name\":\"Curated Ada\",\"aliases\":[\"A. Lovelace\"],\"curator_note\":{\"reviewed\":true},\"merged_into\":\"person/other\"}"), .version = 7 };
             }
             try testing.expectEqualStrings("table:new", table);
@@ -758,6 +767,24 @@ test "DistributedEntitySink deletes an old pinned copy while moving a key" {
     try testing.expect(moved.value.object.get("merged_into") == null);
     try testing.expect(moved.value.object.get("merged_into_table") == null);
     try testing.expectEqualSlices(u64, &.{ 7, 3 }, fake.predicate_versions.items);
+
+    var missing_reads = FakeReads{ .old_exists = false };
+    var missing_fake = FakeTableWriteSource{
+        .alloc = alloc,
+        .table = "table:old",
+        .other_table = "table:new",
+        .support_commit_batch = true,
+    };
+    defer missing_fake.deinit();
+    var missing_sink = DistributedEntitySink{ .writes = missing_fake.source(), .reads = missing_reads.source(), .atomic_batch_required = true };
+    try missing_sink.entitySink().upsertBatch(alloc, &.{
+        .{ .table = "entities", .storage_table = "table:old", .key = "person/ada", .delete = true },
+        .{ .table = "entities", .storage_table = "table:new", .key = "person/ada", .doc_json = "{\"canonical_name\":\"Ada\"}" },
+    });
+    try testing.expectEqual(@as(usize, 1), missing_reads.old_reads);
+    try testing.expectEqual(@as(usize, 1), missing_fake.deletes.items.len);
+    try testing.expectEqualStrings("person/ada", missing_fake.deletes.items[0]);
+    try testing.expectEqualSlices(u64, &.{ 0, 3 }, missing_fake.predicate_versions.items);
 }
 
 test "DistributedEntitySink batch commit remains compatible with transaction-only sources" {
