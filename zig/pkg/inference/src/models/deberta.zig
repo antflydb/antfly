@@ -37,7 +37,11 @@ pub const Config = struct {
     entity_token_id: i64 = 128005,
     relation_token_id: i64 = 128006,
     num_labels: u32 = 1,
+    /// GLiNER2 wrapper `counting_layer` (legacy span checkpoints only).
+    gliner_count_layer: GlinerCountLayer = .count_lstm_v2,
 };
+
+pub const GlinerCountLayer = enum { count_lstm, count_lstm_v2 };
 
 pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});

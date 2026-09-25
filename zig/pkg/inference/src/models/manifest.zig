@@ -344,6 +344,10 @@ pub const ModelManifest = struct {
     gliner_model_type: []const u8 = "", // "gliner2", "gliner2.5", "uniencoder", etc.
     gliner_architecture: gliner_boundary.Architecture = .unknown,
     gliner_boundary_config: ?gliner_boundary.Config = null,
+    /// A gliner2 >= 2.0 span checkpoint that declares `"architecture":"span"`
+    /// (e.g. GLiNER2.5-Decide). Its classification runs the upstream
+    /// `classifier` head on the schema_version:2 route.
+    gliner_span_declared: bool = false,
     gliner_default_labels: [][]const u8 = &.{},
     gliner_relation_labels: [][]const u8 = &.{},
     gliner_relation_threshold: f32 = 0.0,
@@ -1104,6 +1108,7 @@ fn parseBoundaryConfigFromCatalog(
     const architecture = try gliner_boundary.detectArchitecture(allocator, config_bytes);
     if (architecture != .boundary) {
         manifest.gliner_architecture = architecture;
+        if (architecture == .span) manifest.gliner_span_declared = try gliner_boundary.declaresSpanArchitecture(allocator, config_bytes);
         return false;
     }
     const encoder_bytes = try catalog.readOptional("encoder_config/config.json") orelse

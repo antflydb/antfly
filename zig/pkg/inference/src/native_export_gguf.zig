@@ -1154,7 +1154,13 @@ fn writeGlinerEncoderGguf(
     quantization: QuantizationMode,
     filter: QuantizationFilter,
 ) !void {
-    const config_bytes = try c_file.readFileFromDir(allocator, model_dir, "config.json");
+    // Original Fastino checkpoints keep only wrapper metadata in config.json;
+    // the DeBERTa geometry lives in the encoder sidecar. Parsing the wrapper
+    // would silently stamp deberta-v3-base geometry on a large encoder.
+    const config_bytes = c_file.readFileFromDir(allocator, model_dir, "encoder_config/config.json") catch |err| switch (err) {
+        error.FileNotFound => try c_file.readFileFromDir(allocator, model_dir, "config.json"),
+        else => return err,
+    };
     defer allocator.free(config_bytes);
     const config = try deberta_mod.parseConfig(allocator, config_bytes);
 
@@ -1534,12 +1540,14 @@ fn copyGlinerBundleAssets(
         "vocab.txt",
         "vocab.json",
         "merges.txt",
+        "encoder_config/config.json",
     };
     for (asset_names) |asset_name| {
         const bytes = c_file.readFileFromDir(allocator, model_dir, asset_name) catch continue;
         defer allocator.free(bytes);
         const target = try std.fs.path.join(allocator, &.{ out_dir, asset_name });
         defer allocator.free(target);
+        if (std.fs.path.dirname(target)) |parent| try compat.cwd().createDirPath(io, parent);
         try compat.cwd().writeFile(io, .{ .sub_path = target, .data = bytes });
     }
     try writeGlinerBundleMarker(allocator, out_dir, output_path);

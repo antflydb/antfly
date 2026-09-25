@@ -223,6 +223,26 @@ pub fn detectArchitecture(allocator: std.mem.Allocator, bytes: []const u8) !Arch
     return detectArchitectureObject(parsed.value.object);
 }
 
+/// Whether a span checkpoint explicitly declares `"architecture":"span"`,
+/// the gliner2 >= 2.0 AutoExtractor format, rather than the legacy implicit form.
+pub fn declaresSpanArchitecture(allocator: std.mem.Allocator, bytes: []const u8) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return false;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const value = parsed.value.object.get("architecture") orelse return false;
+    return value == .string and std.mem.eql(u8, value.string, "span");
+}
+
+test "declared span architecture distinguishes gliner2 2.x span checkpoints" {
+    const a = std.testing.allocator;
+    try std.testing.expect(try declaresSpanArchitecture(a, "{\"model_type\":\"extractor\",\"architecture\":\"span\",\"config_version\":3}"));
+    try std.testing.expect(!try declaresSpanArchitecture(a, "{\"model_type\":\"extractor\"}"));
+    try std.testing.expect(!try declaresSpanArchitecture(a, "not json"));
+}
+
 fn detectArchitectureObject(obj: std.json.ObjectMap) !Architecture {
     const model = obj.get("model_type");
     const is_extractor = model != null and model.? == .string and std.mem.eql(u8, model.?.string, "extractor");

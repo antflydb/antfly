@@ -1,0 +1,1099 @@
+{
+ "model": "fastino/GLiNER2.5-Decide",
+ "gliner2_version": "2.0.0",
+ "classification": [
+  {
+   "name": "support_intent",
+   "text": "My subscription renewed on April 15 for ¥5,400 after the service was already down. Can I get that charge refunded?",
+   "tasks": {
+    "intent": [
+     "order_status",
+     "refund_request",
+     "cancel_subscription",
+     "update_payment",
+     "login_problem",
+     "shipping_delay",
+     "bug_report",
+     "speak_to_human",
+     "other"
+    ]
+   },
+   "v2_schema": {
+    "classifications": [
+     {
+      "name": "intent",
+      "labels": [
+       "order_status",
+       "refund_request",
+       "cancel_subscription",
+       "update_payment",
+       "login_problem",
+       "shipping_delay",
+       "bug_report",
+       "speak_to_human",
+       "other"
+      ]
+     }
+    ]
+   },
+   "input_ids": [
+    287,
+    128003,
+    5875,
+    287,
+    128007,
+    556,
+    616,
+    35124,
+    128007,
+    6257,
+    616,
+    40952,
+    128007,
+    6788,
+    616,
+    76824,
+    128007,
+    1981,
+    616,
+    24207,
+    128007,
+    6607,
+    616,
+    40843,
+    128007,
+    2741,
+    616,
+    71506,
+    128007,
+    5554,
+    616,
+    27551,
+    128007,
+    1828,
+    616,
+    725,
+    616,
+    11975,
+    128007,
+    340,
+    1263,
+    1263,
+    128002,
+    312,
+    5534,
+    9504,
+    277,
+    47756,
+    706,
+    270,
+    56478,
+    456,
+    366,
+    3755,
+    385,
+    262,
+    506,
+    284,
+    637,
+    444,
+    323,
+    295,
+    584,
+    350,
+    272,
+    1541,
+    24210,
+    1102
+   ],
+   "classifier_logits": [
+    [
+     -4.8493146896362305,
+     3.5138485431671143,
+     -3.871110439300537,
+     -4.253898620605469,
+     -5.772402763366699,
+     -5.490521430969238,
+     -5.102658271789551,
+     -3.5973589420318604,
+     -4.188627243041992
+    ]
+   ],
+   "result": {
+    "intent": {
+     "label": "refund_request",
+     "confidence": 0.997067391872406
+    }
+   }
+  },
+  {
+   "name": "travel",
+   "text": "I need to move my Friday flight to Paris to Saturday morning, same cabin, and keep the aisle seat if you can.",
+   "tasks": {
+    "request": [
+     "book",
+     "change",
+     "cancel",
+     "status",
+     "seat_change",
+     "refund",
+     "baggage"
+    ]
+   },
+   "v2_schema": {
+    "classifications": [
+     {
+      "name": "request",
+      "labels": [
+       "book",
+       "change",
+       "cancel",
+       "status",
+       "seat_change",
+       "refund",
+       "baggage"
+      ]
+     }
+    ]
+   },
+   "input_ids": [
+    287,
+    128003,
+    1409,
+    287,
+    128007,
+    550,
+    128007,
+    575,
+    128007,
+    6788,
+    128007,
+    1980,
+    128007,
+    2328,
+    616,
+    18982,
+    128007,
+    6257,
+    128007,
+    15686,
+    1263,
+    1263,
+    128002,
+    584,
+    389,
+    264,
+    825,
+    312,
+    31798,
+    2541,
+    264,
+    47136,
+    264,
+    42943,
+    1066,
+    366,
+    454,
+    6899,
+    366,
+    263,
+    548,
+    262,
+    15191,
+    2328,
+    337,
+    274,
+    295,
+    323
+   ],
+   "classifier_logits": [
+    [
+     -2.9701309204101562,
+     0.861903190612793,
+     -5.016645431518555,
+     -3.892615556716919,
+     0.9039130806922913,
+     -5.394156455993652,
+     -4.557136535644531
+    ]
+   ],
+   "result": {
+    "request": {
+     "label": "seat_change",
+     "confidence": 0.5008350014686584
+    }
+   }
+  },
+  {
+   "name": "hotel_multi_task",
+   "text": "Guest in room 1408 says the AC has been out since yesterday and they want to move tonight or leave. They also asked for the incidentals hold to be released.",
+   "tasks": {
+    "intent": [
+     "maintenance",
+     "room_change",
+     "checkout",
+     "billing",
+     "complaint",
+     "amenity_request"
+    ],
+    "priority": [
+     "low",
+     "normal",
+     "high",
+     "urgent"
+    ],
+    "needs_human": [
+     "yes",
+     "no"
+    ],
+    "topics": {
+     "labels": [
+      "hvac",
+      "billing",
+      "housekeeping",
+      "noise",
+      "safety"
+     ],
+     "multi_label": true,
+     "cls_threshold": 0.4
+    }
+   },
+   "v2_schema": {
+    "classifications": [
+     {
+      "name": "intent",
+      "labels": [
+       "maintenance",
+       "room_change",
+       "checkout",
+       "billing",
+       "complaint",
+       "amenity_request"
+      ]
+     },
+     {
+      "name": "priority",
+      "labels": [
+       "low",
+       "normal",
+       "high",
+       "urgent"
+      ]
+     },
+     {
+      "name": "needs_human",
+      "labels": [
+       "yes",
+       "no"
+      ]
+     },
+     {
+      "name": "topics",
+      "labels": [
+       "hvac",
+       "billing",
+       "housekeeping",
+       "noise",
+       "safety"
+      ],
+      "multi_label": true,
+      "threshold": 0.4
+     }
+    ]
+   },
+   "input_ids": [
+    287,
+    128003,
+    5875,
+    287,
+    128007,
+    2406,
+    128007,
+    629,
+    616,
+    18982,
+    128007,
+    9623,
+    128007,
+    9833,
+    128007,
+    5142,
+    128007,
+    42150,
+    616,
+    40952,
+    1263,
+    1263,
+    128001,
+    287,
+    128003,
+    3983,
+    287,
+    128007,
+    759,
+    128007,
+    1697,
+    128007,
+    459,
+    128007,
+    9178,
+    1263,
+    1263,
+    128001,
+    287,
+    128003,
+    634,
+    616,
+    11975,
+    287,
+    128007,
+    2489,
+    128007,
+    363,
+    1263,
+    1263,
+    128001,
+    287,
+    128003,
+    3062,
+    287,
+    128007,
+    90182,
+    128007,
+    9833,
+    128007,
+    28869,
+    128007,
+    3616,
+    128007,
+    1343,
+    1263,
+    1263,
+    128002,
+    3043,
+    267,
+    629,
+    936,
+    4425,
+    652,
+    262,
+    24250,
+    303,
+    331,
+    321,
+    515,
+    2807,
+    263,
+    306,
+    409,
+    264,
+    825,
+    4023,
+    289,
+    1021,
+    323,
+    306,
+    327,
+    921,
+    270,
+    262,
+    23367,
+    268,
+    1229,
+    264,
+    282,
+    1315,
+    323
+   ],
+   "classifier_logits": [
+    [
+     -2.6984121799468994,
+     0.54266756772995,
+     -1.846369981765747,
+     -3.8297274112701416,
+     -3.03488826751709,
+     -3.0202157497406006
+    ],
+    [
+     -1.6097275018692017,
+     -1.4882011413574219,
+     -1.034649133682251,
+     -0.6457433104515076
+    ],
+    [
+     0.3756559491157532,
+     -0.31471487879753113
+    ],
+    [
+     2.1432065963745117,
+     -1.9354220628738403,
+     -0.4641674757003784,
+     -2.3596181869506836,
+     -1.9099055528640747
+    ]
+   ],
+   "result": {
+    "intent": {
+     "label": "room_change",
+     "confidence": 0.8334991335868835
+    },
+    "priority": {
+     "label": "urgent",
+     "confidence": 0.40163561701774597
+    },
+    "needs_human": {
+     "label": "yes",
+     "confidence": 0.6660494208335876
+    },
+    "topics": [
+     {
+      "label": "hvac",
+      "confidence": 0.8950322270393372
+     }
+    ]
+   }
+  },
+  {
+   "name": "passage_question",
+   "text": "The treaty was signed in Paris in 1992. It entered into force the following year, after the last signatory ratified it.",
+   "tasks": {
+    "answer": {
+     "labels": [
+      "yes",
+      "no"
+     ],
+     "prompt": "Did the treaty enter into force in 1992?"
+    }
+   },
+   "v2_schema": {
+    "classifications": [
+     {
+      "name": "answer",
+      "labels": [
+       "yes",
+       "no"
+      ],
+      "prompt": "Did the treaty enter into force in 1992?"
+     }
+    ]
+   },
+   "input_ids": [
+    287,
+    128003,
+    1330,
+    294,
+    2709,
+    262,
+    13281,
+    1916,
+    352,
+    1711,
+    267,
+    5762,
+    302,
+    287,
+    128007,
+    2489,
+    128007,
+    363,
+    1263,
+    1263,
+    128002,
+    262,
+    13281,
+    284,
+    2346,
+    267,
+    47136,
+    267,
+    5762,
+    323,
+    278,
+    3040,
+    352,
+    1711,
+    262,
+    776,
+    395,
+    366,
+    385,
+    262,
+    437,
+    59810,
+    31719,
+    278,
+    323
+   ],
+   "classifier_logits": [
+    [
+     2.908085823059082,
+     -2.6777358055114746
+    ]
+   ],
+   "result": {
+    "answer": {
+     "label": "yes",
+     "confidence": 0.996263325214386
+    }
+   }
+  },
+  {
+   "name": "described_labels",
+   "text": "Please reset the card PIN. The new one never arrived and the old one is locked after three tries.",
+   "tasks": {
+    "intent": {
+     "labels": {
+      "card_pin_change": "The customer wants a new PIN or the current PIN replaced",
+      "card_lost": "The physical card is missing",
+      "balance_inquiry": "The customer wants the current balance"
+     }
+    }
+   },
+   "v2_schema": {
+    "classifications": [
+     {
+      "name": "intent",
+      "labels": [
+       "card_pin_change",
+       "card_lost",
+       "balance_inquiry"
+      ],
+      "label_definitions": {
+       "card_pin_change": {
+        "description": "The customer wants a new PIN or the current PIN replaced"
+       },
+       "card_lost": {
+        "description": "The physical card is missing"
+       },
+       "balance_inquiry": {
+        "description": "The customer wants the current balance"
+       }
+      }
+     }
+    ]
+   },
+   "input_ids": [
+    287,
+    128003,
+    5875,
+    128010,
+    1081,
+    616,
+    10161,
+    616,
+    18982,
+    294,
+    279,
+    1099,
+    1654,
+    266,
+    353,
+    20280,
+    289,
+    262,
+    763,
+    20280,
+    3473,
+    128010,
+    1081,
+    616,
+    25826,
+    294,
+    279,
+    1468,
+    1081,
+    269,
+    2367,
+    128010,
+    1990,
+    616,
+    119989,
+    294,
+    279,
+    1099,
+    1654,
+    262,
+    763,
+    1990,
+    287,
+    128007,
+    1081,
+    616,
+    10161,
+    616,
+    18982,
+    128007,
+    1081,
+    616,
+    25826,
+    128007,
+    1990,
+    616,
+    119989,
+    1263,
+    1263,
+    128002,
+    811,
+    9032,
+    262,
+    1081,
+    5423,
+    323,
+    262,
+    353,
+    311,
+    518,
+    2525,
+    263,
+    262,
+    597,
+    311,
+    269,
+    5800,
+    385,
+    475,
+    5364,
+    323
+   ],
+   "classifier_logits": [
+    [
+     1.439753770828247,
+     0.6178942322731018,
+     -2.5709187984466553
+    ]
+   ],
+   "result": {
+    "intent": {
+     "label": "card_pin_change",
+     "confidence": 0.6859959363937378
+    }
+   }
+  },
+  {
+   "name": "ordinal",
+   "text": "I finished it in two nights. The ending is earned, the middle drags, and I would still hand it to a friend.",
+   "tasks": {
+    "rating": [
+     "0",
+     "1",
+     "2",
+     "3",
+     "4",
+     "5",
+     "6",
+     "7",
+     "8",
+     "9",
+     "10"
+    ]
+   },
+   "v2_schema": {
+    "classifications": [
+     {
+      "name": "rating",
+      "labels": [
+       "0",
+       "1",
+       "2",
+       "3",
+       "4",
+       "5",
+       "6",
+       "7",
+       "8",
+       "9",
+       "10"
+      ]
+     }
+    ]
+   },
+   "input_ids": [
+    287,
+    128003,
+    2949,
+    287,
+    128007,
+    767,
+    128007,
+    376,
+    128007,
+    392,
+    128007,
+    404,
+    128007,
+    453,
+    128007,
+    456,
+    128007,
+    525,
+    128007,
+    574,
+    128007,
+    578,
+    128007,
+    712,
+    128007,
+    466,
+    1263,
+    1263,
+    128002,
+    584,
+    1754,
+    278,
+    267,
+    375,
+    4657,
+    323,
+    262,
+    3918,
+    269,
+    3295,
+    366,
+    262,
+    1686,
+    45492,
+    366,
+    263,
+    584,
+    338,
+    449,
+    721,
+    278,
+    264,
+    266,
+    1156,
+    323
+   ],
+   "classifier_logits": [
+    [
+     -3.8949756622314453,
+     -3.351461887359619,
+     -2.850830078125,
+     -2.602832794189453,
+     -2.3061983585357666,
+     -2.279195547103882,
+     -2.11843204498291,
+     -1.9497538805007935,
+     -2.0679233074188232,
+     -2.276475191116333,
+     -3.0822274684906006
+    ]
+   ],
+   "result": {
+    "rating": {
+     "label": "7",
+     "confidence": 0.1535617560148239
+    }
+   }
+  },
+  {
+   "name": "book_genre",
+   "text": "She closed the ledger, blew out the lamp, and listened for the stair. The house had been empty since the winter the river took the bridge",
+   "tasks": {
+    "genre": [
+     "mystery",
+     "romance",
+     "history",
+     "science_fiction",
+     "literary_fiction",
+     "cookbook"
+    ]
+   },
+   "v2_schema": {
+    "classifications": [
+     {
+      "name": "genre",
+      "labels": [
+       "mystery",
+       "romance",
+       "history",
+       "science_fiction",
+       "literary_fiction",
+       "cookbook"
+      ]
+     }
+    ]
+   },
+   "input_ids": [
+    287,
+    128003,
+    6176,
+    287,
+    128007,
+    5633,
+    128007,
+    6981,
+    128007,
+    820,
+    128007,
+    1693,
+    616,
+    18513,
+    128007,
+    7170,
+    616,
+    18513,
+    128007,
+    19991,
+    1263,
+    1263,
+    128002,
+    373,
+    2100,
+    262,
+    25002,
+    366,
+    12081,
+    321,
+    262,
+    6693,
+    366,
+    263,
+    7961,
+    270,
+    262,
+    20786,
+    323,
+    262,
+    669,
+    330,
+    331,
+    3601,
+    515,
+    262,
+    2014,
+    262,
+    3108,
+    681,
+    262,
+    3579,
+    323
+   ],
+   "classifier_logits": [
+    [
+     -1.9721442461013794,
+     -2.4048399925231934,
+     -0.22593745589256287,
+     -2.2523467540740967,
+     -1.5370633602142334,
+     -2.619030475616455
+    ]
+   ],
+   "result": {
+    "genre": {
+     "label": "history",
+     "confidence": 0.5617122054100037
+    }
+   }
+  },
+  {
+   "name": "sentiment_multi",
+   "text": "Great food but the service was painfully slow and our waiter was rude!",
+   "tasks": {
+    "sentiment": [
+     "positive",
+     "negative",
+     "mixed",
+     "neutral"
+    ],
+    "aspects": {
+     "labels": [
+      "food",
+      "service",
+      "price",
+      "ambience"
+     ],
+     "multi_label": true
+    }
+   },
+   "v2_schema": {
+    "classifications": [
+     {
+      "name": "sentiment",
+      "labels": [
+       "positive",
+       "negative",
+       "mixed",
+       "neutral"
+      ]
+     },
+     {
+      "name": "aspects",
+      "labels": [
+       "food",
+       "service",
+       "price",
+       "ambience"
+      ],
+      "multi_label": true
+     }
+    ]
+   },
+   "input_ids": [
+    287,
+    128003,
+    9481,
+    287,
+    128007,
+    1453,
+    128007,
+    2330,
+    128007,
+    3230,
+    128007,
+    5678,
+    1263,
+    1263,
+    128001,
+    287,
+    128003,
+    2592,
+    287,
+    128007,
+    645,
+    128007,
+    506,
+    128007,
+    710,
+    128007,
+    23582,
+    1263,
+    1263,
+    128002,
+    426,
+    645,
+    304,
+    262,
+    506,
+    284,
+    25128,
+    2364,
+    263,
+    316,
+    26647,
+    284,
+    13774,
+    1084
+   ],
+   "classifier_logits": [
+    [
+     -1.5939104557037354,
+     -0.11463259160518646,
+     -1.4135545492172241,
+     -2.1944942474365234
+    ],
+    [
+     0.4803559184074402,
+     2.0622751712799072,
+     -2.6831412315368652,
+     -2.2660181522369385
+    ]
+   ],
+   "result": {
+    "sentiment": {
+     "label": "negative",
+     "confidence": 0.6151667833328247
+    },
+    "aspects": [
+     {
+      "label": "food",
+      "confidence": 0.6178319454193115
+     },
+     {
+      "label": "service",
+      "confidence": 0.8871820569038391
+     }
+    ]
+   }
+  }
+ ],
+ "entities": [
+  {
+   "text": "My name is Clara and I live in Berkeley, California.",
+   "labels": [
+    "person",
+    "location"
+   ],
+   "result": {
+    "entities": {
+     "person": [
+      {
+       "text": "Clara",
+       "confidence": 0.9998717308044434,
+       "start": 11,
+       "end": 16
+      }
+     ],
+     "location": [
+      {
+       "text": "Berkeley",
+       "confidence": 0.9812288880348206,
+       "start": 31,
+       "end": 39
+      },
+      {
+       "text": "California",
+       "confidence": 0.8735216856002808,
+       "start": 41,
+       "end": 51
+      }
+     ]
+    }
+   }
+  },
+  {
+   "text": "Apple CEO Tim Cook announced the iPhone 17 in Cupertino on September 9.",
+   "labels": [
+    "person",
+    "organization",
+    "product",
+    "location",
+    "date"
+   ],
+   "result": {
+    "entities": {
+     "person": [
+      {
+       "text": "Tim Cook",
+       "confidence": 0.9940631985664368,
+       "start": 10,
+       "end": 18
+      }
+     ],
+     "organization": [
+      {
+       "text": "Apple",
+       "confidence": 0.9340402483940125,
+       "start": 0,
+       "end": 5
+      }
+     ],
+     "product": [
+      {
+       "text": "iPhone 17",
+       "confidence": 0.972963273525238,
+       "start": 33,
+       "end": 42
+      }
+     ],
+     "location": [
+      {
+       "text": "Cupertino",
+       "confidence": 0.9892054796218872,
+       "start": 46,
+       "end": 55
+      }
+     ],
+     "date": [
+      {
+       "text": "September 9",
+       "confidence": 0.9996520280838013,
+       "start": 59,
+       "end": 70
+      }
+     ]
+    }
+   }
+  }
+ ]
+}

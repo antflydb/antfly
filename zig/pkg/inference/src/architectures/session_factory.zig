@@ -2437,7 +2437,9 @@ fn detectArchitectureWithGgufFile(
             if (std.mem.eql(u8, model_type, "extractor")) {
                 // Original Fastino checkpoints keep wrapper metadata here and
                 // the actual DeBERTa geometry/activation in a local sidecar.
-                var cfg = try loadLegacyGlinerEncoderConfig(allocator, model_path);
+                const wrapper = try parseLegacyGlinerWrapper(allocator, config_bytes);
+                var cfg = try loadLegacyGlinerEncoderConfig(allocator, model_path, wrapper);
+                cfg.gliner_count_layer = wrapper.count_layer;
                 try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
                 return .{ .gliner = cfg };
             }
@@ -2511,7 +2513,65 @@ fn detectArchitectureWithGgufFile(
 
 const legacy_gliner_encoder_config_max_bytes: usize = 1024 * 1024;
 
-fn loadLegacyGlinerEncoderConfig(allocator: std.mem.Allocator, model_path: []const u8) !deberta_mod.Config {
+const LegacyGlinerWrapper = struct {
+    count_layer: deberta_mod.GlinerCountLayer = .count_lstm_v2,
+    /// deberta.Config defaults describe deberta-v3-base; any other backbone
+    /// needs its encoder sidecar.
+    base_encoder: bool = true,
+};
+
+/// Wrapper fields of a span (`SpanExtractor`) config.json that change the
+/// executed graph. Unsupported values fail closed instead of running the
+/// wrong head.
+fn parseLegacyGlinerWrapper(allocator: std.mem.Allocator, config_bytes: []const u8) !LegacyGlinerWrapper {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGlinerConfig;
+    const obj = parsed.value.object;
+    var wrapper = LegacyGlinerWrapper{};
+    if (obj.get("counting_layer")) |value| {
+        if (value != .string) return error.InvalidGlinerConfig;
+        wrapper.count_layer = std.meta.stringToEnum(deberta_mod.GlinerCountLayer, value.string) orelse
+            return error.UnsupportedGlinerCountingLayer;
+    }
+    if (obj.get("token_pooling")) |value| {
+        if (value != .string or !std.mem.eql(u8, value.string, "first")) return error.UnsupportedGlinerTokenPooling;
+    }
+    if (obj.get("use_moe")) |value| {
+        if (value != .bool or value.bool) return error.UnsupportedGlinerMoe;
+    }
+    if (obj.get("span_head")) |value| if (value == .object) {
+        if (value.object.get("span_mode")) |mode| {
+            if (mode != .string or !std.mem.eql(u8, mode.string, "markerV0")) return error.UnsupportedGlinerSpanMode;
+        }
+    };
+    if (obj.get("model_name")) |value| if (value == .string) {
+        wrapper.base_encoder = std.mem.endsWith(u8, value.string, "deberta-v3-base");
+    };
+    return wrapper;
+}
+
+test "legacy GLiNER wrapper selects the counting layer and rejects unsupported heads" {
+    const a = std.testing.allocator;
+    const decide = try parseLegacyGlinerWrapper(a,
+        \\{"architecture":"span","counting_layer":"count_lstm","model_name":"microsoft/deberta-v3-large","token_pooling":"first","use_moe":false,"span_head":{"span_mode":"markerV0"}}
+    );
+    try std.testing.expectEqual(deberta_mod.GlinerCountLayer.count_lstm, decide.count_layer);
+    try std.testing.expect(!decide.base_encoder);
+    const base = try parseLegacyGlinerWrapper(a,
+        \\{"model_name":"microsoft/deberta-v3-base"}
+    );
+    try std.testing.expectEqual(deberta_mod.GlinerCountLayer.count_lstm_v2, base.count_layer);
+    try std.testing.expect(base.base_encoder);
+    try std.testing.expectError(error.UnsupportedGlinerCountingLayer, parseLegacyGlinerWrapper(a,
+        \\{"counting_layer":"count_lstm_moe"}
+    ));
+    try std.testing.expectError(error.UnsupportedGlinerMoe, parseLegacyGlinerWrapper(a,
+        \\{"use_moe":true}
+    ));
+}
+
+fn loadLegacyGlinerEncoderConfig(allocator: std.mem.Allocator, model_path: []const u8, wrapper: LegacyGlinerWrapper) !deberta_mod.Config {
     const io = compat.io();
     const managed_receipt = @import("../registry/managed_receipt.zig");
     var receipt = try managed_receipt.loadValidated(allocator, io, model_path);
@@ -2530,7 +2590,8 @@ fn loadLegacyGlinerEncoderConfig(allocator: std.mem.Allocator, model_path: []con
             else => return err,
         };
     defer if (config_path) |path| allocator.free(path);
-    const path = config_path orelse return .{};
+    // Built-in geometry is deberta-v3-base; never guess it for other backbones.
+    const path = config_path orelse return if (wrapper.base_encoder) .{} else error.MissingGlinerEncoderConfig;
     const snapshot = @import("../runtime/file_snapshot.zig");
     const bytes = try snapshot.read(allocator, io, compat.cwd(), path, legacy_gliner_encoder_config_max_bytes, null);
     defer allocator.free(bytes);
@@ -4852,6 +4913,27 @@ fn isBgeM3DenseEncoder(manifest: manifest_mod.ModelManifest, arch_config: ArchCo
     };
 }
 
+/// Unquantized GLiNER2 span checkpoints on a DeBERTa-v3-large backbone
+/// (e.g. fastino/GLiNER2.5-Decide, ~1.9 GB F32) exceed the generic 1.5 GiB
+/// host cache on 16 GiB machines, like dense BGE-M3.
+fn isLargeGlinerSpanEncoder(manifest: manifest_mod.ModelManifest, arch_config: ArchConfig) bool {
+    if (manifest.usesGgufWeights()) return false;
+    return switch (arch_config) {
+        .gliner => |cfg| cfg.hidden_size == 1024 and cfg.num_hidden_layers == 24 and cfg.num_attention_heads == 16,
+        else => false,
+    };
+}
+
+fn usesDenseF32EncoderBudget(manifest: manifest_mod.ModelManifest, arch_config: ArchConfig) bool {
+    return isBgeM3DenseEncoder(manifest, arch_config) or isLargeGlinerSpanEncoder(manifest, arch_config);
+}
+
+test "large GLiNER span encoder takes the dense F32 encoder budget" {
+    const manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    try std.testing.expect(isLargeGlinerSpanEncoder(manifest, .{ .gliner = .{ .hidden_size = 1024, .num_hidden_layers = 24, .num_attention_heads = 16 } }));
+    try std.testing.expect(!isLargeGlinerSpanEncoder(manifest, .{ .gliner = .{} }));
+}
+
 fn sessionDirectQuantEnabled(
     direct_quant_enabled: bool,
     manifest: manifest_mod.ModelManifest,
@@ -5166,11 +5248,11 @@ fn sharedGpuHostedBudgetPolicy(
         recommendedGpuHostedQwen3VlRerankerGgufBudgetFloor(model_weight_bytes)
     else
         runtime.tier.memory.Limits{};
-    const bge_m3_budget_floor = if (isBgeM3DenseEncoder(manifest, arch_config))
+    const bge_m3_budget_floor = if (usesDenseF32EncoderBudget(manifest, arch_config))
         recommendedGpuHostedBgeM3BudgetFloor(model_weight_bytes)
     else
         runtime.tier.memory.Limits{};
-    const bge_m3_shared_cache_floor = if (isBgeM3DenseEncoder(manifest, arch_config))
+    const bge_m3_shared_cache_floor = if (usesDenseF32EncoderBudget(manifest, arch_config))
         recommendedGpuHostedBgeM3SharedCacheBudget(model_weight_bytes)
     else
         runtime.tier.cache.Budget{};
@@ -5988,15 +6070,15 @@ test "legacy GLiNER encoder sidecar bounds regular input and recovers after allo
         defer oversized.close(io);
         try oversized.setLength(io, legacy_gliner_encoder_config_max_bytes + 1);
     }
-    try std.testing.expectError(error.SnapshotLimitExceeded, loadLegacyGlinerEncoderConfig(allocator, model_dir));
+    try std.testing.expectError(error.SnapshotLimitExceeded, loadLegacyGlinerEncoderConfig(allocator, model_dir, .{}));
     try tmp.dir.deleteFile(io, "encoder_config/config.json");
     try tmp.dir.createDir(io, "encoder_config/config.json", .default_dir);
-    try std.testing.expectError(error.InvalidModelArtifactKind, loadLegacyGlinerEncoderConfig(allocator, model_dir));
+    try std.testing.expectError(error.InvalidModelArtifactKind, loadLegacyGlinerEncoderConfig(allocator, model_dir, .{}));
     try tmp.dir.deleteDir(io, "encoder_config/config.json");
     try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data = "{\"hidden_size\":64,\"hidden_act\":\"gelu\"}" });
     const Check = struct {
         fn run(a: std.mem.Allocator, path: []const u8) !void {
-            const cfg = try loadLegacyGlinerEncoderConfig(a, path);
+            const cfg = try loadLegacyGlinerEncoderConfig(a, path, .{});
             try std.testing.expectEqual(@as(u32, 64), cfg.hidden_size);
             try std.testing.expect(cfg.use_exact_gelu);
         }
@@ -6016,11 +6098,11 @@ test "legacy GLiNER encoder sidecar obeys managed inventory and root containment
     try tmp.dir.symLink(io, "../../outside.json", "model/encoder_config/config.json", .{});
     const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/model", .{tmp.sub_path});
     defer allocator.free(model_dir);
-    try std.testing.expectError(error.ModelArtifactOutsideRoot, loadLegacyGlinerEncoderConfig(allocator, model_dir));
+    try std.testing.expectError(error.ModelArtifactOutsideRoot, loadLegacyGlinerEncoderConfig(allocator, model_dir, .{}));
     try tmp.dir.deleteFile(io, "model/encoder_config/config.json");
     try tmp.dir.writeFile(io, .{ .sub_path = "model/encoder.json", .data = "{\"hidden_act\":\"gelu\"}" });
     try tmp.dir.symLink(io, "../encoder.json", "model/encoder_config/config.json", .{});
-    try std.testing.expect((try loadLegacyGlinerEncoderConfig(allocator, model_dir)).use_exact_gelu);
+    try std.testing.expect((try loadLegacyGlinerEncoderConfig(allocator, model_dir, .{})).use_exact_gelu);
 
     // A complete managed publication may omit optional encoder metadata. An
     // unrelated local sidecar must not silently override that admitted set.
@@ -6030,12 +6112,12 @@ test "legacy GLiNER encoder sidecar obeys managed inventory and root containment
         .sub_path = receipt_path,
         .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.safetensors\",\"size\":7}]}",
     });
-    try std.testing.expectEqual(deberta_mod.Config{}, try loadLegacyGlinerEncoderConfig(allocator, model_dir));
+    try std.testing.expectEqual(deberta_mod.Config{}, try loadLegacyGlinerEncoderConfig(allocator, model_dir, .{}));
     try tmp.dir.writeFile(io, .{
         .sub_path = receipt_path,
         .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.safetensors\",\"size\":7},{\"path\":\"encoder_config/config.json\",\"size\":21}]}",
     });
-    try std.testing.expect((try loadLegacyGlinerEncoderConfig(allocator, model_dir)).use_exact_gelu);
+    try std.testing.expect((try loadLegacyGlinerEncoderConfig(allocator, model_dir, .{})).use_exact_gelu);
 }
 
 test "detectArchitecture preserves exact GELU for BGE-M3 XLM-R config" {
@@ -7957,6 +8039,16 @@ pub fn getGlinerBoundaryConfig(session: Session) !gliner_boundary_model.Config {
     };
 }
 
+/// Encoder geometry of a legacy span (SpanExtractor) GLiNER2 session.
+pub fn getGlinerSpanConfig(session: Session) !deberta_mod.Config {
+    if (session.vtable != &arch_vtable) return error.NotArchSession;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return switch (self.arch_config) {
+        .gliner => |config| config,
+        else => error.NotGlinerSpanSession,
+    };
+}
+
 pub fn getGlinerBoundaryIdentity(session: Session) !boundary_bundle.Identity {
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
@@ -8909,7 +9001,9 @@ fn archRunImpl(
             const words_mask = inputs[2].asInt64();
             const span_idx = inputs[3].asInt64();
 
-            const use_graph_runtime = graphRuntimeStrategyEnabled(self.graph_runtime_strategy);
+            // The graph head implements only CountLSTMv2; v1 checkpoints run eagerly.
+            const use_graph_runtime = graphRuntimeStrategyEnabled(self.graph_runtime_strategy) and
+                cfg.gliner_count_layer == .count_lstm_v2;
             if (use_graph_runtime) {
                 const head_cfg = gliner_head_graph.Config{
                     .hidden_size = cfg.hidden_size,
@@ -8976,6 +9070,10 @@ fn archRunImpl(
                 .classification = cfg.classification_token_id,
                 .entity = cfg.entity_token_id,
                 .relation = cfg.relation_token_id,
+                .count_layer = switch (cfg.gliner_count_layer) {
+                    .count_lstm => .count_lstm,
+                    .count_lstm_v2 => .count_lstm_v2,
+                },
             });
             defer cb.free(head_result.logits);
             if (head_frame_active) {

@@ -52,6 +52,7 @@ const embedding_mod = @import("../pipelines/embedding.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
 const extraction_v2 = @import("../extractors/extraction_v2.zig");
 const boundary_executor = @import("../extractors/gliner_boundary_executor.zig");
+const span_v2_executor = @import("../extractors/gliner_span_v2_executor.zig");
 const BoundedRequestAllocator = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
 const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
@@ -8940,6 +8941,8 @@ pub const Node = struct {
         // this gate, even for an otherwise small extraction request.
         var manifest = try manifest_mod.loadListingFromDir(scratch, model_path);
         defer manifest.deinit();
+        if (manifest.gliner_architecture == .span)
+            return self.extractV2Span(scratch, model_path, &request, control, failure, response_limit, budget, allocation_failure);
         if (manifest.gliner_architecture != .boundary) return error.UnsupportedExtractionModel;
         const test_qualification = if (builtin.is_test) self.test_allow_unqualified_gliner_boundary else false;
         if (!test_qualification and !manifest.mayLoadQualifiedGlinerBoundaryRuntime()) return error.UnsupportedGlinerBoundaryRuntime;
@@ -9037,6 +9040,49 @@ pub const Node = struct {
         }
     }
 
+    /// schema_version:2 classification on a legacy span (SpanExtractor)
+    /// checkpoint such as GLiNER2.5-Decide. Span entity/relation/structure
+    /// extraction remains on schema_version 1.
+    fn extractV2Span(
+        self: *Node,
+        scratch: std.mem.Allocator,
+        model_path: []const u8,
+        request: *const extraction_v2.Request,
+        control: ?InferenceExecutionControl,
+        failure: *extraction_v2.FailureContext,
+        response_limit: ?usize,
+        budget: *runtime.tier.memory.RunBudget,
+        allocation_failure: *ExtractionAllocationFailure,
+    ) ![]u8 {
+        const options = span_v2_executor.Options{
+            .control = control,
+            .failure = failure,
+            .max_response_bytes = @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024),
+        };
+        try span_v2_executor.preflight(request, options);
+        failure.* = .{ .stage = "model" };
+        allocation_failure.clear();
+        var handle = self.model_manager.acquireFromDirWithControl(model_path, control orelse .{}) catch |err| {
+            allocation_failure.clear();
+            return err;
+        };
+        defer handle.release();
+        const loaded = handle.get();
+        const backend = loaded.session.backend();
+        if (backend != .native and backend != .metal) return error.UnsupportedExtractionBackend;
+        const config = try session_factory.getGlinerSpanConfig(loaded.session);
+        const effective = control orelse InferenceExecutionControl{};
+        const execution_mutex = loaded.targetInferenceExecutionMutex();
+        if (execution_mutex) |mutex| try effective.lock(mutex);
+        defer if (execution_mutex) |mutex| mutex.unlock();
+        var managed = try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, control);
+        defer managed.deinit();
+        const json = try span_v2_executor.execute(&managed.backend, scratch, config, loaded.getTokenizer(), request, options);
+        errdefer scratch.free(json);
+        try effective.check();
+        return json;
+    }
+
     fn extractWithAdmission(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -9059,7 +9105,13 @@ pub const Node = struct {
         var request = supplied_request;
         if (request.schema_version == null) upgrade: {
             const io = self.session_manager.io orelse break :upgrade;
-            if (self.resolvesToBoundaryArchitecture(io, model_name)) request.schema_version = 2;
+            if (self.resolvesToBoundaryArchitecture(io, model_name)) {
+                request.schema_version = 2;
+                break :upgrade;
+            }
+            var schema = std.json.parseFromSlice(std.json.Value, allocator, request.schema_json, .{}) catch break :upgrade;
+            defer schema.deinit();
+            if (self.resolvesToSpanClassification(io, model_name, schema.value)) request.schema_version = 2;
         }
         const schema_version = request.schema_version orelse 1;
         if (schema_version == 2) {
@@ -18634,6 +18686,21 @@ pub const Node = struct {
         return manifest.gliner_architecture == .boundary;
     }
 
+    /// A classification-only request on a declared gliner2 2.x span
+    /// checkpoint runs the upstream `classifier` head on schema_version:2.
+    /// The legacy route scores span logits of `[C]` markers instead, which is
+    /// not the checkpoint's classification semantics.
+    fn resolvesToSpanClassification(self: *Node, io: std.Io, model_name: []const u8, schema: std.json.Value) bool {
+        if (model_name.len == 0 or !schemaIsClassificationOnly(schema)) return false;
+        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const model_path = self.resolveRequestModelPath(scratch, io, model_name, "extractors") catch return false;
+        var manifest = manifest_mod.loadListingFromDir(scratch, model_path) catch return false;
+        defer manifest.deinit();
+        return manifest.gliner_architecture == .span and manifest.gliner_span_declared;
+    }
+
     /// If `request_json` names a boundary-architecture model and does not
     /// already declare a schema version, returns a new allocation (owned by
     /// `result_allocator`) with `"schema_version":2` stamped on, so
@@ -18671,7 +18738,8 @@ pub const Node = struct {
         if (parsed.value.object.contains("schema_version")) return null;
         const model_value = parsed.value.object.get("model") orelse return null;
         if (model_value != .string or model_value.string.len == 0) return null;
-        if (!self.resolvesToBoundaryArchitecture(io, model_value.string)) return null;
+        if (!self.resolvesToBoundaryArchitecture(io, model_value.string) and
+            !self.resolvesToSpanClassification(io, model_value.string, parsed.value.object.get("schema") orelse .null)) return null;
         parsed.value.object.put(scratch, "schema_version", .{ .integer = 2 }) catch return null;
         return std.json.Stringify.valueAlloc(result_allocator, parsed.value, .{}) catch null;
     }
@@ -19660,6 +19728,28 @@ const CanonicalExtractionOperation = enum {
     classifications,
     structures,
 };
+
+/// Whether an extraction schema declares classification tasks and nothing else.
+fn schemaIsClassificationOnly(schema: std.json.Value) bool {
+    if (schema != .object or schema.object.count() != 1) return false;
+    const tasks = schema.object.get("classifications") orelse return false;
+    return tasks == .array and tasks.array.items.len > 0;
+}
+
+test "span classification upgrade requires a classification-only schema" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { json: []const u8, expected: bool }{
+        .{ .json = "{\"classifications\":[{\"name\":\"intent\",\"labels\":[\"a\",\"b\"]}]}", .expected = true },
+        .{ .json = "{\"classifications\":[]}", .expected = false },
+        .{ .json = "{\"entities\":[\"person\"],\"classifications\":[{\"name\":\"x\",\"labels\":[\"a\"]}]}", .expected = false },
+        .{ .json = "[]", .expected = false },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, case.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expected, schemaIsClassificationOnly(parsed.value));
+    }
+}
 
 fn canonicalExtractionOperation(schema: extraction_api.ExtractionSchema) !CanonicalExtractionOperation {
     const has_entities = if (schema.entities) |entities| entities.len > 0 else false;
