@@ -153,6 +153,7 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
         try @import("completion_pool.zig").hasAcceptedGuards(backend.storage.?, allocator, root_dir)
     else
         false;
+    var restore_control_owner = false;
     if (comptime @hasField(BackendType, "completion_pool")) {
         // A transition sidecar may contain an accepted Raft entry whose WAL
         // publication was interrupted. It is an independent startup debt,
@@ -160,11 +161,9 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
         if (try @import("completion_control_accepted.zig").hasAny(backend.storage.?, allocator, root_dir))
             return error.CompletionRecoveryCapacityRequired;
         const control_guard = @import("completion_control_guard.zig");
-        // Control ownership outlives the ordinary accepted cell. Until its
-        // capacity and durable-log reconciliation are installed, an orphaned
-        // full or pending guard must fence startup even with pool configuration.
-        // A trusted installation can already validate the exact local BEGIN
-        // identity and all owner slots before reporting that missing capacity.
+        // Only a single published owner with a trusted installation can enter
+        // the bounded restoration path. Pending publication and accepted
+        // transitions still require separate Raft reconciliation and fence.
         if (try control_guard.hasAny(backend.storage.?, allocator, root_dir)) {
             if (backend.options.completion_pool_config) |config| {
                 const authority: @import("completion_control_record.zig").Authority = .{
@@ -176,9 +175,11 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
                 };
                 var local = try control_guard.loadAll(allocator, backend.storage.?, root_dir, authority);
                 defer local.deinit();
-                if (local.count == 0) return error.InvalidCompletionSlot;
+                if (local.count != 1) return error.CompletionRecoveryCapacityRequired;
+                restore_control_owner = true;
+            } else {
+                return error.CompletionRecoveryCapacityRequired;
             }
-            return error.CompletionRecoveryCapacityRequired;
         }
     }
     if (accepted_pool_guarded) {
@@ -278,7 +279,7 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
     }
     // An installed/accepted owner cannot become a fresh empty store merely
     // because its authoritative manifest disappeared.
-    if (!loaded_manifest and (installed_pool_guarded or accepted_pool_guarded)) return error.InvalidManifest;
+    if (!loaded_manifest and (installed_pool_guarded or accepted_pool_guarded or restore_control_owner)) return error.InvalidManifest;
     if (!loaded_manifest and options.create_if_missing) {
         const phase_start = beginOpenPhase(BackendType, backend, .ensuring_dirs);
         defer finishOpenPhase(BackendType, backend, .ensuring_dirs, phase_start);
@@ -307,7 +308,10 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
         // fixed restart envelope immediately after the last slot retired.
         const restore_pool = pool_configured and loaded_manifest;
         if (comptime @hasField(BackendType, "completion_pool")) {
-            if (restore_pool) try backend.installCompletionPoolLocked(backend.options.completion_pool_config.?);
+            if (restore_pool) {
+                try backend.installCompletionPoolLocked(backend.options.completion_pool_config.?);
+                if (restore_control_owner) try backend.completion_pool.?.restoreControlOwnersBeforeReplay(backend);
+            }
         }
         const guarded = if (comptime @hasField(BackendType, "durable_completion"))
             if (restore_pool) false else try completion_recovery.restoreBeforeReplay(BackendType, backend)
@@ -322,6 +326,7 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
                     const pool = backend.completion_pool.?;
                     try pool.replayBeforePublication(backend);
                     try pool.restoreMaterialized(backend);
+                    if (restore_control_owner) try pool.validateRestoredControlAfterReplay(backend);
                 } else if (guarded) {
                     const replay_stats = try completion_recovery.replay(BackendType, backend);
                     try completion_recovery.finish(BackendType, backend, replay_stats);

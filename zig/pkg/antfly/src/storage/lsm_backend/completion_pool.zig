@@ -63,7 +63,7 @@ pub const Config = struct {
     namespace: enum(u8) { root, docs } = .docs,
     shape: Shape = .{},
     /// Staging is an internal component path while replicated activation is
-    /// disabled. It cannot make a control owner runnable after restart yet.
+    /// disabled. Restart permits only the bounded, proven one-owner profile.
     control_owner_staging: bool = false,
 };
 
@@ -507,6 +507,7 @@ pub fn Pool(comptime Backend: type) type {
         journal_path: []u8,
         restored: bool = false,
         startup_reconciliation_pending: bool = false,
+        restored_control_pending: bool = false,
         ready: bool = false,
         failed: bool = false,
         progress: ?completion.AcceptedIdentity = null,
@@ -748,6 +749,106 @@ pub fn Pool(comptime Backend: type) type {
                     return error.UnsupportedCompletionProfile;
             };
             self.control_transition_staging = true;
+        }
+
+        /// Rebuild the one-owner test profile before primary WAL replay. This
+        /// acquires the exact retained output path and the complete lifetime
+        /// resource envelope; it does not make the owner runnable. Startup
+        /// still needs native-row inspection and a complete v2 Raft proof.
+        pub fn restoreControlOwnersBeforeReplay(self: *Self, backend: *Backend) !void {
+            if (self.config.control_owner_staging or !self.restored or self.ready or self.failed or
+                backend.mutable.entryCount() != 0 or backend.runs.count() > 64)
+                return error.CompletionRecoveryCapacityRequired;
+            for (self.cells[0..self.cell_count]) |cell| if (cell.phase != .free)
+                return error.CompletionRecoveryCapacityRequired;
+            var restored = try control_guard.loadAll(backend.allocator, backend.storage.?, backend.root_dir.?, .{
+                .group_id = self.config.identity.group_id,
+                .incarnation = self.config.identity.incarnation,
+                .policy_digest = self.config.identity.policy_digest,
+                .schema_catalog_digest = self.config.schema_catalog_digest,
+                .generation = self.config.identity.generation,
+            });
+            defer restored.deinit();
+            if (restored.count != 1 or restored.owners[0] == null)
+                return error.CompletionRecoveryCapacityRequired;
+            const owner = restored.owners[0].?;
+            const first = owner.guard.record.output_run_id;
+            if (first == 0 or first > std.math.maxInt(u64) - control_record.max_owners)
+                return error.InvalidCompletionSlot;
+            if (first >= self.cohort.base_run_id and first < self.cohort.base_run_id + max_slots)
+                return error.InvalidCompletionSlot;
+            for (0..backend.runs.count()) |i| if (backend.runs.at(i).id == first)
+                return error.InvalidCompletionSlot;
+            var borrow = try self.compiler.tryBorrow();
+            defer borrow.release() catch unreachable;
+            const alloc = try borrow.allocator();
+            var paths: [68][]const u8 = undefined;
+            for (0..backend.runs.count()) |i| paths[i] = backend.runs.at(i).path orelse return error.UnsupportedCompletionProfile;
+            const measured = try maintenance.measure(alloc, self.io.storage(), paths[0..backend.runs.count()], .{
+                .max_inputs = self.config.shape.max_runs,
+                .max_metadata_bytes = self.config.shape.max_metadata_bytes,
+                .max_block_bytes = self.config.shape.max_block_bytes,
+                .max_record_bytes = self.config.shape.max_record_bytes,
+            });
+            self.control_output_ids[0] = first;
+            var next_output = @max(backend.next_run_id, first + 1);
+            for (1..control_record.max_owners) |i| {
+                self.control_output_ids[i] = next_output;
+                next_output = std.math.add(u64, next_output, 1) catch return error.UnsupportedCompletionProfile;
+            }
+            for (0..backend.runs.count()) |i| {
+                const run_id = backend.runs.at(i).id;
+                for (self.control_output_ids) |output_id| if (run_id == output_id)
+                    return error.InvalidCompletionSlot;
+            }
+            for (self.control_output_ids) |output_id| {
+                const candidate = try repository.runPath(alloc, backend.root_dir.?, output_id);
+                defer alloc.free(candidate);
+                if (backend.storage.?.fileSize(candidate)) |_| return error.CompletionRecoveryCapacityRequired else |err| {
+                    if (err != error.FileNotFound) return err;
+                }
+            }
+            self.config.control_owner_staging = true;
+            try self.bindControlOutputPaths(backend);
+            backend.next_run_id = next_output;
+            self.capacity_cost = measured.cost;
+            self.capacity_baseline_frontier = measured.frontier_bytes;
+            const proof = try control_capacity.certifyRestored(.{
+                .cost = measured.cost,
+                .mutable_growth = .{},
+                .baseline_frontier_bytes = measured.frontier_bytes,
+                .max_mutable_entries = completion.foreground_entries,
+                .current_runs = backend.runs.count(),
+                .future_document_outputs = self.cell_count,
+                .append = try (try self.remainingAppendBudget()).plus(completion.foreground_append_budget),
+            }, &restored, .{
+                .format = .{ .metadata_bytes = self.config.shape.max_metadata_bytes },
+                .max_record_bytes = self.config.shape.max_record_bytes,
+                .max_inputs = self.config.shape.max_runs,
+                .max_path_bytes = 544,
+                .single_drain_metadata_bytes = self.config.shape.max_metadata_bytes,
+                .max_retained_wal_bytes = completion.limits.wal_bytes,
+                .replay_workspace_bytes = completion.scratch_bytes,
+                .compiler_workspace_bytes = completion.scratch_bytes,
+            });
+            try proof.requireHeadroom(backend.write_stats, backend.manifest_journal.sequence orelse return error.RecoveryRequired, backend.next_run_id, if (backend.wal_retention.primary) |primary| primary.current_segment else 1, .{ .manifest_steps = self.cell_count, .run_ids = self.cell_count, .wal_segments = self.cell_count });
+            const path = try repository.runPath(self.control.allocator(), backend.root_dir.?, first);
+            defer self.control.allocator().free(path);
+            var output_pin = try Backend.pinCompletionRunPath(self.control.allocator(), path);
+            errdefer output_pin.release();
+            const manager = backend.options.resource_manager orelse return error.CompletionResourceManagerRequired;
+            const held = try control_resources.Resources.create(backend.allocator, manager, &self.compiler, owner.declaration.txn_id, .{
+                .publication_bytes = proof.owners[0].publication_bytes,
+                .wal_bytes = proof.owners[0].append.bytes,
+            });
+            self.control_owners[0] = .{
+                .held = held,
+                .output_pin = output_pin,
+                .declaration = owner.declaration,
+                .begin = .{ .term = owner.guard.record.begin.term, .index = owner.guard.record.begin.index, .digest = owner.guard.record.begin.digest },
+            };
+            self.startup_reconciliation_pending = true;
+            self.restored_control_pending = true;
         }
 
         /// Native owner calls this only after attached runtime leases are gone
@@ -1912,6 +2013,81 @@ pub fn Pool(comptime Backend: type) type {
             try backend.retireDurableCompletionCohort();
         }
 
+        /// The first runnable restart profile covers an applied BEGIN with no
+        /// accepted transition sidecar. The local WAL and guard must agree on
+        /// the immutable participant declaration; later phases require the
+        /// exact native transition receipt as well as a Raft observation.
+        pub fn validateRestoredControlAfterReplay(self: *Self, backend: *Backend) !void {
+            if (!self.restored_control_pending) return;
+            var borrow = try self.compiler.tryBorrow();
+            defer borrow.release() catch unreachable;
+            const alloc = try borrow.allocator();
+            const active = self.control_owners[0] orelse return error.InvalidCompletionSlot;
+            const id = active.declaration.txn_id;
+            const ns: ?[]const u8 = if (self.config.namespace == .docs) "docs" else null;
+            const record_key = try std.mem.concat(alloc, u8, &.{ control_shape.records_prefix, &id });
+            defer alloc.free(record_key);
+            const participants_key = try std.mem.concat(alloc, u8, &.{ control_shape.participants_prefix, &id });
+            defer alloc.free(participants_key);
+            const resolved_key = try std.mem.concat(alloc, u8, &.{ control_shape.resolved_participants_prefix, &id });
+            defer alloc.free(resolved_key);
+            const record_value = try self.point(backend, alloc, ns, record_key);
+            defer record_value.deinit(alloc);
+            const participants = try self.point(backend, alloc, ns, participants_key);
+            defer participants.deinit(alloc);
+            const resolved = try self.point(backend, alloc, ns, resolved_key);
+            defer resolved.deinit(alloc);
+            const owner_value = try self.point(backend, alloc, ns, &control_record.ownerKey(id));
+            defer owner_value.deinit(alloc);
+            const receipt_value = try self.point(backend, alloc, ns, &control_record.receiptKey(id));
+            defer receipt_value.deinit(alloc);
+            const progress_value = try self.point(backend, alloc, ns, &control_record.progressKey(id));
+            defer progress_value.deinit(alloc);
+            const row = record_value.value orelse return error.InvalidCompletionSlot;
+            if (row.len != control_shape.txn_record_v6_size or row[0] != 0 or row[49] != 0 or
+                row[50] != @intFromBool(active.declaration.coordinator) or
+                row[51] != @intFromBool(active.declaration.retain_terminal) or row[52] != 0 or
+                resolved.value != null or owner_value.value != null or receipt_value.value != null or progress_value.value != null)
+                return error.CompletionRecoveryCapacityRequired;
+            if (!std.meta.eql(try control_record.Participants.fromEncodedList(participants.value orelse return error.InvalidCompletionSlot), active.declaration.participants))
+                return error.InvalidCompletionSlot;
+            const applied = self.progress orelse return error.CompletionRecoveryCapacityRequired;
+            if (applied.index < active.begin.index or
+                (applied.index == active.begin.index and !std.meta.eql(applied, active.begin)))
+                return error.CompletionRecoveryCapacityRequired;
+        }
+
+        /// Called only after the complete startup v2 BEGIN proof and document
+        /// proof were checked under the same backend lock. Re-certify the
+        /// replayed physical state before permitting another owner transition.
+        pub fn qualifyRestoredControlAfterProof(self: *Self, backend: *Backend) !void {
+            if (!self.restored_control_pending or !self.restored or self.ready or self.failed or
+                self.startup_reconciliation_pending or backend.manifest_recovery_required or
+                backend.runs.count() > 64 or backend.activeImmutableMemtableCount() != 0)
+                return error.CompletionRecoveryCapacityRequired;
+            if (backend.mutable.entryCount() > completion.foreground_entries) return error.CompletionRecoveryCapacityRequired;
+            var replay_cost: capacity.Cost = .{};
+            for (0..backend.mutable.entryCount()) |i| {
+                const item = backend.mutable.entryAt(i);
+                replay_cost = try replay_cost.plus(try capacity.Cost.record(if (item.namespace_name) |name| name.len else 0, item.key.len, item.value.len));
+            }
+            const previous_cost = self.capacity_cost;
+            const previous_growth = self.capacity_growth;
+            errdefer {
+                self.capacity_cost = previous_cost;
+                self.capacity_growth = previous_growth;
+            }
+            self.capacity_cost = try self.capacity_cost.plus(replay_cost);
+            self.capacity_growth = replay_cost;
+            try self.certifyActiveControls(backend, .{});
+            self.capacity_certified = true;
+            errdefer self.capacity_certified = false;
+            try self.checkCapacity(.{});
+            self.control_transition_staging = true;
+            self.ready = true;
+            self.restored_control_pending = false;
+        }
+
         pub fn notifyApplied(self: *Self, index: usize) void {
             const cell = &self.cells[index];
             std.debug.assert(cell.phase == .prepared and cell.slot.durable);
@@ -1984,6 +2160,8 @@ pub fn Pool(comptime Backend: type) type {
                 if (!observation.present or owner.identity.index <= log.compacted_index or
                     owner.identity.index > log.last_index or observation.observed_term != owner.identity.term or
                     !std.mem.eql(u8, &observation.observed_digest, &owner.identity.digest))
+                    return error.RecoveryRequired;
+                if (log.mode == .startup_complete and owner.identity.index > log.commit_index)
                     return error.RecoveryRequired;
             }
             for (seen[0..log.observations.len]) |matched| if (!matched) return error.InvalidCompletionSlot;

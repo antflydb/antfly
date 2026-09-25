@@ -379,6 +379,8 @@ pub fn Guard(comptime DB: type) type {
             const p = try pool(owner);
             try p.reconcileControlDurableLog(.{ .mode = mode, .compacted_index = input.compacted_index, .compacted_term = input.compacted_term, .last_index = input.last_index, .commit_index = input.commit_index, .observations = observations[0..input.count] });
             try reconcileDocumentLocked(owner, b, p, &input.document);
+            if (mode == .startup_complete and p.restored_control_pending)
+                try p.qualifyRestoredControlAfterProof(b);
         }
         const control_vtable_v2: abi.ControlVTableV2 = .{ .release = release, .durable_owners = controlDurableOwnersV2, .reconcile_durable = reconcileControlV2 };
         const vtable: abi.VTable = .{ .check = check, .proposal_result = proposalResult, .release = release, .apply_accepted = apply, .progress = progress, .owns_accepted = owns, .durable_cells = durableCells, .reconcile_durable = reconcile };

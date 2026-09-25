@@ -144329,6 +144329,223 @@ test "workload admission physical completion staged control BEGIN retains a pool
     try std.testing.expectError(error.CompletionSlotChecksumMismatch, DB.open(alloc, path, reopen));
 }
 
+test "workload admission physical completion restores one BEGIN owner after exact v2 startup proof" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const local = @import("../local_write.zig");
+    const control_guard = @import("../lsm_backend/completion_control_guard.zig");
+    var tmp = try TestDirectory.init("completion-control-begin-restart");
+    defer tmp.cleanup();
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024 * 1024);
+    const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 1024 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    } };
+    const options: OpenOptions = .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = settings,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const binding: abi.InstallBinding = .{
+        .identity = .{
+            .group_id = 2,
+            .node_id = 7,
+            .capacity = 4,
+            .generation = 1,
+            .incarnation = @splat(27),
+            .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?),
+        },
+        .table_id = 1,
+        .range_id = 3,
+        .schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}"),
+    };
+    const id: transactions_mod.TxnId = @splat(218);
+    var begin_digest: [32]u8 = undefined;
+    var output_run_id: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), options);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const empty: abi.DurableLog = .{ .mode = .startup_complete };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &empty));
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        {
+            const locked = @import("../lsm_backend/runtime.zig").lockBackend(lsm_backend_mod.Backend, backend);
+            defer @import("../lsm_backend/runtime.zig").unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try backend.completion_pool.?.enableControlOwnerStaging(backend);
+        }
+        const local_name = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+        defer alloc.free(local_name);
+        const remote_name = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+        defer alloc.free(remote_name);
+        const request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+            .txn_id = id,
+            .begin_timestamp = 100,
+            .created_at_ns = 90,
+            .topology_epoch = 1,
+            .retain_terminal = true,
+            .participants = &.{ local_name, remote_name },
+        } } };
+        const wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = 0, .index = 0 });
+        defer alloc.free(wire);
+        begin_digest = @import("../../common/completion_entry_protocol.zig").payloadDigest(wire);
+        const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+        const proposal: abi.Check = .{
+            .kind = .proposal,
+            .new_work_allowed = 1,
+            .state = .{ .term = 1, .applied_term_known = 1 },
+            .proposals = .{ .ptr = &payloads, .len = 1 },
+        };
+        var result: abi.CheckResult = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+        lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals });
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
+        output_run_id = backend.completion_pool.?.control_output_ids[0];
+        try std.testing.expect(backend.runs.count() <= 64);
+    }
+    const path = std.mem.span(tmp.path().ptr);
+    try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, path, options));
+    const config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
+    var reopen = options;
+    reopen.durable_completion_authority = .raft_apply;
+    reopen.completion_pool_config = config;
+    {
+        var storage = try @import("../lsm_backend/storage_io.zig").NativeStorage.init(alloc, .threaded);
+        defer storage.deinit();
+        const orphan = try std.fs.path.join(alloc, &.{ path, @import("../lsm_backend/completion_runtime.zig").guard_filenames[0] });
+        defer alloc.free(orphan);
+        try storage.storage().writeFileAbsolute(orphan, "orphan-document-guard");
+        try std.testing.expectError(error.InvalidCompletionSlot, DB.open(alloc, path, reopen));
+        try storage.storage().deleteFileAbsolute(orphan);
+    }
+    // The guard's output must not alias a newly reserved document-cell run
+    // even if the alias is absent from the current manifest.
+    const document_output_id = blk: {
+        var probe = try DB.open(alloc, path, reopen);
+        defer probe.close();
+        break :blk probe.core.primary_store_owner.lsmBackend().?.completion_pool.?.cohort.base_run_id;
+    };
+    {
+        var storage = try @import("../lsm_backend/storage_io.zig").NativeStorage.init(alloc, .threaded);
+        defer storage.deinit();
+        const guard_path = try std.fs.path.join(alloc, &.{ path, control_guard.filenames[0] });
+        defer alloc.free(guard_path);
+        const size = try storage.storage().fileSize(guard_path);
+        const original = try alloc.alloc(u8, @intCast(size));
+        defer alloc.free(original);
+        try storage.storage().readFileRangeInto(alloc, guard_path, 0, original);
+        var alias = try control_guard.Guard.decode(original);
+        alias.record.output_run_id = document_output_id;
+        const encoded = try alias.encode(alloc);
+        defer alloc.free(encoded);
+        try storage.storage().writeFileAbsolute(guard_path, encoded);
+        try std.testing.expectError(error.InvalidCompletionSlot, DB.open(alloc, path, reopen));
+        const output_path = try @import("../lsm_backend/repository.zig").runPath(alloc, path, document_output_id);
+        defer alloc.free(output_path);
+        try std.testing.expectError(error.FileNotFound, storage.storage().fileSize(output_path));
+        try storage.storage().writeFileAbsolute(guard_path, original);
+    }
+    {
+        var db = try DB.open(alloc, path, reopen);
+        defer db.close();
+        // Reattach the trusted local installation binding. No transaction-manager
+        // or metadata-service inventory is used to reconstruct the owner.
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        const pool = backend.completion_pool.?;
+        try std.testing.expect(pool.restored_control_pending and !pool.ready);
+        try std.testing.expect(pool.control_owners[0] != null);
+        try std.testing.expectEqualDeep(id, pool.control_owners[0].?.declaration.txn_id);
+        try std.testing.expect(pool.control_owners[0].?.held.wal_credit > 0);
+        try std.testing.expect(pool.control_owners[0].?.output_pin.path != null);
+        try std.testing.expectEqual(output_run_id, pool.control_output_ids[0]);
+        const control_lease = try @import("../completion_native_guard.zig").Guard(DB).controlLeaseV2(&db, 2, 7);
+        defer control_lease.vtable.release(control_lease.context);
+        var owners: abi.ControlDurableOwnersV2 = .{};
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, control_lease.vtable.durable_owners(control_lease.context, &owners));
+        try std.testing.expectEqual(@as(u32, 1), owners.count);
+        var proof: abi.ControlDurableLogV2 = .{
+            .mode = .startup_complete,
+            .last_index = 1,
+            .commit_index = 1,
+            .count = 1,
+            .document = .{ .mode = .startup_complete, .last_index = 1, .commit_index = 1 },
+        };
+        proof.observations[0] = .{
+            .expected = owners.owners[0].identity,
+            .present = 1,
+            .observed_term = 1,
+            .observed_digest = begin_digest,
+        };
+        proof.observations[0].observed_digest[0] ^= 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, control_lease.vtable.reconcile_durable(control_lease.context, &proof));
+        try std.testing.expect(!pool.ready);
+        proof.observations[0].observed_digest[0] ^= 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, control_lease.vtable.reconcile_durable(control_lease.context, &proof));
+        try std.testing.expect(pool.ready and pool.control_transition_staging and !pool.restored_control_pending);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+        var manager = try transactions_mod.TxnManager.init(alloc, db.core.store);
+        defer manager.deinit();
+        manager.completion_limits = .{
+            .max_transaction_bytes = db.core.table_catalog.transaction_admission_bytes,
+            .max_count = db.core.table_catalog.transaction_recovery_max_count,
+            .max_bytes = db.core.table_catalog.transaction_recovery_max_bytes,
+        };
+        const decision_wire = blk: {
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            break :blk try manager.compileControlMutation(alloc, &read, .{
+                .txn_id = id,
+                .action = .{ .resolve_metadata = .{ .status = .committed, .timestamp = 200 } },
+            }, .{
+                .group_id = binding.identity.group_id,
+                .incarnation = binding.identity.incarnation,
+                .policy_digest = binding.identity.policy_digest,
+                .schema_catalog_digest = binding.schema_catalog_digest,
+                .previous_term = 1,
+                .previous_index = 1,
+            }, @splat(19), "restored-owner-decision", &.{});
+        };
+        defer alloc.free(decision_wire);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const payloads = [_]abi.Bytes{.{ .ptr = decision_wire.ptr, .len = decision_wire.len }};
+        const proposal: abi.Check = .{
+            .kind = .proposal,
+            .new_work_allowed = 1,
+            .state = .{ .term = 1, .applied_term = 1, .applied_term_known = 1, .applied_index = 1, .last_index = 1 },
+            .proposals = .{ .ptr = &payloads, .len = 1 },
+        };
+        var result: abi.CheckResult = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+        lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = 2, .last_index = 2, .payloads = proposal.proposals });
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 2, payloads[0]));
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
+    }
+    // The local owner guard alone is enough to make a missing manifest an
+    // unsafe startup, even if the installation guard is also absent.
+    const descriptor_path = try std.fs.path.join(alloc, &.{ path, "manifest.bin" });
+    defer alloc.free(descriptor_path);
+    const installation_path = try std.fs.path.join(alloc, &.{ path, "completion-installation.guard" });
+    defer alloc.free(installation_path);
+    try std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, descriptor_path);
+    try std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, installation_path);
+    try std.testing.expectError(error.InvalidManifest, DB.open(alloc, path, reopen));
+}
+
 test "workload admission physical completion final named ACK checkpoints retained owner before reopen" {
     const alloc = std.testing.allocator;
     const abi = @import("kernel_owner_abi").completion_pool;
