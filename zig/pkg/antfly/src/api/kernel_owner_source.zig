@@ -1347,6 +1347,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// to invent a route for an unpublished owner. Warm reads pin the exact
     /// current generation; cold reads stay inside the compiled storage owner.
     pub fn readHAHiddenOwnerBootstrap(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) {
+        try self.ensureContextConfigured();
         const generation = self.visibleRootGeneration(group_id);
         var resident: ?Lease = blk: {
             lock(&self.mutex);
@@ -1364,8 +1365,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         var output: abi.OwnedBytes = .{};
         try kernel_error_identity.statusToError(abi.antfly_storage_owner_hidden_restore_json(if (resident) |*lease| lease.owner().handle else null, &.{ .operation = .read_bootstrap, .context = self.context.handle, .path = .fromSlice(path), .table_id = table_id }, &output));
         defer abi.antfly_storage_owner_buffer_destroy(&output);
-        if (output.len == 0) return null;
         if (generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
+        if (output.len == 0) return null;
         return try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, output.slice(), .{ .allocate = .alloc_always });
     }
 

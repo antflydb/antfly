@@ -1022,6 +1022,7 @@ pub const Scenario = struct {
                 }
                 if (self.public_cluster) |fixture| if (fixture.cluster_live) {
                     for (fixture.cluster.cluster.nodes, 0..) |*node, index| {
+                        if (!fixture.cluster.cluster.node_live[index]) continue;
                         const sender = node.runtime.svc.host.http_host.transport_stack.snapshot_transport;
                         std.debug.print("full-cluster metadata snapshot sender={} cond={x} shutdown={}\n", .{ index, @intFromPtr(&sender.send_ready.epoch.raw), sender.send_shutdown_requested });
                     }

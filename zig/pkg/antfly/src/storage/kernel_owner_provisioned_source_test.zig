@@ -118,6 +118,40 @@ test "replica retirement drains active compiled owners before deleting physical 
     }
 }
 
+test "empty hidden bootstrap read retries when the root generation advances" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const Generation = struct {
+        reads: usize = 0,
+
+        fn visible(ptr: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return if (self.reads == 1) 1 else 2;
+        }
+    };
+    var generation = Generation{};
+    var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(
+        alloc,
+        root,
+        table_catalog.emptyCatalogSource(),
+        read_gate.alreadyReadSafeBarrier(),
+    );
+    defer owners.deinit();
+    _ = owners.withGroupVisibleRootGeneration(.{
+        .ptr = &generation,
+        .visible_root_generation_for_group = Generation.visible,
+    });
+    try std.testing.expectError(
+        error.StorageKernelOwnerTransitionRequired,
+        owners.readHAHiddenOwnerBootstrap(alloc, 7196, 71),
+    );
+    try std.testing.expectEqual(@as(usize, 2), generation.reads);
+}
+
 test "hidden constrained lookup recovers cold compiled owner from exact plan authority" {
     const alloc = std.testing.allocator;
     const Source = kernel_owner_source.ProvisionedKernelOwnerSource;

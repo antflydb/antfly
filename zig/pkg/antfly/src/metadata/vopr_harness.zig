@@ -4798,7 +4798,7 @@ pub const MetadataHttpClusterVopr = struct {
         if (self.teardown_requested) return;
         self.teardown_requested = true;
         for (self.cluster.nodes, 0..) |*host, index| {
-            if (!self.restart_in_progress[index]) host.runtime.svc.beginTransportShutdown();
+            if (self.cluster.node_live[index] and !self.restart_in_progress[index]) host.runtime.svc.beginTransportShutdown();
         }
     }
 
@@ -4815,7 +4815,8 @@ pub const MetadataHttpClusterVopr = struct {
         const candidate_index = bestMetadataElectionCandidateIndex(self) orelse
             return error.UnknownGroup;
         var max_observed_term: u64 = 0;
-        for (self.cluster.nodes) |*replica| {
+        for (self.cluster.nodes, self.cluster.node_live) |*replica, live| {
+            if (!live) continue;
             const status = replica.raftStatus(self.metadata_group_id) orelse continue;
             max_observed_term = @max(max_observed_term, status.hard.current_term);
         }
@@ -4835,6 +4836,7 @@ pub const MetadataHttpClusterVopr = struct {
     pub fn stepAll(self: *MetadataHttpClusterVopr) anyerror!void {
         self.scheduler_gate.lock();
         defer self.scheduler_gate.unlock();
+        for (self.cluster.node_live) |live| if (!live) return error.SimulationNodeUnavailable;
         self.manual_clock.advanceMs(100);
         _ = try self.virtual_network.drainDue(null);
         for (0..self.cluster.nodes.len) |i| {
@@ -4855,6 +4857,7 @@ pub const MetadataHttpClusterVopr = struct {
     /// advancement are intentionally separate transitions.
     pub fn stepNode(self: *MetadataHttpClusterVopr, index: usize) anyerror!void {
         if (index >= self.cluster.nodes.len) return error.InvalidNodeIndex;
+        if (!self.cluster.node_live[index]) return error.SimulationNodeUnavailable;
         try self.refreshOwnedMetadataRuntimes(index);
         _ = try self.cluster.node(index).stepOnce();
         try self.refreshOwnedMetadataRuntimes(index);
@@ -4869,6 +4872,7 @@ pub const MetadataHttpClusterVopr = struct {
         self.scheduler_gate.lock();
         defer self.scheduler_gate.unlock();
         std.debug.assert(stalled_index < self.cluster.nodes.len);
+        for (self.cluster.node_live, 0..) |live, index| if (index != stalled_index and !live) return error.SimulationNodeUnavailable;
         self.manual_clock.advanceMs(100);
         _ = try self.virtual_network.drainDue(null);
         for (0..self.cluster.nodes.len) |i| {
@@ -4957,6 +4961,7 @@ pub const MetadataHttpClusterVopr = struct {
 
     fn firstMetadataReplicaIndex(self: *MetadataHttpClusterVopr) ?usize {
         for (self.cluster.nodes, 0..) |*sim, index| {
+            if (!self.cluster.node_live[index]) continue;
             if (sim.raftStatus(self.metadata_group_id) != null) return index;
         }
         return null;
@@ -4987,7 +4992,8 @@ pub const MetadataHttpClusterVopr = struct {
 
     pub fn countGroupStatus(self: *MetadataHttpClusterVopr, group_id: u64, desired: raft_host.HostedReplicaStatus) usize {
         var count: usize = 0;
-        for (self.cluster.nodes) |*sim| {
+        for (self.cluster.nodes, self.cluster.node_live) |*sim, live| {
+            if (!live) continue;
             if (sim.status(group_id) == desired) count += 1;
         }
         return count;
@@ -5429,6 +5435,34 @@ pub const MetadataHttpClusterVopr = struct {
     }
 };
 
+test "failed node replacement leaves a drainable empty slot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{.{
+        .host = .{ .http = .{
+            .host = .{ .local_node_id = 1 },
+            .transport = .{ .snapshot = .{ .root_dir = root } },
+        } },
+    }};
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{.{}};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var cluster = try raft_vopr.ManagedHttpClusterSimulation.init(failing.allocator(), &configs, &deps);
+    defer cluster.deinit();
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, cluster.restartNode(0));
+    try std.testing.expect(!cluster.node_live[0]);
+    try std.testing.expectEqual(@as(usize, 0), cluster.network.routes.count());
+    try std.testing.expectError(error.SimulationNodeUnavailable, cluster.stepAll());
+    failing.fail_index = std.math.maxInt(usize);
+    try cluster.restartNode(0);
+    try std.testing.expect(cluster.node_live[0]);
+    try std.testing.expectEqual(@as(usize, 1), cluster.network.routes.count());
+    cluster.stopAll();
+}
+
 fn metadataLeaderProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataLeaderProgressContext = @ptrCast(@alignCast(ptr));
     ctx.index = cluster.currentMetadataLeaderIndex();
@@ -5768,10 +5802,12 @@ fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterVopr) ?usize {
     var best_commit: u64 = 0;
     var best_applied: u64 = 0;
     for (cluster.cluster.nodes, 0..) |*sim, index| {
+        if (!cluster.cluster.node_live[index]) continue;
         const status = sim.raftStatus(cluster.metadata_group_id) orelse continue;
         if (status.soft.role != .leader) continue;
         var support: usize = 0;
-        for (cluster.cluster.nodes) |*peer| {
+        for (cluster.cluster.nodes, cluster.cluster.node_live) |*peer, live| {
+            if (!live) continue;
             const peer_status = peer.raftStatus(cluster.metadata_group_id) orelse continue;
             if (peer_status.hard.current_term == status.hard.current_term and peer_status.soft.leader_id == status.id) support += 1;
         }
@@ -5806,6 +5842,7 @@ fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterVopr) ?usize 
     var best_applied: u64 = 0;
     var best_term: u64 = 0;
     for (cluster.cluster.nodes, 0..) |*sim, index| {
+        if (!cluster.cluster.node_live[index]) continue;
         const status = sim.raftStatus(cluster.metadata_group_id) orelse continue;
         if (best_index == null or
             status.last_index > best_last_index or
@@ -5827,6 +5864,7 @@ fn currentGroupLeaderIndex(cluster: *MetadataHttpClusterVopr, group_id: u64) ?us
     cluster.scheduler_gate.lock();
     defer cluster.scheduler_gate.unlock();
     for (cluster.cluster.nodes, 0..) |*sim, index| {
+        if (!cluster.cluster.node_live[index]) continue;
         if (sim.raftStatus(group_id)) |status| {
             if (status.soft.role == .leader) return index;
         }

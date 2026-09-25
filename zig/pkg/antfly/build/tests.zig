@@ -3100,6 +3100,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "full cluster VOPR exact replays",
             "full cluster graph inflight restart cutoff drains parked hooks",
+            "failed node replacement leaves a drainable empty slot",
             "full cluster VOPR initializes teardown ownership on reused memory",
             "full cluster VOPR bounded startup cleanup exact replay",
         },
@@ -3133,6 +3134,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("full-cluster-graph-cutoff-test", "Verify graph restart hooks drain at a bounded replay cutoff")
         .dependOn(&b.addRunArtifact(full_cluster_graph_cutoff_tests).step);
+    const full_cluster_node_replacement_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"failed node replacement leaves a drainable empty slot"},
+        .max_rss = full_cluster_vopr_max_rss,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("full-cluster-node-replacement-test", "Verify failed metadata replacement leaves a safe empty slot")
+        .dependOn(&b.addRunArtifact(full_cluster_node_replacement_tests).step);
 
     const extension_lifecycle_tests = b.addTest(.{
         .root_module = antfly_test_mod,
