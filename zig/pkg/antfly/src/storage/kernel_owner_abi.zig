@@ -978,8 +978,10 @@ pub const ResolutionCandidateConfig = extern struct {
 
 pub const EntityUpsert = extern struct {
     table: BorrowedBytes = .{},
+    storage_table: BorrowedBytes = .{},
     key: BorrowedBytes = .{},
     doc_json: BorrowedBytes = .{},
+    delete: u8 = 0,
 };
 pub const EntityUpsertFn = *const fn (
     ?*anyopaque,

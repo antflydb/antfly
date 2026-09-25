@@ -604,6 +604,7 @@ const StorageOwnerRuntimeHooks = struct {
     ) anyerror!void {
         const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
         const callback = self.config.entity_sink.upsert_batch_fn orelse {
+            for (entries) |entry| if (entry.storage_table != null or entry.delete) return error.EntityPromotionAtomicCommitUnavailable;
             for (entries) |entry| try entityUpsert(ptr, alloc, entry.table, entry.key, entry.doc_json);
             return;
         };
@@ -611,8 +612,10 @@ const StorageOwnerRuntimeHooks = struct {
         defer alloc.free(encoded);
         for (entries, encoded) |source, *destination| destination.* = .{
             .table = .fromSlice(source.table),
+            .storage_table = .fromSlice(source.storage_table orelse ""),
             .key = .fromSlice(source.key),
             .doc_json = .fromSlice(source.doc_json),
+            .delete = @intFromBool(source.delete),
         };
         try kernel_error_identity.statusToError(callback(
             self.config.entity_sink.callback_ctx,

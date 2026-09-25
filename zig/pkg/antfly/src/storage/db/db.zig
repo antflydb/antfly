@@ -10686,8 +10686,21 @@ pub const DB = struct {
         // parse/extract/hash/encode work before entering the serialized apply
         // section. A concurrent schema/index publication or transform-base
         // mutation is detected after admission by comparing pinned epochs.
-        const transaction_schema_binding = if (opts.transaction_resolution) |resolution| resolution.schema_binding else if (opts.durable_completion_prepare) |prepare| prepare.schema_binding else null;
-        var request_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, transaction_schema_binding);
+        // A committed entry retains the schema version used when its write
+        // was admitted. Metadata may have published a newer active schema
+        // before this replica applies the entry, just as a prepared durable
+        // transaction may finish after publication. Use the immutable
+        // historical write view for these cases without changing the active
+        // schema or its durable catalog.
+        const request_schema_binding: ?transactions_mod.SchemaBinding = if (opts.transaction_resolution) |resolution|
+            resolution.schema_binding
+        else if (opts.durable_completion_prepare) |prepare|
+            prepare.schema_binding
+        else if (opts.raft_applied_entry_marker != null and req.relational_schema_version != null)
+            .{ .version = req.relational_schema_version }
+        else
+            null;
+        var request_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, request_schema_binding);
         defer if (request_schema_view) |*view| view.release();
         // Only authenticated HA replay may supply final scoped metadata effects
         // without local participant intents. Scope, key kinds, owner range and
@@ -10718,7 +10731,8 @@ pub const DB = struct {
         defer if (prepared_index_keys) |*keys| keys.deinit();
         if (relational_index_snapshot) |index_snapshot| {
             const view = request_schema_view orelse return error.PreparedGenerationChanged;
-            if (index_snapshot.plan.schemaView().epoch != view.epoch) return error.PreparedGenerationChanged;
+            if (index_snapshot.plan.schemaView().epoch != view.epoch and opts.raft_applied_entry_marker == null)
+                return error.PreparedGenerationChanged;
         }
         var index_writer = relational_index_records.Writer.init(preparation_alloc);
         defer index_writer.deinit();
@@ -10797,7 +10811,10 @@ pub const DB = struct {
                     var largest_tuple: usize = 0;
                     var largest_payload: usize = 0;
                     for (rows, effective_req.writes) |*maybe_row, write| {
-                        const index_row = try keys.appendPrepared(&maybe_row.*.?);
+                        const index_row = if (relational_index_snapshot.?.plan.schemaView().epoch == view.epoch)
+                            try keys.appendPrepared(&maybe_row.*.?)
+                        else
+                            try keys.appendPreparedFromSchema(&maybe_row.*.?, view);
                         largest_document = @max(largest_document, internal_keys.encodedComponentLen(write.key));
                         for (keys.view.boundIndexes(), 0..) |_, index| {
                             const key = try keys.key(index_row, index);
@@ -10812,7 +10829,7 @@ pub const DB = struct {
                 // while holding only the catalog read lease. Schema/index
                 // publication may proceed after this short phase; the commit
                 // fence validates both generations before consuming the plan.
-                if ((transaction_schema_binding == null and !self.core.isSchemaViewCurrent(view)) or
+                if ((request_schema_binding == null and !self.core.isSchemaViewCurrent(view)) or
                     self.core.index_manager.writePlanGeneration() != prepared_write_plan_generation.?)
                     return error.PreparedGenerationChanged;
                 {
@@ -11215,7 +11232,7 @@ pub const DB = struct {
         const use_preprepared_rows = blk: {
             const rows = preprepared_rows orelse break :blk false;
             const pinned = request_schema_view orelse break :blk false;
-            if ((transaction_schema_binding == null and !self.core.isSchemaViewCurrent(pinned)) or
+            if ((request_schema_binding == null and !self.core.isSchemaViewCurrent(pinned)) or
                 rows.len != effective_req.writes.len) break :blk false;
             const expected_plan_generation = prepared_write_plan_generation orelse break :blk false;
             if (self.core.index_manager.writePlanGeneration() != expected_plan_generation) break :blk false;
@@ -11231,7 +11248,7 @@ pub const DB = struct {
         // serialized fallback; AROW v2 never encodes without its compiled
         // physical layout.
         var apply_schema_view: ?schema_registry_mod.SchemaView = if (!use_preprepared_rows and relationalColumns(self) != null)
-            if (transaction_schema_binding != null)
+            if (request_schema_binding != null)
                 if (request_schema_view) |view| view.clone() else null
             else
                 self.core.acquireSchemaView()
@@ -11547,7 +11564,13 @@ pub const DB = struct {
                 // after those metadata fields have been finalized.
                 if (index_stage) |*stage| if (prepared_relational) |*prepared| {
                     const keys = &prepared_index_keys.?;
-                    const row = if (use_preprepared_rows) i else try keys.appendPrepared(prepared);
+                    const row = if (use_preprepared_rows) i else if (apply_schema_view) |view|
+                        if (relational_index_snapshot.?.plan.schemaView().epoch == view.epoch)
+                            try keys.appendPrepared(prepared)
+                        else
+                            try keys.appendPreparedFromSchema(prepared, view)
+                    else
+                        return error.PreparedGenerationChanged;
                     const plan = relational_index_snapshot.?.plan;
                     // Effective writes/deletes are coalesced before this loop,
                     // so the pinned base is the exact prior row for each key.

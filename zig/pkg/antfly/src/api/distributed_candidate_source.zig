@@ -62,6 +62,7 @@ pub const DistributedCandidateSource = struct {
         binding: @import("../system_catalog/domain.zig").BindingSource,
         names: []const []const u8,
         physical: ?[][]u8 = null,
+        external_physical: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
 
         fn resolve(self: *@This(), table: []const u8) !?[]const u8 {
             // Curated endpoints outside this resolver's declared target retain
@@ -75,15 +76,24 @@ pub const DistributedCandidateSource = struct {
         }
         fn boundTable(ptr: *anyopaque, table: []const u8) anyerror!?[]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.resolve(table);
+            if (try self.resolve(table)) |physical| return physical;
+            // Curated endpoints may target a table outside this resolver's
+            // candidate set. Pin that table independently when writing the
+            // resolution artifact, so promotion can later redirect its old
+            // document even if the logical name is rebound.
+            if (self.external_physical.get(table)) |physical| return physical;
+            const a = self.arena.allocator();
+            const physical = try self.binding.bindOne(a, table);
+            try self.external_physical.put(a, try a.dupe(u8, table), physical);
+            return physical;
         }
         fn get(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return getFn(&self.raw, alloc, (try self.resolve(table)) orelse return error.TableNotFound, key);
+            return getFn(&self.raw, alloc, (try boundTable(ptr, table)) orelse return error.TableNotFound, key);
         }
         fn getMany(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return getManyFn(&self.raw, alloc, (try self.resolve(table)) orelse return error.TableNotFound, keys, ctx, consume);
+            return getManyFn(&self.raw, alloc, (try boundTable(ptr, table)) orelse return error.TableNotFound, keys, ctx, consume);
         }
         fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, prefix: []const u8, opts: CandidateSource.ScanOptions, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -551,6 +561,43 @@ test "DistributedCandidateSource system catalog batch binds once and retains the
     defer next.deinit(alloc);
     try testing.expectEqualStrings("table:replacement", (try next.source.boundTable("entities")).?);
     try testing.expectEqual(@as(usize, 2), binding.calls);
+}
+
+test "DistributedCandidateSource pins a curated endpoint outside the candidate table" {
+    const alloc = testing.allocator;
+    const Binding = struct {
+        calls: usize = 0,
+        external: []const u8 = "table:old",
+        fn bind(ptr: *anyopaque, a: std.mem.Allocator, names: []const []const u8) anyerror![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try testing.expectEqual(@as(usize, 1), names.len);
+            try testing.expectEqualStrings("events", names[0]);
+            const result = try a.alloc([]u8, 1);
+            result[0] = try a.dupe(u8, self.external);
+            return result;
+        }
+    };
+    var binding: Binding = .{};
+    var fake = FakeTableReadSource{ .alloc = alloc, .table = "table:old" };
+    defer fake.docs.deinit(alloc);
+    try fake.docs.put(alloc, "event:one", "{\"canonical_name\":\"One\"}");
+    var adapter = DistributedCandidateSource{ .reads = fake.source(), .catalog_binding = .{ .ptr = &binding, .bind_fn = Binding.bind } };
+    const batch = try adapter.candidateSource().beginBatch(alloc, &.{"entities"});
+    defer batch.deinit(alloc);
+    try testing.expectEqualStrings("table:old", (try batch.source.boundTable("events")).?);
+    const doc = (try batch.source.get(alloc, "events", "event:one")).?;
+    defer alloc.free(doc);
+    try @import("antfly-json").testing.expectSubsetJsonText(alloc, "{\"canonical_name\":\"One\"}", doc);
+    binding.external = "table:new";
+    var collected = CollectCtx{ .alloc = alloc };
+    defer collected.deinit();
+    try batch.source.vtable.get_many.?(batch.source.ptr, alloc, "events", &.{"event:one"}, &collected, CollectCtx.consume);
+    try testing.expectEqual(@as(usize, 1), fake.point_query_calls);
+    try testing.expectEqual(@as(usize, 1), collected.keys.items.len);
+    try @import("antfly-json").testing.expectSubsetJsonText(alloc, "{\"canonical_name\":\"One\"}", collected.values.items[0]);
+    try testing.expectEqualStrings("table:old", (try batch.source.boundTable("events")).?);
+    try testing.expectEqual(@as(usize, 1), binding.calls);
 }
 
 test "DistributedCandidateSource system catalog bulk reads are bounded and preserve missing keys" {

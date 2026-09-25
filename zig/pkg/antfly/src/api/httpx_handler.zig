@@ -7872,6 +7872,7 @@ pub const AntflyApiHandler = struct {
                 error.LsmRootWriterAlreadyOpen,
                 error.ResidentDbRetryRequired,
                 error.StorageReadTemporarilyUnavailable,
+                error.StorageKernelOwnerStaleDescriptor,
                 error.ConcurrencyUnavailable,
                 error.GenerationTransitionActive,
                 => {
@@ -7997,6 +7998,7 @@ pub const AntflyApiHandler = struct {
             error.LsmRootWriterAlreadyOpen,
             error.ResidentDbRetryRequired,
             error.StorageReadTemporarilyUnavailable,
+            error.StorageKernelOwnerStaleDescriptor,
             error.ConcurrencyUnavailable,
             error.RestoreStagingInProgress,
             error.GenerationTransitionActive,
@@ -13216,6 +13218,110 @@ test "httpx lookup revalidates missing catalog bindings across restore" {
             try std.testing.expectEqual(@as(usize, 1), fake.lookups);
         }
     }
+}
+
+test "httpx antfly scan reports a stale owner descriptor as temporarily unavailable" {
+    const alloc = std.testing.allocator;
+    const FakeReads = struct {
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnexpectedTestCall;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnexpectedTestCall;
+        }
+
+        fn scanStream(_: *anyopaque, _: std.mem.Allocator, table_name: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency, _: table_reads.ScanStreamSink) !bool {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return error.StorageKernelOwnerStaleDescriptor;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedTestCall;
+        }
+    };
+    var status = LookupStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), .{
+        .ptr = undefined,
+        .vtable = &.{ .lookup = FakeReads.lookup, .scan = FakeReads.scan, .scan_stream = FakeReads.scanStream, .query = FakeReads.query },
+    }, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/documents");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, undefined, &request);
+    defer ctx.deinit();
+    var response = try handler.scanKeys(&ctx, "docs");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+}
+
+test "httpx antfly scan honors optional body and documented bad requests" {
+    const alloc = std.testing.allocator;
+    const db_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-httpx-handler-scan-{d}", .{platform_time.monotonicNs()});
+    defer alloc.free(db_path);
+
+    var fs_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer fs_io.deinit();
+    std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
+
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
+    }
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value = "{\"title\":\"alpha\",\"body\":\"hello\"}",
+            },
+        },
+        .timestamp_ns = 4321,
+    });
+
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var source = LookupStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
+
+    var e2e_server: HttpxE2eServer = undefined;
+    e2e_server.init(alloc, &api_server) catch |err| switch (err) {
+        // Restricted test environments may forbid even loopback listeners.
+        // The same test runs normally in CI and release validation.
+        error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const scan_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/documents", .{base_url});
+    defer alloc.free(scan_url);
+
+    var bodyless = try requestWithRetry(&client, client_io.io(), .POST, scan_url, null, null, 20);
+    defer bodyless.deinit();
+    try std.testing.expectEqual(@as(u16, 200), bodyless.status.code);
+    try std.testing.expectEqualStrings("application/x-ndjson", bodyless.contentType().?);
+    try std.testing.expect(std.mem.indexOf(u8, bodyless.body.?, "\"_id\":\"doc:a\"") != null);
+
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    var unsupported = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        scan_url,
+        "{\"filter_query\":{\"match_phrase\":\"paid receipt\",\"field\":\"body\"}}",
+        &headers,
+        20,
+    );
+    defer unsupported.deinit();
+    try std.testing.expectEqual(@as(u16, 400), unsupported.status.code);
+    try std.testing.expectEqualStrings("unsupported scan filter query", unsupported.body.?);
 }
 
 test "httpx antfly lookup decodes percent-encoded path keys" {

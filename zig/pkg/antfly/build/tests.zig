@@ -1762,11 +1762,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "API kernel create ",
         "API kernel failed fallible create releases unpublished state",
         "API kernel runtime I/O ",
+        "DistributedCandidateSource",
+        "DistributedEntitySink",
+        "prefixUpperBoundAlloc",
     };
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
     const api_http_runtime_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = &api_http_runtime_default_filters,
+        .filters = @import("test_support.zig").compileFiltersWithAnchors(b, &.{"api module compiles"}, api_http_runtime_filters),
         // The native-generation merge raised this linked API/DB harness to
         // 16.01 GB in macOS ReleaseFast codegen. Reserve measured usage plus
         // headroom; the shared runner still caps aggregate compilation.
