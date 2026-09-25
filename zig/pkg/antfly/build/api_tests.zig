@@ -232,6 +232,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx antfly reads preserve availability and terminal failures",
         "httpx lookup revalidates missing catalog bindings across restore",
         "httpx antfly scan honors optional body and documented bad requests",
+        "httpx antfly scan reports a stale owner descriptor as temporarily unavailable",
         "httpx multi batch route uses the batch commit hook and public response contract",
         "httpx stable transaction commit durably hands off recovery before acknowledgement",
         "httpx shared registrar keeps root probes and rejects removed data aliases",
