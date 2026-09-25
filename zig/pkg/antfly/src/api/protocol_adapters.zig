@@ -1464,7 +1464,7 @@ fn buildA2aDispatcher(
     authenticated_identity: anytype,
 ) !a2a.Dispatcher {
     const Server = @TypeOf(server_ptr);
-    const HandlerKind = enum { query_builder, retrieval };
+    const HandlerKind = enum { query_builder, retrieval, research };
     const HandlerContext = struct {
         server: Server,
         authorization: ?[]const u8,
@@ -1486,6 +1486,7 @@ fn buildA2aDispatcher(
             return switch (ctx.kind) {
                 .query_builder => "query-builder",
                 .retrieval => "retrieval",
+                .research => "research",
             };
         }
 
@@ -1494,6 +1495,7 @@ fn buildA2aDispatcher(
             return switch (ctx.kind) {
                 .query_builder => .{ .id = "query-builder", .name = "Query Builder", .description = "Translate natural language into Antfly query requests", .tags = &.{ "antfly", "query" } },
                 .retrieval => .{ .id = "retrieval", .name = "Retrieval", .description = "Run Antfly retrieval and generation workflows", .tags = &.{ "antfly", "retrieval" } },
+                .research => .{ .id = "research", .name = "Research", .description = "Plan, research in parallel and write a cited report over Antfly tables and the web", .tags = &.{ "antfly", "research" } },
             };
         }
 
@@ -1502,6 +1504,7 @@ fn buildA2aDispatcher(
             return switch (ctx.kind) {
                 .query_builder => try ctx.executeQueryBuilder(alloc, request_ctx, queue),
                 .retrieval => try ctx.executeRetrieval(alloc, request_ctx, queue),
+                .research => try ctx.executeResearch(alloc, request_ctx, queue),
             };
         }
 
@@ -1525,6 +1528,43 @@ fn buildA2aDispatcher(
             const parsed: std.json.Value = std.json.parseFromSliceLeaky(std.json.Value, alloc, resp.body, .{}) catch .{ .string = resp.body };
             try queue.artifact(alloc, request_ctx.task_id, request_ctx.context_id, "query", try a2a.dataPart(alloc, parsed));
             try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "completed", "query built");
+        }
+
+        /// Research data parts may carry `queries` (or a `table`), and the
+        /// research request's `generator`, `chain`, `steps`, `budget`, `tools`
+        /// and `agent_knowledge`. The run is non-interactive.
+        fn executeResearch(ctx: *@This(), alloc: std.mem.Allocator, request_ctx: a2a.RequestContext, queue: *a2a.EventQueue) !void {
+            const text = try a2a.messageText(alloc, request_ctx.message);
+            var body = std.json.ObjectMap.empty;
+            try body.put(alloc, "query", .{ .string = text });
+            try body.put(alloc, "stream", .{ .bool = true });
+            try body.put(alloc, "interactive", .{ .bool = false });
+            var queries = std.json.Array.init(alloc);
+            if (a2a.firstDataPart(request_ctx.message)) |data| {
+                if (data == .object) {
+                    if (data.object.get("queries")) |value| {
+                        if (value == .array) queries = value.array;
+                    } else if (jsonStringObjectField(data.object, "table")) |table| {
+                        var query_obj = std.json.ObjectMap.empty;
+                        try query_obj.put(alloc, "table", .{ .string = table });
+                        try queries.append(.{ .object = query_obj });
+                    }
+                    inline for (.{ "generator", "chain", "steps", "budget", "tools", "agent_knowledge", "research_state" }) |field| {
+                        if (data.object.get(field)) |value| try body.put(alloc, field, value);
+                    }
+                }
+            }
+            try body.put(alloc, "queries", .{ .array = queries });
+            const body_json = try stringifyJsonValue(alloc, .{ .object = body });
+            try ctx.server.executeA2aResearch(
+                alloc,
+                body_json,
+                request_ctx.task_id,
+                request_ctx.context_id,
+                queue,
+                ctx.query_embedding_security_scope,
+                ctx.authenticated_identity,
+            );
         }
 
         fn executeRetrieval(ctx: *@This(), alloc: std.mem.Allocator, request_ctx: a2a.RequestContext, queue: *a2a.EventQueue) !void {
@@ -1581,7 +1621,7 @@ fn buildA2aDispatcher(
         .task_store = server_ptr.a2a_tasks.iface(),
         .task_authority = task_authority,
     };
-    const contexts = try dispatcher_alloc.alloc(HandlerContext, 2);
+    const contexts = try dispatcher_alloc.alloc(HandlerContext, 3);
     contexts[0] = .{
         .server = server_ptr,
         .authorization = authorization,
@@ -1596,8 +1636,14 @@ fn buildA2aDispatcher(
         .authenticated_identity = authenticated_identity,
         .kind = .retrieval,
     };
-    try dispatcher.addHandler(dispatcher_alloc, contexts[0].iface());
-    try dispatcher.addHandler(dispatcher_alloc, contexts[1].iface());
+    contexts[2] = .{
+        .server = server_ptr,
+        .authorization = authorization,
+        .query_embedding_security_scope = query_embedding_security_scope,
+        .authenticated_identity = authenticated_identity,
+        .kind = .research,
+    };
+    for (contexts) |*context| try dispatcher.addHandler(dispatcher_alloc, context.iface());
     return dispatcher;
 }
 

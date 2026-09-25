@@ -17,6 +17,9 @@ const openapi = @import("antfly_client_openapi");
 const httpx = @import("httpx");
 
 const retrieval_agent_timeout_ms = 300_000;
+/// Research runs and job advances are bounded by the request's declared
+/// budget (at most 30 minutes); allow that plus transport slack.
+const research_agent_timeout_ms = 1_860_000;
 
 pub const ApiError = struct {
     status_code: u16,
@@ -604,6 +607,108 @@ pub const AntflyClient = struct {
             .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null,
             .allocator = self.allocator,
         };
+    }
+
+    pub fn researchAgent(self: *AntflyClient, body: openapi.types.ResearchAgentRequest) !openapi.client.RawResponse {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/research", .{self.inner.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var auth_headers: ?[1][2][]const u8 = null;
+        if (self.inner.auth_header) |h| auth_headers = .{h};
+        var resp = try self.inner.http.post(url, .{
+            .json = json_body,
+            .headers = if (auth_headers) |*h| h[0..] else null,
+            .timeout_ms = research_agent_timeout_ms,
+        });
+        defer resp.deinit();
+        return .{
+            .status_code = resp.status.code,
+            .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null,
+            .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Execute a research-agent request while forwarding SSE bytes as they
+    /// arrive. The body has already been written to `writer`.
+    pub fn researchAgentToWriter(
+        self: *AntflyClient,
+        body: openapi.types.ResearchAgentRequest,
+        writer: anytype,
+    ) !openapi.client.RawResponse {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/research", .{self.inner.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var auth_headers: ?[1][2][]const u8 = null;
+        if (self.inner.auth_header) |h| auth_headers = .{h};
+        var resp = try self.inner.http.requestToWriter(.POST, url, .{
+            .json = json_body,
+            .headers = if (auth_headers) |*h| h[0..] else null,
+            .timeout_ms = research_agent_timeout_ms,
+        }, writer, null, null);
+        defer resp.deinit();
+        return .{
+            .status_code = resp.status.code,
+            .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Start or advance a durable research job. Both may run model phases, so
+    /// they use the research timeout. A 409 (another advance holds the lease)
+    /// is returned to the caller rather than treated as an error.
+    fn researchJobPost(self: *AntflyClient, url: []const u8, json_body: ?[]const u8) !openapi.ApiResponse(openapi.types.ResearchJob) {
+        var auth_headers: ?[1][2][]const u8 = null;
+        if (self.inner.auth_header) |h| auth_headers = .{h};
+        var resp = try self.inner.http.post(url, .{
+            .json = json_body,
+            .headers = if (auth_headers) |*h| h[0..] else null,
+            .timeout_ms = research_agent_timeout_ms,
+        });
+        var parsed = try openapi.ApiResponse(openapi.types.ResearchJob).fromResponse(self.allocator, &resp);
+        if (parsed.status_code >= 300 and parsed.status_code != 409) {
+            defer parsed.deinit();
+            return self.apiErrorFromResponse(&parsed);
+        }
+        return parsed;
+    }
+
+    pub fn startResearchJob(self: *AntflyClient, body: openapi.types.ResearchJobStartRequest) !openapi.ApiResponse(openapi.types.ResearchJob) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/research/jobs", .{self.inner.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        return self.researchJobPost(url, json_body);
+    }
+
+    pub fn advanceResearchJob(self: *AntflyClient, job_id: []const u8, max_phases: ?i64) !openapi.ApiResponse(openapi.types.ResearchJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/research/jobs/{s}/advance", .{ self.inner.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, openapi.types.ResearchJobAdvanceRequest{ .max_phases = max_phases });
+        defer self.allocator.free(json_body);
+        return self.researchJobPost(url, json_body);
+    }
+
+    pub fn getResearchJob(self: *AntflyClient, job_id: []const u8) !openapi.ApiResponse(openapi.types.ResearchJob) {
+        var resp = try self.inner.getResearchJob(job_id);
+        if (resp.status_code >= 300) {
+            defer resp.deinit();
+            return self.apiErrorFromResponse(&resp);
+        }
+        return resp;
+    }
+
+    pub fn cancelResearchJob(self: *AntflyClient, job_id: []const u8) !openapi.ApiResponse(openapi.types.ResearchJob) {
+        var resp = try self.inner.cancelResearchJob(job_id);
+        if (resp.status_code >= 300) {
+            defer resp.deinit();
+            return self.apiErrorFromResponse(&resp);
+        }
+        return resp;
     }
 
     pub fn queryBuilder(self: *AntflyClient, body: openapi.types.QueryBuilderRequest) !openapi.ApiResponse(openapi.types.QueryBuilderResult) {

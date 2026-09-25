@@ -269,6 +269,38 @@ type (
 	PruneStats            = oapi.PruneStats
 	RetrievalAgentSteps   = oapi.RetrievalAgentSteps
 
+	// Research Agent types
+	ResearchAgentRequest            = oapi.ResearchAgentRequest
+	ResearchAgentResult             = oapi.ResearchAgentResult
+	ResearchAgentSteps              = oapi.ResearchAgentSteps
+	ResearchBudget                  = oapi.ResearchBudget
+	ResearchState                   = oapi.ResearchState
+	ResearchPhase                   = oapi.ResearchPhase
+	ResearchStepConfig              = oapi.ResearchStepConfig
+	ResearchRetrievalStepConfig     = oapi.ResearchRetrievalStepConfig
+	ResearchWriteStepConfig         = oapi.ResearchWriteStepConfig
+	ResearchPlan                    = oapi.ResearchPlan
+	ResearchSubQuestion             = oapi.ResearchSubQuestion
+	ResearchSubQuestionSources      = oapi.ResearchSubQuestionSources
+	ResearchSubQuestionStatus       = oapi.ResearchSubQuestionStatus
+	ResearchClaim                   = oapi.ResearchClaim
+	ResearchFinding                 = oapi.ResearchFinding
+	ResearchEvidence                = oapi.ResearchEvidence
+	ResearchEvidenceSource          = oapi.ResearchEvidenceSource
+	ResearchReflection              = oapi.ResearchReflection
+	ResearchReport                  = oapi.ResearchReport
+	ResearchReportSection           = oapi.ResearchReportSection
+	ResearchCitation                = oapi.ResearchCitation
+	ResearchUnsupportedClaim        = oapi.ResearchUnsupportedClaim
+	ResearchVerification            = oapi.ResearchVerification
+	ResearchUsage                   = oapi.ResearchUsage
+	ResearchIncompleteDetails       = oapi.ResearchIncompleteDetails
+	ResearchIncompleteDetailsReason = oapi.ResearchIncompleteDetailsReason
+	ResearchJob                     = oapi.ResearchJob
+	ResearchJobState                = oapi.ResearchJobState
+	ResearchJobStartRequest         = oapi.ResearchJobStartRequest
+	ResearchJobAdvanceRequest       = oapi.ResearchJobAdvanceRequest
+
 	// SSE event types for streaming
 	SSEEvent         = oapi.SSEEvent
 	SSEStepStarted   = oapi.SSEStepStarted
