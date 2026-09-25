@@ -92,6 +92,10 @@ const initialState: ResearchStreamState = {
 export function useResearchStream() {
   const [state, setState] = useState<ResearchStreamState>(initialState);
   const abortControllerRef = useRef<AbortController | null>(null);
+  // Identifies the current run. Stop, reset and every new start advance it,
+  // so a run that is still connecting can never deliver callbacks or install
+  // its controller afterwards.
+  const runRef = useRef(0);
 
   const startStream = useCallback(
     async ({
@@ -106,7 +110,14 @@ export function useResearchStream() {
       // Abort any existing stream
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
+        abortControllerRef.current = null;
       }
+      runRef.current += 1;
+      const runId = runRef.current;
+      const isCurrent = () => runRef.current === runId;
+      const update: typeof setState = (next) => {
+        if (isCurrent()) setState(next);
+      };
 
       // Reset state
       setState({ ...initialState, status: "streaming" });
@@ -114,41 +125,41 @@ export function useResearchStream() {
       try {
         const controller = await streamResearch(url, request, headers, {
           onStepStarted: (step) => {
-            setState((prev) => ({ ...prev, activeSteps: [...prev.activeSteps, step] }));
+            update((prev) => ({ ...prev, activeSteps: [...prev.activeSteps, step] }));
           },
           onStepCompleted: (step) => {
-            setState((prev) => ({
+            update((prev) => ({
               ...prev,
               steps: [...prev.steps, step],
               activeSteps: prev.activeSteps.filter((s) => s.id !== step.id),
             }));
           },
           onPlan: (plan) => {
-            setState((prev) => ({ ...prev, plan }));
+            update((prev) => ({ ...prev, plan }));
           },
           onSubQuestionStarted: (event) => {
-            setState((prev) => ({
+            update((prev) => ({
               ...prev,
               subQuestionProgress: [...prev.subQuestionProgress, event],
             }));
           },
           onFinding: (finding) => {
-            setState((prev) => ({ ...prev, findings: [...prev.findings, finding] }));
+            update((prev) => ({ ...prev, findings: [...prev.findings, finding] }));
           },
           onReflection: (reflection) => {
-            setState((prev) => ({ ...prev, reflections: [...prev.reflections, reflection] }));
+            update((prev) => ({ ...prev, reflections: [...prev.reflections, reflection] }));
           },
           onSection: (section) => {
-            setState((prev) => ({ ...prev, sections: [...prev.sections, section] }));
+            update((prev) => ({ ...prev, sections: [...prev.sections, section] }));
           },
           onVerification: (verification) => {
-            setState((prev) => ({ ...prev, verification }));
+            update((prev) => ({ ...prev, verification }));
           },
           onGeneration: (chunk) => {
-            setState((prev) => ({ ...prev, reportMarkdown: prev.reportMarkdown + chunk }));
+            update((prev) => ({ ...prev, reportMarkdown: prev.reportMarkdown + chunk }));
           },
           onResearchAgentResult: (result) => {
-            setState((prev) => ({
+            update((prev) => ({
               ...prev,
               result,
               plan: result.plan ?? prev.plan,
@@ -161,18 +172,23 @@ export function useResearchStream() {
             }));
           },
           onComplete: () => {
-            setState((prev) => ({ ...prev, status: "done" }));
+            update((prev) => ({ ...prev, status: "done" }));
           },
           onError: (err) => {
             const errorObj = err instanceof Error ? err : new Error(String(err));
-            setState((prev) => ({ ...prev, status: "error", error: errorObj }));
+            update((prev) => ({ ...prev, status: "error", error: errorObj }));
           },
         });
 
+        // Stopped or superseded while connecting: end this run now.
+        if (!isCurrent()) {
+          controller.abort();
+          return;
+        }
         abortControllerRef.current = controller;
       } catch (err) {
         const errorObj = err instanceof Error ? err : new Error(String(err));
-        setState((prev) => ({ ...prev, status: "error", error: errorObj }));
+        update((prev) => ({ ...prev, status: "error", error: errorObj }));
       }
     },
     []
@@ -182,6 +198,7 @@ export function useResearchStream() {
    * Stop the current stream
    */
   const stopStream = useCallback(() => {
+    runRef.current += 1;
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;

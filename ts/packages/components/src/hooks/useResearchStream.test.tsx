@@ -209,4 +209,44 @@ describe("useResearchStream", () => {
 
     expect(firstAbort).toHaveBeenCalled();
   });
+
+  it("ignores a run that is stopped while it is still connecting", async () => {
+    let finishConnect: (() => void) | undefined;
+    let callbacks: Parameters<typeof utils.streamResearch>[3] | undefined;
+    const lateController = new AbortController();
+    vi.mocked(utils.streamResearch).mockImplementation(async (_url, _request, _headers, cbs) => {
+      callbacks = cbs;
+      await new Promise<void>((resolve) => {
+        finishConnect = resolve;
+      });
+      return lateController;
+    });
+
+    const { result } = renderHook(() => useResearchStream());
+    let started: Promise<void> | undefined;
+    act(() => {
+      started = result.current.startStream({ url: "http://localhost:8080/db/v1", request });
+    });
+    await waitFor(() => expect(finishConnect).toBeDefined());
+
+    // Stop before streamResearch resolves.
+    act(() => {
+      result.current.stopStream();
+    });
+    await act(async () => {
+      finishConnect?.();
+      await started;
+    });
+
+    // The controller that arrived after the stop is aborted, and callbacks
+    // from the stopped run do not change state.
+    expect(lateController.signal.aborted).toBe(true);
+    act(() => {
+      callbacks?.onPlan?.({ brief: "late", sub_questions: [] });
+      callbacks?.onError?.(new Error("late"));
+    });
+    expect(result.current.plan).toBeNull();
+    expect(result.current.error).toBeNull();
+    expect(result.current.status).toBe("done");
+  });
 });

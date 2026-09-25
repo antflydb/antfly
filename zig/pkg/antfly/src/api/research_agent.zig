@@ -1203,8 +1203,12 @@ const Run = struct {
     // -- state --------------------------------------------------------------
 
     fn restore(self: *Run, state: State) !void {
+        // Continuation state is client-carried: its counters decide how much
+        // budget remains, so a forged value must be rejected, never trusted.
+        const round = state.round orelse 0;
+        if (round < 0 or round > self.budget.max_rounds) return error.InvalidResearchAgentRequest;
         self.phase = state.phase;
-        self.round = @intCast(@max(state.round orelse 0, 0));
+        self.round = @intCast(round);
         if (state.plan) |plan| {
             self.brief = plan.brief;
             self.success_criteria = plan.success_criteria orelse &.{};
@@ -1220,10 +1224,21 @@ const Run = struct {
         self.citations = state.citations orelse &.{};
         self.verification = state.verification;
         if (state.usage) |usage| {
-            self.llm_calls = usage.llm_calls orelse 0;
-            self.tool_calls = usage.tool_calls orelse 0;
-            self.researcher_runs = usage.researcher_runs orelse 0;
-            self.prior_elapsed_ms = usage.elapsed_ms orelse 0;
+            const llm_calls = usage.llm_calls orelse 0;
+            const tool_calls = usage.tool_calls orelse 0;
+            const researcher_runs = usage.researcher_runs orelse 0;
+            const elapsed_ms = usage.elapsed_ms orelse 0;
+            if (llm_calls < 0 or llm_calls > self.budget.max_llm_calls) return error.InvalidResearchAgentRequest;
+            if (tool_calls < 0 or tool_calls > self.budget.max_tool_calls) return error.InvalidResearchAgentRequest;
+            if (researcher_runs < 0 or elapsed_ms < 0) return error.InvalidResearchAgentRequest;
+            self.llm_calls = llm_calls;
+            self.tool_calls = tool_calls;
+            self.researcher_runs = researcher_runs;
+            self.prior_elapsed_ms = elapsed_ms;
+        } else if (state.phase != .plan) {
+            // Every checkpoint after planning carries usage (the plan phase
+            // spends a model call); a state without it would reset the budget.
+            return error.InvalidResearchAgentRequest;
         }
     }
 
@@ -2208,4 +2223,26 @@ test "research retries never exceed the tool-call budget" {
         // With spare tool budget the retries run and produce findings.
         if (case[1] == 1 and max_tools == 6) try std.testing.expect(Count.queries.load(.monotonic) > 0);
     }
+}
+
+test "research rejects forged continuation counters" {
+    var fake = TestFake{};
+    const r = fake.runners(null);
+    const cases = [_][]const u8{
+        "{\"phase\":\"research\",\"round\":0,\"plan\":{\"brief\":\"b\",\"sub_questions\":[{\"id\":\"q1\",\"question\":\"x\",\"status\":\"pending\"}]},\"usage\":{\"llm_calls\":-1000,\"tool_calls\":0}}",
+        "{\"phase\":\"research\",\"round\":0,\"plan\":{\"brief\":\"b\",\"sub_questions\":[{\"id\":\"q1\",\"question\":\"x\",\"status\":\"pending\"}]},\"usage\":{\"llm_calls\":1,\"tool_calls\":-5}}",
+        "{\"phase\":\"research\",\"round\":0,\"plan\":{\"brief\":\"b\",\"sub_questions\":[{\"id\":\"q1\",\"question\":\"x\",\"status\":\"pending\"}]},\"usage\":{\"llm_calls\":999,\"tool_calls\":0}}",
+        "{\"phase\":\"research\",\"round\":0,\"plan\":{\"brief\":\"b\",\"sub_questions\":[{\"id\":\"q1\",\"question\":\"x\",\"status\":\"pending\"}]}}",
+        "{\"phase\":\"reflect\",\"round\":-1,\"plan\":{\"brief\":\"b\",\"sub_questions\":[]},\"usage\":{\"llm_calls\":1}}",
+        "{\"phase\":\"reflect\",\"round\":9,\"plan\":{\"brief\":\"b\",\"sub_questions\":[]},\"usage\":{\"llm_calls\":1}}",
+    };
+    for (cases) |state| {
+        const body = try std.fmt.allocPrint(std.testing.allocator,
+            \\{{"query":"q","queries":[{{"table":"docs"}}],"generator":{{"provider":"antfly","model":"test"}},"stream":false,"research_state":{s}}}
+        , .{state});
+        defer std.testing.allocator.free(body);
+        try std.testing.expectError(error.InvalidResearchAgentRequest, execute(std.testing.allocator, r[0], r[1], body, null, .{}));
+    }
+    // Nothing ran for any forged state.
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.load(.monotonic));
 }
