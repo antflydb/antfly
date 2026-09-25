@@ -154,12 +154,12 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
     else
         false;
     var restore_control_owner = false;
+    var accepted_control_guarded = false;
     if (comptime @hasField(BackendType, "completion_pool")) {
         // A transition sidecar may contain an accepted Raft entry whose WAL
         // publication was interrupted. It is an independent startup debt,
         // even if its BEGIN guard was lost or removed out of order.
-        if (try @import("completion_control_accepted.zig").hasAny(backend.storage.?, allocator, root_dir))
-            return error.CompletionRecoveryCapacityRequired;
+        accepted_control_guarded = try @import("completion_control_accepted.zig").hasAny(backend.storage.?, allocator, root_dir);
         const control_guard = @import("completion_control_guard.zig");
         // Only a single published owner with a trusted installation can enter
         // the bounded restoration path. Pending publication and accepted
@@ -181,6 +181,7 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
                 return error.CompletionRecoveryCapacityRequired;
             }
         }
+        if (accepted_control_guarded and !restore_control_owner) return error.CompletionRecoveryCapacityRequired;
     }
     if (accepted_pool_guarded) {
         if (!stable_address) return error.UnsupportedCompletionBackend;
@@ -279,7 +280,7 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
     }
     // An installed/accepted owner cannot become a fresh empty store merely
     // because its authoritative manifest disappeared.
-    if (!loaded_manifest and (installed_pool_guarded or accepted_pool_guarded or restore_control_owner)) return error.InvalidManifest;
+    if (!loaded_manifest and (installed_pool_guarded or accepted_pool_guarded or restore_control_owner or accepted_control_guarded)) return error.InvalidManifest;
     if (!loaded_manifest and options.create_if_missing) {
         const phase_start = beginOpenPhase(BackendType, backend, .ensuring_dirs);
         defer finishOpenPhase(BackendType, backend, .ensuring_dirs, phase_start);

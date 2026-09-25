@@ -861,11 +861,36 @@ pub fn Pool(comptime Backend: type) type {
                 .publication_bytes = proof.owners[0].publication_bytes,
                 .wal_bytes = proof.owners[0].append.bytes,
             });
+            errdefer held.destroy();
+            // A sidecar is only a retained accepted-entry obligation. Load it
+            // into the owner's prepaid buffer before ordinary WAL replay; the
+            // DATA v4 proof must later bind it to the committed Raft suffix.
+            var pending: ?completion.AcceptedIdentity = null;
+            for (self.control_accepted_paths[1..]) |other| {
+                if (self.io.storage().fileSize(other)) |_| return error.CompletionRecoveryCapacityRequired else |err| {
+                    if (err != error.FileNotFound) return err;
+                }
+            }
+            const accepted_size: ?u64 = self.io.storage().fileSize(self.control_accepted_paths[0]) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            if (accepted_size) |size| {
+                if (size == 0 or size > held.accepted.len) return error.InvalidCompletionSlot;
+                const bytes = held.accepted[0..@intCast(size)];
+                try self.io.storage().readFileRangeInto(alloc, self.control_accepted_paths[0], 0, bytes);
+                const accepted = try control_accepted.Accepted.decode(bytes);
+                if (accepted.slot_index != 0 or !std.mem.eql(u8, &accepted.txn_id, &owner.declaration.txn_id) or
+                    !std.meta.eql(accepted.begin, owner.guard.record.begin)) return error.InvalidCompletionSlot;
+                held.accepted_len = bytes.len;
+                pending = .{ .term = accepted.transition.term, .index = accepted.transition.index, .digest = accepted.transition.digest };
+            }
             self.control_owners[0] = .{
                 .held = held,
                 .output_pin = output_pin,
                 .declaration = owner.declaration,
                 .begin = .{ .term = owner.guard.record.begin.term, .index = owner.guard.record.begin.index, .digest = owner.guard.record.begin.digest },
+                .pending = pending,
             };
             self.startup_reconciliation_pending = true;
             self.restored_control_pending = true;
@@ -1205,6 +1230,27 @@ pub fn Pool(comptime Backend: type) type {
             if (terminal) try self.checkpointTerminalControlOwner(backend, alloc, owner_index);
             self.failed = false;
             return true;
+        }
+
+        /// A crash after native WAL publication can leave the accepted
+        /// sidecar behind. V4 first proves the same committed Raft entry and
+        /// exact native progress; only then may this file be retired.
+        pub fn retireRestoredControlSidecar(self: *Self, backend: *Backend, owner_index: usize) !void {
+            if (!self.restored or self.failed or !self.ready or owner_index >= self.control_owners.len)
+                return error.RecoveryRequired;
+            if (self.control_owners[owner_index] == null) return error.InvalidCompletionSlot;
+            const active = &self.control_owners[owner_index].?;
+            const pending = active.pending orelse return error.InvalidCompletionSlot;
+            if (!std.meta.eql(pending, active.latest orelse return error.InvalidCompletionSlot) or
+                active.held.accepted_len == 0) return error.InvalidCompletionSlot;
+            self.failed = true;
+            errdefer backend.fenceFailedBulkWal();
+            try self.io.storage().deleteFileAbsolute(self.control_accepted_paths[owner_index]);
+            try self.io.storage().syncParentAbsolute(self.control_accepted_paths[owner_index]);
+            active.pending = null;
+            active.transition = null;
+            active.held.accepted_len = 0;
+            self.failed = false;
         }
 
         /// One retained owner spends its predeclared output after the final
@@ -2102,6 +2148,26 @@ pub fn Pool(comptime Backend: type) type {
             if (applied.index < latest.index or
                 (applied.index == latest.index and !std.meta.eql(applied, latest)))
                 return error.CompletionRecoveryCapacityRequired;
+            if (active.pending) |pending| {
+                if (std.meta.eql(pending, latest)) {
+                    // WAL publication completed, but sidecar unlink did not.
+                    // Only an exact committed v4 proof may retire this file.
+                    return;
+                }
+                // This first restorable sidecar profile excludes interleaved
+                // Raft indices. It can then reclassify against the exact
+                // replayed predecessor without inventing metadata state.
+                if (pending.index != applied.index +| 1 or pending.index <= latest.index)
+                    return error.CompletionRecoveryCapacityRequired;
+                var decoded = try entry_codec.decode(alloc, active.held.accepted[control_accepted.header_bytes..active.held.accepted_len]);
+                defer decoded.deinit();
+                if (!std.mem.eql(u8, &decoded.digest, &pending.digest) or
+                    decoded.entry.previous_index != applied.index or decoded.entry.previous_term != applied.term)
+                    return error.InvalidCompletionSlot;
+                const target = try self.classifyOwnedControlTransition(backend, alloc, &decoded) orelse return error.InvalidCompletionSlot;
+                if (target.slot_index != 0) return error.InvalidCompletionSlot;
+                active.transition = target.transition;
+            }
         }
 
         /// Called only after the complete startup v2 BEGIN proof and document

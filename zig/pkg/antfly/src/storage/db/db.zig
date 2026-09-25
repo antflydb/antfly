@@ -28393,6 +28393,17 @@ pub const DB = struct {
         return @import("../completion_native_guard.zig").Guard(DB).controlLeaseV3(stable, group_id, node_id);
     }
 
+    pub fn acquireControlCompletionLeaseV4(self: *DB, group_id: u64, node_id: u64) !@import("kernel_owner_abi").completion_pool.ControlLeaseV4 {
+        const stable = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const backend = self.core.primary_store_owner.lsmBackend() orelse return error.NotFound;
+            if (backend.completion_pool == null) return error.NotFound;
+            break :blk self.async_context.completion_pool_owner orelse return error.CompletionAdmissionUnavailable;
+        };
+        return @import("../completion_native_guard.zig").Guard(DB).controlLeaseV4(stable, group_id, node_id);
+    }
+
     pub fn attestCompletionBacking(self: *DB, group_id: u64, node_id: u64) !@import("kernel_owner_abi").completion_pool.NativeAttestation {
         const stable = self.async_context.completion_pool_owner orelse return error.CompletionAdmissionUnavailable;
         return @import("../completion_native_guard.zig").Guard(DB).attest(stable, group_id, node_id);
@@ -144549,7 +144560,64 @@ test "workload admission physical completion restores one BEGIN owner after exac
         var result: abi.CheckResult = undefined;
         try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
         lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = 2, .last_index = 2, .payloads = proposal.proposals });
-        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 2, payloads[0]));
+        try std.testing.expect(pool.control_owners[0].?.pending != null);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+    }
+    {
+        var storage = try @import("../lsm_backend/storage_io.zig").NativeStorage.init(alloc, .threaded);
+        defer storage.deinit();
+        const accepted_path = try std.fs.path.join(alloc, &.{ path, @import("../lsm_backend/completion_control_accepted.zig").filenames[0] });
+        defer alloc.free(accepted_path);
+        const size = try storage.storage().fileSize(accepted_path);
+        const original = try alloc.alloc(u8, @intCast(size));
+        defer alloc.free(original);
+        try storage.storage().readFileRangeInto(alloc, accepted_path, 0, original);
+        const damaged = try alloc.dupe(u8, original);
+        defer alloc.free(damaged);
+        damaged[damaged.len - 1] ^= 1;
+        try storage.storage().writeFileAbsolute(accepted_path, damaged);
+        try std.testing.expectError(error.CompletionSlotChecksumMismatch, DB.open(alloc, path, reopen));
+        try storage.storage().writeFileAbsolute(accepted_path, "");
+        try std.testing.expectError(error.InvalidCompletionSlot, DB.open(alloc, path, reopen));
+        try storage.storage().writeFileAbsolute(accepted_path, original);
+    }
+    {
+        var db = try DB.open(alloc, path, reopen);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const pool = db.core.primary_store_owner.lsmBackend().?.completion_pool.?;
+        try std.testing.expect(pool.restored_control_pending and !pool.ready);
+        const old = try db.acquireControlCompletionLeaseV3(2, 7);
+        defer old.vtable.release(old.context);
+        var old_proof: abi.ControlDurableLogV3 = .{
+            .mode = .startup_complete,
+            .last_index = 2,
+            .commit_index = 2,
+            .count = 1,
+            .document = .{ .mode = .startup_complete, .last_index = 2, .commit_index = 2 },
+        };
+        old_proof.begins[0] = .{ .expected = .{ .term = 1, .index = 1, .payload_digest = begin_digest }, .present = 1, .observed_term = 1, .observed_digest = begin_digest };
+        old_proof.latest[0] = old_proof.begins[0];
+        try std.testing.expectEqual(runtime_failure_abi.Status.completion_admission_unavailable, old.vtable.reconcile_durable(old.context, &old_proof));
+        const lease = try db.acquireControlCompletionLeaseV4(2, 7);
+        defer lease.vtable.release(lease.context);
+        var owners: abi.ControlDurableOwnersV4 = .{};
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_owners(lease.context, &owners));
+        try std.testing.expectEqual(@as(u32, 1), owners.count);
+        try std.testing.expectEqual(@as(u8, 1), owners.owners[0].has_accepted);
+        var proof: abi.ControlDurableLogV4 = .{
+            .accepted_mask = 1,
+            .applied = .{ .mode = .startup_complete, .last_index = 2, .commit_index = 2, .count = 1, .document = .{ .mode = .startup_complete, .last_index = 2, .commit_index = 2 } },
+        };
+        proof.applied.begins[0] = .{ .expected = owners.owners[0].applied.begin, .present = 1, .observed_term = 1, .observed_digest = begin_digest };
+        proof.applied.latest[0] = proof.applied.begins[0];
+        proof.accepted[0] = .{ .expected = owners.owners[0].accepted, .present = 1, .observed_term = 1, .observed_digest = decision_digest };
+        proof.accepted[0].observed_digest[0] ^= 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, lease.vtable.reconcile_durable(lease.context, &proof));
+        try std.testing.expect(!pool.ready);
+        proof.accepted[0].observed_digest[0] ^= 1;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable(lease.context, &proof));
+        try std.testing.expect(pool.ready and !pool.restored_control_pending);
         try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
     }
     {
@@ -144634,7 +144702,32 @@ test "workload admission physical completion restores one BEGIN owner after exac
         var result: abi.CheckResult = undefined;
         try std.testing.expectEqual(runtime_failure_abi.Status.ok, apply_lease.vtable.check(apply_lease.context, &proposal, &result));
         apply_lease.vtable.proposal_result(apply_lease.context, &.{ .state = proposal.state, .first_index = 3, .last_index = 3, .payloads = proposal.proposals });
-        try std.testing.expectEqual(runtime_failure_abi.Status.ok, apply_lease.vtable.apply_accepted.?(apply_lease.context, 1, 3, payloads[0]));
+        try std.testing.expect(pool.control_owners[0].?.pending != null);
+    }
+    {
+        var db = try DB.open(alloc, path, reopen);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const pool = db.core.primary_store_owner.lsmBackend().?.completion_pool.?;
+        try std.testing.expect(pool.restored_control_pending and !pool.ready);
+        const lease = try db.acquireControlCompletionLeaseV4(2, 7);
+        defer lease.vtable.release(lease.context);
+        var owners: abi.ControlDurableOwnersV4 = .{};
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_owners(lease.context, &owners));
+        var proof: abi.ControlDurableLogV4 = .{
+            .accepted_mask = 1,
+            .applied = .{ .mode = .startup_complete, .last_index = 3, .commit_index = 3, .count = 1, .document = .{ .mode = .startup_complete, .last_index = 3, .commit_index = 3 } },
+        };
+        proof.applied.begins[0] = .{ .expected = owners.owners[0].applied.begin, .present = 1, .observed_term = 1, .observed_digest = begin_digest };
+        proof.applied.latest[0] = .{ .expected = owners.owners[0].applied.latest, .present = 1, .observed_term = 1, .observed_digest = decision_digest };
+        proof.accepted[0] = .{ .expected = owners.owners[0].accepted, .present = 1, .observed_term = 1, .observed_digest = ack_digest };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable(lease.context, &proof));
+        try std.testing.expect(pool.ready and !pool.restored_control_pending);
+        const progress_bytes = (try db.core.getStoreValue(alloc, &@import("../lsm_backend/completion_control_record.zig").progressKey(id))).?;
+        defer alloc.free(progress_bytes);
+        const progress = try @import("../lsm_backend/completion_control_record.zig").Progress.decode(progress_bytes);
+        try std.testing.expectEqual(@as(u32, 1), progress.acknowledged);
+        try std.testing.expectEqual(@as(u64, 3), progress.latest.index);
     }
     {
         var db = try DB.open(alloc, path, reopen);

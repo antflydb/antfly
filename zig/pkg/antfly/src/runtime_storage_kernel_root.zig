@@ -148,6 +148,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerAcquireCompletionLease, "antfly_storage_owner_acquire_completion_lease");
     exportInternal(&storage_kernel_exports.storageOwnerAcquireControlProofLeaseV2, "antfly_storage_owner_acquire_control_proof_lease_v2");
     exportInternal(&storage_kernel_exports.storageOwnerAcquireControlProofLeaseV3, "antfly_storage_owner_acquire_control_proof_lease_v3");
+    exportInternal(&storage_kernel_exports.storageOwnerAcquireControlProofLeaseV4, "antfly_storage_owner_acquire_control_proof_lease_v4");
     exportInternal(&storage_kernel_exports.storageOwnerInstallCompletion, "antfly_storage_owner_install_completion");
     exportInternal(&storage_kernel_exports.storageOwnerAttestCompletionBacking, "antfly_storage_owner_attest_completion_backing");
     exportInternal(&storage_kernel_exports.storageOwnerTransactionStatus, "antfly_storage_owner_transaction_status");

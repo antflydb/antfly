@@ -289,6 +289,43 @@ pub const ControlProviderV3 = extern struct {
     context: ?*anyopaque,
     acquire: *const fn (?*anyopaque, u64, u64, *ControlLeaseV3) callconv(.c) failure.Status,
 };
+/// V4 adds one accepted-but-unapplied sidecar observation. V1–V3 layouts
+/// remain fixed for rolling peers; peers without V4 cannot qualify a restored
+/// sidecar because their native callbacks explicitly refuse pending ownership.
+pub const control_proof_abi_version_v4: u32 = 4;
+pub const ControlDurableOwnerV4 = extern struct {
+    applied: ControlDurableOwnerV3 = .{},
+    accepted: Progress = .{},
+    has_accepted: u8 = 0,
+    reserved: [7]u8 = @splat(0),
+};
+pub const ControlDurableOwnersV4 = extern struct {
+    version: u32 = control_proof_abi_version_v4,
+    count: u32 = 0,
+    reserved: u64 = 0,
+    owners: [max_durable_controls]ControlDurableOwnerV4 = @splat(.{}),
+};
+pub const ControlDurableLogV4 = extern struct {
+    version: u32 = control_proof_abi_version_v4,
+    accepted_mask: u8 = 0,
+    reserved: [3]u8 = @splat(0),
+    applied: ControlDurableLogV3 = .{ .mode = .startup_complete },
+    accepted: [max_durable_controls]DurableObservation = @splat(.{}),
+};
+pub const ControlVTableV4 = extern struct {
+    release: *const fn (?*anyopaque) callconv(.c) void,
+    durable_owners: *const fn (?*anyopaque, *ControlDurableOwnersV4) callconv(.c) failure.Status,
+    reconcile_durable: *const fn (?*anyopaque, *const ControlDurableLogV4) callconv(.c) failure.Status,
+};
+pub const ControlLeaseV4 = extern struct {
+    identity: Identity,
+    context: ?*anyopaque,
+    vtable: *const ControlVTableV4,
+};
+pub const ControlProviderV4 = extern struct {
+    context: ?*anyopaque,
+    acquire: *const fn (?*anyopaque, u64, u64, *ControlLeaseV4) callconv(.c) failure.Status,
+};
 test "workload admission completion pool v1 durable ABI layout remains unchanged" {
     const std = @import("std");
     try std.testing.expectEqual(@as(usize, 240), @sizeOf(DurableCells));

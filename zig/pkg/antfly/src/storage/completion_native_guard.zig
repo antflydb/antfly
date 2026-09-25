@@ -79,6 +79,16 @@ pub fn Guard(comptime DB: type) type {
             if (p.config.identity.group_id != group or p.config.identity.node_id != node) return error.InvalidArgument;
             return .{ .identity = p.config.identity, .context = owner, .vtable = &control_vtable_v3 };
         }
+        pub fn controlLeaseV4(owner: *DB, group: u64, node: u64) !abi.ControlLeaseV4 {
+            owner.core.lockApply();
+            defer owner.core.unlockApply();
+            const b = try backend(owner);
+            const locked = backend_runtime.lockBackend(native.Backend, b);
+            defer backend_runtime.unlockBackend(native.Backend, b, locked);
+            const p = try pool(owner);
+            if (p.config.identity.group_id != group or p.config.identity.node_id != node) return error.InvalidArgument;
+            return .{ .identity = p.config.identity, .context = owner, .vtable = &control_vtable_v4 };
+        }
         pub fn attest(owner: *DB, group: u64, node: u64) !abi.NativeAttestation {
             owner.core.lockApply();
             defer owner.core.unlockApply();
@@ -392,7 +402,8 @@ pub fn Guard(comptime DB: type) type {
             if (p.restored_control_pending) {
                 var restored: [abi.max_durable_controls]native.completion_pool_mod.DurableControlOwnerV3 = undefined;
                 for (try p.durableControlOwnersV3(&restored)) |active| {
-                    if (!std.meta.eql(active.begin, active.latest)) return error.CompletionAdmissionUnavailable;
+                    if (!std.meta.eql(active.begin, active.latest) or p.control_owners[active.slot_index].?.pending != null)
+                        return error.CompletionAdmissionUnavailable;
                 }
             }
             try p.reconcileControlDurableLog(.{ .mode = mode, .compacted_index = input.compacted_index, .compacted_term = input.compacted_term, .last_index = input.last_index, .commit_index = input.commit_index, .observations = observations[0..input.count] });
@@ -452,6 +463,11 @@ pub fn Guard(comptime DB: type) type {
             const locked = backend_runtime.lockBackend(native.Backend, b);
             defer backend_runtime.unlockBackend(native.Backend, b, locked);
             const p = try pool(owner);
+            if (p.restored_control_pending) {
+                for (p.control_owners) |active| if (active) |control| {
+                    if (control.pending != null) return error.CompletionAdmissionUnavailable;
+                };
+            }
             try p.reconcileControlDurableLogV3(
                 .{ .mode = mode, .compacted_index = input.compacted_index, .compacted_term = input.compacted_term, .last_index = input.last_index, .commit_index = input.commit_index, .observations = begins[0..input.count] },
                 .{ .mode = mode, .compacted_index = input.compacted_index, .compacted_term = input.compacted_term, .last_index = input.last_index, .commit_index = input.commit_index, .observations = latest[0..input.count] },
@@ -460,6 +476,108 @@ pub fn Guard(comptime DB: type) type {
             if (mode == .startup_complete and p.restored_control_pending)
                 try p.qualifyRestoredControlAfterProof(b);
         }
+        fn controlDurableOwnersV4(raw: ?*anyopaque, out: *abi.ControlDurableOwnersV4) callconv(.c) failure.Status {
+            if (raw == null) return .invalid_argument;
+            const owner = db(raw);
+            owner.core.lockApply();
+            defer owner.core.unlockApply();
+            const b = backend(owner) catch |err| return errors.statusFromError(err);
+            const locked = backend_runtime.lockBackend(native.Backend, b);
+            defer backend_runtime.unlockBackend(native.Backend, b, locked);
+            const p = pool(owner) catch |err| return errors.statusFromError(err);
+            var buffer: [abi.max_durable_controls]native.completion_pool_mod.DurableControlOwnerV3 = undefined;
+            const owners = p.durableControlOwnersV3(&buffer) catch |err| return errors.statusFromError(err);
+            out.* = .{ .count = @intCast(owners.len) };
+            for (owners, out.owners[0..owners.len]) |active, *result| {
+                result.* = .{ .applied = .{
+                    .begin = .{ .term = active.begin.term, .index = active.begin.index, .payload_digest = active.begin.digest },
+                    .latest = .{ .term = active.latest.term, .index = active.latest.index, .payload_digest = active.latest.digest },
+                    .slot_index = @intCast(active.slot_index),
+                } };
+                if (p.control_owners[active.slot_index].?.pending) |pending| {
+                    result.has_accepted = 1;
+                    result.accepted = .{ .term = pending.term, .index = pending.index, .payload_digest = pending.digest };
+                }
+            }
+            return .ok;
+        }
+        fn reconcileControlV4(raw: ?*anyopaque, input: *const abi.ControlDurableLogV4) callconv(.c) failure.Status {
+            if (raw == null) return .invalid_argument;
+            reconcileControlV4Impl(db(raw), input) catch |err| return errors.statusFromError(err);
+            return .ok;
+        }
+        fn reconcileControlV4Impl(owner: *DB, input: *const abi.ControlDurableLogV4) !void {
+            const frame = &input.applied;
+            if (input.version != abi.control_proof_abi_version_v4 or
+                !std.mem.allEqual(u8, &input.reserved, 0) or
+                input.accepted_mask >> @intCast(frame.count) != 0 or
+                frame.version != abi.control_proof_abi_version_v3 or frame.count > abi.max_durable_controls or frame.reserved != 0 or
+                frame.commit_index > frame.last_index or frame.compacted_index > frame.commit_index or
+                (frame.compacted_index == 0) != (frame.compacted_term == 0) or
+                frame.document.mode != frame.mode or frame.document.compacted_index != frame.compacted_index or
+                frame.document.compacted_term != frame.compacted_term or frame.document.last_index != frame.last_index or
+                frame.document.commit_index != frame.commit_index) return error.InvalidArgument;
+            const mode: @FieldType(native.completion_pool_mod.DurableLog, "mode") = switch (frame.mode) {
+                .startup_complete => .startup_complete,
+                .persisted_replacement => .persisted_replacement,
+                else => return error.InvalidArgument,
+            };
+            var begins: [abi.max_durable_controls]native.completion_pool_mod.DurableObservation = undefined;
+            var latest: [abi.max_durable_controls]native.completion_pool_mod.DurableObservation = undefined;
+            var accepted: [abi.max_durable_controls]native.completion_pool_mod.DurableObservation = undefined;
+            for (0..frame.count) |i| {
+                for ([_]abi.DurableObservation{ frame.begins[i], frame.latest[i] }, [_]*native.completion_pool_mod.DurableObservation{ &begins[i], &latest[i] }) |value, out| {
+                    out.* = try decodeControlObservation(value);
+                }
+                if (input.accepted_mask & (@as(u8, 1) << @intCast(i)) != 0)
+                    accepted[i] = try decodeControlObservation(input.accepted[i]);
+            }
+            owner.core.lockApply();
+            defer owner.core.unlockApply();
+            const b = try backend(owner);
+            const locked = backend_runtime.lockBackend(native.Backend, b);
+            defer backend_runtime.unlockBackend(native.Backend, b, locked);
+            const p = try pool(owner);
+            try p.reconcileControlDurableLogV3(
+                .{ .mode = mode, .compacted_index = frame.compacted_index, .compacted_term = frame.compacted_term, .last_index = frame.last_index, .commit_index = frame.commit_index, .observations = begins[0..frame.count] },
+                .{ .mode = mode, .compacted_index = frame.compacted_index, .compacted_term = frame.compacted_term, .last_index = frame.last_index, .commit_index = frame.commit_index, .observations = latest[0..frame.count] },
+            );
+            var owners: [abi.max_durable_controls]native.completion_pool_mod.DurableControlOwnerV3 = undefined;
+            const active = try p.durableControlOwnersV3(&owners);
+            for (active, 0..) |control, i| {
+                const pending = p.control_owners[control.slot_index].?.pending;
+                const observed = input.accepted_mask & (@as(u8, 1) << @intCast(i)) != 0;
+                if (observed != (pending != null)) return error.InvalidCompletionSlot;
+                if (!observed) continue;
+                const expected = pending.?;
+                const proof = accepted[i];
+                if (!std.meta.eql(proof.expected, expected) or !proof.present or
+                    proof.observed_term != expected.term or
+                    !std.mem.eql(u8, &proof.observed_digest, &expected.digest) or
+                    expected.index <= frame.compacted_index or expected.index > frame.commit_index)
+                    return error.RecoveryRequired;
+            }
+            try reconcileDocumentLocked(owner, b, p, &frame.document);
+            if (mode == .startup_complete and p.restored_control_pending) {
+                try p.qualifyRestoredControlAfterProof(b);
+                errdefer {
+                    p.failed = true;
+                    b.fenceFailedBulkWal();
+                }
+                for (active) |control| if (p.control_owners[control.slot_index].?.pending) |pending| {
+                    if (std.meta.eql(pending, control.latest)) {
+                        try p.retireRestoredControlSidecar(b, control.slot_index);
+                    } else if (!try p.applyOwnedControlTransition(b, pending)) return error.InvalidCompletionSlot;
+                };
+            }
+        }
+        fn decodeControlObservation(value: abi.DurableObservation) !native.completion_pool_mod.DurableObservation {
+            if (value.expected.term == 0 or value.expected.index == 0 or
+                std.mem.allEqual(u8, &value.expected.payload_digest, 0) or value.present > 1 or
+                value.replaced_in_this_persist > 1 or !std.mem.allEqual(u8, &value.reserved, 0)) return error.InvalidArgument;
+            return .{ .expected = .{ .term = value.expected.term, .index = value.expected.index, .digest = value.expected.payload_digest }, .present = value.present != 0, .observed_term = value.observed_term, .observed_digest = value.observed_digest, .replaced_in_this_persist = value.replaced_in_this_persist != 0 };
+        }
+        const control_vtable_v4: abi.ControlVTableV4 = .{ .release = release, .durable_owners = controlDurableOwnersV4, .reconcile_durable = reconcileControlV4 };
         const control_vtable_v3: abi.ControlVTableV3 = .{ .release = release, .durable_owners = controlDurableOwnersV3, .reconcile_durable = reconcileControlV3 };
         const control_vtable_v2: abi.ControlVTableV2 = .{ .release = release, .durable_owners = controlDurableOwnersV2, .reconcile_durable = reconcileControlV2 };
         const vtable: abi.VTable = .{ .check = check, .proposal_result = proposalResult, .release = release, .apply_accepted = apply, .progress = progress, .owns_accepted = owns, .durable_cells = durableCells, .reconcile_durable = reconcile };

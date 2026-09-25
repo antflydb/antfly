@@ -282,6 +282,53 @@ pub const Bridge = struct {
         }
         try error_identity.statusToError(lease.vtable.reconcile_durable(lease.context, &proof));
     }
+    pub fn reconcileControlProviderV4(provider: ?abi.ControlProviderV4, document_lease: abi.Lease, group_id: u64, node_id: u64, log: guard_iface.DurableLog) !void {
+        const issuer = provider orelse return error.CompletionAdmissionUnavailable;
+        var lease: abi.ControlLeaseV4 = undefined;
+        const result = issuer.acquire(issuer.context, group_id, node_id, &lease);
+        if (result == .not_found) return error.CompletionAdmissionUnavailable;
+        try error_identity.statusToError(result);
+        defer lease.vtable.release(lease.context);
+        try validateIdentity(lease.identity, group_id, node_id);
+        try reconcileControlLeaseV4(lease, document_lease, log);
+    }
+    pub fn reconcileControlLeaseV4(lease: abi.ControlLeaseV4, document_lease: abi.Lease, log: guard_iface.DurableLog) !void {
+        if (!log.durability_confirmed or log.commit_index > log.last_index or log.compacted_index > log.commit_index or
+            (log.compacted_index == 0) != (log.compacted_term == 0) or
+            (log.replacement_first == 0) != (log.replacement_last == 0) or
+            log.replacement_first > log.replacement_last or log.replacement_last > log.last_index)
+            return error.CompletionAdmissionUnavailable;
+        var owners: abi.ControlDurableOwnersV4 = .{};
+        try error_identity.statusToError(lease.vtable.durable_owners(lease.context, &owners));
+        if (owners.version != abi.control_proof_abi_version_v4 or owners.count > abi.max_durable_controls or owners.reserved != 0)
+            return error.CompletionAdmissionUnavailable;
+        var proof: abi.ControlDurableLogV4 = .{ .applied = .{
+            .mode = if (log.mode == .startup_complete) .startup_complete else .persisted_replacement,
+            .compacted_index = log.compacted_index,
+            .compacted_term = log.compacted_term,
+            .last_index = log.last_index,
+            .commit_index = log.commit_index,
+            .count = owners.count,
+            .document = try documentProof(document_lease, log),
+        } };
+        for (owners.owners[0..owners.count], 0..) |owner, i| {
+            const current = owner.applied;
+            if (current.slot_index >= abi.max_durable_controls or owner.has_accepted > 1 or
+                !std.mem.allEqual(u8, &owner.reserved, 0) or current.reserved != 0 or
+                current.latest.index < current.begin.index) return error.CompletionAdmissionUnavailable;
+            for (owners.owners[0..i]) |prior| if (prior.applied.slot_index == current.slot_index or
+                prior.applied.begin.index == current.begin.index) return error.CompletionAdmissionUnavailable;
+            proof.applied.begins[i] = try controlObservation(current.begin, log);
+            proof.applied.latest[i] = try controlObservation(current.latest, log);
+            if (owner.has_accepted != 0) {
+                if (owner.accepted.index < current.latest.index or owner.accepted.index > log.commit_index)
+                    return error.CompletionAdmissionUnavailable;
+                proof.accepted_mask |= @as(u8, 1) << @intCast(i);
+                proof.accepted[i] = try controlObservation(owner.accepted, log);
+            }
+        }
+        try error_identity.statusToError(lease.vtable.reconcile_durable(lease.context, &proof));
+    }
     fn ownsAccepted(ptr: *anyopaque, term: u64, index: u64, payload: []const u8) !bool {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
         if (payload.len > abi.max_check_payload_bytes or term == 0 or index == 0) return error.CompletionAdmissionUnavailable;
@@ -741,6 +788,68 @@ fn implementationTests() type {
             const calls = fake.calls;
             try std.testing.expectError(error.CompletionAdmissionUnavailable, Bridge.reconcileControlLeaseV3(lease, document_lease, log));
             try std.testing.expectEqual(calls, fake.calls);
+        }
+
+        test "workload admission retained control v4 binds accepted entry to one committed image" {
+            const Fake = struct {
+                owners: abi.ControlDurableOwnersV4 = .{ .count = 1 },
+                calls: usize = 0,
+                proof: abi.ControlDurableLogV4 = .{},
+                fn check(_: ?*anyopaque, _: *const abi.Check, _: *abi.CheckResult) callconv(.c) @import("kernel_owner_abi").Status {
+                    return .ok;
+                }
+                fn result(_: ?*anyopaque, _: *const abi.ProposalResult) callconv(.c) void {}
+                fn release(_: ?*anyopaque) callconv(.c) void {}
+                fn documentCells(_: ?*anyopaque, out: *abi.DurableCells) callconv(.c) @import("kernel_owner_abi").Status {
+                    out.* = .{};
+                    return .ok;
+                }
+                fn enumerate(raw: ?*anyopaque, out: *abi.ControlDurableOwnersV4) callconv(.c) @import("kernel_owner_abi").Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    out.* = self.owners;
+                    return .ok;
+                }
+                fn reconcile(raw: ?*anyopaque, proof: *const abi.ControlDurableLogV4) callconv(.c) @import("kernel_owner_abi").Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    self.calls += 1;
+                    self.proof = proof.*;
+                    const accepted = proof.accepted[0];
+                    if (proof.accepted_mask != 1 or accepted.present != 1 or accepted.observed_term != accepted.expected.term or
+                        !std.mem.eql(u8, &accepted.observed_digest, &accepted.expected.payload_digest)) return .recovery_required;
+                    return .ok;
+                }
+            };
+            var fake = Fake{};
+            var entries = [_]core.Entry{
+                .{ .index = 1, .term = 7, .data = @constCast("canonical-BEGIN") },
+                .{ .index = 2, .term = 7, .data = @constCast("canonical-decision") },
+            };
+            var begin_digest: [32]u8 = undefined;
+            var decision_digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(entries[0].data, &begin_digest, .{});
+            std.crypto.hash.sha2.Sha256.hash(entries[1].data, &decision_digest, .{});
+            fake.owners.owners[0] = .{ .applied = .{
+                .begin = .{ .term = 7, .index = 1, .payload_digest = begin_digest },
+                .latest = .{ .term = 7, .index = 1, .payload_digest = begin_digest },
+            }, .accepted = .{ .term = 7, .index = 2, .payload_digest = decision_digest }, .has_accepted = 1 };
+            const lease: abi.ControlLeaseV4 = .{ .identity = .{}, .context = &fake, .vtable = &.{ .release = Fake.release, .durable_owners = Fake.enumerate, .reconcile_durable = Fake.reconcile } };
+            const document_lease: abi.Lease = .{ .identity = .{}, .context = &fake, .vtable = &.{ .check = Fake.check, .proposal_result = Fake.result, .release = Fake.release, .durable_cells = Fake.documentCells } };
+            var log: guard_iface.DurableLog = .{ .mode = .startup_complete, .durability_confirmed = true, .last_index = 2, .commit_index = 2, .entries = &entries };
+            try Bridge.reconcileControlLeaseV4(lease, document_lease, log);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            try std.testing.expectEqualSlices(u8, &decision_digest, &fake.proof.accepted[0].observed_digest);
+            log.commit_index = 1;
+            try std.testing.expectError(error.CompletionAdmissionUnavailable, Bridge.reconcileControlLeaseV4(lease, document_lease, log));
+            log.commit_index = 2;
+            entries[1].data = @constCast("replacement-decision");
+            log.mode = .persisted_replacement;
+            log.replacement_first = 2;
+            log.replacement_last = 2;
+            try std.testing.expectError(error.RecoveryRequired, Bridge.reconcileControlLeaseV4(lease, document_lease, log));
+            try std.testing.expectEqual(@as(u8, 1), fake.proof.accepted[0].replaced_in_this_persist);
+            log.compacted_index = 2;
+            log.compacted_term = 7;
+            try std.testing.expectError(error.CompletionAdmissionUnavailable, Bridge.reconcileControlLeaseV4(lease, document_lease, log));
         }
     };
     return Suite;

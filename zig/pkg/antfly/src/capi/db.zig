@@ -6311,6 +6311,31 @@ const StorageOwnerControlProofLeaseV3 = struct {
     const vtable: pool.ControlVTableV3 = .{ .release = release, .durable_owners = durableOwners, .reconcile_durable = reconcileDurable };
 };
 
+const StorageOwnerControlProofLeaseV4 = struct {
+    handle: *Handle,
+    inner: kernel_owner_abi.completion_pool.ControlLeaseV4,
+    const pool = kernel_owner_abi.completion_pool;
+    fn from(raw: ?*anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw.?));
+    }
+    fn release(raw: ?*anyopaque) callconv(.c) void {
+        const self = from(raw);
+        const handle = self.handle;
+        self.inner.vtable.release(self.inner.context);
+        handle.alloc.destroy(self);
+        closeHandle(handle);
+    }
+    fn durableOwners(raw: ?*anyopaque, output: *pool.ControlDurableOwnersV4) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        return self.inner.vtable.durable_owners(self.inner.context, output);
+    }
+    fn reconcileDurable(raw: ?*anyopaque, request: *const pool.ControlDurableLogV4) callconv(.c) kernel_owner_abi.Status {
+        const self = from(raw);
+        return self.inner.vtable.reconcile_durable(self.inner.context, request);
+    }
+    const vtable: pool.ControlVTableV4 = .{ .release = release, .durable_owners = durableOwners, .reconcile_durable = reconcileDurable };
+};
+
 pub fn storageOwnerInstallCompletion(owner: ?*anyopaque, request: *const kernel_owner_abi.InstallCompletionRequest) callconv(.c) kernel_owner_abi.Status {
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const handle = asHandle(owner) orelse return .invalid_argument;
@@ -6360,6 +6385,20 @@ pub fn storageOwnerAcquireControlProofLeaseV3(owner: ?*anyopaque, group_id: u64,
     _ = handle.owner_refs.fetchAdd(1, .monotonic);
     retained.* = .{ .handle = handle, .inner = inner };
     output.* = .{ .identity = inner.identity, .context = retained, .vtable = &StorageOwnerControlProofLeaseV3.vtable };
+    success = true;
+    return .ok;
+}
+
+pub fn storageOwnerAcquireControlProofLeaseV4(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *kernel_owner_abi.completion_pool.ControlLeaseV4) callconv(.c) kernel_owner_abi.Status {
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    if (group_id == 0 or node_id == 0 or group_id != handle.storage_owner_group_id) return .invalid_argument;
+    const retained = handle.alloc.create(StorageOwnerControlProofLeaseV4) catch return .out_of_memory;
+    var success = false;
+    defer if (!success) handle.alloc.destroy(retained);
+    const inner = handle.db.acquireControlCompletionLeaseV4(group_id, node_id) catch |err| return storageOwnerStatusFromError(err);
+    _ = handle.owner_refs.fetchAdd(1, .monotonic);
+    retained.* = .{ .handle = handle, .inner = inner };
+    output.* = .{ .identity = inner.identity, .context = retained, .vtable = &StorageOwnerControlProofLeaseV4.vtable };
     success = true;
     return .ok;
 }

@@ -335,6 +335,12 @@ pub const Owner = struct {
         return result;
     }
 
+    pub fn acquireControlProofLeaseV4(self: *Owner, group_id: u64, node_id: u64) !abi.completion_pool.ControlLeaseV4 {
+        var result: abi.completion_pool.ControlLeaseV4 = undefined;
+        try statusToError(abi.antfly_storage_owner_acquire_control_proof_lease_v4(self.handle, group_id, node_id, &result));
+        return result;
+    }
+
     pub fn attestCompletionBacking(self: *Owner, group_id: u64, node_id: u64) !abi.completion_pool.NativeAttestation {
         var result: abi.completion_pool.NativeAttestation = .{};
         try statusToError(abi.antfly_storage_owner_attest_completion_backing(self.handle, group_id, node_id, &result));
