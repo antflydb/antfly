@@ -40,8 +40,11 @@ writer. Only the encoder and head differ.
   with even one task is rejected (`413 EXTRACTION_LIMIT_EXCEEDED`); long texts
   need text windowing, not task splitting. At most 8 sequences per input and
   65,536 encoded tokens per request are accepted. Below 512 tokens the route
-  is identical to upstream. On an 8-task, 483-token support ticket split at a
-  400-token budget, all 8 top labels matched the unsplit run.
+  is identical to upstream. Splitting is an extension: labels in different
+  sequences cannot attend to one another, so scores and threshold-sensitive
+  decisions can differ from a hypothetical longer early-fusion run. On an
+  8-task, 483-token support ticket split at a 400-token budget, all 8 top
+  labels matched the unsplit run; this is a single fixture, not general parity.
 - **Upgrading schema-version-less requests**: a classification-only request
   to a declared span checkpoint runs on `schema_version: 2`. A request-level
   `options.threshold` is carried into every classification task that sets no
@@ -50,8 +53,9 @@ writer. Only the encoder and head differ.
   rejected rather than ignored.
 - Mixed classification + span tasks in one `schema_version: 2` request, and
   `long_document` windows, are rejected with `400
-  UNSUPPORTED_EXTRACTION_FEATURE`. Only checkpoints whose config declares
-  `"architecture": "span"` (gliner2 2.x) take this route; older span
+  UNSUPPORTED_EXTRACTION_FEATURE`. Only checkpoints declaring the supported
+  span marker contract (`architecture: span`, config version 3, architecture
+  version 1, `span_head.span_mode: markerV0`) take this route; other span
   checkpoints keep the prior unsupported-model response on
   `schema_version: 2`.
 - Metal requests on this route are admitted like the boundary route: the
@@ -96,11 +100,12 @@ Base-size GLiNER encoders use bounded F16 weight mirrors on Metal. For the
 large encoder the policy depends on whether the encoder matrices are already
 quantized (read from the GGUF tensor types at load):
 
-- **Quantized bundle (e.g. Q8_0)**: no encoder mirrors; the bundle's own
+- **Fully quantized encoder bundle (e.g. Q8_0)**: no encoder mirrors; the bundle's own
   kernels run directly (interleaved A/B on M4, 102 tokens: ~75 ms vs ~110 ms
   with mirrors).
-- **Dense weights (F32 safetensors or a dense GGUF export)**: mirrors stay
-  on. Without them Metal stages dense matrices to Q8_0 on the fly, which
+- **Dense or mixed encoder weights (F32 safetensors, dense GGUF, or filtered
+  quantization)**: mirrors stay on. Without them Metal stages dense matrices
+  to Q8_0 on the fly, which
   changes numerics (logit error 3e-2 vs 8e-4) without the user choosing a
   quantized artifact.
 

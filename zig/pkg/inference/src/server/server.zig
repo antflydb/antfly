@@ -19825,17 +19825,32 @@ test "v1 classification upgrade keeps the request threshold per task" {
 
 /// Whether an extraction schema declares classification tasks and nothing else.
 fn schemaIsClassificationOnly(schema: std.json.Value) bool {
-    if (schema != .object or schema.object.count() != 1) return false;
+    if (schema != .object) return false;
     const tasks = schema.object.get("classifications") orelse return false;
-    return tasks == .array and tasks.array.items.len > 0;
+    if (tasks != .array or tasks.array.items.len == 0) return false;
+    var fields = schema.object.iterator();
+    while (fields.next()) |field| {
+        const name = field.key_ptr.*;
+        if (std.mem.eql(u8, name, "classifications")) continue;
+        const value = field.value_ptr.*;
+        if (std.mem.eql(u8, name, "entities") or std.mem.eql(u8, name, "relations")) {
+            if (value == .array and value.array.items.len == 0) continue;
+        } else if (std.mem.eql(u8, name, "structures")) {
+            if (value == .object and value.object.count() == 0) continue;
+        }
+        return false;
+    }
+    return true;
 }
 
 test "span classification upgrade requires a classification-only schema" {
     const a = std.testing.allocator;
     const cases = [_]struct { json: []const u8, expected: bool }{
         .{ .json = "{\"classifications\":[{\"name\":\"intent\",\"labels\":[\"a\",\"b\"]}]}", .expected = true },
+        .{ .json = "{\"entities\":[],\"relations\":[],\"structures\":{},\"classifications\":[{\"name\":\"intent\",\"labels\":[\"a\",\"b\"]}]}", .expected = true },
         .{ .json = "{\"classifications\":[]}", .expected = false },
         .{ .json = "{\"entities\":[\"person\"],\"classifications\":[{\"name\":\"x\",\"labels\":[\"a\"]}]}", .expected = false },
+        .{ .json = "{\"entities\":{},\"classifications\":[{\"name\":\"x\",\"labels\":[\"a\"]}]}", .expected = false },
         .{ .json = "[]", .expected = false },
     };
     for (cases) |case| {

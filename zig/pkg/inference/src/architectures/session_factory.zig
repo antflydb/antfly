@@ -2600,22 +2600,51 @@ fn loadLegacyGlinerEncoderConfig(allocator: std.mem.Allocator, model_path: []con
     return deberta_mod.parseConfig(allocator, bytes);
 }
 
-/// Whether the selected GGUF stores its weight matrices quantized. A dense
-/// (`--format none`) export or a safetensors checkpoint returns false.
+/// Whether every encoder-layer matrix in the selected GGUF is quantized. A
+/// filtered export may retain dense projections; those still need mirrors to
+/// avoid the Metal path's implicit Q8 staging. Embedding tables and the head
+/// do not participate in the encoder linear mirror policy.
 fn glinerGgufMatricesQuantized(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest, parsed_gguf: ?*const gguf_mod.format.File) !bool {
     if (!mf.usesGgufWeights()) return false;
-    if (parsed_gguf) |file| return ggufFileHasQuantizedMatrices(file);
+    if (parsed_gguf) |file| return ggufEncoderLayerMatricesAllQuantized(file.tensors);
     const store = try tensor_store_mod.GgufStore.initAbsolute(allocator, mf.gguf_path.?);
     defer store.tensorStore().deinit();
     const file = store.tensorStore().ggufFile() orelse return false;
-    return ggufFileHasQuantizedMatrices(file);
+    return ggufEncoderLayerMatricesAllQuantized(file.tensors);
 }
 
-fn ggufFileHasQuantizedMatrices(file: *const gguf_mod.format.File) bool {
-    for (file.tensors) |tensor| {
-        if (tensor.dimensions.len == 2 and tensor.tensor_type.isQuantized()) return true;
+fn ggufEncoderLayerMatricesAllQuantized(tensors: []const gguf_mod.format.TensorInfo) bool {
+    var found = false;
+    for (tensors) |tensor| {
+        if (!std.mem.startsWith(u8, tensor.name, "encoder.layer.") or tensor.dimensions.len != 2) continue;
+        found = true;
+        if (!tensor.tensor_type.isQuantized()) return false;
     }
-    return false;
+    return found;
+}
+
+test "GLiNER mixed GGUF encoder matrices retain Metal mirrors" {
+    var matrix_dims = [_]u64{ 1024, 1024 };
+    var embedding_dims = [_]u64{ 1024, 128011 };
+    const tensors = [_]gguf_mod.format.TensorInfo{
+        .{ .name = "embeddings.word_embeddings.weight", .dimensions = &embedding_dims, .tensor_type = .{ .known = .F32 }, .offset = 0, .data_offset = 0 },
+        .{ .name = "encoder.layer.0.attention.self.query_proj.weight", .dimensions = &matrix_dims, .tensor_type = .{ .known = .Q8_0 }, .offset = 0, .data_offset = 0 },
+        .{ .name = "encoder.layer.0.attention.self.key_proj.weight", .dimensions = &matrix_dims, .tensor_type = .{ .known = .F32 }, .offset = 0, .data_offset = 0 },
+    };
+    try std.testing.expect(!ggufEncoderLayerMatricesAllQuantized(&tensors));
+    try std.testing.expect(ggufEncoderLayerMatricesAllQuantized(tensors[0..2]));
+    try std.testing.expect(!ggufEncoderLayerMatricesAllQuantized(tensors[0..1]));
+}
+
+test "GLiNER Decide Q8 bundle can use quantized encoder path" {
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR") orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const path = try std.fs.path.join(allocator, &.{ directory, "gliner2-encoder.Q8_0.gguf" });
+    defer allocator.free(path);
+    const store = try tensor_store_mod.GgufStore.initAbsolute(allocator, path);
+    defer store.tensorStore().deinit();
+    const file = store.tensorStore().ggufFile() orelse return error.InvalidGguf;
+    try std.testing.expect(ggufEncoderLayerMatricesAllQuantized(file.tensors));
 }
 
 fn detectArchitectureFromOptionalGgufFile(

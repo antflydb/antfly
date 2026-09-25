@@ -344,7 +344,7 @@ pub const ModelManifest = struct {
     gliner_model_type: []const u8 = "", // "gliner2", "gliner2.5", "uniencoder", etc.
     gliner_architecture: gliner_boundary.Architecture = .unknown,
     gliner_boundary_config: ?gliner_boundary.Config = null,
-    /// A gliner2 >= 2.0 span checkpoint that declares `"architecture":"span"`
+    /// A span checkpoint with the supported gliner2 2.x marker contract
     /// (e.g. GLiNER2.5-Decide). Its classification runs the upstream
     /// `classifier` head on the schema_version:2 route.
     gliner_span_declared: bool = false,
@@ -7166,7 +7166,7 @@ test "span wrapper manifest takes encoder geometry from encoder_config" {
     defer tmp.cleanup();
     const io = std.testing.io;
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data =
-        \\{"model_type":"extractor","architecture":"span","architectures":["SpanExtractor"],"config_version":3,"counting_layer":"count_lstm","model_name":"microsoft/deberta-v3-large","token_pooling":"first"}
+        \\{"model_type":"extractor","architecture":"span","architecture_version":1,"architectures":["SpanExtractor"],"config_version":3,"span_head":{"span_mode":"markerV0"},"counting_layer":"count_lstm","model_name":"microsoft/deberta-v3-large","token_pooling":"first"}
     });
     try tmp.dir.createDirPath(io, "encoder_config");
     try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data =
