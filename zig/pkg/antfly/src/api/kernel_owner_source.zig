@@ -186,6 +186,12 @@ pub const ProvisionedKernelOwnerSource = struct {
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     completion_installations: std.AutoHashMapUnmanaged(u64, *CompletionInstallation) = .empty,
     completion_installation_preparations: usize = 0,
+    // Installation records never retire during this source's lifetime. This
+    // exact, append-only index lets Raft callbacks distinguish an unrelated
+    // mutex holder from a real obligation without waiting on that holder.
+    completion_installation_ids: [1024]std.atomic.Value(u64) = @splat(.init(0)),
+    completion_installation_ids_count: std.atomic.Value(usize) = .init(0),
+    completion_installation_ids_overflow: std.atomic.Value(bool) = .init(false),
     completion_filesystem_io: ?std.Io = null,
 
     publications: std.ArrayListUnmanaged(*PendingPublication) = .empty,
@@ -4738,6 +4744,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                     return error.CompletionAdmissionUnavailable;
             }
             // Capacity was reserved while preparing, before DATA took its lock.
+            self.source.publishCompletionInstallationIdLocked(group_id);
             self.source.completion_installations.putAssumeCapacity(group_id, self.record);
             self.source.completion_installation_preparations -= 1;
             self.capacity_reserved = false;
@@ -4816,10 +4823,32 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     pub fn completionInstallationPresent(self: *ProvisionedKernelOwnerSource, group_id: u64) bool {
-        // Contention must not manufacture a legacy absence.
-        if (!self.mutex.tryLock()) return true;
+        if (!self.mutex.tryLock()) return self.publishedCompletionInstallationId(group_id);
         defer self.mutex.unlock();
         return self.completion_installations.contains(group_id);
+    }
+
+    fn publishedCompletionInstallationId(self: *const ProvisionedKernelOwnerSource, group_id: u64) bool {
+        // The map is protected by mutex; on contention consult only the
+        // exact release-published index. Overflow stays fail-closed.
+        if (self.completion_installation_ids_overflow.load(.acquire)) return true;
+        const count = self.completion_installation_ids_count.load(.acquire);
+        for (self.completion_installation_ids[0..count]) |*id| {
+            if (id.load(.acquire) == group_id) return true;
+        }
+        return false;
+    }
+
+    fn publishCompletionInstallationIdLocked(self: *ProvisionedKernelOwnerSource, group_id: u64) void {
+        // Publish before map mutation. A reader racing this publication may
+        // observe absence only while the obligation is still unpublished.
+        const count = self.completion_installation_ids_count.load(.monotonic);
+        if (count >= self.completion_installation_ids.len) {
+            self.completion_installation_ids_overflow.store(true, .release);
+            return;
+        }
+        self.completion_installation_ids[count].store(group_id, .release);
+        self.completion_installation_ids_count.store(count + 1, .release);
     }
 
     pub fn completionBackingIdentityMatches(self: *ProvisionedKernelOwnerSource, identity: abi.completion_pool.Identity) bool {
@@ -4896,7 +4925,10 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Borrow an already installed owner only. This path runs under DATA Raft
     /// serialization and must not perform catalog refresh, root open, or install.
     fn installedCompletionOwner(self: *ProvisionedKernelOwnerSource, group_id: u64) !Lease {
-        if (!self.mutex.tryLock()) return error.CompletionAdmissionUnavailable;
+        if (!self.mutex.tryLock()) return if (self.publishedCompletionInstallationId(group_id))
+            error.CompletionAdmissionUnavailable
+        else
+            error.NotFound;
         defer self.mutex.unlock();
         if (self.quiescing) return error.CompletionAdmissionUnavailable;
         const installation = self.completion_installations.get(group_id) orelse return error.NotFound;
@@ -7168,6 +7200,7 @@ test "workload admission completion capsule reconciliation cannot erase an ident
         .state = .backed,
     };
     try source.completion_installations.put(alloc, 7, &installed);
+    source.publishCompletionInstallationIdLocked(7);
     try std.testing.expect(source.completionInstallationPresent(7));
     try std.testing.expect(!source.completionInstallationPresent(8));
     try std.testing.expect(source.completionBackingIdentityMatches(installed.binding.identity));
@@ -7175,7 +7208,16 @@ test "workload admission completion capsule reconciliation cannot erase an ident
     wrong_identity.generation += 1;
     try std.testing.expect(!source.completionBackingIdentityMatches(wrong_identity));
     ProvisionedKernelOwnerSource.lock(&source.mutex);
+    try std.testing.expect(source.completionInstallationPresent(7));
+    try std.testing.expect(!source.completionInstallationPresent(8));
+    const provider = source.completionProvider();
+    var lease: abi.completion_pool.Lease = undefined;
+    try std.testing.expectEqual(abi.Status.completion_admission_unavailable, provider.acquire(provider.context, 7, 7, &lease));
+    try std.testing.expectEqual(abi.Status.not_found, provider.acquire(provider.context, 8, 7, &lease));
+    source.completion_installation_ids_overflow.store(true, .release);
     try std.testing.expect(source.completionInstallationPresent(8));
+    try std.testing.expectEqual(abi.Status.completion_admission_unavailable, provider.acquire(provider.context, 8, 7, &lease));
+    source.completion_installation_ids_overflow.store(false, .release);
     source.mutex.unlock();
     try std.testing.expect(!source.completionAdmissionAuthorized(7));
     var authenticated = installed;

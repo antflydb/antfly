@@ -32315,6 +32315,26 @@ fn consumerTests() type {
             };
             remote.completion_native_provider = .{ .context = null, .acquire = Missing.acquire };
             try std.testing.expectError(error.CompletionAdmissionUnavailable, RemoteMetadataSource.restoredCompletionProgress(&remote, 2, 7));
+            {
+                // WAL descriptor restoration must not mistake unrelated
+                // registry contention for an installed native obligation.
+                remote.completion_native_provider = provider;
+                try std.testing.expect(source.mutex.tryLock());
+                defer source.mutex.unlock();
+                try std.testing.expectEqual(@as(?raft_engine.runtime.completion_admission_iface.Progress, null), try RemoteMetadataSource.restoredCompletionProgress(&remote, 3, 7));
+                try std.testing.expectError(error.CompletionAdmissionUnavailable, RemoteMetadataSource.restoredCompletionProgress(&remote, 2, 7));
+                const empty_log: raft_engine.runtime.completion_admission_iface.DurableLog = .{
+                    .mode = .startup_complete,
+                    .durability_confirmed = true,
+                    .compacted_index = 0,
+                    .compacted_term = 0,
+                    .last_index = 0,
+                    .commit_index = 0,
+                    .entries = &.{},
+                };
+                try RemoteMetadataSource.reconcileCompletionDurableLog(&remote, 3, 7, empty_log);
+                try std.testing.expectError(error.CompletionAdmissionUnavailable, RemoteMetadataSource.reconcileCompletionDurableLog(&remote, 2, 7, empty_log));
+            }
             installer.node_id = 8;
             try std.testing.expectError(error.CompletionProfileChanged, installer.install(2, null));
             try std.testing.expectEqual(@as(usize, 0), offline.calls);
