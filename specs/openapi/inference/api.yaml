@@ -3844,6 +3844,7 @@ components:
       pattern: '^(native|onnx|metal|cuda|xla|webgpu|wasm)(:(auto|cuda|tpu|cpu))?$'
     ModelRef:
       type: object
+      additionalProperties: false
       description: Model reference used by startup preload and model-loading configuration.
       required:
         - kind

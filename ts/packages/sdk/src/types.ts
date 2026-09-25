@@ -550,6 +550,78 @@ export interface RetrievalAgentStreamCallbacks {
   onError?: (error: string) => void;
 }
 
+// Research Agent types
+export type ResearchPhase = components["schemas"]["ResearchPhase"];
+export type ResearchBudget = components["schemas"]["ResearchBudget"];
+export type ResearchStepConfig = components["schemas"]["ResearchStepConfig"];
+export type ResearchRetrievalStepConfig = components["schemas"]["ResearchRetrievalStepConfig"];
+export type ResearchWriteStepConfig = components["schemas"]["ResearchWriteStepConfig"];
+export type ResearchAgentSteps = components["schemas"]["ResearchAgentSteps"];
+export type ResearchSubQuestion = components["schemas"]["ResearchSubQuestion"];
+export type ResearchPlan = components["schemas"]["ResearchPlan"];
+export type ResearchClaim = components["schemas"]["ResearchClaim"];
+export type ResearchFinding = components["schemas"]["ResearchFinding"];
+export type ResearchEvidence = components["schemas"]["ResearchEvidence"];
+export type ResearchReflection = components["schemas"]["ResearchReflection"];
+export type ResearchReportSection = components["schemas"]["ResearchReportSection"];
+export type ResearchReport = components["schemas"]["ResearchReport"];
+export type ResearchCitation = components["schemas"]["ResearchCitation"];
+export type ResearchUnsupportedClaim = components["schemas"]["ResearchUnsupportedClaim"];
+export type ResearchVerification = components["schemas"]["ResearchVerification"];
+export type ResearchUsage = components["schemas"]["ResearchUsage"];
+export type ResearchState = components["schemas"]["ResearchState"];
+export type ResearchIncompleteDetails = components["schemas"]["ResearchIncompleteDetails"];
+export type ResearchAgentRequest = components["schemas"]["ResearchAgentRequest"];
+export type ResearchAgentResult = components["schemas"]["ResearchAgentResult"];
+export type ResearchJobState = components["schemas"]["ResearchJobState"];
+export type ResearchJobStartRequest = components["schemas"]["ResearchJobStartRequest"];
+export type ResearchJobAdvanceRequest = components["schemas"]["ResearchJobAdvanceRequest"];
+export type ResearchJob = components["schemas"]["ResearchJob"];
+
+/** `step_progress` payload for phase `plan`: the brief and initial sub-questions. */
+export type ResearchPlanProgress = ResearchPlan;
+
+/** `step_progress` payload for phase `sub_question_started`. */
+export interface ResearchSubQuestionStartedProgress {
+  sub_question_id: string;
+  question: string;
+  round?: number;
+}
+
+/** `step_progress` payload for phase `section`: one report section as it is written. */
+export interface ResearchSectionProgress {
+  index: number;
+  heading: string;
+}
+
+// Research Agent streaming callbacks for structured SSE events
+export interface ResearchAgentStreamCallbacks {
+  onStepStarted?: (step: SSEStepStarted) => void;
+  onPlan?: (plan: ResearchPlanProgress) => void;
+  onSubQuestionStarted?: (event: ResearchSubQuestionStartedProgress) => void;
+  onFinding?: (finding: ResearchFinding) => void;
+  onReflection?: (reflection: ResearchReflection) => void;
+  onSection?: (section: ResearchSectionProgress) => void;
+  onVerification?: (verification: ResearchVerification) => void;
+  onGeneration?: (chunk: string) => void;
+  onStepCompleted?: (step: AgentStep) => void;
+  onDone?: (data: ResearchAgentResult) => void;
+  /** Receives typed failures, including InferenceCapacityError with retryAfterMs. */
+  onErrorDetail?: (error: Error) => void;
+  /** Legacy message callback; use onErrorDetail for structured retry handling. */
+  onError?: (error: string) => void;
+}
+
+/** Options for AntflyClient.runResearchJob. */
+export interface RunResearchJobOptions {
+  /** Maximum phases to run per advance call (server default 1, max 10). */
+  maxPhasesPerAdvance?: number;
+  /** Called with the latest job snapshot after start and after every advance or poll. */
+  onJob?: (job: ResearchJob) => void;
+  /** Aborts the polling loop. Does not cancel the durable job itself. */
+  signal?: AbortSignal;
+}
+
 // Chat Agent convenience types for multi-turn conversation
 export interface ChatAgentConfig {
   /** Generator configuration (provider, model, temperature) */

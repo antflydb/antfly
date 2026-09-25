@@ -85,8 +85,10 @@ const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.Ca
     laya,
     deberta_reranker,
     gliner2,
+    gliner2_training,
     florence2,
     gemma4,
+    gemma4_training,
     qwen3_embedding,
     qwen3_vl_generation,
 };
@@ -1471,6 +1473,63 @@ test "CUDA resident uploads follow mmap offsets before heap weights" {
     try std.testing.expectEqualStrings("heap", uploads[2].key);
 }
 
+/// CUDA preference training builds only the Gemma text graph.  Unified
+/// checkpoints also contain modality towers that are unreachable from that
+/// graph and must not consume scarce device residency.  Shared-tail K/V
+/// projections are omitted for the same reason: those layers consume their
+/// donor layer's cache in the graph.
+fn gemma4CudaTrainingUsesWeight(arch_config: ArchConfig, name: []const u8) bool {
+    const config = switch (arch_config) {
+        .gpt => |value| value,
+        else => return false,
+    };
+    if (config.family != .gemma) return false;
+    const relative_name = if (config.weight_prefix.len == 0)
+        if (std.mem.startsWith(u8, name, "model.")) name["model.".len..] else name
+    else blk: {
+        if (std.mem.eql(u8, name, "lm_head.weight")) return true;
+        if (name.len <= config.weight_prefix.len or
+            !std.mem.startsWith(u8, name, config.weight_prefix) or
+            name[config.weight_prefix.len] != '.') return false;
+        break :blk name[config.weight_prefix.len + 1 ..];
+    };
+
+    if (std.mem.startsWith(u8, relative_name, "layers.")) {
+        const after_layers = relative_name["layers.".len..];
+        if (std.mem.indexOfScalar(u8, after_layers, '.')) |layer_end| {
+            const layer = std.fmt.parseInt(usize, after_layers[0..layer_end], 10) catch return false;
+            const suffix = after_layers[layer_end + 1 ..];
+            if (config.layerSharesKv(layer) and
+                (std.mem.eql(u8, suffix, "self_attn.k_proj.weight") or
+                    std.mem.eql(u8, suffix, "self_attn.v_proj.weight"))) return false;
+            if (config.layerOmitsVProj(layer) and
+                std.mem.eql(u8, suffix, "self_attn.v_proj.weight")) return false;
+        }
+    }
+
+    if (config.weight_prefix.len == 0) return true;
+    if (std.mem.eql(u8, name, "lm_head.weight")) return true;
+    return name.len > config.weight_prefix.len and
+        std.mem.startsWith(u8, name, config.weight_prefix) and
+        name[config.weight_prefix.len] == '.';
+}
+
+test "gemma4 CUDA text training excludes unreachable unified modality weights" {
+    const unified = ArchConfig{ .gpt = .{
+        .family = .gemma,
+        .weight_prefix = "model.language_model",
+    } };
+    try std.testing.expect(gemma4CudaTrainingUsesWeight(unified, "model.language_model.embed_tokens.weight"));
+    try std.testing.expect(gemma4CudaTrainingUsesWeight(unified, "model.language_model.layers.41.mlp.down_proj.weight"));
+    try std.testing.expect(gemma4CudaTrainingUsesWeight(unified, "lm_head.weight"));
+    try std.testing.expect(!gemma4CudaTrainingUsesWeight(unified, "model.audio_tower.layers.0.self_attn.q_proj.weight"));
+    try std.testing.expect(!gemma4CudaTrainingUsesWeight(unified, "model.vision_tower.vision_model.embeddings.patch_embedding.weight"));
+    try std.testing.expect(!gemma4CudaTrainingUsesWeight(unified, "model.multi_modal_projector.mm_input_projection_weight"));
+
+    const text_only = ArchConfig{ .gpt = .{ .family = .gemma } };
+    try std.testing.expect(gemma4CudaTrainingUsesWeight(text_only, "model.layers.0.self_attn.q_proj.weight"));
+}
+
 pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
     allocator: std.mem.Allocator,
     model_path: []const u8,
@@ -1478,6 +1537,44 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
+) !Session {
+    return createCudaSessionWithRequiredProfile(
+        allocator,
+        model_path,
+        override,
+        config,
+        load_context,
+        a4b_request,
+        null,
+    );
+}
+
+/// Create a Gemma 4 CUDA session with the stronger compiled-training kernel
+/// contract.  This is intentionally text-only and dense today: quantized MoE
+/// policy training remains fail-closed until its routed-expert VJP is present.
+pub fn createGemma4CudaTrainingSession(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+) !Session {
+    return createCudaSessionWithRequiredProfile(
+        allocator,
+        model_path,
+        null,
+        .{},
+        .dynamic,
+        null,
+        .gemma4_training,
+    );
+}
+
+fn createCudaSessionWithRequiredProfile(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    override: ?TaskOverride,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+    required_profile_override: ?CudaCapabilityProfile,
 ) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
     try config.validate();
@@ -1489,12 +1586,15 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
     defer model_manifest.deinit();
     try model_manifest.requireRecognizedGlinerArchitecture();
     if (model_manifest.gliner_architecture == .boundary) return error.UnsupportedGlinerBoundaryBackend;
-    const a4b_inference = try resolveCudaA4bInferenceConfigForModelListing(
-        allocator,
-        model_path,
-        model_manifest,
-        a4b_request,
-    );
+    const a4b_inference = if (required_profile_override == null)
+        try resolveCudaA4bInferenceConfigForModelListing(
+            allocator,
+            model_path,
+            model_manifest,
+            a4b_request,
+        )
+    else
+        null;
     if (a4b_inference) |a4b| {
         if (a4b.residency_mode != .resident)
             return error.A4bCudaStreamingUnsupported;
@@ -1549,11 +1649,20 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
             model_manifest.gguf_path orelse return error.A4bCudaPackedStoreUnavailable,
         );
     }
-    const cuda_profile = cudaProfileForArch(
+    const architecture_profile = cudaProfileForArch(
         native_impl.arch_config,
         native_impl.task,
         &model_manifest,
     ) orelse return error.UnsupportedCudaArchitecture;
+    if (required_profile_override == .gemma4_training) {
+        const training_config = switch (native_impl.arch_config) {
+            .gpt => |value| value,
+            else => return error.UnsupportedCudaArchitecture,
+        };
+        if (training_config.family != .gemma) return error.UnsupportedCudaArchitecture;
+        if (training_config.usesMoe()) return error.UnsupportedGemmaMoeTraining;
+    }
+    const cuda_profile = required_profile_override orelse architecture_profile;
     const jit_scope = cuda_compute_mod.kernelJitRouteScopeForLoadedWeights(
         cuda_profile,
         &native_impl.backend_data.native.resident_weights,
@@ -1585,6 +1694,11 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
     defer resident_uploads.deinit(allocator);
     var it = native_impl.backend_data.native.resident_weights.iterator();
     while (it.next()) |entry| {
+        if (required_profile_override == .gemma4_training and
+            !gemma4CudaTrainingUsesWeight(native_impl.arch_config, entry.key_ptr.*))
+        {
+            continue;
+        }
         const span = loadedWeightMmapSpan(entry.value_ptr);
         try resident_uploads.append(allocator, .{
             .key = entry.key_ptr.*,
@@ -4575,12 +4689,36 @@ fn resolveCudaA4bGptInferenceConfig(
     request: ?backend_contracts.A4bInferenceRequest,
     artifact_qualified: bool,
 ) !?backend_contracts.A4bInferenceConfig {
+    // Apply the CUDA defaults (16 GiB envelope, resident placement) before
+    // the geometry pre-pass. Validating the raw request first rejects an
+    // explicit `residency_mode: resident` without `memory_budget_mb` against
+    // the streamed floor, so the documented default could never apply.
+    const effective = backend_contracts.effectiveCudaA4bRequest(request);
     const detected = (try resolveA4bGptInferenceConfig(
         gpt_config,
-        request,
+        if (request != null) effective else null,
         artifact_qualified,
     )) orelse return null;
     return try backend_contracts.buildCudaA4bInferenceConfig(request, detected.geometry);
+}
+
+test "CUDA A4B resolver applies the resident envelope default before validating residency" {
+    const gpt_config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2816,
+        .num_hidden_layers = 30,
+        .num_local_experts = 128,
+        .num_experts_per_tok = 8,
+        .num_shared_experts = 1,
+        .expert_intermediate_size = 704,
+    };
+    const request = backend_contracts.A4bInferenceRequest{ .residency_mode = .resident };
+    const resolved = (try resolveCudaA4bGptInferenceConfig(gpt_config, request, true)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(backend_contracts.A4bResidencyMode.resident, resolved.residency_mode);
+    try std.testing.expectEqual(
+        @as(u64, backend_contracts.qualified_cuda_a4b_memory_budget_mb) * 1024 * 1024,
+        resolved.memory_budget_bytes,
+    );
 }
 
 fn shouldRetainTensorStore(store_kind: tensor_store_mod.StoreKind, lazy_weight_count: usize) bool {
@@ -6948,9 +7086,63 @@ pub fn loadGptConfigFromModelDir(
     mf: manifest_mod.ModelManifest,
 ) !gpt_mod.Config {
     return switch (try detectArchitecture(allocator, model_dir, mf)) {
-        .gpt => |cfg| cfg,
+        .gpt => |parsed| blk: {
+            var config = parsed;
+            try refineGptConfigFromManifestTensorMetadata(allocator, mf, &config);
+            break :blk config;
+        },
         else => error.InvalidModelForGeneration,
     };
+}
+
+/// Load GPT architecture metadata without retaining a runtime session or
+/// reading tensor payloads. Gemma 4 checkpoints omit some structural
+/// dimensions from config.json, so SafeTensors/GGUF headers are still used to
+/// refine the graph config before a strict training session is admitted.
+pub fn loadGptConfigMetadataFromModelDir(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+) !gpt_mod.Config {
+    var mf = try manifest_mod.loadListingFromDir(allocator, model_dir);
+    defer mf.deinit();
+
+    const arch_config = if (mf.usesGgufWeights()) blk: {
+        const gguf_path = mf.gguf_path orelse return error.MissingModelWeights;
+        var mapped = try c_file.MmapRegion.init(allocator, gguf_path);
+        defer mapped.deinit();
+
+        var file = try gguf_mod.format.parseStructure(allocator, mapped.data);
+        defer file.deinit(allocator);
+        try gguf_mod.format.validateTensorDataRanges(&file, mapped.data.len);
+        const parsed_prefix_len = std.math.cast(usize, file.data_region_offset) orelse mapped.data.len;
+        mapped.adviseSequentialPrefix(@min(parsed_prefix_len, mapped.data.len));
+        break :blk try detectArchitectureWithGgufFile(allocator, model_dir, mf, &file);
+    } else try detectArchitecture(allocator, model_dir, mf);
+
+    return switch (arch_config) {
+        .gpt => |parsed| blk: {
+            var config = parsed;
+            try refineGptConfigFromManifestTensorMetadata(allocator, mf, &config);
+            break :blk config;
+        },
+        else => error.UnsupportedModelArchitecture,
+    };
+}
+
+fn refineGptConfigFromManifestTensorMetadata(
+    allocator: std.mem.Allocator,
+    mf: manifest_mod.ModelManifest,
+    config: *gpt_mod.Config,
+) !void {
+    if (mf.usesGgufWeights()) return;
+    if (mf.safetensors_path == null and mf.safetensors_index_path == null) return;
+
+    var store = try tensor_store_mod.openFromManifest(allocator, mf);
+    defer store.deinit();
+    const source = (try store.weightSource()) orelse return error.NoDenseWeightSource;
+    const all_names = try source.listNames(allocator);
+    defer allocator.free(all_names);
+    try refineGptConfigFromStore(allocator, store, all_names, config);
 }
 
 pub fn getWeightExportSource(session: Session) ?export_source_mod.Source {

@@ -103,6 +103,7 @@ generate: graph-identifier-generate build-docs tidy
 		(cd $$mod && $(GO) generate ./...) || exit 1; \
 	done
 	cd ts && node scripts/run-pinned-toolchain.mjs pnpm --filter @antfly/sdk generate
+	cd ts/apps/model-explorer && node --experimental-strip-types generator/index.ts
 	$(MAKE) -C ./py/packages/sdk generate
 	$(MAKE) build-antfarm
 

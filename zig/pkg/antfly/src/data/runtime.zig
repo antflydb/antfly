@@ -5055,6 +5055,9 @@ const RaftBatchLeaderStatusDiagnostics = struct {
     votes_granted: usize,
     votes_rejected: usize,
     votes_unknown: usize,
+    voters_at_last_index: usize,
+    recent_active_voters: usize,
+    lowest_voter_match_index: u64,
     commit_index: u64,
     last_index: u64,
     applied_index: u64,
@@ -5069,6 +5072,11 @@ const RaftBatchLeaderTimeoutDiagnostics = struct {
     retries_scheduled: usize,
     retries_exhausted: usize,
     pending_retry_count: usize,
+    async_send_pending: usize,
+    async_send_failed: u64,
+    async_send_queue_full: u64,
+    async_send_peer_queue_full: u64,
+    async_heartbeats_coalesced: u64,
 };
 
 const RaftBatchLeaderTimeoutCaptureContext = struct {
@@ -5079,6 +5087,7 @@ const RaftBatchLeaderTimeoutCaptureContext = struct {
 fn captureRaftBatchLeaderTimeoutDiagnostics(context: RaftBatchLeaderTimeoutCaptureContext) RaftBatchLeaderTimeoutDiagnostics {
     const transport_host = &context.raft.host.http_host.transport_stack.transport_host;
     const transport_metrics = transport_host.metricsSnapshot();
+    const async_metrics = context.raft.host.http_host.transport_stack.driver.metricsSnapshot();
     const status = if (context.raft.host.http_host.host.raftStatus(context.group_id)) |raft_status|
         RaftBatchLeaderStatusDiagnostics{
             .node_id = raft_status.id,
@@ -5091,6 +5100,9 @@ fn captureRaftBatchLeaderTimeoutDiagnostics(context: RaftBatchLeaderTimeoutCaptu
             .votes_granted = raft_status.votes_granted,
             .votes_rejected = raft_status.votes_rejected,
             .votes_unknown = raft_status.votes_unknown,
+            .voters_at_last_index = raft_status.voters_at_last_index,
+            .recent_active_voters = raft_status.recent_active_voters,
+            .lowest_voter_match_index = raft_status.lowest_voter_match_index,
             .commit_index = raft_status.hard.commit_index,
             .last_index = raft_status.last_index,
             .applied_index = raft_status.applied_index,
@@ -5106,6 +5118,11 @@ fn captureRaftBatchLeaderTimeoutDiagnostics(context: RaftBatchLeaderTimeoutCaptu
         .retries_scheduled = transport_metrics.retries_scheduled,
         .retries_exhausted = transport_metrics.retries_exhausted,
         .pending_retry_count = transport_host.pendingRetryCount(),
+        .async_send_pending = async_metrics.pending,
+        .async_send_failed = async_metrics.failed,
+        .async_send_queue_full = async_metrics.queue_full,
+        .async_send_peer_queue_full = async_metrics.peer_queue_full,
+        .async_heartbeats_coalesced = async_metrics.heartbeats_coalesced,
     };
 }
 
@@ -5970,6 +5987,8 @@ pub const DataServer = struct {
         }
         var owned_restore_job_store_path: ?[]u8 = null;
         defer if (owned_restore_job_store_path) |path| self.alloc.free(path);
+        var owned_research_job_store_path: ?[]u8 = null;
+        defer if (owned_research_job_store_path) |path| self.alloc.free(path);
         // Only filesystem builds can use the legacy LMDB registry. Standalone
         // lifecycle jobs already belong to the durable metadata owner.
         if (comptime build_options.lmdb_enabled) {
@@ -5982,6 +6001,15 @@ pub const DataServer = struct {
             {
                 owned_restore_job_store_path = try std.fmt.allocPrint(self.alloc, "{s}/api-restore-jobs", .{self.write_source.replica_root_dir});
                 api_server_cfg.restore_job_store_path = owned_restore_job_store_path;
+            }
+            // Research jobs checkpoint every phase so a restart resumes them.
+            if (api_server_cfg.research_job_store_path == null and
+                api_server_cfg.session_store_path == null and
+                self.status_source.standalone_hot_standby == null and
+                api_server_cfg.deployment_mode != .serverless)
+            {
+                owned_research_job_store_path = try std.fmt.allocPrint(self.alloc, "{s}/api-research-jobs", .{self.write_source.replica_root_dir});
+                api_server_cfg.research_job_store_path = owned_research_job_store_path;
             }
         }
         api_server_cfg.shard_ops = self.localShardOperationAdapter();
@@ -12322,7 +12350,7 @@ pub const DataServer = struct {
         // snapshot helper has already released data_raft_mutex, so a blocked
         // log sink cannot stop Raft progress or participate in a lock cycle.
         if (diagnostics.status) |status| {
-            std.log.warn("data raft leader wait timed out group_id={} node_id={} role={} leader={?} voters={} term={} election_elapsed={} election_timeout={} votes_granted={} votes_rejected={} votes_unknown={} commit={} last={} applied={} served_groups={} peer_routes={} sent_frames={} send_failures={} retries_scheduled={} retries_exhausted={} pending_retries={}", .{
+            std.log.warn("data raft leader wait timed out group_id={} node_id={} role={} leader={?} voters={} term={} election_elapsed={} election_timeout={} votes_granted={} votes_rejected={} votes_unknown={} voters_at_last={} recent_active_voters={} lowest_voter_match={} commit={} last={} applied={} served_groups={} peer_routes={} sent_frames={} send_failures={} retries_scheduled={} retries_exhausted={} pending_retries={} async_pending={} async_failed={} async_queue_full={} async_peer_queue_full={} async_heartbeats_coalesced={}", .{
                 group_id,
                 status.node_id,
                 status.role,
@@ -12334,6 +12362,9 @@ pub const DataServer = struct {
                 status.votes_granted,
                 status.votes_rejected,
                 status.votes_unknown,
+                status.voters_at_last_index,
+                status.recent_active_voters,
+                status.lowest_voter_match_index,
                 status.commit_index,
                 status.last_index,
                 status.applied_index,
@@ -12344,9 +12375,14 @@ pub const DataServer = struct {
                 diagnostics.retries_scheduled,
                 diagnostics.retries_exhausted,
                 diagnostics.pending_retry_count,
+                diagnostics.async_send_pending,
+                diagnostics.async_send_failed,
+                diagnostics.async_send_queue_full,
+                diagnostics.async_send_peer_queue_full,
+                diagnostics.async_heartbeats_coalesced,
             });
         } else {
-            std.log.warn("data raft leader wait timed out group_id={} status=missing served_groups={} peer_routes={} sent_frames={} send_failures={} retries_scheduled={} retries_exhausted={} pending_retries={}", .{
+            std.log.warn("data raft leader wait timed out group_id={} status=missing served_groups={} peer_routes={} sent_frames={} send_failures={} retries_scheduled={} retries_exhausted={} pending_retries={} async_pending={} async_failed={} async_queue_full={} async_peer_queue_full={} async_heartbeats_coalesced={}", .{
                 group_id,
                 diagnostics.served_group_count,
                 diagnostics.peer_route_count,
@@ -12355,6 +12391,11 @@ pub const DataServer = struct {
                 diagnostics.retries_scheduled,
                 diagnostics.retries_exhausted,
                 diagnostics.pending_retry_count,
+                diagnostics.async_send_pending,
+                diagnostics.async_send_failed,
+                diagnostics.async_send_queue_full,
+                diagnostics.async_send_peer_queue_full,
+                diagnostics.async_heartbeats_coalesced,
             });
         }
     }

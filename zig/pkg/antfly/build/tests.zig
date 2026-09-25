@@ -1505,7 +1505,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Keep retrieval's unit/contract gate independent of the HTTP-linked
     // serving harness pulled in by root-test. Reuse the same root module and
     // runner, with only retrieval tests selected for code generation.
-    const retrieval_filters = &[_][]const u8{ "api.retrieval_agent.", "api.document_renderer.", "api.web_search." };
+    const retrieval_filters = &[_][]const u8{ "api.retrieval_agent.", "api.document_renderer.", "api.web_search.", "api.web_fetch.", "api.agent_tools.", "api.research_agent.", "api.research_jobs." };
     const retrieval_selected_filters = selectTestFilters(b, retrieval_filters);
     const retrieval_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -1531,6 +1531,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "artifact enrichment accepts typed chunker and rejects ambiguous legacy config",
+        "artifact enrichment list does not expose internal JSON or producer credentials",
+        "typed enrichment producer and graph scorer normalize to legacy storage fields",
+        "empty legacy graph scorer remains a deterministic resolver",
         "staged restore published metadata wins cancellation only after every owner opens",
         "staged restore worker publishes a dependency complete mixed native cohort",
         "staged restore worker rebuilds a dependency complete mixed portable cohort",

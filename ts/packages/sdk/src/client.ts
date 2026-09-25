@@ -60,12 +60,25 @@ import type {
   RelationalConstraintStatus,
   RelationalRowMutationRequest,
   RelationalRowQueryRequest,
+  ResearchAgentRequest,
+  ResearchAgentResult,
+  ResearchAgentStreamCallbacks,
+  ResearchFinding,
+  ResearchJob,
+  ResearchJobAdvanceRequest,
+  ResearchJobStartRequest,
+  ResearchPlanProgress,
+  ResearchReflection,
+  ResearchSectionProgress,
+  ResearchSubQuestionStartedProgress,
+  ResearchVerification,
   ResourceType,
   RestoreJob,
   RestoreRequest,
   RetrievalAgentRequest,
   RetrievalAgentResult,
   RetrievalAgentStreamCallbacks,
+  RunResearchJobOptions,
   ScanKeysRequest,
   SQLDiagnostic,
   SQLPreparedExecutionRequest,
@@ -251,6 +264,20 @@ export class StorageReadTemporarilyUnavailableError extends QueryTemporarilyUnav
   constructor(message: string, retryAfterSeconds: number | undefined) {
     super(message, "storage_read_temporarily_unavailable", retryAfterSeconds);
     this.name = "StorageReadTemporarilyUnavailableError";
+  }
+}
+
+/** Another advance call already holds the lease for this research job. */
+export class ResearchJobAdvanceConflictError extends Error {
+  readonly status = 409 as const;
+  readonly retryable = true as const;
+
+  constructor(
+    message: string,
+    readonly retryAfterSeconds: number | undefined
+  ) {
+    super(message);
+    this.name = "ResearchJobAdvanceConflictError";
   }
 }
 
@@ -507,6 +534,24 @@ export async function readLimitedResponseText(
 
 function parseJSON<T>(text: string): T {
   return JSON.parse(text) as T;
+}
+
+/** Resolves after `ms`, or rejects immediately/on abort when `signal` fires. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export class AntflyClient {
@@ -1104,6 +1149,318 @@ export class AntflyClient {
     // result rather than dropping it, while keeping the streaming return shape.
     callbacks.onDone?.(result);
     return new AbortController();
+  }
+
+  /**
+   * Private helper for Research Agent requests to handle streaming and non-streaming responses
+   */
+  private async performResearchAgent(
+    request: ResearchAgentRequest,
+    callbacks?: ResearchAgentStreamCallbacks,
+    signal?: AbortSignal
+  ): Promise<ResearchAgentResult | AbortController> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream, application/json",
+    };
+
+    // Add auth header if configured
+    const authHeader = this.getAuthHeader();
+    if (authHeader) {
+      headers.Authorization = authHeader;
+    }
+
+    // Merge with any additional headers
+    Object.assign(headers, this.config.headers);
+
+    const abortController = new AbortController();
+    // A caller signal aborts the request too, including while it connects.
+    if (signal) {
+      if (signal.aborted) abortController.abort(signal.reason);
+      else
+        signal.addEventListener("abort", () => abortController.abort(signal.reason), {
+          once: true,
+        });
+    }
+    const response = await fetch(`${normalizeBaseUrl(this.config.baseUrl)}/db/v1/agents/research`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(request),
+      signal: abortController.signal,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      let error: unknown = errorText;
+      try {
+        error = JSON.parse(errorText);
+      } catch {
+        // Older servers may return plain text.
+      }
+      throw queryError("Research agent request failed", error, response);
+    }
+
+    if (!response.body) {
+      throw new Error("Response body is null");
+    }
+
+    // Check content type to determine response format
+    const contentType = response.headers.get("content-type") || "";
+    const isJSON = contentType.includes("application/json");
+
+    // Handle JSON response (non-streaming)
+    if (isJSON) {
+      const result = (await response.json()) as ResearchAgentResult;
+      return result;
+    }
+
+    if (contentType.split(";", 1)[0]?.trim().toLowerCase() !== "text/event-stream") {
+      await response.body.cancel();
+      throw new Error("Research agent returned an unsupported content type");
+    }
+
+    // A JSON caller must not leave an unexpected stream open.
+    if (!callbacks) {
+      await response.body.cancel();
+      return abortController;
+    }
+
+    const stream = response.body;
+    // The controller is returned immediately; terminal failures are delivered
+    // through onError, including read errors, malformed frames, and early EOF.
+    void (async () => {
+      try {
+        for await (const frame of parseSSEFrames(stream, "Research agent")) {
+          if (abortController.signal.aborted) return;
+          switch (frame.event) {
+            case "generation":
+              callbacks.onGeneration?.(JSON.parse(frame.data));
+              break;
+            case "step_started":
+              callbacks.onStepStarted?.(JSON.parse(frame.data));
+              break;
+            case "step_progress": {
+              const progress = JSON.parse(frame.data) as { phase?: string } & Record<
+                string,
+                unknown
+              >;
+              switch (progress.phase) {
+                case "plan":
+                  callbacks.onPlan?.(progress as unknown as ResearchPlanProgress);
+                  break;
+                case "sub_question_started":
+                  callbacks.onSubQuestionStarted?.(
+                    progress as unknown as ResearchSubQuestionStartedProgress
+                  );
+                  break;
+                case "finding":
+                  callbacks.onFinding?.(progress as unknown as ResearchFinding);
+                  break;
+                case "reflection":
+                  callbacks.onReflection?.(progress as unknown as ResearchReflection);
+                  break;
+                case "section":
+                  callbacks.onSection?.(progress as unknown as ResearchSectionProgress);
+                  break;
+                case "verification":
+                  callbacks.onVerification?.(progress as unknown as ResearchVerification);
+                  break;
+              }
+              break;
+            }
+            case "step_completed":
+              callbacks.onStepCompleted?.(JSON.parse(frame.data));
+              break;
+            case "done": {
+              const result = JSON.parse(frame.data);
+              if (
+                result === null ||
+                typeof result !== "object" ||
+                Array.isArray(result) ||
+                typeof result.status !== "string"
+              ) {
+                throw new Error("Research agent returned an invalid done result");
+              }
+              callbacks.onDone?.(result);
+              return;
+            }
+            case "error": {
+              const parsed = JSON.parse(frame.data);
+              if (isTransientCapacityError(parsed)) throw new InferenceCapacityError(parsed);
+              const message =
+                parsed !== null && typeof parsed === "object" && parsed.error
+                  ? String(parsed.error)
+                  : String(parsed);
+              throw new Error(message);
+            }
+          }
+        }
+        throw new Error("Research agent stream ended before done");
+      } catch (error) {
+        if (!abortController.signal.aborted) {
+          const detail = error instanceof Error ? error : new Error(String(error));
+          callbacks.onErrorDetail?.(detail);
+          callbacks.onError?.(detail.message);
+        }
+      }
+    })();
+
+    return abortController;
+  }
+
+  /**
+   * Run the research agent and return one complete JSON result.
+   *
+   * Use streamResearchAgent when incremental plan/finding/report events are
+   * required. For runs that may exceed one request's wall-clock budget, use
+   * startResearchJob/advanceResearchJob or the runResearchJob convenience.
+   */
+  async researchAgent(
+    request: ResearchAgentRequest,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<ResearchAgentResult> {
+    const result = await this.performResearchAgent(
+      { ...request, stream: false },
+      undefined,
+      options.signal
+    );
+    if (result instanceof AbortController) {
+      result.abort();
+      throw new Error("Research agent returned a stream for a JSON request");
+    }
+    return result;
+  }
+
+  /** Run the research agent as an SSE stream. */
+  async streamResearchAgent(
+    request: ResearchAgentRequest,
+    callbacks: ResearchAgentStreamCallbacks,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<AbortController> {
+    const result = await this.performResearchAgent(
+      { ...request, stream: true },
+      callbacks,
+      options.signal
+    );
+    if (result instanceof AbortController) return result;
+
+    // A proxy or older server may still answer with JSON. Preserve the complete
+    // result rather than dropping it, while keeping the streaming return shape.
+    callbacks.onDone?.(result);
+    return new AbortController();
+  }
+
+  /**
+   * Start a durable research job. The job advances one bounded phase at a
+   * time via advanceResearchJob and survives server restarts.
+   */
+  async startResearchJob(request: ResearchJobStartRequest): Promise<ResearchJob> {
+    const { data, error } = await this.client.POST("/db/v1/agents/research/jobs", {
+      body: request,
+    });
+    if (error) {
+      throw new Error(`Failed to start research job: ${apiErrorMessage(error)}`);
+    }
+    if (!data) throw new Error("Failed to start research job: unexpected empty response");
+    return data;
+  }
+
+  /** Get a durable research job's current state and latest checkpointed result. */
+  async getResearchJob(jobId: string): Promise<ResearchJob> {
+    const { data, error } = await this.client.GET("/db/v1/agents/research/jobs/{jobId}", {
+      params: { path: { jobId } },
+    });
+    if (error) {
+      throw new Error(`Failed to get research job: ${apiErrorMessage(error)}`);
+    }
+    if (!data) throw new Error("Failed to get research job: unexpected empty response");
+    return data;
+  }
+
+  /**
+   * Advance a durable research job by up to `request.max_phases` phases.
+   * Throws ResearchJobAdvanceConflictError (409) when another advance call
+   * currently holds the job's lease.
+   */
+  async advanceResearchJob(
+    jobId: string,
+    request?: ResearchJobAdvanceRequest
+  ): Promise<ResearchJob> {
+    const { data, error, response } = await this.client.POST(
+      "/db/v1/agents/research/jobs/{jobId}/advance",
+      {
+        params: { path: { jobId } },
+        body: request,
+      }
+    );
+    if (error) {
+      if (response?.status === 409) {
+        const retryAfter = Number.parseInt(response.headers.get("Retry-After") ?? "", 10);
+        const retryAfterSeconds =
+          Number.isSafeInteger(retryAfter) && retryAfter > 0 ? retryAfter : undefined;
+        throw new ResearchJobAdvanceConflictError(
+          `Failed to advance research job: ${apiErrorMessage(error)}`,
+          retryAfterSeconds
+        );
+      }
+      throw new Error(`Failed to advance research job: ${apiErrorMessage(error)}`);
+    }
+    if (!data) throw new Error("Failed to advance research job: unexpected empty response");
+    return data;
+  }
+
+  /** Cancel a durable research job. Returns the job unchanged if already terminal. */
+  async cancelResearchJob(jobId: string): Promise<ResearchJob> {
+    const { data, error } = await this.client.POST("/db/v1/agents/research/jobs/{jobId}/cancel", {
+      params: { path: { jobId } },
+    });
+    if (error) {
+      throw new Error(`Failed to cancel research job: ${apiErrorMessage(error)}`);
+    }
+    if (!data) throw new Error("Failed to cancel research job: unexpected empty response");
+    return data;
+  }
+
+  /**
+   * Start a durable research job and advance it until it reaches a terminal
+   * state (succeeded, failed or cancelled). A 409 from a concurrent advance
+   * is treated as "someone else is advancing": this waits Retry-After (or 1s)
+   * and polls with getResearchJob instead of racing another advance call.
+   */
+  async runResearchJob(
+    request: ResearchAgentRequest,
+    options?: RunResearchJobOptions
+  ): Promise<ResearchJob> {
+    const advanceRequest: ResearchJobAdvanceRequest | undefined =
+      options?.maxPhasesPerAdvance === undefined
+        ? undefined
+        : { max_phases: options.maxPhasesPerAdvance };
+
+    let job = await this.startResearchJob({ request });
+    options?.onJob?.(job);
+
+    while (job.state === "queued" || job.state === "running") {
+      if (options?.signal?.aborted) {
+        throw options.signal.reason instanceof Error
+          ? options.signal.reason
+          : new Error("runResearchJob aborted");
+      }
+      try {
+        job = await this.advanceResearchJob(job.job_id, advanceRequest);
+      } catch (error) {
+        if (error instanceof ResearchJobAdvanceConflictError) {
+          const delayMs = (error.retryAfterSeconds ?? 1) * 1000;
+          await sleep(delayMs, options?.signal);
+          job = await this.getResearchJob(job.job_id);
+          options?.onJob?.(job);
+          continue;
+        }
+        throw error;
+      }
+      options?.onJob?.(job);
+    }
+
+    return job;
   }
 
   /**

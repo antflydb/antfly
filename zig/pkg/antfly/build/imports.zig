@@ -257,6 +257,7 @@ pub const AntflyRootImports = struct {
         "generating_api_openapi",
         "generating_openapi",
         "mcp",
+        "matcher",
         "raft_engine",
         "toon",
         "usermgr_openapi",
@@ -294,6 +295,7 @@ pub const AntflyRootImports = struct {
         inline for (.{
             "inference_api", "inference_config_openapi", "middleware_openapi",
             "s3_openapi",    "scraping_openapi",         "vectorindex",
+            "matcher",
         }) |field| self.addImport(mod, field);
         addSnowballModule(b, mod);
     }

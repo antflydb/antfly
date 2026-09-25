@@ -1297,6 +1297,67 @@ pub const Client = struct {
         return ApiResponse(types.QueryBuilderResult).fromResponse(self.allocator, &resp);
     }
 
+    /// Research Agent - Bounded multi-phase research with a cited report
+    /// POST /db/v1/agents/research
+    pub fn researchAgent(self: *@This(), body: types.ResearchAgentRequest) !RawResponse {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/research", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
+    /// Start a durable research job
+    /// POST /db/v1/agents/research/jobs
+    pub fn startResearchJob(self: *@This(), body: types.ResearchJobStartRequest) !ApiResponse(types.ResearchJob) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/research/jobs", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ResearchJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get a durable research job
+    /// GET /db/v1/agents/research/jobs/{jobId}
+    pub fn getResearchJob(self: *@This(), job_id: []const u8) !ApiResponse(types.ResearchJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/research/jobs/{s}", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResearchJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Advance a durable research job
+    /// POST /db/v1/agents/research/jobs/{jobId}/advance
+    pub fn advanceResearchJob(self: *@This(), job_id: []const u8, body: ?types.ResearchJobAdvanceRequest) !ApiResponse(types.ResearchJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/research/jobs/{s}/advance", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
+        defer if (json_body) |value| self.allocator.free(value);
+        var resp = if (json_body) |value|
+            try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
+        else
+            try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResearchJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Cancel a durable research job
+    /// POST /db/v1/agents/research/jobs/{jobId}/cancel
+    pub fn cancelResearchJob(self: *@This(), job_id: []const u8) !ApiResponse(types.ResearchJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/research/jobs/{s}/cancel", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResearchJob).fromResponse(self.allocator, &resp);
+    }
+
     /// Retrieval Agent - Agentic document retrieval with tool calling
     /// POST /db/v1/agents/retrieval
     pub fn retrievalAgent(self: *@This(), body: types.RetrievalAgentRequest) !RawResponse {

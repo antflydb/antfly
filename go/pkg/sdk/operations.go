@@ -1095,6 +1095,434 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 	return result, nil
 }
 
+// ResearchSubQuestionStarted reports that a researcher is about to run for a
+// planned sub-question.
+type ResearchSubQuestionStarted struct {
+	SubQuestionID string `json:"sub_question_id"`
+	Question      string `json:"question"`
+	Round         int    `json:"round"`
+}
+
+// ResearchSectionProgress reports a report section as the writer produces it.
+type ResearchSectionProgress struct {
+	Index   int    `json:"index"`
+	Heading string `json:"heading"`
+}
+
+// ResearchAgentError represents an error from the research agent.
+type ResearchAgentError struct {
+	Error  string `json:"error"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// ResearchAgentOptions configures streaming callbacks for the research agent.
+// Callbacks are invoked as SSE events arrive during a streaming request. The
+// retrieval-agent event names are reused; each `step_progress` phase (plan,
+// sub_question_started, finding, reflection, section, verification) is
+// dispatched to its own typed callback.
+type ResearchAgentOptions struct {
+	OnStepStarted        func(step *SSEStepStarted) error
+	OnStepCompleted      func(step *AgentStep) error
+	OnPlan               func(plan *ResearchPlan) error
+	OnSubQuestionStarted func(sq *ResearchSubQuestionStarted) error
+	OnFinding            func(finding *ResearchFinding) error
+	OnReflection         func(reflection *ResearchReflection) error
+	OnSection            func(section *ResearchSectionProgress) error
+	OnVerification       func(verification *ResearchVerification) error
+	OnGeneration         func(chunk string) error
+	OnError              func(err *ResearchAgentError) error
+}
+
+// ResearchAgent runs the bounded multi-phase research agent: plan, then
+// parallel retrieval researchers, reflection, report writing, and citation
+// verification. Supports streaming responses with callbacks for step
+// lifecycle, phase progress, and generation text. Send back the result's
+// ResearchState in a follow-up request to resume or extend a run; for runs
+// longer than one request, use StartResearchJob/RunResearchJob instead.
+func (c *AntflyClient) ResearchAgent(ctx context.Context, req ResearchAgentRequest, opts ...ResearchAgentOptions) (*ResearchAgentResult, error) {
+	// Merge options
+	var opt ResearchAgentOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
+	// Marshal request
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling research agent request: %w", err)
+	}
+
+	// Set Accept header based on streaming mode
+	acceptHeader := func(_ context.Context, httpReq *http.Request) error {
+		if req.Stream {
+			httpReq.Header.Set("Accept", "text/event-stream")
+		} else {
+			httpReq.Header.Set("Accept", "application/json")
+		}
+		return nil
+	}
+
+	resp, err := c.client.ResearchAgentWithBody(ctx, "application/json", bytes.NewBuffer(reqBody), acceptHeader)
+	if err != nil {
+		return nil, fmt.Errorf("sending research agent request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("research agent request failed: %w", readErrorResponse(resp))
+	}
+
+	// If streaming is disabled, read JSON response directly
+	if !req.Stream {
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("reading response body: %w", err)
+		}
+		var result ResearchAgentResult
+		if err := json.Unmarshal(respBody, &result); err != nil {
+			return nil, fmt.Errorf("parsing research agent result: %w", err)
+		}
+		return &result, nil
+	}
+
+	// Build result from streaming events. Only a well-formed done event
+	// completes the call: a stream that ends early (connection reset,
+	// truncation) or carries a malformed done is an error, never an empty
+	// result.
+	result := &ResearchAgentResult{}
+	sawDone := false
+
+	for eventType, data := range readSSEEvents(resp.Body) {
+		switch oapi.SSEEvent(eventType) {
+		case oapi.SSEEventStepStarted:
+			if opt.OnStepStarted != nil {
+				var d SSEStepStarted
+				if json.Unmarshal([]byte(data), &d) == nil {
+					if err := opt.OnStepStarted(&d); err != nil {
+						return nil, fmt.Errorf("step_started callback: %w", err)
+					}
+				}
+			}
+		case oapi.SSEEventStepProgress:
+			var head struct {
+				Phase string `json:"phase"`
+			}
+			if json.Unmarshal([]byte(data), &head) != nil {
+				continue
+			}
+			switch head.Phase {
+			case "plan":
+				if opt.OnPlan != nil {
+					var d ResearchPlan
+					if json.Unmarshal([]byte(data), &d) == nil {
+						if err := opt.OnPlan(&d); err != nil {
+							return nil, fmt.Errorf("plan callback: %w", err)
+						}
+					}
+				}
+			case "sub_question_started":
+				if opt.OnSubQuestionStarted != nil {
+					var d ResearchSubQuestionStarted
+					if json.Unmarshal([]byte(data), &d) == nil {
+						if err := opt.OnSubQuestionStarted(&d); err != nil {
+							return nil, fmt.Errorf("sub_question_started callback: %w", err)
+						}
+					}
+				}
+			case "finding":
+				if opt.OnFinding != nil {
+					var d ResearchFinding
+					if json.Unmarshal([]byte(data), &d) == nil {
+						if err := opt.OnFinding(&d); err != nil {
+							return nil, fmt.Errorf("finding callback: %w", err)
+						}
+					}
+				}
+			case "reflection":
+				if opt.OnReflection != nil {
+					var d ResearchReflection
+					if json.Unmarshal([]byte(data), &d) == nil {
+						if err := opt.OnReflection(&d); err != nil {
+							return nil, fmt.Errorf("reflection callback: %w", err)
+						}
+					}
+				}
+			case "section":
+				if opt.OnSection != nil {
+					var d ResearchSectionProgress
+					if json.Unmarshal([]byte(data), &d) == nil {
+						if err := opt.OnSection(&d); err != nil {
+							return nil, fmt.Errorf("section callback: %w", err)
+						}
+					}
+				}
+			case "verification":
+				if opt.OnVerification != nil {
+					var d ResearchVerification
+					if json.Unmarshal([]byte(data), &d) == nil {
+						if err := opt.OnVerification(&d); err != nil {
+							return nil, fmt.Errorf("verification callback: %w", err)
+						}
+					}
+				}
+			}
+		case oapi.SSEEventStepCompleted:
+			if opt.OnStepCompleted != nil {
+				var step AgentStep
+				if json.Unmarshal([]byte(data), &step) == nil {
+					if err := opt.OnStepCompleted(&step); err != nil {
+						return nil, fmt.Errorf("step_completed callback: %w", err)
+					}
+				}
+			}
+		case oapi.SSEEventGeneration:
+			if opt.OnGeneration != nil {
+				var chunk string
+				if json.Unmarshal([]byte(data), &chunk) == nil {
+					if err := opt.OnGeneration(chunk); err != nil {
+						return nil, fmt.Errorf("generation callback: %w", err)
+					}
+				}
+			}
+		case oapi.SSEEventDone:
+			if err := json.Unmarshal([]byte(data), result); err != nil {
+				return nil, fmt.Errorf("parsing research agent done event: %w", err)
+			}
+			if result.Status == "" {
+				return nil, errors.New("research agent done event has no status")
+			}
+			sawDone = true
+		case oapi.SSEEventError:
+			var agentErr ResearchAgentError
+			if json.Unmarshal([]byte(data), &agentErr) != nil {
+				agentErr = ResearchAgentError{Error: data}
+			}
+			if opt.OnError != nil {
+				if callbackErr := opt.OnError(&agentErr); callbackErr != nil {
+					return nil, callbackErr
+				}
+			}
+			return nil, fmt.Errorf("research agent: %s", agentErr.Error)
+		}
+	}
+
+	if !sawDone {
+		return nil, errors.New("research agent stream ended without a done event")
+	}
+	return result, nil
+}
+
+// ErrResearchJobAdvanceConflict indicates a concurrent advance of the same
+// durable research job is already in flight. Callers should wait and re-GET
+// the job with GetResearchJob rather than treating this as a hard failure.
+var ErrResearchJobAdvanceConflict = errors.New("research job advance already in progress")
+
+// StartResearchJob persists a research request as a durable job that
+// advances one bounded phase at a time. Use AdvanceResearchJob or
+// RunResearchJob to make progress.
+func (c *AntflyClient) StartResearchJob(ctx context.Context, req ResearchJobStartRequest) (*ResearchJob, error) {
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling research job start request: %w", err)
+	}
+
+	resp, err := c.client.StartResearchJobWithBody(ctx, "application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("starting research job: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("starting research job failed: %w", readErrorResponse(resp))
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+	var job ResearchJob
+	if err := json.Unmarshal(respBody, &job); err != nil {
+		return nil, fmt.Errorf("parsing research job: %w", err)
+	}
+	return &job, nil
+}
+
+// GetResearchJob returns a durable research job's current state and latest
+// checkpointed result.
+func (c *AntflyClient) GetResearchJob(ctx context.Context, jobID string) (*ResearchJob, error) {
+	resp, err := c.client.GetResearchJob(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("getting research job: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("getting research job failed: %w", readErrorResponse(resp))
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+	var job ResearchJob
+	if err := json.Unmarshal(respBody, &job); err != nil {
+		return nil, fmt.Errorf("parsing research job: %w", err)
+	}
+	return &job, nil
+}
+
+// AdvanceResearchJob runs up to req.MaxPhases bounded research phases and
+// persists the checkpoint after each one. A 409 response, returned when a
+// concurrent advance of the same job is already in flight, is reported as
+// ErrResearchJobAdvanceConflict; callers should wait and re-GET the job
+// rather than retrying immediately. RunResearchJob handles this loop
+// automatically.
+func (c *AntflyClient) AdvanceResearchJob(ctx context.Context, jobID string, req ResearchJobAdvanceRequest) (*ResearchJob, error) {
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling research job advance request: %w", err)
+	}
+
+	resp, err := c.client.AdvanceResearchJobWithBody(ctx, jobID, "application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("advancing research job: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusConflict {
+		return nil, fmt.Errorf("%w: %w", ErrResearchJobAdvanceConflict, readErrorResponse(resp))
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("advancing research job failed: %w", readErrorResponse(resp))
+	}
+
+	// Both 202 (advanced) and 200 (already terminal) carry a ResearchJob body.
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+	var job ResearchJob
+	if err := json.Unmarshal(respBody, &job); err != nil {
+		return nil, fmt.Errorf("parsing research job: %w", err)
+	}
+	return &job, nil
+}
+
+// CancelResearchJob requests cancellation of a durable research job. Already
+// terminal jobs are returned unchanged.
+func (c *AntflyClient) CancelResearchJob(ctx context.Context, jobID string) (*ResearchJob, error) {
+	resp, err := c.client.CancelResearchJob(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("cancelling research job: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("cancelling research job failed: %w", readErrorResponse(resp))
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+	var job ResearchJob
+	if err := json.Unmarshal(respBody, &job); err != nil {
+		return nil, fmt.Errorf("parsing research job: %w", err)
+	}
+	return &job, nil
+}
+
+// isResearchJobTerminal reports whether a durable research job has reached a
+// terminal lifecycle state.
+func isResearchJobTerminal(state ResearchJobState) bool {
+	switch state {
+	case oapi.ResearchJobStateSucceeded, oapi.ResearchJobStateFailed, oapi.ResearchJobStateCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// RunResearchJobOptions configures RunResearchJob's advance/poll loop.
+type RunResearchJobOptions struct {
+	// MaxPhasesPerAdvance bounds phases run per AdvanceResearchJob call.
+	// Defaults to 1.
+	MaxPhasesPerAdvance int
+	// PollInterval is how long to wait before re-GETting the job after a 409
+	// (a concurrent advance is already in flight). Defaults to 500ms.
+	PollInterval time.Duration
+	// OnUpdate, when set, is invoked with the job's latest state after every
+	// advance or poll, including the terminal one.
+	OnUpdate func(job *ResearchJob) error
+}
+
+// RunResearchJob starts a durable research job and repeatedly advances it
+// until it reaches a terminal state (succeeded, failed, or cancelled). A 409
+// from a concurrent advance is treated as "wait and re-GET" rather than an
+// error, per AdvanceResearchJob's documented contract. The returned job's
+// Result carries the final ResearchAgentResult once state is "succeeded".
+func (c *AntflyClient) RunResearchJob(ctx context.Context, req ResearchAgentRequest, opts ...RunResearchJobOptions) (*ResearchJob, error) {
+	var opt RunResearchJobOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	maxPhases := opt.MaxPhasesPerAdvance
+	if maxPhases <= 0 {
+		maxPhases = 1
+	}
+	pollInterval := opt.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = 500 * time.Millisecond
+	}
+
+	job, err := c.StartResearchJob(ctx, ResearchJobStartRequest{Request: req})
+	if err != nil {
+		return nil, fmt.Errorf("starting research job: %w", err)
+	}
+	if opt.OnUpdate != nil {
+		if err := opt.OnUpdate(job); err != nil {
+			return nil, err
+		}
+	}
+
+	for !isResearchJobTerminal(job.State) {
+		if err := ctx.Err(); err != nil {
+			return job, err
+		}
+
+		advanced, err := c.AdvanceResearchJob(ctx, job.JobId, ResearchJobAdvanceRequest{MaxPhases: maxPhases})
+		if err != nil {
+			if errors.Is(err, ErrResearchJobAdvanceConflict) {
+				select {
+				case <-ctx.Done():
+					return job, ctx.Err()
+				case <-time.After(pollInterval):
+				}
+				refreshed, getErr := c.GetResearchJob(ctx, job.JobId)
+				if getErr != nil {
+					return nil, fmt.Errorf("re-fetching research job after conflict: %w", getErr)
+				}
+				job = refreshed
+				if opt.OnUpdate != nil {
+					if err := opt.OnUpdate(job); err != nil {
+						return nil, err
+					}
+				}
+				continue
+			}
+			return nil, fmt.Errorf("advancing research job: %w", err)
+		}
+		job = advanced
+		if opt.OnUpdate != nil {
+			if err := opt.OnUpdate(job); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return job, nil
+}
+
 // MultiBatch performs a cross-table batch operation atomically. Transaction
 // conflicts return a result with Status "aborted" and a populated Conflict;
 // they are outcomes, not transport errors.

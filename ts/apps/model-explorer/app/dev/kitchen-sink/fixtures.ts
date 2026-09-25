@@ -125,7 +125,6 @@ export const fixtureSpec: ModelSpec = {
     },
   },
   sankey: fixtureSankey,
-  sources: { gitCommit: "fixture", generatedAt: "fixture" },
 };
 
 export const fixtureKvTrace: KvTrace = {

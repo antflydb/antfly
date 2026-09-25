@@ -13,6 +13,39 @@ pub fn parseQueryBuilderAgentBody(allocator: std.mem.Allocator, body: []const u8
     return std.json.parseFromSlice(types.QueryBuilderRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for researchAgent.
+pub fn parseResearchAgentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ResearchAgentRequest) {
+    return std.json.parseFromSlice(types.ResearchAgentRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for startResearchJob.
+pub fn parseStartResearchJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ResearchJobStartRequest) {
+    return std.json.parseFromSlice(types.ResearchJobStartRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Get a durable research job
+pub const GetResearchJobPathParams = struct {
+    /// Research job identifier.
+    job_id: []const u8,
+};
+
+/// Advance a durable research job
+pub const AdvanceResearchJobPathParams = struct {
+    /// Research job identifier.
+    job_id: []const u8,
+};
+
+/// Parse the JSON request body for advanceResearchJob.
+pub fn parseAdvanceResearchJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ResearchJobAdvanceRequest) {
+    return std.json.parseFromSlice(types.ResearchJobAdvanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Cancel a durable research job
+pub const CancelResearchJobPathParams = struct {
+    /// Research job identifier.
+    job_id: []const u8,
+};
+
 /// Parse the JSON request body for retrievalAgent.
 pub fn parseRetrievalAgentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RetrievalAgentRequest) {
     return std.json.parseFromSlice(types.RetrievalAgentRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -1463,6 +1496,11 @@ pub const Route = struct {
 
 pub const routes = [_]Route{
     .{ .method = "POST", .path = "/agents/query-builder", .operation_id = "queryBuilderAgent", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/agents/research", .operation_id = "researchAgent", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "POST", .path = "/agents/research/jobs", .operation_id = "startResearchJob", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/agents/research/jobs/{jobId}", .operation_id = "getResearchJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/agents/research/jobs/{jobId}/advance", .operation_id = "advanceResearchJob", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/agents/research/jobs/{jobId}/cancel", .operation_id = "cancelResearchJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/agents/retrieval", .operation_id = "retrievalAgent", .request_body = .buffered, .streaming_response = true },
     .{ .method = "GET", .path = "/auth/v1/me", .operation_id = "getCurrentUser", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/auth/v1/subjects", .operation_id = "listAuthSubjects", .request_body = .none, .streaming_response = false },
@@ -1620,6 +1658,11 @@ pub const routes = [_]Route{
 // Handler interface. Implement these methods on your Impl struct:
 //
 //   fn queryBuilderAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn researchAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn startResearchJob(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getResearchJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn advanceResearchJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn cancelResearchJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
 //   fn retrievalAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getCurrentUser(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listAuthSubjects(self: *Impl, ctx: *httpx.Context) !httpx.Response

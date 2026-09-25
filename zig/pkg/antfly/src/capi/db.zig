@@ -6046,6 +6046,7 @@ pub fn storageOwnerOpen(
     const prepared_schema = local_write.prepareOwnerSchemaBeforeIndexLoad(alloc, request.schema_json.slice()) catch |err| return storageOwnerStatusFromError(err);
     defer local_write.freeOwnerSchemaBeforeIndexLoad(alloc, prepared_schema);
     if (request.restore_cancel_recovery > 1 or request.restore_ha_replay > 1 or
+        request.historical_raft_apply > 1 or
         (request.restore_cancel_recovery != 0 and request.restore_ha_replay != 0) or
         ((request.restore_cancel_recovery != 0 or request.restore_ha_replay != 0) and request.restore_bootstrap_json.len == 0) or request.restore_bootstrap_json.len > 16 * 1024 * 1024 or
         request.initial_child_bootstrap_json.len > 4096 or
@@ -6140,6 +6141,12 @@ pub fn storageOwnerOpen(
     handle.* = .{
         .alloc = alloc,
         .db = db_mod.DB.open(alloc, path, open_options) catch |err| {
+            // A descriptor captured before structural reconciliation can outlive
+            // the owner that installed a newer durable schema. Reject the stale
+            // open without making Raft apply fatal; its next attempt reloads the
+            // catalog descriptor. Keep exact restore bootstrap failures strict.
+            if (err == error.SchemaVersionRegression and restore_bootstrap == null)
+                return storageOwnerStatusFromError(error.StorageBusy);
             std.log.err("storage owner open failed table={s} group_id={} err={s}", .{
                 table_name, request.group_id, @errorName(err),
             });
@@ -6171,7 +6178,7 @@ pub fn storageOwnerOpen(
     // after the DB occupies its final address, and drain them on failure.
     if (restore_bootstrap) |bootstrap| {
         local_write.configureRestoreOwnerDb(alloc, &handle.db, bootstrap.value, request.restore_cancel_recovery != 0, request.restore_ha_replay != 0) catch |err| return storageOwnerStatusFromError(err);
-    } else local_write.configureStorageKernelOwnerDb(
+    } else local_write.configureStorageKernelOwnerDbAtOpen(
         alloc,
         &handle.db,
         table_name,
@@ -6182,6 +6189,7 @@ pub fn storageOwnerOpen(
         if (owner_context) |context| context.secret_store else null,
         if (owner_context) |context| context.remoteContent() else null,
         &handle.storage_owner_managed_config,
+        request.historical_raft_apply != 0,
     ) catch |err| return storageOwnerStatusFromError(err);
     // DB.open returns by value. Only now is the compiled owner's DB at its
     // permanent address with configuration installed; use the same startup as

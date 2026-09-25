@@ -2,7 +2,7 @@
 
 import { Card, CardContent, CardHeader, CardTitle } from "@antfly/design-system";
 import { CodeLink } from "@/components/code/code-link";
-import { type ClientSnippet, SnippetProvider } from "@/components/code/snippet-context";
+import { SourceLinkProvider } from "@/components/code/source-link-context";
 import { BytesBar, ComparisonBars, JourneyChart } from "@/components/viz/perf-charts";
 import {
   bytesBreakdown,
@@ -16,17 +16,9 @@ import {
   splitGqaRetune,
 } from "@/content/perf";
 
-export function PerfClient({
-  snippets,
-  gitCommit,
-  permalinkBase,
-}: {
-  snippets: Record<string, ClientSnippet>;
-  gitCommit: string;
-  permalinkBase?: string;
-}) {
+export function PerfClient({ permalinkBase }: { permalinkBase?: string }) {
   return (
-    <SnippetProvider snippets={snippets} gitCommit={gitCommit} permalinkBase={permalinkBase}>
+    <SourceLinkProvider permalinkBase={permalinkBase}>
       <div className="mx-auto max-w-6xl space-y-12 px-4 py-8">
         <header className="max-w-3xl">
           <h1 className="text-3xl font-bold tracking-tight">Performance &amp; roofline</h1>
@@ -148,6 +140,6 @@ export function PerfClient({
           </div>
         </section>
       </div>
-    </SnippetProvider>
+    </SourceLinkProvider>
   );
 }

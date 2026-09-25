@@ -105,11 +105,13 @@ const public_limits = @import("public_limits.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
 const request_admission_policy = @import("request_admission_policy.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
+const research_agent = @import("research_agent.zig");
 const web_search = @import("web_search.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const distributed_join = @import("distributed_join.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
+const research_jobs = @import("research_jobs.zig");
 const repair_jobs = @import("repair_jobs.zig");
 const admin_routes = @import("../admin/routes.zig");
 const internal_api_routes = @import("../internal/routes.zig");
@@ -571,6 +573,13 @@ fn restoreRetryDelayNs(err: anyerror, job_id: u64, attempt_id: u64) u64 {
     };
 }
 
+fn restoreRewriteStepError(err: anyerror) anyerror {
+    // A source or target owner may briefly return 503 while leadership or
+    // routing settles. The rewrite cursor is already durable: keep this
+    // attempt and retry the same step instead of backing off a new attempt.
+    return if (err == error.RestoreValidationPending) error.RestoreStagingWait else err;
+}
+
 fn waitForRestoreCutoverFence(
     alloc: std.mem.Allocator,
     reads: table_reads.TableReadSource,
@@ -605,6 +614,8 @@ test "restore cutover readiness waits without exponential retry" {
     try std.testing.expectEqual(restore_staging_wait_ns, restoreRetryDelayNs(error.RestoreStagingWait, 42, 8));
     try std.testing.expect(restoreRetryDelayNs(error.RestoreValidationPending, 42, 8) > restore_staging_wait_ns);
     try std.testing.expect(restoreJobErrorIsRetryable(error.RestoreStagingWait));
+    try std.testing.expectEqual(error.RestoreStagingWait, restoreRewriteStepError(error.RestoreValidationPending));
+    try std.testing.expectEqual(error.RestoreStagingScopeChanged, restoreRewriteStepError(error.RestoreStagingScopeChanged));
 }
 
 test "restore cutover lost begin reply waits for the same fence to drain" {
@@ -1437,6 +1448,11 @@ pub const ApiHttpServerConfig = struct {
     join_job_retention_ms: ?u64 = null,
     artifact_reprocess_job_store_path: ?[]const u8 = null,
     artifact_reprocess_job_retention_ms: ?u64 = null,
+    /// Durable research-agent jobs: an engine-owned store (standalone), else
+    /// a docstore at this path, else `<session_store_path>.research_jobs`.
+    research_job_store: ?*backend_erased.Store = null,
+    research_job_store_path: ?[]const u8 = null,
+    research_job_retention_ms: ?u64 = null,
     repair_job_store_path: ?[]const u8 = null,
     repair_job_retention_ms: ?u64 = null,
     /// Engine-owned durable storage for restore jobs. The caller retains
@@ -3462,6 +3478,10 @@ pub const ApiHttpServer = struct {
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    research_job_store: research_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    research_state_key: [32]u8 = undefined,
+    research_state_key_ready: std.atomic.Value(bool) = .init(false),
+    research_state_key_mutex: std.atomic.Mutex = .unlocked,
     repair_job_store: repair_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     restore_job_store: restore_jobs.Store = .{ .alloc = undefined },
     rewrite_artifact_peer_cursor: std.atomic.Value(usize) = .init(0),
@@ -3693,6 +3713,10 @@ pub const ApiHttpServer = struct {
                 .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
                 .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
+            .research_job_store = research_jobs.Store.init(owner_alloc, .{
+                .path = cfg.research_job_store_path,
+                .retention_ms = cfg.research_job_retention_ms,
+            }),
             .repair_job_store = repair_jobs.Store.init(owner_alloc, .{
                 .repair_job_store_path = cfg.repair_job_store_path,
                 .repair_job_retention_ms = cfg.repair_job_retention_ms,
@@ -3764,6 +3788,29 @@ pub const ApiHttpServer = struct {
 
     fn protocolStoreNowNs() u64 {
         return platform_time.monotonicNs();
+    }
+
+    /// Key that signs client-carried research checkpoints. Derived from the
+    /// internal service secret so every node of a cluster verifies every
+    /// other node's checkpoints; otherwise random per process, so standalone
+    /// checkpoints stop verifying after a restart (durable jobs do not).
+    pub fn researchStateKey(self: *ApiHttpServer, io: std.Io) ![32]u8 {
+        if (self.research_state_key_ready.load(.acquire)) return self.research_state_key;
+        @import("antfly_platform").sync.lockYielding(&self.research_state_key_mutex);
+        defer self.research_state_key_mutex.unlock();
+        if (!self.research_state_key_ready.load(.acquire)) {
+            if (self.cfg.internal_service_secret) |secret| {
+                std.crypto.auth.hmac.sha2.HmacSha256.create(&self.research_state_key, "antfly research_state v1", secret);
+            } else try io.randomSecure(&self.research_state_key);
+            self.research_state_key_ready.store(true, .release);
+        }
+        return self.research_state_key;
+    }
+
+    /// Multi-threaded runtime for bounded agent fan-out (parallel tool calls
+    /// and research researchers). Null runs the same work sequentially.
+    pub fn agentConcurrencyIo(self: *const ApiHttpServer) ?std.Io {
+        return configuredApiNetworkIo(self.cfg);
     }
 
     pub fn inferenceIo(self: *const ApiHttpServer) std.Io {
@@ -4092,6 +4139,20 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.artifact_reprocess_job_store.attachOpenedStore(opened);
         }
+        if (cfg.research_job_store) |store| {
+            try server.research_job_store.attachRuntime(store);
+        } else if (cfg.research_job_store_path orelse cfg.session_store_path) |base_path| {
+            const job_path = if (cfg.research_job_store_path != null)
+                try alloc.dupe(u8, base_path)
+            else
+                try std.fmt.allocPrint(alloc, "{s}.research_jobs", .{base_path});
+            defer alloc.free(job_path);
+            const opened = try alloc.create(research_jobs.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try research_jobs.OpenedStore.open(alloc, job_path);
+            errdefer opened.deinit();
+            try server.research_job_store.attachOpenedStore(opened);
+        }
         if (cfg.repair_job_store_path orelse cfg.session_store_path) |base_path| {
             const job_path = if (cfg.repair_job_store_path != null)
                 try alloc.dupe(u8, base_path)
@@ -4177,6 +4238,7 @@ pub const ApiHttpServer = struct {
         }
         self.join_job_store.deinit();
         self.artifact_reprocess_job_store.deinit();
+        self.research_job_store.deinit();
         self.repair_job_store.deinit();
         self.restore_job_store.deinit();
         self.scheduled_restore_jobs.deinit(self.alloc);
@@ -4712,6 +4774,7 @@ pub const ApiHttpServer = struct {
         };
         self.join_job_store.cleanupExpiredJoinJobs();
         self.artifact_reprocess_job_store.cleanupExpiredJobs();
+        self.research_job_store.cleanupExpiredJobs();
         self.repair_job_store.cleanupExpiredJobs();
         if (self.cfg.backend_runtime) |runtime| {
             _ = runtime.durable_jobs.poll(32) catch |err| {
@@ -7960,6 +8023,35 @@ pub const ApiHttpServer = struct {
         query_embedding_security_scope: QueryEmbeddingSecurityScope,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !void {
+        return self.executeA2aAgent(.retrieval, alloc, body, task_id, context_id, queue, query_embedding_security_scope, authenticated_identity);
+    }
+
+    /// A2A `research` skill: the same native research agent as
+    /// `/agents/research`, reported as A2A task artifacts and status updates.
+    pub fn executeA2aResearch(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        body: []const u8,
+        task_id: []const u8,
+        context_id: []const u8,
+        queue: *a2a.EventQueue,
+        query_embedding_security_scope: QueryEmbeddingSecurityScope,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !void {
+        return self.executeA2aAgent(.research, alloc, body, task_id, context_id, queue, query_embedding_security_scope, authenticated_identity);
+    }
+
+    fn executeA2aAgent(
+        self: *ApiHttpServer,
+        comptime kind: enum { retrieval, research },
+        alloc: std.mem.Allocator,
+        body: []const u8,
+        task_id: []const u8,
+        context_id: []const u8,
+        queue: *a2a.EventQueue,
+        query_embedding_security_scope: QueryEmbeddingSecurityScope,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !void {
         var diagnostic_context: query_request_diagnostics.Context = .{};
         const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
         defer diagnostic_scope.deinit();
@@ -7995,6 +8087,7 @@ pub const ApiHttpServer = struct {
                         .scan_key_page = scanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
                     },
+                    .io = runner.server.agentConcurrencyIo(),
                 };
             }
 
@@ -8129,7 +8222,10 @@ pub const ApiHttpServer = struct {
             .secret_store = self.cfg.secret_store,
             .inference_api_key = self.cfg.inference_api_key,
             .io = self.inferenceIo(),
-            .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
+            .deadline_ns = platform_time.monotonicNs() +| switch (kind) {
+                .retrieval => 5 * std.time.ns_per_min,
+                .research => (research_agent.deadlineMs(alloc, body) orelse research_agent.max_deadline_ms) *| std.time.ns_per_ms,
+            },
         };
 
         var query_runner = RetrievalQueryRunner{
@@ -8170,7 +8266,7 @@ pub const ApiHttpServer = struct {
                         .string => |text| text,
                         else => "completed",
                     } else "completed";
-                    try sink.queue.status(event_alloc, sink.task_id, sink.context_id, state, "retrieval completed");
+                    try sink.queue.status(event_alloc, sink.task_id, sink.context_id, state, "agent completed");
                 }
             }
         };
@@ -8180,8 +8276,22 @@ pub const ApiHttpServer = struct {
             .task_id = task_id,
             .context_id = context_id,
         };
-        try queue.status(alloc, task_id, context_id, "working", "retrieval started");
-        const retrieval_resp = retrieval_agent.executeWithEventSink(alloc, query_runner.iface(), generation_runner.iface(), body, sink.iface()) catch |err| switch (err) {
+        try queue.status(alloc, task_id, context_id, "working", @tagName(kind) ++ " started");
+        const retrieval_resp = (switch (kind) {
+            .retrieval => retrieval_agent.executeWithEventSink(alloc, query_runner.iface(), generation_runner.iface(), body, sink.iface()),
+            .research => research_agent.execute(alloc, query_runner.iface(), generation_runner.iface(), body, sink.iface(), .{
+                .deadline_ns = generation_runner.deadline_ns,
+                .state_key = try self.researchStateKey(self.inferenceIo()),
+            }),
+        }) catch |err| switch (err) {
+            error.InvalidResearchAgentRequest => {
+                try queue.status(alloc, task_id, context_id, "failed", "invalid research agent request");
+                return;
+            },
+            error.InvalidResearchState => {
+                try queue.status(alloc, task_id, context_id, "failed", "research_state was modified or issued by another server");
+                return;
+            },
             error.TreeRootSetTooLarge => {
                 try queue.status(alloc, task_id, context_id, "failed", "tree root set exceeds the bounded retrieval limit");
                 return;
@@ -16952,7 +17062,7 @@ pub const ApiHttpServer = struct {
                 const before = worker_state.value.rewrite_progress;
                 driver.step(self, &job, &worker_state.value, context) catch |err| {
                     if (restore_staging_diagnostic_gate.admit(platform_time.monotonicNs())) std.log.warn("restore rewrite retry staging={s} phase={s} owner={d} err={s}", .{ @tagName(phase), @tagName(worker_state.value.rewrite_progress.phase), worker_state.value.rewrite_progress.owner, @errorName(err) });
-                    return @as(anyerror![]u8, err);
+                    return @as(anyerror![]u8, restoreRewriteStepError(err));
                 };
                 rewrite_diagnostic = worker_state.value.rewrite_progress;
                 // Bound CPU/IO work and yield on a pending full owner pass,
@@ -17446,6 +17556,11 @@ pub const ApiHttpServer = struct {
     fn stagedRestoreError(err: anyerror) cluster_api_http.ClusterApi.ExecuteRestoreError {
         return switch (err) {
             error.RestoreStagingYield => error.RestoreStagingYield,
+            error.RestoreStagingWait => error.RestoreStagingWait,
+            // Owner transitions can report StorageBusy while the pinned plan
+            // is progressing. Retry the next cooperative slice on the same
+            // durable attempt; a readiness fence uses the longer wait below.
+            error.StorageBusy => error.RestoreStagingYield,
             error.Cancelled => error.Cancelled,
             error.RestoreJobFenced, error.NotLeader => error.NotLeader,
             error.TableAlreadyExists => error.TableAlreadyExists,
@@ -21876,6 +21991,21 @@ test "native restore validation uncertainty remains an asynchronous retry" {
     try std.testing.expect(restoreJobErrorIsRetryable(error.RestoreValidationPending));
     try std.testing.expect(restoreJobErrorIsRetryable(error.BackupRepositoryBusy));
     try std.testing.expect(!restoreJobErrorIsRetryable(error.BackupIntegrityFailure));
+}
+
+test "busy staged restore owner retains its pinned attempt" {
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreStagingWait),
+        ApiHttpServer.stagedRestoreError(error.RestoreStagingWait),
+    );
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreStagingYield),
+        ApiHttpServer.stagedRestoreError(error.StorageBusy),
+    );
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreValidationPending),
+        ApiHttpServer.stagedRestoreError(error.BackupRepositoryBusy),
+    );
 }
 
 test "restore worker authority is fenced across leadership reacquisition" {
@@ -30709,7 +30839,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     try std.testing.expectEqual(@as(u16, 200), card_resp.status);
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"skills\":[{\"id\":\"query-builder\"},{\"id\":\"retrieval\"}]}",
+        "{\"skills\":[{\"id\":\"query-builder\"},{\"id\":\"retrieval\"},{\"id\":\"research\"}]}",
         card_resp.body,
     );
 
