@@ -34,6 +34,8 @@ pub const Config = struct {
     use_exact_gelu: bool = false,
     // GLiNER label marker token IDs (from added_tokens.json).
     classification_token_id: i64 = 128004,
+    /// Explicit managed artifact contract for the `[L]` classifier MLP.
+    label_marker_decision_head: bool = false,
     entity_token_id: i64 = 128005,
     relation_token_id: i64 = 128006,
     num_labels: u32 = 1,

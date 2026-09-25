@@ -52,6 +52,7 @@ const embedding_mod = @import("../pipelines/embedding.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
 const extraction_v2 = @import("../extractors/extraction_v2.zig");
 const boundary_executor = @import("../extractors/gliner_boundary_executor.zig");
+const decision_executor = @import("../extractors/gliner_decision_executor.zig");
 const BoundedRequestAllocator = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
 const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
@@ -4813,6 +4814,8 @@ pub const Node = struct {
         defer model_handle.release();
         const model = model_handle.get();
         if (!model.isGlinerModel() or !model.supportsClassification()) return error.UnsupportedClassifierProvider;
+        if (model.manifest.gliner_classification_head == .label_marker_mlp and hypothesis_template != null)
+            return error.UnsupportedDecisionHypothesisTemplate;
         var pipeline = createGlinerPipeline(self, allocator, model);
         const input_tokens = try pipeline.maxClassificationInputTokens(texts, labels);
         try validateTextExecutorInvocation(
@@ -8925,8 +8928,6 @@ pub const Node = struct {
             .pipeline = .{ .regex_context = &validators, .validate_value_fn = regex.Context.validateValue },
             .max_response_bytes = @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024),
         };
-        try boundary_executor.preflight(&request, execution_options);
-
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(scratch, null, &owned_io);
@@ -8940,6 +8941,21 @@ pub const Node = struct {
         // this gate, even for an otherwise small extraction request.
         var manifest = try manifest_mod.loadListingFromDir(scratch, model_path);
         defer manifest.deinit();
+        if (manifest.gliner_classification_head == .label_marker_mlp) {
+            try decision_executor.preflight(&request);
+            allocation_failure.clear();
+            var handle = self.model_manager.acquireFromDirWithControl(model_path, control orelse .{}) catch |err| {
+                allocation_failure.clear();
+                return err;
+            };
+            defer handle.release();
+            const loaded = handle.get();
+            const backend = loaded.session.backend();
+            if (backend != .native and backend != .cuda) return error.UnsupportedDecisionBackend;
+            var pipeline = createGlinerPipeline(self, scratch, loaded);
+            return decision_executor.execute(scratch, &pipeline, &request, execution_options.max_response_bytes, control);
+        }
+        try boundary_executor.preflight(&request, execution_options);
         if (manifest.gliner_architecture != .boundary) return error.UnsupportedExtractionModel;
         const test_qualification = if (builtin.is_test) self.test_allow_unqualified_gliner_boundary else false;
         if (!test_qualification and !manifest.mayLoadQualifiedGlinerBoundaryRuntime()) return error.UnsupportedGlinerBoundaryRuntime;
@@ -9045,8 +9061,7 @@ pub const Node = struct {
         admission_owner: ExtractionAdmissionOwner,
         supplied_control: ?InferenceExecutionControl,
     ) !extracting_api.Response {
-        // A boundary-architecture model (e.g. a qualified GLiNER2.5
-        // checkpoint) is only ever executed through the schema_version:2
+        // A native GLiNER extraction head is executed through schema_version:2
         // path below (extractV2WithAdmission -> extractV2InMemory ->
         // boundary_executor); the legacy dispatch beneath this check cannot
         // run it. This is the one entry point shared by both the HTTP
@@ -9059,7 +9074,7 @@ pub const Node = struct {
         var request = supplied_request;
         if (request.schema_version == null) upgrade: {
             const io = self.session_manager.io orelse break :upgrade;
-            if (self.resolvesToBoundaryArchitecture(io, model_name)) request.schema_version = 2;
+            if (self.resolvesToNativeExtractionV2(io, model_name)) request.schema_version = 2;
         }
         const schema_version = request.schema_version orelse 1;
         if (schema_version == 2) {
@@ -9468,6 +9483,8 @@ pub const Node = struct {
             if (classification_schema.top_k) |top_k| if (top_k < 1) return error.InvalidTopK;
 
             if (model.isGlinerModel()) {
+                if (model.manifest.gliner_classification_head == .label_marker_mlp and classification_schema.hypothesis_template != null)
+                    return error.UnsupportedDecisionHypothesisTemplate;
                 var pipeline = createGlinerPipeline(self, allocator, model);
                 pipeline.execution_control = execution_control;
                 const input_tokens = try pipeline.maxClassificationInputTokens(texts, classification_schema.labels);
@@ -18614,8 +18631,8 @@ pub const Node = struct {
         return !ctx.isCancellationRequested();
     }
 
-    /// True if `model_name` resolves to a boundary-architecture manifest
-    /// (e.g. a qualified GLiNER2.5 checkpoint). Used only to decide whether a
+    /// True if `model_name` resolves to a boundary or decision-head manifest.
+    /// Used only to decide whether a
     /// request that omits an explicit schema version must be upgraded onto
     /// the schema_version:2 path before any operation-specific dispatch;
     /// this grants no execution permission by itself -- Gate/require() still
@@ -18623,7 +18640,7 @@ pub const Node = struct {
     /// geometry once a session loads. Fails closed to `false` (leave the
     /// request alone) on any resolution error, so it can never itself turn a
     /// valid request into a rejection.
-    fn resolvesToBoundaryArchitecture(self: *Node, io: std.Io, model_name: []const u8) bool {
+    fn resolvesToNativeExtractionV2(self: *Node, io: std.Io, model_name: []const u8) bool {
         if (model_name.len == 0) return false;
         var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
         defer arena.deinit();
@@ -18631,10 +18648,10 @@ pub const Node = struct {
         const model_path = self.resolveRequestModelPath(scratch, io, model_name, "extractors") catch return false;
         var manifest = manifest_mod.loadListingFromDir(scratch, model_path) catch return false;
         defer manifest.deinit();
-        return manifest.gliner_architecture == .boundary;
+        return manifest.gliner_architecture == .boundary or manifest.gliner_classification_head == .label_marker_mlp;
     }
 
-    /// If `request_json` names a boundary-architecture model and does not
+    /// If `request_json` names a native GLiNER extraction model and does not
     /// already declare a schema version, returns a new allocation (owned by
     /// `result_allocator`) with `"schema_version":2` stamped on, so
     /// extractJSON routes it to the only path that can execute it
@@ -18654,7 +18671,7 @@ pub const Node = struct {
     /// operation switch, is what keeps this file's one other legacy
     /// entities/relations implementation (extractEntitiesAndRelations) out
     /// of the boundary architecture's path entirely.
-    fn boundaryUpgradeRequestJsonIfNeeded(
+    fn nativeUpgradeRequestJsonIfNeeded(
         self: *Node,
         result_allocator: std.mem.Allocator,
         io: std.Io,
@@ -18671,7 +18688,7 @@ pub const Node = struct {
         if (parsed.value.object.contains("schema_version")) return null;
         const model_value = parsed.value.object.get("model") orelse return null;
         if (model_value != .string or model_value.string.len == 0) return null;
-        if (!self.resolvesToBoundaryArchitecture(io, model_value.string)) return null;
+        if (!self.resolvesToNativeExtractionV2(io, model_value.string)) return null;
         parsed.value.object.put(scratch, "schema_version", .{ .integer = 2 }) catch return null;
         return std.json.Stringify.valueAlloc(result_allocator, parsed.value, .{}) catch null;
     }
@@ -18694,7 +18711,7 @@ pub const Node = struct {
             break :blk attachment_envelope.?.metadata;
         } else (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-        // A boundary-architecture model (e.g. a qualified GLiNER2.5 checkpoint)
+        // A native GLiNER extraction model
         // is only ever executed through the schema_version:2 path
         // (extractV2InMemory -> boundary_executor); the pre-boundary legacy
         // dispatcher below cannot run it. The documented plain request shape
@@ -18703,7 +18720,7 @@ pub const Node = struct {
         // Any failure here (bad JSON, unknown model, non-boundary model)
         // falls through to the unchanged existing behavior below.
         const boundary_upgraded = if (!uses_attachment_envelope)
-            boundaryUpgradeRequestJsonIfNeeded(self, ctx.allocator, ctx.io, request_json, ctx.max_request_body_size) catch null
+            nativeUpgradeRequestJsonIfNeeded(self, ctx.allocator, ctx.io, request_json, ctx.max_request_body_size) catch null
         else
             null;
         defer if (boundary_upgraded) |bytes| ctx.allocator.free(bytes);
@@ -34061,4 +34078,51 @@ test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
     try std.testing.expect(taskMatchesModelListing("extractors", "classifier", "", &.{"extract"}, &.{"typed_decisions"}, false));
     try std.testing.expect(!taskMatchesModelListing("classifiers", "classifier", "", &.{"extract"}, &.{"typed_decisions"}, false));
+}
+
+test "Decide extraction v2 serves classifications through HTTP handler" {
+    const model_path = platform.env.getenv("ANTFLY_GLINER_DECIDE_MODEL") orelse return error.SkipZigTest;
+    const model_name = std.fs.path.basename(model_path);
+    const models_dir = std.fs.path.dirname(model_path) orelse return error.InvalidDecisionTestModelPath;
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .allow_unknown_models = true,
+        .max_concurrent_requests = 1,
+        .process_termination_available = true,
+        .generation_budget_overrides = .{
+            .host_limit_bytes = 6 * 1024 * 1024 * 1024,
+            .backend_limit_bytes = 12 * 1024 * 1024 * 1024,
+            .combined_limit_bytes = 18 * 1024 * 1024 * 1024,
+            .scratch_limit_bytes = 8 * 1024 * 1024 * 1024,
+        },
+    });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    const backend_name = platform.env.getenv("ANTFLY_GLINER_DECIDE_BACKEND") orelse "native";
+    const backend: backends_mod.BackendType = if (std.mem.eql(u8, backend_name, "cuda")) .cuda else if (std.mem.eql(u8, backend_name, "native")) .native else return error.InvalidDecisionTestBackend;
+    node.session_manager.required_backend = backend;
+    node.model_manager.session_manager.required_backend = backend;
+    const body = try std.fmt.allocPrint(
+        a,
+        "{{\"model\":\"{s}\",\"schema_version\":2,\"inputs\":[{{\"content\":\"Please refund the duplicate charge. I do not need technical help.\"}}],\"schema\":{{\"classifications\":[{{\"name\":\"intent\",\"mode\":\"single\",\"labels\":[\"refund\",\"technical_support\",\"sales\"]}},{{\"name\":\"urgency\",\"mode\":\"single\",\"labels\":[\"low\",\"medium\",\"high\"]}}]}}}}",
+        .{model_name},
+    );
+    defer a.free(body);
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.extractJSON(&ctx);
+    defer response.deinit();
+    errdefer std.debug.print("Decide HTTP response: status={d} body={s}\n", .{ response.status.code, response.body orelse "<absent>" });
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.MissingResponseBody, .{});
+    defer parsed.deinit();
+    const classes = parsed.value.object.get("data").?.array.items[0].object.get("classifications").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), classes.len);
+    try std.testing.expectEqualStrings("refund", classes[0].object.get("label").?.string);
+    try std.testing.expectEqualStrings("low", classes[1].object.get("label").?.string);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }

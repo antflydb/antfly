@@ -730,7 +730,8 @@ pub const ModelRegistry = struct {
     ) !void {
         var existing = try manifest_mod.loadFromManagedPlanDir(self.allocator, dest_dir);
         defer existing.deinit();
-        if (existing.model_manifest_path != null and tasks_csv == null and capabilities_csv == null) return;
+        if (existing.model_manifest_path != null and tasks_csv == null and capabilities_csv == null and
+            !try isKnownDecideStagingSource(self.allocator, dest_dir)) return;
 
         const manifest_json = try synthesizePulledModelManifestJsonFromPlan(self.allocator, dest_dir, tasks_csv, capabilities_csv);
         defer self.allocator.free(manifest_json);
@@ -1097,6 +1098,58 @@ fn boundaryIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const ma
     return gliner_qualification.hasQualifiedIdentity(identity);
 }
 
+const gliner_decide_weight_pin = boundary_bundle.FilePin{
+    .path = "model.safetensors",
+    .size_bytes = 1_945_828_140,
+    .sha256 = "40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997",
+};
+
+const gliner_decide_sidecar_pins = [_]boundary_bundle.FilePin{
+    .{ .path = "config.json", .size_bytes = 594, .sha256 = "e748e5b80575471c91b3f0dd00f513ba58242544fcb7e1236e0021e61abd7673" },
+    .{ .path = "encoder_config/config.json", .size_bytes = 920, .sha256 = "bd32f1484ba5a199f7a63df44df3814b839fffcf6e64478323c4689868ef6015" },
+    .{ .path = "special_tokens_map.json", .size_bytes = 2414, .sha256 = "84ea70143f533d7e99b393d87f20010887a9ac2cba955828ef313886e4e83f4f" },
+    .{ .path = "tokenizer.json", .size_bytes = 8333952, .sha256 = "3ad87d9ffe669147063e70850927dd2da90249e2acc5c8527f1eb65df467bcc8" },
+    .{ .path = "tokenizer_config.json", .size_bytes = 3356, .sha256 = "323199a4e946039410899f3779f2aa3eaef1500213c512727ad0f623d4f21309" },
+};
+
+fn decideSidecarsQualified(allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    for (gliner_decide_sidecar_pins) |pin| {
+        const bytes = c_file.readFileFromDir(allocator, model_dir, pin.path) catch return false;
+        defer allocator.free(bytes);
+        boundary_bundle.Digest.of(bytes).verify(pin) catch return false;
+    }
+    return true;
+}
+
+/// The published Decide contract is granted only to the reviewed checkpoint
+/// bytes. Repository/path spelling is intentionally irrelevant: local copies
+/// of the same immutable artifact qualify, while changed weights fail closed.
+fn decideIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) bool {
+    if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or
+        manifest.gliner_architecture != .span or manifest.hidden_size != 1024 or
+        manifest.intermediate_size != 4096 or manifest.num_hidden_layers != 24 or
+        manifest.num_attention_heads != 16 or manifest.bert_vocab_size != 128011 or
+        manifest.gliner_token_l != 128007 or manifest.gliner_token_sep_struct != 128001)
+        return false;
+    const weight_path = manifest.safetensors_path orelse return false;
+    var reader = safetensors_mod.MMapReader.openFileAbsolute(allocator, weight_path) catch return false;
+    defer reader.deinit();
+    boundary_bundle.Digest.of(reader.file_bytes).verify(gliner_decide_weight_pin) catch return false;
+    return decideSidecarsQualified(allocator, std.fs.path.dirname(weight_path) orelse return false);
+}
+
+fn isKnownDecideSource(source: managed_receipt.DownloadSource) bool {
+    return std.ascii.eqlIgnoreCase(source.owner, "fastino") and
+        std.ascii.eqlIgnoreCase(source.name, "GLiNER2.5-Decide");
+}
+
+fn isKnownDecideStagingSource(allocator: std.mem.Allocator, dest_dir: []const u8) !bool {
+    var plan = try managed_receipt.loadValidatedPlan(allocator, std.Options.debug_io, dest_dir);
+    defer plan.deinit();
+    const source = plan.parsed.value.source orelse return false;
+    return isKnownDecideSource(source);
+}
+
 fn appendManifestTasks(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
@@ -1128,6 +1181,10 @@ fn appendSupplementalTasks(
     qualified_boundary: bool,
 ) !void {
     if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary) return;
+    if (manifest.gliner_classification_head == .label_marker_mlp) {
+        try appendUniqueOwnedString(allocator, tasks, "extract");
+        return;
+    }
     if (manifest.hasCapability("extraction")) {
         try appendUniqueOwnedString(allocator, tasks, "extract");
     }
@@ -1254,6 +1311,11 @@ fn appendInferredCapabilities(
 ) !void {
     if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary) return;
     for (manifest.capabilities) |cap| try appendUniqueOwnedString(allocator, capabilities, cap);
+
+    if (manifest.gliner_classification_head == .label_marker_mlp) {
+        try appendUniqueOwnedString(allocator, capabilities, "classification");
+        return;
+    }
 
     if (taskListContains(tasks, "embed") and manifest.sparse_3d_output_layout != null) {
         try appendUniqueOwnedString(allocator, capabilities, "sparse");
@@ -1519,6 +1581,10 @@ fn synthesizePulledModelManifestJsonInternal(
     // run on the per-request listing path (loadListingFromDir), only here,
     // where the artifact was just staged to disk.
     const qualified_boundary = boundaryIdentityIsQualified(allocator, &manifest);
+    const qualified_decide = decideIdentityIsQualified(allocator, &manifest);
+    if (source == .staging_plan and try isKnownDecideStagingSource(allocator, dest_dir) and !qualified_decide)
+        return error.UnsupportedGlinerDecisionArtifact;
+    if (qualified_decide) manifest.gliner_classification_head = .label_marker_mlp;
 
     if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary and (tasks_csv != null or capabilities_csv != null))
         return error.UnsupportedGlinerBoundaryRuntime;
@@ -1554,6 +1620,10 @@ fn synthesizePulledModelManifestJsonInternal(
     }
     try appendInferredCapabilities(allocator, &manifest, tasks.items, &capabilities, qualified_boundary);
     if (capabilities_csv) |csv| try appendCsvCapabilities(allocator, &capabilities, csv);
+    if (qualified_decide) {
+        for (tasks.items) |task| if (!std.mem.eql(u8, task, "extract")) return error.InvalidModelManifest;
+        for (capabilities.items) |capability| if (!std.mem.eql(u8, capability, "classification")) return error.InvalidModelManifest;
+    }
 
     const sparse_3d_output_layout = inferredSparse3DOutputLayout(&manifest);
 
@@ -1573,6 +1643,8 @@ fn synthesizePulledModelManifestJsonInternal(
         try body.appendSlice(allocator, ",\"inputs\":");
         try appendJsonStringArray(&body, allocator, inputs.items);
     }
+    if (qualified_decide)
+        try body.appendSlice(allocator, ",\"gliner_classification_head\":\"label_marker_mlp\"");
     if (sparse_3d_output_layout) |layout| {
         try body.appendSlice(allocator, ",\"sparse_3d_output_layout\":");
         try appendJsonString(&body, allocator, sparse3DOutputLayoutName(layout));
