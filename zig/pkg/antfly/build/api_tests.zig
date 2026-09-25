@@ -1090,6 +1090,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "retained read RPC",
             "retained read client",
             "relational row query response budget",
+            "relational statement retries unavailable capture and releases fences before pages or deadline",
             "relational row query full-key index proof requires every routed owner",
             "partially applied two-owner decision cannot enter retained SQL cut",
             "relational row query executes typed projection",
@@ -1559,6 +1560,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_api_table_writes_docid_tests = @import("linked_tests.zig").runPair(b, api_table_writes_docid_tests, write_implementation_tests);
     const run_api_table_reads_docid_tests = @import("linked_tests.zig").runPair(b, api_table_reads_linked_tests, write_implementation_tests);
     b.step("antfly-api-table-read-test", "Run table-read routing and internal group contracts").dependOn(&run_api_table_reads_docid_tests.step);
+    const statement_capture_retry_run = b.addRunArtifact(api_table_reads_linked_tests.executable);
+    @import("test_support.zig").configureTestRun(statement_capture_retry_run);
+    statement_capture_retry_run.addArgs(&.{ "--test-filter", "relational statement retries unavailable capture and releases fences before pages or deadline" });
+    b.step("antfly-api-statement-capture-retry-test", "Run bounded SQL statement capture retry regression")
+        .dependOn(&statement_capture_retry_run.step);
     const api_aggregation_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-aggregation-tests",
         .root_module = api_table_reads_docid_test_mod,
@@ -1871,6 +1877,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     run_api_table_writes_production_regression_unit_tests.step.dependOn(&run_public_api_parity_aggregate_tests.step);
     const api_table_writes_production_regression_step = b.step("antfly-api-table-writes-lifecycle-test", "Run focused restore and writer-cache lifecycle regressions");
     api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
+    const replica_retirement_batch_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "api-replica-retirement-batch-tests",
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{"replica retirement journal batches preserve every group phase"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    }, write_implementation_tests);
+    b.step("antfly-api-replica-retirement-batch-test", "Run the durable replica-retirement batch decoder regression").dependOn(&replica_retirement_batch_tests.run(b).step);
     const api_create_structural_retry_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-table-create-retry-tests",
         .root_module = api_table_writes_docid_test_mod,
@@ -1980,11 +1993,29 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_placement_tests).step);
     const sql_rewrite_receipt_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
-        .filters = &.{ "SQL rewrite response retains admitted and uncertain restore handles", "SQL DDL receipt status distinguishes unknown admission", "initial foreign-key create distinguishes unknown admission from accepted work", "primary key schema lowering rejects deferred timing and empty keys", "relational primary keys cannot defer enforcement" },
+        .filters = &.{ "SQL rewrite response retains admitted and uncertain restore handles", "SQL DDL receipt status distinguishes unknown admission", "initial foreign-key create distinguishes unknown admission from accepted work", "primary key schema lowering rejects deferred timing and empty keys", "relational primary keys cannot defer enforcement", "restore immutable rewrite failures are terminal but transport pressure is retryable", "httpx restore owner accepts bounded rewrite source chunks above legacy control limit" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-sql-rewrite-receipt-test", "Run SQL rewrite receipt and unknown-admission response regression")
         .dependOn(&addFilteredTestRunArtifact(b, sql_rewrite_receipt_tests).step);
+    const pk_failure_abi_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_failure_abi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pk_failure_identity_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_failure_identity.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pk_failure_identity_mod.addImport("runtime_failure_abi", pk_failure_abi_mod);
+    const pk_failure_identity_tests = b.addTest(.{
+        .root_module = pk_failure_identity_mod,
+        .filters = &.{"registered storage-kernel errors are unique and round trip without losing identity"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-pk-restore-error-identity-test", "Run exact native invalid-row restore error identity regression")
+        .dependOn(&addFilteredTestRunArtifact(b, pk_failure_identity_tests).step);
     const sql_primary_key_rewrite_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_sql_primary_key_rewrite_test_root.zig"),
         .target = target,
@@ -2005,10 +2036,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_primary_key_rewrite_test_mod.addImport("usermgr_storage", pk_usermgr_storage);
     const sql_primary_key_rewrite_tests = b.addTest(.{
         .root_module = sql_primary_key_rewrite_test_mod,
-        .filters = &.{"mounted SQL ADD PRIMARY KEY validates existing rows before publication"},
+        .filters = &.{"mounted SQL ADD PRIMARY KEY guards publication until rewrite validates"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-api-sql-primary-key-rewrite-test", "Run mounted SQL primary-key rewrite regression")
+    b.step("antfly-api-sql-primary-key-rewrite-test", "Run guarded mounted SQL primary-key rewrite preconditions")
         .dependOn(&addFilteredTestRunArtifact(b, sql_primary_key_rewrite_tests).step);
     const hosted_initial_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_initial_fk_test_root.zig"),

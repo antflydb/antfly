@@ -955,6 +955,7 @@ pub const Call = union(enum) {
     fk_initial_create_begin: @import("../metadata/fk_generation_publication.zig").InitialCreatePlan,
     fk_initial_create_mutate: @import("../metadata/fk_generation_publication.zig").InitialCommand,
     fk_initial_create_status: u64,
+    fk_generation_table_locked: u64,
     fk_initial_create_work: u64,
     fk_initial_parent_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
     setting_mutate: @import("settings.zig").Request,

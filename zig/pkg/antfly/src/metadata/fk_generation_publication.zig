@@ -85,6 +85,26 @@ pub fn initialGroupPrefixForGroup(buf: []u8, metadata_group_id: u64) ![]const u8
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:fk_initial_group:{d}:", .{metadata_group_id});
 }
 
+/// Point-resolvable hidden owner authority. The group reservation binds both
+/// the immutable plan and the child table so placement apply never scans all
+/// active publications to validate an unpublished group.
+pub const InitialGroupReservation = struct {
+    plan_id: Id,
+    child_table_id: u64,
+
+    pub fn encode(self: @This()) [24]u8 {
+        var bytes: [24]u8 = undefined;
+        @memcpy(bytes[0..16], &self.plan_id);
+        std.mem.writeInt(u64, bytes[16..24], self.child_table_id, .little);
+        return bytes;
+    }
+
+    pub fn decode(bytes: []const u8) !@This() {
+        if (bytes.len != 24) return error.InvalidGenerationPublication;
+        return .{ .plan_id = bytes[0..16].*, .child_table_id = std.mem.readInt(u64, bytes[16..24], .little) };
+    }
+};
+
 pub const Transition = struct {
     child_table_id: u64,
     child_table_name: []const u8,
@@ -103,11 +123,24 @@ pub const Transition = struct {
     }
 };
 
+fn initialTransitionsEqual(left: Transition, right: Transition) bool {
+    return left.child_table_id == right.child_table_id and
+        std.mem.eql(u8, left.child_table_name, right.child_table_name) and
+        std.mem.eql(u8, left.constraint_name, right.constraint_name) and
+        std.meta.eql(left.expected_generation, right.expected_generation) and
+        std.meta.eql(left.next_generation, right.next_generation);
+}
+
 pub const Parent = struct {
     table: records.TableRecord,
     ranges: []const records.RangeRecord,
     fences: []const topology.Fence,
     transitions: []const Transition,
+    support_before: ?records.TableRecord = null,
+    /// Initial CREATE only: the support-index schema to install atomically
+    /// with the hidden child reservation. `table` remains the exact prior
+    /// descriptor until the post-migration owner cut is sealed.
+    support_after: ?records.TableRecord = null,
 };
 
 pub const Plan = struct {
@@ -168,7 +201,7 @@ pub const Plan = struct {
         var owner_count = self.child_ranges.len;
         var constraint_count: usize = 0;
         for (self.parents, 0..) |parent, index| {
-            if (parent.table.table_id == 0 or parent.table.table_id == self.child_before.table_id or
+            if (parent.support_before != null or parent.support_after != null or parent.table.table_id == 0 or parent.table.table_id == self.child_before.table_id or
                 parent.ranges.len == 0 or parent.ranges.len > max_owners or parent.fences.len != parent.ranges.len or
                 parent.transitions.len == 0 or parent.transitions.len > max_constraints) return error.InvalidGenerationPublication;
             for (self.parents[0..index]) |prior| if (prior.table.table_id == parent.table.table_id) return error.InvalidGenerationPublication;
@@ -314,6 +347,36 @@ pub const Plan = struct {
     }
 };
 
+/// Schema updates mint a random identity for the next versioned full-text
+/// index. A publication validator must recompute with the identity in the
+/// proposed descriptor instead of minting another one. Reject any identity
+/// already present on the parent: otherwise stale coverage observations for a
+/// different index could satisfy readiness for this new version.
+fn supportIndexIncarnation(alloc: std.mem.Allocator, before: records.TableRecord, after: records.TableRecord) !?u64 {
+    const coverage = @import("../api/coverage_policy.zig");
+    const tables = @import("../api/tables.zig");
+    if (after.indexes_json.len == 0) return null;
+    var proposed = try std.json.parseFromSlice(std.json.Value, alloc, after.indexes_json, .{});
+    defer proposed.deinit();
+    if (proposed.value != .object) return error.InvalidGenerationPublication;
+    const version = try tables.schemaVersion(after.schema_json);
+    const name = try std.fmt.allocPrint(alloc, "full_text_index_v{d}", .{version});
+    defer alloc.free(name);
+    const next = proposed.value.object.get(name) orelse return null;
+    const incarnation = coverage.incarnation(next) orelse return error.InvalidGenerationPublication;
+    if (before.indexes_json.len == 0) return incarnation;
+    var prior = try std.json.parseFromSlice(std.json.Value, alloc, before.indexes_json, .{});
+    defer prior.deinit();
+    if (prior.value != .object) return error.InvalidGenerationPublication;
+    var it = prior.value.object.iterator();
+    while (it.next()) |entry| {
+        if (coverage.incarnation(entry.value_ptr.*)) |existing| {
+            if (existing == incarnation) return error.InvalidGenerationPublication;
+        }
+    }
+    return incarnation;
+}
+
 /// Initial FK-bearing CREATE has no old child generation. Metadata reserves
 /// this candidate invisibly, provisions each child owner under a plan-bound
 /// zero-write fence, and publishes only after every parent accepts the new
@@ -327,6 +390,10 @@ pub const InitialCreatePlan = struct {
     child: records.TableRecord,
     child_ranges: []const records.RangeRecord,
     parents: []const Parent,
+    /// A preparatory plan has no owner fences yet. The metadata transaction
+    /// installs support_after and owns the parent locks before any owner RPC;
+    /// a later seal supplies read-index fences against finalized descriptors.
+    support_pending: bool = false,
     /// Parent generations hosted by the hidden child itself. Every child
     /// range installs these scopes atomically with its initial schema/AIC.
     self_transitions: []const Transition = &.{},
@@ -359,6 +426,7 @@ pub const InitialCreatePlan = struct {
         if (self.child_ranges.len != @as(usize, self.child.min_ranges)) return error.InvalidGenerationPublication;
         var owners = self.child_ranges.len;
         var transitions: usize = self.self_transitions.len;
+        var support_changes: usize = 0;
         if (transitions > max_constraints) return error.InvalidGenerationPublication;
         if (self.self_transitions.len != 0)
             try @import("../schema/relational_foreign_key_target.zig").validate(alloc, self.child.schema_json, self.child.name, self.child.schema_json);
@@ -375,16 +443,63 @@ pub const InitialCreatePlan = struct {
         for (self.parents, 0..) |parent, index| {
             if (parent.table.table_id == 0 or parent.table.table_id == self.child.table_id or
                 parent.ranges.len == 0 or parent.ranges.len > max_owners or
-                parent.fences.len != parent.ranges.len or parent.transitions.len == 0 or
+                parent.fences.len != (if (self.support_pending) @as(usize, 0) else parent.ranges.len) or parent.transitions.len == 0 or
                 parent.transitions.len > max_constraints) return error.InvalidGenerationPublication;
             for (self.parents[0..index]) |prior| if (prior.table.table_id == parent.table.table_id) return error.InvalidGenerationPublication;
             try table_manager.validateCompleteKeyspaceRanges(parent.ranges);
-            try validateOwnerFences(self.id, parent.table, parent.ranges, parent.fences, .child_generation_parent);
+            // Metadata rederives the *only* authorized parent schema delta.
+            // A client-supplied support_after may not carry unrelated DDL,
+            // placement, index, or policy changes through the lock bypass.
+            const support_before = parent.support_before orelse parent.table;
+            if (parent.support_before != null and parent.support_after == null) return error.InvalidGenerationPublication;
+            var support_json = support_before.schema_json;
+            var changed = false;
+            for (fks) |fk| {
+                if (fk.match != .partial or !std.mem.eql(u8, fk.parent_table, parent.table.name)) continue;
+                if (try @import("../schema/relational_witness_indexes.zig").ensureCoverage(alloc, support_json, fk.parent_columns)) |updated| {
+                    if (changed) alloc.free(support_json);
+                    support_json = updated;
+                    changed = true;
+                }
+            }
+            defer if (changed) alloc.free(support_json);
+            if (changed) {
+                support_changes += 1;
+                const before = parent.support_before orelse return error.InvalidGenerationPublication;
+                const after = parent.support_after orelse return error.InvalidGenerationPublication;
+                const pinned_incarnation = try supportIndexIncarnation(alloc, before, after);
+                const expected = try @import("../api/tables.zig").applySchemaUpdateRecordWithIncarnation(
+                    alloc,
+                    &before,
+                    support_json,
+                    pinned_incarnation orelse 1,
+                );
+                defer table_manager.freeTable(alloc, expected);
+                if (!table_manager.tableDefinitionsEqual(expected, after)) return error.InvalidGenerationPublication;
+                if (self.support_pending) {
+                    if (!table_manager.tableDefinitionsEqual(parent.table, before)) return error.InvalidGenerationPublication;
+                } else {
+                    var finalized = try table_manager.cloneTable(alloc, expected);
+                    defer table_manager.freeTable(alloc, finalized);
+                    try @import("schema_migration_finalization.zig").apply(alloc, &finalized);
+                    if (!table_manager.tableDefinitionsEqual(parent.table, finalized)) return error.InvalidGenerationPublication;
+                }
+            } else if (parent.support_before != null or parent.support_after != null) {
+                return error.InvalidGenerationPublication;
+            }
+            if (!self.support_pending)
+                try validateOwnerFences(self.id, parent.table, parent.ranges, parent.fences, .child_generation_parent);
             // The ingress may have prepared an owned witness index, but a
             // submitted plan is not trusted authority. Pin the support to
             // this exact parent descriptor before metadata locks the owner;
             // begin also compares that descriptor inside its Raft txn.
-            try validateInitialPartialParent(alloc, self.child.schema_json, fks, parent.table);
+            if (self.support_pending) {
+                const after = parent.support_after orelse parent.table;
+                if (after.table_id != parent.table.table_id or !std.mem.eql(u8, after.name, parent.table.name)) return error.InvalidGenerationPublication;
+                try validateInitialPartialParent(alloc, self.child.schema_json, fks, after);
+            } else {
+                try validateInitialPartialParent(alloc, self.child.schema_json, fks, parent.table);
+            }
             owners = std.math.add(usize, owners, parent.ranges.len) catch return error.InvalidGenerationPublication;
             transitions = std.math.add(usize, transitions, parent.transitions.len) catch return error.InvalidGenerationPublication;
             if (owners > max_owners or transitions > max_constraints) return error.InvalidGenerationPublication;
@@ -399,6 +514,7 @@ pub const InitialCreatePlan = struct {
                 if (!std.mem.eql(u8, parent.table.name, parent_name)) return error.InvalidGenerationPublication;
             }
         }
+        if (self.support_pending and support_changes == 0) return error.InvalidGenerationPublication;
         if (transitions != fks.len) return error.InvalidGenerationPublication;
         const group_ids = try alloc.alloc(u64, owners);
         defer alloc.free(group_ids);
@@ -615,6 +731,7 @@ pub const InitialParentDecision = struct {
 };
 
 pub const InitialPhase = enum {
+    preparing_support,
     provisioning_child,
     staging_parents,
     activating_parents,
@@ -630,7 +747,7 @@ pub const InitialCommand = struct {
     plan_id: Id,
     child_table_id: u64,
     expected_revision: u64,
-    action: enum { begin, child_provisioned, parent_staged, parent_activated, parent_acknowledged, child_released, publish_child, cancel, child_canceled, parent_canceled },
+    action: enum { begin, seal_support, child_provisioned, parent_staged, parent_activated, parent_acknowledged, child_released, publish_child, cancel, child_canceled, parent_canceled },
     plan: ?InitialCreatePlan = null,
     child_receipt: ?@import("../api/relational_fk_generation_publication.zig").InitialChildReceipt = null,
     parent_receipt: ?@import("../api/relational_fk_generation_publication.zig").Receipt = null,
@@ -639,6 +756,8 @@ pub const InitialCommand = struct {
         if (std.mem.allEqual(u8, &self.plan_id, 0) or self.child_table_id == 0) return error.InvalidGenerationPublication;
         switch (self.action) {
             .begin => if (self.expected_revision != 0 or self.plan == null or self.child_receipt != null or self.parent_receipt != null or
+                !std.mem.eql(u8, &self.plan_id, &self.plan.?.id) or self.child_table_id != self.plan.?.child.table_id) return error.InvalidGenerationPublication,
+            .seal_support => if (self.expected_revision == 0 or self.plan == null or self.plan.?.support_pending or self.child_receipt != null or self.parent_receipt != null or
                 !std.mem.eql(u8, &self.plan_id, &self.plan.?.id) or self.child_table_id != self.plan.?.child.table_id) return error.InvalidGenerationPublication,
             .child_provisioned, .child_released, .child_canceled => if (self.expected_revision == 0 or self.plan != null or self.child_receipt == null or self.parent_receipt != null) return error.InvalidGenerationPublication,
             .parent_staged, .parent_activated, .parent_acknowledged, .parent_canceled => if (self.expected_revision == 0 or self.plan != null or self.child_receipt != null or self.parent_receipt == null) return error.InvalidGenerationPublication,
@@ -670,6 +789,52 @@ pub const InitialPublication = struct {
         next.revision = std.math.add(u64, self.revision, 1) catch return error.GenerationPublicationChanged;
         switch (command.action) {
             .begin => unreachable,
+            .seal_support => {
+                if (self.phase != .preparing_support or !self.plan.support_pending) return error.GenerationPublicationChanged;
+                const sealed = command.plan.?;
+                try sealed.validate(alloc);
+                if (sealed.catalog_id != self.plan.catalog_id or sealed.namespace_id != self.plan.namespace_id or
+                    sealed.expected_catalog_revision != self.plan.expected_catalog_revision or
+                    sealed.tablespace_id != self.plan.tablespace_id or
+                    sealed.min_ranges_explicit != self.plan.min_ranges_explicit or
+                    !std.mem.eql(u8, sealed.logical_name, self.plan.logical_name) or
+                    !table_manager.tableDefinitionsEqual(sealed.child, self.plan.child) or
+                    sealed.child_ranges.len != self.plan.child_ranges.len or
+                    sealed.parents.len != self.plan.parents.len or
+                    sealed.self_transitions.len != self.plan.self_transitions.len) return error.GenerationPublicationChanged;
+                for (sealed.self_transitions, self.plan.self_transitions) |transition, pending| {
+                    if (!initialTransitionsEqual(transition, pending)) return error.GenerationPublicationChanged;
+                }
+                for (sealed.child_ranges, self.plan.child_ranges) |range, pending| {
+                    if (!table_manager.rangeRecordsEqual(range, pending)) return error.GenerationPublicationChanged;
+                }
+                for (sealed.parents, self.plan.parents) |parent, pending| {
+                    if (parent.table.table_id != pending.table.table_id or parent.ranges.len != pending.ranges.len or
+                        parent.transitions.len != pending.transitions.len) return error.GenerationPublicationChanged;
+                    if (pending.support_after) |after| {
+                        var finalized = try table_manager.cloneTable(alloc, after);
+                        defer table_manager.freeTable(alloc, finalized);
+                        try @import("schema_migration_finalization.zig").apply(alloc, &finalized);
+                        if (pending.support_before == null or parent.support_before == null or parent.support_after == null or
+                            !table_manager.tableDefinitionsEqual(parent.support_before.?, pending.support_before.?) or
+                            !table_manager.tableDefinitionsEqual(parent.support_after.?, after) or
+                            !table_manager.tableDefinitionsEqual(parent.table, finalized)) return error.GenerationPublicationChanged;
+                    } else if (parent.support_before != null or parent.support_after != null or
+                        !table_manager.tableDefinitionsEqual(parent.table, pending.table))
+                    {
+                        return error.GenerationPublicationChanged;
+                    }
+                    for (parent.ranges, pending.ranges) |range, original| {
+                        if (!table_manager.rangeRecordsEqual(range, original)) return error.GenerationPublicationChanged;
+                    }
+                    for (parent.transitions, pending.transitions) |transition, original| {
+                        if (!initialTransitionsEqual(transition, original)) return error.GenerationPublicationChanged;
+                    }
+                }
+                next.plan = sealed;
+                next.plan_digest = try sealed.digest(alloc);
+                next.phase = .provisioning_child;
+            },
             .child_provisioned, .child_released, .child_canceled => {
                 const receipt = command.child_receipt.?;
                 const expected_action: @import("../api/relational_fk_generation_publication.zig").InitialChildAction = switch (command.action) {
@@ -742,9 +907,12 @@ pub const InitialPublication = struct {
                 next.phase = .published;
             },
             .cancel => {
-                if ((self.phase != .provisioning_child and self.phase != .staging_parents and self.phase != .activating_parents) or self.parent_activated.len != 0)
+                if ((self.phase != .preparing_support and self.phase != .provisioning_child and self.phase != .staging_parents and self.phase != .activating_parents) or self.parent_activated.len != 0)
                     return error.GenerationPublicationChanged;
-                next.phase = .canceling;
+                // No child owner has been touched while support is preparing.
+                // The durable name/lock reservation can retire in this txn;
+                // ordinary owned-index cleanup may then remove orphan support.
+                next.phase = if (self.phase == .preparing_support) .canceled else .canceling;
             },
         }
         if (next.phase == .canceling and next.child_canceled.len == self.plan.child_ranges.len) {
@@ -783,6 +951,7 @@ pub const InitialPublication = struct {
         try validateReceipts(parent_groups.items, self.parent_canceled);
         if (self.phase != .canceling and self.phase != .canceled and (self.child_canceled.len != 0 or self.parent_canceled.len != 0)) return error.InvalidGenerationPublication;
         switch (self.phase) {
+            .preparing_support => if (!self.plan.support_pending or self.child_provisioned.len != 0 or self.parent_staged.len != 0) return error.InvalidGenerationPublication,
             .provisioning_child => if (self.parent_staged.len != 0 or self.child_released.len != 0) return error.InvalidGenerationPublication,
             .staging_parents => if (self.child_provisioned.len != self.plan.child_ranges.len or self.parent_activated.len != 0) return error.InvalidGenerationPublication,
             .activating_parents => if (self.parent_staged.len != parent_groups.items.len or self.parent_acknowledged.len != 0) return error.InvalidGenerationPublication,
@@ -791,7 +960,14 @@ pub const InitialPublication = struct {
             .published => if (self.child_released.len != self.plan.child_ranges.len) return error.InvalidGenerationPublication,
             .canceling, .canceled => if (self.parent_activated.len != 0 or self.parent_acknowledged.len != 0 or self.child_released.len != 0) return error.InvalidGenerationPublication,
         }
-        if (self.phase == .canceled and (self.child_canceled.len != self.plan.child_ranges.len or self.parent_canceled.len != parent_groups.items.len)) return error.InvalidGenerationPublication;
+        if (self.phase == .canceled) {
+            if (self.plan.support_pending) {
+                if (self.child_provisioned.len != 0 or self.parent_staged.len != 0 or
+                    self.child_canceled.len != 0 or self.parent_canceled.len != 0)
+                    return error.InvalidGenerationPublication;
+            } else if (self.child_canceled.len != self.plan.child_ranges.len or
+                self.parent_canceled.len != parent_groups.items.len) return error.InvalidGenerationPublication;
+        }
     }
 
     /// A supervisor receives only one bounded next step. The immutable plan
@@ -799,6 +975,7 @@ pub const InitialPublication = struct {
     /// exact decision independently from the read-index endpoint.
     pub fn nextWork(self: InitialPublication) !?InitialWork {
         const target: InitialWork.Target = switch (self.phase) {
+            .preparing_support => .seal_support,
             .provisioning_child => try self.nextChild(self.child_provisioned, .provision),
             .staging_parents => self.nextParent(self.parent_staged, .stage) orelse return error.InvalidGenerationPublication,
             .activating_parents => self.nextParent(self.parent_activated, .activate) orelse return error.InvalidGenerationPublication,
@@ -843,6 +1020,7 @@ pub const InitialWork = struct {
     target: Target,
 
     pub const Target = union(enum) {
+        seal_support,
         child: struct { group_id: u64, action: @import("../api/relational_fk_generation_publication.zig").InitialChildAction },
         parent: struct { table_name: []const u8, table_id: u64, group_id: u64, action: @import("../api/relational_fk_generation_publication.zig").Action },
         publish_child,
@@ -1280,6 +1458,18 @@ test "initial MATCH PARTIAL publication pins parent witness support" {
     try std.testing.expectError(error.ForeignKeyPartialSupportIndexRequired, validateInitialPartialParent(alloc, child_json, fks, .{ .table_id = 201, .name = "parent", .schema_json = parent_json }));
     const supported = (try @import("../schema/relational_witness_indexes.zig").ensureCoverage(alloc, parent_json, &.{ "a", "b" })).?;
     defer alloc.free(supported);
+    const no_full_text: records.TableRecord = .{
+        .table_id = 201,
+        .name = "parent",
+        .schema_json = parent_json,
+        .indexes_json = "{}",
+    };
+    const no_full_text_after = try @import("../api/tables.zig").applySchemaUpdateRecord(alloc, &no_full_text, supported);
+    defer table_manager.freeTable(alloc, no_full_text_after);
+    try std.testing.expect((try supportIndexIncarnation(alloc, no_full_text, no_full_text_after)) == null);
+    const recomputed = try @import("../api/tables.zig").applySchemaUpdateRecordWithIncarnation(alloc, &no_full_text, supported, 1);
+    defer table_manager.freeTable(alloc, recomputed);
+    try std.testing.expect(table_manager.tableDefinitionsEqual(no_full_text_after, recomputed));
     try validateInitialPartialParent(alloc, child_json, fks, .{ .table_id = 201, .name = "parent", .schema_json = supported });
     var names_arena = std.heap.ArenaAllocator.init(alloc);
     defer names_arena.deinit();

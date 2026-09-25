@@ -1110,7 +1110,7 @@ pub const HASeedOperation = enum(u32) {
 /// Private owner discovery is physical metadata, not public catalog routing.
 pub const HiddenRestoreRequest = extern struct {
     version: u32 = abi_version,
-    operation: enum(u32) { read_bootstrap = 0, capture_snapshot = 1, capture_public_snapshot = 2 },
+    operation: enum(u32) { read_bootstrap = 0, capture_snapshot = 1, capture_public_snapshot = 2, read_initial_child = 3 },
     context: ?*anyopaque = null,
     path: BorrowedBytes = .{},
     table_name: BorrowedBytes = .{},

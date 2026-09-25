@@ -71,6 +71,7 @@ const mappings = [_]Mapping{
     .{ .status = .relational_expression_budget_exceeded, .err = error.RelationalExpressionBudgetExceeded },
     .{ .status = .relational_index_key_too_large, .err = error.RelationalIndexKeyTooLarge },
     .{ .status = .invalid_relational_expression_input, .err = error.InvalidRelationalExpressionInput },
+    .{ .status = .invalid_relational_row, .err = error.InvalidRelationalRow },
     .{ .status = .invalid_relational_generated_value, .err = error.InvalidRelationalGeneratedValue },
     .{ .status = .generated_column_rewrite_required, .err = error.GeneratedColumnRewriteRequired },
     .{ .status = .relational_index_not_ready, .err = error.RelationalIndexNotReady },
@@ -919,6 +920,10 @@ test "registered storage-kernel errors are unique and round trip without losing 
     // rather than becoming an unregistered StorageKernelFailure (HTTP 500).
     try std.testing.expectEqual(abi.Status.index_rebuilding, statusFromError(error.IndexRebuilding));
     try std.testing.expectError(error.IndexRebuilding, statusToError(.index_rebuilding));
+    // A fixed rewrite source row that violates the target layout must reach
+    // restore validation as its exact error, not generic kernel pressure.
+    try std.testing.expectEqual(abi.Status.invalid_relational_row, statusFromError(error.InvalidRelationalRow));
+    try std.testing.expectError(error.InvalidRelationalRow, statusToError(.invalid_relational_row));
     try validateForTest();
 }
 

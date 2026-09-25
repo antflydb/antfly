@@ -668,6 +668,7 @@ pub const Status = enum(u32) {
     invalid_row_policy_receipt = 709,
     invalid_row_policy_bundle = 710,
     row_policy_unsupported = 711,
+    invalid_relational_row = 712,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

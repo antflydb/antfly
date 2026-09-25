@@ -1751,23 +1751,36 @@ pub fn applySchemaUpdateRecord(
     table: *const metadata_table_manager.TableRecord,
     schema_json: []const u8,
 ) !metadata_table_manager.TableRecord {
-    return applySchemaRecord(alloc, table, schema_json, false, false);
+    return applySchemaRecord(alloc, table, schema_json, false, false, null);
+}
+
+/// Recompute an already prepared schema update without minting a second index
+/// incarnation. Only trusted validation paths may supply the pinned token;
+/// ordinary DDL always mints a fresh one above.
+pub fn applySchemaUpdateRecordWithIncarnation(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    schema_json: []const u8,
+    incarnation: u64,
+) !metadata_table_manager.TableRecord {
+    if (!@import("../storage/coverage_identity.zig").isValid(incarnation)) return error.InvalidIndexConfig;
+    return applySchemaRecord(alloc, table, schema_json, false, false, incarnation);
 }
 
 /// Only the fresh-generation rewrite reservation may use this constructor.
 /// It does not publish the schema or permit changing existing stored rows.
 pub fn prepareSchemaRewriteRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8) !metadata_table_manager.TableRecord {
-    return applySchemaRecord(alloc, table, schema_json, true, false);
+    return applySchemaRecord(alloc, table, schema_json, true, false, null);
 }
 
 /// Construct the immutable candidate for a coordinated FK generation plan.
 /// This does not publish the table: metadata's dedicated fenced state machine
 /// is the only consumer allowed to commit the returned record.
 pub fn prepareForeignKeyPublicationRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8) !metadata_table_manager.TableRecord {
-    return applySchemaRecord(alloc, table, schema_json, false, true);
+    return applySchemaRecord(alloc, table, schema_json, false, true, null);
 }
 
-fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool) !metadata_table_manager.TableRecord {
+fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool, pinned_incarnation: ?u64) !metadata_table_manager.TableRecord {
     try @import("../schema/relational_index_namespace.zig").validate(alloc, schema_json, table.indexes_json);
     const current_version = try schemaVersion(table.schema_json);
     const schema_changed = !try schemasSemanticallyEqual(alloc, table.schema_json, schema_json);
@@ -1814,7 +1827,7 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
         updated.read_schema_json = normalized_read_schema_json;
     }
 
-    const next_indexes_json = try upsertVersionedFullTextIndex(alloc, updated.indexes_json, current_version, next_version);
+    const next_indexes_json = try upsertVersionedFullTextIndex(alloc, updated.indexes_json, current_version, next_version, pinned_incarnation);
     alloc.free(updated.indexes_json);
     updated.indexes_json = next_indexes_json;
     return updated;
@@ -3943,6 +3956,7 @@ fn upsertVersionedFullTextIndex(
     current_indexes_json: []const u8,
     current_version: u32,
     next_version: u32,
+    pinned_incarnation: ?u64,
 ) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer parsed.deinit();
@@ -3990,7 +4004,10 @@ fn upsertVersionedFullTextIndex(
         // readiness for the newly built index.
         removeOwnedJsonObjectField(alloc, &next_config.object, coverage_policy_mod.incarnation_field);
         removeOwnedJsonObjectField(alloc, &next_config.object, coverage_policy_mod.legacy_coverage_incarnation_field);
-        const encoded_next_config = try coverage_policy_mod.withFreshIncarnationAlloc(alloc, next_config);
+        const encoded_next_config = if (pinned_incarnation) |incarnation|
+            try coverage_policy_mod.withIncarnationAlloc(alloc, next_config, incarnation)
+        else
+            try coverage_policy_mod.withFreshIncarnationAlloc(alloc, next_config);
         defer alloc.free(encoded_next_config);
 
         if (!first) try out.append(alloc, ',');

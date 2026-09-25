@@ -3964,17 +3964,26 @@ pub const ProvisionedTableReadSource = struct {
         }
         const fences = try temporary.alloc(Fence, participants.items.len);
         var held: usize = 0;
+        var capture_read_unavailable = false;
         defer for (fences[0..held]) |fence| fence.deinit();
         while (true) {
-            try wait_budget.checkpoint();
+            wait_budget.checkpoint() catch |err| return if (capture_read_unavailable and err == error.CatalogRoutingSnapshotTimeout) error.SqlStatementReadUnavailable else err;
             for (scans) |input| if (input.opts.cancellation) |token| try token.check();
             for (participants.items, owner_routes, owner_schema_versions) |participant, owner_route, schema_version| {
                 const input = scans[participant.scan_index];
                 const prepared = &retained.prepared[participant.scan_index];
                 const local_source = self.groupLocalSourceWithFence(prepared.fenceAt(participant.group_index, input.opts.execution_deadline_ns, input.opts.cancellation));
-                const fence = (try switch (owner_route) {
+                const fence = (switch (owner_route) {
                     .local => local_source.tryStatementReadFenceGroupLocal(alloc, prepared.group_ids[participant.group_index], input.table, input.opts, .stale),
                     .remote => |remote| @import("retained_read_client.zig").Client.capture(alloc, self.distributedInternalExecutor(), remote.base_uri, input.table, prepared.fenceAt(participant.group_index, input.opts.execution_deadline_ns, input.opts.cancellation), schema_version, input.opts.execution_deadline_ns),
+                } catch |err| {
+                    if (err != error.ReadUnavailable) return err;
+                    // A frozen read-index capture can lose a tryLock or lag
+                    // apply briefly. It has published no rows; release the
+                    // already held fences and retry within this statement's
+                    // existing deadline, without weakening its read cut.
+                    capture_read_unavailable = true;
+                    break;
                 }) orelse break;
                 fences[held] = fence;
                 held += 1;
@@ -3982,7 +3991,7 @@ pub const ProvisionedTableReadSource = struct {
             if (held == fences.len) break;
             for (fences[0..held]) |fence| fence.deinit();
             held = 0;
-            try wait_budget.sleepNs(std.time.ns_per_ms);
+            wait_budget.sleepNs(std.time.ns_per_ms) catch |err| return if (capture_read_unavailable and err == error.CatalogRoutingSnapshotTimeout) error.SqlStatementReadUnavailable else err;
         }
         const proof_lists = try retained.proof_arena.allocator().alloc([]const table_read_source.RelationalStatementRead.OwnerRangeProof, scans.len);
         @memset(proof_lists, &.{});
@@ -4032,7 +4041,7 @@ pub const ProvisionedTableReadSource = struct {
             opened = 0;
             retained.view_count += 1;
         }
-        for (fences) |fence| try fence.validate();
+        for (fences) |fence| fence.validate() catch |err| return if (err == error.ReadUnavailable) error.SqlStatementReadUnavailable else err;
         return .{ .ptr = retained, .views = retained.views, .vtable = &.{ .close = RetainedStatementRead.close, .range_proofs = RetainedStatementRead.rangeProofs } };
     }
 
@@ -16520,14 +16529,18 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(builtin.is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
-        test "relational row query statement aliases share capture not cursors and release fences before pages" {
+        test "relational statement retries unavailable capture and releases fences before pages or deadline" {
             const View = @import("table_read_source.zig").RelationalReadView;
             const Fence = @import("table_read_source.zig").StatementReadFence;
             const Fixture = struct {
                 admission: *TopologyReadAdmissionTracker,
                 held: bool = false,
                 captures: usize = 0,
+                transient_unavailable: bool = true,
+                persistently_unavailable: bool = false,
                 opens: usize = 0,
+                opens_since_capture: usize = 0,
+                fail_final_validation: bool = false,
                 closes: usize = 0,
                 releases: usize = 0,
                 fn capture(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group: u64, _: []const u8, _: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?Fence {
@@ -16536,18 +16549,28 @@ fn consumerTests() type {
                     try std.testing.expectEqual(@as(usize, 2), self.admission.active);
                     try std.testing.expectEqual(group, fence.route.group_id);
                     try std.testing.expectEqual(raft_mod.ReadConsistency.stale, consistency);
-                    self.held = true;
                     self.captures += 1;
+                    if (self.transient_unavailable or self.persistently_unavailable) {
+                        self.transient_unavailable = false;
+                        return error.ReadUnavailable;
+                    }
+                    self.held = true;
+                    self.opens_since_capture = 0;
                     return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .release = release } };
                 }
                 fn validate(ptr: *anyopaque) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(self.held);
+                    if (self.fail_final_validation and self.opens_since_capture == 2) {
+                        self.fail_final_validation = false;
+                        return error.ReadUnavailable;
+                    }
                 }
                 fn open(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions) !View {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try validate(ptr);
                     self.opens += 1;
+                    self.opens_since_capture += 1;
                     return .{ .ptr = self, .vtable = &.{ .next = next, .close = close, .range_proofs = proofs } };
                 }
                 fn proofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("../storage/range_protection.zig").Proof {
@@ -16585,7 +16608,7 @@ fn consumerTests() type {
             };
             const input: @import("table_read_source.zig").RelationalStatementScan = .{ .table = "docs", .opts = .{ .relational_query = .{ .fields = &.{} }, .include_range_proofs = true } };
             const statement = try routed.source().openRelationalStatement(std.testing.allocator, &.{ input, input }, .stale);
-            try std.testing.expectEqual(@as(usize, 1), fixture.captures);
+            try std.testing.expectEqual(@as(usize, 2), fixture.captures);
             try std.testing.expectEqual(@as(usize, 2), fixture.opens);
             try std.testing.expectEqual(@as(usize, 1), fixture.releases);
             var proof_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -16605,6 +16628,17 @@ fn consumerTests() type {
             statement.deinit();
             try std.testing.expectEqual(@as(usize, 2), fixture.closes);
             try std.testing.expectEqual(@as(usize, 0), admission.active);
+            fixture.fail_final_validation = true;
+            try std.testing.expectError(error.SqlStatementReadUnavailable, routed.source().openRelationalStatement(std.testing.allocator, &.{ input, input }, .stale));
+            try std.testing.expectEqual(@as(usize, 4), fixture.closes);
+            try std.testing.expectEqual(@as(usize, 2), fixture.releases);
+            try std.testing.expectEqual(@as(usize, 0), admission.active);
+            try std.testing.expect(!fixture.held);
+            fixture.persistently_unavailable = true;
+            const deadline_input: @import("table_read_source.zig").RelationalStatementScan = .{ .table = "docs", .opts = .{ .relational_query = .{ .fields = &.{} }, .include_range_proofs = true, .execution_deadline_ns = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms } };
+            try std.testing.expectError(error.SqlStatementReadUnavailable, routed.source().openRelationalStatement(std.testing.allocator, &.{ deadline_input, deadline_input }, .stale));
+            try std.testing.expectEqual(@as(usize, 0), admission.active);
+            try std.testing.expect(!fixture.held);
         }
 
         test "relational row query full-key index proof requires every routed owner" {

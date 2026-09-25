@@ -4738,8 +4738,27 @@ pub const ApiHttpServer = struct {
         for (snapshot.tables) |table| if (table.table_id == owner.table_id) {
             if (try @import("relational_witness_ddl.zig").cleanup(self.alloc, snapshot.tables, table)) |replacement| {
                 defer metadata_table_manager.freeTable(self.alloc, replacement);
-                try self.source.replaceTableDefinition(table, replacement);
-                return;
+                // An unpublished initial child is deliberately absent from
+                // this public snapshot. Its parent support indexes still
+                // belong to the durable FK reservation. A failed cleanup CAS
+                // must not return before activation advances the parent's
+                // read-schema migration (which the FK seal awaits).
+                const context: api_operation.RequestContext = .{
+                    .deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s,
+                    .setting_admin = true,
+                    .fk_generation_publication_authority = true,
+                };
+                const lock_bytes = self.source.systemCatalog(self.alloc, context, .{ .fk_generation_table_locked = table.table_id }) catch null;
+                defer if (lock_bytes) |bytes| self.alloc.free(bytes);
+                const locked = if (lock_bytes) |bytes| blk: {
+                    var parsed = std.json.parseFromSlice(bool, self.alloc, bytes, .{}) catch break :blk true;
+                    defer parsed.deinit();
+                    break :blk parsed.value;
+                } else true; // No authority means cleanup is unsafe; activation may still progress.
+                if (!locked) {
+                    try self.source.replaceTableDefinition(table, replacement);
+                    return;
+                }
             }
             break;
         };
@@ -4874,6 +4893,10 @@ pub const ApiHttpServer = struct {
             .action = undefined,
         };
         switch (value.target) {
+            .seal_support => {
+                command.action = .seal_support;
+                command.plan = try @import("fk_initial_create_plan_builder.zig").sealSupport(self, alloc, context, value.child_table_id);
+            },
             .child => |child| {
                 const request: control.InitialChildRequest = .{
                     .plan_id = value.plan_id,

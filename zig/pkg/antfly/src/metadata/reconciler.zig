@@ -85,6 +85,9 @@ pub const CurrentMetadataState = struct {
     placement_version_fences: []const PlacementVersionFence = &.{},
     tables: []const table_manager.TableRecord = &.{},
     ranges: []const table_manager.RangeRecord = &.{},
+    /// Plan-bound hidden initial child groups from the private provisioning
+    /// projection. Never upsert these tables/ranges into the public catalog.
+    initial_fk_owner_group_ids: []const u64 = &.{},
     stores: []const table_manager.StoreRecord = &.{},
     merged_group_statuses: []const MergedGroupStatus = &.{},
     restore_progresses: []const table_manager.RestoreProgressRecord = &.{},
@@ -365,6 +368,33 @@ pub const Reconciler = struct {
         );
         const desired_ranges = try manager.listRanges(self.alloc);
         defer manager.freeRanges(self.alloc, desired_ranges);
+        var private_initial_group_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer private_initial_group_ids.deinit(self.alloc);
+        for (current.initial_fk_owner_group_ids) |group_id| {
+            if (group_id == 0 or private_initial_group_ids.contains(group_id)) return error.InvalidGenerationPublication;
+            try private_initial_group_ids.put(self.alloc, group_id, {});
+        }
+        var private_initial_table_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer private_initial_table_ids.deinit(self.alloc);
+        var private_initial_tables: std.ArrayListUnmanaged(table_manager.TableRecord) = .empty;
+        defer private_initial_tables.deinit(self.alloc);
+        var private_initial_ranges: std.ArrayListUnmanaged(table_manager.RangeRecord) = .empty;
+        defer private_initial_ranges.deinit(self.alloc);
+        var observed_private_groups: usize = 0;
+        for (current.ranges) |range| {
+            if (!private_initial_group_ids.contains(range.group_id)) continue;
+            observed_private_groups += 1;
+            if (findRangeRecord(desired_ranges, range.group_id) != null) continue;
+            const table = findTableRecord(current.tables, range.table_id) orelse return error.InvalidGenerationPublication;
+            try private_initial_ranges.append(self.alloc, range);
+            if (findTableRecord(desired_tables, table.table_id) == null and
+                !private_initial_table_ids.contains(table.table_id))
+            {
+                try private_initial_tables.append(self.alloc, table);
+                try private_initial_table_ids.put(self.alloc, table.table_id, {});
+            }
+        }
+        if (observed_private_groups != current.initial_fk_owner_group_ids.len) return error.InvalidGenerationPublication;
         const desired_splits = try manager.listDesiredSplitTransitions(self.alloc);
         defer manager.freeSplitTransitions(self.alloc, desired_splits);
         const desired_merges = try manager.listDesiredMergeTransitions(self.alloc);
@@ -426,13 +456,15 @@ pub const Reconciler = struct {
         );
         defer self.alloc.free(protected_placement_groups);
         const desired_placements = if (placement_candidate_node_ids.len > 0)
-            try planner.planAllIntentsWithConstraints(
+            try planner.planAllIntentsWithPrivate(
                 manager,
                 placement_candidate_node_ids,
                 current.placement_intents,
                 candidate_domains,
                 split_provisioning_ranges,
                 protected_placement_groups,
+                private_initial_tables.items,
+                private_initial_ranges.items,
             )
         else
             try self.alloc.alloc(raft_reconciler.PlacementIntent, 0);
@@ -797,6 +829,7 @@ pub const Reconciler = struct {
             }
         }
         for (current.tables) |record| {
+            if (private_initial_table_ids.contains(record.table_id)) continue;
             if (findTableRecord(desired_tables, record.table_id) == null and
                 active_transition_contracts.get(record.table_id) == null)
             {
@@ -804,6 +837,7 @@ pub const Reconciler = struct {
             }
         }
         for (current.ranges) |record| {
+            if (private_initial_group_ids.contains(record.group_id)) continue;
             if (findRangeRecord(desired_ranges, record.group_id) != null) continue;
             if (active_transition_contracts.rangeMutationFenced(record.group_id))
                 continue;
@@ -3880,16 +3914,7 @@ fn maybeFinalizeSchemaMigration(
 
     const state = readiness.tables.get(desired.table_id) orelse return;
     if (!state.ready()) return;
-    const target_version = state.version;
-
-    const read_version = try schemaVersion(alloc, desired.read_schema_json);
-    if (read_version != target_version) {
-        const next_indexes_json = try dropFullTextIndexForVersion(alloc, desired.indexes_json, read_version);
-        alloc.free(desired.indexes_json);
-        desired.indexes_json = next_indexes_json;
-    }
-    alloc.free(desired.read_schema_json);
-    desired.read_schema_json = try alloc.dupe(u8, "");
+    try @import("schema_migration_finalization.zig").apply(alloc, desired);
 }
 
 // Retained solely as the workload equality oracle.
@@ -3913,27 +3938,6 @@ fn schemaMigrationReadyReference(
         if (findSchemaProgress(current.schema_progresses, table_id, node_id, target_version) == null) return false;
     }
     return true;
-}
-
-fn dropFullTextIndexForVersion(
-    alloc: std.mem.Allocator,
-    indexes_json: []const u8,
-    version: u32,
-) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |*object| object,
-        else => return error.InvalidTableIndexMetadata,
-    };
-
-    var versioned_name_buf: [64]u8 = undefined;
-    const stale_name = if (version == 0)
-        @import("../api/tables.zig").default_full_text_index_name
-    else
-        try std.fmt.bufPrint(&versioned_name_buf, "full_text_index_v{d}", .{version});
-    _ = object.swapRemove(stale_name);
-    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
 }
 
 fn schemaVersion(alloc: std.mem.Allocator, schema_json: []const u8) !u32 {
@@ -5232,6 +5236,57 @@ test "metadata reconciler forced reallocation can place replicas on newly added 
         findPlacementIntent(forced_plan.placement_upserts, 2101, 4) != null or
             findPlacementIntent(forced_plan.placement_upserts, 2102, 4) != null,
     );
+}
+
+test "hidden initial FK owner receives placement without public topology publication" {
+    const alloc = std.testing.allocator;
+    var manager = table_manager.TableManager.initProvisioning(alloc);
+    defer manager.deinit();
+    const hidden_table: table_manager.TableRecord = .{ .table_id = 701, .name = "hidden-child", .desired_replica_count = 1 };
+    const hidden_range: table_manager.RangeRecord = .{ .group_id = 1701, .table_id = 701, .start_key = "" };
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{.{ .node_id = 9, .store_id = 9, .role = "data", .failure_domain = "rack-a" }};
+    var reconciler = Reconciler.init(alloc);
+    defer reconciler.deinit();
+    var pending = try reconciler.computePlan(&manager, &.{9}, &candidates, .{
+        .tables = &.{hidden_table},
+        .ranges = &.{hidden_range},
+        .initial_fk_owner_group_ids = &.{hidden_range.group_id},
+    });
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), pending.placement_upserts.len);
+    try std.testing.expectEqual(hidden_range.group_id, pending.placement_upserts[0].record.group_id);
+    try std.testing.expectEqual(@as(usize, 0), pending.table_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), pending.range_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), pending.table_removals.len);
+    try std.testing.expectEqual(@as(usize, 0), pending.range_removals.len);
+
+    const placed = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{ .group_id = hidden_range.group_id, .replica_id = 1, .local_node_id = 9, .metadata_version = 1 },
+        .store_id = 9,
+        .peer_node_ids = &.{9},
+    }};
+    var terminal = try reconciler.computePlan(&manager, &.{9}, &candidates, .{
+        .placement_intents = &placed,
+        .placement_version_fences = &.{.{ .group_id = hidden_range.group_id, .local_node_id = 9, .version = 1 }},
+    });
+    defer terminal.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), terminal.placement_removals.len);
+    try std.testing.expectEqual(hidden_range.group_id, terminal.placement_removals[0].group_id);
+
+    // Publication transfers the same group into public topology. Existing
+    // placement remains routable; it must not be retired and reprovisioned.
+    try manager.upsertTable(hidden_table);
+    try manager.upsertRange(hidden_range);
+    var published = try reconciler.computePlan(&manager, &.{9}, &candidates, .{
+        .tables = &.{hidden_table},
+        .ranges = &.{hidden_range},
+        .placement_intents = &placed,
+        .placement_version_fences = &.{.{ .group_id = hidden_range.group_id, .local_node_id = 9, .version = 1 }},
+    });
+    defer published.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), published.placement_removals.len);
+    try std.testing.expectEqual(@as(usize, 0), published.table_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), published.range_upserts.len);
 }
 
 test "metadata reconciler serializes forced placement movement behind split provisioning" {

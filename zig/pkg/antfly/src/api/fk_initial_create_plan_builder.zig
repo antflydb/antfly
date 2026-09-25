@@ -120,10 +120,18 @@ pub fn build(
     const prepared = try std.json.parseFromSliceLeaky(publication.InitialCreatePrepare, alloc, prepare_bytes, .{ .allocate = .alloc_always });
     var child = prepared.child;
     child.schema_json = try bindReservedSelf(alloc, child.schema_json, target.table, child.name);
-    const derived = try publication.deriveInitialTransitions(alloc, child.table_id, child.name, child.schema_json);
-    if (derived.len == 0) return error.InvalidGenerationPublication;
-    var snapshot = try settledParentSnapshot(server, context, child.name, derived);
+    const routing_derived = try publication.deriveInitialTransitions(alloc, child.table_id, child.name, child.schema_json);
+    if (routing_derived.len == 0) return error.InvalidGenerationPublication;
+    var snapshot = try settledParentSnapshot(server, context, child.name, routing_derived);
     defer server.source.freeAdminSnapshot(&snapshot);
+    // Calculate support definitions against this settled read cut, but do
+    // not publish any parent here. Begin owns each exact before/after pair in
+    // one metadata transaction with the hidden child/name reservation.
+    var witness = try @import("relational_witness_ddl.zig").prepare(alloc, snapshot.tables, child.name, child.schema_json, "");
+    defer witness.deinit();
+    child.schema_json = try alloc.dupe(u8, witness.schema_json);
+    const derived = try publication.deriveInitialTransitions(alloc, child.table_id, child.name, child.schema_json);
+    const support_pending = witness.parents.len != 0;
     var id: publication.Id = undefined;
     const io = server.restore_job_store.io orelse return error.AsyncRestoreUnavailable;
     while (true) {
@@ -159,11 +167,16 @@ pub fn build(
                 try server_mod.resolveEffectiveRowFilterJson(alloc, identity, names[0]) != null)
                 return error.Forbidden;
             const ranges = try existing.rangesFor(alloc, snapshot, parent_table.table_id);
+            const support_after: ?records.TableRecord = for (witness.parents) |support_parent| {
+                if (support_parent.before.table_id == parent_table.table_id) break try existing.ownedTableForPlan(alloc, support_parent.after);
+            } else null;
             try parents.append(alloc, .{
                 .table = try existing.ownedTableForPlan(alloc, parent_table),
                 .ranges = ranges,
-                .fences = try existing.ownerFences(server, alloc, context, id, parent_table, ranges, .child_generation_parent),
+                .fences = if (support_pending) &.{} else try existing.ownerFences(server, alloc, context, id, parent_table, ranges, .child_generation_parent),
                 .transitions = &.{},
+                .support_before = if (support_after != null) try existing.ownedTableForPlan(alloc, parent_table) else null,
+                .support_after = support_after,
             });
             found = &parents.items[parents.items.len - 1];
         }
@@ -201,12 +214,55 @@ pub fn build(
         .child = child,
         .child_ranges = prepared.child_ranges,
         .parents = try parents.toOwnedSlice(alloc),
+        .support_pending = support_pending,
         .self_transitions = try self_transitions.toOwnedSlice(alloc),
         .logical_name = try alloc.dupe(u8, target.table),
         .namespace_id = namespace_id,
     };
     try plan.validate(alloc);
     return plan;
+}
+
+/// Seal a durable support reservation only after every touched parent has
+/// finalized its schema migration. The owner fences are collected from that
+/// post-support cut, never guessed from the pre-install descriptors.
+pub fn sealSupport(
+    server: *server_mod.ApiHttpServer,
+    alloc: std.mem.Allocator,
+    context: operation.RequestContext,
+    child_table_id: u64,
+) !publication.InitialCreatePlan {
+    const status_bytes = try server.source.systemCatalog(alloc, context, .{ .fk_initial_create_status = child_table_id });
+    const status = try std.json.parseFromSliceLeaky(publication.InitialPublication, alloc, status_bytes, .{ .allocate = .alloc_always });
+    if (status.phase != .preparing_support or !status.plan.support_pending) return error.GenerationPublicationChanged;
+    var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
+    defer server.source.freeAdminSnapshot(&snapshot);
+    const parents = try alloc.alloc(publication.Parent, status.plan.parents.len);
+    for (status.plan.parents, parents) |pending, *parent| {
+        const current = for (snapshot.tables) |table| {
+            if (table.table_id == pending.table.table_id) break table;
+        } else return error.GenerationPublicationChanged;
+        if (current.read_schema_json.len != 0) return error.ForeignKeyParentSchemaPending;
+        if (pending.support_after) |after| {
+            if (!std.mem.eql(u8, current.schema_json, after.schema_json)) return error.GenerationPublicationChanged;
+        } else if (!std.mem.eql(u8, current.schema_json, pending.table.schema_json)) {
+            return error.GenerationPublicationChanged;
+        }
+        const ranges = try existing.rangesFor(alloc, snapshot, current.table_id);
+        parent.* = .{
+            .table = try existing.ownedTableForPlan(alloc, current),
+            .ranges = ranges,
+            .fences = try existing.ownerFences(server, alloc, context, status.plan.id, current, ranges, .child_generation_parent),
+            .transitions = pending.transitions,
+            .support_before = pending.support_before,
+            .support_after = pending.support_after,
+        };
+    }
+    var sealed = status.plan;
+    sealed.support_pending = false;
+    sealed.parents = parents;
+    try sealed.validate(alloc);
+    return sealed;
 }
 
 test "initial FK plan waits for all external parent schema migrations" {

@@ -732,6 +732,7 @@ const replica_retirement_magic_v1 = "AFRTRM1\x00";
 const replica_retirement_magic_v2 = "AFRTRM2\x00";
 const replica_retirement_magic = "AFRTRM3\x00";
 const replica_retirement_batch_magic = "AFRTBT1\x00";
+const replica_retirement_batch_magic_v2 = "AFRTBT2\x00";
 const replica_retirement_batch_prefix = "batch-";
 const max_replica_retirement_table_name_bytes: usize = 64 * 1024;
 const max_replica_retirement_batch_entries: usize = 64 * 1024;
@@ -742,7 +743,7 @@ const max_dropped_table_repair_name_bytes: usize = 16 * 1024;
 const replica_retirement_batch_base_encoded_len: usize =
     replica_retirement_batch_magic.len + 1 + 4 + std.crypto.hash.sha2.Sha256.digest_length;
 
-fn addReplicaRetirementBatchEncodedEntry(current: usize, table_name: ?[]const u8) !usize {
+fn addReplicaRetirementBatchEncodedEntry(current: usize, table_name: ?[]const u8, version_two: bool, proof: ?InitialFkRetirementProof) !usize {
     const name_len = if (table_name) |name| blk: {
         if (name.len == 0 or name.len > max_replica_retirement_table_name_bytes)
             return error.InvalidReplicaRetirementTableName;
@@ -752,6 +753,11 @@ fn addReplicaRetirementBatchEncodedEntry(current: usize, table_name: ?[]const u8
         return error.ReplicaRetirementBatchTooLarge;
     encoded_len = std.math.add(usize, encoded_len, name_len) catch
         return error.ReplicaRetirementBatchTooLarge;
+    if (version_two) {
+        if (proof) |value| try value.validate();
+        encoded_len = std.math.add(usize, encoded_len, 1 + if (proof != null) InitialFkRetirementProof.encoded_len else @as(usize, 0)) catch
+            return error.ReplicaRetirementBatchTooLarge;
+    }
     if (encoded_len > max_replica_retirement_batch_bytes)
         return error.ReplicaRetirementBatchTooLarge;
     return encoded_len;
@@ -1348,6 +1354,7 @@ fn replicaRetirementIntentPath(
 const PersistedReplicaRetirementIntent = struct {
     group_id: u64,
     table_name: ?[]u8,
+    initial_fk_proof: ?InitialFkRetirementProof = null,
     path: []u8,
     created: bool,
 
@@ -1357,6 +1364,52 @@ const PersistedReplicaRetirementIntent = struct {
         self.* = undefined;
     }
 };
+
+/// Immutable metadata identity carried by a crash-safe local retirement
+/// intent. The owning metadata publication, not this sidecar, decides whether
+/// cancellation committed; the cold physical AICH record must match it too.
+pub const InitialFkRetirementProof = struct {
+    child_table_id: u64,
+    plan_id: [16]u8,
+    plan_digest: [32]u8,
+
+    const encoded_len = 8 + 16 + 32;
+
+    pub fn validate(self: @This()) !void {
+        if (self.child_table_id == 0 or std.mem.allEqual(u8, &self.plan_id, 0) or
+            std.mem.allEqual(u8, &self.plan_digest, 0)) return error.InvalidReplicaRetirementIntent;
+    }
+
+    fn encode(self: @This()) ![encoded_len]u8 {
+        try self.validate();
+        var bytes: [encoded_len]u8 = undefined;
+        std.mem.writeInt(u64, bytes[0..8], self.child_table_id, .little);
+        @memcpy(bytes[8..24], &self.plan_id);
+        @memcpy(bytes[24..56], &self.plan_digest);
+        return bytes;
+    }
+
+    fn decode(bytes: []const u8) !@This() {
+        if (bytes.len != encoded_len) return error.InvalidReplicaRetirementIntent;
+        const result: @This() = .{
+            .child_table_id = std.mem.readInt(u64, bytes[0..8], .little),
+            .plan_id = bytes[8..24].*,
+            .plan_digest = bytes[24..56].*,
+        };
+        try result.validate();
+        return result;
+    }
+};
+
+fn initialFkRetirementProofsEqual(lhs: ?InitialFkRetirementProof, rhs: ?InitialFkRetirementProof) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return std.meta.eql(lhs.?, rhs.?);
+}
+
+fn replicaRetirementBatchMagic(intents: []const PersistedReplicaRetirementIntent) []const u8 {
+    for (intents) |intent| if (intent.initial_fk_proof != null) return replica_retirement_batch_magic_v2;
+    return replica_retirement_batch_magic;
+}
 
 const ReplicaRetirementIntentPhase = enum(u8) {
     prepared = 1,
@@ -1401,7 +1454,8 @@ fn replicaRetirementBatchPath(
     intents: []const PersistedReplicaRetirementIntent,
 ) ![]u8 {
     var checksum = std.crypto.hash.sha2.Sha256.init(.{});
-    checksum.update(replica_retirement_batch_magic);
+    const magic = replicaRetirementBatchMagic(intents);
+    checksum.update(magic);
     var encoded_count: [4]u8 = undefined;
     std.mem.writeInt(u32, &encoded_count, @intCast(intents.len), .little);
     checksum.update(&encoded_count);
@@ -1413,6 +1467,10 @@ fn replicaRetirementBatchPath(
         std.mem.writeInt(u32, &encoded_name_len, @intCast(if (intent.table_name) |name| name.len else 0), .little);
         checksum.update(&encoded_name_len);
         if (intent.table_name) |name| checksum.update(name);
+        if (std.mem.eql(u8, magic, replica_retirement_batch_magic_v2)) {
+            checksum.update(&[_]u8{@intFromBool(intent.initial_fk_proof != null)});
+            if (intent.initial_fk_proof) |proof| checksum.update(&try proof.encode());
+        }
     }
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     checksum.final(&digest);
@@ -1435,13 +1493,15 @@ fn writeReplicaRetirementBatch(
 ) !void {
     if (intents.len == 0 or intents.len > max_replica_retirement_batch_entries)
         return error.ReplicaRetirementBatchTooLarge;
+    const magic = replicaRetirementBatchMagic(intents);
+    const version_two = std.mem.eql(u8, magic, replica_retirement_batch_magic_v2);
     var encoded_len: usize = replica_retirement_batch_base_encoded_len;
     var previous_group_id: ?u64 = null;
     for (intents) |intent| {
         if (previous_group_id != null and previous_group_id.? >= intent.group_id)
             return error.InvalidReplicaRetirementIntent;
         previous_group_id = intent.group_id;
-        encoded_len = try addReplicaRetirementBatchEncodedEntry(encoded_len, intent.table_name);
+        encoded_len = try addReplicaRetirementBatchEncodedEntry(encoded_len, intent.table_name, version_two, intent.initial_fk_proof);
     }
 
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
@@ -1456,10 +1516,10 @@ fn writeReplicaRetirementBatch(
         const encoded_phase = [_]u8{@intFromEnum(phase)};
         var encoded_count: [4]u8 = undefined;
         std.mem.writeInt(u32, &encoded_count, @intCast(intents.len), .little);
-        checksum.update(replica_retirement_batch_magic);
+        checksum.update(magic);
         checksum.update(&encoded_phase);
         checksum.update(&encoded_count);
-        try writer.interface.writeAll(replica_retirement_batch_magic);
+        try writer.interface.writeAll(magic);
         try writer.interface.writeAll(&encoded_phase);
         try writer.interface.writeAll(&encoded_count);
         for (intents) |intent| {
@@ -1470,9 +1530,18 @@ fn writeReplicaRetirementBatch(
             checksum.update(&encoded_group_id);
             checksum.update(&encoded_name_len);
             if (intent.table_name) |name| checksum.update(name);
+            if (version_two) {
+                const flag = [_]u8{@intFromBool(intent.initial_fk_proof != null)};
+                checksum.update(&flag);
+                if (intent.initial_fk_proof) |proof| checksum.update(&try proof.encode());
+            }
             try writer.interface.writeAll(&encoded_group_id);
             try writer.interface.writeAll(&encoded_name_len);
             if (intent.table_name) |name| try writer.interface.writeAll(name);
+            if (version_two) {
+                try writer.interface.writeAll(&[_]u8{@intFromBool(intent.initial_fk_proof != null)});
+                if (intent.initial_fk_proof) |proof| try writer.interface.writeAll(&try proof.encode());
+            }
         }
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         checksum.final(&digest);
@@ -1492,8 +1561,10 @@ fn loadReplicaRetirementBatch(alloc: std.mem.Allocator, io: std.Io, path: []cons
     };
     defer alloc.free(encoded);
     const header_len = replica_retirement_batch_magic.len + 1 + 4;
-    if (encoded.len < header_len + std.crypto.hash.sha2.Sha256.digest_length or
-        !std.mem.eql(u8, encoded[0..replica_retirement_batch_magic.len], replica_retirement_batch_magic))
+    if (encoded.len < header_len + std.crypto.hash.sha2.Sha256.digest_length)
+        return error.InvalidReplicaRetirementIntent;
+    const version_two = std.mem.eql(u8, encoded[0..replica_retirement_batch_magic.len], replica_retirement_batch_magic_v2);
+    if (!version_two and !std.mem.eql(u8, encoded[0..replica_retirement_batch_magic.len], replica_retirement_batch_magic))
         return error.InvalidReplicaRetirementIntent;
     const phase: ReplicaRetirementIntentPhase = switch (encoded[replica_retirement_batch_magic.len]) {
         @intFromEnum(ReplicaRetirementIntentPhase.prepared) => .prepared,
@@ -1535,16 +1606,29 @@ fn loadReplicaRetirementBatch(alloc: std.mem.Allocator, io: std.Io, path: []cons
         previous_group_id = group_id;
         const table_name = if (name_len == 0) null else try alloc.dupe(u8, encoded[offset .. offset + name_len]);
         errdefer if (table_name) |name| alloc.free(name);
-        // The batch owns its path once; entries retain only the cleanup
-        // identity and avoid O(entries * path length) recovery memory.
+        offset += name_len;
+        var proof: ?InitialFkRetirementProof = null;
+        if (version_two) {
+            if (offset == payload_end) return error.InvalidReplicaRetirementIntent;
+            const flag = encoded[offset];
+            offset += 1;
+            if (flag > 1) return error.InvalidReplicaRetirementIntent;
+            if (flag == 1) {
+                if (offset + InitialFkRetirementProof.encoded_len > payload_end) return error.InvalidReplicaRetirementIntent;
+                proof = try InitialFkRetirementProof.decode(encoded[offset..][0..InitialFkRetirementProof.encoded_len]);
+                offset += InitialFkRetirementProof.encoded_len;
+            }
+        }
+        // Allocate only after every fallible per-entry decode. A malformed
+        // proof must not leak a path that was never transferred to the batch.
         const owned_path = try alloc.alloc(u8, 0);
         intents[initialized] = .{
             .group_id = group_id,
             .table_name = table_name,
+            .initial_fk_proof = proof,
             .path = owned_path,
             .created = false,
         };
-        offset += name_len;
     }
     if (offset != payload_end) return error.InvalidReplicaRetirementIntent;
     return .{ .phase = phase, .intents = intents };
@@ -7343,8 +7427,13 @@ pub const ProvisionedTableWriteSource = struct {
 
         ptr: *anyopaque,
         classify: *const fn (ptr: *anyopaque, group_id: u64) anyerror!State,
+        classify_initial_fk: ?*const fn (ptr: *anyopaque, group_id: u64, proof: InitialFkRetirementProof) anyerror!State = null,
 
-        fn state(self: @This(), group_id: u64) !State {
+        fn state(self: @This(), group_id: u64, proof: ?InitialFkRetirementProof) !State {
+            if (proof) |value| {
+                const classifier = self.classify_initial_fk orelse return error.ReplicaRetirementOwnershipUnavailable;
+                return try classifier(self.ptr, group_id, value);
+            }
             return try self.classify(self.ptr, group_id);
         }
     };
@@ -7371,6 +7460,7 @@ pub const ProvisionedTableWriteSource = struct {
         /// produced the placement removal. Null is reserved for legacy repair
         /// records and deliberately falls back to conservative coordination.
         table_name: ?[]const u8 = null,
+        initial_fk_proof: ?InitialFkRetirementProof = null,
     };
 
     fn preflightReplicaRetirementBatch(targets: []const ReplicaRetirementTarget) !void {
@@ -7379,8 +7469,11 @@ pub const ProvisionedTableWriteSource = struct {
             return error.ReplicaRetirementBatchTooLarge;
 
         var encoded_len: usize = replica_retirement_batch_base_encoded_len;
+        const version_two = for (targets) |target| {
+            if (target.initial_fk_proof != null) break true;
+        } else false;
         for (targets) |target| {
-            encoded_len = try addReplicaRetirementBatchEncodedEntry(encoded_len, target.table_name);
+            encoded_len = try addReplicaRetirementBatchEncodedEntry(encoded_len, target.table_name, version_two, target.initial_fk_proof);
         }
     }
 
@@ -9547,7 +9640,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(states);
         var has_committed_removal = false;
         for (loaded_batch.intents, states) |intent, *state| {
-            state.* = ownership.state(intent.group_id) catch |err| {
+            state.* = ownership.state(intent.group_id, intent.initial_fk_proof) catch |err| {
                 std.log.warn("replica-retirement batch ownership classification deferred group_id={d} path={s} err={s}", .{
                     intent.group_id,
                     path,
@@ -9673,7 +9766,7 @@ pub const ProvisionedTableWriteSource = struct {
                 std.debug.assert(removed);
                 self.replica_retirement_intent_mutex.unlock();
             }
-            const state = ownership.state(group_id) catch |err| {
+            const state = ownership.state(group_id, null) catch |err| {
                 std.log.warn("replica-retirement ownership classification deferred group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
                 retry_required = true;
                 continue;
@@ -9766,6 +9859,7 @@ pub const ProvisionedTableWriteSource = struct {
             intent.* = .{
                 .group_id = target.group_id,
                 .table_name = name,
+                .initial_fk_proof = target.initial_fk_proof,
                 // The shared path is owned once by PreparedReplicaRetirements.
                 .path = try alloc.alloc(u8, 0),
                 .created = false,
@@ -9827,7 +9921,8 @@ pub const ProvisionedTableWriteSource = struct {
                 return error.InvalidReplicaRetirementIntent;
             for (persisted.intents, intents) |stored, requested| {
                 if (stored.group_id != requested.group_id or
-                    !optionalBytesEqual(stored.table_name, requested.table_name))
+                    !optionalBytesEqual(stored.table_name, requested.table_name) or
+                    !initialFkRetirementProofsEqual(stored.initial_fk_proof, requested.initial_fk_proof))
                     return error.InvalidReplicaRetirementIntent;
             }
         } else |err| switch (err) {
@@ -40006,6 +40101,27 @@ fn consumerTests() type {
             try std.testing.expect(!try source.recoverReplicaRetirementIntents(alloc));
             try std.testing.expect(std.mem.allEqual(bool, &ownership.drained, true));
             try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), prepared.batch_path.?, .{}));
+
+            // A V2 proof failure occurs after the table name has been
+            // allocated. The decoder must release it on this error path.
+            const proof: InitialFkRetirementProof = .{
+                .child_table_id = 91,
+                .plan_id = @splat(7),
+                .plan_digest = @splat(9),
+            };
+            var proved = try source.prepareReplicaRetirements(alloc, &.{.{
+                .group_id = 7004,
+                .table_name = "docs",
+                .initial_fk_proof = proof,
+            }});
+            defer proved.deinit();
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), proved.batch_path.?, alloc, .limited(max_replica_retirement_batch_bytes + 1));
+            defer alloc.free(bytes);
+            const flag_offset = replica_retirement_batch_magic_v2.len + 1 + 4 + 8 + 4 + "docs".len;
+            bytes[flag_offset] = 2;
+            std.crypto.hash.sha2.Sha256.hash(bytes[0 .. bytes.len - std.crypto.hash.sha2.Sha256.digest_length], bytes[bytes.len - std.crypto.hash.sha2.Sha256.digest_length ..][0..std.crypto.hash.sha2.Sha256.digest_length], .{});
+            try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = proved.batch_path.?, .data = bytes });
+            try std.testing.expectError(error.InvalidReplicaRetirementIntent, loadReplicaRetirementBatch(alloc, io_impl.io(), proved.batch_path.?));
         }
 
         test "replica retirement batch size is rejected before target cloning" {

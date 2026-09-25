@@ -477,6 +477,9 @@ pub const RaftApplyStore = struct {
     pub fn fkInitialCreateStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, child_table_id: u64) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_status = child_table_id });
     }
+    pub fn fkGenerationTableLockedJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_table_locked = table_id });
+    }
     pub fn fkInitialCreateWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after_child_table_id: u64) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_work = after_child_table_id });
     }

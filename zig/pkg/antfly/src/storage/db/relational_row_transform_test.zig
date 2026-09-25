@@ -50,6 +50,10 @@ test "SQL primary-key rewrite retains a present key across nullable-to-required 
     const target_view = try codec.ordinalRowView(result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
     const target_id = (try target_view.findCell(0)) orelse return error.TestUnexpectedResult;
     try std.testing.expect(!target_id.is_null);
+    var null_source = try mapper.PreparedRelationalWrite.initFromIntent(alloc, "row-null", "{\"id\":null,\"note\":\"missing\"}", program.source.validator(), program.source.tableSchema().*, program.source.physicalLayout(), null);
+    defer null_source.deinit(alloc);
+    try null_source.finalizeMetadata(123);
+    try std.testing.expectError(error.InvalidRelationalRow, program.transform(alloc, null_source.packed_row));
 }
 
 const source_schema =

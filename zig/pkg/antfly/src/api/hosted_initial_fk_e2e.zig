@@ -228,12 +228,14 @@ test "mounted hosted FK parent owner is read-index ready" {
             child_released: []const publication.Receipt = &.{},
         };
         const source = http_server.StatusSource.fromMetadataHttpService(metadata.server.svc);
-        var last_phase: publication.InitialPhase = .provisioning_child;
+        var last_phase: publication.InitialPhase = .preparing_support;
         var last_revision: u64 = 0;
+        var last_receipts: [5]usize = .{ 0, 0, 0, 0, 0 };
         var published = false;
-        for (0..1500) |_| {
+        const publication_deadline = platform.time.monotonicNs() +| 45 * std.time.ns_per_s;
+        while (platform.time.monotonicNs() < publication_deadline) {
             const status_json = try source.systemCatalog(alloc, .{
-                .deadline_ns = platform.time.monotonicNs() +| 5 * std.time.ns_per_s,
+                .deadline_ns = @min(publication_deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s),
                 .fk_generation_publication_authority = true,
             }, .{ .fk_initial_create_status = child_table_id });
             defer alloc.free(status_json);
@@ -241,6 +243,13 @@ test "mounted hosted FK parent owner is read-index ready" {
             defer status.deinit();
             last_phase = status.value.phase;
             last_revision = status.value.revision;
+            last_receipts = .{
+                status.value.child_provisioned.len,
+                status.value.parent_staged.len,
+                status.value.parent_activated.len,
+                status.value.parent_acknowledged.len,
+                status.value.child_released.len,
+            };
             if (last_phase == .published) {
                 try std.testing.expectEqual(@as(usize, 1), status.value.child_provisioned.len);
                 try std.testing.expectEqual(@as(usize, 1), status.value.parent_staged.len);
@@ -252,7 +261,58 @@ test "mounted hosted FK parent owner is read-index ready" {
             }
             try io.sleep(.fromMilliseconds(20), .awake);
         }
-        if (!published) std.debug.print("linked hosted initial FK stalled phase={s} revision={}\n", .{ @tagName(last_phase), last_revision });
+        if (!published) {
+            var stalled_snapshot = try metadata.server.svc.adminSnapshot();
+            defer metadata.server.svc.freeAdminSnapshot(&stalled_snapshot);
+            const durable_json = try source.systemCatalog(alloc, .{
+                .deadline_ns = platform.time.monotonicNs() +| 5 * std.time.ns_per_s,
+                .fk_generation_publication_authority = true,
+            }, .{ .fk_initial_create_status = child_table_id });
+            defer alloc.free(durable_json);
+            var durable = try std.json.parseFromSlice(publication.InitialPublication, alloc, durable_json, .{ .ignore_unknown_fields = true });
+            defer durable.deinit();
+            for (stalled_snapshot.tables) |table| if (table.table_id == parent_table_id) {
+                const pending_parent = durable.value.plan.parents[0];
+                const after = pending_parent.support_after orelse pending_parent.table;
+                std.debug.print("linked hosted initial FK stalled phase={s} revision={} receipts={any} schema_v={} read_v={} support_after_v={} matches_after={} v0_index={} v1_index={}\n", .{
+                    @tagName(last_phase),                                       last_revision,                                                                                                         last_receipts,
+                    try @import("tables.zig").schemaVersion(table.schema_json), if (table.read_schema_json.len == 0) @as(u32, 0) else try @import("tables.zig").schemaVersion(table.read_schema_json), try @import("tables.zig").schemaVersion(after.schema_json),
+                    metadata_table_manager.tableDefinitionsEqual(table, after), std.mem.indexOf(u8, table.indexes_json, "full_text_index_v0") != null,                                                 std.mem.indexOf(u8, table.indexes_json, "full_text_index_v1") != null,
+                });
+                break;
+            };
+            for (stalled_snapshot.schema_progresses) |progress| if (progress.table_id == parent_table_id)
+                std.debug.print("linked hosted parent schema progress node={} version={}\n", .{ progress.node_id, progress.schema_version });
+            for (stalled_snapshot.placement_intents) |intent|
+                std.debug.print("linked hosted placement group={} node={} store={}\n", .{ intent.record.group_id, intent.record.local_node_id, intent.store_id });
+            const hidden_group_id = durable.value.plan.child_ranges[0].group_id;
+            var hidden_status_seen = false;
+            for (stalled_snapshot.merged_group_statuses) |status| if (status.group_id == hidden_group_id) {
+                hidden_status_seen = true;
+                std.debug.print("linked hosted hidden raft group={} leader_known={} leader_store={} healthy_voters={}\n", .{
+                    hidden_group_id, status.leader_known, status.leader_store_id, status.healthy_voter_reports,
+                });
+            };
+            if (!hidden_status_seen) std.debug.print("linked hosted hidden raft group={} status=absent\n", .{hidden_group_id});
+            const hidden_record = data.readHiddenInitialChildRecord(hidden_group_id, child_table_id) catch |err| blk: {
+                std.debug.print("linked hosted hidden owner read err={s}\n", .{@errorName(err)});
+                break :blk null;
+            };
+            if (hidden_record) |record|
+                std.debug.print("linked hosted hidden owner phase={s} provision={}/{}\n", .{ @tagName(record.phase), record.provision_term, record.provision_index })
+            else
+                std.debug.print("linked hosted hidden owner record=absent\n", .{});
+            for (stalled_snapshot.stores) |store| for (store.runtime_statuses) |runtime| {
+                if (runtime.table_id != parent_table_id) continue;
+                std.debug.print("linked hosted parent runtime node={} group={} freshness={s} identity_live={} indexes={}\n", .{
+                    store.node_id, runtime.group_id, runtime.freshness, runtime.doc_identity.live_ordinals, runtime.indexes.len,
+                });
+                for (runtime.indexes) |index| if (std.mem.eql(u8, index.name, "full_text_index_v1"))
+                    std.debug.print("linked hosted parent v1 index docs={} backfill={} replay={}/{} load_error={s}\n", .{
+                        index.doc_count, index.backfill_active, index.replay_applied_sequence, index.replay_target_sequence, index.load_error orelse "none",
+                    });
+            };
+        }
         try std.testing.expect(published);
         var visible = try metadata.server.svc.adminSnapshot();
         defer metadata.server.svc.freeAdminSnapshot(&visible);

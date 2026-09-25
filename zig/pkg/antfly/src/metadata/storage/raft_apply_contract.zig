@@ -271,6 +271,7 @@ pub const CatalogProjectionRequest = union(enum) {
     fk_initial_create_prepare: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest,
     fk_initial_child_decision: @import("../fk_generation_publication.zig").InitialChildDecisionRequest,
     fk_initial_create_status: u64,
+    fk_generation_table_locked: u64,
     fk_initial_create_work: u64,
     fk_initial_parent_decision: @import("../fk_generation_publication.zig").DecisionRequest,
 };

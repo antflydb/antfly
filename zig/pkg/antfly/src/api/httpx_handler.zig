@@ -6499,7 +6499,13 @@ pub const AntflyApiHandler = struct {
         const has_initial_fk = try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(alloc, fk_schema);
         if (has_initial_fk and try @import("relational_witness_ddl.zig").needed(alloc, fk_schema, ""))
             return jsonErrorResponse(ctx, 422, "initial MATCH PARTIAL foreign keys require atomic parent support-index publication; create the table without that constraint, then add it with ALTER TABLE");
-        const supported_schema = self.api_server.preparePartialWitnessSchema(alloc, decoded_table_name, fk_schema, "", operationContext(ctx, authenticated_identity)) catch |err| return witnessDDLError(ctx, err);
+        // Initial FK-bearing CREATE computes support in its immutable plan.
+        // Parent schema changes and hidden child reservation are owned by one
+        // metadata begin transaction; ingress must not publish parent CASes.
+        const supported_schema = if (has_initial_fk)
+            try alloc.dupe(u8, fk_schema)
+        else
+            self.api_server.preparePartialWitnessSchema(alloc, decoded_table_name, fk_schema, "", operationContext(ctx, authenticated_identity)) catch |err| return witnessDDLError(ctx, err);
         if (create_req.schema_json) |old| alloc.free(old);
         create_req.schema_json = supported_schema;
         if (has_initial_fk) {
@@ -13408,6 +13414,7 @@ test "httpx restore owner accepts bounded rewrite source chunks above legacy con
     try request.validate(22);
     const Fixture = struct {
         calls: std.atomic.Value(u32) = .init(0),
+        failure: ?anyerror = null,
         fn execute(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, group: u64, input: contract.Request, context: @import("operation.zig").RequestContext) !contract.Response {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
@@ -13416,6 +13423,7 @@ test "httpx restore owner accepts bounded rewrite source chunks above legacy con
             try std.testing.expectEqual(@as(usize, 32 * 1024), input.source_chunk.?.data_base64.len);
             try std.testing.expectEqual(@as(u8, 'z'), input.source_chunk.?.data_base64[0]);
             _ = self.calls.fetchAdd(1, .monotonic);
+            if (self.failure) |err| return err;
             return .{ .phase = .importing, .rows = 0, .receipt = @splat(0), .source_next_offset = 24576 };
         }
     };
@@ -13448,6 +13456,11 @@ test "httpx restore owner accepts bounded rewrite source chunks above legacy con
     const parsed = try std.json.parseFromSlice(contract.Response, alloc, response.body.?, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u64, 24576), parsed.value.source_next_offset);
+    fixture.failure = error.InvalidRelationalRow;
+    var invalid_row = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
+    defer invalid_row.deinit();
+    try std.testing.expectEqual(@as(u16, 422), invalid_row.status.code);
+    try std.testing.expectEqual(@as(u32, 2), fixture.calls.load(.monotonic));
 
     // Count the actual wire format at both independent maximum payload sizes,
     // without allocating or parsing a corpus-sized JSON tree. 0xff exercises

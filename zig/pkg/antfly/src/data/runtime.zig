@@ -10382,10 +10382,17 @@ pub const DataServer = struct {
             .public_schema_json_digest = public_digest,
             .catalog_digest = catalog_digest,
         };
-        var preflight_response = (if (leader_term == null)
-            try (try self.ensureKernelOwnerSource()).lookupInitialChildPrivate(scratch, group_id, table_name, private_bootstrap, .{ .relational_topology_json = "{\"mode\":\"initial_child_preflight\"}" })
-        else
-            try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"initial_child_preflight\"}" }, owner_consistency)) orelse return error.GenerationAdmissionPending;
+        // The child is intentionally absent from the public catalog. Even a
+        // hosted Raft leader must use the exact private compiled-owner route;
+        // ordinary group-local lookup cannot resolve an unpublished table.
+        // The read-index barrier above establishes the hosted read cut.
+        var preflight_response = (try (try self.ensureKernelOwnerSource()).lookupInitialChildPrivate(
+            scratch,
+            group_id,
+            table_name,
+            private_bootstrap,
+            .{ .relational_topology_json = "{\"mode\":\"initial_child_preflight\"}" },
+        )) orelse return error.GenerationAdmissionPending;
         defer preflight_response.deinit(scratch);
         const preflight = try std.json.parseFromSliceLeaky(struct {
             namespace: @import("../storage/db/doc_identity_namespace.zig").Namespace,
@@ -10453,10 +10460,15 @@ pub const DataServer = struct {
                 },
             }
         }
-        var status_response = (if (leader_term == null)
-            try (try self.ensureKernelOwnerSource()).lookupInitialChildPrivate(scratch, group_id, table_name, private_bootstrap, .{ .relational_topology_json = "{\"mode\":\"initial_child_publication\"}" })
-        else
-            try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"initial_child_publication\"}" }, owner_consistency)) orelse return error.GenerationAdmissionPending;
+        if (leader_term != null)
+            try self.waitDataReadSafeWithCancellation(group_id, "FK-initial-child-publication", 30_000, context.cancellation);
+        var status_response = (try (try self.ensureKernelOwnerSource()).lookupInitialChildPrivate(
+            scratch,
+            group_id,
+            table_name,
+            private_bootstrap,
+            .{ .relational_topology_json = "{\"mode\":\"initial_child_publication\"}" },
+        )) orelse return error.GenerationAdmissionPending;
         defer status_response.deinit(scratch);
         const status = (try std.json.parseFromSliceLeaky(?hidden.Record, scratch, status_response.json, .{ .allocate = .alloc_always })) orelse return error.GenerationAdmissionPending;
         if (!std.mem.eql(u8, &status.plan_id, &request.plan_id) or
@@ -17677,6 +17689,7 @@ pub const DataServer = struct {
         self: *DataServer,
         snapshot: *const antfly.metadata_api.AdminSnapshot,
         local_intents: []const antfly.raft.PlacementIntent,
+        private_initial_owners: []const @import("private_provisioning.zig").InitialOwner,
     ) !std.AutoHashMapUnmanaged(u64, []u8) {
         var names = std.AutoHashMapUnmanaged(u64, []u8).empty;
         errdefer {
@@ -17688,7 +17701,11 @@ pub const DataServer = struct {
             return error.DataRaftPlacementSetTooLarge;
         try names.ensureTotalCapacity(self.alloc, capacity);
         for (local_intents) |intent| {
-            const table_name = snapshotTableNameForGroup(snapshot, intent.record.group_id) orelse continue;
+            const table_name = snapshotTableNameForGroup(snapshot, intent.record.group_id) orelse blk: {
+                for (private_initial_owners) |owner| if (owner.range.group_id == intent.record.group_id)
+                    break :blk owner.table.name;
+                continue;
+            };
             const owned_name = try self.alloc.dupe(u8, table_name);
             const entry = names.getOrPutAssumeCapacity(intent.record.group_id);
             if (entry.found_existing) {
@@ -17877,7 +17894,56 @@ pub const DataServer = struct {
             return error.MetadataReconciliationRequiresAuthority;
         var next_inputs = try DataRaftPlacementInputs.clone(self.alloc, snapshot);
         defer next_inputs.deinit(self.alloc);
-        var next_group_table_names = try self.buildLocalDataRaftGroupTableNames(snapshot, next_cached_local_intents);
+        // A hidden initial child has explicit placement but no public range.
+        // Obtain its node-scoped immutable descriptor at this same metadata
+        // head, before the Raft host may admit or apply the new group. The
+        // private table never enters public routing or the shared catalog.
+        var private_initial_snapshot: ?std.json.Parsed(@import("../metadata/restore_staging.zig").ProvisioningSnapshot) = null;
+        defer if (private_initial_snapshot) |*value| value.deinit();
+        var private_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer private_arena.deinit();
+        var private_initial_owners: []const @import("private_provisioning.zig").InitialOwner = &.{};
+        const needs_private_identity = for (next_cached_local_intents) |intent| {
+            if (snapshotTableNameForGroup(snapshot, intent.record.group_id) == null) break true;
+        } else false;
+        if (needs_private_identity) {
+            const remote_metadata = self.remote_metadata orelse return error.MissingMetadataApi;
+            // AdminSnapshot.status.metadata_epoch is a lifecycle counter, not
+            // the provisioning fingerprint returned by MetadataHead. Capture
+            // both public placement authority and the private descriptors at
+            // one actual head, then prove the authority matches the snapshot
+            // from which this reconciliation plan was built.
+            const private_head = try remote_metadata.fetchHead();
+            var paired_public = try remote_metadata.fetchSnapshotForHead(private_head);
+            defer freeAdminSnapshotOwned(self.alloc, &paired_public);
+            if (!next_inputs.matches(&paired_public)) return error.MetadataSnapshotHeadMismatch;
+            private_initial_snapshot = remote_metadata.fetchProvisioningSnapshotForHead(private_head, registration.node_id) catch |err| switch (err) {
+                error.UnsupportedOperation => null,
+                else => return err,
+            };
+            if (private_initial_snapshot) |value| {
+                private_initial_owners = try @import("private_provisioning.zig").validateInitial(
+                    private_arena.allocator(),
+                    snapshot.tables,
+                    snapshot.ranges,
+                    value.value.catalog,
+                );
+            }
+            // A hidden initial-FK placement cannot enter Raft as an ordinary
+            // range merely because its private descriptor is absent or was
+            // canceled between the two reads. Split/restore destinations have
+            // their own admission protocols and carry no initial-FK generation.
+            for (next_cached_local_intents) |intent| {
+                if (intent.record.initial_fk_root_generation == 0 or
+                    snapshotTableNameForGroup(snapshot, intent.record.group_id) != null) continue;
+                const found = for (private_initial_owners) |owner| {
+                    if (owner.range.group_id == intent.record.group_id and
+                        owner.descriptor.child_table_id == owner.table.table_id) break true;
+                } else false;
+                if (!found) return error.InvalidGenerationPublication;
+            }
+        }
+        var next_group_table_names = try self.buildLocalDataRaftGroupTableNames(snapshot, next_cached_local_intents, private_initial_owners);
         defer {
             var it = next_group_table_names.valueIterator();
             while (it.next()) |name| self.alloc.free(name.*);
@@ -17888,6 +17954,17 @@ pub const DataServer = struct {
         // for that group: state-machine apply is deliberately unable to create
         // storage or consult metadata after an entry has committed.
         try self.provisionSplitDestinationsBeforeRaftAdmission(snapshot, next_cached_local_intents);
+        for (private_initial_owners) |owner| {
+            const assigned = for (next_cached_local_intents) |intent| {
+                if (intent.record.group_id == owner.range.group_id and intent.record.local_node_id == registration.node_id)
+                    break true;
+            } else false;
+            if (!assigned) return error.InvalidGenerationPublication;
+            var activity = self.liveRuntimeWriteSource().tryBeginGroupRefreshActivity(owner.table.name, owner.range.group_id) orelse
+                return error.TransitionDestinationProvisioningBusy;
+            defer activity.deinit();
+            try self.primePrivateInitialChildOwner(owner);
+        }
         try self.applyDataRaftStorageOwnershipChange(snapshot, next_cached_local_intents);
 
         var updates = std.ArrayListUnmanaged(antfly.raft.MetadataUpdate).empty;
@@ -18777,6 +18854,11 @@ pub const DataServer = struct {
     /// to the same compiled owner used by clustered provisioning.
     pub fn primeInitialChildOwnerDescriptor(self: *DataServer, owner: @import("private_provisioning.zig").InitialOwner) !void {
         return self.primePrivateInitialChildOwner(owner);
+    }
+
+    pub fn readHiddenInitialChildRecord(self: *DataServer, group_id: u64, table_id: u64) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+        if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+        return (try self.ensureKernelOwnerSource()).readHiddenInitialChildRecord(self.alloc, group_id, table_id);
     }
 
     /// Expose the same private, decision-checked control port to deterministic

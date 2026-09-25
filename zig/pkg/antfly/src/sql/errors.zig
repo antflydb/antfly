@@ -105,6 +105,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.CatalogGenerationChanged, error.PreparedGenerationChanged, error.IntegrityCatalogChanged => .{ .code = "40001", .message = "The table definition changed before the statement could complete.", .hint = "Prepare the statement again against the current schema.", .retryable = true },
         error.SqlWriteConflict, error.PreparedReadSetChanged, error.VersionConflict, error.IntentConflict => .{ .code = "40001", .message = "The mutation conflicted with a concurrent change and was not committed.", .hint = "Read the current rows before retrying the complete statement.", .retryable = true },
         error.SqlWriteCapacityUnavailable, error.SqlPlanCacheBusy, error.Backpressured, error.DenseRepairBackpressure => .{ .code = "53300", .message = "SQL execution capacity is temporarily exhausted.", .hint = "Retry after a bounded delay; reduce concurrent requests.", .retryable = true },
+        error.SqlStatementReadUnavailable => .{ .code = "53300", .message = "A consistent SQL statement read is temporarily unavailable.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
         error.RestoreValidationPending => .{ .code = "53300", .message = "The source owner is not ready to admit a schema rewrite.", .hint = "No rewrite job was admitted; wait for the table owner to become ready before retrying the DDL.", .retryable = true },
         error.HAReadOnlyStandby, error.HAPromotedStandbyRequiresPrimaryOpen, error.HAFencedPrimary => .{ .code = "25006", .message = "This server is not accepting writes in its current standby or fencing state.", .hint = "Send the mutation to an active writable primary.", .retryable = false },
         error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown => .{ .code = "40003", .message = "The mutation outcome is unknown; it may already have committed.", .hint = "Do not replay the statement. Use its transaction receipt to reconcile the outcome.", .retryable = false },
@@ -122,12 +123,14 @@ pub fn message(err: anyerror, buffer: []u8) []const u8 {
 }
 
 test "SQL diagnostics retain definite constraints conflicts and unknown outcomes" {
+    try std.testing.expectEqual(@as(u16, 503), describe(error.SqlStatementReadUnavailable).httpStatus());
     for ([_]struct { err: anyerror, code: []const u8, retryable: ?bool }{
         .{ .err = error.UniqueConstraintViolation, .code = "23505", .retryable = false },
         .{ .err = error.ForeignKeyParentMissing, .code = "23503", .retryable = false },
         .{ .err = error.RelationalCheckViolation, .code = "23514", .retryable = false },
         .{ .err = error.SqlNotNullViolation, .code = "23502", .retryable = false },
         .{ .err = error.PreparedReadSetChanged, .code = "40001", .retryable = true },
+        .{ .err = error.SqlStatementReadUnavailable, .code = "53300", .retryable = true },
         .{ .err = error.SqlMutationOutcomeUnknown, .code = "40003", .retryable = false },
         .{ .err = error.QueryCanceled, .code = "57014", .retryable = null },
         .{ .err = error.RowPolicyUnsupported, .code = "0A000", .retryable = false },

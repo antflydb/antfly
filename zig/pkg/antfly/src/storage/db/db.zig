@@ -39346,6 +39346,14 @@ pub const DB = struct {
         return null;
     }
 
+    /// A cold, read-only physical proof for canceled initial FK retirement.
+    /// This does not consult or synthesize a public catalog route.
+    pub fn readInitialChildPublicationRecord(self: *DB) !?@import("relational_initial_child_publication.zig").Record {
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return @import("relational_initial_child_publication.zig").load(&txn);
+    }
+
     fn encodeRestoreStagingHAPayload(self: *DB, req: types.BatchRequest) ![]u8 {
         const staging = @import("restore_staging.zig");
         if (req.restore_staging.? == .begin) {

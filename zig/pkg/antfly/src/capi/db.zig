@@ -4728,6 +4728,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.fkInitialCreateStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .fk_generation_table_locked => |input| {
+                    const value = handle.store.fkGenerationTableLockedJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .fk_initial_create_work => |input| {
                     const value = handle.store.fkInitialCreateWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -17657,6 +17661,17 @@ pub fn storageOwnerRelationalTransitionRead(owner_ptr: ?*anyopaque, request: *co
 }
 
 fn hiddenRestoreJson(alloc: std.mem.Allocator, db: *db_mod.DB, request: *const kernel_owner_abi.HiddenRestoreRequest, out_result: *kernel_owner_abi.OwnedBytes) !void {
+    if (request.operation == .read_initial_child) {
+        const record = (try db.readInitialChildPublicationRecord()) orelse return;
+        // A cold hidden owner is opened read-only without a public table
+        // descriptor. Its core identity is not the authority for this path;
+        // the durable AICH namespace is, and the caller checks the complete
+        // bootstrap and terminal receipt before any retirement.
+        if (record.namespace.table_id != request.table_id) return error.InitialChildPublicationChanged;
+        const encoded = try std.json.Stringify.valueAlloc(alloc, record, .{});
+        out_result.* = .{ .ptr = encoded.ptr, .len = @intCast(encoded.len) };
+        return;
+    }
     if (db.core.identity_namespace.table_id != request.table_id) return error.RestoreStagingScopeChanged;
     if (request.operation == .capture_public_snapshot) return captureOwnerSeedSnapshot(alloc, db, request);
     var bootstrap = (try db.readRestoreStagingBootstrap(alloc)) orelse {
@@ -17677,6 +17692,7 @@ fn hiddenRestoreJson(alloc: std.mem.Allocator, db: *db_mod.DB, request: *const k
             try captureOwnerSeedSnapshot(alloc, db, request);
         },
         .capture_public_snapshot => unreachable,
+        .read_initial_child => unreachable,
     }
 }
 
@@ -17704,7 +17720,7 @@ pub fn storageOwnerHiddenRestoreJson(owner_ptr: ?*anyopaque, request: *const ker
         hiddenRestoreJson(handle.alloc, &handle.db, request, out_result) catch |err| return storageOwnerStatusFromError(err);
         return .ok;
     }
-    if (request.operation != .read_bootstrap or request.path.len == 0) return .invalid_argument;
+    if ((request.operation != .read_bootstrap and request.operation != .read_initial_child) or request.path.len == 0) return .invalid_argument;
     const context = asStorageOwnerContext(request.context) orelse return .invalid_argument;
     const alloc = context.alloc;
     const runtime = context.backend_runtime.ptr();

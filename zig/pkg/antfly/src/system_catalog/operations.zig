@@ -445,6 +445,12 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.fkInitialCreateStatusJson(alloc, svc.metadata_group_id, child_table_id);
         },
+        .fk_generation_table_locked => |table_id| blk: {
+            if (!context.fk_generation_publication_authority) return error.Forbidden;
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.fkGenerationTableLockedJson(alloc, svc.metadata_group_id, table_id);
+        },
         .fk_initial_create_work => |after_child_table_id| blk: {
             if (!context.fk_generation_publication_authority) return error.Forbidden;
             try svc.ensureLinearizableReadWithContext(context);

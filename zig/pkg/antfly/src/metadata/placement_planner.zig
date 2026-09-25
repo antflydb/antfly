@@ -118,10 +118,35 @@ pub const PlacementPlanner = struct {
         provisioning_ranges: []const table_manager.RangeRecord,
         protected_group_ids: []const u64,
     ) ![]raft_reconciler.PlacementIntent {
+        return self.planAllIntentsWithPrivate(manager, candidate_node_ids, current_intents, candidate_domains, provisioning_ranges, protected_group_ids, &.{}, &.{});
+    }
+
+    /// Additional private owners share the normal placement capacity and
+    /// failure-domain planner, but never enter the public desired catalog.
+    pub fn planAllIntentsWithPrivate(
+        self: *const PlacementPlanner,
+        manager: *table_manager.TableManager,
+        candidate_node_ids: []const u64,
+        current_intents: []const raft_reconciler.PlacementIntent,
+        candidate_domains: []const CandidateDomain,
+        provisioning_ranges: []const table_manager.RangeRecord,
+        protected_group_ids: []const u64,
+        private_tables: []const table_manager.TableRecord,
+        private_ranges: []const table_manager.RangeRecord,
+    ) ![]raft_reconciler.PlacementIntent {
         if (candidate_node_ids.len == 0) return error.MissingCandidateNodes;
 
-        const tables = try manager.listTables(self.alloc);
-        defer manager.freeTables(self.alloc, tables);
+        const owned_tables = try manager.listTables(self.alloc);
+        var tables = std.ArrayListUnmanaged(table_manager.TableRecord).fromOwnedSlice(owned_tables);
+        defer {
+            for (tables.items) |table| table_manager.freeTable(self.alloc, table);
+            tables.deinit(self.alloc);
+        }
+        for (private_tables) |table| {
+            if (findTable(tables.items, table.table_id) != null) continue;
+            try tables.ensureUnusedCapacity(self.alloc, 1);
+            tables.appendAssumeCapacity(try table_manager.cloneTable(self.alloc, table));
+        }
         const owned_ranges = try manager.listRanges(self.alloc);
         var ranges = std.ArrayListUnmanaged(table_manager.RangeRecord).fromOwnedSlice(owned_ranges);
         defer {
@@ -130,7 +155,13 @@ pub const PlacementPlanner = struct {
         }
         for (provisioning_ranges) |range| {
             if (containsRangeGroup(ranges.items, range.group_id)) continue;
-            try ranges.append(self.alloc, try table_manager.cloneRange(self.alloc, range));
+            try ranges.ensureUnusedCapacity(self.alloc, 1);
+            ranges.appendAssumeCapacity(try table_manager.cloneRange(self.alloc, range));
+        }
+        for (private_ranges) |range| {
+            if (containsRangeGroup(ranges.items, range.group_id)) continue;
+            try ranges.ensureUnusedCapacity(self.alloc, 1);
+            ranges.appendAssumeCapacity(try table_manager.cloneRange(self.alloc, range));
         }
         std.mem.sort(table_manager.RangeRecord, ranges.items, current_intents, struct {
             fn lessThan(current: []const raft_reconciler.PlacementIntent, a: table_manager.RangeRecord, b: table_manager.RangeRecord) bool {
@@ -157,7 +188,7 @@ pub const PlacementPlanner = struct {
         const force_reallocate = forcedReallocationRequested(candidate_domains);
 
         for (ranges.items) |range| {
-            const table = findTable(tables, range.table_id) orelse return error.UnknownTable;
+            const table = findTable(tables.items, range.table_id) orelse return error.UnknownTable;
             const replica_count = @min(@as(usize, table.desired_replica_count), countEligibleCandidates(candidate_node_ids, candidate_domains, table.placement_role));
             if (replica_count == 0) continue;
             const has_current_group = findCurrentIntent(current_intents, range.group_id, null) != null;

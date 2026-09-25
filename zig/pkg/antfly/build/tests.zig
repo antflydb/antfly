@@ -187,11 +187,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     }
     const initial_fk_admission_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[metadata_unit_baseline_mods.len - 1],
-        .filters = &.{ "initial self FK reserves one hidden child owner", "FK generation publication initial create reserves hidden identity" },
+        .filters = &.{ "initial self FK reserves one hidden child owner", "FK generation publication initial create reserves hidden identity", "FK parent lock permits only exact read-schema retirement", "initial partial support begin survives restart", "initial MATCH PARTIAL publication pins parent witness support", "initial FK root generation" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-metadata-initial-fk-admission-test", "Run initial-FK preflight and stale-begin metadata fault regressions")
-        .dependOn(&addFilteredTestRunArtifact(b, initial_fk_admission_tests).step);
+    const initial_fk_admission_step = b.step("antfly-metadata-initial-fk-admission-test", "Run initial-FK preflight and stale-begin metadata fault regressions");
+    initial_fk_admission_step.dependOn(&addFilteredTestRunArtifact(b, initial_fk_admission_tests).step);
+    const initial_fk_placement_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[0],
+        .filters = &.{"hidden initial FK owner receives placement"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    initial_fk_admission_step.dependOn(&addFilteredTestRunArtifact(b, initial_fk_placement_tests).step);
 
     const store_observer_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[2],
@@ -4371,7 +4377,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     standalone_initial_fk_test_mod.addImport("usermgr_storage", usermgr_storage_initial_fk_test_mod);
     const standalone_initial_fk_tests = b.addTest(.{
         .root_module = standalone_initial_fk_test_mod,
-        .filters = &.{"standalone initial self FK private owners publish two ranges after restart"},
+        .filters = &.{
+            "standalone initial self FK private owners publish two ranges after restart",
+            "standalone canceled initial self FK retires exact private owners after restart",
+        },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
     });

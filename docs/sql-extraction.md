@@ -632,6 +632,45 @@ guarded until their owner or atomic support-index paths are proven. Hidden-owner
 standby replay has a Raft-bound batch envelope, but seed/promotion fault
 coverage remains a release gate.
 
+Initial MATCH PARTIAL support-index installation now reserves the parent
+descriptor, hidden child identity, locks, and durable work in one metadata
+transaction. The hosted path now seals parent support, places a private child
+group, and admits a local Raft leader from a paired public/private metadata
+cut. The mounted lifecycle still stalls in `provisioning_child` without a child
+receipt; the private owner/control apply boundary and rollback fault matrix
+remain unproven, so initial MATCH PARTIAL CREATE stays publicly guarded.
+Standalone cancellation has an exact hidden-owner retirement
+path and a checksummed local intent. Its self-FK two-range crash/restart and
+terminal cold-root tests pass, but this does not retire offline hosted replicas:
+distributed cancellation still needs metadata-owned per-store/replica work,
+placement fencing, and durable ACKs before that route is released.
+
+Hosted cancellation must retain a bounded historical set of every hidden child
+replica actually admitted by placement, keyed by group, store incarnation, and
+replica incarnation; current placement alone is insufficient after removal or
+node loss. The terminal canceled metadata transaction should publish an indexed
+group-to-plan/child/range proof and per-replica retirement work, never for a
+published child. A returning store pages only its work, verifies its cold AICH
+bootstrap and canceled receipt against that immutable proof, fsyncs a local
+retirement intent, drains/deletes the exact root and local replica catalog, then
+submits an idempotent incarnation-fenced ACK. Metadata may compact the work
+only after every recorded replica ACKs, retaining a stale-rejoin fence. Required
+fault tests include an offline store, placement removal before cancellation,
+crashes before the cancel CAS and between unlink and ACK, wrong bootstrap or
+reused group ID, store-incarnation replacement, and published-child exclusion.
+The metadata placement CAS now assigns a durable initial-FK root generation,
+preserves it across same-owner refresh and publication, and rotates it for a
+different node, store, or replica; the local replica catalog persists that
+generation before owner publication. This is admission identity groundwork,
+not a physical-disk identity or a deletion authorization. If an offline disk
+is replaced under the same node/store/replica while its placement remains,
+metadata could otherwise reuse the generation. Hosted GC therefore still
+requires a persistent store-root UUID proven at registration and bound to
+placements, owner receipts, work, and ACKs (or an enforced removal/re-admission
+CAS), plus an explicit bootstrap-source protocol for replacement roots. Until
+that proof and the offline fault matrix pass, hosted cancellation remains
+guarded and no generation-only ACK may compact retirement work.
+
 Acceptance needs crash/lost-ack tests at each fence, publication and activation
 boundary, cancellation on both sides of publication, parent mutations and new
 child inserts during cutover, stale prepared participants, nullable/MATCH PARTIAL

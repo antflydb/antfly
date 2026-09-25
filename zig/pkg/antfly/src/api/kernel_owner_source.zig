@@ -1365,6 +1365,37 @@ pub const ProvisionedKernelOwnerSource = struct {
         return try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, output.slice(), .{ .allocate = .alloc_always });
     }
 
+    pub fn readHiddenInitialChildRecord(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_id: u64,
+    ) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+        const generation = self.visibleRootGeneration(group_id);
+        var resident: ?Lease = blk: {
+            lock(&self.mutex);
+            defer self.mutex.unlock();
+            for (self.entries.items) |entry| {
+                if (entry.group_id != group_id or entry.generation != generation or entry.retired or entry.closing) continue;
+                if (!tryReserveEntryLeaseLocked(entry, .shared)) return error.StorageReadTemporarilyUnavailable;
+                break :blk .{ .source = self, .entry = entry };
+            }
+            break :blk null;
+        };
+        defer if (resident) |*lease| lease.deinit();
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        defer alloc.free(path);
+        var output: abi.OwnedBytes = .{};
+        try kernel_error_identity.statusToError(abi.antfly_storage_owner_hidden_restore_json(if (resident) |*lease| lease.owner().handle else null, &.{ .operation = .read_initial_child, .context = self.context.handle, .path = .fromSlice(path), .table_id = table_id }, &output));
+        defer abi.antfly_storage_owner_buffer_destroy(&output);
+        if (output.len == 0) return null;
+        if (generation != self.visibleRootGeneration(group_id)) return error.InitialChildPublicationChanged;
+        var parsed = try std.json.parseFromSlice(@import("../storage/db/relational_initial_child_publication.zig").Record, alloc, output.slice(), .{ .ignore_unknown_fields = false });
+        defer parsed.deinit();
+        try parsed.value.validate();
+        return parsed.value;
+    }
+
     pub fn captureHASeedHiddenReplicaSnapshot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, scope: [32]u8, snapshot_token: []const u8, destination_root: []const u8) !void {
         var descriptor = (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) orelse return error.RestoreStagingScopeChanged;
         defer descriptor.deinit(alloc);
@@ -2862,6 +2893,38 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer self.alloc.free(path);
         var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor);
         defer lease.deinit();
+    }
+
+    /// Retire only the exact private owner named by a terminal metadata
+    /// cancellation. A public owner (or a different hidden plan) is never
+    /// evicted by a delayed supervisor round. Active leases drain normally;
+    /// callers retry until this returns true.
+    pub fn retireCanceledInitialChildOwner(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        expected: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap,
+    ) !bool {
+        try expected.validate();
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.initial_child_bootstrap_json.len == 0 or
+                entry.identity.table_id != expected.namespace.table_id or
+                entry.identity.shard_id != expected.namespace.shard_id or
+                entry.identity.range_id != expected.namespace.range_id)
+                return error.InitialChildPublicationChanged;
+            var stored = std.json.parseFromSlice(@TypeOf(expected), self.alloc, entry.initial_child_bootstrap_json, .{ .ignore_unknown_fields = false }) catch return error.InvalidInitialChildPublication;
+            defer stored.deinit();
+            if (!stored.value.eql(expected)) return error.InitialChildPublicationChanged;
+            entry.retired = true;
+        }
+        self.drainRetiredLocked(group_id, table_name);
+        for (self.entries.items) |entry| {
+            if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name)) return false;
+        }
+        return true;
     }
 
     /// A not-yet-published child has no catalog route. Only the exact hidden
