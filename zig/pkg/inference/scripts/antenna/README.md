@@ -40,3 +40,38 @@ python antenna_datasets.py --pin       # re-pin after deliberately changing a so
 ```
 
 The module needs only the standard library and `pyarrow` (for Parquet).
+
+## Student and teacher targets
+
+Both scripts run on the pinned GLiNER2.5 oracle
+([`../gliner25/oracle.py`](../gliner25/oracle.py)), in a uv venv made from
+`../gliner25/requirements.txt` plus `pyarrow`, with the upstream checkout at
+the pinned commit.
+
+- `init_student.py` builds the starting checkpoint: a boundary extractor on a
+  pinned pretrained ModernBERT (`answerdotai/ModernBERT-base` by default) with
+  freshly initialized published heads. The native training source loads it
+  unchanged, and its `processor.json` pins upstream's token ids for that
+  tokenizer (`ANTFLY_GLINER25_MODERNBERT_STUDENT=<dir>` runs the check).
+- `teacher_targets.py` writes boundary training rows from the train splits of
+  Banking77 and AG News (classification) and CrossNER ai/literature/music and
+  MIT Restaurant (entities). Classification rows carry per-label
+  `probabilities`, `w * gold + (1 - w) * sigmoid(Decide logit)`, over a
+  sampled label subset; entity rows carry gold spans, or an extraction
+  teacher's spans with `--teacher-entities`. Rows are deduplicated by text and
+  split into train and validation.
+
+```sh
+python init_student.py --upstream <GLiNER2> --output <student>
+ANTFLY_ANTENNA_DATA=<cache> python teacher_targets.py --upstream <GLiNER2> \
+  --classifier <GLiNER2.5-Decide dir> --output <data>
+antfly-inference finetune train gliner25 <job.json>
+```
+
+A ModernBERT-base job on resident Metal needs larger budgets than the job
+defaults, which are sized for the small DeBERTa checkpoint: for example
+`"memory": {"host_bytes": 6 GiB, "backend_bytes": 14 GiB, "combined_bytes":
+22 GiB, "optimizer_state_bytes": 8 GiB, "optimizer_transaction_bytes": 8 GiB}`
+and `"training_limits": {"differentiation": {"max_tape_bytes": 12 GiB}}`
+(values in bytes). The exported `model/` directory loads with upstream
+`AutoExtractor.from_pretrained`, so the baseline harness evaluates it.
