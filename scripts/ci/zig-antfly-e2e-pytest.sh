@@ -27,6 +27,15 @@ fi
 workers="${ANTFLY_E2E_WORKERS:-$default_workers}"
 process_slots="${ANTFLY_E2E_PROCESS_SLOTS:-2}"
 
+# Approved PR CI runs the workflow from main while checking out the PR code.
+# Its legacy one-slot setting meant one cluster workload per runner, but a
+# mixed stateful/serverless test requires two actual processes on one worker.
+# Preserve that isolation until main picks up the two-slot workflow setting.
+if [[ "${GITHUB_ACTIONS:-}" == "true" && "${ANTFLY_E2E_SUITE:-}" == antfly* && -n "${ANTFLY_E2E_SHARD:-}" && "${ANTFLY_E2E_PROCESS_SLOTS:-}" == "1" && -z "${ANTFLY_E2E_PROCESS_WORKERS+x}" ]]; then
+  process_slots=2
+  export ANTFLY_E2E_PROCESS_WORKERS=1
+fi
+
 if [[ ! "$workers" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "ANTFLY_E2E_WORKERS must be a non-negative integer; got: $workers" >&2
   exit 2
