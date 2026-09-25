@@ -345,11 +345,16 @@ replica progress'`. Evidence: `/tmp/workload-invalid-participant-data1.log`.
 | Distributed search through `table_reads.queryProvisionedAcrossGroupsParallel` and its hosted variant | Per-shard search-result arenas share a synchronized wrapper over the caller allocator. The final merged result uses the caller allocator. | Every wave joins before cancellation/error inspection, and cancellation is checked again before result publication. The focused read-fanout gate passed 4/4, including search with a 1 MiB budget against two 600 KiB worker allocations and a canceled first wave, with no leaks. |
 | Distributed preflight through `table_reads.preflightProvisionedGroupsParallel` and its hosted variant | Per-shard preflight-summary arenas share a synchronized wrapper over the caller allocator; the merged summary uses the caller allocator. | Existing before/after-wave cancellation checks and join order remain intact. The focused read-fanout gate passed 4/4, including the existing canceled-wave test and a new 1 MiB quota test against two 600 KiB worker allocations, with no leaks. |
 
-These are scoped ownership proofs for the named paths. The new search and
-preflight quota/cancellation regressions use provisioned-local fixtures; hosted
-routes share the same fanout backing and wave logic but do not yet have a
-separate remote-peer saturation test. Other query operators, background helpers,
-and real mixed-runtime saturation remain item-7 work.
+These are scoped ownership proofs for the named paths. The search and preflight
+quota/cancellation regressions use provisioned-local fixtures. A hosted text-stat
+transport fixture now pins remote routes, exercises the internal request
+encoder, catalog fence and peer acknowledgement, and checks a 1 MiB request
+budget against two retained 600 KiB transport allocations: one peer response
+completes, the second fails, and no partial result is returned. With 16 MiB both
+responses merge; canceling the first wave sends no later group request. Its
+focused gate passed 1/1 with no leaks. This is an in-process `RequestExecutor`
+fixture, not a socket or multi-process saturation test. Other query operators,
+background helpers, and real mixed-runtime saturation remain item-7 work.
 
 ## Current integration evidence and boundaries
 

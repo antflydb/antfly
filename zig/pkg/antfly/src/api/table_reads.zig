@@ -25404,6 +25404,169 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 2), fixture.calls.load(.acquire));
         }
 
+        test "hosted text stats transport fanout shares request quota and stops canceled waves" {
+            const Catalog = struct {
+                fn fence(_: *anyopaque, group_id: u64) !?metadata_api.CatalogRouteFence {
+                    return .{
+                        .metadata_group_id = 1,
+                        .catalog_revision = 2,
+                        .table_id = 7,
+                        .topology_epoch = 3,
+                        .route = .{
+                            .group_id = group_id,
+                            .range_id = group_id,
+                            .identity_namespace = .{ .table_id = 7, .shard_id = group_id, .range_id = group_id },
+                        },
+                    };
+                }
+
+                fn iface() table_catalog.CatalogSource {
+                    return .{ .ptr = undefined, .vtable = &.{
+                        .admin_snapshot = undefined,
+                        .free_admin_snapshot = undefined,
+                        .route_fence = fence,
+                    } };
+                }
+            };
+            const Router = struct {
+                fn localNodeId(_: *anyopaque) u64 {
+                    return 1;
+                }
+                fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+                    return .absent;
+                }
+                fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, _: u64) !?[]u8 {
+                    return try alloc.dupe(u8, "http://peer.test");
+                }
+                fn routes(_: *anyopaque, alloc: std.mem.Allocator, group_ids: []const u64, _: table_router.RoutePolicy, _: table_router.RouteBudget) !?[]table_router.GroupRoute {
+                    const result = try alloc.alloc(table_router.GroupRoute, group_ids.len);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (result[0..initialized]) |*route| route.deinit(alloc);
+                        alloc.free(result);
+                    }
+                    for (result) |*route| {
+                        route.* = .{ .remote = .{ .node_id = 2, .base_uri = try alloc.dupe(u8, "http://peer.test") } };
+                        initialized += 1;
+                    }
+                    return result;
+                }
+                fn iface() table_router.HostedGroupRouter {
+                    return .{ .ptr = undefined, .vtable = &.{
+                        .local_node_id = localNodeId,
+                        .local_status = localStatus,
+                        .node_base_uri = nodeBaseUri,
+                        .resolve_group_routes = routes,
+                    } };
+                }
+            };
+            const Executor = struct {
+                calls: std.atomic.Value(usize) = .init(0),
+                completed: std.atomic.Value(usize) = .init(0),
+                later_calls: std.atomic.Value(usize) = .init(0),
+                cancelled: *std.atomic.Value(bool),
+                retained_transport_bytes: usize = 0,
+                cancel_on_first: bool = false,
+
+                fn iface(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    _ = self.calls.fetchAdd(1, .acq_rel);
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(std.mem.startsWith(u8, req.uri, "http://peer.test/internal/v1/groups/"));
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, "/tables/docs/text-stats"));
+                    if (std.mem.indexOf(u8, req.uri, "/groups/3/") != null or
+                        std.mem.indexOf(u8, req.uri, "/groups/4/") != null or
+                        std.mem.indexOf(u8, req.uri, "/groups/5/") != null)
+                    {
+                        _ = self.later_calls.fetchAdd(1, .acq_rel);
+                    }
+                    try std.testing.expect(req.header(metadata_api.catalog_route_fence_header) != null);
+                    if (self.cancel_on_first and std.mem.indexOf(u8, req.uri, "/groups/1/") != null)
+                        self.cancelled.store(true, .release);
+                    if (self.retained_transport_bytes > 0) {
+                        // The transport callback receives the worker arena. This
+                        // scratch remains live alongside its decoded response.
+                        const scratch = try alloc.alloc(u8, self.retained_transport_bytes);
+                        @memset(scratch, 'x');
+                    }
+
+                    const headers = try alloc.alloc(http_common.Header, 1);
+                    errdefer alloc.free(headers);
+                    headers[0] = .{
+                        .name = try alloc.dupe(u8, metadata_api.catalog_route_fence_ack_header),
+                        .value = try alloc.dupe(u8, metadata_api.catalog_route_fence_ack_value),
+                    };
+                    const body = try alloc.dupe(u8, "{\"fields\":[]}");
+                    _ = self.completed.fetchAdd(1, .acq_rel);
+                    return .{ .status = 200, .headers = headers, .body = body };
+                }
+            };
+
+            var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(2) });
+            defer threaded.deinit();
+            var cancelled = std.atomic.Value(bool).init(false);
+            var executor: Executor = .{ .cancelled = &cancelled, .retained_transport_bytes = 600 * 1024 };
+            var hosted = HostedProvisionedTableReadSource.init("unused", Catalog.iface(), undefined, Router.iface(), executor.iface());
+            const storage = try std.testing.allocator.alloc(u8, 1024 * 1024);
+            defer std.testing.allocator.free(storage);
+            var quota = std.heap.FixedBufferAllocator.init(storage);
+            try std.testing.expectError(error.OutOfMemory, collectHostedSearchRequestTextStatsParallel(
+                &hosted,
+                quota.allocator(),
+                threaded.io(),
+                2,
+                &.{ 1, 2 },
+                "docs",
+                "{}",
+                .{},
+                .stale,
+            ));
+            try std.testing.expectEqual(@as(usize, 2), executor.calls.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), executor.completed.load(.acquire));
+
+            executor.calls.store(0, .release);
+            executor.completed.store(0, .release);
+            const larger_storage = try std.testing.allocator.alloc(u8, 16 * 1024 * 1024);
+            defer std.testing.allocator.free(larger_storage);
+            var larger_quota = std.heap.FixedBufferAllocator.init(larger_storage);
+            const merged = try collectHostedSearchRequestTextStatsParallel(
+                &hosted,
+                larger_quota.allocator(),
+                threaded.io(),
+                2,
+                &.{ 1, 2 },
+                "docs",
+                "{}",
+                .{},
+                .stale,
+            );
+            defer distributed_stats_mod.deinitTextFieldStats(larger_quota.allocator(), merged);
+            try std.testing.expectEqual(@as(usize, 0), merged.len);
+            try std.testing.expectEqual(@as(usize, 2), executor.calls.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 2), executor.completed.load(.acquire));
+
+            executor.calls.store(0, .release);
+            executor.retained_transport_bytes = 0;
+            executor.cancel_on_first = true;
+            const req: db_mod.types.SearchRequest = .{ .cancellation = db_mod.types.CancellationToken.fromAtomic(&cancelled) };
+            try std.testing.expectError(error.Cancelled, collectHostedSearchRequestTextStatsParallel(
+                &hosted,
+                std.testing.allocator,
+                threaded.io(),
+                2,
+                &.{ 1, 2, 3, 4, 5 },
+                "docs",
+                "{}",
+                req,
+                .stale,
+            ));
+            try std.testing.expect(executor.calls.load(.acquire) <= 2);
+            try std.testing.expectEqual(@as(usize, 0), executor.later_calls.load(.acquire));
+        }
+
         test "merge distributed text stats sums shard corpus stats by field and term" {
             const alloc = std.testing.allocator;
 
