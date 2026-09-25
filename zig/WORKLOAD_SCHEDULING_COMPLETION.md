@@ -20,6 +20,14 @@ this requested implementation/correctness scope.
 
 ## Current work
 
+- Trusted local restart now reconstructs one slot-0 applied BEGIN owner before
+  WAL replay from its published guard, measured manifest runs, and retained
+  capacity. It requires exact committed v2 BEGIN proof before readiness and
+  then applies a real owner-backed decision. The DB test rejects missing
+  manifest, orphan document guard, output-ID alias, and wrong v2 digest;
+  the durable gate passed 51/51 with no leaks. Accepted transition sidecars,
+  already-applied decision/ACK restart, multiple owners, and larger run
+  profiles remain fenced; production activation is still disabled.
 - A fresh ReleaseFast binary at `08807fe878` passed the six-process ordinary
   DATA quorum driver with zero cleanup errors. The driver checked all-replica
   applied progress, successor election after DATA leader loss, exact reads,
