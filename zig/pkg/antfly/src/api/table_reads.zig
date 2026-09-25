@@ -7432,10 +7432,9 @@ const TextStatsFanoutSlot = struct {
     }
 };
 
-// Parallel text-stat workers retain response and decoded field arrays until
-// merge. The caller allocator may be an unsynchronized request arena, so all
-// worker arenas share one serialized parent to keep that scratch admitted.
-const TextStatsFanoutBacking = struct {
+// Parallel read workers retain responses until merge. The request allocator
+// may be unsynchronized, so their arenas share one serialized parent.
+const ReadFanoutBacking = struct {
     parent: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
 
@@ -7481,9 +7480,9 @@ const SearchFanoutSlot = struct {
     result: ?db_mod.types.SearchResult = null,
     err: ?anyerror = null,
 
-    fn init() SearchFanoutSlot {
+    fn init(backing: std.mem.Allocator) SearchFanoutSlot {
         return .{
-            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .arena = std.heap.ArenaAllocator.init(backing),
         };
     }
 
@@ -7498,9 +7497,9 @@ const PreflightFanoutSlot = struct {
     summary: ?db_mod.RuntimePreflightSummary = null,
     err: ?anyerror = null,
 
-    fn init() PreflightFanoutSlot {
+    fn init(backing: std.mem.Allocator) PreflightFanoutSlot {
         return .{
-            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .arena = std.heap.ArenaAllocator.init(backing),
         };
     }
 
@@ -7522,10 +7521,10 @@ fn deinitTextStatsFanoutSlots(alloc: std.mem.Allocator, slots: []TextStatsFanout
     alloc.free(slots);
 }
 
-fn initSearchFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]SearchFanoutSlot {
+fn initSearchFanoutSlots(alloc: std.mem.Allocator, backing: std.mem.Allocator, count: usize) ![]SearchFanoutSlot {
     const slots = try alloc.alloc(SearchFanoutSlot, count);
     errdefer alloc.free(slots);
-    for (slots) |*slot| slot.* = .init();
+    for (slots) |*slot| slot.* = .init(backing);
     return slots;
 }
 
@@ -7534,10 +7533,10 @@ fn deinitSearchFanoutSlots(alloc: std.mem.Allocator, slots: []SearchFanoutSlot) 
     alloc.free(slots);
 }
 
-fn initPreflightFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]PreflightFanoutSlot {
+fn initPreflightFanoutSlots(alloc: std.mem.Allocator, backing: std.mem.Allocator, count: usize) ![]PreflightFanoutSlot {
     const slots = try alloc.alloc(PreflightFanoutSlot, count);
     errdefer alloc.free(slots);
-    for (slots) |*slot| slot.* = .init();
+    for (slots) |*slot| slot.* = .init(backing);
     return slots;
 }
 
@@ -7554,9 +7553,10 @@ fn collectProvisionedSearchRequestTextStatsParallel(
     group_ids: []const u64,
     table_name: []const u8,
     body: []const u8,
+    req: db_mod.types.SearchRequest,
 ) ![]const distributed_stats_mod.TextFieldStats {
     const start_ns = platform_time.monotonicNs();
-    var backing = TextStatsFanoutBacking{ .parent = alloc };
+    var backing = ReadFanoutBacking{ .parent = alloc };
     const slots = try initTextStatsFanoutSlots(alloc, backing.allocator(), group_ids.len);
     defer deinitTextStatsFanoutSlots(alloc, slots);
 
@@ -7591,12 +7591,14 @@ fn collectProvisionedSearchRequestTextStatsParallel(
 
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
+        try checkQueryDeadline(req);
         const end = @min(start + width, group_ids.len);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
             group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, body });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try checkQueryDeadline(req);
     }
 
     for (slots) |slot| {
@@ -7607,6 +7609,8 @@ fn collectProvisionedSearchRequestTextStatsParallel(
     defer alloc.free(shard_stats);
     for (slots, 0..) |slot, i| shard_stats[i] = slot.fields;
     const merged = try mergeDistributedTextStats(alloc, shard_stats);
+    errdefer distributed_stats_mod.deinitTextFieldStats(alloc, merged);
+    try checkQueryDeadline(req);
     recordParallelFanout(.text_stats, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
 }
@@ -7641,7 +7645,7 @@ fn collectHostedSearchRequestTextStatsParallel(
     const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency, .fromRequest(req));
     defer deinitHostedShardRoutes(alloc, routes);
 
-    var backing = TextStatsFanoutBacking{ .parent = alloc };
+    var backing = ReadFanoutBacking{ .parent = alloc };
     const slots = try initTextStatsFanoutSlots(alloc, backing.allocator(), group_ids.len);
     defer deinitTextStatsFanoutSlots(alloc, slots);
 
@@ -7681,12 +7685,14 @@ fn collectHostedSearchRequestTextStatsParallel(
 
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
+        try checkQueryDeadline(req);
         const end = @min(start + width, group_ids.len);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
             group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, body, req });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try checkQueryDeadline(req);
     }
 
     for (slots) |slot| {
@@ -7697,6 +7703,8 @@ fn collectHostedSearchRequestTextStatsParallel(
     defer alloc.free(shard_stats);
     for (slots, 0..) |slot, i| shard_stats[i] = slot.fields;
     const merged = try mergeDistributedTextStats(alloc, shard_stats);
+    errdefer distributed_stats_mod.deinitTextFieldStats(alloc, merged);
+    try checkQueryDeadline(req);
     recordParallelFanout(.text_stats, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
 }
@@ -7716,7 +7724,8 @@ fn queryProvisionedAcrossGroupsParallel(
 ) !db_mod.types.SearchResult {
     const start_ns = platform_time.monotonicNs();
     std.debug.assert(req.graph_queries.len == 0);
-    const slots = try initSearchFanoutSlots(alloc, group_ids.len);
+    var backing = ReadFanoutBacking{ .parent = alloc };
+    const slots = try initSearchFanoutSlots(alloc, backing.allocator(), group_ids.len);
     defer deinitSearchFanoutSlots(alloc, slots);
 
     const Fiber = struct {
@@ -7754,13 +7763,15 @@ fn queryProvisionedAcrossGroupsParallel(
 
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
+        try checkQueryDeadline(req);
         const end = @min(start + width, group_ids.len);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
             const required_generation = if (required_identity_generations) |generations| generations[i] else null;
             group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, shard_req, consistency, required_generation });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try checkQueryDeadline(req);
         for (slots[start..end], start..end) |slot, i| {
             if (slot.err) |err| return err;
             const result = slot.result orelse return error.InvalidRemoteResponse;
@@ -7780,6 +7791,7 @@ fn queryProvisionedAcrossGroupsParallel(
     var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, coordinator_paging.offset, coordinator_paging.limit);
     errdefer merged.deinit();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
+    try checkQueryDeadline(req);
     recordParallelFanout(.query, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
 }
@@ -7802,7 +7814,8 @@ fn queryHostedAcrossGroupsParallel(
     const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency, .fromRequest(req));
     defer deinitHostedShardRoutes(alloc, routes);
 
-    const slots = try initSearchFanoutSlots(alloc, group_ids.len);
+    var backing = ReadFanoutBacking{ .parent = alloc };
+    const slots = try initSearchFanoutSlots(alloc, backing.allocator(), group_ids.len);
     defer deinitSearchFanoutSlots(alloc, slots);
 
     const Fiber = struct {
@@ -7845,13 +7858,15 @@ fn queryHostedAcrossGroupsParallel(
 
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
+        try checkQueryDeadline(req);
         const end = @min(start + width, group_ids.len);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
             const required_generation = if (required_identity_generations) |generations| generations[i] else null;
             group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, shard_req, consistency, required_generation });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try checkQueryDeadline(req);
         for (slots[start..end], start..end) |slot, i| {
             if (slot.err) |err| return err;
             const result = slot.result orelse return error.InvalidRemoteResponse;
@@ -7871,6 +7886,7 @@ fn queryHostedAcrossGroupsParallel(
     var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, coordinator_paging.offset, coordinator_paging.limit);
     errdefer merged.deinit();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
+    try checkQueryDeadline(req);
     recordParallelFanout(.query, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
 }
@@ -8243,7 +8259,8 @@ fn preflightProvisionedGroupsParallel(
     max_work: u32,
 ) !?db_mod.RuntimePreflightSummary {
     const start_ns = platform_time.monotonicNs();
-    const slots = try initPreflightFanoutSlots(alloc, group_ids.len);
+    var backing = ReadFanoutBacking{ .parent = alloc };
+    const slots = try initPreflightFanoutSlots(alloc, backing.allocator(), group_ids.len);
     defer deinitPreflightFanoutSlots(alloc, slots);
 
     const Fiber = struct {
@@ -8314,7 +8331,8 @@ fn preflightHostedGroupsParallel(
     const routes = (try table_router.resolveGroupRoutes(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids, routePolicyForConsistency(consistency))) orelse return null;
     defer deinitHostedShardRoutes(alloc, routes);
 
-    const slots = try initPreflightFanoutSlots(alloc, group_ids.len);
+    var backing = ReadFanoutBacking{ .parent = alloc };
+    const slots = try initPreflightFanoutSlots(alloc, backing.allocator(), group_ids.len);
     defer deinitPreflightFanoutSlots(alloc, slots);
 
     const Fiber = struct {
@@ -14232,7 +14250,7 @@ fn collectProvisionedSearchRequestTextStats(
     const plan = planFanout(.text_stats, self.io_impl, group_ids.len);
     recordFanoutPlan(.text_stats, plan);
     if (plan.parallel) {
-        return try collectProvisionedSearchRequestTextStatsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, table_name, body);
+        return try collectProvisionedSearchRequestTextStatsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, table_name, body, req);
     }
     if (plan.reason == .no_io) recordParallelFanoutFallback(.text_stats);
 
@@ -21033,6 +21051,119 @@ fn consumerTests() type {
             try std.testing.expectEqual(group_ids.len, fake.calls.load(.acquire));
         }
 
+        test "parallel search charges retained response scratch and stops after canceled wave" {
+            const Fake = struct {
+                calls: std.atomic.Value(usize) = .init(0),
+                cancelled: *std.atomic.Value(bool),
+                scratch_bytes: usize = 0,
+                cancel_on_group: ?u64 = null,
+
+                fn search(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    _ = self.calls.fetchAdd(1, .acq_rel);
+                    if (self.scratch_bytes > 0) {
+                        const scratch = try alloc.alloc(u8, self.scratch_bytes);
+                        @memset(scratch, 'x');
+                    }
+                    if (self.cancel_on_group) |target| {
+                        if (target == group_id) self.cancelled.store(true, .release);
+                    }
+                    return .{ .alloc = alloc, .hits = try alloc.alloc(db_mod.types.SearchHit, 0), .total_hits = 0 };
+                }
+            };
+
+            var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(2) });
+            defer threaded.deinit();
+            var cancelled = std.atomic.Value(bool).init(false);
+            var fake: Fake = .{ .cancelled = &cancelled, .scratch_bytes = 600 * 1024 };
+            var source = ProvisionedTableReadSource.init("unused", undefined, undefined);
+            source.local_read_source = .{ .ptr = &fake, .vtable = &.{
+                .lookup = undefined,
+                .scan = undefined,
+                .query = undefined,
+                .search_result_group_local = Fake.search,
+            } };
+            const group_ids = [_]u64{ 1, 2, 3, 4, 5 };
+            var generations = [_]?u64{null} ** group_ids.len;
+            const plain_req: db_mod.types.SearchRequest = .{};
+            const storage = try std.testing.allocator.alloc(u8, 1024 * 1024);
+            defer std.testing.allocator.free(storage);
+            var quota = std.heap.FixedBufferAllocator.init(storage);
+            try std.testing.expectError(error.OutOfMemory, queryProvisionedAcrossGroupsParallel(
+                &source,
+                quota.allocator(),
+                threaded.io(),
+                2,
+                group_ids[0..2],
+                &plain_req,
+                plain_req,
+                "docs",
+                .stale,
+                null,
+                generations[0..2],
+            ));
+            try std.testing.expectEqual(@as(usize, 2), fake.calls.load(.acquire));
+
+            fake.calls.store(0, .release);
+            fake.scratch_bytes = 0;
+            fake.cancel_on_group = 1;
+            const req: db_mod.types.SearchRequest = .{ .cancellation = db_mod.types.CancellationToken.fromAtomic(&cancelled) };
+            try std.testing.expectError(error.Cancelled, queryProvisionedAcrossGroupsParallel(
+                &source,
+                std.testing.allocator,
+                threaded.io(),
+                2,
+                &group_ids,
+                &req,
+                req,
+                "docs",
+                .stale,
+                null,
+                &generations,
+            ));
+            try std.testing.expectEqual(@as(usize, 2), fake.calls.load(.acquire));
+        }
+
+        test "parallel preflight charges retained response scratch to request quota" {
+            const Fake = struct {
+                calls: std.atomic.Value(usize) = .init(0),
+
+                fn preflight(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency, _: u32) !?db_mod.RuntimePreflightSummary {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    _ = self.calls.fetchAdd(1, .acq_rel);
+                    const scratch = try alloc.alloc(u8, 600 * 1024);
+                    @memset(scratch, 'x');
+                    return .{};
+                }
+            };
+
+            const storage = try std.testing.allocator.alloc(u8, 1024 * 1024);
+            defer std.testing.allocator.free(storage);
+            var quota = std.heap.FixedBufferAllocator.init(storage);
+            var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(2) });
+            defer threaded.deinit();
+            var fake: Fake = .{};
+            var source = ProvisionedTableReadSource.init("unused", undefined, undefined);
+            source.local_read_source = .{ .ptr = &fake, .vtable = &.{
+                .lookup = undefined,
+                .scan = undefined,
+                .query = undefined,
+                .preflight_query_group_local = Fake.preflight,
+            } };
+            try std.testing.expectError(error.OutOfMemory, preflightProvisionedGroupsParallel(
+                &source,
+                quota.allocator(),
+                threaded.io(),
+                2,
+                &.{ 1, 2 },
+                "docs",
+                .{},
+                .stale,
+                0,
+            ));
+            try std.testing.expectEqual(@as(usize, 2), fake.calls.load(.acquire));
+        }
+
         test "fanout planner uses io cap and request shape" {
             var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
                 .async_limit = .limited(8),
@@ -25218,6 +25349,7 @@ fn consumerTests() type {
                 &.{ 1, 2 },
                 "docs",
                 "{}",
+                .{},
             ));
             try std.testing.expectEqual(@as(usize, 2), fixture.calls.load(.acquire));
 
@@ -25232,10 +25364,44 @@ fn consumerTests() type {
                 &.{ 1, 2 },
                 "docs",
                 "{}",
+                .{},
             );
             defer distributed_stats_mod.deinitTextFieldStats(larger_quota.allocator(), merged);
             try std.testing.expectEqual(@as(usize, 0), merged.len);
             try std.testing.expectEqual(@as(usize, 4), fixture.calls.load(.acquire));
+        }
+
+        test "parallel text stats joins canceled wave without publishing or dispatching later groups" {
+            const Fixture = struct {
+                calls: std.atomic.Value(usize) = .init(0),
+                cancelled: *std.atomic.Value(bool),
+
+                fn textStats(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, _: []const u8, _: []const u8) !?query_api.QueryResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    _ = self.calls.fetchAdd(1, .acq_rel);
+                    if (group_id == 1) self.cancelled.store(true, .release);
+                    return .{ .json = try alloc.dupe(u8, "{\"fields\":[]}") };
+                }
+            };
+
+            var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(2) });
+            defer threaded.deinit();
+            var cancelled = std.atomic.Value(bool).init(false);
+            var fixture: Fixture = .{ .cancelled = &cancelled };
+            var source = ProvisionedTableReadSource.init("unused", undefined, undefined);
+            source.local_read_source = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .text_stats_group_local = Fixture.textStats } };
+            const req: db_mod.types.SearchRequest = .{ .cancellation = db_mod.types.CancellationToken.fromAtomic(&cancelled) };
+            try std.testing.expectError(error.Cancelled, collectProvisionedSearchRequestTextStatsParallel(
+                &source,
+                std.testing.allocator,
+                threaded.io(),
+                2,
+                &.{ 1, 2, 3, 4, 5 },
+                "docs",
+                "{}",
+                req,
+            ));
+            try std.testing.expectEqual(@as(usize, 2), fixture.calls.load(.acquire));
         }
 
         test "merge distributed text stats sums shard corpus stats by field and term" {

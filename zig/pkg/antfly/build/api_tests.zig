@@ -1079,6 +1079,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "profiled composed dense query preserves exact route telemetry",
             "aggregation completeness requires exact total relation",
             "parallel text stats fanout charges retained response scratch to request quota",
+            "parallel text stats joins canceled wave without publishing or dispatching later groups",
+            "parallel search charges retained response scratch and stops after canceled wave",
+            "parallel preflight charges retained response scratch to request quota",
             "aggregation-only collection preserves controls and clears only internal hits",
             "aggregation full-result rerun includes newly published text documents at the same identity generation",
             "aggregation full-result rerun preserves the graph reranked hit page",
@@ -1542,10 +1545,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_text_stats_fanout_tests = b.addTest(.{
         .name = "api-text-stats-fanout-tests",
         .root_module = api_table_reads_docid_test_mod,
-        .filters = &.{"parallel text stats fanout charges retained response scratch to request quota"},
+        .filters = &.{ "parallel text stats fanout charges retained response scratch to request quota", "parallel text stats joins canceled wave without publishing or dispatching later groups" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-text-stats-fanout-test", "Run text-stat request quota fanout regression").dependOn(&addFilteredTestRunArtifact(b, api_text_stats_fanout_tests).step);
+    const api_read_fanout_tests = b.addTest(.{
+        .name = "api-read-fanout-tests",
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &.{
+            "parallel text stats joins canceled wave without publishing or dispatching later groups",
+            "parallel search charges retained response scratch and stops after canceled wave",
+            "parallel preflight charges retained response scratch to request quota",
+            "parallel preflight joins canceled wave without dispatching later groups",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-read-fanout-test", "Run search and preflight request quota and cancellation regressions").dependOn(&addFilteredTestRunArtifact(b, api_read_fanout_tests).step);
     const api_aggregation_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-aggregation-tests",
         .root_module = api_table_reads_docid_test_mod,
