@@ -1782,7 +1782,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const join_fanout_quota_tests = b.addTest(.{
         .name = "api-join-fanout-quota-tests",
         .root_module = api_http_runtime_test_mod,
-        .filters = &.{ "distributed join fanout bounds concurrency drains errors and preserves group order", "distributed join fanout charges worker scratch to request quota", "distributed join rejects late right worker reply before widening partial page" },
+        .filters = &.{ "distributed join fanout bounds concurrency drains errors and preserves group order", "distributed join fanout charges worker scratch to request quota", "distributed join rejects late right worker reply before widening partial page", "distributed join rejects a delayed socket worker reply after the original request ends" },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });

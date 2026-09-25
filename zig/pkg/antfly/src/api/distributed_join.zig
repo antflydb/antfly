@@ -6534,6 +6534,142 @@ test "distributed join rejects late right worker reply before widening partial p
     }
 }
 
+test "distributed join rejects a delayed socket worker reply after the original request ends" {
+    if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const httpx = @import("httpx");
+    const Fixture = struct {
+        const Self = @This();
+        const Mode = enum { cancel, timeout };
+        const partial = "{\"responses\":[{\"hits\":{\"total\":{\"value\":2,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"a\",\"_source\":{}}]}}]}";
+        io: std.Io,
+        address: std.Io.net.IpAddress,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        calls: std.atomic.Value(usize) = .init(0),
+        now_ns: std.atomic.Value(u64) = .init(0),
+        cancelled: std.atomic.Value(bool) = .init(false),
+
+        fn handle(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            return ctx.text(partial);
+        }
+
+        fn now(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.now_ns.load(.acquire);
+        }
+
+        fn plain(ptr: *anyopaque, alloc: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, deadline: ?u64, cancellation: ?CancellationToken) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // The adapter converts this fixture's clock to the native query
+            // clock before handing the absolute deadline to transport.
+            try std.testing.expect(deadline != null);
+            try std.testing.expect(cancellation != null);
+            var socket = try httpx.Socket.connect(self.address, self.io);
+            defer socket.close();
+            try socket.setRecvTimeout(5_000);
+            try socket.sendAll("GET /worker HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+            var response: [8192]u8 = undefined;
+            var used: usize = 0;
+            while (true) {
+                if (used == response.len) return error.TestUnexpectedResult;
+                const received = try socket.recv(response[used..]);
+                if (received == 0) break;
+                used += received;
+            }
+            const start = (std.mem.indexOf(u8, response[0..used], "\r\n\r\n") orelse return error.TestUnexpectedResult) + 4;
+            return .{ .json = try alloc.dupe(u8, response[start..used]) };
+        }
+
+        const Coordinator = struct {
+            fixture: *Self,
+            result_error: ?anyerror = null,
+            published: bool = false,
+
+            fn run(self: *@This()) void {
+                const join = SupportedJoinRequest{
+                    .right_table = @constCast("right"),
+                    .left_field = @constCast("left_id"),
+                    .right_field = @constCast("right_id"),
+                };
+                var query_value = std.json.Value{ .object = std.json.ObjectMap.empty };
+                const ctx = JoinContext{
+                    .ptr = self.fixture,
+                    .vtable = &.{
+                        .acquire_planning = undefined,
+                        .execute_plain_query = Self.plain,
+                        .execute_query_dispatch = undefined,
+                        .build_owned_search_request = undefined,
+                        .ensure_foreign_registry = undefined,
+                        .monotonic_now_ns = Self.now,
+                    },
+                    .execution_deadline_ns = 100,
+                    .cancellation = CancellationToken.fromAtomic(&self.fixture.cancelled),
+                };
+                var loaded = loadRightJoinQueryAlloc(ctx, undefined, std.testing.allocator, undefined, join, &query_value, false, .{}) catch |err| {
+                    self.result_error = err;
+                    return;
+                };
+                defer loaded.deinit();
+                self.published = true;
+            }
+        };
+
+        fn runMode(mode: Mode) !void {
+            const alloc = std.testing.allocator;
+            var server_io = std.Io.Threaded.init(alloc, .{});
+            defer server_io.deinit();
+            var client_io = std.Io.Threaded.init(alloc, .{});
+            defer client_io.deinit();
+            var server = httpx.Server.initWithConfig(alloc, server_io.io(), .{ .host = "127.0.0.1", .port = 0, .max_connections = 2, .max_request_tasks = 2 });
+            defer server.deinit();
+            var fixture = Self{ .io = client_io.io(), .address = undefined };
+            try server.get("/worker", httpx.Handler.bind(&fixture, Self.handle));
+            var listener = httpx.ListenerTask.init(&server);
+            try listener.start();
+            defer {
+                fixture.release.store(true, .release);
+                listener.requestStop();
+                listener.join() catch {};
+            }
+            fixture.address = server.boundAddress() orelse return error.TestUnexpectedResult;
+            var coordinator = Coordinator{ .fixture = &fixture };
+            var future = std.Io.async(client_io.io(), Coordinator.run, .{&coordinator});
+            var awaited = false;
+            defer if (!awaited) {
+                fixture.release.store(true, .release);
+                future.await(client_io.io());
+            };
+            for (0..5_000) |_| {
+                if (fixture.entered.load(.acquire)) break;
+                try client_io.io().sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expect(fixture.entered.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.acquire));
+            switch (mode) {
+                .cancel => fixture.cancelled.store(true, .release),
+                .timeout => fixture.now_ns.store(100, .release),
+            }
+            fixture.release.store(true, .release);
+            future.await(client_io.io());
+            awaited = true;
+            try std.testing.expectEqual(if (mode == .cancel) error.Cancelled else error.Timeout, coordinator.result_error orelse return error.TestUnexpectedResult);
+            try std.testing.expect(!coordinator.published);
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.acquire));
+            for (0..5_000) |_| {
+                if (server.runtimeStats().active_connections == 0 and server.runtimeStats().active_requests == 0) break;
+                try client_io.io().sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expectEqual(@as(usize, 0), server.runtimeStats().active_connections);
+            try std.testing.expectEqual(@as(usize, 0), server.runtimeStats().active_requests);
+        }
+    };
+    try Fixture.runMode(.cancel);
+    try Fixture.runMode(.timeout);
+}
+
 test "workload admission distributed join transports relative budgets and rejects exhausted handoffs" {
     var state: u8 = 0;
     const ctx = JoinContext{
