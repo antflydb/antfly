@@ -2,7 +2,9 @@
 
 const std = @import("std");
 
-/// Process-wide byte budget shared by every inbound HTTP connection.
+/// Server-scoped byte budget shared by every inbound HTTP connection on that
+/// server. Separate listeners own separate budgets; this is not a process heap
+/// limit.
 ///
 /// Charges allocation capacity, including cached buffers and overlapping
 /// allocations during growth or materialization. Each parser, stream, or
