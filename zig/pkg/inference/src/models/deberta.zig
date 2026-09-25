@@ -37,7 +37,27 @@ pub const Config = struct {
     entity_token_id: i64 = 128005,
     relation_token_id: i64 = 128006,
     num_labels: u32 = 1,
+    /// GLiNER2 wrapper `counting_layer` (legacy span checkpoints only).
+    gliner_count_layer: GlinerCountLayer = .count_lstm_v2,
+    /// The encoder's weight matrices are stored quantized (e.g. a Q8_0 GGUF
+    /// bundle), as opposed to dense F32/F16 safetensors or a dense GGUF export.
+    gliner_quantized_weights: bool = false,
 };
+
+pub const GlinerCountLayer = enum { count_lstm, count_lstm_v2 };
+
+/// Encoder F16 Metal weight mirrors (the `prefer_weight_mirrors` argument of
+/// `forwardCt`). They speed up base-size GLiNER encoders. On a
+/// deberta-v3-large encoder whose matrices are already quantized (the
+/// GLiNER2.5-Decide Q8_0 bundle) they measured slower than the bundle's own
+/// Q8_0 kernels (interleaved A/B on M4: ~110 vs ~75 ms at 102 tokens). Dense
+/// weights keep them: without mirrors Metal stages dense matrices to Q8_0 on
+/// the fly (classifier logit error 3e-2 vs 8e-4). Every route over one
+/// session uses this same policy so its prepared encoder slots agree.
+pub fn glinerPrefersWeightMirrors(config: Config) bool {
+    if (config.hidden_size < 1024 or !config.gliner_quantized_weights) return true;
+    return @import("antfly_platform").env.getenvBool("TERMITE_METAL_GLINER_LARGE_WEIGHT_MIRRORS");
+}
 
 pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
