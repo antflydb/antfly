@@ -23,9 +23,8 @@ this requested implementation/correctness scope.
 - The operator inventory now links public, internal, SDK, and job entry points
   to their admission owners. Synchronous artifact-range reprocessing acquires
   foreground write capacity before it walks groups and releases that lease on
-  every exit path. Its policy and saturation regression are committed, with the
-  focused API gate pending while the DATA VOPR diagnostic runs. Other helper
-  and retained-work accounting remains open under item 7.
+  every exit path. Its focused Debug admission gate passed 2/2 with no leaks.
+  Other helper and retained-work accounting remains open under item 7.
 - Public DATA HTTP upload buffering now uses the resolved process memory
   envelope instead of reserving its former fixed 2 GiB by default. It retains
   space for one configured 64 MiB request and its growth overlap, and rejects
