@@ -104,7 +104,7 @@ def evaluate_classification(model: Any, name: str, records: list[dict], batch_si
     classifier = Classifier(model, device=device)
     config = ClassificationConfig(batch_size=batch_size)
     fixed = datasets.label_names(name)
-    gold, predicted, confidences, correct, cross_entropy, by_kind = [], [], [], [], [], {}
+    gold, predicted, confidences, correct, cross_entropy, by_kind, rows = [], [], [], [], [], {}, []
     started = time.perf_counter()
     for offset in range(0, len(records), batch_size):
         chunk = records[offset:offset + batch_size]
@@ -122,16 +122,21 @@ def evaluate_classification(model: Any, name: str, records: list[dict], batch_si
             predicted.append(labels[best])
             confidences.append(probabilities[best])
             correct.append(labels[best] == record["label"])
+            row = {"id": record["id"], "predicted": labels[best], "confidence": probabilities[best], "correct": correct[-1]}
             if "target" in record:
                 cross_entropy.append(-sum(t * math.log(max(p, 1e-12)) for t, p in zip(record["target"], probabilities)))
+                row["soft_cross_entropy"] = cross_entropy[-1]
                 kind = by_kind.setdefault(record["kind"], [0, 0])
                 kind[0] += correct[-1]
                 kind[1] += 1
+            rows.append(row)
     result = {
         "task": "classification", "records": len(records),
         "accuracy": sum(correct) / len(correct),
         "macro_f1": macro_f1(gold, predicted, fixed or sorted(set(gold) | set(predicted))),
         "ece": ece(confidences, correct), "seconds": time.perf_counter() - started,
+        # Per-record predictions allow comparisons on another model's admissible subset.
+        "predictions": rows,
     }
     if cross_entropy:
         result["soft_cross_entropy"] = sum(cross_entropy) / len(cross_entropy)
@@ -169,7 +174,8 @@ def summarize(results: dict[str, dict]) -> dict:
     """Mean classification accuracy and NER F1 over the in-domain and held-out sets."""
     groups = {}
     for group, names in (("in_domain", IN_DOMAIN), ("held_out", HELD_OUT)):
-        present = [n for n in names if n in results and "error" not in results[n]]
+        # Errors and not-applicable datasets carry no metrics.
+        present = [n for n in names if n in results and "task" in results[n]]
         classification = [results[n]["accuracy"] for n in present if results[n]["task"] == "classification"]
         ner = [results[n]["f1"] for n in present if results[n]["task"] == "ner"]
         groups[group] = {
@@ -245,7 +251,7 @@ def main() -> int:
         result["sample_ids"] = [r["id"] for r in chosen]
         result["sources"] = datasets.source_pins(name)
         report["datasets"][name] = result
-        print(json.dumps({"dataset": name, **{k: v for k, v in result.items() if k not in ("sample_ids", "sources")}}), flush=True)
+        print(json.dumps({"dataset": name, **{k: v for k, v in result.items() if k not in ("sample_ids", "sources", "predictions")}}), flush=True)
     report["groups"] = summarize(report["datasets"])
     report["seconds"] = time.perf_counter() - started
     args.output.parent.mkdir(parents=True, exist_ok=True)
