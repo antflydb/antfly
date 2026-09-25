@@ -12468,16 +12468,16 @@ pub const ApiHttpServer = struct {
         while (true) {
             try ensureTableOperationActive(request);
             return source.lookup(alloc, table_name, key, opts, consistency) catch |err| switch (err) {
-                error.StorageReadTemporarilyUnavailable => {
+                error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor => {
                     const now_ns = retryMonotonicNs(retry_io);
-                    if (retry_timeout_ns == 0) return err;
+                    if (retry_timeout_ns == 0) return error.StorageReadTemporarilyUnavailable;
                     const sleep_ns = boundedRetrySleepNs(
                         retry_deadline_ns,
                         now_ns,
                         start_ns,
                         retry_timeout_ns,
                         retry_poll_ns,
-                    ) orelse return err;
+                    ) orelse return error.StorageReadTemporarilyUnavailable;
                     if (sleep_ns == 0) return error.DeadlineExceeded;
                     try sleepNsCancellable(retry_io, sleep_ns, request.cancellation);
                     continue;
@@ -27436,6 +27436,7 @@ test "api http point lookup retries bounded local readiness races" {
     };
     const FakeReads = struct {
         attempts: u32 = 0,
+        first_error: anyerror = error.StorageReadTemporarilyUnavailable,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{ .ptr = self, .vtable = &.{
@@ -27457,7 +27458,7 @@ test "api http point lookup retries bounded local readiness races" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("doc:1", key);
             self.attempts += 1;
-            if (self.attempts == 1) return error.StorageReadTemporarilyUnavailable;
+            if (self.attempts == 1) return self.first_error;
             return .{
                 .json = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
                 .version = 7,
@@ -27482,29 +27483,45 @@ test "api http point lookup retries bounded local readiness races" {
         }
     };
 
-    var reads = FakeReads{};
-    var server = ApiHttpServer.init(
+    for ([_]anyerror{ error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor }) |first_error| {
+        var reads = FakeReads{ .first_error = first_error };
+        var server = ApiHttpServer.init(
+            std.testing.allocator,
+            .{},
+            FakeStatus.source(),
+            reads.source(),
+            DummyWrites.source(),
+        );
+        defer server.deinit();
+        var response = (try server.lookupWithReadinessRetry(
+            std.testing.allocator,
+            reads.source(),
+            "docs",
+            "doc:1",
+            .{},
+            .read_index,
+            .{},
+        )).?;
+        defer response.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+        try std.testing.expectEqual(@as(u64, 7), response.version);
+        try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", response.json);
+    }
+
+    var stale_reads = FakeReads{ .first_error = error.StorageKernelOwnerStaleDescriptor };
+    var read_only_server = ApiHttpServer.init(std.testing.allocator, .{}, FakeStatus.source(), stale_reads.source(), null);
+    defer read_only_server.deinit();
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, read_only_server.lookupWithReadinessRetry(
         std.testing.allocator,
-        .{},
-        FakeStatus.source(),
-        reads.source(),
-        DummyWrites.source(),
-    );
-    defer server.deinit();
-    var response = (try server.lookupWithReadinessRetry(
-        std.testing.allocator,
-        reads.source(),
+        stale_reads.source(),
         "docs",
         "doc:1",
         .{},
         .read_index,
         .{},
-    )).?;
-    defer response.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
-    try std.testing.expectEqual(@as(u64, 7), response.version);
-    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", response.json);
+    ));
+    try std.testing.expectEqual(@as(u32, 1), stale_reads.attempts);
 }
 
 test "api http transient read retry honors expired request deadline before source query" {

@@ -6860,6 +6860,7 @@ pub const AntflyApiHandler = struct {
             error.LsmRootWriterAlreadyOpen,
             error.ResidentDbRetryRequired,
             error.StorageReadTemporarilyUnavailable,
+            error.StorageKernelOwnerStaleDescriptor,
             error.ConcurrencyUnavailable,
             error.RestoreStagingInProgress,
             error.GenerationTransitionActive,

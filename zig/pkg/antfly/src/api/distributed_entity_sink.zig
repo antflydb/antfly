@@ -218,8 +218,13 @@ pub const DistributedEntitySink = struct {
                 try batch.transforms.append(a, .{ .key = e.key, .operations = ops, .upsert = true });
             }
         }
-        for (moves.values()) |move| {
+        for (moves.values()) |*move| {
             const batch = try promotionTableBatch(a, &tables, move.physical);
+            // The survivor is live even when either stored copy was a
+            // tombstone. Match the ordinary promotion transform's redirect
+            // clearing before replacing its complete document.
+            _ = move.document.object.swapRemove("merged_into");
+            _ = move.document.object.swapRemove("merged_into_table");
             try batch.writes.append(a, .{ .key = move.key, .value = try std.json.Stringify.valueAlloc(a, move.document, .{}) });
             try batch.predicates.append(a, .{ .key = move.key, .expected_version = move.version, .expected_content_digest = move.digest });
         }
@@ -699,11 +704,11 @@ test "DistributedEntitySink deletes an old pinned copy while moving a key" {
             try testing.expectEqual(@as(@TypeOf(consistency), .read_index), consistency);
             if (std.mem.eql(u8, table, "table:old")) {
                 self.old_reads += 1;
-                return .{ .json = try a.dupe(u8, "{\"canonical_name\":\"Curated Ada\",\"aliases\":[\"A. Lovelace\"],\"curator_note\":{\"reviewed\":true}}"), .version = 7 };
+                return .{ .json = try a.dupe(u8, "{\"canonical_name\":\"Curated Ada\",\"aliases\":[\"A. Lovelace\"],\"curator_note\":{\"reviewed\":true},\"merged_into\":\"person/other\"}"), .version = 7 };
             }
             try testing.expectEqualStrings("table:new", table);
             self.new_reads += 1;
-            return .{ .json = try a.dupe(u8, "{\"canonical_name\":\"New Ada\",\"aliases\":[\"Countess Ada\"],\"new_note\":true}"), .version = 3 };
+            return .{ .json = try a.dupe(u8, "{\"canonical_name\":\"New Ada\",\"aliases\":[\"Countess Ada\"],\"new_note\":true,\"merged_into_table\":\"other_people\"}"), .version = 3 };
         }
 
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) anyerror!?table_reads.ScanResponse {
@@ -748,6 +753,10 @@ test "DistributedEntitySink deletes an old pinned copy while moving a key" {
         "{\"canonical_name\":\"New Ada\",\"aliases\":[\"Countess Ada\",\"A. Lovelace\",\"Ada\",\"Ada Byron\"],\"curator_note\":{\"reviewed\":true},\"new_note\":true}",
         fake.write_docs.items[0],
     );
+    var moved = try std.json.parseFromSlice(std.json.Value, alloc, fake.write_docs.items[0], .{});
+    defer moved.deinit();
+    try testing.expect(moved.value.object.get("merged_into") == null);
+    try testing.expect(moved.value.object.get("merged_into_table") == null);
     try testing.expectEqualSlices(u64, &.{ 7, 3 }, fake.predicate_versions.items);
 }
 
