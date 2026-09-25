@@ -239,3 +239,89 @@ CPU:
 {"backend":"native","state_sentences":12,"questions":8,"unpacked_ms":7401.4,"packed_ms":1824.4,"packed_cached_ms":1408.4,"unpacked_tokens":3295,"packed_tokens":594}
 {"backend":"native","state_sentences":12,"questions":16,"unpacked_ms":14821.7,"packed_ms":2756.9,"packed_cached_ms":2324.4,"unpacked_tokens":6587,"packed_tokens":798}
 ```
+
+## Segment attention (step 1b), 2026-09-24
+
+Metal:
+
+```
+{"backend":"metal","state_sentences":1,"questions":1,"unpacked_ms":61.9,"packed_ms":60.7,"packed_cached_ms":59.5,"unpacked_tokens":55,"packed_tokens":56}
+{"backend":"metal","state_sentences":1,"questions":2,"unpacked_ms":70.9,"packed_ms":64.6,"packed_cached_ms":63.3,"unpacked_tokens":119,"packed_tokens":86}
+{"backend":"metal","state_sentences":1,"questions":4,"unpacked_ms":83.4,"packed_ms":69.9,"packed_cached_ms":69.3,"unpacked_tokens":235,"packed_tokens":134}
+{"backend":"metal","state_sentences":1,"questions":8,"unpacked_ms":112.2,"packed_ms":81.8,"packed_cached_ms":81.7,"unpacked_tokens":479,"packed_tokens":242}
+{"backend":"metal","state_sentences":1,"questions":16,"unpacked_ms":169.4,"packed_ms":106.7,"packed_cached_ms":106.3,"unpacked_tokens":955,"packed_tokens":446}
+{"backend":"metal","state_sentences":1,"questions":64,"unpacked_ms":515.4,"packed_ms":258.6,"packed_cached_ms":259.2,"unpacked_tokens":3835,"packed_tokens":1694}
+{"backend":"metal","state_sentences":4,"questions":1,"unpacked_ms":82.5,"packed_ms":74.6,"packed_cached_ms":61.0,"unpacked_tokens":151,"packed_tokens":152}
+{"backend":"metal","state_sentences":4,"questions":2,"unpacked_ms":107.4,"packed_ms":78.1,"packed_cached_ms":65.0,"unpacked_tokens":311,"packed_tokens":182}
+{"backend":"metal","state_sentences":4,"questions":4,"unpacked_ms":151.6,"packed_ms":84.8,"packed_cached_ms":73.2,"unpacked_tokens":619,"packed_tokens":230}
+{"backend":"metal","state_sentences":4,"questions":8,"unpacked_ms":237.7,"packed_ms":102.1,"packed_cached_ms":88.8,"unpacked_tokens":1247,"packed_tokens":338}
+{"backend":"metal","state_sentences":4,"questions":16,"unpacked_ms":418.8,"packed_ms":132.2,"packed_cached_ms":119.2,"unpacked_tokens":2491,"packed_tokens":542}
+{"backend":"metal","state_sentences":4,"questions":64,"unpacked_ms":1543.2,"packed_ms":316.8,"packed_cached_ms":307.3,"unpacked_tokens":9979,"packed_tokens":1790}
+{"backend":"metal","state_sentences":12,"questions":1,"unpacked_ms":207.1,"packed_ms":135.1,"packed_cached_ms":66.2,"unpacked_tokens":407,"packed_tokens":408}
+{"backend":"metal","state_sentences":12,"questions":2,"unpacked_ms":301.8,"packed_ms":138.0,"packed_cached_ms":72.5,"unpacked_tokens":823,"packed_tokens":438}
+{"backend":"metal","state_sentences":12,"questions":4,"unpacked_ms":477.3,"packed_ms":146.5,"packed_cached_ms":82.9,"unpacked_tokens":1643,"packed_tokens":486}
+{"backend":"metal","state_sentences":12,"questions":8,"unpacked_ms":816.7,"packed_ms":170.4,"packed_cached_ms":102.5,"unpacked_tokens":3295,"packed_tokens":594}
+{"backend":"metal","state_sentences":12,"questions":16,"unpacked_ms":1544.7,"packed_ms":200.0,"packed_cached_ms":141.2,"unpacked_tokens":6587,"packed_tokens":798}
+{"backend":"metal","state_sentences":12,"questions":64,"unpacked_ms":6099.4,"packed_ms":472.2,"packed_cached_ms":382.4,"unpacked_tokens":26363,"packed_tokens":2046}
+```
+
+CPU:
+
+```
+{"backend":"native","state_sentences":1,"questions":1,"unpacked_ms":317.8,"packed_ms":300.8,"packed_cached_ms":328.5,"unpacked_tokens":55,"packed_tokens":56}
+{"backend":"native","state_sentences":1,"questions":2,"unpacked_ms":425.6,"packed_ms":371.4,"packed_cached_ms":373.2,"unpacked_tokens":119,"packed_tokens":86}
+{"backend":"native","state_sentences":1,"questions":4,"unpacked_ms":587.0,"packed_ms":450.5,"packed_cached_ms":463.6,"unpacked_tokens":235,"packed_tokens":134}
+{"backend":"native","state_sentences":1,"questions":8,"unpacked_ms":884.4,"packed_ms":579.3,"packed_cached_ms":577.8,"unpacked_tokens":479,"packed_tokens":242}
+{"backend":"native","state_sentences":1,"questions":16,"unpacked_ms":1560.0,"packed_ms":930.8,"packed_cached_ms":931.7,"unpacked_tokens":955,"packed_tokens":446}
+{"backend":"native","state_sentences":1,"questions":64,"unpacked_ms":5776.4,"packed_ms":2913.3,"packed_cached_ms":2862.5,"unpacked_tokens":3835,"packed_tokens":1694}
+{"backend":"native","state_sentences":4,"questions":1,"unpacked_ms":514.4,"packed_ms":499.5,"packed_cached_ms":323.5,"unpacked_tokens":151,"packed_tokens":152}
+{"backend":"native","state_sentences":4,"questions":2,"unpacked_ms":803.5,"packed_ms":523.9,"packed_cached_ms":318.3,"unpacked_tokens":311,"packed_tokens":182}
+{"backend":"native","state_sentences":4,"questions":4,"unpacked_ms":1210.8,"packed_ms":595.0,"packed_cached_ms":431.2,"unpacked_tokens":619,"packed_tokens":230}
+{"backend":"native","state_sentences":4,"questions":8,"unpacked_ms":2183.0,"packed_ms":782.3,"packed_cached_ms":609.5,"unpacked_tokens":1247,"packed_tokens":338}
+{"backend":"native","state_sentences":4,"questions":16,"unpacked_ms":4248.2,"packed_ms":1191.2,"packed_cached_ms":994.7,"unpacked_tokens":2491,"packed_tokens":542}
+{"backend":"native","state_sentences":4,"questions":64,"unpacked_ms":16224.0,"packed_ms":3399.2,"packed_cached_ms":3229.0,"unpacked_tokens":9979,"packed_tokens":1790}
+{"backend":"native","state_sentences":12,"questions":1,"unpacked_ms":1162.1,"packed_ms":1144.8,"packed_cached_ms":331.2,"unpacked_tokens":407,"packed_tokens":408}
+{"backend":"native","state_sentences":12,"questions":2,"unpacked_ms":2071.5,"packed_ms":1220.0,"packed_cached_ms":375.9,"unpacked_tokens":823,"packed_tokens":438}
+{"backend":"native","state_sentences":12,"questions":4,"unpacked_ms":3889.6,"packed_ms":1340.0,"packed_cached_ms":521.1,"unpacked_tokens":1643,"packed_tokens":486}
+{"backend":"native","state_sentences":12,"questions":8,"unpacked_ms":7427.5,"packed_ms":1593.6,"packed_cached_ms":770.4,"unpacked_tokens":3295,"packed_tokens":594}
+{"backend":"native","state_sentences":12,"questions":16,"unpacked_ms":15620.5,"packed_ms":2102.2,"packed_cached_ms":1503.3,"unpacked_tokens":6587,"packed_tokens":798}
+{"backend":"native","state_sentences":12,"questions":64,"unpacked_ms":59179.5,"packed_ms":5076.6,"packed_cached_ms":4331.7,"unpacked_tokens":26363,"packed_tokens":2046}
+```
+
+## Step 0: typed-decisions accuracy, 2026-09-24
+
+Serving-path evaluation (`finetune eval laya`, Metal) on s0-eval (152 cases, 760 decisions):
+
+```
+== released
+{"format": "antfly-laya-eval/v1", "records_sha256": "0996cec5994f3c05e233556b30e674627aa6730f28d84b34b8877f50fc193c2c", "packing": "none", "backend": "metal", "overall": {"decisions": 760, "accuracy": 0.3868421052631579, "soft_ce": 1.30795638096163, "ece": 0.1579487887652297, "ordinal_mae": 0.6562302058198264}, "choice": {"decisions": 228, "accuracy": 0.33771929824561403, "soft_ce": 1.5210421520678148, "ece": 0.14279232108802123, "ordinal_mae": null}, "score": {"decisions": 304, "accuracy": 0.3519736842105263, "soft_ce": 1.4879718930366135, "ece": 0.19068649979798416, "ordinal_mae": 0.6562302058198264}, "noul": {"decisions": 228, "accuracy": 0.4824561403508772, "soft_ce": 0.8548499270887835, "ece": 0.19880408832901406, "ordinal_mae": null}, "prompt_tokens": 211125, "seconds": 53.172325}
+== released-packed
+{"format": "antfly-laya-eval/v1", "records_sha256": "0996cec5994f3c05e233556b30e674627aa6730f28d84b34b8877f50fc193c2c", "packing": "question", "backend": "metal", "overall": {"decisions": 760, "accuracy": 0.3605263157894737, "soft_ce": 1.337135795768793, "ece": 0.132774419063016, "ordinal_mae": 0.666354491148396}, "choice": {"decisions": 228, "accuracy": 0.19736842105263158, "soft_ce": 1.6675512599335334, "ece": 0.2193197396240736, "ordinal_mae": null}, "score": {"decisions": 304, "accuracy": 0.3092105263157895, "soft_ce": 1.4718076766670365, "ece": 0.11344727913015767, "ordinal_mae": 0.666354491148396}, "noul": {"decisions": 228, "accuracy": 0.5921052631578947, "soft_ce": 0.8271578237397333, "ece": 0.17399306673752635, "ordinal_mae": null}, "prompt_tokens": 81745, "seconds": 37.975024}
+== upstream-typed-decisions
+{"format": "antfly-laya-eval/v1", "records_sha256": "0996cec5994f3c05e233556b30e674627aa6730f28d84b34b8877f50fc193c2c", "packing": "none", "backend": "metal", "overall": {"decisions": 760, "accuracy": 0.7539473684210526, "soft_ce": 0.8853601253877356, "ece": 0.19298428155873945, "ordinal_mae": 0.24779554366681336}, "choice": {"decisions": 228, "accuracy": 0.7236842105263158, "soft_ce": 1.0261173186789596, "ece": 0.2362423859405936, "ordinal_mae": null}, "score": {"decisions": 304, "accuracy": 0.6875, "soft_ce": 1.0553627544088877, "ece": 0.1570452262500399, "ordinal_mae": 0.24779554366681336}, "noul": {"decisions": 228, "accuracy": 0.8728070175438597, "soft_ce": 0.517932760068309, "ece": 0.19764491758848482, "ordinal_mae": null}, "prompt_tokens": 211125, "seconds": 75.273512}
+== packed-finetune
+{"format": "antfly-laya-eval/v1", "records_sha256": "0996cec5994f3c05e233556b30e674627aa6730f28d84b34b8877f50fc193c2c", "packing": "question", "backend": "metal", "overall": {"decisions": 760, "accuracy": 0.5736842105263158, "soft_ce": 1.026462118628347, "ece": 0.06338861419966349, "ordinal_mae": 0.47073215398124474}, "choice": {"decisions": 228, "accuracy": 0.6052631578947368, "soft_ce": 1.1576869213269179, "ece": 0.12279918450012542, "ordinal_mae": null}, "score": {"decisions": 304, "accuracy": 0.48026315789473684, "soft_ce": 1.2315875480013918, "ece": 0.041850975469539003, "ordinal_mae": 0.47073215398124474}, "noul": {"decisions": 228, "accuracy": 0.6666666666666666, "soft_ce": 0.6217367434323828, "ece": 0.044915111964209053, "ordinal_mae": null}, "prompt_tokens": 81745, "seconds": 92.540653}
+== unpacked-finetune
+{"format": "antfly-laya-eval/v1", "records_sha256": "0996cec5994f3c05e233556b30e674627aa6730f28d84b34b8877f50fc193c2c", "packing": "none", "backend": "metal", "overall": {"decisions": 760, "accuracy": 0.5723684210526315, "soft_ce": 1.0072466132111706, "ece": 0.055086075279273485, "ordinal_mae": 0.4607488314655041}, "choice": {"decisions": 228, "accuracy": 0.6271929824561403, "soft_ce": 1.1254137490200218, "ece": 0.10696306916182498, "ordinal_mae": null}, "score": {"decisions": 304, "accuracy": 0.46710526315789475, "soft_ce": 1.2132717188316264, "ece": 0.04945284049761921, "ordinal_mae": 0.4607488314655041}, "noul": {"decisions": 228, "accuracy": 0.6578947368421053, "soft_ce": 0.6143793365750404, "ece": 0.08476328745222925, "ordinal_mae": null}, "prompt_tokens": 211125, "seconds": 143.770676}
+```
+
+Training reports:
+
+```
+{"packing": "question", "train_examples": 400, "train_records": 2000, "temperature": [1.0232930183410645, 1, 1.4454398155212402], "optimizer": {"optimizer_step": 400, "microbatch_step": 400}, "host_peak_bytes": 11167714964, "run_sha256": "af26dc1fdd769317158043b3ba2ab4ccfbe715bb6d9668a974f1f0bc740f9b77"}
+{"packing": "none", "train_examples": 2000, "train_records": 2000, "temperature": [1.1481536626815796, 1, 1.5135612487792969], "optimizer": {"optimizer_step": 400, "microbatch_step": 2000}, "host_peak_bytes": 10607865574, "run_sha256": "969a37be6ccbe55f8eed6181331d912e4e9b9a8f6bee55ca051026fb34d4ae8f"}
+train question exit 0 seconds 3343
+train unpacked exit 0 seconds 11363
+```
+
+Packed training throughput by batch size (median step, steps 3+):
+
+```
+bs=1 exit 0
+  steps 48 median step 5.7s -> 0.88 decisions/s
+bs=4 exit 0
+  steps 12 median step 17.2s -> 1.16 decisions/s
+bs=8 exit 0
+  steps 6 median step 36.5s -> 1.10 decisions/s
+
+```

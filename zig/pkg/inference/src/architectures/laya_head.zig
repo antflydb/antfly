@@ -16,6 +16,7 @@
 const std = @import("std");
 const ops = @import("../ops/ops.zig");
 const Config = @import("../models/laya.zig").Config;
+const modern = @import("modern_bert.zig");
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const CB = ops.ComputeBackend;
 const CT = ops.CT;
@@ -150,17 +151,17 @@ fn scoreHost(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32
 }
 
 /// Tree-packed decision head for one row (pipelines/laya_tree.zig). `encoder`
-/// is `[seq, dim]`; `head_bias` is the row's dense `[seq, seq]` visibility
+/// is `[seq, dim]`; `segments` gives each row's visible key ranges.
 /// mask. Trunk tokens (`kinds` = -1) receive no question-type embedding.
 /// Returns logits `[questions, width]` and action logits `[questions, n_act]`.
-pub fn forwardPacked(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, head_bias: CT, kinds: []const i64, markers: []const i64, anchors: []const i64, width: usize, dim: usize) ![]Tensor {
-    return packedHead(cb, a, cfg, encoder, head_bias, kinds, markers, anchors, width, dim, null);
+pub fn forwardPacked(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, segments: modern.Packed, kinds: []const i64, markers: []const i64, anchors: []const i64, width: usize, dim: usize) ![]Tensor {
+    return packedHead(cb, a, cfg, encoder, segments, kinds, markers, anchors, width, dim, null);
 }
 
 /// `forwardPacked` for the branch rows of a row whose trunk keys and values
 /// are cached (`prefix`). `encoder` and `kinds` cover the branch rows only;
-/// `markers` and `anchors` stay row-global. `head_bias` covers the whole row.
-pub fn forwardPackedBranches(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, head_bias: CT, kinds: []const i64, markers: []const i64, anchors: []const i64, width: usize, dim: usize, prefix: Prefix) ![]Tensor {
+/// `markers` and `anchors` stay row-global; `segments` covers the branch rows.
+pub fn forwardPackedBranches(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, segments: modern.Packed, kinds: []const i64, markers: []const i64, anchors: []const i64, width: usize, dim: usize, prefix: Prefix) ![]Tensor {
     const local_markers = try a.alloc(i64, markers.len);
     defer a.free(local_markers);
     for (markers, local_markers) |marker, *local| {
@@ -173,7 +174,7 @@ pub fn forwardPackedBranches(cb: *const CB, a: std.mem.Allocator, cfg: Config, e
         if (anchor < prefix.rows) return error.InvalidLayaInputs;
         local.* = anchor - @as(i64, @intCast(prefix.rows));
     }
-    return packedHead(cb, a, cfg, encoder, head_bias, kinds, local_markers, local_anchors, width, dim, prefix);
+    return packedHead(cb, a, cfg, encoder, segments, kinds, local_markers, local_anchors, width, dim, prefix);
 }
 
 /// Run the head layers over trunk-only encoder rows (`[rows, dim]`, no type
@@ -192,7 +193,7 @@ pub fn captureTrunk(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: C
     cb.free(hidden);
 }
 
-fn packedHead(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, head_bias: CT, kinds: []const i64, markers: []const i64, anchors: []const i64, width: usize, dim: usize, prefix: ?Prefix) ![]Tensor {
+fn packedHead(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, segments: modern.Packed, kinds: []const i64, markers: []const i64, anchors: []const i64, width: usize, dim: usize, prefix: ?Prefix) ![]Tensor {
     const rows = kinds.len;
     const seq = rows + if (prefix) |p| p.rows else 0;
     const questions = anchors.len;
@@ -213,7 +214,7 @@ fn packedHead(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, hea
     const mask = try a.alloc(i64, seq);
     defer a.free(mask);
     @memset(mask, 1);
-    const hidden = try layers(cb, a, cfg, try cb.add(encoder, type_ct), mask, head_bias, 1, seq, dim, prefix, null);
+    const hidden = try layers(cb, a, cfg, try cb.add(encoder, type_ct), mask, segments, 1, seq, dim, prefix, null);
     defer cb.free(hidden);
     const host = try cb.toFloat32(hidden, a);
     defer a.free(host);
@@ -282,7 +283,7 @@ pub fn transform(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, 
 
 /// Cached trunk keys and values per head layer, `[rows, dim]` each, and a
 /// `[rows, dim]` zero block standing in for trunk queries.
-pub const Prefix = struct { rows: usize, keys: []const CT, values: []const CT, zeros: CT };
+pub const Prefix = struct { rows: usize, keys: []const CT, values: []const CT };
 /// Each head layer's keys and values, as host copies or dense tensors owned
 /// by the caller (see `modern_bert.Capture`).
 pub const Capture = struct {
@@ -294,7 +295,9 @@ pub const Capture = struct {
 
 /// Pre-norm TransformerEncoder layers. Takes ownership of `input`. With a
 /// prefix, `input` holds only the rows after it and attention spans both.
-fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []const i64, bias: ?CT, batch: usize, seq: usize, dim: usize, trunk: ?Prefix, capture: ?Capture) !CT {
+/// With `segments`, attention is segment-masked (tree-packed rows) and
+/// `seq` counts every key of the row; otherwise it is dense over `mask`.
+fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []const i64, segments: ?modern.Packed, batch: usize, seq: usize, dim: usize, trunk: ?Prefix, capture: ?Capture) !CT {
     const prefix_rows: usize = if (trunk) |p| p.rows else 0;
     const rows = batch * seq - prefix_rows;
     var hidden = input;
@@ -319,21 +322,17 @@ fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []c
         const v = try cb.sliceLastDim(qkv, dim * 2, dim * 3);
         defer cb.free(v);
         if (capture) |c| try @import("modern_bert.zig").captureLayer(cb, a, c.keys, c.values, c.key_tensors, c.value_tensors, layer, k, v, rows, dim);
-        var joined: [3]?CT = .{ null, null, null };
+        var joined: [2]?CT = .{ null, null };
         defer for (joined) |tensor| if (tensor) |t| cb.free(t);
         if (trunk) |p| {
-            const modern = @import("modern_bert.zig");
-            joined[0] = try modern.joinRows(cb, a, p.zeros, p.rows, q, rows, dim);
-            joined[1] = try modern.joinRows(cb, a, p.keys[layer], p.rows, k, rows, dim);
-            joined[2] = try modern.joinRows(cb, a, p.values[layer], p.rows, v, rows, dim);
+            joined[0] = try modern.joinRows(cb, a, p.keys[layer], p.rows, k, rows, dim);
+            joined[1] = try modern.joinRows(cb, a, p.values[layer], p.rows, v, rows, dim);
         }
-        const attn_full = try cb.scaledDotProductAttention(joined[0] orelse q, joined[1] orelse k, joined[2] orelse v, mask, bias, batch, seq, dim / 64, 64);
-        defer cb.free(attn_full);
-        const attn = if (trunk != null)
-            try @import("modern_bert.zig").branchRows(cb, a, attn_full, prefix_rows, seq, dim)
+        const attn = if (segments) |row|
+            try modern.packedAttention(cb, a, q, joined[0] orelse k, joined[1] orelse v, row, std.math.maxInt(u32), rows, seq, dim / 64, 64)
         else
-            attn_full;
-        defer if (trunk != null) cb.free(attn);
+            try cb.scaledDotProductAttention(q, k, v, mask, null, batch, seq, dim / 64, 64);
+        defer cb.free(attn);
         const proj = try linear(cb, attn, try std.fmt.bufPrint(&buf, "{s}.self_attn.out_proj", .{prefix}), rows, dim, dim);
         defer cb.free(proj);
         const residual = try cb.add(hidden, proj);

@@ -293,15 +293,15 @@ pub fn forwardCT(
     return forwardImpl(cb, allocator, config, input_ids, attention_mask, batch, seq_len, null, null, null);
 }
 
-/// One tree-packed row (see pipelines/laya_tree.zig). RoPE uses the logical
-/// `positions`; global layers apply `global_bias` and local layers apply
-/// `local_bias`, each a dense `[seq_len, seq_len]` additive mask shared by
-/// every head. Both biases already exclude keys outside a token's ancestry,
-/// and `local_bias` also applies the sliding window in logical positions.
+/// One tree-packed row (see pipelines/laya_tree.zig), attended through
+/// `ComputeBackend.segmentAttention` instead of a dense mask. `positions`
+/// and `ranges` (three key ranges per row, `[rows * 6]`) cover the rows this
+/// forward computes; `key_positions` covers every key of the row. Local
+/// layers add the sliding window in logical positions.
 pub const Packed = struct {
     positions: []const i64,
-    global_bias: CT,
-    local_bias: CT,
+    ranges: []const u32,
+    key_positions: []const i32,
 };
 
 /// Encode one tree-packed row. The result is `[seq_len, hidden]`.
@@ -322,13 +322,11 @@ pub fn forwardPackedCT(
 }
 
 /// Cached trunk rows for a branch-only packed forward: per encoder layer,
-/// the trunk keys (after RoPE) and values, each `[prefix_rows, hidden]`, and
-/// a `[prefix_rows, hidden]` zero block standing in for trunk queries.
+/// the trunk keys (after RoPE) and values, each `[prefix_rows, hidden]`.
 pub const Branches = struct {
     prefix_rows: usize,
     keys: []const CT,
     values: []const CT,
-    zeros: CT,
 };
 
 /// Per encoder layer keys (after RoPE) and values. Either host copies,
@@ -385,20 +383,16 @@ pub fn forwardCapturingCT(
     // and layout as the branch forward that later reads them.
     const positions = try allocator.alloc(i64, n);
     defer allocator.free(positions);
-    for (positions, 0..) |*p, i| p.* = @intCast(i);
-    const masks = try allocator.alloc(f32, 2 * n * n);
-    defer allocator.free(masks);
-    const half = config.local_attention_window / 2;
-    for (0..n) |q| for (0..n) |k| {
-        masks[q * n + k] = 0;
-        masks[n * n + q * n + k] = if (@max(q, k) - @min(q, k) <= half) 0 else -1e9;
-    };
-    const shape = [_]i32{ @intCast(n), @intCast(n) };
-    const global = try cb.fromFloat32Shape(masks[0 .. n * n], &shape);
-    defer cb.free(global);
-    const local = try cb.fromFloat32Shape(masks[n * n ..], &shape);
-    defer cb.free(local);
-    return forwardImpl(cb, allocator, config, input_ids, mask, 1, n, .{ .positions = positions, .global_bias = global, .local_bias = local }, null, capture);
+    const key_positions = try allocator.alloc(i32, n);
+    defer allocator.free(key_positions);
+    const ranges = try allocator.alloc(u32, 6 * n);
+    defer allocator.free(ranges);
+    for (positions, key_positions, 0..) |*p, *k, i| {
+        p.* = @intCast(i);
+        k.* = @intCast(i);
+        ranges[6 * i ..][0..6].* = .{ 0, @intCast(n), 0, 0, 0, 0 };
+    }
+    return forwardImpl(cb, allocator, config, input_ids, mask, 1, n, .{ .positions = positions, .ranges = ranges, .key_positions = key_positions }, null, capture);
 }
 
 fn forwardImpl(
@@ -603,18 +597,14 @@ fn encoderLayer(
     defer cb.free(K);
 
     if (capture) |c| try captureLayer(cb, allocator, c.keys, c.values, c.key_tensors, c.value_tensors, layer_idx, K, qkv.v, total, H);
-    var joined: [3]?CT = .{ null, null, null };
+    var joined: [2]?CT = .{ null, null };
     defer for (joined) |tensor| if (tensor) |t| cb.free(t);
     if (branches) |b| {
-        joined[0] = try joinRows(cb, allocator, b.zeros, prefix_rows, Q, total, H);
-        joined[1] = try joinRows(cb, allocator, b.keys[layer_idx], prefix_rows, K, total, H);
-        joined[2] = try joinRows(cb, allocator, b.values[layer_idx], prefix_rows, qkv.v, total, H);
+        joined[0] = try joinRows(cb, allocator, b.keys[layer_idx], prefix_rows, K, total, H);
+        joined[1] = try joinRows(cb, allocator, b.values[layer_idx], prefix_rows, qkv.v, total, H);
     }
-    const q_all = joined[0] orelse Q;
-    const k_all = joined[1] orelse K;
-    const v_all = joined[2] orelse qkv.v;
-    const attn_full = if (packed_row) |row|
-        try cb.scaledDotProductAttention(q_all, k_all, v_all, attention_mask, if (is_global) row.global_bias else row.local_bias, batch, seq_len, num_heads, head_dim)
+    const attn_out = if (packed_row) |row|
+        try packedAttention(cb, allocator, Q, joined[0] orelse K, joined[1] orelse qkv.v, row, if (is_global) std.math.maxInt(u32) else config.local_attention_window / 2, total, seq_len, num_heads, head_dim)
     else if (!is_global and cb.kind() == .cuda)
         (try cb.encoderLocalAttention(Q, K, qkv.v, attention_mask, batch, seq_len, num_heads, head_dim, config.local_attention_window / 2)) orelse return error.UnsupportedLayaBackend
     else fallback: {
@@ -643,12 +633,7 @@ fn encoderLayer(
             head_dim,
         );
     };
-    defer cb.free(attn_full);
-    const attn_out = if (branches != null)
-        try branchRows(cb, allocator, attn_full, prefix_rows, seq_len, H)
-    else
-        attn_full;
-    defer if (branches != null) cb.free(attn_out);
+    defer cb.free(attn_out);
 
     // Output projection
     const attn_proj = try projectAttentionOutput(
@@ -891,6 +876,24 @@ fn geGluFfn(
         hidden_size,
         wo_slot,
     );
+}
+
+/// Segment-masked attention for `queries` packed rows over all `keys`.
+pub fn packedAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, q: CT, k: CT, v: CT, row: Packed, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize) !CT {
+    if (row.positions.len != queries or row.ranges.len != queries * 6 or row.key_positions.len != keys) return error.InvalidInputShape;
+    const query_positions = try allocator.alloc(i32, queries);
+    defer allocator.free(query_positions);
+    for (query_positions, row.positions) |*dst, p| dst.* = @intCast(p);
+    return cb.segmentAttention(allocator, q, k, v, &.{
+        .ranges = row.ranges,
+        .query_positions = query_positions,
+        .key_positions = row.key_positions,
+        .window = window,
+        .queries = queries,
+        .keys = keys,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+    });
 }
 
 /// Rows `prefix..seq` of a token-major `[seq, width]` activation.

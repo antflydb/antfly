@@ -105,6 +105,20 @@ pub fn layout(examples: []const Example) !architecture.Layout {
     return .{ .batch = @intCast(examples.len), .sequence = @intCast(sequence), .options = @intCast(options), .questions = @intCast(questions) };
 }
 
+/// `layout` rounded up so that a small set of compiled programs covers a
+/// whole dataset: sequences to 64 tokens and options to 4, within the
+/// model's limits. Padding keys are masked and padded option logits carry no
+/// loss, so results are unchanged; graph construction and autodiff (seconds
+/// per new shape on the released checkpoint) are no longer paid per step.
+pub fn bucketedLayout(examples: []const Example, cfg: modern.Config) !architecture.Layout {
+    var l = try layout(examples);
+    const laya = cfg.laya orelse return error.InvalidLayaConfig;
+    const sequence_limit = if (laya.packing.enabled()) laya.packing.max_packed_len else laya.max_len;
+    l.sequence = @intCast(@min(std.mem.alignForward(usize, l.sequence, 64), @max(sequence_limit, l.sequence)));
+    l.options = @intCast(@min(std.mem.alignForward(usize, l.options, 4), @max(laya.maxOptions(), l.options)));
+    return l;
+}
+
 /// Decision rows in logit order.
 pub fn rows(a: std.mem.Allocator, examples: []const Example) ![]objective.Row {
     var out: std.ArrayListUnmanaged(objective.Row) = .empty;
@@ -117,7 +131,7 @@ pub fn rows(a: std.mem.Allocator, examples: []const Example) ![]objective.Row {
 
 /// CTs must be freed before the backend; metadata uses the caller's arena.
 pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const ml.Graph, built: architecture.Built, cfg: modern.Config, examples: []const Example, random: std.Random, training: bool) ![]interpreter.RuntimeInput {
-    const l = try layout(examples);
+    const l = try bucketedLayout(examples, cfg);
     var result: std.ArrayListUnmanaged(interpreter.RuntimeInput) = .empty;
     errdefer for (result.items) |input| cb.free(input.value);
     const ids = try a.alloc(i32, l.batch * l.sequence);
@@ -248,7 +262,7 @@ pub fn step(a: std.mem.Allocator, program: *Program, trainer: *controller.Traine
     var forward = try interpreter.execute(a, &program.graph, cb, .{ .runtime_inputs = combined, .strict_integer_constants = true });
     defer forward.deinit(cb);
     const logits = try cb.toFloat32(forward.outputs[0], scratch);
-    const l = try layout(examples);
+    const l = try bucketedLayout(examples, cfg);
     const decision_rows = try rows(scratch, examples);
     const noise = try scratch.alloc(f32, if (loss_cfg.rl_weight == 0) 0 else loss_cfg.group_size * logits.len);
     for (noise) |*value| value.* = prng.random().floatNorm(f32);

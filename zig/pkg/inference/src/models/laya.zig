@@ -20,6 +20,9 @@ pub const QuestionType = enum(u8) { choice, score, noul };
 pub const max_options = 20;
 /// Candidate-branch packing gives every option its own branch (see LAYA.md).
 pub const max_packed_options = 255;
+/// Physical tokens per packed row. Segment attention keeps no `[L, L]` state;
+/// the bound keeps u32 kernel indexing and per-row staging modest.
+pub const max_packed_len_limit = 32768;
 
 /// Tree-packed execution (zig/pkg/inference/models/laya/LAYA.md). The state is a
 /// shared trunk that attends only to itself; each question, and in candidate
@@ -105,13 +108,12 @@ fn parsePacking(value: std.json.Value, max_len: usize) !Packing {
     if (mode != .string) return error.InvalidLayaConfig;
     out.mode = std.meta.stringToEnum(PackingMode, mode.string) orelse return error.InvalidLayaConfig;
     if (out.mode == .none) return out;
-    out.max_packed_len = @min(4 * max_len, 8192);
+    out.max_packed_len = @min(4 * max_len, max_packed_len_limit);
     if (value.object.get("max_packed_len")) |v| {
         if (v != .integer or v.integer < 0) return error.InvalidLayaConfig;
         out.max_packed_len = std.math.cast(usize, v.integer) orelse return error.InvalidLayaConfig;
     }
-    // Encoder and head attention materialize one [L, L] mask per packed row.
-    if (out.max_packed_len < max_len or out.max_packed_len > 8192) return error.InvalidLayaConfig;
+    if (out.max_packed_len < max_len or out.max_packed_len > max_packed_len_limit) return error.InvalidLayaConfig;
     return out;
 }
 

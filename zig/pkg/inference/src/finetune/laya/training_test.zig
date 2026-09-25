@@ -65,7 +65,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     for (examples, ref.sequences, ref.targets) |*dst, seq, target| dst.* = .{ .ids = seq.ids, .markers = seq.markers, .kind = @enumFromInt(seq.qtype), .target = target[0..seq.markers.len] };
     const config_path = try std.fmt.allocPrint(scratch, "{s}/model/config.json", .{root});
     const config = try modern.parseConfig(scratch, try files.readFile(scratch, config_path));
-    var program = try train.Program.init(a, config, try train.layout(examples), 0);
+    var program = try train.Program.init(a, config, try train.bucketedLayout(examples, config), 0);
     defer program.deinit();
     var weights = try safetensors.MMapReader.openFileAbsolute(a, try std.fmt.allocPrint(scratch, "{s}/model/model.safetensors", .{root}));
     defer weights.deinit();
@@ -98,12 +98,20 @@ test "laya training forward objective and every parameter gradient match PyTorch
     defer forward.deinit(cb);
     if (trace) try compareTraces(scratch, root, &program, cb, forward.outputs[1..], "forward");
     const logits = try cb.toFloat32(forward.outputs[0], scratch);
-    const l = try train.layout(examples);
+    const l = try train.bucketedLayout(examples, config);
     for (examples, ref.logits, 0..) |e, expected, row| for (0..e.target.len) |k| try std.testing.expectApproxEqAbs(expected[k], logits[row * l.options + k], 2e-4);
     const rows = try scratch.alloc(objective.Row, examples.len);
     for (rows, examples) |*row, e| row.* = .{ .kind = e.kind, .target = e.target };
-    const loss = try objective.evaluate(a, .{}, rows, l.options, logits, ref.noise);
+    // The PyTorch noise has the unpadded option width; the graph's options are
+    // bucketed. Score the unpadded logits and pad the cotangent back.
+    const width = (try train.layout(examples)).options;
+    const compact = try scratch.alloc(f32, examples.len * width);
+    for (0..examples.len) |row| @memcpy(compact[row * width ..][0..width], logits[row * l.options ..][0..width]);
+    const loss = try objective.evaluate(a, .{}, rows, width, compact, ref.noise);
     defer loss.deinit(a);
+    const cotangent = try scratch.alloc(f32, logits.len);
+    @memset(cotangent, 0);
+    for (0..examples.len) |row| @memcpy(cotangent[row * l.options ..][0..width], loss.gradient[row * width ..][0..width]);
     try std.testing.expectApproxEqAbs(ref.loss, loss.loss, 2e-4);
     try std.testing.expectApproxEqAbs(ref.ce, loss.ce, 2e-4);
     try std.testing.expectApproxEqAbs(ref.policy, loss.policy, 2e-4);
@@ -111,7 +119,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     for (ref.cotangent, loss.gradient) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 2e-4);
     const backward_inputs = try scratch.alloc(interpreter.RuntimeInput, combined.len + 1);
     for (combined, backward_inputs[0..combined.len]) |input, *dst| dst.* = .{ .node_id = program.gradients.id_map[input.node_id], .value = input.value };
-    const seed = try cb.fromFloat32Shape(loss.gradient, &.{ @intCast(l.questions), @intCast(l.options) });
+    const seed = try cb.fromFloat32Shape(cotangent, &.{ @intCast(l.questions), @intCast(l.options) });
     defer cb.free(seed);
     backward_inputs[combined.len] = .{ .node_id = program.gradients.id_map[program.seed], .value = seed };
     var backward = try interpreter.execute(a, &program.gradients.graph, cb, .{ .runtime_inputs = backward_inputs, .strict_integer_constants = true });

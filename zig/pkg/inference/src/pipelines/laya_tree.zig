@@ -91,6 +91,17 @@ pub fn validate(row: Row, max_len: usize, max_packed_len: usize, max_options: us
         if (segment < 0 or segment >= row.parents.len or position < 0 or position >= max_len) return error.InvalidLayaPackedRow;
         if ((segment == 0) != (kind == trunk_kind) or (kind != trunk_kind and (kind < 0 or kind > 2))) return error.InvalidLayaPackedRow;
     }
+    // Segments are contiguous and at most three deep (trunk, question,
+    // candidate), so each token's visible keys are at most three ranges.
+    for (row.segments[1..], 1..) |segment, i| {
+        if (segment != row.segments[i - 1] and segment <= row.segments[i - 1]) return error.InvalidLayaPackedRow;
+    }
+    for (row.parents) |first| {
+        var depth: usize = 0;
+        var segment = first;
+        while (segment >= 0) : (segment = row.parents[@intCast(segment)]) depth += 1;
+        if (depth > 3) return error.InvalidLayaPackedRow;
+    }
     for (row.anchors, 0..) |anchor, question| {
         if (anchor < 0 or anchor >= n or row.segments[@intCast(anchor)] == 0) return error.InvalidLayaPackedRow;
         const kind = row.kinds[@intCast(anchor)];
@@ -104,6 +115,41 @@ pub fn validate(row: Row, max_len: usize, max_packed_len: usize, max_options: us
         }
         if (valid < 2) return error.InvalidLayaPackedRow;
     }
+}
+
+/// Visible key ranges of tokens `first..` for `ops.SegmentAttention`: the
+/// `[start, end)` extent of each token's segment and of its ancestors, three
+/// pairs per token (unused pairs empty). Requires a validated row.
+pub fn ranges(a: std.mem.Allocator, row: Row, first: usize) ![]u32 {
+    const extents = try a.alloc([2]u32, row.parents.len);
+    defer a.free(extents);
+    for (extents) |*e| e.* = .{ 0, 0 };
+    var i: usize = 0;
+    while (i < row.segments.len) {
+        const segment: usize = @intCast(row.segments[i]);
+        var end = i;
+        while (end < row.segments.len and row.segments[end] == row.segments[i]) end += 1;
+        extents[segment] = .{ @intCast(i), @intCast(end) };
+        i = end;
+    }
+    const out = try a.alloc(u32, (row.ids.len - first) * 6);
+    @memset(out, 0);
+    for (first..row.ids.len) |token| {
+        var slot: usize = 0;
+        var segment = row.segments[token];
+        while (segment >= 0 and slot < 3) : (segment = row.parents[@intCast(segment)]) {
+            out[(token - first) * 6 + 2 * slot ..][0..2].* = extents[@intCast(segment)];
+            slot += 1;
+        }
+    }
+    return out;
+}
+
+/// Logical positions as i32 for `ops.SegmentAttention`.
+pub fn positions32(a: std.mem.Allocator, positions: []const i64) ![]i32 {
+    const out = try a.alloc(i32, positions.len);
+    for (out, positions) |*dst, p| dst.* = @intCast(p);
+    return out;
 }
 
 /// Dense `[L, L]` additive bias, shared by every head. With `window_half`,

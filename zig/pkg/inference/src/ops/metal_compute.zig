@@ -12746,6 +12746,28 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.hostFallbackSdpa(q_ct, k_ct, v_ct, mask, attn_bias_ct, batch, seq_len, num_heads, head_dim);
     }
 
+    /// Tree-packed segment attention on device (see `ops.SegmentAttention`).
+    fn segmentAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, request: *const ops.SegmentAttention) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var q = self.ownedDeviceMetalTensorFromCt(q_ct) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
+        defer q.deinit();
+        var k = self.ownedDeviceMetalTensorFromCt(k_ct) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
+        defer k.deinit();
+        var v = self.ownedDeviceMetalTensorFromCt(v_ct) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
+        defer v.deinit();
+        const output = (try metal_runtime.decoderRuntimeSegmentAttentionF32Device(self.provider_impl, q, k, v, request)) orelse return null;
+        return try self.ctFromOwnedMetalTensor(output);
+    }
+
     fn scaledDotProductAttentionQwen3VlVisionOp(
         ctx: *anyopaque,
         q_ct: CT,
@@ -30418,6 +30440,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.concatPrimOp = concatPrimOp;
         vt.softmaxOp = softmaxOp;
         vt.scaledDotProductAttention = scaledDotProductAttentionOp;
+        vt.segmentAttention = segmentAttentionOp;
         vt.scaledDotProductAttentionQwen3VlVision = scaledDotProductAttentionQwen3VlVisionOp;
         vt.scaledDotProductAttentionFull = scaledDotProductAttentionFullOp;
         vt.maskedBceWithLogitsLoss = maskedBceWithLogitsLossOp;

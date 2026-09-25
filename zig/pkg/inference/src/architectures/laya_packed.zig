@@ -196,25 +196,12 @@ fn trunkTensor(cb: *const ops.ComputeBackend, entry: *const trunk_cache.Entry, l
 }
 
 fn forwardCached(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row, entry: *const trunk_cache.Entry) ![]Tensor {
-    const n = row.ids.len;
     const trunk = entry.tokens;
     const hidden = cfg.hidden_size;
-    const shape = [_]i32{ @intCast(n), @intCast(n) };
-    const global_values = try tree.bias(a, row, null);
-    defer a.free(global_values);
-    const global = try cb.fromFloat32Shape(global_values, &shape);
-    defer cb.free(global);
-    const local_values = try tree.bias(a, row, cfg.local_attention_window / 2);
-    defer a.free(local_values);
-    const local = try cb.fromFloat32Shape(local_values, &shape);
-    defer cb.free(local);
-    const zeros = (try cb.zeroTensor(trunk, hidden)) orelse blk: {
-        const zero_values = try a.alloc(f32, trunk * hidden);
-        defer a.free(zero_values);
-        @memset(zero_values, 0);
-        break :blk try cb.fromFloat32Shape(zero_values, &.{ @intCast(trunk), @intCast(hidden) });
-    };
-    defer cb.free(zeros);
+    const segments = try tree.ranges(a, row, trunk);
+    defer a.free(segments);
+    const key_positions = try tree.positions32(a, row.positions);
+    defer a.free(key_positions);
     const keys = try a.alloc(ops.CT, entry.layers);
     defer a.free(keys);
     const values = try a.alloc(ops.CT, entry.layers);
@@ -233,36 +220,31 @@ fn forwardCached(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: moder
         uploaded += 1;
     }
     const layers = cfg.num_hidden_layers;
-    const encoded = try modern.forwardBranchesCT(cb, a, cfg, row.ids[trunk..], .{ .positions = row.positions[trunk..], .global_bias = global, .local_bias = local }, .{ .prefix_rows = trunk, .keys = keys[0..layers], .values = values[0..layers], .zeros = zeros });
+    const branch: modern.Packed = .{ .positions = row.positions[trunk..], .ranges = segments, .key_positions = key_positions };
+    const encoded = try modern.forwardBranchesCT(cb, a, cfg, row.ids[trunk..], branch, .{ .prefix_rows = trunk, .keys = keys[0..layers], .values = values[0..layers] });
     defer cb.free(encoded);
-    return head.forwardPackedBranches(cb, a, laya, encoded, global, row.kinds[trunk..], row.markers, row.anchors, row.width, hidden, .{ .rows = trunk, .keys = keys[layers..], .values = values[layers..], .zeros = zeros });
+    return head.forwardPackedBranches(cb, a, laya, encoded, branch, row.kinds[trunk..], row.markers, row.anchors, row.width, hidden, .{ .rows = trunk, .keys = keys[layers..], .values = values[layers..] });
 }
 
 /// Encoder and decision head over every token of one validated row.
 pub fn forwardFull(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row) ![]Tensor {
-    const n = row.ids.len;
-    const shape = [_]i32{ @intCast(n), @intCast(n) };
-    const global_values = try tree.bias(a, row, null);
-    defer a.free(global_values);
-    const global = try cb.fromFloat32Shape(global_values, &shape);
-    defer cb.free(global);
-    const local_values = try tree.bias(a, row, cfg.local_attention_window / 2);
-    defer a.free(local_values);
-    const local = try cb.fromFloat32Shape(local_values, &shape);
-    defer cb.free(local);
-    const encoded = try modern.forwardPackedCT(cb, a, cfg, row.ids, .{ .positions = row.positions, .global_bias = global, .local_bias = local });
+    const segments = try tree.ranges(a, row, 0);
+    defer a.free(segments);
+    const key_positions = try tree.positions32(a, row.positions);
+    defer a.free(key_positions);
+    const packed_row: modern.Packed = .{ .positions = row.positions, .ranges = segments, .key_positions = key_positions };
+    const encoded = try modern.forwardPackedCT(cb, a, cfg, row.ids, packed_row);
     defer cb.free(encoded);
-    return head.forwardPacked(cb, a, laya, encoded, global, row.kinds, row.markers, row.anchors, row.width, cfg.hidden_size);
+    return head.forwardPacked(cb, a, laya, encoded, packed_row, row.kinds, row.markers, row.anchors, row.width, cfg.hidden_size);
 }
 
-/// Peak transient bytes for one row: two encoder masks, attention scores for
-/// every head, and FFN activations. Packed rows are always batch 1.
+/// Peak transient bytes for one row: FFN and projection activations plus
+/// one head's segment-attention staging. Packed attention keeps no
+/// `[L, L]` state. Packed rows are always batch 1.
 pub fn workspaceBytes(cfg: modern.Config, sequence: usize) !usize {
     const mul = std.math.mul;
     const add = std.math.add;
-    const square = try mul(usize, sequence, sequence);
-    const masks = try mul(usize, square, 2);
-    const scores = try mul(usize, square, @max(cfg.num_attention_heads, cfg.hidden_size / 64));
     const activations = try mul(usize, sequence, try add(usize, try mul(usize, cfg.hidden_size, 8), try mul(usize, cfg.intermediate_size, 4)));
-    return mul(usize, try add(usize, try add(usize, masks, scores), activations), @sizeOf(f32));
+    const staging = try add(usize, try mul(usize, try mul(usize, sequence, 4), cfg.hidden_size / @max(cfg.num_attention_heads, 1)), 64 * 256);
+    return mul(usize, try add(usize, activations, staging), @sizeOf(f32));
 }

@@ -34,17 +34,19 @@ parent at every branch. Three properties follow, and each has a test:
   ModernBERT encoder exactly.
 
 On the released 421M checkpoint (Apple M4 Max, ReleaseFast), sixteen questions
-about a ~400-token state take **1,535 ms unpacked and 340 ms packed on Metal**
-and **16.1 s unpacked and 3.0 s packed on CPU**. Processed tokens fall from
-6,587 to 798. A state cache also reuses a state across requests, on the GPU
-as device-resident tensors.
+about a ~400-token state take **1,545 ms unpacked and 200 ms packed on Metal**
+and **15.6 s unpacked and 2.1 s packed on CPU**. Processed tokens fall from
+6,587 to 798. With 64 questions and a cached state, packed takes 382 ms
+against 6.1 s unpacked. Attention is segment-masked, so work follows the keys
+each token can see, and a state cache reuses a state across requests.
 
 Packing changes what the state tokens can see: they no longer attend to the
 question. A packed model therefore needs fine-tuned weights. The native
 trainer supports this, starting from a released checkpoint and optionally
 distilling from it (see [Training methodology](#training-methodology)).
-Accuracy of a packed fine-tune has **not** yet been qualified on a real
-dataset. That is the main open gate.
+At equal training budget on LocalLLaMA/typed-decisions, a packed fine-tune
+matches an unpacked one (accuracy 0.574 vs 0.572) and trains 3.4× faster (see
+[Accuracy (step 0)](#accuracy-step-0)). Candidate mode is not yet qualified.
 
 ## Evidence and motivation
 
@@ -180,8 +182,8 @@ segment:    0 (trunk)           | 1 (parent 0)              | 2 (parent 0)      
 
 `max_len` still bounds the **logical** length: the trunk plus the longest
 path. A new `max_packed_len` bounds the **physical** row. Its default is
-`min(4 * max_len, 8192)` and it is capped at 8192, because one dense `[L, L]`
-mask per row is materialized. When one row cannot hold every question, the
+`min(4 * max_len, 32768)` and it is capped at 32,768. Attention is
+segment-masked (see below), so no `[L, L]` state limits the row.
 packer splits them greedily and repeats the trunk
 (`laya_tree.build`). A state that leaves no logical room for some question's
 branch is rejected with `ExtractionTextLimitExceeded`, never truncated.
@@ -226,7 +228,8 @@ to callers.
 
 Backend status:
 
-- **CPU and Metal:** use the generic ModernBERT path with dense `[L, L]` masks.
+- **CPU and Metal:** use the generic ModernBERT path with segment attention
+  (below).
 - **Fused Metal kernels:** the resident Laya kernels (`ops/laya_metal.zig`)
   are not used for packed rows.
 - **CUDA:** does not select the Laya profile for packed configs, just as it
@@ -264,10 +267,33 @@ and later requests then hit it. The API and the pipeline are unchanged.
   last-dimension concat and slice (`modern_bert.joinRows`/`branchRows`). This
   keeps the encoder's batched command frame on. CPU uses the axis-0 concat and
   row gather directly.
-- **Remaining cost:** trunk query rows are still present, as zeros, in the
-  attention call, so attention cost is unchanged. Only the per-token
-  projections and feed-forward work for the trunk are skipped. A segment-aware
-  attention kernel (roadmap step 1b) removes the rest.
+- **Queries:** with segment attention, a cached row computes queries for its
+  branch tokens only. The trunk contributes keys and values and no work of
+  its own.
+
+### Segment attention
+
+In a packed row, the keys a token may see are the contiguous extents of its
+own segment and its ancestors: at most three ranges (trunk, question,
+candidate). `ComputeBackend.segmentAttention` (`ops.SegmentAttention`) takes
+those ranges per query (`laya_tree.ranges`), the logical positions of queries
+and keys, and a sliding window for local layers. It returns attention over
+exactly the visible keys. There are no `[L, L]` masks, and queries may be a
+suffix of the row, which the state cache uses. Every packed attention call in
+the encoder and the decision head goes through it.
+
+- **CPU (`linalg.segmentAttentionHost`):** a flash-style kernel. For each
+  64-query block it merges the block's ranges and multiplies only those key
+  chunks. Within a chunk, keys outside a query's own ranges or window get a
+  zero weight.
+- **Metal (`termite_sdpa_f32_segments`):** one threadgroup per (query, head)
+  walks the query's ranges in 256-key chunks with an online softmax, so work
+  and threadgroup memory depend only on visible keys. Ranges and positions go
+  to the GPU in a single staged blob. Outside a command frame, the runtime
+  stages every call at offset 0 of one buffer, and the first version's three
+  separate staging calls overwrote each other. The symptom was wrong
+  attention whenever a query had more than one range.
+- **Fallback:** backends without the op use the host kernel.
 
 ## Training methodology
 
@@ -340,6 +366,74 @@ was pretrained at 8,192 tokens. That in turn needs a non-materialized
 attention in the training graph, because the current graph admits
 `batch · L² · heads ≤ 64M` elements, about 2k tokens at batch 1.
 
+## Accuracy (step 0)
+
+Measured 2026-09-24 on an Apple M4 Max, ReleaseFast, Metal trainer.
+
+**Data.** [LocalLLaMA/typed-decisions](https://huggingface.co/datasets/LocalLLaMA/typed-decisions)
+at `c76749ec58bd8c3d2ea706b31c333a9059c38f90` (`all` config): 1,200 train and
+400 test cases in four workflows, with five questions per case. Train is
+shuffled with seed 20260924, and 50 cases per workflow are held out for
+calibration. Cases whose state exceeds 316 tokens are dropped from every
+split, which guarantees any question fits the 512-token budget packed or
+unpacked. The step-0 subsets are 100 train, 20 calibration, and 38 eval cases
+per workflow: 400 / 80 / 152 cases, or 2,000 / 400 / 760 decisions.
+
+**Training.** Both runs start from the released `convaiinnovations/laya` and
+run one epoch with the RLCD objective, seed 42, and default learning rates,
+with temperatures fitted on the calibration split.
+
+- **Packed:** `"packing": "question"`, one packed case per step.
+- **Unpacked:** one decision per step with gradient accumulation 5, so every
+  optimizer update sees five decisions in both runs.
+
+**Scoring.** Every model is scored on the same 760 decisions through the
+serving pipeline (`antfly inference finetune eval laya <model> <records>`,
+`finetune/laya/evaluate.zig`), with its calibration applied.
+
+| Model | Layout | Accuracy | Soft CE | ECE | Ordinal MAE | Choice / score / boolean accuracy | Train time |
+| --- | --- | ---: | ---: | ---: | ---: | --- | ---: |
+| Released `laya`, zero-shot | unpacked | 0.387 | 1.308 | 0.158 | 0.656 | 0.338 / 0.352 / 0.482 | — |
+| Released weights, zero-shot | packed | 0.361 | 1.337 | 0.133 | 0.666 | 0.197 / 0.309 / 0.592 | — |
+| Unpacked fine-tune | unpacked | 0.572 | 1.007 | 0.055 | 0.461 | 0.627 / 0.467 / 0.658 | 3 h 09 min |
+| **Packed fine-tune** | packed | **0.574** | 1.026 | 0.063 | 0.471 | 0.605 / 0.480 / 0.667 | **56 min** |
+| Upstream `laya-typed-decisions` (`1a793eb`) | unpacked | 0.754 | 0.885 | 0.193 | 0.248 | 0.724 / 0.688 / 0.873 | — |
+
+**Result.** At equal data and optimizer budget, the packed model is within
+noise of the unpacked one on every metric. That is the gate: losing early
+fusion (the state no longer sees the question) did not cost accuracy here.
+Packed training took 3.4× less wall time, and packed evaluation processed
+2.6× fewer tokens (81,745 vs 211,125).
+
+**Caveats.**
+
+- **Upstream checkpoint:** it is far ahead because it trained on all 1,200
+  cases for longer and with a 1,024-token budget. It shows what more training
+  buys, not a packed-versus-unpacked difference.
+- **Released weights in the packed layout:** these score near zero-shot chance,
+  like the unpacked released model. Upstream reports 0.362 unpacked zero-shot,
+  so the layout change alone does not break the model.
+- **Candidate mode:** not yet qualified. Its target, Banking77, is still to
+  run.
+
+**Training throughput.** Steady state on this machine: ~5–6 s per unpacked
+decision, and ~6–9 s per packed case of five decisions. Several things turned
+up along the way:
+
+- **Bucketing:** sequences are bucketed to 64 tokens and options to 4 so
+  compiled programs are reused. Parity is unchanged, but it did not shorten
+  steps, so graph construction is not the bottleneck.
+- **Batch size:** `batch_size` 4 raised throughput only from 0.88 to 1.16
+  decisions/s, and 8 gave 1.10. Cost grows about linearly with tokens.
+- **Where the time goes:** the time is per-token work in the trainer's
+  materialized attention and host/device traffic, not per-step overhead.
+- **Environment:** peak memory is ~27.5 GB. A concurrent 10 GB Zig build got
+  the trainer SIGKILLed. macOS also throttles a trainer launched from a
+  background shell (nice 5, background scheduling policy, display sleep) to a
+  few steps per hour; run it in the foreground or clear the policy
+  (`taskpolicy -B -p <pid>`) and keep the display awake. The raw logs are in
+  the work log.
+
 ## Verification
 
 All numbers are from 2026-09-24 on an Apple M4 Max (36 GiB), Zig 0.16.0.
@@ -360,6 +454,8 @@ All numbers are from 2026-09-24 on an Apple M4 Max (36 GiB), Zig 0.16.0.
 | State cache through a real session: oracle decisions on a miss and on a hit | `pipelines/laya_packed_parity_test.zig` | max probability error 1.2e-7 (CPU and Metal) |
 | Session cache hits across pipeline requests; a disabled cache returns the same decisions | same | 1 miss, 1 hit; < 1e-5 |
 | Cache pinning, LRU eviction, oversize entries | `architectures/laya_trunk_cache.zig` | unit test |
+| CPU segment kernel equals dense masked softmax (three ranges, window, fewer queries than keys) | `lib/linalg/src/attention.zig` | < 1e-5 |
+| Segment attention equals dense tree-masked attention on the session backend, all queries and branch queries only | `pipelines/laya_packed_test.zig` | 2.4e-7 (CPU), 3.6e-7 (Metal) |
 
 Reproduce the fixture-backed tests:
 
@@ -389,60 +485,45 @@ ANTFLY_LAYA_PACKED_BENCH=/abs/models/extractors/laya [ANTFLY_LAYA_BACKEND=metal]
   zig build test -Doptimize=ReleaseFast -- --test-filter "laya packed benchmark"
 ```
 
-Metal: the unpacked baseline uses the fused resident Laya kernels; packed uses
-the generic encoder.
+Current code: segment attention plus the state cache. Metal's unpacked
+baseline uses the fused resident Laya kernels. "Cached" is a repeated request
+about the same state after the first (states under 96 tokens are not cached).
 
-| State tokens (unpacked, Q=1) | Q | Unpacked ms | Packed ms | Tokens unpacked → packed |
-| ---: | ---: | ---: | ---: | ---: |
-| 55 | 1 | 58.5 | 56.5 | 55 → 56 |
-| 55 | 16 | 165.4 | 148.4 | 955 → 446 |
-| 151 | 4 | 149.3 | 87.4 | 619 → 230 |
-| 151 | 16 | 410.8 | 190.7 | 2,491 → 542 |
-| 407 | 1 | 195.5 | 139.2 | 407 → 408 |
-| 407 | 4 | 453.6 | 165.8 | 1,643 → 486 |
-| 407 | 8 | 800.1 | 219.9 | 3,295 → 594 |
-| 407 | 16 | 1,534.7 | 340.3 | 6,587 → 798 |
+| Backend | State tokens | Q | Unpacked ms | Packed ms | Packed, cached ms | Tokens unpacked → packed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Metal | 55 | 16 | 169 | 107 | 106 | 955 → 446 |
+| Metal | 151 | 16 | 419 | 132 | 119 | 2,491 → 542 |
+| Metal | 407 | 1 | 207 | 135 | 66 | 407 → 408 |
+| Metal | 407 | 4 | 477 | 147 | 83 | 1,643 → 486 |
+| Metal | 407 | 16 | 1,545 | 200 | 141 | 6,587 → 798 |
+| Metal | 407 | 64 | 6,099 | 472 | 382 | 26,363 → 2,046 |
+| CPU | 55 | 16 | 1,560 | 931 | 932 | 955 → 446 |
+| CPU | 151 | 16 | 4,248 | 1,191 | 995 | 2,491 → 542 |
+| CPU | 407 | 1 | 1,162 | 1,145 | 331 | 407 → 408 |
+| CPU | 407 | 4 | 3,890 | 1,340 | 521 | 1,643 → 486 |
+| CPU | 407 | 16 | 15,621 | 2,102 | 1,503 | 6,587 → 798 |
+| CPU | 407 | 64 | 59,180 | 5,077 | 4,332 | 26,363 → 2,046 |
 
-CPU (native BLAS), before the state cache:
+Sixty-four questions about a 400-token state take 6.1 s unpacked and 0.38 s
+packed with a cached state on Metal (16×), and 59 s against 4.3 s on CPU
+(13.7×). A follow-up question about a cached state takes 66 ms on Metal
+against 207 ms unpacked. A single question about a new state costs about the
+same packed or unpacked.
 
-| State tokens | Q | Unpacked ms | Packed ms |
-| ---: | ---: | ---: | ---: |
-| 55 | 1 | 336 | 332 |
-| 55 | 16 | 1,644 | 1,274 |
-| 151 | 16 | 5,716 | 1,888 |
-| 407 | 1 | 1,467 | 1,344 |
-| 407 | 4 | 4,020 | 1,566 |
-| 407 | 16 | 16,066 | 2,954 |
+How the numbers got here, all on the same machine and checkpoint:
 
-With the state cache (final code; `packed_cached_ms` in the benchmark
-output). Each repeated request hits the cache after the first. States under 96
-tokens are not cached, so they are omitted.
+- **RoPE on the device:** the first packed Metal implementation rotated RoPE
+  on the host. That took 56 device synchronizations per forward, added
+  200–800 ms, and lost to the fused baseline everywhere. The device M-RoPE op
+  removed the overhead.
+- **Dense masks (before step 1b):** 16 questions on a 407-token state took
+  342 ms on Metal and 2.76 s on CPU. Segment attention brought that to 200 ms
+  and 2.10 s, and the gap grows with row length.
+- **State cache before segment attention:** a cached follow-up was 108 ms on
+  Metal and 740 ms on CPU. Removing the trunk's zero query rows brought it to
+  66 ms and 331 ms.
 
-| Backend | State tokens | Q | Unpacked ms | Packed, no cache ms | Packed, cached trunk ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Metal | 151 | 1 | 79.6 | 72.0 | 66.8 |
-| Metal | 151 | 16 | 411.4 | 194.0 | 191.4 |
-| Metal | 407 | 1 | 193.5 | 137.2 | 108.5 |
-| Metal | 407 | 4 | 452.0 | 168.0 | 139.4 |
-| Metal | 407 | 8 | 788.1 | 222.4 | 192.9 |
-| CPU | 151 | 1 | 476 | 472 | 346 |
-| CPU | 151 | 16 | 4,106 | 1,611 | 1,443 |
-| CPU | 407 | 1 | 1,175 | 1,182 | 740 |
-| CPU | 407 | 4 | 4,158 | 1,675 | 1,034 |
-| CPU | 407 | 16 | 14,822 | 2,757 | 2,324 |
-
-On Metal, a follow-up question about a cached 400-token state takes 108 ms,
-against 137 ms packed uncached and 194 ms for the fused unpacked kernels. On
-CPU it takes 740 ms instead of 1,182 ms. In this run the Metal uncached
-16-question, 407-token measurement was an outlier (973 ms; three earlier runs
-gave 340–347 ms), so it is left out; the cached value was 473 ms. With this
-runtime, a single question about a new state costs the same packed or
-unpacked. The saving grows with both the
-number of questions and the state length. The first packed Metal
-implementation rotated RoPE on the host: 56 device synchronizations per
-forward added 200–800 ms and lost to the fused baseline everywhere. Moving
-RoPE onto the device M-RoPE op removed that overhead. The full raw output is
-in
+The full raw output of every run is in
 [`work-log/completed/inference/laya/2026-09-24-tree-packing.md`](../../../../../work-log/completed/inference/laya/2026-09-24-tree-packing.md).
 
 ## Roadmap
@@ -451,9 +532,9 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 
 | Step | Retraining | Status | Gate |
 | --- | --- | --- | --- |
-| 0. Qualify packed accuracy | fine-tune | recipe and tooling done; not run | Packed model within tolerance of the released model on typed-decisions, AG News, BoolQ, SST-5 (accuracy, soft CE, ECE); Banking77 for candidate mode |
+| 0. Qualify packed accuracy | fine-tune | question mode passed on typed-decisions (packed 0.574 vs unpacked 0.572 at equal budget); candidate mode on Banking77 not run | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE |
 | 1a. State cache across rows and requests | no | done (CPU and Metal) | Exact against the full row and the oracle; follow-up questions skip trunk projections and feed-forward work |
-| 1b. Segment-aware attention and multi-row calls | no | not started | Skip masked blocks: cost trunk² + Σ branch·(trunk + branch) instead of L². Removes the dense `[L, L]` masks, the 8,192-token physical cap, and the trunk queries the cache still carries. Needs a per-row segment contract so several rows share a call |
+| 1b. Segment attention | no | done (CPU and Metal); multi-row calls not started | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call remain, which needs a per-row segment contract |
 | 1c. Metal and CUDA packed kernels | no | not started | Tree masks and explicit positions in the fused Metal and CUDA kernels (the generic Metal path, device cache, and in-stream row joins are done) |
 | 1d. Weight quantization (q8_0) | no | not started | Probability error within the existing 5e-5 qualification bound |
 | 2a. Long-context teacher (Qwen3.8-27B) | labels only | not started | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
@@ -473,3 +554,7 @@ Other open items:
   softmax (step 2b).
 - **Cache memory:** the state cache stores f32. f16 storage or eviction tied to
   model admission would let it hold more states.
+- **Trainer throughput:** steps are bound by per-token work (materialized
+  attention, host/device traffic), not per-step overhead. Segment attention
+  with a backward pass in the training graph, device-resident gradients, and
+  LoRA or frozen lower layers are the next levers, alongside step 2c.

@@ -167,18 +167,11 @@ test "laya packed encoder on a one-segment tree reproduces the unpacked encoder"
         k.* = tree.trunk_kind;
     }
     const row = tree.Row{ .ids = &ids, .positions = &positions, .segments = &segments, .parents = &.{-1}, .kinds = &kinds, .anchors = &.{}, .markers = &.{}, .question_index = &.{}, .width = 0 };
-    const global_values = try tree.bias(a, row, null);
-    defer a.free(global_values);
-    const local_values = try tree.bias(a, row, fixture.encoder.local_attention_window / 2);
-    defer a.free(local_values);
-    const shape = [_]i32{ n, n };
-    const global = try cb.fromFloat32Shape(global_values, &shape);
-    defer cb.free(global);
-    const local = try cb.fromFloat32Shape(local_values, &shape);
-    defer cb.free(local);
+    const segments_row = try packedSegments(a, row);
+    defer freeSegments(a, segments_row);
     const expected_ct = try modern.forwardCT(&cb, a, fixture.encoder, &ids, &mask, 1, n);
     defer cb.free(expected_ct);
-    const actual_ct = try modern.forwardPackedCT(&cb, a, fixture.encoder, &ids, .{ .positions = &positions, .global_bias = global, .local_bias = local });
+    const actual_ct = try modern.forwardPackedCT(&cb, a, fixture.encoder, &ids, segments_row);
     defer cb.free(actual_ct);
     const expected = try cb.toFloat32(expected_ct, a);
     defer a.free(expected);
@@ -200,24 +193,77 @@ fn runRow(a: std.mem.Allocator, fixture: *const Fixture, row: tree.Row) ![2][]f3
     return .{ try a.dupe(f32, outputs[0].asFloat32()), try a.dupe(f32, outputs[1].asFloat32()) };
 }
 
+fn packedSegments(a: std.mem.Allocator, row: tree.Row) !modern.Packed {
+    return .{ .positions = row.positions, .ranges = try tree.ranges(a, row, 0), .key_positions = try tree.positions32(a, row.positions) };
+}
+
+fn freeSegments(a: std.mem.Allocator, row: modern.Packed) void {
+    a.free(row.ranges);
+    a.free(row.key_positions);
+}
+
 fn trunkEncoding(a: std.mem.Allocator, fixture: *const Fixture, row: tree.Row) ![]f32 {
     const cb = try factory.getComputeBackend(fixture.session, a);
     defer cb.deinit();
-    const n = row.ids.len;
-    const shape = [_]i32{ @intCast(n), @intCast(n) };
-    const global_values = try tree.bias(a, row, null);
-    defer a.free(global_values);
-    const local_values = try tree.bias(a, row, fixture.encoder.local_attention_window / 2);
-    defer a.free(local_values);
-    const global = try cb.fromFloat32Shape(global_values, &shape);
-    defer cb.free(global);
-    const local = try cb.fromFloat32Shape(local_values, &shape);
-    defer cb.free(local);
-    const encoded = try modern.forwardPackedCT(&cb, a, fixture.encoder, row.ids, .{ .positions = row.positions, .global_bias = global, .local_bias = local });
+    const segments_row = try packedSegments(a, row);
+    defer freeSegments(a, segments_row);
+    const encoded = try modern.forwardPackedCT(&cb, a, fixture.encoder, row.ids, segments_row);
     defer cb.free(encoded);
     const all = try cb.toFloat32(encoded, a);
     defer a.free(all);
     return a.dupe(f32, all[0 .. @as(usize, @intCast(row.anchors[0])) * synthetic.hidden]);
+}
+
+test "laya segment attention equals dense tree-masked attention on the session backend" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    var fixture = try Fixture.init(std.testing.allocator, "{\"mode\":\"candidate\"}");
+    defer fixture.deinit(std.testing.allocator);
+    const row = (try tree.build(a, tok, fixture.cfg, state_text, &questions))[0];
+    const n = row.ids.len;
+    const heads = 2;
+    const hd = 32;
+    const H = heads * hd;
+    var prng = std.Random.DefaultPrng.init(5);
+    const values = try a.alloc(f32, 3 * n * H);
+    for (values) |*x| x.* = prng.random().floatNorm(f32);
+    const cb = try factory.getComputeBackend(fixture.session, std.testing.allocator);
+    defer cb.deinit();
+    const shape = [_]i32{ @intCast(n), H };
+    var worst: f32 = 0;
+    for ([_]?usize{ null, 4 }) |window| {
+        // Dense reference: the full row with the tree bias.
+        const bias_values = try tree.bias(a, row, window);
+        const bias = try cb.fromFloat32Shape(bias_values, &.{ @intCast(n), @intCast(n) });
+        defer cb.free(bias);
+        const q = try cb.fromFloat32Shape(values[0 .. n * H], &shape);
+        defer cb.free(q);
+        const k = try cb.fromFloat32Shape(values[n * H ..][0 .. n * H], &shape);
+        defer cb.free(k);
+        const v = try cb.fromFloat32Shape(values[2 * n * H ..][0 .. n * H], &shape);
+        defer cb.free(v);
+        const mask = try a.alloc(i64, n);
+        @memset(mask, 1);
+        const dense_ct = try cb.scaledDotProductAttention(q, k, v, mask, bias, 1, n, heads, hd);
+        defer cb.free(dense_ct);
+        const dense = try cb.toFloat32(dense_ct, a);
+        // Every query, then only the branch queries against all keys.
+        for ([_]usize{ 0, @intCast(row.anchors[0]) }) |first| {
+            const queries = n - first;
+            const q_rows = try cb.fromFloat32Shape(values[first * H ..][0 .. queries * H], &.{ @intCast(queries), H });
+            defer cb.free(q_rows);
+            const packed_row: modern.Packed = .{ .positions = row.positions[first..], .ranges = try tree.ranges(a, row, first), .key_positions = try tree.positions32(a, row.positions) };
+            const out_ct = try modern.packedAttention(&cb, a, q_rows, k, v, packed_row, if (window) |w| @intCast(w) else std.math.maxInt(u32), queries, n, heads, hd);
+            defer cb.free(out_ct);
+            const out = try cb.toFloat32(out_ct, a);
+            worst = @max(worst, try maxError(dense[first * H ..], out));
+        }
+    }
+    std.debug.print("Laya segment attention ({s}) vs dense max error={d}\n", .{ @tagName(fixture.session.backend()), worst });
+    try std.testing.expect(worst < 1e-5);
 }
 
 test "laya packed questions are isolated and share one exact trunk encoding" {
@@ -418,7 +464,7 @@ test "laya packed benchmark shared-state cost against unpacked" {
     for ([_]usize{ 1, 4, 12 }) |sentences| {
         const text = try s.alloc(u8, sentence.len * sentences);
         for (0..sentences) |i| @memcpy(text[i * sentence.len ..][0..sentence.len], sentence);
-        for ([_]usize{ 1, 2, 4, 8, 16 }) |count| {
+        for ([_]usize{ 1, 2, 4, 8, 16, 64 }) |count| {
             const tasks = try s.alloc(pipeline.Task, count);
             for (tasks, 0..) |*task, i| task.* = .{ .text = text, .question = bench_questions[i % bench_questions.len] };
             var medians: [2]u64 = undefined;

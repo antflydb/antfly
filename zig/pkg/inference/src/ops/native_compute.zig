@@ -4729,6 +4729,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .convertDType = &convertDTypeOp,
     .cumulativeSum = &cumulativeSumOp,
     .cloneTensorShape = &cloneTensorShapeOp,
+    .segmentAttention = &segmentAttentionOp,
     .toFloat32 = &toFloat32Op,
     .exportTensorData = &exportTensorDataOp,
     .tensorDType = &tensorDTypeOp,
@@ -40344,6 +40345,14 @@ fn fromInt32ShapeOp(ctx: *anyopaque, data: []const i32, shape: []const i32) anye
     if ((typedShapeNumel(logical_shape[0..shape.len]) orelse return error.InvalidShape) != data.len) return error.InvalidShape;
     const tensor = try tensor_mod.Tensor.initInt32(self.allocator, "", logical_shape[0..shape.len], data);
     return try self.makeBufWithOwnedSourceTensor(tensor);
+}
+
+/// Host segment-masked attention over token-major Q/K/V (no staging copies).
+fn segmentAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.SegmentAttention) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const out = try linalg.segmentAttentionHost(self.allocator, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), request.ranges, request.query_positions, request.key_positions, request.window, request.queries, request.keys, request.num_heads, request.head_dim);
+    const result = try self.makeBuf(out, true);
+    return try self.withLogicalShape(result, &.{ @intCast(request.queries), @intCast(request.num_heads * request.head_dim) });
 }
 
 fn cloneTensorShapeOp(ctx: *anyopaque, input: CT, shape: []const i32) anyerror!?CT {

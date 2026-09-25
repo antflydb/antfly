@@ -2992,6 +2992,41 @@ pub fn decoderRuntimeApplyRope(self: anytype, request: anytype) !?MetalTensor {
 /// is axis-major (`temporal`, `height`, `width`) with `token_count` values per
 /// axis. Unlike ordinary RoPE, the position is shared by all attention heads
 /// belonging to a token and selected per frequency pair using `sections`.
+/// Segment-masked attention over token-major device Q/K/V (see
+/// `ops.SegmentAttention`). Null when the runtime or geometry is unsupported.
+pub fn decoderRuntimeSegmentAttentionF32Device(self: anytype, q: MetalTensor, k: MetalTensor, v: MetalTensor, request: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!q.isDevice() or !k.isDevice() or !v.isDevice()) return null;
+    const hidden = std.math.mul(usize, request.num_heads, request.head_dim) catch return null;
+    if (q.elemCount() != request.queries * hidden or k.elemCount() != request.keys * hidden or v.elemCount() != request.keys * hidden) return null;
+    const shape = [_]i32{ @intCast(request.queries), @intCast(hidden) };
+    var output = try MetalTensor.deviceAllocate(runtime, request.queries * hidden * @sizeOf(f32), .private, &shape);
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_sdpa_segments_f32_device(
+        runtime,
+        q.deviceHandle(),
+        q.deviceByteOffset(),
+        k.deviceHandle(),
+        k.deviceByteOffset(),
+        v.deviceHandle(),
+        v.deviceByteOffset(),
+        request.ranges.ptr,
+        request.query_positions.ptr,
+        request.key_positions.ptr,
+        request.queries,
+        request.keys,
+        request.num_heads,
+        request.head_dim,
+        request.window,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc == 0) return output;
+    output.deinit();
+    return null;
+}
+
 pub fn decoderRuntimeApplyMrope(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -19124,6 +19159,25 @@ pub extern fn termite_metal_decode_runtime_apply_rope_device(
     theta: f32,
     freq_scale: f32,
     consecutive_pairs: u32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_sdpa_segments_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    q_handle: ?*anyopaque,
+    q_offset: usize,
+    k_handle: ?*anyopaque,
+    k_offset: usize,
+    v_handle: ?*anyopaque,
+    v_offset: usize,
+    ranges: [*c]const u32,
+    query_positions: [*c]const i32,
+    key_positions: [*c]const i32,
+    queries: usize,
+    keys: usize,
+    num_heads: usize,
+    head_dim: usize,
+    window: u32,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;

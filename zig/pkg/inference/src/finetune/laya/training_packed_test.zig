@@ -37,7 +37,7 @@ const Harness = struct {
     vtable: *@import("../../ops/ops.zig").ComputeBackend.VTable,
 
     fn init(a: std.mem.Allocator, scratch: std.mem.Allocator, dir: []const u8, config: modern.Config, examples: []const train.Example) !Harness {
-        var program = try train.Program.init(a, config, try train.layout(examples), 0);
+        var program = try train.Program.init(a, config, try train.bucketedLayout(examples, config), 0);
         errdefer program.deinit();
         var weights = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ dir, "model.safetensors" }));
         defer weights.deinit();
@@ -103,7 +103,7 @@ test "laya packed training graph matches packed serving logits, alone and in a p
             defer harness.deinit();
             const logits = try train.predict(a, &harness.program, &harness.trainer, config, batch);
             defer a.free(logits);
-            const l = try train.layout(batch);
+            const l = try train.bucketedLayout(batch, config);
             var decision: usize = 0;
             for (batch) |e| {
                 const outputs = try packed_arch.forwardRow(&cb, a, config, laya, e.packed_row.?.row, null);

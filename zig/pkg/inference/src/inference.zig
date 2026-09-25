@@ -121,6 +121,7 @@ test {
     _ = @import("finetune/laya/training_packed_test.zig");
     _ = @import("finetune/laya/data.zig");
     _ = @import("finetune/laya/job.zig");
+    _ = @import("finetune/laya/evaluate.zig");
     _ = @import("pipelines/laya.zig");
     _ = @import("pipelines/laya_tree.zig");
     _ = @import("architectures/laya_trunk_cache.zig");

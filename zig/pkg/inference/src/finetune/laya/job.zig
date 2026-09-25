@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Native Laya full finetuning, deterministic resume, and serving export.
 const std = @import("std");
+const platform = @import("antfly_platform");
 const ml = @import("ml").graph;
 const data = @import("data.zig");
 const training = @import("training.zig");
@@ -68,8 +69,8 @@ pub fn validate(c: Config) !void {
 fn packing(c: Config, source: model.Config) !model.Packing {
     const mode = c.packing orelse return source.packing;
     if (mode == .none) return .{};
-    const length: usize = c.max_packed_len orelse @min(4 * source.max_len, 8192);
-    if (length < source.max_len or length > 8192) return error.InvalidLayaJob;
+    const length: usize = c.max_packed_len orelse @min(4 * source.max_len, model.max_packed_len_limit);
+    if (length < source.max_len or length > model.max_packed_len_limit) return error.InvalidLayaJob;
     return .{ .mode = mode, .max_packed_len = length };
 }
 
@@ -101,7 +102,7 @@ const Cache = struct {
     program: ?training.Program = null,
     last: architecture.Layout = .{ .batch = 0, .sequence = 0, .options = 0, .questions = 0 },
     fn get(self: *Cache, examples: []const training.Example) !*training.Program {
-        const l = try training.layout(examples);
+        const l = try training.bucketedLayout(examples, self.config);
         if (self.program == null or !std.meta.eql(l, self.last)) {
             if (self.program) |*p| p.deinit();
             self.program = null;
@@ -258,7 +259,7 @@ fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_s
     var layout = architecture.Layout{ .batch = @intCast(@min(batch_size, examples.len)), .sequence = 0, .options = 0, .questions = 0 };
     var questions: u32 = 0;
     for (examples) |e| {
-        const single = try training.layout(&.{e});
+        const single = try training.bucketedLayout(&.{e}, cfg);
         layout.sequence = @max(layout.sequence, single.sequence);
         layout.options = @max(layout.options, single.options);
         questions = @max(questions, single.questions);
@@ -464,9 +465,12 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
             }
             const program = try cache.get(batch[0..count]);
             const progress = @as(f32, @floatFromInt(epoch)) / @as(f32, @floatFromInt(@max(1, c.epochs - 1)));
+            const began = platform.time.monotonicNs();
             const report = try training.step(a, program, &trainer, encoder, batch[0..count], .{ .group_size = c.group_size, .sigma = c.sigma_start + (c.sigma_end - c.sigma_start) * progress, .rl_weight = if (c.objective == .rlcd) 1 else 0 }, c.seed +% (microbatch *% 0x9e3779b97f4a7c15));
-            try event(io, log, .{ .event = "step", .epoch = epoch + 1, .batch = batch_index + 1, .record_ids = batch_ids.items, .report = report });
-            try event(io, std.Io.File.stdout(), .{ .event = "step", .epoch = epoch + 1, .batch = batch_index + 1, .report = report });
+            // Wall time of this microbatch, including any graph build for a new shape.
+            const step_ms = @as(f64, @floatFromInt(platform.time.monotonicNs() - began)) / 1e6;
+            try event(io, log, .{ .event = "step", .epoch = epoch + 1, .batch = batch_index + 1, .record_ids = batch_ids.items, .step_ms = step_ms, .report = report });
+            try event(io, std.Io.File.stdout(), .{ .event = "step", .epoch = epoch + 1, .batch = batch_index + 1, .step_ms = step_ms, .report = report });
             if (batch_index + 1 == batches) _ = try trainer.flush(trainer.identity(), null);
             if (trainer.identity().microbatch_step % c.checkpoint_every_steps == 0 or batch_index + 1 == batches) try trainer.save(latest, identity, null);
             if (c.stop_after_microbatches) |stop| if (trainer.identity().microbatch_step >= stop) {
