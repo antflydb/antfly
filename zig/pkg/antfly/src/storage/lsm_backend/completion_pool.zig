@@ -334,9 +334,23 @@ fn entryCapacity(entry: *const entry_codec.OwnedEntry) !capacity.Cost {
     return result;
 }
 
-const replay_max_records = completion.recovery_wal_records + 2 * max_slots;
-const replay_max_entries = completion.foreground_entries + max_slots * 2 * completion.records_per_phase;
-const replay_max_bytes = completion.recovery_wal_bytes + max_slots * (completion.prepare_append_budget.bytes + completion.outcome_append_budget.bytes);
+// An installed pool can retain one staged control owner in addition to the
+// document cells. The owner may have applied one decision and up to 96 named
+// ACKs before a crash. Its native owner/progress, applied marker, and group
+// progress rows all share those WAL records. The cohort certificate already
+// rejects aggregate WAL bytes above the installed 8 MiB physical limit.
+const replay_control_mutations = 2 + control_record.progress_bitmap_bits;
+const replay_control_entries = (11 + 3 * control_record.progress_bitmap_bits) + 2 + 3 * replay_control_mutations;
+const replay_max_records = completion.recovery_wal_records + 2 * max_slots + replay_control_mutations;
+const replay_max_entries = completion.foreground_entries + max_slots * 2 * completion.records_per_phase + replay_control_entries;
+const replay_max_bytes = completion.limits.wal_bytes;
+comptime {
+    // Restored WAL is charged to the four document-cell pins, leaving the
+    // retained control owner's full future WAL credit untouched. The replay
+    // bound is at most one cell's 8 MiB credit, below the four-cell total.
+    if (replay_max_bytes > max_slots * completion.limits.wal_bytes)
+        @compileError("restored WAL exceeds prepaid document-cell credit");
+}
 const ReplayWorkspace = struct { tree: usize, pending: usize, paths: usize, total: usize };
 
 /// Replay starts with no readers or shared roots. Payload includes every WAL
@@ -3423,6 +3437,9 @@ test "workload admission completion replay workspace covers unique and replaced 
     const alloc = std.testing.allocator;
     const bound = try replayWorkspaceRequirement();
     try std.testing.expect(bound.total <= completion.scratch_bytes);
+    try std.testing.expectEqual(@as(usize, completion.limits.wal_bytes), replay_max_bytes);
+    try std.testing.expect(replay_max_bytes <= max_slots * completion.limits.wal_bytes);
+    try std.testing.expect(replay_max_records >= completion.recovery_wal_records + 2 * max_slots + 2 + control_record.progress_bitmap_bits);
     for ([_]bool{ false, true }) |replace| {
         var memory = storage_io.MemoryStorage.init(alloc);
         defer memory.deinit();

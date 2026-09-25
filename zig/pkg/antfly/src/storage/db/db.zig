@@ -144385,6 +144385,7 @@ test "workload admission physical completion restores one BEGIN owner after exac
     var begin_digest: [32]u8 = undefined;
     var decision_digest: [32]u8 = undefined;
     var ack_digest: [32]u8 = undefined;
+    var retained_owner_wal_credit: u64 = 0;
     var output_run_id: u64 = 0;
     {
         var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), options);
@@ -144427,6 +144428,8 @@ test "workload admission physical completion restores one BEGIN owner after exac
         lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals });
         try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
         output_run_id = backend.completion_pool.?.control_output_ids[0];
+        retained_owner_wal_credit = backend.completion_pool.?.control_owners[0].?.held.wal_credit;
+        try std.testing.expect(retained_owner_wal_credit > 0);
         try std.testing.expect(backend.runs.count() <= 64);
     }
     const path = std.mem.span(tmp.path().ptr);
@@ -144553,9 +144556,13 @@ test "workload admission physical completion restores one BEGIN owner after exac
         var db = try DB.open(alloc, path, reopen);
         defer db.close();
         try db.installCompletionBinding(binding, "", "", "{}", settings);
-        const pool = db.core.primary_store_owner.lsmBackend().?.completion_pool.?;
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        const pool = backend.completion_pool.?;
         try std.testing.expect(pool.restored_control_pending and !pool.ready);
         try std.testing.expectEqual(@as(u64, 2), pool.control_owners[0].?.latest.?.index);
+        try std.testing.expectEqual(retained_owner_wal_credit, pool.control_owners[0].?.held.wal_credit);
+        try std.testing.expect(backend.wal_retention.primary.?.bytes > 0);
+        try std.testing.expectEqual(backend.wal_retention.primary.?.bytes, backend.tracked_wal_retention_bytes);
         const old_lease = try db.acquireControlCompletionLeaseV2(2, 7);
         defer old_lease.vtable.release(old_lease.context);
         var old_proof: abi.ControlDurableLogV2 = .{
@@ -144633,8 +144640,12 @@ test "workload admission physical completion restores one BEGIN owner after exac
         var db = try DB.open(alloc, path, reopen);
         defer db.close();
         try db.installCompletionBinding(binding, "", "", "{}", settings);
-        const pool = db.core.primary_store_owner.lsmBackend().?.completion_pool.?;
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        const pool = backend.completion_pool.?;
         try std.testing.expect(pool.restored_control_pending and !pool.ready);
+        try std.testing.expectEqual(retained_owner_wal_credit, pool.control_owners[0].?.held.wal_credit);
+        try std.testing.expect(backend.wal_retention.primary.?.bytes > 0);
+        try std.testing.expectEqual(backend.wal_retention.primary.?.bytes, backend.tracked_wal_retention_bytes);
         const lease = try db.acquireControlCompletionLeaseV3(2, 7);
         defer lease.vtable.release(lease.context);
         var owners: abi.ControlDurableOwnersV3 = .{};
