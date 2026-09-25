@@ -20,6 +20,28 @@ this requested implementation/correctness scope.
 
 ## Current work
 
+- A fresh ReleaseFast binary at `08807fe878` passed the six-process ordinary
+  DATA quorum driver with zero cleanup errors. The driver checked all-replica
+  applied progress, successor election after DATA leader loss, exact reads,
+  and restart of the killed node. Receipt:
+  `/private/tmp/antfly-workload-data-quorum-08807-qual-1/receipt.json`.
+  This does not qualify replicated physical completion or performance.
+- An ordinary DATA startup failure under a contended owner-source mutex was
+  fixed by publishing an exact installed-group side index. A missing
+  installation now returns `NotFound` to the completion provider while an
+  installed group or side-index overflow remains fail-closed. The focused
+  owner-source and DATA callback gates each passed 1/1; the live driver above
+  passed on a binary containing the fix.
+- A sole staged owner's terminal ACK now tombstones its owner row in the
+  canonical WAL batch, checkpoints the full mutable state to its reserved run,
+  journals the manifest, resets WAL, then unlinks/syncs its guard and releases
+  ownership. Other retained owners or live document completions reject the
+  terminal ACK before acceptance. A real DB fixture covers success/reopen,
+  same-process requalification, post-manifest and post-WAL-reset interruption,
+  and a native journal-sync fault. The durable gate passed 50/50; the workload
+  gate passed 310/310 owning and 393 broad tests with one skip, no leaks.
+  Runnable nonterminal-owner restoration and multi-owner terminal interleavings
+  remain open.
 - A volatile, test-only control transition gate now accepts the first decision
   for a staged BEGIN into an exact durable sidecar before Raft acceptance. Its
   retained owner prepays the canonical decision, native owner/progress rows,
