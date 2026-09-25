@@ -752,6 +752,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         /// Published immutable model storage is charged to the session owner,
         /// not to a request scope's transient allocation allowance.
         boundary_immutable_f32: bool = false,
+        /// Training state (weights, moments, gradients) the optimizer replaces
+        /// every step. Caches keyed by buffer identity must not retain it: a
+        /// freed buffer's address is reused, so the cache would serve a copy
+        /// of an earlier step's weights.
+        mutable_state: bool = false,
     };
 
     /// The only resident tensors with a retained host representation are
@@ -5425,6 +5430,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         out_dim: usize,
     ) !?usize {
         if (!self.provider_impl.hasDecoderRuntime()) return null;
+        // Slots hold a private copy of the weight, keyed by buffer identity.
+        if (toBuf(weight).mutable_state or toBuf(bias).mutable_state) return null;
         const key = dynamicLinearSlotKey(weight, bias, in_dim, out_dim);
         if (self.dynamic_linear_slots.get(key)) |slot| return slot;
         const slot = self.nextFreeDynamicLinearSlot() orelse return null;
@@ -7200,7 +7207,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // The initial strict surface owns individual dispatches. A future
         // command-batch interface must pass an explicit owner token.
         if (self.residentExternalFrame()) return error.ResidentTrainingExternalFrame;
-        return switch (request.*) {
+        const result = try switch (request.*) {
             .upload_f32 => |r| self.residentTrainingUpload(f32, r.values, r.shape, limits, false),
             .upload_i32 => |r| self.residentTrainingUpload(i32, r.values, r.shape, limits, true),
             .adopt_f32 => |r| self.residentTrainingAdopt(r.input, r.shape, limits),
@@ -7209,6 +7216,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .gather => |r| self.residentTrainingGather(r.input, r.indices, r.input_shape, r.axis, limits),
             .scatter_add => |r| self.residentTrainingScatter(r.values, r.indices, r.input_shape, r.output_shape, r.axis, limits, control),
         };
+        toBuf(result).mutable_state = true;
+        return result;
     }
 
     fn nextBoundaryScopeGeneration() !u64 {

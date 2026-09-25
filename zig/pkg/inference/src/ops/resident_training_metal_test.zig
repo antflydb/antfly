@@ -412,3 +412,40 @@ test "resident training Metal AdamW failed partial tensor preparation releases r
     const after = metal_tensor.memoryStatsSnapshot();
     try std.testing.expectEqual(before.device_owned_live_bytes, after.device_owned_live_bytes);
 }
+
+test "resident training Metal linears always read the current weight buffer" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    var fixture = try Fixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    const cb = fixture.backend.computeBackend();
+    const rows = 4;
+    const in_dim = 32;
+    const out_dim = 16;
+    var x: [rows * in_dim]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) - 3;
+    const input = try upload(&cb, &x, &.{ rows, in_dim });
+    defer cb.free(input);
+    // Each step replaces the weight, as the optimizer does. Freed buffers
+    // are recycled, so a cache keyed by buffer identity would return an
+    // earlier step's weights.
+    for (0..8) |step| {
+        var w: [out_dim * in_dim]f32 = undefined;
+        for (&w, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i + step * 5) % 11)) * 0.125 - 0.5;
+        var b: [out_dim]f32 = undefined;
+        for (&b, 0..) |*v, i| v.* = @as(f32, @floatFromInt(step)) + @as(f32, @floatFromInt(i)) * 0.01;
+        const weight = try upload(&cb, &w, &.{ out_dim, in_dim });
+        defer cb.free(weight);
+        const bias = try upload(&cb, &b, &.{out_dim});
+        defer cb.free(bias);
+        const y = try cb.linear(input, weight, bias, rows, in_dim, out_dim);
+        defer cb.free(y);
+        const got = try cb.toFloat32(y, std.testing.allocator);
+        defer std.testing.allocator.free(got);
+        for (0..rows) |r| for (0..out_dim) |o| {
+            var want: f32 = b[o];
+            for (0..in_dim) |k| want += x[r * in_dim + k] * w[o * in_dim + k];
+            try std.testing.expectApproxEqAbs(want, got[r * out_dim + o], 1e-3);
+        };
+    }
+}
