@@ -14,6 +14,49 @@ import zig_vopr_soak as soak
 
 
 class SoakTests(unittest.TestCase):
+    def test_batched_campaign_runs_both_shards_after_a_failure(self):
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/zig-vopr-soak.yml"
+        ).read_text()
+        step = workflow.split("      - name: Run retained-corpus campaign\n", 1)[1]
+        step = step.split("      - name:", 1)[0]
+        command = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stub = root / "stub.py"
+            stub.write_text(
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "output = Path(args[args.index('--output') + 1])\n"
+                "output.mkdir(parents=True)\n"
+                "(output / 'run.json').write_text(json.dumps(args))\n"
+                "sys.exit(37 if output.name == '0' else 0)\n"
+            )
+            command = command.replace(
+                "python3 ../scripts/ci/zig_vopr_soak.py", f"python3 {stub}"
+            )
+            result = subprocess.run(
+                ["bash", "-e", "-o", "pipefail", "-c", command],
+                cwd=root,
+                env={
+                    **os.environ,
+                    "RUNNER_TEMP": directory,
+                    "SCENARIO": "standby",
+                    "HISTORY_BUDGET": "0",
+                    "DEFAULT_HISTORY_BUDGET": "1000",
+                    "RUN_NUMBER": "42",
+                    "REQUIRE_SEED": "false",
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            for shard, policy in (("0", "bounded-fair"), ("1", "adversarial")):
+                args = json.loads((root / "vopr-run" / shard / "run.json").read_text())
+                self.assertEqual(args[args.index("--exploration-policy") + 1], policy)
+                self.assertEqual(args[args.index("--histories") + 1], "1000")
+
     def test_production_pipelines_preserve_the_producer_failure(self):
         workflow = (
             Path(__file__).resolve().parents[2] / ".github/workflows/zig-vopr-soak.yml"
@@ -43,7 +86,11 @@ class SoakTests(unittest.TestCase):
                 (root / "production-e2e-soak").mkdir()
                 (root / "scripts/ci").mkdir(parents=True)
                 (root / "tools").mkdir()
-                for helper in ("run_e2e_case.py", "zig_vopr_soak.py"):
+                for helper in (
+                    "run_e2e_case.py",
+                    "zig_vopr_soak.py",
+                    "measure_disk_usage.py",
+                ):
                     shutil.copyfile(
                         Path(__file__).with_name(helper), root / "scripts/ci" / helper
                     )
@@ -75,6 +122,7 @@ class SoakTests(unittest.TestCase):
                     env={
                         **os.environ,
                         "RUNNER_TEMP": directory,
+                        "GITHUB_WORKSPACE": directory,
                         "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
                     },
                     capture_output=True,
@@ -109,6 +157,11 @@ class SoakTests(unittest.TestCase):
             ):
                 root = Path(directory)
                 (root / "tools").mkdir()
+                (root / "scripts/ci").mkdir(parents=True)
+                shutil.copyfile(
+                    Path(__file__).with_name("measure_disk_usage.py"),
+                    root / "scripts/ci/measure_disk_usage.py",
+                )
                 (root / "tools/run_bounded_zig_build.py").write_text(
                     "import json, sys\n"
                     "from pathlib import Path\n"
@@ -125,6 +178,8 @@ class SoakTests(unittest.TestCase):
                         **os.environ,
                         "VOPR_LOCAL_CACHE_DIR": "local-cache",
                         "VOPR_GLOBAL_CACHE_DIR": "global-cache",
+                        "GITHUB_WORKSPACE": directory,
+                        "RUNNER_TEMP": directory,
                     },
                     capture_output=True,
                     text=True,

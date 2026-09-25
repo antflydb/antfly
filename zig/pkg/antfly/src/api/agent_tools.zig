@@ -23,6 +23,8 @@ pub const Conversation = struct {
     messages: std.ArrayListUnmanaged(generating.ChatMessage) = .empty,
     ids: std.StringHashMapUnmanaged(void) = .empty,
     bytes: usize = 0,
+    /// Nested agents may lend a smaller history ceiling than the default.
+    limit_bytes: usize = max_bytes,
     pub const max_bytes = 256 * 1024;
     pub const max_calls_per_turn = 8;
 
@@ -36,7 +38,7 @@ pub const Conversation = struct {
     }
 
     fn reserve(self: *@This(), count: usize) !void {
-        if (count > max_bytes - self.bytes) return error.AgentContextLimitExceeded;
+        if (count > self.limit_bytes -| self.bytes) return error.AgentContextLimitExceeded;
         self.bytes += count;
     }
 
@@ -65,6 +67,54 @@ pub const Conversation = struct {
     }
 };
 
+/// Execution ceilings for one model-directed agent loop. Public retrieval
+/// requests use the defaults; composite agents such as research lend each
+/// nested run a smaller slice so the parent's declared worst case holds.
+pub const Budget = struct {
+    /// Tool calls across every round, including delegated planning.
+    max_tool_calls: i64 = default_max_tool_calls,
+    /// Retained model history, see Conversation.limit_bytes.
+    max_history_bytes: usize = Conversation.max_bytes,
+
+    pub const default_max_tool_calls: i64 = 20;
+
+    pub fn toolCalls(self: Budget) i64 {
+        return std.math.clamp(self.max_tool_calls, 0, default_max_tool_calls);
+    }
+};
+
+/// Longest prefix of `text` of at most `max_bytes` that does not split a
+/// UTF-8 sequence. Use it for every byte-bounded cut of user or model text
+/// that is later serialized as JSON.
+pub fn truncateUtf8(text: []const u8, max_bytes: usize) []const u8 {
+    if (text.len <= max_bytes) return text;
+    var end = max_bytes;
+    while (end > 0 and (text[end] & 0xc0) == 0x80) end -= 1;
+    return text[0..end];
+}
+
+/// Conservative token estimate for budgeting text whose generator tokenizer
+/// is not available locally. ASCII averages about four bytes per token for
+/// BPE vocabularies; every non-ASCII code point (CJK, emoji, most non-Latin
+/// scripts) is charged a full token so those budgets are not overrun 3-4x.
+pub fn estimateTokens(text: []const u8) usize {
+    var ascii: usize = 0;
+    var other: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const byte = text[i];
+        if (byte < 0x80) {
+            ascii += 1;
+            i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+        other += 1;
+        i += @min(len, text.len - i);
+    }
+    return (ascii + 3) / 4 + other;
+}
+
 pub fn withTools(alloc: std.mem.Allocator, chain: []const generating.ChainLink, schema: []const u8) ![]const generating.ChainLink {
     const copy = try alloc.dupe(generating.ChainLink, chain);
     for (copy) |*link| {
@@ -77,6 +127,34 @@ pub fn withTools(alloc: std.mem.Allocator, chain: []const generating.ChainLink, 
         link.generator.tool_choice_json = if (has_tools) "\"auto\"" else null;
     }
     return copy;
+}
+
+test "token estimate charges non-ASCII code points individually" {
+    try std.testing.expectEqual(@as(usize, 0), estimateTokens(""));
+    try std.testing.expectEqual(@as(usize, 1), estimateTokens("abcd"));
+    try std.testing.expectEqual(@as(usize, 2), estimateTokens("abcde"));
+    // Three CJK code points are nine bytes but at least three tokens.
+    try std.testing.expectEqual(@as(usize, 3), estimateTokens("\u{4e2d}\u{6587}\u{5b57}"));
+    // Truncated sequences never read past the slice.
+    try std.testing.expectEqual(@as(usize, 1), estimateTokens("\xe4"));
+}
+
+test "UTF-8 truncation never splits a code point" {
+    const text = "ab\u{4e2d}\u{6587}";
+    try std.testing.expectEqualStrings("ab", truncateUtf8(text, 3));
+    try std.testing.expectEqualStrings("ab", truncateUtf8(text, 4));
+    try std.testing.expectEqualStrings("ab\u{4e2d}", truncateUtf8(text, 5));
+    try std.testing.expectEqualStrings(text, truncateUtf8(text, 64));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(truncateUtf8("\u{1f600}\u{1f600}", 6)));
+}
+
+test "agent conversation honors a lent history ceiling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var history = Conversation{ .alloc = arena.allocator(), .limit_bytes = 8 };
+    try history.append(.user, "12345678", null);
+    try std.testing.expectError(error.AgentContextLimitExceeded, history.append(.user, "x", null));
+    try std.testing.expectEqual(@as(i64, 20), (Budget{ .max_tool_calls = 99 }).toolCalls());
 }
 
 test "agent tools accept OpenRouter generators" {

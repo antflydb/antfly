@@ -17701,9 +17701,7 @@ pub fn textQueryToSearchQuery(
         .match_phrase => |phrase| blk: {
             const analyzer = try resolveQueryAnalyzer(phrase.field, phrase.analyzer, text_analysis, runtime_schema);
             if (analyzer == &analysis_mod.substring_analyzer) {
-                // A phrase is contained text; the companion answers that
-                // directly and must never see the query exploded into suffixes.
-                break :blk try substringQueryToSearchQuery(alloc, phrase.field, phrase.text, phrase.boost);
+                break :blk try substringPhraseToSearchQuery(alloc, phrase.field, phrase.text, phrase.boost);
             }
             break :blk .{ .phrase = .{
                 .field = phrase.field,
@@ -18011,8 +18009,12 @@ fn highlightRootField(field: []const u8) []const u8 {
     return field;
 }
 
-fn highlightFieldIsSurfaceMatched(field: []const u8) bool {
-    return std.mem.endsWith(u8, field, "._substring") or std.mem.endsWith(u8, field, ".keyword");
+fn highlightFieldIsSubstring(field: []const u8) bool {
+    return std.mem.endsWith(u8, field, "._substring");
+}
+
+fn highlightFieldIsKeyword(field: []const u8) bool {
+    return std.mem.endsWith(u8, field, ".keyword");
 }
 
 fn highlightAutoFuzziness(term: []const u8) u8 {
@@ -18044,7 +18046,7 @@ fn collectHighlightMatchers(
         },
         .term => |term| try out.append(arena, .{
             .field = highlightRootField(term.field),
-            .matcher = if (highlightFieldIsSurfaceMatched(term.field)) .{ .contains = term.term } else .{ .term = term.term },
+            .matcher = if (highlightFieldIsKeyword(term.field)) .{ .literal = term.term } else if (highlightFieldIsSubstring(term.field)) .{ .contains = term.term } else .{ .term = term.term },
         }),
         .term_phrase => |phrase| for (phrase.terms) |term| {
             try out.append(arena, .{ .field = highlightRootField(phrase.field), .matcher = .{ .term = term } });
@@ -18061,7 +18063,7 @@ fn collectHighlightMatchers(
         }),
         .prefix => |prefix| try out.append(arena, .{
             .field = highlightRootField(prefix.field),
-            .matcher = if (highlightFieldIsSurfaceMatched(prefix.field)) .{ .contains = prefix.prefix } else .{ .prefix = prefix.prefix },
+            .matcher = if (highlightFieldIsKeyword(prefix.field)) .{ .literal_prefix = prefix.prefix } else if (highlightFieldIsSubstring(prefix.field)) .{ .contains = prefix.prefix } else .{ .prefix = prefix.prefix },
         }),
         .wildcard => |wildcard| try out.append(arena, .{ .field = highlightRootField(wildcard.field), .matcher = .{ .wildcard = wildcard.pattern } }),
         .regexp => |regexp| {
@@ -18232,12 +18234,13 @@ test "attachHighlights marks analyzed, prefix, and substring matches on stored s
             .{ .field_name = "sku", .analyzer_name = "standard" },
             .{ .field_name = "sku._substring", .analyzer_name = "substring" },
             .{ .field_name = "tags", .analyzer_name = "simple" },
+            .{ .field_name = "place.keyword", .analyzer_name = "keyword" },
         },
     };
 
     var hits = [_]types.SearchHit{
         .{ .id = try alloc.dupe(u8, "doc:1"), .stored_data = try alloc.dupe(u8,
-            \\{"title":"The Runners Handbook","sku":"Rag3-Weaver kit","tags":["alpha wing","beta","zulu wing"],"n":3}
+            \\{"title":"The Runners Handbook","sku":"Rag3-Weaver kit","tags":["alpha wing","beta","zulu wing"],"place":"New York City","n":3}
         ) },
         .{ .id = try alloc.dupe(u8, "doc:2"), .stored_data = null },
     };
@@ -18251,14 +18254,16 @@ test "attachHighlights marks analyzed, prefix, and substring matches on stored s
     // Named full-text queries contribute matchers alongside the primary one.
     const named: types.TextQuery = .{ .prefix = .{ .field = "tags", .prefix = "zu" } };
 
-    try attachHighlights(alloc, .{ .fragment_size = 64, .max_fragments = 2 }, &.{ query, named }, &hits, null, text_analysis, null);
+    const keyword: types.TextQuery = .{ .term = .{ .field = "place.keyword", .term = "New York City" } };
+    try attachHighlights(alloc, .{ .fragment_size = 64, .max_fragments = 2 }, &.{ query, named, keyword }, &hits, null, text_analysis, null);
 
     try std.testing.expectEqual(@as(usize, 0), hits[1].highlights.len);
-    try std.testing.expectEqual(@as(usize, 3), hits[0].highlights.len);
+    try std.testing.expectEqual(@as(usize, 4), hits[0].highlights.len);
 
     var saw_title = false;
     var saw_sku = false;
     var saw_tags = false;
+    var saw_place = false;
     for (hits[0].highlights) |field| {
         if (std.mem.eql(u8, field.field, "title")) {
             saw_title = true;
@@ -18278,9 +18283,13 @@ test "attachHighlights marks analyzed, prefix, and substring matches on stored s
             try std.testing.expectEqual(@as(?u32, 2), field.fragments[0].item);
             const fragment = field.fragments[0];
             try std.testing.expectEqualStrings("zulu", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
+        } else if (std.mem.eql(u8, field.field, "place")) {
+            saw_place = true;
+            const fragment = field.fragments[0];
+            try std.testing.expectEqualStrings("New York City", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
         }
     }
-    try std.testing.expect(saw_title and saw_sku and saw_tags);
+    try std.testing.expect(saw_title and saw_sku and saw_tags and saw_place);
 
     // Explicit field selection narrows the output and clones survive.
     var narrowed = [_]types.SearchHit{
@@ -18328,8 +18337,7 @@ fn fieldUsesSubstringAnalyzer(
 /// Queries against a substring-analyzed field lower to containment lookups
 /// over its suffix dictionary. Each adjacent pair of query tokens (or the lone
 /// token) is joined the way the index joins shingles and becomes a prefix
-/// lookup; pairs are conjoined, so a query of three or more tokens is
-/// answered as "every adjacent pair occurs", a superset of the exact phrase.
+/// lookup; pairs are conjoined for match queries.
 /// Queries shorter than the indexed minimum suffix can never match.
 fn substringQueryToSearchQuery(
     alloc: Allocator,
@@ -18348,12 +18356,23 @@ fn substringQueryToSearchQuery(
             try alloc.dupe(u8, tokens[0].term)
         else
             try std.mem.concat(alloc, u8, &.{ tokens[i].term, tokens[i + 1].term });
+        if (joined.len < analysis_mod.substring_min_query_length) return .{ .match_none = {} };
+        if (joined.len > analysis_mod.substring_max_query_length) return error.InvalidArgument;
         const prefix = analysis_mod.substringQueryPrefix(joined);
-        if (prefix.len < analysis_mod.substring_min_query_length) return .{ .match_none = {} };
         query.* = .{ .prefix = .{ .field = field, .prefix = prefix, .boost = boost } };
     }
     if (must.len == 1) return must[0];
     return .{ .bool_query = .{ .must = must } };
+}
+
+/// The suffix dictionary cannot verify word boundaries across three or more
+/// words: pair terms can also be suffixes of a single word. Reject those
+/// phrases instead of returning documents that do not contain the phrase.
+fn substringPhraseToSearchQuery(alloc: Allocator, field: []const u8, text: []const u8, boost: f32) !search_mod.SearchQuery {
+    const tokens = try analysis_mod.substring_query_analyzer.analyze(alloc, text);
+    defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
+    if (tokens.len > 2) return error.InvalidArgument;
+    return substringQueryToSearchQuery(alloc, field, text, boost);
 }
 
 test "substring field queries lower to suffix-dictionary prefix lookups" {
@@ -18389,10 +18408,18 @@ test "substring field queries lower to suffix-dictionary prefix lookups" {
     const short = try textQueryToSearchQuery(alloc, .{ .match = .{ .field = "name._substring", .text = "a" } }, text_analysis, null);
     try std.testing.expect(short == .match_none);
 
+    // The dictionary only stores 32-byte suffixes. Truncating a longer
+    // query would match documents that differ after byte 32.
+    try std.testing.expectError(error.InvalidArgument, textQueryToSearchQuery(alloc, .{ .match = .{ .field = "name._substring", .text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab" } }, text_analysis, null));
+
     // Phrases on the companion are contained text as well.
     const phrase = try textQueryToSearchQuery(alloc, .{ .match_phrase = .{ .field = "name._substring", .text = "Rag3 Weaver" } }, text_analysis, null);
     try std.testing.expect(phrase == .prefix);
     try std.testing.expectEqualStrings("rag3weaver", phrase.prefix.prefix);
+
+    // The suffix index cannot distinguish pair shingles from one-word
+    // suffixes at the same positions, so longer phrases are unsupported.
+    try std.testing.expectError(error.InvalidArgument, textQueryToSearchQuery(alloc, .{ .match_phrase = .{ .field = "name._substring", .text = "alpha beta gamma" } }, text_analysis, null));
 
     // Prefix queries on the companion get the same normalization.
     const prefix_query = try textQueryToSearchQuery(alloc, .{ .prefix = .{ .field = "name._substring", .prefix = "G3-We" } }, text_analysis, null);

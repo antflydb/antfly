@@ -93,13 +93,16 @@ Query lowering in `search_exec.zig` recognizes fields whose resolved analyzer is
 `substring_analyzer` (explicit companions, dynamic-template fields with
 `analyzer: substring`, and `analysis_config` overrides alike). `match`,
 `match_phrase`, and `prefix` on such a field analyze the query with `substring_query_analyzer`
-(`unicode_words → lowercase`), join each adjacent pair of tokens, bound each
-joined string to 32 bytes, and emit one prefix lookup per pair conjoined in a
-`bool_query`. A single-byte query lowers to `match_none` because one-byte
+(`unicode_words → lowercase`) and join each adjacent pair of tokens. `match`
+and `prefix` emit one prefix lookup per pair conjoined in a `bool_query`.
+`match_phrase` with three or more words is rejected because the suffix index
+cannot prove word boundaries across that many words. A pair longer than 32 bytes
+is also rejected because the suffix dictionary cannot verify the remaining bytes.
+A single-byte query lowers to `match_none` because one-byte
 suffixes are never indexed; that is the guard against the "two characters match
 everything" failure mode described in Lucivy's own benchmarks. Three-or-more
-token queries are answered as "every adjacent pair occurs", a superset of the
-exact phrase.
+token `match` queries are answered as "every adjacent pair occurs", a superset
+of the exact phrase.
 
 `term` queries on `._substring` are deliberately left raw: they match tokens
 that end with the given bytes, which is occasionally useful and never

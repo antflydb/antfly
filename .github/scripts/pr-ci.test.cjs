@@ -21,6 +21,7 @@ function fixture() {
   const statuses = [];
   const checks = [], dispatches = [], cancelled = [], runs = [], outputs = {}, notices = [];
   let permission = 'write';
+  let permissionCalls = 0;
   let files = [{filename: 'docs/guide.md'}];
   let jobs = [{name: 'PR CI result', conclusion: 'success'}];
   const github = {rest: {
@@ -43,8 +44,10 @@ function fixture() {
     },
     issues: {getComment: async () => ({data: structuredClone(comment)})},
     repos: {createCommitStatus: async body => {statuses.push(structuredClone(body));}, getCollaboratorPermissionLevel: async () => {
-      if (typeof permission === 'number') throw Object.assign(new Error('Permission lookup failed'), {status: permission});
-      return {data: {permission}};
+      permissionCalls++;
+      const current = Array.isArray(permission) ? permission.shift() : permission;
+      if (typeof current === 'number') throw Object.assign(new Error('Permission lookup failed'), {status: current});
+      return {data: {permission: current}};
     }},
     actions: {
       listWorkflowRuns: async ({status}) => runs.filter(r => r.status === status),
@@ -57,7 +60,8 @@ function fixture() {
   const core = {setOutput: (k,v) => {outputs[k]=v;}, notice: msg => notices.push(msg)};
   const env = {PR_NUMBER: '7', CHECK_ID: '1', COMMENT_ID: '17', HEAD_SHA: SHA, BASE_SHA: BASE};
   return {pr, comment, context, checks, statuses, notices, dispatches, cancelled, runs, outputs, env, github,
-    permission: value => {permission = value;}, files: value => {files = value;},
+    permission: value => {permission = value;}, permissionCalls: () => permissionCalls,
+    files: value => {files = value;},
     jobs: value => {jobs = value;},
     call: (mode='event') => main({github, context, core, mode, config, env}),
     finish: () => {
@@ -100,6 +104,33 @@ test('approval is consumed once, uses the default branch, and publishes on the P
   f.finish(); await f.call();
   assert.equal(f.checks[0].conclusion,'success');
   await assert.rejects(f.call('verify'),/expired/);
+});
+
+test('transient collaborator lookup failures retry but authorization failures remain closed', async () => {
+  const transient = fixture(); transient.permission([503, 502, 'write']);
+  await transient.call();
+  assert.equal(transient.permissionCalls(), 3);
+  assert.equal(transient.dispatches.length, 1);
+
+  const denied = fixture(); denied.permission([403, 'write']);
+  await denied.call();
+  assert.equal(denied.permissionCalls(), 1);
+  assert.equal(denied.dispatches.length, 0);
+
+  const exhausted = fixture(); exhausted.permission([503, 503, 503, 'write']);
+  await exhausted.call();
+  assert.equal(exhausted.permissionCalls(), 3);
+  assert.equal(exhausted.dispatches.length, 0);
+
+  const unknown = fixture();
+  let unknownCalls = 0;
+  unknown.github.rest.repos.getCollaboratorPermissionLevel = async () => {
+    unknownCalls++;
+    throw new Error('unexpected lookup failure');
+  };
+  await unknown.call();
+  assert.equal(unknownCalls, 1);
+  assert.equal(unknown.dispatches.length, 0);
 });
 
 test('PR checks link to the admitted run through completion and revocation', async t => {

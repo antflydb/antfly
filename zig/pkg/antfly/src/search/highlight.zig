@@ -45,6 +45,9 @@ pub const Matcher = union(enum) {
     term: []const u8,
     prefix: []const u8,
     contains: []const u8,
+    /// Exact keyword fields retain separators and case in one token.
+    literal: []const u8,
+    literal_prefix: []const u8,
     wildcard: []const u8,
     fuzzy: Fuzzy,
     regexp: Regexp,
@@ -97,6 +100,25 @@ pub fn highlightMatchers(
     var spans = std.ArrayListUnmanaged(Span).empty;
     defer spans.deinit(alloc);
     try collectMatchSpans(alloc, tokens, matchers, &spans);
+
+    for (matchers) |matcher| {
+        switch (matcher) {
+            .literal => |needle| {
+                if (needle.len == 0) continue;
+                var offset: usize = 0;
+                while (std.mem.indexOfPos(u8, text, offset, needle)) |start| {
+                    try spans.append(alloc, .{ .start = @intCast(start), .end = @intCast(start + needle.len) });
+                    offset = start + needle.len;
+                }
+            },
+            .literal_prefix => |prefix| {
+                if (prefix.len > 0 and std.mem.startsWith(u8, text, prefix)) {
+                    try spans.append(alloc, .{ .start = 0, .end = @intCast(prefix.len) });
+                }
+            },
+            else => {},
+        }
+    }
 
     // `contains` matchers come from substring companions, which index every
     // surface word and every adjacent word pair regardless of the root
@@ -208,6 +230,7 @@ fn collectMatchSpans(
                 .fuzzy => |fuzzy| if (boundedEditDistance(tok.term, fuzzy.term, fuzzy.max_edits) <= fuzzy.max_edits) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
                 .regexp => |regexp| if (regex_mod.matchesCompiled(regexp.pattern, regexp.compiled, tok.term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
                 .contains => {},
+                .literal, .literal_prefix => {},
             }
         }
     }
@@ -443,6 +466,23 @@ test "highlight contains matcher marks bytes inside and across tokens" {
     defer freeFragments(alloc, stemmed);
     try std.testing.expectEqual(@as(usize, 1), stemmed.len);
     try std.testing.expectEqualStrings("g3 Weaver", stemmed[0].text[stemmed[0].highlights[0].start..stemmed[0].highlights[0].end]);
+}
+
+test "keyword matchers highlight a whole value across three words" {
+    const alloc = std.testing.allocator;
+    const text = "New York City";
+    const exact = try highlightMatchers(alloc, text, &.{.{ .literal = text }}, &analysis_mod.simple_analyzer, 1, 100);
+    defer freeFragments(alloc, exact);
+    try std.testing.expectEqual(@as(usize, 1), exact.len);
+    try std.testing.expectEqual(@as(usize, 1), exact[0].highlights.len);
+    try std.testing.expectEqualStrings(text, exact[0].text[exact[0].highlights[0].start..exact[0].highlights[0].end]);
+
+    const prefix = try highlightMatchers(alloc, text, &.{.{ .literal_prefix = "New York" }}, &analysis_mod.simple_analyzer, 1, 100);
+    defer freeFragments(alloc, prefix);
+    try std.testing.expectEqualStrings("New York", prefix[0].text[prefix[0].highlights[0].start..prefix[0].highlights[0].end]);
+
+    const wrong_case = try highlightMatchers(alloc, text, &.{.{ .literal = "new york city" }}, &analysis_mod.simple_analyzer, 1, 100);
+    try std.testing.expectEqual(@as(usize, 0), wrong_case.len);
 }
 
 test "highlight prefix wildcard fuzzy and regexp matchers mark whole tokens" {

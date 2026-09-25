@@ -1528,7 +1528,8 @@ pub const substring_analyzer = Analyzer{
 };
 
 /// Bound a substring lookup to the longest suffix the index stores, without
-/// splitting a UTF-8 sequence.
+/// splitting a UTF-8 sequence. Callers must reject a longer query rather than
+/// treating this truncated prefix as an exact containment match.
 pub fn substringQueryPrefix(term: []const u8) []const u8 {
     return term[0..utf8BoundaryAtOrBefore(term, @min(term.len, substring_max_query_length))];
 }

@@ -10,7 +10,7 @@ import {
   SourceLink,
   type Stage,
 } from "../lib/schema/index.ts";
-import { appRoot, verifySourceLink } from "./lib.ts";
+import { appRoot, verifySourcePath } from "./lib.ts";
 
 const CURATED_DIR = join(appRoot, "data", "curated");
 
@@ -19,8 +19,6 @@ interface MergeContext {
   kernels: Set<string>;
   routes: Set<string>;
   flags: Set<string>;
-  gitCommit: string;
-  generatedAt: string;
   warnings: string[];
 }
 
@@ -28,41 +26,28 @@ export function buildMergeContext(
   opKinds: { name: string }[],
   inventory: KernelInventoryEntry[],
   routes: KernelRoute[],
-  flags: EnvFlagGate[],
-  gitCommit: string,
-  generatedAt: string
+  flags: EnvFlagGate[]
 ): MergeContext {
   return {
     opKinds: new Set(opKinds.map((o) => o.name)),
     kernels: new Set(inventory.map((k) => k.name)),
     routes: new Set(routes.map((r) => r.id)),
     flags: new Set(flags.map((f) => f.name)),
-    gitCommit,
-    generatedAt,
     warnings: [],
   };
 }
 
-function healLink(link: SourceLink | undefined, ctx: MergeContext, where: string): void {
+function verifyLink(link: SourceLink | undefined, where: string): void {
   if (!link) return;
   try {
-    const result = verifySourceLink(link);
-    if (result?.healed) {
-      if (link.line !== undefined)
-        ctx.warnings.push(
-          `healed anchor for ${where}: ${link.path}:${link.line} -> :${result.line}`
-        );
-      if (link.endLine !== undefined && link.line !== undefined)
-        link.endLine += result.line - link.line;
-      link.line = result.line;
-    }
+    verifySourcePath(link);
   } catch (err) {
     throw new Error(`${where}: ${(err as Error).message}`);
   }
 }
 
 /**
- * A curated model file is a ModelSpec minus `schemaVersion`/`sources`, or a
+ * A curated model file is a ModelSpec minus `schemaVersion`, or a
  * family file with `variants` (one topology emitted per variant with
  * stat/repeat overrides).
  */
@@ -91,7 +76,6 @@ export function mergeCuratedModels(ctx: MergeContext): ModelSpec[] {
         stages: raw.stages,
         graphs: raw.graphs,
         sankey: raw.sankey,
-        sources: { gitCommit: ctx.gitCommit, generatedAt: ctx.generatedAt },
       });
       const repeatOverrides = (variant.repeatOverrides ?? {}) as Record<string, number>;
       const stageOverrides = (variant.stageOverrides ?? {}) as Record<string, Partial<Stage>>;
@@ -141,7 +125,7 @@ export function validateSpec(spec: ModelSpec, ctx: MergeContext, file: string): 
   );
   const stageIds = new Set(spec.stages.map((s) => s.id));
   for (const stage of spec.stages) {
-    healLink(stage.source, ctx, `${file}/${stage.id}`);
+    verifyLink(stage.source, `${file}/${stage.id}`);
     if (stage.repeat?.variants) {
       const count = stage.repeat.count;
       requireUnique(
@@ -185,8 +169,8 @@ export function validateSpec(spec: ModelSpec, ctx: MergeContext, file: string): 
       for (const f of node.envFlagNames) {
         if (!ctx.flags.has(f)) throw new Error(`${where}: env flag not found in scan: "${f}"`);
       }
-      healLink(node.source, ctx, where);
-      healLink(node.lowererSource, ctx, `${where} (lowerer)`);
+      verifyLink(node.source, where);
+      verifyLink(node.lowererSource, `${where} (lowerer)`);
     }
     for (const edge of graph.edges) {
       if (!nodeIds.has(edge.from) || !nodeIds.has(edge.to)) {
@@ -227,34 +211,14 @@ export function validateSpec(spec: ModelSpec, ctx: MergeContext, file: string): 
 
 /**
  * data/curated/links.json: a registry of named SourceLinks used by TSX
- * content ({ "id": { path, anchor, line? } }). Anchors are verified and
- * line numbers healed, so prose links never rot.
+ * content ({ "id": { path } }). Every path must exist in the checkout.
  */
-export function mergeNamedLinks(ctx: MergeContext): Record<string, SourceLink> {
+export function mergeNamedLinks(): Record<string, SourceLink> {
   const file = join(CURATED_DIR, "links.json");
   if (!existsSync(file)) return {};
   const raw = z.record(z.string(), SourceLink).parse(JSON.parse(readFileSync(file, "utf8")));
   for (const [id, link] of Object.entries(raw)) {
-    healLink(link, ctx, `links.json/${id}`);
+    verifyLink(link, `links.json/${id}`);
   }
   return raw;
-}
-
-/** Collect every SourceLink in the emitted data, for the snippet cache. */
-export function collectLinks(values: unknown[]): SourceLink[] {
-  const out: SourceLink[] = [];
-  const visit = (v: unknown): void => {
-    if (Array.isArray(v)) {
-      for (const item of v) visit(item);
-    } else if (v && typeof v === "object") {
-      const obj = v as Record<string, unknown>;
-      if (typeof obj.path === "string" && (obj.path as string).startsWith("zig/")) {
-        out.push(obj as unknown as SourceLink);
-      } else {
-        for (const value of Object.values(obj)) visit(value);
-      }
-    }
-  };
-  visit(values);
-  return out;
 }

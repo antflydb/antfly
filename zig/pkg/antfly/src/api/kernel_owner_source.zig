@@ -245,6 +245,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_storage: ?@import("../common/table_storage.zig").Settings = null,
         restore: ?@import("../storage/restore_identity.zig").Identity = null,
         owner: client.Owner,
+        /// A Raft entry's pinned descriptor did not authorize current-catalog
+        /// reconciliation. The next ordinary acquisition must reopen against
+        /// the catalog, even when the descriptor bytes happen to match.
+        opened_for_historical_apply: bool = false,
         // Exact descriptor/target proof, owned by this physical generation.
         // Shared repair steps may reuse it until a structural follow-up is due.
         repair_target: ?[]u8 = null,
@@ -876,6 +880,46 @@ pub const ProvisionedKernelOwnerSource = struct {
         return count;
     }
 
+    /// True when `incoming` carries a lower durable schema version than
+    /// `current`. Table schemas persist a monotonic `version`; the storage
+    /// kernel rejects opening a lower one as `SchemaVersionRegression`, so a
+    /// caller presenting it can only be stale. Unversioned or unparseable
+    /// schemas compare as "not older" and keep the conservative drain.
+    fn schemaVersionRegresses(current: []const u8, incoming: []const u8) bool {
+        const current_version = schemaVersionFromJson(current) orelse return false;
+        const incoming_version = schemaVersionFromJson(incoming) orelse return false;
+        return incoming_version < current_version;
+    }
+
+    fn schemaVersionFromJson(schema_json: []const u8) ?u32 {
+        var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, schema_json);
+        defer scanner.deinit();
+        if ((scanner.next() catch return null) != .object_begin) return null;
+        var depth: usize = 0;
+        while (true) {
+            const token = scanner.next() catch return null;
+            switch (token) {
+                .object_begin, .array_begin => depth += 1,
+                .object_end, .array_end => {
+                    if (depth == 0) return null;
+                    depth -= 1;
+                },
+                .end_of_document => return null,
+                .string => |key| if (depth == 0 and std.mem.eql(u8, key, "version")) {
+                    const value = scanner.next() catch return null;
+                    return switch (value) {
+                        .number => |digits| std.fmt.parseInt(u32, digits, 10) catch null,
+                        else => null,
+                    };
+                } else {
+                    // Skip the value that follows this key or array element.
+                    if (depth == 0) scanner.skipValue() catch return null;
+                },
+                else => {},
+            }
+        }
+    }
+
     fn publicationPendingLocked(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) bool {
         for (self.publications.items) |publication| {
             if (publication.group_id == group_id and std.mem.eql(u8, publication.table_name, table_name)) return true;
@@ -1227,7 +1271,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // checkpoint. Yield admission conflicts to it immediately: waiting for
         // another owner lease here stalls unrelated groups and can deadlock a
         // maintenance callback waiting for this same progress driver.
-        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{}) catch |err| switch (err) {
+        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{ .historical_raft_apply = true }) catch |err| switch (err) {
             error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
             else => return err,
         };
@@ -2343,6 +2387,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         execution_deadline_ns: ?u64 = null,
         execution_io: ?@import("../runtime_io_abi.zig").Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
+        historical_raft_apply: bool = false,
 
         fn from(req: anytype) ReadControls {
             return .{ .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
@@ -2500,8 +2545,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer self.alloc.free(entries);
         for (encoded, entries) |source, *destination| destination.* = .{
             .table = source.table.slice(),
+            .storage_table = if (source.storage_table.slice().len == 0) null else source.storage_table.slice(),
             .key = source.key.slice(),
             .doc_json = source.doc_json.slice(),
+            .delete = source.delete != 0,
         };
         sink.upsertBatch(self.alloc, entries) catch |err|
             return kernel_error_identity.statusFromError(err);
@@ -2924,7 +2971,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // retains the inspection debt and retries. Explicit structural changes
         // and admitted repair work keep their writer-preference contract.
         return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .exclusive_if_idle, residency, .{}) catch |err| switch (err) {
-            error.StorageKernelOwnerTransitionRequired => null,
+            error.StorageKernelOwnerTransitionRequired, error.StorageKernelOwnerStaleDescriptor => null,
             else => return err,
         };
     }
@@ -2941,6 +2988,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !Lease {
         try controls.check();
         var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency, controls) catch |err| switch (err) {
+            error.StorageKernelOwnerStaleDescriptor => return err,
             error.StorageKernelOwnerTransitionRequired => try self.acquireDescriptorAfterTransition(
                 group_id,
                 table_name,
@@ -2977,6 +3025,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             try wait_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
             try controls.check();
             return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency, controls) catch |err| switch (err) {
+                error.StorageKernelOwnerStaleDescriptor => return err,
                 error.StorageKernelOwnerTransitionRequired => {
                     try controls.check();
                     if (platform_time.monotonicNs() >= deadline_ns) return error.StorageBusy;
@@ -3035,13 +3084,23 @@ pub const ProvisionedKernelOwnerSource = struct {
         var stale_index: ?usize = null;
         for (self.entries.items, 0..) |entry, index| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.closing) return error.StorageKernelOwnerTransitionRequired;
             // A cached owner opened before restore intent must drain as well.
             // Compare the admitted binding in memory; warm hits need no marker I/O.
             const restore_matches = if (descriptor.restore) |expected|
                 if (entry.restore) |admitted| admitted.eql(expected) else false
             else
                 true;
+            // Ordinary callers must refresh an older descriptor before they
+            // can disturb the current owner, even when that owner is idle.
+            // Committed Raft entries are different: historical apply opens
+            // the entry's schema without downgrading the durable catalog.
+            if (!controls.historical_raft_apply and entry.identity.eql(descriptor.identity) and restore_matches and
+                !std.mem.eql(u8, entry.schema_json, descriptor.schema_json) and
+                schemaVersionRegresses(entry.schema_json, descriptor.schema_json))
+            {
+                return error.StorageKernelOwnerStaleDescriptor;
+            }
+            if (entry.closing) return error.StorageKernelOwnerTransitionRequired;
             if (entry.retired or entry.generation != descriptor.lsm_root_generation or !entry.identity.eql(descriptor.identity) or !restore_matches) {
                 entry.retired = true;
                 if (entry.active_users == 0) {
@@ -3050,7 +3109,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 }
                 return error.StorageKernelOwnerTransitionRequired;
             }
-            if (!std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
+            if ((!controls.historical_raft_apply and entry.opened_for_historical_apply) or
+                !std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
                 !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
                 !std.mem.eql(u8, entry.restore_bootstrap_json, descriptor.restore_bootstrap_json) or
                 !descriptor_contract.initialRangesEqual(entry.initial_range, descriptor.initial_range) or
@@ -3065,7 +3125,16 @@ pub const ProvisionedKernelOwnerSource = struct {
                 // lease. Retire the idle owner so close drains that work, then
                 // reopen with the new exact descriptor. Live configure here
                 // would race the old descriptor's DB-owned maintenance.
-                if (entry.active_users != 0) return error.StorageKernelOwnerTransitionRequired;
+                if (entry.active_users != 0) {
+                    // An admitted descriptor change must close admission before
+                    // waiting, or overlapping readers can starve its drain.
+                    // Periodic inspection yields without retiring readers.
+                    // Historical Raft apply may need the old schema after the
+                    // current owner's leases drain.
+                    if (admission != .exclusive_if_idle and
+                        (controls.historical_raft_apply or !schemaVersionRegresses(entry.schema_json, descriptor.schema_json))) entry.retired = true;
+                    return error.StorageKernelOwnerTransitionRequired;
+                }
                 entry.retired = true;
                 stale_index = index;
                 break;
@@ -3123,6 +3192,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .restore_cancel_recovery = @intFromBool(descriptor.restore_cancel_recovery),
             .restore_ha_replay = @intFromBool(descriptor.restore_ha_replay),
             .online_source_authority = @intFromEnum(self.online_source_authority),
+            .historical_raft_apply = @intFromBool(controls.historical_raft_apply),
             .dense_embedding_storage = if (descriptor.table_storage) |settings| switch (settings.dense_embeddings) {
                 .primary_lsm => .primary_lsm,
                 .vector_store => .vector_store,
@@ -3167,6 +3237,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_storage = descriptor.table_storage,
             .restore = owned_restore,
             .owner = owner,
+            .opened_for_historical_apply = controls.historical_raft_apply,
             .active_users = 1,
             .resident = residency == .resident,
             .exclusive_pending = false,
@@ -5210,6 +5281,213 @@ test "committed owner apply yields admission conflicts and retries the exact ent
     }
 }
 
+test "committed catch-up retains newer durable schema across an older pinned descriptor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+    defer alloc.free(path);
+    var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    const old: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":0}",
+    };
+    const current: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = old.lsm_root_generation,
+        .identity = old.identity,
+        .schema_json = "{\"version\":1}",
+    };
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
+    }, 1, 1);
+    {
+        var lease = try source.acquireDescriptor(1, "docs", path, current);
+        lease.deinit();
+    }
+    // An old Raft entry can be retried after the metadata schema advances.
+    // Its already-applied marker prevents duplicate mutation, and historical
+    // admission must preserve the newer durable catalog.
+    for (0..4) |_| {
+        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+            .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"duplicate\"}" }},
+        }, 1, 1) catch |err| switch (err) {
+            error.StorageBusy => continue,
+            else => return err,
+        };
+        break;
+    } else return error.TestOwnerAdmissionDidNotRecover;
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\",\"count\":0}" }},
+    }, 1, 2);
+    const increment: db_types.BatchRequest = .{ .transforms = &.{.{
+        .key = "doc:second",
+        .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+    }} };
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, increment, 1, 3);
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, increment, 1, 3);
+    var lease = try source.acquireDescriptor(1, "docs", path, current);
+    defer lease.deinit();
+    var first = try lease.owner().lookupJson("docs", "{\"key\":\"doc:first\"}");
+    defer first.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, first.bytes(), "duplicate") == null);
+    var second = try lease.owner().lookupJson("docs", "{\"key\":\"doc:second\"}");
+    defer second.deinit();
+    try @import("antfly-json").testing.expectSubsetJsonText(alloc, "{\"title\":\"second\",\"count\":1}", second.bytes());
+}
+
+test "committed relational catch-up applies an older pinned schema version" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+    defer alloc.free(path);
+    var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    const old: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}",
+    };
+    var current = old;
+    current.schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"relational_indexes\":[{\"name\":\"id_idx\",\"keys\":[{\"column\":\"id\"}]}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"extra\":{\"type\":\"string\"}},\"additionalProperties\":false}}}}";
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        .writes = &.{.{ .key = "doc:first", .value = "{\"id\":1}" }},
+        .relational_schema_version = 1,
+    }, 1, 1);
+    var lease = try source.acquireDescriptor(1, "docs", path, current);
+    lease.deinit();
+    for (0..4) |_| {
+        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+            .writes = &.{.{ .key = "doc:second", .value = "{\"id\":2}" }},
+            .relational_schema_version = 1,
+        }, 1, 2) catch |err| switch (err) {
+            error.StorageBusy => continue,
+            else => return err,
+        };
+        break;
+    } else return error.TestOwnerAdmissionDidNotRecover;
+    var reader = try source.acquireDescriptor(1, "docs", path, current);
+    defer reader.deinit();
+    var second = try reader.owner().lookupJson("docs", "{\"key\":\"doc:second\",\"include_all_fields\":true}");
+    defer second.deinit();
+    try @import("antfly-json").testing.expectSubsetJsonText(alloc, "{\"id\":2}", second.bytes());
+}
+
+test "committed catch-up does not reconcile an older index-only descriptor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+    defer alloc.free(path);
+    var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    const old: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":0}",
+        .indexes_json = "{}",
+    };
+    const current: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = old.lsm_root_generation,
+        .identity = old.identity,
+        .schema_json = old.schema_json,
+        .indexes_json = "{\"new_idx\":{\"type\":\"full_text\"}}",
+    };
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
+    }, 1, 1);
+    {
+        var lease = try source.acquireDescriptor(1, "docs", path, current);
+        lease.deinit();
+    }
+    for (0..4) |_| {
+        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+            .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
+        }, 1, 2) catch |err| switch (err) {
+            error.StorageBusy => continue,
+            else => return err,
+        };
+        break;
+    } else return error.TestOwnerAdmissionDidNotRecover;
+    var lease = try source.acquireDescriptorOnce(1, "docs", path, old, .shared, .resident, .{ .historical_raft_apply = true });
+    defer lease.deinit();
+    // Reconciliation would have to add this index again if historical open
+    // retired it. Querying the existing owner avoids an intervening reopen.
+    const reconciled = try lease.owner().reconcile("docs", current.schema_json, current.indexes_json, null, false);
+    try std.testing.expectEqual(@as(u64, 0), reconciled.indexes_added);
+    try std.testing.expectEqual(@as(u64, 0), reconciled.indexes_removed);
+    var second = try lease.owner().lookupJson("docs", "{\"key\":\"doc:second\"}");
+    defer second.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, second.bytes(), "second") != null);
+}
+
+test "current catalog acquisition replaces a replay-only owner with the same descriptor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+    defer alloc.free(path);
+    const descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":0}",
+        .indexes_json =
+        \\{"search":{"type":"full_text","artifact_name":"chunks","enrichments":[{"name":"assets","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},{"name":"chunks","kind":"chunk","source_artifact_name":"assets","field":"text","chunk_size":128}]}}
+        ,
+    };
+    {
+        var initial = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer initial.deinit();
+        try initial.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, .{
+            .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
+        }, 1, 1);
+    }
+    var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, .{
+        .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
+    }, 1, 2);
+    try std.testing.expectEqual(@as(u64, 1), source.cacheStats().miss_count);
+    {
+        var replay = try source.acquireDescriptorOnce(1, "docs", path, descriptor, .shared, .resident, .{ .historical_raft_apply = true });
+        defer replay.deinit();
+        const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (true) {
+            var status = replay.owner().runtimeStatusJson("docs") catch |err| switch (err) {
+                error.StorageBusy => {
+                    if (platform_time.monotonicNs() >= deadline) return error.TestEnrichmentRuntimeNotObservable;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+            defer status.deinit();
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, status.bytes(), .{});
+            defer parsed.deinit();
+            const enrichment = parsed.value.object.get("stats").?.object.get("enrichment").?.object;
+            if (enrichment.get("enabled").?.bool and enrichment.get("worker_started").?.bool) break;
+            if (platform_time.monotonicNs() >= deadline) return error.TestEnrichmentRuntimeNotStarted;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    var current = try source.acquireDescriptor(1, "docs", path, descriptor);
+    defer current.deinit();
+    try std.testing.expectEqual(@as(u64, 2), source.cacheStats().miss_count);
+    var second = try current.owner().lookupJson("docs", "{\"key\":\"doc:second\"}");
+    defer second.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, second.bytes(), "second") != null);
+}
+
 test "pending exclusive storage owner lease blocks new readers until drain" {
     var entry: ProvisionedKernelOwnerSource.Entry = undefined;
     entry.active_users = 1;
@@ -5348,6 +5626,115 @@ test "storage repair lease downgrade admits readers while fencing configuration"
     try std.testing.expect(Source.tryReserveEntryLeaseLocked(&entry, .shared));
     try std.testing.expectEqual(@as(usize, 2), entry.active_users);
     try std.testing.expect(!Source.tryReserveEntryLeaseLocked(&entry, .exclusive));
+}
+
+test "owner descriptor changes close admission before draining existing readers" {
+    const Source = ProvisionedKernelOwnerSource;
+    for ([_]Source.LeaseAdmission{ .shared, .exclusive, .exclusive_if_idle }) |admission| {
+        var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer source.entries.deinit(std.testing.allocator);
+        var entry: Source.Entry = .{
+            .group_id = 1,
+            .table_name = @constCast("docs"),
+            .generation = 7,
+            .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+            .schema_json = @constCast("old schema"),
+            .indexes_json = @constCast("{}"),
+            .restore_bootstrap_json = @constCast(""),
+            .owner = undefined,
+            .active_users = 1,
+            .resident = true,
+        };
+        try source.entries.append(std.testing.allocator, &entry);
+        const descriptor: descriptor_contract.Descriptor = .{
+            .lsm_root_generation = entry.generation,
+            .identity = entry.identity,
+            .schema_json = "new schema",
+            .indexes_json = entry.indexes_json,
+        };
+        try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, .{}));
+        // Scheduled inspection yields without interrupting foreground work.
+        // An admitted change must prevent observers from extending the drain.
+        try std.testing.expectEqual(admission != .exclusive_if_idle, entry.retired);
+        if (admission != .exclusive_if_idle) {
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowEntryLocked(&entry));
+            var old_descriptor = descriptor;
+            old_descriptor.schema_json = entry.schema_json;
+            try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", old_descriptor, .shared, .resident, .{}));
+        }
+        try std.testing.expectEqual(@as(usize, 1), entry.active_users);
+    }
+}
+
+test "owner descriptor changes do not retire a live owner for an older schema version" {
+    const Source = ProvisionedKernelOwnerSource;
+    try std.testing.expectEqual(@as(?u32, 7), Source.schemaVersionFromJson("{\"default_type\":\"_default\",\"types\":{\"a\":{\"version\":1}},\"version\":7}"));
+    try std.testing.expectEqual(@as(?u32, null), Source.schemaVersionFromJson("old schema"));
+    try std.testing.expect(Source.schemaVersionRegresses("{\"version\":7}", "{\"version\":6}"));
+    try std.testing.expect(!Source.schemaVersionRegresses("{\"version\":7}", "{\"version\":8}"));
+    try std.testing.expect(!Source.schemaVersionRegresses("{\"version\":7}", "{\"version\":7}"));
+    try std.testing.expect(!Source.schemaVersionRegresses("old schema", "{\"version\":1}"));
+
+    for ([_]Source.LeaseAdmission{ .shared, .exclusive }) |admission| {
+        var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer source.entries.deinit(std.testing.allocator);
+        var entry: Source.Entry = .{
+            .group_id = 1,
+            .table_name = @constCast("docs"),
+            .generation = 7,
+            .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+            .schema_json = @constCast("{\"version\":7,\"default_type\":\"_default\"}"),
+            .indexes_json = @constCast("{}"),
+            .restore_bootstrap_json = @constCast(""),
+            .owner = undefined,
+            .active_users = 1,
+            .resident = true,
+        };
+        try source.entries.append(std.testing.allocator, &entry);
+        var descriptor: descriptor_contract.Descriptor = .{
+            .lsm_root_generation = entry.generation,
+            .identity = entry.identity,
+            .schema_json = "{\"version\":6,\"default_type\":\"_default\"}",
+            .indexes_json = entry.indexes_json,
+        };
+        // A stale caller (schema captured before the current publication)
+        // is turned away without closing admission for current readers.
+        try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, .{}));
+        try std.testing.expect(!entry.retired);
+        try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorWithMode(1, "docs", "/unused", descriptor, admission == .exclusive, .resident, .{}));
+        try std.testing.expect(!entry.retired);
+        // A newer schema still closes admission so the drain can complete.
+        descriptor.schema_json = "{\"version\":8,\"default_type\":\"_default\"}";
+        try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, .{}));
+        try std.testing.expect(entry.retired);
+        try std.testing.expectEqual(@as(usize, 1), entry.active_users);
+    }
+
+    var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.entries.deinit(std.testing.allocator);
+    var entry: Source.Entry = .{
+        .group_id = 1,
+        .table_name = @constCast("docs"),
+        .generation = 7,
+        .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .schema_json = @constCast("{\"version\":7}"),
+        .indexes_json = @constCast("{}"),
+        .restore_bootstrap_json = @constCast(""),
+        .owner = undefined,
+        .active_users = 0,
+        .resident = true,
+    };
+    try source.entries.append(std.testing.allocator, &entry);
+    const stale: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = entry.generation,
+        .identity = entry.identity,
+        .schema_json = "{\"version\":6}",
+        .indexes_json = entry.indexes_json,
+    };
+    try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", stale, .shared, .resident, .{}));
+    try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptor(1, "docs", "/unused", stale));
+    try std.testing.expect(!entry.retired);
+    try std.testing.expectEqual(@as(usize, 0), entry.active_users);
 }
 
 test "scheduled repair admission yields to readers and reuses exact configured generation" {

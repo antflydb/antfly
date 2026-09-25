@@ -1,5 +1,5 @@
 import { FrameScenario, type KernelInventoryEntry } from "../lib/schema/index.ts";
-import { verifySourceLink } from "./lib.ts";
+import { verifySourcePath } from "./lib.ts";
 import { requireUnique } from "./merge.ts";
 
 /** Validate representative frames as eagerly as the model graphs. */
@@ -25,18 +25,6 @@ export function validateFrame(raw: unknown, kernels: KernelInventoryEntry[]): Fr
       throw new Error(`${frame.id}/${scope.id}: barrier op index outside scope`);
     }
   }
-  if (frame.source) {
-    const result = verifySourceLink(frame.source);
-    if (result?.healed) {
-      if (frame.source.line !== undefined) {
-        console.warn(
-          `  warn: healed anchor for frame ${frame.id}: ${frame.source.path}:${frame.source.line} -> :${result.line}`
-        );
-      }
-      if (frame.source.endLine !== undefined && frame.source.line !== undefined)
-        frame.source.endLine += result.line - frame.source.line;
-      frame.source.line = result.line;
-    }
-  }
+  if (frame.source) verifySourcePath(frame.source);
   return frame;
 }

@@ -7654,6 +7654,786 @@ components:
           description: Evaluation results when steps.eval was configured
 
     # ==========================================
+    # Research Agent - bounded multi-phase deep research over retrieval
+    # ==========================================
+
+    ResearchPhase:
+      type: string
+      enum:
+        - plan
+        - research
+        - reflect
+        - write
+        - verify
+        - done
+      description: |
+        Research state-machine phase. `plan` decomposes the question,
+        `research` runs one bounded round of retrieval researchers, `reflect`
+        decides whether another round is needed, `write` produces the cited
+        report, `verify` checks citations, and `done` is terminal.
+
+    ResearchBudget:
+      type: object
+      description: |
+        Declared upper bounds for one research run. The worst-case LLM and
+        tool-call cost is computable before execution; requests whose worst
+        case exceeds the server ceiling are rejected, not clamped.
+      properties:
+        max_rounds:
+          type: integer
+          minimum: 1
+          maximum: 5
+          default: 2
+          description: Maximum research rounds (plan or reflect, then fan-out).
+        max_sub_questions:
+          type: integer
+          minimum: 1
+          maximum: 8
+          default: 4
+          description: Maximum sub-questions researched per round.
+        max_parallel:
+          type: integer
+          minimum: 1
+          maximum: 4
+          default: 2
+          description: Maximum researchers in flight at once.
+        researcher_iterations:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 6
+          description: Model-generation rounds available to each researcher.
+        researcher_tool_calls:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 8
+          description: Tool calls available to each researcher.
+        max_llm_calls:
+          type: integer
+          minimum: 3
+          maximum: 400
+          default: 80
+          description: Hard cap on model calls across every role in the run.
+        max_tool_calls:
+          type: integer
+          minimum: 1
+          maximum: 400
+          default: 120
+          description: Hard cap on tool calls across every researcher in the run.
+        max_evidence:
+          type: integer
+          minimum: 1
+          maximum: 400
+          default: 80
+          description: Maximum distinct evidence items retained in the registry.
+        max_report_tokens:
+          type: integer
+          minimum: 256
+          maximum: 32000
+          default: 4000
+          description: Output token budget for the report writer.
+        deadline_ms:
+          type: integer
+          minimum: 1000
+          maximum: 1800000
+          default: 600000
+          description: Wall-clock budget for a synchronous run or a single job advance.
+
+    ResearchStepConfig:
+      type: object
+      description: Configuration for one research role. Generator and chain default to the top-level request values.
+      properties:
+        enabled:
+          type: boolean
+          description: Whether the step runs. Defaults vary by step.
+        generator:
+          $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
+          description: Generator for this role.
+        chain:
+          type: array
+          items:
+            $ref: "../shared/generating.yaml#/components/schemas/ChainLink"
+          description: Chain of generators for this role.
+        instructions:
+          type: string
+          description: Additional role instructions. They cannot change authorized tables, filters, tools or budgets.
+
+    ResearchRetrievalStepConfig:
+      type: object
+      description: |
+        Configuration for researchers. Every researcher is a bounded retrieval
+        agent run over the request's authorized queries. `tools` narrows the
+        top-level tools policy and cannot widen it.
+      properties:
+        generator:
+          $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
+          description: Generator for researchers. Defaults to the top-level generator.
+        chain:
+          type: array
+          items:
+            $ref: "../shared/generating.yaml#/components/schemas/ChainLink"
+          description: Chain of generators for researchers.
+        instructions:
+          type: string
+          description: Additional researcher instructions.
+        tools:
+          $ref: "generating.yaml#/components/schemas/ChatToolsConfig"
+          description: Researcher tool policy. Narrows the top-level tools policy.
+        navigation:
+          $ref: "#/components/schemas/RetrievalNavigationConfig"
+          description: Optional tree or graph navigation available to each researcher.
+
+    ResearchWriteStepConfig:
+      type: object
+      description: Configuration for the report writer.
+      properties:
+        generator:
+          $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
+          description: Generator for the writer. Defaults to the top-level generator.
+        chain:
+          type: array
+          items:
+            $ref: "../shared/generating.yaml#/components/schemas/ChainLink"
+          description: Chain of generators for the writer.
+        instructions:
+          type: string
+          description: Additional writer instructions, for example audience or tone.
+        outline:
+          type: array
+          maxItems: 12
+          items:
+            type: string
+          description: Optional caller-supplied section headings. When omitted the writer chooses them.
+
+    ResearchAgentSteps:
+      type: object
+      description: Per-role configuration for the research agent.
+      properties:
+        plan:
+          $ref: "#/components/schemas/ResearchStepConfig"
+          description: Planner that writes the research brief and sub-questions. Always runs unless research_state carries a plan.
+        research:
+          $ref: "#/components/schemas/ResearchRetrievalStepConfig"
+          description: Researcher configuration.
+        reflect:
+          $ref: "#/components/schemas/ResearchStepConfig"
+          description: Gap analysis after each round. Enabled by default when budget.max_rounds > 1.
+        write:
+          $ref: "#/components/schemas/ResearchWriteStepConfig"
+          description: Report writer.
+        verify:
+          $ref: "#/components/schemas/ResearchStepConfig"
+          description: Optional model check that cited evidence supports each section. Disabled by default.
+
+    ResearchSubQuestion:
+      type: object
+      required:
+        - id
+        - question
+      properties:
+        id:
+          type: string
+          description: Stable sub-question identifier within the run.
+          example: "q1"
+        question:
+          type: string
+          description: Self-contained question a researcher can answer.
+        rationale:
+          type: string
+          description: Why this sub-question matters for the brief.
+        sources:
+          type: array
+          items:
+            type: string
+            enum:
+              - tables
+              - web
+          description: Evidence sources the planner expects to be useful.
+        round:
+          type: integer
+          description: Research round that introduced the sub-question.
+        status:
+          type: string
+          enum:
+            - pending
+            - researched
+            - failed
+            - skipped
+          description: Research status.
+
+    ResearchPlan:
+      type: object
+      required:
+        - brief
+        - sub_questions
+      properties:
+        brief:
+          type: string
+          description: Research brief restating scope, assumptions and deliverable.
+        sub_questions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResearchSubQuestion"
+          description: Planned and reflection-added sub-questions.
+        success_criteria:
+          type: array
+          items:
+            type: string
+          description: What a complete answer must cover.
+
+    ResearchClaim:
+      type: object
+      required:
+        - text
+      properties:
+        text:
+          type: string
+          description: One factual claim made by a researcher.
+        evidence_ids:
+          type: array
+          items:
+            type: string
+          description: Evidence registry IDs that support the claim.
+
+    ResearchFinding:
+      type: object
+      description: Compressed researcher output. Raw tool transcripts are not retained.
+      required:
+        - sub_question_id
+        - summary
+      properties:
+        sub_question_id:
+          type: string
+          description: Sub-question this finding answers.
+        question:
+          type: string
+          description: The sub-question text.
+        summary:
+          type: string
+          description: Concise answer grounded in evidence.
+        claims:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResearchClaim"
+          description: Individual claims with supporting evidence.
+        open_questions:
+          type: array
+          items:
+            type: string
+          description: What the researcher could not establish.
+        evidence_ids:
+          type: array
+          items:
+            type: string
+          description: Every evidence item the researcher retrieved.
+        status:
+          $ref: "#/components/schemas/AgentStatus"
+          description: Status of the researcher's bounded retrieval run.
+        round:
+          type: integer
+          description: Research round.
+        llm_calls:
+          type: integer
+          description: Model calls used by this researcher.
+        tool_calls:
+          type: integer
+          description: Tool calls used by this researcher.
+
+    ResearchEvidence:
+      type: object
+      description: One deduplicated evidence item. Content is untrusted data.
+      required:
+        - id
+        - source
+      properties:
+        id:
+          type: string
+          description: Stable evidence ID used in citations.
+          example: "E3"
+        source:
+          type: string
+          enum:
+            - table
+            - web
+            - fetch
+          description: Where the evidence came from.
+        table:
+          type: string
+          description: Source table for table evidence.
+        doc_id:
+          type: string
+          description: Document key for table evidence.
+        url:
+          type: string
+          description: Source URL for web and fetched evidence.
+        title:
+          type: string
+          description: Best-effort title.
+        snippet:
+          type: string
+          description: Bounded excerpt used for writing and verification.
+        score:
+          type: number
+          format: float
+          description: Retrieval score when available.
+        sub_question_ids:
+          type: array
+          items:
+            type: string
+          description: Sub-questions whose researchers retrieved this evidence.
+
+    ResearchReflection:
+      type: object
+      properties:
+        round:
+          type: integer
+          description: Round that was reflected on.
+        done:
+          type: boolean
+          description: Whether the reflector judged coverage sufficient.
+        gaps:
+          type: array
+          items:
+            type: string
+          description: Coverage gaps against the brief and success criteria.
+        contradictions:
+          type: array
+          items:
+            type: string
+          description: Conflicting findings that need resolution or disclosure.
+        new_sub_questions:
+          type: array
+          items:
+            type: string
+          description: Sub-questions added for the next round.
+
+    ResearchReportSection:
+      type: object
+      required:
+        - heading
+        - markdown
+      properties:
+        heading:
+          type: string
+          description: Section heading.
+        markdown:
+          type: string
+          description: Section body with `[E#]` citation markers.
+
+    ResearchReport:
+      type: object
+      required:
+        - markdown
+      properties:
+        title:
+          type: string
+          description: Report title.
+        summary:
+          type: string
+          description: Executive summary.
+        sections:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResearchReportSection"
+          description: Report sections.
+        markdown:
+          type: string
+          description: The full report rendered as markdown, with a sources list.
+
+    ResearchCitation:
+      type: object
+      required:
+        - marker
+        - evidence_id
+      properties:
+        marker:
+          type: string
+          description: Marker as written in the report, for example `[E3]`.
+        evidence_id:
+          type: string
+          description: Resolved evidence ID.
+        section_index:
+          type: integer
+          description: Section containing the marker. -1 is the summary.
+        count:
+          type: integer
+          description: Number of occurrences in that section.
+
+    ResearchUnsupportedClaim:
+      type: object
+      properties:
+        section_index:
+          type: integer
+          description: Section containing the claim.
+        text:
+          type: string
+          description: Claim text.
+        evidence_ids:
+          type: array
+          items:
+            type: string
+          description: Evidence the claim cited.
+        reason:
+          type: string
+          description: Why the claim is unsupported.
+
+    ResearchVerification:
+      type: object
+      properties:
+        checked_sections:
+          type: integer
+          description: Number of sections checked.
+        unresolved_markers:
+          type: array
+          items:
+            type: string
+          description: Citation markers that did not resolve to evidence and were removed.
+        uncited_sections:
+          type: array
+          items:
+            type: integer
+          description: Sections without any resolvable citation.
+        unsupported:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResearchUnsupportedClaim"
+          description: Claims the verifier judged unsupported by their cited evidence.
+        supported_ratio:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: Share of checked claims judged supported.
+
+    ResearchUsage:
+      type: object
+      properties:
+        llm_calls:
+          type: integer
+          description: Model calls across every role.
+        tool_calls:
+          type: integer
+          description: Tool calls across every researcher.
+        researcher_runs:
+          type: integer
+          description: Researcher executions.
+        rounds:
+          type: integer
+          description: Research rounds completed.
+        evidence_count:
+          type: integer
+          description: Evidence items in the registry.
+        elapsed_ms:
+          type: integer
+          format: int64
+          description: Wall-clock time consumed so far.
+
+    ResearchState:
+      type: object
+      description: |
+        Client-carried continuation state. Sending it back resumes the run at
+        `phase` without repeating completed work. It never contains raw tool
+        transcripts, credentials or connection settings. Evidence snippets are
+        bounded excerpts of documents the caller was authorized to read; every
+        resumed request is re-authorized.
+
+        The server signs the state it returns (`signature`) and rejects a
+        state whose signature does not verify, so a client cannot alter a
+        checkpoint, including its budget counters. Send the state back
+        unmodified. Signatures are valid across a cluster that shares an
+        internal service secret, otherwise only on the server that issued them
+        and until it restarts; use durable jobs to resume across restarts.
+      required:
+        - phase
+      properties:
+        signature:
+          type: string
+          description: Server signature over this state. Do not modify the state.
+        phase:
+          $ref: "#/components/schemas/ResearchPhase"
+        round:
+          type: integer
+          description: Completed research rounds.
+        plan:
+          $ref: "#/components/schemas/ResearchPlan"
+        findings:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResearchFinding"
+        evidence:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResearchEvidence"
+        reflections:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResearchReflection"
+        report:
+          $ref: "#/components/schemas/ResearchReport"
+        citations:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResearchCitation"
+        verification:
+          $ref: "#/components/schemas/ResearchVerification"
+        usage:
+          $ref: "#/components/schemas/ResearchUsage"
+
+    ResearchIncompleteDetails:
+      type: object
+      required:
+        - reason
+      properties:
+        reason:
+          type: string
+          enum:
+            - max_rounds
+            - max_llm_calls
+            - max_tool_calls
+            - deadline
+            - no_evidence
+            - clarification_required
+            - cancelled
+            - phase_limit
+          description: |
+            Why the run stopped:
+            - max_rounds: research rounds were exhausted before the reflector was satisfied (the report is still written)
+            - max_llm_calls / max_tool_calls: a hard budget was exhausted
+            - deadline: the wall-clock budget elapsed
+            - no_evidence: researchers found no evidence to write from
+            - clarification_required: the planner needs a user decision
+            - cancelled: a durable job was cancelled
+            - phase_limit: a job advance stopped after its requested number of phases
+        message:
+          type: string
+          description: Human-readable detail.
+
+    ResearchAgentRequest:
+      type: object
+      description: |
+        Request for the research agent. The agent plans sub-questions, runs a
+        bounded retrieval researcher per sub-question in parallel, reflects on
+        coverage, and writes a long-form report whose `[E#]` citations resolve
+        to a deduplicated evidence registry.
+
+        Researchers are ordinary retrieval-agent runs over `queries` with the
+        same authorization, mandatory predicates and tool policy. They cannot
+        widen tables, filters, tools or budgets.
+      required:
+        - query
+        - queries
+      properties:
+        query:
+          type: string
+          description: The research question.
+          example: "How do Antfly's hybrid search and reranking interact, and what are the tuning trade-offs?"
+        queries:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryRequest"
+          description: |
+            Authorized table scopes, as for the retrieval agent. `filter_query`
+            and `exclusion_query` are mandatory predicates for every researcher.
+            May be empty when web search is enabled.
+        messages:
+          type: array
+          items:
+            $ref: "../shared/generating.yaml#/components/schemas/ChatMessage"
+          description: Optional conversational context.
+        agent_knowledge:
+          type: string
+          description: Domain context for every role.
+        accumulated_filters:
+          type: array
+          items:
+            $ref: "generating.yaml#/components/schemas/FilterSpec"
+          description: Mandatory filters applied to every researcher search.
+        session_id:
+          type: string
+          description: Correlation identifier echoed back to the client.
+        decisions:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentDecision"
+          description: Structured user answers for client-carried continuation.
+        interactive:
+          type: boolean
+          default: false
+          description: If true, the planner may return clarification questions instead of a plan.
+        generator:
+          $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
+          description: Default generator for every role.
+        chain:
+          type: array
+          items:
+            $ref: "../shared/generating.yaml#/components/schemas/ChainLink"
+          description: Default chain of generators for every role.
+        tools:
+          $ref: "generating.yaml#/components/schemas/ChatToolsConfig"
+          description: Default tool policy for researchers, for example `web_search` and `fetch`.
+        steps:
+          $ref: "#/components/schemas/ResearchAgentSteps"
+        budget:
+          $ref: "#/components/schemas/ResearchBudget"
+        research_state:
+          $ref: "#/components/schemas/ResearchState"
+          description: Continuation state returned by an earlier run.
+        max_context_tokens:
+          type: integer
+          description: Per-researcher tool-result context budget in tokens.
+        reserve_tokens:
+          type: integer
+          minimum: 0
+          description: Tokens reserved from max_context_tokens for prompts and answers.
+        stream:
+          type: boolean
+          default: true
+          description: Enable SSE streaming vs JSON response.
+
+    ResearchAgentResult:
+      type: object
+      description: Result from the research agent.
+      required:
+        - status
+        - research_state
+      properties:
+        id:
+          type: string
+          description: Unique response ID.
+          example: "resr_cr3ig20h5tbs73e3ahrg"
+        model:
+          type: string
+          description: Writer model.
+        created_at:
+          type: integer
+          format: int64
+          description: Unix timestamp (seconds) when the response was created.
+        status:
+          $ref: "#/components/schemas/AgentStatus"
+        incomplete_details:
+          $ref: "#/components/schemas/ResearchIncompleteDetails"
+        phase:
+          $ref: "#/components/schemas/ResearchPhase"
+        usage:
+          $ref: "#/components/schemas/ResearchUsage"
+        plan:
+          $ref: "#/components/schemas/ResearchPlan"
+        findings:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResearchFinding"
+        evidence:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResearchEvidence"
+        reflections:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResearchReflection"
+        report:
+          $ref: "#/components/schemas/ResearchReport"
+        citations:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResearchCitation"
+        verification:
+          $ref: "#/components/schemas/ResearchVerification"
+        research_state:
+          $ref: "#/components/schemas/ResearchState"
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentStep"
+          description: Execution trace.
+        questions:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentQuestion"
+          description: Clarification questions when status is clarification_required.
+        session_id:
+          type: string
+          description: Echoed correlation identifier.
+
+    ResearchJobState:
+      type: string
+      enum:
+        - queued
+        - running
+        - succeeded
+        - failed
+        - cancelled
+      description: Durable research job lifecycle state.
+
+    ResearchJobStartRequest:
+      type: object
+      required:
+        - request
+      properties:
+        request:
+          $ref: "#/components/schemas/ResearchAgentRequest"
+          description: |
+            The research request. `stream` is ignored. Durable jobs persist the
+            request, so generators must reference credentials through the
+            secret store, environment or server connections rather than inline
+            API keys.
+        advance:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 0
+          description: Number of phases to run before the start call returns.
+
+    ResearchJobAdvanceRequest:
+      type: object
+      properties:
+        max_phases:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 1
+          description: Maximum phases to run in this advance. Each phase checkpoints before the next starts.
+
+    ResearchJob:
+      type: object
+      required:
+        - job_id
+        - state
+        - phase
+      properties:
+        job_id:
+          type: string
+          description: Job identifier.
+        state:
+          $ref: "#/components/schemas/ResearchJobState"
+        phase:
+          $ref: "#/components/schemas/ResearchPhase"
+        query:
+          type: string
+          description: The research question.
+        advances:
+          type: integer
+          description: Completed advance calls.
+        cancel_requested:
+          type: boolean
+          description: Whether cancellation was requested.
+        last_error:
+          type: string
+          description: Last advance error, if any.
+        created_at_ms:
+          type: integer
+          format: int64
+        updated_at_ms:
+          type: integer
+          format: int64
+        expires_at_ms:
+          type: integer
+          format: int64
+        result:
+          $ref: "#/components/schemas/ResearchAgentResult"
+          description: Latest checkpointed result, including research_state.
+
+    # ==========================================
     # Answer Agent (DEPRECATED) - Backward-compatible wrapper for Retrieval Agent
     # ==========================================
 
@@ -11889,6 +12669,217 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /agents/research:
+    post:
+      summary: Research Agent - Bounded multi-phase research with a cited report
+      tags:
+        - query_operations
+      description: |
+        Runs a bounded research state machine:
+        plan → research (parallel retrieval researchers) → reflect → … → write → verify
+
+        Every researcher is an ordinary retrieval-agent run over the request's
+        authorized queries, so authorization, mandatory predicates and tool
+        policy are identical to `/agents/retrieval`. Researchers return
+        compressed findings; the writer only sees findings and a deduplicated
+        evidence registry, and the server validates every `[E#]` citation.
+
+        All work is bounded by `budget`. Send `research_state` back to resume
+        or extend a run. For runs longer than one request, use
+        `/agents/research/jobs`.
+
+        **SSE Event Types:** the retrieval-agent events are reused.
+        `step_progress` carries `phase` values `plan`, `sub_question_started`,
+        `finding`, `reflection`, `section` and `verification`. Report text
+        streams as `generation`. `done` carries the authoritative
+        ResearchAgentResult.
+      operationId: researchAgent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResearchAgentRequest"
+      responses:
+        "200":
+          description: Research agent response
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Server-Sent Events stream. See SSEEvent for event types.
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResearchAgentResult"
+        "400":
+          description: Invalid research agent request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: The caller lacks read permission on a requested table or tool connection
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          $ref: "#/components/responses/QueryPayloadTooLarge"
+        "422":
+          $ref: "#/components/responses/QueryUnprocessable"
+        "429":
+          $ref: "#/components/responses/QueryRateLimited"
+        "502":
+          $ref: "#/components/responses/QueryBadGateway"
+        "503":
+          $ref: "#/components/responses/AgentTemporarilyUnavailable"
+        "504":
+          $ref: "#/components/responses/QueryGatewayTimeout"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /agents/research/jobs:
+    post:
+      summary: Start a durable research job
+      description: |
+        Persists a research request as a durable job that advances one bounded
+        phase at a time. Each phase checkpoints its research_state, so a job
+        survives server restarts and can be resumed by any caller holding the
+        same identity. Jobs are scoped to the authenticated principal.
+      tags:
+        - query_operations
+      operationId: startResearchJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResearchJobStartRequest"
+      responses:
+        "202":
+          description: Research job durably accepted
+          headers:
+            Location:
+              description: Relative URL of the durable research job resource.
+              schema: { type: string }
+            Retry-After:
+              description: Suggested delay in seconds before the next advance or poll.
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResearchJob"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: The caller lacks read permission on a requested table or tool connection
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/QueryRateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /agents/research/jobs/{jobId}:
+    parameters:
+      - name: jobId
+        in: path
+        required: true
+        description: Research job identifier.
+        schema:
+          type: string
+    get:
+      summary: Get a durable research job
+      tags:
+        - query_operations
+      operationId: getResearchJob
+      responses:
+        "200":
+          description: Research job status and latest checkpoint
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResearchJob"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /agents/research/jobs/{jobId}/advance:
+    parameters:
+      - name: jobId
+        in: path
+        required: true
+        description: Research job identifier.
+        schema:
+          type: string
+    post:
+      summary: Advance a durable research job
+      description: |
+        Runs up to `max_phases` bounded research phases and persists the
+        checkpoint after each one. Concurrent advances of the same job are
+        rejected with 409.
+      tags:
+        - query_operations
+      operationId: advanceResearchJob
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResearchJobAdvanceRequest"
+      responses:
+        "202":
+          description: Research job advanced
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResearchJob"
+        "200":
+          description: Research job was already terminal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResearchJob"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/QueryRateLimited"
+        "502":
+          $ref: "#/components/responses/QueryBadGateway"
+        "503":
+          $ref: "#/components/responses/AgentTemporarilyUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /agents/research/jobs/{jobId}/cancel:
+    parameters:
+      - name: jobId
+        in: path
+        required: true
+        description: Research job identifier.
+        schema:
+          type: string
+    post:
+      summary: Cancel a durable research job
+      tags:
+        - query_operations
+      operationId: cancelResearchJob
+      responses:
+        "200":
+          description: Research job cancelled or already terminal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResearchJob"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
   /tables:
     get:
       summary: List all tables

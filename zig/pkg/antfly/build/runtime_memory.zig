@@ -81,7 +81,10 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // reservation; the former monolithic 24/22 GiB measurements
         // do not describe either of these independent artifacts.
         .storage_kernel => 20 * 1024 * 1024 * 1024,
-        .distributed => 11 * 1024 * 1024 * 1024,
+        // The aarch64-macOS ReleaseSafe distributed unit reached 12.14 GB
+        // after the September 2026 runtime changes. Keep a measured margin
+        // without reducing Linux runner concurrency.
+        .distributed => @as(usize, if (target.os.tag == .macos) 13 else 11) * 1024 * 1024 * 1024,
         .enrichment_compute => 4 * 1024 * 1024 * 1024,
         // This is deliberately a separate non-PIC product unit. The
         // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
@@ -105,6 +108,13 @@ test "measured release reservations admit storage with inference and preserve un
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
     const measured: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .ReleaseFast, .strip = true, .cpu_inference = true };
     const budget = 22 * 1024 * 1024 * 1024;
+    try std.testing.expectEqual(@as(usize, 13) * 1024 * 1024 * 1024, runtimeCompileMaxRss(.distributed, .{
+        .host = macos,
+        .target = macos,
+        .optimize = .ReleaseSafe,
+        .strip = false,
+        .cpu_inference = true,
+    }));
     try std.testing.expect(runtimeCompileMaxRss(.storage_kernel, measured) + runtimeCompileMaxRss(.inference, measured) <= budget);
     var conservative = measured;
     conservative.cpu_inference = false;
