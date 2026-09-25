@@ -176,7 +176,8 @@ Inputs:
 - `budget`: `max_rounds`, `max_sub_questions`, `max_parallel`, `researcher_iterations`, `researcher_tool_calls`,
   `max_llm_calls`, `max_tool_calls`, `max_evidence`, `max_report_tokens`, `deadline_ms`. Budgets are cumulative over
   `research_state.usage`, so a resumed run cannot exceed the declared worst case.
-- `research_state`: client-carried continuation. Sending it back resumes at its `phase`.
+- `research_state`: client-carried continuation. Sending it back resumes at its `phase`. It is signed by the
+  server and must be returned unmodified.
 - bounded-agent fields: `session_id`, `decisions`, `interactive` (planner clarification, default false).
 
 Outputs:

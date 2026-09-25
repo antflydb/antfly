@@ -213,14 +213,18 @@ describe("useResearchStream", () => {
   it("ignores a run that is stopped while it is still connecting", async () => {
     let finishConnect: (() => void) | undefined;
     let callbacks: Parameters<typeof utils.streamResearch>[3] | undefined;
+    let connectSignal: AbortSignal | undefined;
     const lateController = new AbortController();
-    vi.mocked(utils.streamResearch).mockImplementation(async (_url, _request, _headers, cbs) => {
-      callbacks = cbs;
-      await new Promise<void>((resolve) => {
-        finishConnect = resolve;
-      });
-      return lateController;
-    });
+    vi.mocked(utils.streamResearch).mockImplementation(
+      async (_url, _request, _headers, cbs, signal) => {
+        callbacks = cbs;
+        connectSignal = signal;
+        await new Promise<void>((resolve) => {
+          finishConnect = resolve;
+        });
+        return lateController;
+      }
+    );
 
     const { result } = renderHook(() => useResearchStream());
     let started: Promise<void> | undefined;
@@ -229,10 +233,12 @@ describe("useResearchStream", () => {
     });
     await waitFor(() => expect(finishConnect).toBeDefined());
 
-    // Stop before streamResearch resolves.
+    // Stop before streamResearch resolves: the in-flight request is aborted.
+    expect(connectSignal?.aborted).toBe(false);
     act(() => {
       result.current.stopStream();
     });
+    expect(connectSignal?.aborted).toBe(true);
     await act(async () => {
       finishConnect?.();
       await started;

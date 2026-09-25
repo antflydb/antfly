@@ -139,4 +139,27 @@ describe("research agent SSE parsing", () => {
     expect(String(url)).toContain("/agents/research");
     expect(JSON.parse(String(options?.body)).stream).toBe(false);
   });
+
+  it("aborts a request that is still connecting when the caller signal aborts", async () => {
+    let fetchSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      (_input, init) =>
+        new Promise((_resolve, reject) => {
+          fetchSignal = init?.signal ?? undefined;
+          fetchSignal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError"))
+          );
+        })
+    );
+    const caller = new AbortController();
+    const pending = new AntflyClient({ baseUrl: "http://localhost:8080" }).streamResearchAgent(
+      request,
+      {},
+      { signal: caller.signal }
+    );
+    await vi.waitFor(() => expect(fetchSignal).toBeDefined());
+    caller.abort();
+    expect(fetchSignal?.aborted).toBe(true);
+    await expect(pending).rejects.toThrow("aborted");
+  });
 });

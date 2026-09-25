@@ -58,6 +58,11 @@ const QueryHit = metadata.QueryHit;
 const JsonObject = std.json.ArrayHashMap(std.json.Value);
 
 pub const Options = struct {
+    /// Key for signing returned research_state and verifying a client-carried
+    /// one. Null disables both (embedded callers and unit tests).
+    state_key: ?[32]u8 = null,
+    /// The state is server-held (durable jobs), so it is not verified.
+    trusted_state: bool = false,
     /// Stop after this many phases and return status in_progress. Durable
     /// jobs advance one bounded phase at a time; null runs to completion.
     max_phases: ?usize = null,
@@ -167,8 +172,11 @@ const Registry = struct {
         try self.by_key.put(arena, try dedupKey(arena, item), i);
         try self.by_ref.put(arena, item.id, i);
         if (item.url) |url| {
+            // Web snippets and fetched pages of one URL are one evidence item;
+            // both hit ID forms resolve to it, before and after a restore.
             try self.by_ref.put(arena, url, i);
-            try self.by_ref.put(arena, try std.fmt.allocPrint(arena, "{s}:{s}", .{ item.source, url }), i);
+            try self.by_ref.put(arena, try std.fmt.allocPrint(arena, "web:{s}", .{url}), i);
+            try self.by_ref.put(arena, try std.fmt.allocPrint(arena, "fetch:{s}", .{url}), i);
         }
         if (item.doc_id) |doc| {
             // A bare key may name documents in several tables; the first one
@@ -197,6 +205,9 @@ const Registry = struct {
                 if (candidate.title != null) existing.title = candidate.title;
             }
             existing.sub_question_ids = try appendUnique(arena, existing.sub_question_ids orelse &[_][]const u8{}, sub_question_id);
+            // The merged hit's own ID must resolve too (for example the
+            // fetch: ID that upgraded a web: snippet).
+            if (!self.by_ref.contains(hit._id)) try self.by_ref.put(arena, try arena.dupe(u8, hit._id), i);
             return existing.id;
         }
         if (self.items.items.len >= self.max) return null;
@@ -1526,6 +1537,69 @@ pub fn parseRequest(arena: std.mem.Allocator, body: []const u8) !Parsed {
     return .{ .request = request, .raw = raw.object };
 }
 
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+
+/// Canonical bytes a signature covers: the typed state re-encoded without
+/// its signature, with null, false, zero, empty-string, empty-array and
+/// empty-object values dropped at every depth. SDKs that omit zero values or
+/// reformat floats still round-trip to the same bytes, while any change to a
+/// meaningful value (including lowering a counter) changes them.
+fn canonicalState(arena: std.mem.Allocator, state: State) ![]const u8 {
+    var unsigned = state;
+    unsigned.signature = null;
+    const encoded = try std.json.Stringify.valueAlloc(arena, unsigned, .{ .emit_null_optional_fields = false });
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, encoded, .{ .allocate = .alloc_always });
+    const stripped = (try stripZero(arena, value)) orelse std.json.Value{ .object = std.json.ObjectMap.empty };
+    return std.json.Stringify.valueAlloc(arena, stripped, .{});
+}
+
+fn stripZero(arena: std.mem.Allocator, value: std.json.Value) !?std.json.Value {
+    switch (value) {
+        .null => return null,
+        .bool => |b| return if (b) value else null,
+        .integer => |n| return if (n != 0) value else null,
+        .float => |f| return if (f != 0) value else null,
+        .number_string => return value,
+        .string => |text| return if (text.len > 0) value else null,
+        .array => |items| {
+            var out = std.json.Array.init(arena);
+            // Array positions are meaningful: keep zero elements as null.
+            for (items.items) |item| try out.append((try stripZero(arena, item)) orelse .null);
+            return if (out.items.len > 0) std.json.Value{ .array = out } else null;
+        },
+        .object => |object| {
+            var out = std.json.ObjectMap.empty;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (try stripZero(arena, entry.value_ptr.*)) |kept| try out.put(arena, entry.key_ptr.*, kept);
+            }
+            return if (out.count() > 0) std.json.Value{ .object = out } else null;
+        },
+    }
+}
+
+fn signState(arena: std.mem.Allocator, key: [32]u8, state: State) ![]const u8 {
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, try canonicalState(arena, state), &key);
+    const hex = std.fmt.bytesToHex(mac, .lower);
+    return arena.dupe(u8, &hex);
+}
+
+fn verifyState(arena: std.mem.Allocator, key: [32]u8, state: State) !void {
+    const presented = state.signature orelse return error.InvalidResearchState;
+    const expected = try signState(arena, key, state);
+    if (presented.len != expected.len) return error.InvalidResearchState;
+    var diff: u8 = 0;
+    for (presented, expected) |a, b| diff |= a ^ b;
+    if (diff != 0) return error.InvalidResearchState;
+}
+
+/// Verify the client-carried research_state of a parsed request, if any.
+/// Durable job start calls this before the state becomes server-held.
+pub fn verifyRequestState(arena: std.mem.Allocator, parsed: Parsed, key: [32]u8) !void {
+    if (parsed.request.research_state) |state| try verifyState(arena, key, state);
+}
+
 /// Run the state machine from the request (or its research_state) until done,
 /// a clarification, a budget stop, the deadline, or options.max_phases.
 pub fn run(
@@ -1564,7 +1638,12 @@ pub fn run(
         .registry = .{ .max = budget.max_evidence },
         .single_table = if (tables == 1) single_table else null,
     };
-    if (request.research_state) |state| try run_state.restore(state);
+    if (request.research_state) |state| {
+        // A client-carried checkpoint must be one this server issued,
+        // unmodified; durable jobs hold theirs server-side.
+        if (!options.trusted_state) if (options.state_key) |key| try verifyState(arena, key, state);
+        try run_state.restore(state);
+    }
 
     var phases: usize = 0;
     var status: AgentStatus = .completed;
@@ -1606,7 +1685,8 @@ pub fn run(
     if (status == .completed and run_state.incomplete != null) status = .incomplete;
     if (status == .completed and run_state.phase != .done) status = .incomplete;
 
-    const state = run_state.snapshot();
+    var state = run_state.snapshot();
+    if (options.state_key) |key| state.signature = try signState(arena, key, state);
     const now_s: i64 = @intCast(@divTrunc(platform_time.realtimeNs(), std.time.ns_per_s));
     var id_hash = std.hash.Wyhash.init(started);
     id_hash.update(request.query);
@@ -1919,6 +1999,12 @@ test "citation scan keeps resolvable markers and ignores ordinary brackets" {
     try source.map.put(a, "text", .{ .string = "full page" });
     try std.testing.expectEqualStrings("E1", (try registry.addHit(a, .{ ._id = "fetch:https://x.test/a", ._score = 1, ._source = source }, null, "q2")).?);
     try std.testing.expectEqualStrings("fetch", registry.items.items[0].source);
+    try std.testing.expectEqualStrings("E1", registry.resolve("fetch:https://x.test/a").?);
+    // A registry restored from the checkpoint resolves both aliases alike.
+    var restored = Registry{ .max = 10 };
+    try restored.restore(a, registry.items.items);
+    try std.testing.expectEqualStrings("E1", restored.resolve("fetch:https://x.test/a").?);
+    try std.testing.expectEqualStrings("E1", restored.resolve("web:https://x.test/a").?);
     try std.testing.expectEqualStrings("full page", registry.items.items[0].snippet.?);
     try std.testing.expectEqual(@as(usize, 2), registry.items.items[0].sub_question_ids.?.len);
 }
@@ -2245,4 +2331,51 @@ test "research rejects forged continuation counters" {
     }
     // Nothing ran for any forged state.
     try std.testing.expectEqual(@as(usize, 0), fake.calls.load(.monotonic));
+}
+
+test "research signs its checkpoints and rejects modified or unsigned ones" {
+    var fake = TestFake{};
+    const r = fake.runners(null);
+    const key = [_]u8{7} ** 32;
+    const first_encoded = try execute(std.testing.allocator, r[0], r[1], test_request, null, .{ .max_phases = 1, .state_key = key });
+    defer std.testing.allocator.free(first_encoded.body);
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const first = try std.json.parseFromSliceLeaky(std.json.Value, arena, first_encoded.body, .{ .allocate = .alloc_always });
+    const state_json = try std.json.Stringify.valueAlloc(arena, first.object.get("research_state").?, .{});
+    try std.testing.expect(first.object.get("research_state").?.object.get("signature") != null);
+
+    const Resume = struct {
+        /// An independent deep copy of the returned state.
+        fn state(a: std.mem.Allocator, encoded: []const u8) !std.json.ObjectMap {
+            return (try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{ .allocate = .alloc_always })).object;
+        }
+        fn body(a: std.mem.Allocator, research_state: std.json.ObjectMap) ![]const u8 {
+            var request = (try std.json.parseFromSliceLeaky(std.json.Value, a, test_request, .{ .allocate = .alloc_always })).object;
+            try request.put(a, "research_state", .{ .object = research_state });
+            return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = request }, .{});
+        }
+    };
+    // Unmodified: resumes. Clients that drop zero values still verify.
+    var trimmed = try Resume.state(arena, state_json);
+    _ = trimmed.getPtr("usage").?.object.orderedRemove("rounds");
+    const resumed = try execute(std.testing.allocator, r[0], r[1], try Resume.body(arena, trimmed), null, .{ .state_key = key });
+    std.testing.allocator.free(resumed.body);
+
+    // Lowered counter, missing signature, edited round: rejected.
+    var lowered = try Resume.state(arena, state_json);
+    try lowered.getPtr("usage").?.object.put(arena, "llm_calls", .{ .integer = 0 });
+    var unsigned = try Resume.state(arena, state_json);
+    _ = unsigned.orderedRemove("signature");
+    var edited = try Resume.state(arena, state_json);
+    try edited.put(arena, "round", .{ .integer = 1 });
+    for ([_]std.json.ObjectMap{ lowered, unsigned, edited }) |forged| {
+        try std.testing.expectError(error.InvalidResearchState, execute(std.testing.allocator, r[0], r[1], try Resume.body(arena, forged), null, .{ .state_key = key }));
+    }
+    // A checkpoint from a server with another key is rejected.
+    try std.testing.expectError(error.InvalidResearchState, execute(std.testing.allocator, r[0], r[1], try Resume.body(arena, try Resume.state(arena, state_json)), null, .{ .state_key = [_]u8{8} ** 32 }));
+    // Durable jobs hold their state server-side and skip verification.
+    const trusted = try execute(std.testing.allocator, r[0], r[1], try Resume.body(arena, try Resume.state(arena, state_json)), null, .{ .state_key = key, .trusted_state = true });
+    std.testing.allocator.free(trusted.body);
 }

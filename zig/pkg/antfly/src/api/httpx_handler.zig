@@ -5415,6 +5415,7 @@ pub const AntflyApiHandler = struct {
         return switch (err) {
             error.InvalidResearchAgentRequest, error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => jsonErrorResponse(ctx, 400, "invalid research agent request"),
             error.InlineCredentialNotAllowed => jsonErrorResponse(ctx, 400, "durable research jobs must reference credentials through the secret store, environment or server connections"),
+            error.InvalidResearchState => jsonErrorResponse(ctx, 400, "research_state was modified or issued by another server; send it back unmodified, or use durable jobs to resume across restarts"),
             error.UnsupportedAgentToolProvider => jsonErrorResponse(ctx, 400, "agent tools require an Antfly or OpenAI tool-capable generator"),
             error.MissingGenerationConfig => jsonErrorResponse(ctx, 422, "research requires a top-level generator or chain, or generators for plan, research and write"),
             error.Forbidden => jsonErrorResponse(ctx, 403, "forbidden"),
@@ -5469,6 +5470,7 @@ pub const AntflyApiHandler = struct {
         var sink = RetrievalSseSink{ .context = ctx };
         const response = research_agent.execute(alloc, runners.query.iface(), runners.generation.iface(), body_data, sink.iface(), .{
             .deadline_ns = runners.generation.request_context.deadline_ns,
+            .state_key = try self.api_server.researchStateKey(ctx.io),
         }) catch |err| {
             if (sink.writer != null) {
                 if (sink.failed or ctx.isCancellationRequested()) return err;
@@ -5511,6 +5513,9 @@ pub const AntflyApiHandler = struct {
         // Validate and authorize now so a bad job fails at creation.
         const parsed = research_agent.parseRequest(arena, request_json) catch |err| return researchErrorResponse(ctx, err);
         _ = research_agent.Budget.fromRequest(parsed.request.budget) catch |err| return researchErrorResponse(ctx, err);
+        // A job's stored state is trusted from here on, so a client-carried
+        // checkpoint must verify before it is stored.
+        research_agent.verifyRequestState(arena, parsed, try self.api_server.researchStateKey(ctx.io)) catch |err| return researchErrorResponse(ctx, err);
         var runners = self.agentRunners(ctx, source, authenticated_identity, research_agent.deadlineMs(arena, request_json));
         for (parsed.request.queries) |query| {
             const table = query.table orelse return jsonErrorResponse(ctx, 400, "invalid research job request");

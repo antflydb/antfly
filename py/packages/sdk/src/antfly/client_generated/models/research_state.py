@@ -31,11 +31,19 @@ class ResearchState:
     bounded excerpts of documents the caller was authorized to read; every
     resumed request is re-authorized.
 
+    The server signs the state it returns (`signature`) and rejects a
+    state whose signature does not verify, so a client cannot alter a
+    checkpoint, including its budget counters. Send the state back
+    unmodified. Signatures are valid across a cluster that shares an
+    internal service secret, otherwise only on the server that issued them
+    and until it restarts; use durable jobs to resume across restarts.
+
         Attributes:
             phase (ResearchPhase): Research state-machine phase. `plan` decomposes the question,
                 `research` runs one bounded round of retrieval researchers, `reflect`
                 decides whether another round is needed, `write` produces the cited
                 report, `verify` checks citations, and `done` is terminal.
+            signature (str | Unset): Server signature over this state. Do not modify the state.
             round_ (int | Unset): Completed research rounds.
             plan (ResearchPlan | Unset):
             findings (list[ResearchFinding] | Unset):
@@ -48,6 +56,7 @@ class ResearchState:
     """
 
     phase: ResearchPhase
+    signature: str | Unset = UNSET
     round_: int | Unset = UNSET
     plan: ResearchPlan | Unset = UNSET
     findings: list[ResearchFinding] | Unset = UNSET
@@ -61,6 +70,8 @@ class ResearchState:
 
     def to_dict(self) -> dict[str, Any]:
         phase = self.phase.value
+
+        signature = self.signature
 
         round_ = self.round_
 
@@ -115,6 +126,8 @@ class ResearchState:
                 "phase": phase,
             }
         )
+        if signature is not UNSET:
+            field_dict["signature"] = signature
         if round_ is not UNSET:
             field_dict["round"] = round_
         if plan is not UNSET:
@@ -149,6 +162,8 @@ class ResearchState:
 
         d = dict(src_dict)
         phase = ResearchPhase(d.pop("phase"))
+
+        signature = d.pop("signature", UNSET)
 
         round_ = d.pop("round", UNSET)
 
@@ -218,6 +233,7 @@ class ResearchState:
 
         research_state = cls(
             phase=phase,
+            signature=signature,
             round_=round_,
             plan=plan,
             findings=findings,

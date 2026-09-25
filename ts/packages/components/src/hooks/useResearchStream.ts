@@ -114,6 +114,10 @@ export function useResearchStream() {
       }
       runRef.current += 1;
       const runId = runRef.current;
+      // Own the controller before connecting so stopStream can abort the
+      // request while it is still waiting for response headers.
+      const runController = new AbortController();
+      abortControllerRef.current = runController;
       const isCurrent = () => runRef.current === runId;
       const update: typeof setState = (next) => {
         if (isCurrent()) setState(next);
@@ -123,69 +127,78 @@ export function useResearchStream() {
       setState({ ...initialState, status: "streaming" });
 
       try {
-        const controller = await streamResearch(url, request, headers, {
-          onStepStarted: (step) => {
-            update((prev) => ({ ...prev, activeSteps: [...prev.activeSteps, step] }));
+        const controller = await streamResearch(
+          url,
+          request,
+          headers,
+          {
+            onStepStarted: (step) => {
+              update((prev) => ({ ...prev, activeSteps: [...prev.activeSteps, step] }));
+            },
+            onStepCompleted: (step) => {
+              update((prev) => ({
+                ...prev,
+                steps: [...prev.steps, step],
+                activeSteps: prev.activeSteps.filter((s) => s.id !== step.id),
+              }));
+            },
+            onPlan: (plan) => {
+              update((prev) => ({ ...prev, plan }));
+            },
+            onSubQuestionStarted: (event) => {
+              update((prev) => ({
+                ...prev,
+                subQuestionProgress: [...prev.subQuestionProgress, event],
+              }));
+            },
+            onFinding: (finding) => {
+              update((prev) => ({ ...prev, findings: [...prev.findings, finding] }));
+            },
+            onReflection: (reflection) => {
+              update((prev) => ({ ...prev, reflections: [...prev.reflections, reflection] }));
+            },
+            onSection: (section) => {
+              update((prev) => ({ ...prev, sections: [...prev.sections, section] }));
+            },
+            onVerification: (verification) => {
+              update((prev) => ({ ...prev, verification }));
+            },
+            onGeneration: (chunk) => {
+              update((prev) => ({ ...prev, reportMarkdown: prev.reportMarkdown + chunk }));
+            },
+            onResearchAgentResult: (result) => {
+              update((prev) => ({
+                ...prev,
+                result,
+                plan: result.plan ?? prev.plan,
+                findings: result.findings ?? prev.findings,
+                reflections: result.reflections ?? prev.reflections,
+                verification: result.verification ?? prev.verification,
+                reportMarkdown: result.report?.markdown ?? prev.reportMarkdown,
+                steps: result.steps ?? prev.steps,
+                activeSteps: [],
+              }));
+            },
+            onComplete: () => {
+              update((prev) => ({ ...prev, status: "done" }));
+            },
+            onError: (err) => {
+              const errorObj = err instanceof Error ? err : new Error(String(err));
+              update((prev) => ({ ...prev, status: "error", error: errorObj }));
+            },
           },
-          onStepCompleted: (step) => {
-            update((prev) => ({
-              ...prev,
-              steps: [...prev.steps, step],
-              activeSteps: prev.activeSteps.filter((s) => s.id !== step.id),
-            }));
-          },
-          onPlan: (plan) => {
-            update((prev) => ({ ...prev, plan }));
-          },
-          onSubQuestionStarted: (event) => {
-            update((prev) => ({
-              ...prev,
-              subQuestionProgress: [...prev.subQuestionProgress, event],
-            }));
-          },
-          onFinding: (finding) => {
-            update((prev) => ({ ...prev, findings: [...prev.findings, finding] }));
-          },
-          onReflection: (reflection) => {
-            update((prev) => ({ ...prev, reflections: [...prev.reflections, reflection] }));
-          },
-          onSection: (section) => {
-            update((prev) => ({ ...prev, sections: [...prev.sections, section] }));
-          },
-          onVerification: (verification) => {
-            update((prev) => ({ ...prev, verification }));
-          },
-          onGeneration: (chunk) => {
-            update((prev) => ({ ...prev, reportMarkdown: prev.reportMarkdown + chunk }));
-          },
-          onResearchAgentResult: (result) => {
-            update((prev) => ({
-              ...prev,
-              result,
-              plan: result.plan ?? prev.plan,
-              findings: result.findings ?? prev.findings,
-              reflections: result.reflections ?? prev.reflections,
-              verification: result.verification ?? prev.verification,
-              reportMarkdown: result.report?.markdown ?? prev.reportMarkdown,
-              steps: result.steps ?? prev.steps,
-              activeSteps: [],
-            }));
-          },
-          onComplete: () => {
-            update((prev) => ({ ...prev, status: "done" }));
-          },
-          onError: (err) => {
-            const errorObj = err instanceof Error ? err : new Error(String(err));
-            update((prev) => ({ ...prev, status: "error", error: errorObj }));
-          },
-        });
+          runController.signal
+        );
 
         // Stopped or superseded while connecting: end this run now.
         if (!isCurrent()) {
           controller.abort();
           return;
         }
-        abortControllerRef.current = controller;
+        // stopStream aborts runController; forward that to the controller
+        // streamResearch returned, which is not always linked to the signal
+        // (the non-streaming path returns a fresh one).
+        runController.signal.addEventListener("abort", () => controller.abort(), { once: true });
       } catch (err) {
         const errorObj = err instanceof Error ? err : new Error(String(err));
         update((prev) => ({ ...prev, status: "error", error: errorObj }));

@@ -39,6 +39,13 @@ class ResearchAgentResult:
             transcripts, credentials or connection settings. Evidence snippets are
             bounded excerpts of documents the caller was authorized to read; every
             resumed request is re-authorized.
+
+            The server signs the state it returns (`signature`) and rejects a
+            state whose signature does not verify, so a client cannot alter a
+            checkpoint, including its budget counters. Send the state back
+            unmodified. Signatures are valid across a cluster that shares an
+            internal service secret, otherwise only on the server that issued them
+            and until it restarts; use durable jobs to resume across restarts.
         id (str | Unset): Unique response ID. Example: resr_cr3ig20h5tbs73e3ahrg.
         model (str | Unset): Writer model.
         created_at (int | Unset): Unix timestamp (seconds) when the response was created.

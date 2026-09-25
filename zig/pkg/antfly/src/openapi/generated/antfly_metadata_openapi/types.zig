@@ -10538,8 +10538,10 @@ pub const ResearchRetrievalStepConfig = struct {
     }
 };
 
-/// Client-carried continuation state. Sending it back resumes the run at `phase` without repeating completed work. It never contains raw tool transcripts, credentials or connection settings. Evidence snippets are bounded excerpts of documents the caller was authorized to read; every resumed request is re-authorized.
+/// Client-carried continuation state. Sending it back resumes the run at `phase` without repeating completed work. It never contains raw tool transcripts, credentials or connection settings. Evidence snippets are bounded excerpts of documents the caller was authorized to read; every resumed request is re-authorized. The server signs the state it returns (`signature`) and rejects a state whose signature does not verify, so a client cannot alter a checkpoint, including its budget counters. Send the state back unmodified. Signatures are valid across a cluster that shares an internal service secret, otherwise only on the server that issued them and until it restarts; use durable jobs to resume across restarts.
 pub const ResearchState = struct {
+    /// Server signature over this state. Do not modify the state.
+    signature: ?[]const u8 = null,
     phase: ResearchPhase,
     /// Completed research rounds.
     round: ?i64 = null,
@@ -10554,6 +10556,7 @@ pub const ResearchState = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "signature", "signature", true },
         .{ "phase", "phase", false },
         .{ "round", "round", true },
         .{ "plan", "plan", true },
@@ -10576,6 +10579,10 @@ pub const ResearchState = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.signature) |value| {
+            try jw.objectField("signature");
+            try jw.write(value);
+        }
         try jw.objectField("phase");
         try jw.write(self.phase);
         if (self.round) |value| {

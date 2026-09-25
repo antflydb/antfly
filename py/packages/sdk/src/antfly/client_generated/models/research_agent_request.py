@@ -68,6 +68,13 @@ class ResearchAgentRequest:
                 transcripts, credentials or connection settings. Evidence snippets are
                 bounded excerpts of documents the caller was authorized to read; every
                 resumed request is re-authorized.
+
+                The server signs the state it returns (`signature`) and rejects a
+                state whose signature does not verify, so a client cannot alter a
+                checkpoint, including its budget counters. Send the state back
+                unmodified. Signatures are valid across a cluster that shares an
+                internal service secret, otherwise only on the server that issued them
+                and until it restarts; use durable jobs to resume across restarts.
             max_context_tokens (int | Unset): Per-researcher tool-result context budget in tokens.
             reserve_tokens (int | Unset): Tokens reserved from max_context_tokens for prompts and answers.
             stream (bool | Unset): Enable SSE streaming vs JSON response. Default: True.

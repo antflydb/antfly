@@ -500,7 +500,8 @@ pub fn advance(
         else => return .{ .state = .failed, .phase = "plan", .request = request_json, .result = "{}", .last_error = @errorName(err) },
     };
     const current_phase: []const u8 = if (parsed.request.research_state) |state| @tagName(state.phase) else "plan";
-    const result = research_agent.run(arena, query_runner, generator, parsed, null, .{ .max_phases = max_phases, .deadline_ns = deadline_ns }) catch |err| switch (err) {
+    // The stored request's state is server-held, not client-carried.
+    const result = research_agent.run(arena, query_runner, generator, parsed, null, .{ .max_phases = max_phases, .deadline_ns = deadline_ns, .trusted_state = true }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return .{
             .state = if (transient(err)) .queued else .failed,

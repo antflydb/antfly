@@ -308,7 +308,8 @@ export async function streamResearch(
   url: string,
   request: ResearchAgentRequest,
   headers: Record<string, string> = {},
-  callbacks: ResearchCallbacks
+  callbacks: ResearchCallbacks,
+  signal?: AbortSignal
 ): Promise<AbortController> {
   try {
     // Always create a fresh client with the base URL
@@ -364,10 +365,10 @@ export async function streamResearch(
 
     // Call the research agent endpoint
     if (sdkCallbacks) {
-      return await client.streamResearchAgent(researchRequest, sdkCallbacks);
+      return await client.streamResearchAgent(researchRequest, sdkCallbacks, { signal });
     }
 
-    const result: ResearchAgentResult = await client.researchAgent(researchRequest);
+    const result: ResearchAgentResult = await client.researchAgent(researchRequest, { signal });
     callbacks.onResearchAgentResult?.(result);
     callbacks.onComplete?.();
     return new AbortController();

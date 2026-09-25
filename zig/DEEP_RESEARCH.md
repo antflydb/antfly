@@ -97,8 +97,11 @@ sub-questions. When a budget stop leaves no evidence, the budget reason is repor
   partial report; `error` is reserved for failures.
 - **Client-carried continuation:** the result's `research_state` (plan, findings, evidence, reflections, report,
   usage, and never raw transcripts or credentials) resumes the run at its phase. Every resumed request is
-  re-authorized, and its counters are validated: usage must be present after planning, non-negative, and within the
-  declared budget, and `round` within `max_rounds`, so a forged state cannot buy extra budget.
+  re-authorized. The server signs every state it returns (`signature`, HMAC-SHA256 over a canonical encoding that
+  ignores omitted zero values) and rejects a state that does not verify, so a client cannot lower a counter or
+  edit the plan to buy budget. Counters are also range-checked. The key derives from the internal service secret,
+  so a cluster shares it; without one it is random per process, so standalone checkpoints stop verifying after a
+  restart. Durable jobs keep their state server-side and verify a client checkpoint once, at job start.
 - **Durable jobs:** `POST /agents/research/jobs` stores the request (streaming and interactivity forced off) and
   optionally runs phases immediately. `POST .../advance` runs up to `max_phases` phases and checkpoints after each
   one while holding its lease, so a crash in a later phase keeps the completed ones;

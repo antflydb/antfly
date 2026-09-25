@@ -1005,7 +1005,8 @@ export class AntflyClient {
    */
   private async performResearchAgent(
     request: ResearchAgentRequest,
-    callbacks?: ResearchAgentStreamCallbacks
+    callbacks?: ResearchAgentStreamCallbacks,
+    signal?: AbortSignal
   ): Promise<ResearchAgentResult | AbortController> {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -1022,6 +1023,14 @@ export class AntflyClient {
     Object.assign(headers, this.config.headers);
 
     const abortController = new AbortController();
+    // A caller signal aborts the request too, including while it connects.
+    if (signal) {
+      if (signal.aborted) abortController.abort(signal.reason);
+      else
+        signal.addEventListener("abort", () => abortController.abort(signal.reason), {
+          once: true,
+        });
+    }
     const response = await fetch(`${normalizeBaseUrl(this.config.baseUrl)}/db/v1/agents/research`, {
       method: "POST",
       headers,
@@ -1155,8 +1164,15 @@ export class AntflyClient {
    * required. For runs that may exceed one request's wall-clock budget, use
    * startResearchJob/advanceResearchJob or the runResearchJob convenience.
    */
-  async researchAgent(request: ResearchAgentRequest): Promise<ResearchAgentResult> {
-    const result = await this.performResearchAgent({ ...request, stream: false });
+  async researchAgent(
+    request: ResearchAgentRequest,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<ResearchAgentResult> {
+    const result = await this.performResearchAgent(
+      { ...request, stream: false },
+      undefined,
+      options.signal
+    );
     if (result instanceof AbortController) {
       result.abort();
       throw new Error("Research agent returned a stream for a JSON request");
@@ -1167,9 +1183,14 @@ export class AntflyClient {
   /** Run the research agent as an SSE stream. */
   async streamResearchAgent(
     request: ResearchAgentRequest,
-    callbacks: ResearchAgentStreamCallbacks
+    callbacks: ResearchAgentStreamCallbacks,
+    options: { signal?: AbortSignal } = {}
   ): Promise<AbortController> {
-    const result = await this.performResearchAgent({ ...request, stream: true }, callbacks);
+    const result = await this.performResearchAgent(
+      { ...request, stream: true },
+      callbacks,
+      options.signal
+    );
     if (result instanceof AbortController) return result;
 
     // A proxy or older server may still answer with JSON. Preserve the complete

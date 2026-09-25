@@ -3436,6 +3436,9 @@ pub const ApiHttpServer = struct {
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     research_job_store: research_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    research_state_key: [32]u8 = undefined,
+    research_state_key_ready: std.atomic.Value(bool) = .init(false),
+    research_state_key_mutex: std.atomic.Mutex = .unlocked,
     repair_job_store: repair_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     restore_job_store: restore_jobs.Store = .{ .alloc = undefined },
     rewrite_artifact_peer_cursor: std.atomic.Value(usize) = .init(0),
@@ -3734,6 +3737,23 @@ pub const ApiHttpServer = struct {
 
     fn protocolStoreNowNs() u64 {
         return platform_time.monotonicNs();
+    }
+
+    /// Key that signs client-carried research checkpoints. Derived from the
+    /// internal service secret so every node of a cluster verifies every
+    /// other node's checkpoints; otherwise random per process, so standalone
+    /// checkpoints stop verifying after a restart (durable jobs do not).
+    pub fn researchStateKey(self: *ApiHttpServer, io: std.Io) ![32]u8 {
+        if (self.research_state_key_ready.load(.acquire)) return self.research_state_key;
+        @import("antfly_platform").sync.lockYielding(&self.research_state_key_mutex);
+        defer self.research_state_key_mutex.unlock();
+        if (!self.research_state_key_ready.load(.acquire)) {
+            if (self.cfg.internal_service_secret) |secret| {
+                std.crypto.auth.hmac.sha2.HmacSha256.create(&self.research_state_key, "antfly research_state v1", secret);
+            } else try io.randomSecure(&self.research_state_key);
+            self.research_state_key_ready.store(true, .release);
+        }
+        return self.research_state_key;
     }
 
     /// Multi-threaded runtime for bounded agent fan-out (parallel tool calls
@@ -7657,10 +7677,17 @@ pub const ApiHttpServer = struct {
         try queue.status(alloc, task_id, context_id, "working", @tagName(kind) ++ " started");
         const retrieval_resp = (switch (kind) {
             .retrieval => retrieval_agent.executeWithEventSink(alloc, query_runner.iface(), generation_runner.iface(), body, sink.iface()),
-            .research => research_agent.execute(alloc, query_runner.iface(), generation_runner.iface(), body, sink.iface(), .{ .deadline_ns = generation_runner.deadline_ns }),
+            .research => research_agent.execute(alloc, query_runner.iface(), generation_runner.iface(), body, sink.iface(), .{
+                .deadline_ns = generation_runner.deadline_ns,
+                .state_key = try self.researchStateKey(self.inferenceIo()),
+            }),
         }) catch |err| switch (err) {
             error.InvalidResearchAgentRequest => {
                 try queue.status(alloc, task_id, context_id, "failed", "invalid research agent request");
+                return;
+            },
+            error.InvalidResearchState => {
+                try queue.status(alloc, task_id, context_id, "failed", "research_state was modified or issued by another server");
                 return;
             },
             error.TreeRootSetTooLarge => {
