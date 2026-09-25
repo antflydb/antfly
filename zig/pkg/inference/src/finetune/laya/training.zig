@@ -96,6 +96,15 @@ fn bindFrozen(a: std.mem.Allocator, graph: *const ml.Graph, values: []const Froz
     return result.toOwnedSlice(a);
 }
 
+/// A float runtime input. On Metal it is uploaded to the device once here;
+/// a host-backed input would be uploaded again by every op that reads it,
+/// in every layer of the forward and the backward graph.
+fn floatInput(cb: *const ops.ComputeBackend, values: []const f32, dims: []const i32) !ops.CT {
+    if (cb.kind() == .metal and cb.vtable.residentTrainingPrimitive != null)
+        return cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = values, .shape = dims } }, .{});
+    return cb.fromFloat32Shape(values, dims);
+}
+
 /// All returned storage belongs to a caller-owned arena.
 /// Trainable parameters, excluding those frozen by `freeze_layers`.
 pub fn parameters(a: std.mem.Allocator, graph: *const ml.Graph, reader: *const tensors.MMapReader, freeze_layers: u32) ![]controller.Parameter {
@@ -197,7 +206,7 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
         try result.append(a, .{ .node_id = id, .value = value });
     }
     {
-        const value = try cb.fromFloat32Shape(type_mask, &.{ @intCast(ids.len), @intCast(cfg.hidden_size) });
+        const value = try floatInput(cb, type_mask, &.{ @intCast(ids.len), @intCast(cfg.hidden_size) });
         errdefer cb.free(value);
         try result.append(a, .{ .node_id = built.inputs.type_mask, .value = value });
     }
@@ -214,7 +223,7 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
             };
             for (1..heads) |h| @memcpy(bias[(row * heads + h) * plane ..][0..plane], first);
         }
-        const value = try cb.fromFloat32Shape(bias, &.{ @intCast(l.batch * heads), @intCast(l.sequence), @intCast(l.sequence) });
+        const value = try floatInput(cb, bias, &.{ @intCast(l.batch * heads), @intCast(l.sequence), @intCast(l.sequence) });
         errdefer cb.free(value);
         try result.append(a, .{ .node_id = id, .value = value });
     }
@@ -222,7 +231,7 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
     for (built.inputs.rope, [_]f32{ cfg.global_rope_theta, cfg.local_rope_theta }) |ids_pair, theta| {
         const tables = try architecture.ropeTables(a, positions, cfg.num_attention_heads, head_dim, theta);
         for (ids_pair, tables) |id, table| {
-            const value = try cb.fromFloat32Shape(table, &.{ @intCast(ids.len * cfg.num_attention_heads), @intCast(head_dim / 2) });
+            const value = try floatInput(cb, table, &.{ @intCast(ids.len * cfg.num_attention_heads), @intCast(head_dim / 2) });
             errdefer cb.free(value);
             try result.append(a, .{ .node_id = id, .value = value });
         }
@@ -233,7 +242,7 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
         for (mask) |*v| v.* = if (!training) 1 else if (random.float(f32) < entry.probability) 0 else 1 / (1 - entry.probability);
         var dims: [8]i32 = undefined;
         for (shape.dims[0..shape.rank()], 0..) |dim, i| dims[i] = @intCast(dim);
-        const value = try cb.fromFloat32Shape(mask, dims[0..shape.rank()]);
+        const value = try floatInput(cb, mask, dims[0..shape.rank()]);
         errdefer cb.free(value);
         try result.append(a, .{ .node_id = entry.node, .value = value });
     }
@@ -328,7 +337,7 @@ pub fn step(a: std.mem.Allocator, program: *Program, trainer: *controller.Traine
     defer loss.deinit(a);
     const backward_inputs = try scratch.alloc(interpreter.RuntimeInput, combined.len + 1);
     for (combined, backward_inputs[0..combined.len]) |input, *dst| dst.* = .{ .node_id = program.gradients.id_map[input.node_id], .value = input.value };
-    const cotangent = try cb.fromFloat32Shape(loss.gradient, &.{ @intCast(l.questions), @intCast(l.options) });
+    const cotangent = try floatInput(cb, loss.gradient, &.{ @intCast(l.questions), @intCast(l.options) });
     defer cb.free(cotangent);
     backward_inputs[combined.len] = .{ .node_id = program.gradients.id_map[program.seed], .value = cotangent };
     var backward = try executeFramed(a, &program.gradients.graph, cb, backward_inputs);

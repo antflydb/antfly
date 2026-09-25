@@ -1143,6 +1143,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     boundary_scope_buffers: std.ArrayListUnmanaged(MetalTensor) = .empty,
     boundary_workspace: ?@import("gliner_boundary_resident.zig").Workspace.Borrow = null,
     boundary_workspace_cursor: ?ops.gliner_boundary_device.ProductWorkspaceCursor = null,
+    /// A resident training transaction owns the active command frame.
+    resident_batch: bool = false,
     boundary_resident_preparation: bool = false,
     boundary_resident_generation: ?u64 = null,
     a4b_mapped_layer0_prewarm_result: ?ops.A4bMappedLayer0PrewarmResult = null,
@@ -6825,10 +6827,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!source.isDevice() or source.dtype != .f32 or source.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime)))
             return error.ResidentTrainingRequiresDeviceTensor;
         if (source.elemCount() != count or source.deviceByteLen() != count * 4) return error.InvalidResidentTrainingShape;
-        var copied = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), count * 4, .private, shape);
-        errdefer copied.deinit();
-        try source.copyInto(&copied);
-        return self.ctFromOwnedMetalTensor(copied);
+        // A retained view: consumers only read gradients, and the producer
+        // releases rather than overwrites its buffer, so no copy is needed.
+        var view = try source.retainedView(0, count * 4, shape);
+        errdefer view.deinit();
+        return self.ctFromOwnedMetalTensor(view);
     }
 
     fn residentTrainingGather(self: *MetalCompute, input: CT, indices: CT, input_shape: []const i64, axis: u8, limits: ops.resident_training.Limits) !CT {
@@ -6911,7 +6914,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (control) |active| try active.check();
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedResidentTrainingPrimitive;
-        if (metal_runtime.hasActiveFrame(runtime)) return error.ResidentTrainingExternalFrame;
+        if (self.residentExternalFrame()) return error.ResidentTrainingExternalFrame;
         if (inputs.len > limits.max_tensors or inputs.len > 16384) return error.ResourceLimitExceeded;
         if (inputs.len == 0) return .{ .sum_squares = 0, .norm = 0, .finite = true, .tensor_count = 0, .partial_bytes = 0, .download_bytes = 0 };
         var total_elements: usize = 0;
@@ -6938,8 +6941,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer output.deinit();
         const summaries = try self.allocator.alloc(f32, inputs.len * 3);
         defer self.allocator.free(summaries);
-        try metal_runtime.beginFrame(runtime);
-        var frame_owned = true;
+        // Inside a transaction's batch, reduce in its frame and synchronize
+        // it; otherwise own a frame for the reduction alone.
+        const batched = self.resident_batch;
+        if (!batched) try metal_runtime.beginFrame(runtime);
+        var frame_owned = !batched;
         errdefer if (frame_owned) metal_runtime.cancelFrame(runtime) catch {};
         for (inputs, 0..) |input, i| {
             if (control) |active| try active.check();
@@ -6958,8 +6964,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, sources, merged))
                 return error.UnsupportedResidentTrainingPrimitive;
         }
-        try metal_runtime.submitFrame(runtime);
-        try metal_runtime.waitFrame(runtime);
+        if (batched) {
+            try metal_runtime.flushActiveFrame(runtime);
+        } else {
+            try metal_runtime.submitFrame(runtime);
+            try metal_runtime.waitFrame(runtime);
+        }
         frame_owned = false;
         if (control) |active| try active.check();
         try output.downloadF32Into(summaries);
@@ -6972,6 +6982,31 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             sum_squares += scale * scale * scaled_sum;
         }
         return .{ .sum_squares = sum_squares, .norm = @sqrt(sum_squares), .finite = finite, .tensor_count = inputs.len, .partial_bytes = partial_bytes, .download_bytes = summaries.len * 4 };
+    }
+
+    /// Resident operations refuse a frame they do not own: their completion
+    /// is otherwise proven per call. A transaction's own batch is allowed.
+    fn residentExternalFrame(self: *const MetalCompute) bool {
+        return metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and !self.resident_batch;
+    }
+
+    fn residentTrainingBeginBatchOp(ctx: *anyopaque) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (self.resident_batch or metal_runtime.hasActiveFrame(runtime)) return error.ResidentTrainingExternalFrame;
+        try metal_runtime.beginFrame(runtime);
+        self.resident_batch = true;
+        return true;
+    }
+
+    fn residentTrainingEndBatchOp(ctx: *anyopaque, commit: bool) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.resident_batch) return error.ResidentTrainingBatchNotOpen;
+        self.resident_batch = false;
+        const runtime = self.provider_impl.raw_decode_runtime;
+        if (!commit) return metal_runtime.cancelFrame(runtime);
+        try metal_runtime.submitFrame(runtime);
+        try metal_runtime.waitFrame(runtime);
     }
 
     fn snapshotTensorShapeOp(ctx: *anyopaque, input: CT, shape: []const i32) anyerror!CT {
@@ -7017,7 +7052,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const geometry = try instruction.validate(limits);
         if (inputs.len != instruction.num_inputs) return error.InvalidResidentProgramShape;
         if (!self.provider_impl.hasDecoderRuntime()) return error.UnsupportedResidentProgramBackend;
-        if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) return error.ResidentTrainingExternalFrame;
+        if (self.residentExternalFrame()) return error.ResidentTrainingExternalFrame;
         var tensors: [4]MetalTensor = undefined;
         for (inputs, 0..) |input, i| {
             const expected = instruction.inputs[i];
@@ -7164,7 +7199,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!self.provider_impl.hasDecoderRuntime()) return error.UnsupportedResidentTrainingPrimitive;
         // The initial strict surface owns individual dispatches. A future
         // command-batch interface must pass an explicit owner token.
-        if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) return error.ResidentTrainingExternalFrame;
+        if (self.residentExternalFrame()) return error.ResidentTrainingExternalFrame;
         return switch (request.*) {
             .upload_f32 => |r| self.residentTrainingUpload(f32, r.values, r.shape, limits, false),
             .upload_i32 => |r| self.residentTrainingUpload(i32, r.values, r.shape, limits, true),
@@ -30453,6 +30488,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.trainingZeroF32 = trainingZeroF32Op;
         vt.trainingAccumulateF32 = trainingAccumulateF32Op;
         vt.trainingAdamWManyF32 = trainingAdamWManyF32Op;
+        vt.residentTrainingBeginBatch = residentTrainingBeginBatchOp;
+        vt.residentTrainingEndBatch = residentTrainingEndBatchOp;
         vt.trainingSumSquaresManyF32 = trainingSumSquaresManyF32Op;
         vt.argmaxLastRow = argmaxLastRowOp;
         vt.linearNoBiasArgmaxLastRow = linearNoBiasArgmaxLastRowOp;

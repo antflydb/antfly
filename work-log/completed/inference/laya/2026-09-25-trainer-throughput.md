@@ -23,7 +23,30 @@ framed, freeze_layers 11, median 1.41 s
 1 1.61 1.6273;2 1.38 0.9854;3 1.53 1.893;4 1.35 1.0983;5 1.11 0.6937;6 1.48 0.6993;7 1.34 0.1582;8 1.63 1.2782;9 1.11 0.926;10 1.47 0.6645;11 1.1 0.7686;12 1.34 0.8299;13 1.63 1.832;14 1.48 0.8211
 framed, freeze_layers 18, median 1.17 s
 1 1.11 1.6273;2 1.1 0.8034;3 1.23 1.9789;4 1.11 1.1772;5 0.89 0.864;6 1.22 0.6721;7 1.1 0.301;8 1.34 1.5027;9 0.89 1.0155;10 1.22 0.7304;11 0.89 1.0149;12 1.1 0.8149;13 1.34 1.8038;14 1.22 0.9628
+framed + one command batch per optimizer transaction, median 1.68 s
+1 2.66 1.6273;2 1.81 1.4148;3 1.74 1.9196;4 1.63 1.1551;5 1.35 0.7116;6 1.77 0.6766;7 1.58 0.2296;8 1.94 1.1614;9 1.25 0.9236;10 1.73 0.5738;11 1.24 0.6766;12 1.6 1.4978;13 1.96 1.8385;14 1.73 0.8051
++ runtime inputs uploaded once, zero-copy gradient hand-off, median 1.38 s
+1 1.96 1.6273;2 1.46 1.4148;3 1.5 1.9196;4 1.3 1.1551;5 1.08 0.7116;6 1.46 0.6766;7 1.31 0.2296;8 1.61 1.1614;9 1.08 0.9236;10 1.46 0.5738;11 1.08 0.6766;12 1.32 1.4978;13 1.58 1.8385;14 1.43 0.8051
 ```
+
+Losses are identical to the unframed trainer at every step in both runs.
+
+## Profiles (`sample`, 20 s of a steady-state run, main thread)
+
+At 2.02 s per step: optimizer update ~42% (every snapshot, elementwise op
+and zero fill submitted and waited alone), backward ~33% (GPU ~0.36 s, host
+encoding ~0.13 s), forward ~15%, inputs ~5%.
+
+After batching the optimizer (1.68 s): the update fell to ~0.23 s per step.
+Host encoding (~0.19 s) turned out to be ~95% `add`/`multiply` uploading
+host-backed runtime inputs (attention biases, RoPE tables, masks) through a
+fresh staging buffer at every use. The gradient hand-off's per-gradient copy
+added ~0.06 s.
+
+After uploading inputs once and dropping that copy (1.38 s): GPU forward
+~0.13 s and backward ~0.34 s, optimizer ~0.21 s (its snapshot copies and
+full-state finiteness reads), inputs ~0.07 s (dropout random numbers on the
+host), encoding ~0.05 s.
 
 Earlier reference points on the same job: 8.55 s median with the step-0
 trainer, 6.43 s after device strided slices, 2.65 s framed with a frame flush

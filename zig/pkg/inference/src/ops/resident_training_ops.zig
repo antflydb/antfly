@@ -80,9 +80,10 @@ pub const NormSummary = struct {
 pub const Request = union(enum) {
     upload_f32: struct { values: []const f32, shape: []const i32 },
     upload_i32: struct { values: []const i32, shape: []const i32 },
-    /// A physically independent resident copy of a dense f32 device tensor
-    /// produced by this backend outside the resident surface, such as an
-    /// interpreter gradient. Host-backed or view inputs are refused.
+    /// A read-only resident view of a dense f32 device tensor produced by
+    /// this backend outside the resident surface, such as an interpreter
+    /// gradient whose producer releases it unmodified. Host-backed or view
+    /// inputs are refused. Use snapshot for a tensor that may be overwritten.
     adopt_f32: struct { input: CT, shape: []const i32 },
     /// A physically independent buffer, suitable for retained tape captures.
     snapshot: struct { input: CT, shape: []const i32 },

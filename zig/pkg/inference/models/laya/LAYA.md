@@ -456,9 +456,16 @@ steps, ReleaseFast.
 | Step-0 trainer (per-op synchronization, host slicing, gradient round trip) | 8.55 s | 1× |
 | + strided slices on the device | 6.43 s | 1.3× |
 | + gradients kept on the device (unframed) | 5.34 s | 1.6× |
-| + one command frame per forward and per backward | **2.02 s** | **4.2×** |
-| + `freeze_layers: 11` (half the encoder) | 1.41 s | 6.1× |
-| + `freeze_layers: 18` | 1.17 s | 7.3× |
+| + one command frame per forward and per backward | 2.02 s | 4.2× |
+| + one command batch per optimizer transaction | 1.68 s | 5.1× |
+| + runtime inputs uploaded once; gradients handed over without a copy | **1.38 s** | **6.2×** |
+
+Frozen layers, measured on the 2.02 s trainer:
+
+| Trainer | Median step |
+| --- | ---: |
+| `freeze_layers: 11` (half the encoder) | 1.41 s |
+| `freeze_layers: 18` | 1.17 s |
 
 The first four losses are identical in every configuration without frozen
 layers. Frozen runs share the first loss and then diverge, as expected.
@@ -467,9 +474,22 @@ decision head still run in full.
 
 - **Device slices:** strided slices of device tensors now run on the GPU
   (`slice_plan` on `decoderRuntimeSliceTypedDevice`) instead of downloading.
-- **Gradients on the device:** the resident optimizer takes a device copy of
-  each dense gradient (`resident_training.Request.adopt_f32`). It falls back
-  to download and upload only for host-backed gradients.
+- **Gradients on the device:** the resident optimizer takes a read-only view
+  of each dense device gradient (`resident_training.Request.adopt_f32`), with
+  no copy. It falls back to download and upload only for host-backed
+  gradients.
+- **Optimizer batch:** the resident AdamW transaction
+  (`seeded_device_transaction.prepare`) used to submit and wait after every
+  snapshot, elementwise op and zero fill. It now owns one command batch
+  (`ComputeBackend.residentTrainingBeginBatch`/`EndBatch`). Only the
+  finiteness and norm reductions synchronize it, and it commits before the
+  transaction returns. A failed or cancelled transaction discards the batch;
+  anything already executed wrote only replacement buffers. Resident ops
+  still refuse any frame they do not own.
+- **Device inputs:** attention biases, RoPE tables, type masks and dropout
+  masks are uploaded once per step. As host tensors, every op that read them
+  uploaded them again, in every layer of both graphs. This was ~95% of the
+  host-side encoding time.
 - **Command frames:** `training.executeFramed` runs each forward and backward
   graph in one Metal command frame and synchronizes once at the end.
   `ANTFLY_LAYA_TRAIN_UNFRAMED=1` restores per-op submission.
@@ -488,6 +508,14 @@ NaN updates. It showed up only in framed runs, and flushing after almost any
 op hid it. The pool now takes private buffers only
 (`metal_runtime.zig`, "metal in-frame buffer reuse never hands a
 host-writable buffer to a private request").
+
+What remains per step at 1.38 s: GPU work of ~0.13 s forward and ~0.34 s
+backward, ~0.21 s in the optimizer transaction (mostly its snapshot copies
+and full-state finiteness reads), ~0.07 s building inputs (dropout random
+numbers on the host), and ~0.05 s encoding. Cutting the optimizer further
+means changing the transaction contract: skip re-validating state the
+previous commit already validated, and write AdamW out of place instead of
+snapshotting weights and moments first.
 
 Raw per-step logs and the investigation are in
 [`work-log/completed/inference/laya/2026-09-25-trainer-throughput.md`](../../../../../work-log/completed/inference/laya/2026-09-25-trainer-throughput.md).
@@ -619,7 +647,8 @@ Other open items:
 - **Very many options:** candidate branches cannot compare options before the
   softmax (step 2b).
 - **Trainer throughput:** device slices, device-resident gradients, command
-  frames and frozen lower layers are done
+  frames, the batched optimizer, device inputs and frozen lower layers are
+  done
   ([Trainer throughput](#trainer-throughput)). Segment attention with a
   backward pass in the training graph, alongside step 2c, and LoRA are next.
   A qualification run with frozen layers has not been done.

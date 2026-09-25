@@ -2428,6 +2428,13 @@ pub const ComputeBackend = struct {
         residentTrainingNorm: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.NormInput, limits: resident_training.NormLimits, control: ?InferenceExecutionControl) anyerror!resident_training.NormSummary = null,
         residentTrainingValidate: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.ValidationInput, limits: resident_training.ValidationLimits, control: ?InferenceExecutionControl) anyerror!resident_training.ValidationSummary = null,
         residentTrainingInstruction: ?*const fn (ctx: *anyopaque, instruction: *const resident_program.Instruction, inputs: []const CT, limits: resident_program.Limits, control: ?InferenceExecutionControl) anyerror!CT = null,
+        /// Open a command batch owned by one resident training transaction.
+        /// Resident operations then encode into it instead of each submitting
+        /// and waiting; reductions that read results back synchronize it.
+        /// Returns false when the backend has no batching.
+        residentTrainingBeginBatch: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        /// Submit and wait for (commit) or discard (cancel) the open batch.
+        residentTrainingEndBatch: ?*const fn (ctx: *anyopaque, commit: bool) anyerror!void = null,
 
         /// Copy a tensor from another backend instance into this backend
         /// without host materialization when the two backends are compatible.
@@ -4485,6 +4492,16 @@ pub const ComputeBackend = struct {
         errdefer self.free(result);
         try self.checkExecutionControl();
         return result;
+    }
+
+    pub fn residentTrainingBeginBatch(self: *const ComputeBackend) !bool {
+        const op = self.vtable.residentTrainingBeginBatch orelse return false;
+        return op(self.ptr);
+    }
+
+    pub fn residentTrainingEndBatch(self: *const ComputeBackend, commit: bool) !void {
+        const op = self.vtable.residentTrainingEndBatch orelse return;
+        return op(self.ptr, commit);
     }
 
     pub fn copyTensorFromBackend(self: *const ComputeBackend, src_backend: *const ComputeBackend, src_tensor: CT) !?CT {
