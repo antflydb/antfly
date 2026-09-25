@@ -161,9 +161,9 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
         // even if its BEGIN guard was lost or removed out of order.
         accepted_control_guarded = try @import("completion_control_accepted.zig").hasAny(backend.storage.?, allocator, root_dir);
         const control_guard = @import("completion_control_guard.zig");
-        // Only a single published owner with a trusted installation can enter
-        // the bounded restoration path. Pending publication and accepted
-        // transitions still require separate Raft reconciliation and fence.
+        // Published owners with a trusted installation enter the bounded
+        // restoration path. Accepted multi-owner transitions still require
+        // an interleaved Raft suffix proof and remain fenced by the pool.
         if (try control_guard.hasAny(backend.storage.?, allocator, root_dir)) {
             if (backend.options.completion_pool_config) |config| {
                 const authority: @import("completion_control_record.zig").Authority = .{
@@ -175,7 +175,7 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
                 };
                 var local = try control_guard.loadAll(allocator, backend.storage.?, root_dir, authority);
                 defer local.deinit();
-                if (local.count != 1) return error.CompletionRecoveryCapacityRequired;
+                if (local.count == 0 or local.count > 2) return error.CompletionRecoveryCapacityRequired;
                 restore_control_owner = true;
             } else {
                 return error.CompletionRecoveryCapacityRequired;

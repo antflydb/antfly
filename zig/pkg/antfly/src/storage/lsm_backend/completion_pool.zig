@@ -63,7 +63,8 @@ pub const Config = struct {
     namespace: enum(u8) { root, docs } = .docs,
     shape: Shape = .{},
     /// Staging is an internal component path while replicated activation is
-    /// disabled. Restart permits only the bounded, proven one-owner profile.
+    /// disabled. Restart permits applied BEGINs for up to two owners; an
+    /// accepted transition sidecar is restorable only for a sole owner.
     control_owner_staging: bool = false,
 };
 
@@ -499,6 +500,9 @@ pub fn Pool(comptime Backend: type) type {
         /// activate the incomplete decision/ACK lifecycle.
         control_transition_staging: bool = false,
         control_owners: [control_record.max_owners]?ControlOwner = @splat(null),
+        /// A restored two-owner profile must not accept a third BEGIN whose
+        /// next crash would exceed the same proven restart envelope.
+        restored_control_owner_limit: usize = control_record.max_owners,
         control_output_ids: [control_record.max_owners]u64 = @splat(0),
         control: *domains.RecyclingScratch,
         maintenance_active: bool = false,
@@ -771,7 +775,7 @@ pub fn Pool(comptime Backend: type) type {
             self.control_transition_staging = true;
         }
 
-        /// Rebuild the one-owner test profile before primary WAL replay. This
+        /// Rebuild retained BEGIN owners before primary WAL replay. This
         /// acquires the exact retained output path and the complete lifetime
         /// resource envelope; it does not make the owner runnable. Startup
         /// still needs native-row inspection and a complete v2 Raft proof.
@@ -789,12 +793,30 @@ pub fn Pool(comptime Backend: type) type {
                 .generation = self.config.identity.generation,
             });
             defer restored.deinit();
-            if (restored.count != 1 or restored.owners[0] == null)
+            if (restored.count == 0 or restored.count > 2)
                 return error.CompletionRecoveryCapacityRequired;
-            const owner = restored.owners[0].?;
-            const first = owner.guard.record.output_run_id;
+            // Reject an interleaved accepted suffix before reserving any
+            // owner resources. A sole owner's v4 sidecar follows below.
+            for (self.control_accepted_paths, 0..) |accepted_path, i| {
+                const size = self.io.storage().fileSize(accepted_path) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return err,
+                };
+                _ = size;
+                if (restored.owners[i] == null or restored.count > 1)
+                    return error.CompletionRecoveryCapacityRequired;
+            }
+            const first_index = for (restored.owners, 0..) |owner, i| {
+                if (owner != null) break i;
+            } else return error.InvalidCompletionSlot;
+            const first_owner = restored.owners[first_index].?;
+            if (first_owner.guard.record.output_run_id < first_index) return error.InvalidCompletionSlot;
+            const first = first_owner.guard.record.output_run_id - first_index;
             if (first == 0 or first > std.math.maxInt(u64) - control_record.max_owners)
                 return error.InvalidCompletionSlot;
+            for (restored.owners, 0..) |owner, i| if (owner) |active| {
+                if (active.guard.record.output_run_id != first + i) return error.InvalidCompletionSlot;
+            };
             if (first >= self.cohort.base_run_id and first < self.cohort.base_run_id + max_slots)
                 return error.InvalidCompletionSlot;
             for (0..backend.runs.count()) |i| if (backend.runs.at(i).id == first)
@@ -810,12 +832,8 @@ pub fn Pool(comptime Backend: type) type {
                 .max_block_bytes = self.config.shape.max_block_bytes,
                 .max_record_bytes = self.config.shape.max_record_bytes,
             });
-            self.control_output_ids[0] = first;
-            var next_output = @max(backend.next_run_id, first + 1);
-            for (1..control_record.max_owners) |i| {
-                self.control_output_ids[i] = next_output;
-                next_output = std.math.add(u64, next_output, 1) catch return error.UnsupportedCompletionProfile;
-            }
+            for (0..control_record.max_owners) |i| self.control_output_ids[i] = first + i;
+            const next_output = @max(backend.next_run_id, first + control_record.max_owners);
             for (0..backend.runs.count()) |i| {
                 const run_id = backend.runs.at(i).id;
                 for (self.control_output_ids) |output_id| if (run_id == output_id)
@@ -852,48 +870,48 @@ pub fn Pool(comptime Backend: type) type {
                 .compiler_workspace_bytes = completion.scratch_bytes,
             });
             try proof.requireHeadroom(backend.write_stats, backend.manifest_journal.sequence orelse return error.RecoveryRequired, backend.next_run_id, if (backend.wal_retention.primary) |primary| primary.current_segment else 1, .{ .manifest_steps = self.cell_count, .run_ids = self.cell_count, .wal_segments = self.cell_count });
-            const path = try repository.runPath(self.control.allocator(), backend.root_dir.?, first);
-            defer self.control.allocator().free(path);
-            var output_pin = try Backend.pinCompletionRunPath(self.control.allocator(), path);
-            errdefer output_pin.release();
             const manager = backend.options.resource_manager orelse return error.CompletionResourceManagerRequired;
-            const held = try control_resources.Resources.create(backend.allocator, manager, &self.compiler, owner.declaration.txn_id, .{
-                .publication_bytes = proof.owners[0].publication_bytes,
-                .wal_bytes = proof.owners[0].append.bytes,
-            });
-            errdefer held.destroy();
-            // A sidecar is only a retained accepted-entry obligation. Load it
-            // into the owner's prepaid buffer before ordinary WAL replay; the
-            // DATA v4 proof must later bind it to the committed Raft suffix.
-            var pending: ?completion.AcceptedIdentity = null;
-            for (self.control_accepted_paths[1..]) |other| {
-                if (self.io.storage().fileSize(other)) |_| return error.CompletionRecoveryCapacityRequired else |err| {
-                    if (err != error.FileNotFound) return err;
+            var ordinal: usize = 0;
+            for (restored.owners, 0..) |maybe_owner, i| {
+                const owner = maybe_owner orelse continue;
+                const accepted_size: ?u64 = self.io.storage().fileSize(self.control_accepted_paths[i]) catch |err| switch (err) {
+                    error.FileNotFound => null,
+                    else => return err,
+                };
+                {
+                    const path = try repository.runPath(self.control.allocator(), backend.root_dir.?, first + i);
+                    defer self.control.allocator().free(path);
+                    var output_pin = try Backend.pinCompletionRunPath(self.control.allocator(), path);
+                    errdefer output_pin.release();
+                    const held = try control_resources.Resources.create(backend.allocator, manager, &self.compiler, owner.declaration.txn_id, .{
+                        .publication_bytes = proof.owners[ordinal].publication_bytes,
+                        .wal_bytes = proof.owners[ordinal].append.bytes,
+                    });
+                    errdefer held.destroy();
+                    var pending: ?completion.AcceptedIdentity = null;
+                    if (accepted_size) |size| {
+                        if (size == 0 or size > held.accepted.len) return error.InvalidCompletionSlot;
+                        const bytes = held.accepted[0..@intCast(size)];
+                        try self.io.storage().readFileRangeInto(alloc, self.control_accepted_paths[i], 0, bytes);
+                        const accepted = try control_accepted.Accepted.decode(bytes);
+                        if (accepted.slot_index != i or !std.mem.eql(u8, &accepted.txn_id, &owner.declaration.txn_id) or
+                            !std.meta.eql(accepted.begin, owner.guard.record.begin)) return error.InvalidCompletionSlot;
+                        held.accepted_len = bytes.len;
+                        pending = .{ .term = accepted.transition.term, .index = accepted.transition.index, .digest = accepted.transition.digest };
+                    }
+                    self.control_owners[i] = .{
+                        .held = held,
+                        .output_pin = output_pin,
+                        .declaration = owner.declaration,
+                        .begin = .{ .term = owner.guard.record.begin.term, .index = owner.guard.record.begin.index, .digest = owner.guard.record.begin.digest },
+                        .pending = pending,
+                    };
                 }
+                ordinal += 1;
             }
-            const accepted_size: ?u64 = self.io.storage().fileSize(self.control_accepted_paths[0]) catch |err| switch (err) {
-                error.FileNotFound => null,
-                else => return err,
-            };
-            if (accepted_size) |size| {
-                if (size == 0 or size > held.accepted.len) return error.InvalidCompletionSlot;
-                const bytes = held.accepted[0..@intCast(size)];
-                try self.io.storage().readFileRangeInto(alloc, self.control_accepted_paths[0], 0, bytes);
-                const accepted = try control_accepted.Accepted.decode(bytes);
-                if (accepted.slot_index != 0 or !std.mem.eql(u8, &accepted.txn_id, &owner.declaration.txn_id) or
-                    !std.meta.eql(accepted.begin, owner.guard.record.begin)) return error.InvalidCompletionSlot;
-                held.accepted_len = bytes.len;
-                pending = .{ .term = accepted.transition.term, .index = accepted.transition.index, .digest = accepted.transition.digest };
-            }
-            self.control_owners[0] = .{
-                .held = held,
-                .output_pin = output_pin,
-                .declaration = owner.declaration,
-                .begin = .{ .term = owner.guard.record.begin.term, .index = owner.guard.record.begin.index, .digest = owner.guard.record.begin.digest },
-                .pending = pending,
-            };
             self.startup_reconciliation_pending = true;
             self.restored_control_pending = true;
+            self.restored_control_owner_limit = 2;
         }
 
         /// Native owner calls this only after attached runtime leases are gone
@@ -1366,12 +1384,22 @@ pub fn Pool(comptime Backend: type) type {
         /// startup obligation; runnable restore and control transitions remain
         /// disabled until the complete lifecycle is installed.
         fn stageControlBegin(self: *Self, backend: *Backend, declaration: control_begin.Declaration, identity: completion.AcceptedIdentity, envelope: []const u8, growth: capacity.Cost) !void {
+            if (self.restored_control_owner_limit < control_record.max_owners) {
+                var active_count: usize = 0;
+                for (self.control_owners) |owner| if (owner != null) {
+                    active_count += 1;
+                };
+                if (active_count >= self.restored_control_owner_limit) return error.CompletionReservationBusy;
+            }
             for (self.control_owners) |owner| if (owner) |active| if (active.pending != null)
                 return error.CompletionReservationBusy;
-            const slot = for (self.control_owners, 0..) |owner, i| {
+            const slot = for (self.control_owners[0..self.restored_control_owner_limit], 0..) |owner, i| {
                 if (owner) |active| if (std.mem.eql(u8, &active.declaration.txn_id, &declaration.txn_id)) return error.CompletionReservationBusy;
                 if (owner == null) break i;
-            } else return error.CompletionPlanCapacityExceeded;
+            } else return if (self.restored_control_owner_limit < control_record.max_owners)
+                error.CompletionReservationBusy
+            else
+                error.CompletionPlanCapacityExceeded;
             var rows: [control_record.max_owners][3]control_capacity.NativeRowShape = undefined;
             var inputs: [control_record.max_owners]control_capacity.OwnerInput = undefined;
             var count: usize = 0;
@@ -2089,84 +2117,86 @@ pub fn Pool(comptime Backend: type) type {
             var borrow = try self.compiler.tryBorrow();
             defer borrow.release() catch unreachable;
             const alloc = try borrow.allocator();
-            const active = &self.control_owners[0].?;
-            const id = active.declaration.txn_id;
-            const ns: ?[]const u8 = if (self.config.namespace == .docs) "docs" else null;
-            const record_key = try std.mem.concat(alloc, u8, &.{ control_shape.records_prefix, &id });
-            defer alloc.free(record_key);
-            const participants_key = try std.mem.concat(alloc, u8, &.{ control_shape.participants_prefix, &id });
-            defer alloc.free(participants_key);
-            const resolved_key = try std.mem.concat(alloc, u8, &.{ control_shape.resolved_participants_prefix, &id });
-            defer alloc.free(resolved_key);
-            const record_value = try self.point(backend, alloc, ns, record_key);
-            defer record_value.deinit(alloc);
-            const participants = try self.point(backend, alloc, ns, participants_key);
-            defer participants.deinit(alloc);
-            const resolved = try self.point(backend, alloc, ns, resolved_key);
-            defer resolved.deinit(alloc);
-            const owner_value = try self.point(backend, alloc, ns, &control_record.ownerKey(id));
-            defer owner_value.deinit(alloc);
-            const receipt_value = try self.point(backend, alloc, ns, &control_record.receiptKey(id));
-            defer receipt_value.deinit(alloc);
-            const progress_value = try self.point(backend, alloc, ns, &control_record.progressKey(id));
-            defer progress_value.deinit(alloc);
-            const row = record_value.value orelse return error.InvalidCompletionSlot;
-            if (row.len != control_shape.txn_record_v6_size or row[49] != 0 or
-                row[50] != @intFromBool(active.declaration.coordinator) or
-                row[51] != @intFromBool(active.declaration.retain_terminal) or receipt_value.value != null)
-                return error.CompletionRecoveryCapacityRequired;
-            if (!std.meta.eql(try control_record.Participants.fromEncodedList(participants.value orelse return error.InvalidCompletionSlot), active.declaration.participants))
-                return error.InvalidCompletionSlot;
-            const applied = self.progress orelse return error.CompletionRecoveryCapacityRequired;
-            var latest = active.begin;
-            if (progress_value.value) |wire| {
-                const progress = try control_record.Progress.decode(wire);
-                const owner_record = self.controlOwnerRecord(0);
-                try progress.verifyOwner(owner_record);
-                const actual_owner = owner_value.value orelse return error.InvalidCompletionSlot;
-                if (!std.mem.eql(u8, actual_owner, &try owner_record.encode()) or
-                    progress.phase == .begin or progress.decision == .none or
-                    row[0] != @intFromEnum(progress.decision) or row[52] != 1 or
-                    progress.acknowledged >= active.declaration.participants.count)
-                    return error.InvalidCompletionSlot;
-                switch (progress.phase) {
-                    .decision => if (resolved.value != null) return error.InvalidCompletionSlot,
-                    .acknowledgement => {
-                        const encoded = resolved.value orelse return error.InvalidCompletionSlot;
-                        if (std.mem.allEqual(u8, &progress.ack_bitmap, 0) or
-                            !std.mem.eql(u8, &progress.resolved_digest, &control_transition.resolvedDigest(encoded)) or
-                            !std.mem.eql(u8, &progress.ack_bitmap, &try control_transition.resolvedBitmap(participants.value.?, encoded)))
-                            return error.InvalidCompletionSlot;
-                    },
-                    else => return error.InvalidCompletionSlot,
-                }
-                latest = .{ .term = progress.latest.term, .index = progress.latest.index, .digest = progress.latest.digest };
-                active.latest = latest;
-            } else if (row[0] != 0 or row[52] != 0 or resolved.value != null or owner_value.value != null) {
-                return error.CompletionRecoveryCapacityRequired;
-            }
-            if (applied.index < latest.index or
-                (applied.index == latest.index and !std.meta.eql(applied, latest)))
-                return error.CompletionRecoveryCapacityRequired;
-            if (active.pending) |pending| {
-                if (std.meta.eql(pending, latest)) {
-                    // WAL publication completed, but sidecar unlink did not.
-                    // Only an exact committed v4 proof may retire this file.
-                    return;
-                }
-                // This first restorable sidecar profile excludes interleaved
-                // Raft indices. It can then reclassify against the exact
-                // replayed predecessor without inventing metadata state.
-                if (pending.index != applied.index +| 1 or pending.index <= latest.index)
+            for (&self.control_owners, 0..) |*maybe_owner, owner_index| {
+                const active = if (maybe_owner.*) |*owner| owner else continue;
+                const id = active.declaration.txn_id;
+                const ns: ?[]const u8 = if (self.config.namespace == .docs) "docs" else null;
+                const record_key = try std.mem.concat(alloc, u8, &.{ control_shape.records_prefix, &id });
+                defer alloc.free(record_key);
+                const participants_key = try std.mem.concat(alloc, u8, &.{ control_shape.participants_prefix, &id });
+                defer alloc.free(participants_key);
+                const resolved_key = try std.mem.concat(alloc, u8, &.{ control_shape.resolved_participants_prefix, &id });
+                defer alloc.free(resolved_key);
+                const record_value = try self.point(backend, alloc, ns, record_key);
+                defer record_value.deinit(alloc);
+                const participants = try self.point(backend, alloc, ns, participants_key);
+                defer participants.deinit(alloc);
+                const resolved = try self.point(backend, alloc, ns, resolved_key);
+                defer resolved.deinit(alloc);
+                const owner_value = try self.point(backend, alloc, ns, &control_record.ownerKey(id));
+                defer owner_value.deinit(alloc);
+                const receipt_value = try self.point(backend, alloc, ns, &control_record.receiptKey(id));
+                defer receipt_value.deinit(alloc);
+                const progress_value = try self.point(backend, alloc, ns, &control_record.progressKey(id));
+                defer progress_value.deinit(alloc);
+                const row = record_value.value orelse return error.InvalidCompletionSlot;
+                if (row.len != control_shape.txn_record_v6_size or row[49] != 0 or
+                    row[50] != @intFromBool(active.declaration.coordinator) or
+                    row[51] != @intFromBool(active.declaration.retain_terminal) or receipt_value.value != null)
                     return error.CompletionRecoveryCapacityRequired;
-                var decoded = try entry_codec.decode(alloc, active.held.accepted[control_accepted.header_bytes..active.held.accepted_len]);
-                defer decoded.deinit();
-                if (!std.mem.eql(u8, &decoded.digest, &pending.digest) or
-                    decoded.entry.previous_index != applied.index or decoded.entry.previous_term != applied.term)
+                if (!std.meta.eql(try control_record.Participants.fromEncodedList(participants.value orelse return error.InvalidCompletionSlot), active.declaration.participants))
                     return error.InvalidCompletionSlot;
-                const target = try self.classifyOwnedControlTransition(backend, alloc, &decoded) orelse return error.InvalidCompletionSlot;
-                if (target.slot_index != 0) return error.InvalidCompletionSlot;
-                active.transition = target.transition;
+                const applied = self.progress orelse return error.CompletionRecoveryCapacityRequired;
+                var latest = active.begin;
+                if (progress_value.value) |wire| {
+                    const progress = try control_record.Progress.decode(wire);
+                    const owner_record = self.controlOwnerRecord(owner_index);
+                    try progress.verifyOwner(owner_record);
+                    const actual_owner = owner_value.value orelse return error.InvalidCompletionSlot;
+                    if (!std.mem.eql(u8, actual_owner, &try owner_record.encode()) or
+                        progress.phase == .begin or progress.decision == .none or
+                        row[0] != @intFromEnum(progress.decision) or row[52] != 1 or
+                        progress.acknowledged >= active.declaration.participants.count)
+                        return error.InvalidCompletionSlot;
+                    switch (progress.phase) {
+                        .decision => if (resolved.value != null) return error.InvalidCompletionSlot,
+                        .acknowledgement => {
+                            const encoded = resolved.value orelse return error.InvalidCompletionSlot;
+                            if (std.mem.allEqual(u8, &progress.ack_bitmap, 0) or
+                                !std.mem.eql(u8, &progress.resolved_digest, &control_transition.resolvedDigest(encoded)) or
+                                !std.mem.eql(u8, &progress.ack_bitmap, &try control_transition.resolvedBitmap(participants.value.?, encoded)))
+                                return error.InvalidCompletionSlot;
+                        },
+                        else => return error.InvalidCompletionSlot,
+                    }
+                    latest = .{ .term = progress.latest.term, .index = progress.latest.index, .digest = progress.latest.digest };
+                    active.latest = latest;
+                } else if (row[0] != 0 or row[52] != 0 or resolved.value != null or owner_value.value != null) {
+                    return error.CompletionRecoveryCapacityRequired;
+                }
+                if (applied.index < latest.index or
+                    (applied.index == latest.index and !std.meta.eql(applied, latest)))
+                    return error.CompletionRecoveryCapacityRequired;
+                if (active.pending) |pending| {
+                    if (std.meta.eql(pending, latest)) {
+                        // WAL publication completed, but sidecar unlink did not.
+                        // Only an exact committed v4 proof may retire this file.
+                        return;
+                    }
+                    // This first restorable sidecar profile excludes interleaved
+                    // Raft indices. It can then reclassify against the exact
+                    // replayed predecessor without inventing metadata state.
+                    if (pending.index != applied.index +| 1 or pending.index <= latest.index)
+                        return error.CompletionRecoveryCapacityRequired;
+                    var decoded = try entry_codec.decode(alloc, active.held.accepted[control_accepted.header_bytes..active.held.accepted_len]);
+                    defer decoded.deinit();
+                    if (!std.mem.eql(u8, &decoded.digest, &pending.digest) or
+                        decoded.entry.previous_index != applied.index or decoded.entry.previous_term != applied.term)
+                        return error.InvalidCompletionSlot;
+                    const target = try self.classifyOwnedControlTransition(backend, alloc, &decoded) orelse return error.InvalidCompletionSlot;
+                    if (target.slot_index != owner_index) return error.InvalidCompletionSlot;
+                    active.transition = target.transition;
+                }
             }
         }
 

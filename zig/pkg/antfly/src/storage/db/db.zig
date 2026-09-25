@@ -144351,6 +144351,211 @@ test "workload admission physical completion staged control BEGIN retains a pool
     try std.testing.expectError(error.CompletionSlotChecksumMismatch, DB.open(alloc, path, reopen));
 }
 
+test "workload admission physical completion restores two interleaved BEGIN owners after exact v2 proof" {
+    try exerciseInterleavedBeginOwnerRestart(2);
+}
+
+test "workload admission physical completion refuses three interleaved BEGIN owners on restart" {
+    try exerciseInterleavedBeginOwnerRestart(3);
+}
+
+fn exerciseInterleavedBeginOwnerRestart(owner_count: usize) !void {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const local = @import("../local_write.zig");
+    var tmp = try TestDirectory.init("completion-two-control-begins");
+    defer tmp.cleanup();
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024 * 1024);
+    const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 1024 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    } };
+    const options: OpenOptions = .{
+        .resource_manager = &resources,
+        .durable_completion_enabled = true,
+        .durable_completion_authority = .standalone_local,
+        .table_storage = settings,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const binding: abi.InstallBinding = .{
+        .identity = .{
+            .group_id = 2,
+            .node_id = 7,
+            .capacity = 4,
+            .generation = 1,
+            .incarnation = @splat(27),
+            .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?),
+        },
+        .table_id = 1,
+        .range_id = 3,
+        .schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}"),
+    };
+    const ids = [_]transactions_mod.TxnId{ @splat(181), @splat(182), @splat(183) };
+    var digests: [3][32]u8 = undefined;
+    {
+        var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), options);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const empty: abi.DurableLog = .{ .mode = .startup_complete };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &empty));
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        {
+            const backend_runtime = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try backend.completion_pool.?.enableControlOwnerStaging(backend);
+        }
+        const participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+        defer alloc.free(participant);
+        const local_participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+        defer alloc.free(local_participant);
+        for (ids[0..owner_count], 0..) |id, i| {
+            if (i != 0) {
+                const backend_runtime = @import("../lsm_backend/runtime.zig");
+                const locked = backend_runtime.lockBackend(lsm_backend_mod.Backend, backend);
+                defer backend_runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+                try backend.completion_pool.?.maintainLocked(backend);
+                try backend.completion_pool.?.qualifyFresh(backend);
+            }
+            const request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+                .txn_id = id,
+                .begin_timestamp = 100 + i,
+                .created_at_ns = 90 + i,
+                .topology_epoch = 1,
+                .retain_terminal = true,
+                .participants = &.{ local_participant, participant },
+            } } };
+            const previous: u64 = @intCast(i);
+            const wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = if (i == 0) 0 else 1, .index = previous });
+            defer alloc.free(wire);
+            digests[i] = @import("../../common/completion_entry_protocol.zig").payloadDigest(wire);
+            const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+            const proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+                .term = 1,
+                .applied_term = if (i == 0) 0 else 1,
+                .applied_term_known = 1,
+                .applied_index = previous,
+                .last_index = previous,
+            }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+            var result: abi.CheckResult = undefined;
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+            lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = previous + 1, .last_index = previous + 1, .payloads = proposal.proposals });
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, previous + 1, payloads[0]));
+        }
+    }
+    const path = std.mem.span(tmp.path().ptr);
+    const config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
+    var reopen = options;
+    reopen.durable_completion_authority = .raft_apply;
+    reopen.completion_pool_config = config;
+    if (owner_count == 3) {
+        try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, path, reopen));
+        return;
+    }
+    {
+        const control_guard = @import("../lsm_backend/completion_control_guard.zig");
+        var storage = try @import("../lsm_backend/storage_io.zig").NativeStorage.init(alloc, .threaded);
+        defer storage.deinit();
+        const first_guard_path = try std.fs.path.join(alloc, &.{ path, control_guard.filenames[0] });
+        defer alloc.free(first_guard_path);
+        const second_guard_path = try std.fs.path.join(alloc, &.{ path, control_guard.filenames[1] });
+        defer alloc.free(second_guard_path);
+        const first_bytes = try storage.storage().readFileAlloc(alloc, first_guard_path, control_guard.max_bytes);
+        defer alloc.free(first_bytes);
+        const second_bytes = try storage.storage().readFileAlloc(alloc, second_guard_path, control_guard.max_bytes);
+        defer alloc.free(second_bytes);
+        const first_guard = try control_guard.Guard.decode(first_bytes);
+        var alias = try control_guard.Guard.decode(second_bytes);
+        alias.record.output_run_id = first_guard.record.output_run_id;
+        const bad = try alias.encode(alloc);
+        defer alloc.free(bad);
+        try storage.storage().writeFileAbsolute(second_guard_path, bad);
+        try std.testing.expectError(error.InvalidCompletionSlot, DB.open(alloc, path, reopen));
+        try storage.storage().writeFileAbsolute(second_guard_path, second_bytes);
+        const accepted_path = try std.fs.path.join(alloc, &.{ path, @import("../lsm_backend/completion_control_accepted.zig").filenames[0] });
+        defer alloc.free(accepted_path);
+        try storage.storage().writeFileAbsolute(accepted_path, "pending-interleaved-transition");
+        try std.testing.expectError(error.CompletionRecoveryCapacityRequired, DB.open(alloc, path, reopen));
+        try std.testing.expectEqual(@as(u64, "pending-interleaved-transition".len), try storage.storage().fileSize(accepted_path));
+        try storage.storage().deleteFileAbsolute(accepted_path);
+    }
+    var db = try DB.open(alloc, path, reopen);
+    defer db.close();
+    try db.installCompletionBinding(binding, "", "", "{}", settings);
+    const backend = db.core.primary_store_owner.lsmBackend().?;
+    const pool = backend.completion_pool.?;
+    try std.testing.expect(pool.restored_control_pending and !pool.ready);
+    try std.testing.expect(pool.control_owners[0] != null and pool.control_owners[1] != null);
+    const lease = try @import("../completion_native_guard.zig").Guard(DB).controlLeaseV2(&db, 2, 7);
+    defer lease.vtable.release(lease.context);
+    var owners: abi.ControlDurableOwnersV2 = .{};
+    try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_owners(lease.context, &owners));
+    try std.testing.expectEqual(@as(u32, 2), owners.count);
+    var proof: abi.ControlDurableLogV2 = .{
+        .mode = .startup_complete,
+        .last_index = 2,
+        .commit_index = 2,
+        .count = 2,
+        .document = .{ .mode = .startup_complete, .last_index = 2, .commit_index = 2 },
+    };
+    for (owners.owners[0..owners.count], 0..) |owner, i| proof.observations[i] = .{
+        .expected = owner.identity,
+        .present = 1,
+        .observed_term = 1,
+        .observed_digest = digests[owner.slot_index],
+    };
+    proof.observations[1].present = 0;
+    try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, lease.vtable.reconcile_durable(lease.context, &proof));
+    try std.testing.expect(!pool.ready);
+    proof.observations[1].present = 1;
+    proof.observations[1].observed_digest[0] ^= 1;
+    try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, lease.vtable.reconcile_durable(lease.context, &proof));
+    try std.testing.expect(!pool.ready);
+    proof.observations[1].observed_digest[0] ^= 1;
+    try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable(lease.context, &proof));
+    try std.testing.expect(pool.ready and !pool.restored_control_pending);
+    for (ids[0..owner_count]) |id| try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+    try std.testing.expectEqual(@as(usize, 2), pool.restored_control_owner_limit);
+    const apply_lease = try db.acquireCompletionLease(2, 7);
+    defer apply_lease.vtable.release(apply_lease.context);
+    const local_participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+    defer alloc.free(local_participant);
+    const remote_participant = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+    defer alloc.free(remote_participant);
+    const third: types.BatchRequest = .{ .transaction = .{ .begin = .{
+        .txn_id = ids[2],
+        .begin_timestamp = 102,
+        .created_at_ns = 92,
+        .topology_epoch = 1,
+        .retain_terminal = true,
+        .participants = &.{ local_participant, remote_participant },
+    } } };
+    const wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, third, .{ .term = 1, .index = 2 });
+    defer alloc.free(wire);
+    const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+    const proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{
+        .term = 1,
+        .applied_term = 1,
+        .applied_term_known = 1,
+        .applied_index = 2,
+        .last_index = 2,
+    }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+    var result: abi.CheckResult = undefined;
+    try std.testing.expectEqual(runtime_failure_abi.Status.completion_reservation_busy, apply_lease.vtable.check(apply_lease.context, &proposal, &result));
+    try std.testing.expect(pool.control_owners[2] == null);
+}
+
 test "workload admission physical completion restores one BEGIN owner after exact v2 startup proof" {
     const alloc = std.testing.allocator;
     const abi = @import("kernel_owner_abi").completion_pool;
