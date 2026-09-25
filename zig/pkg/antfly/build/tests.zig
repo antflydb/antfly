@@ -1053,6 +1053,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "created nested response allowlists cover generated schemas",
         "public index config encoders redact nested credentials",
         "public index config encoders preserve enrichment objects on read",
+        "metadata.table status uses public index projection for legacy graph artifacts",
         "public index config encoders retain credential-free provider urls",
         "public index config encoders omit root write-only producer documents",
         "created graph index response projects closed nested schemas",
