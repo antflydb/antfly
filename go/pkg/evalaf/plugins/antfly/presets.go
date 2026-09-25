@@ -127,6 +127,20 @@ func ComprehensiveEvaluatorPreset(g *genkitpkg.Genkit, modelName string) []eval.
 	return evaluators
 }
 
+// ResearchAgentEvaluatorPreset returns a preset of evaluators for ResearchAgent
+// evaluation: citation coverage and precision (grounded in the server's own
+// verification pass when available), sub-question coverage against the
+// planner's brief, and evidence source diversity. All are fast, LLM-free
+// checks over the structured ResearchAgentResult.
+func ResearchAgentEvaluatorPreset() []eval.Evaluator {
+	return []eval.Evaluator{
+		NewResearchCitationCoverageEvaluator("citation_coverage", 0),
+		NewResearchCitationPrecisionEvaluator("citation_precision", 0),
+		NewResearchSubQuestionCoverageEvaluator("sub_question_coverage", 0),
+		NewResearchEvidenceDiversityEvaluator("evidence_diversity", 0),
+	}
+}
+
 // QuickEvaluatorPreset returns a fast preset without LLM-as-judge.
 // Useful for CI/CD or rapid iteration.
 func QuickEvaluatorPreset() []eval.Evaluator {
