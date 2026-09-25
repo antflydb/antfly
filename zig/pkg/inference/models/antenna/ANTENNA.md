@@ -33,9 +33,18 @@ trail following), as this model is one encoder with many heads.
 - The GLiNER2 heads' outputs are indexed by **words, labels, and tasks, never
   by tokenizer pieces**. A ModernBERT student can therefore be distilled
   directly from DeBERTa teachers' outputs.
-- The plan starts with a cheap PyTorch distillation experiment. Native
-  runtime work begins only after the student is shown to hold the teacher's
-  quality.
+- Much of Antenna already exists in our tree. The fused chunker
+  (`src/finetune/fused_chunker*.zig`) is a ModernBERT encoder with a
+  chunk-boundary head and an embedding head, trained natively with InfoNCE,
+  Matryoshka dimensions, cross-batch negatives, and SPLADE. Antenna is that
+  trunk plus the GLiNER2.5 heads plus Laya's decision head.
+- Training is **Zig-first**. PyTorch serves only as the parity oracle and to
+  run the two span teachers we do not serve natively. The main missing piece
+  is a fused ModernBERT training attention (forward and backward), which
+  also removes Laya's ~2k-token training cap.
+- The plan starts with a small native distillation on the fused chunker's
+  existing ModernBERT-base graph at 512 tokens, which needs no new kernels,
+  so the quality question is answered before the kernel work.
 
 ## Background
 
@@ -94,6 +103,7 @@ document chunker. Boundary and span checkpoints are not interchangeable.
 | GLiNER2.5 boundary core | `fastino/gliner2.5-{small,base,multi}-v1` (`boundary`) | Learned `classifier` over `[L]` states (`classifyNative`) | DeBERTa only: `Backbone` is `small`/`base`/`multi` with hard-coded hidden and vocabulary sizes | `src/architectures/gliner/boundary_*.zig`, `src/models/gliner_boundary.zig`, [GLINER25.md](../gliner2/GLINER25.md) |
 | GLiNER2 fine-tuning | span checkpoints | trains `classifier` | DeBERTa (`deberta_graph`) | `src/finetune/gliner2_real_autodiff.zig`, [FINETUNING.md](../gliner2/FINETUNING.md) |
 | Laya | `convaiinnovations/laya*` | decision head | ModernBERT-large / mmBERT-base; tree packing, segment attention, trunk cache | [LAYA.md](../laya/LAYA.md) |
+| Fused chunker (training only) | own checkpoints (`fused_chunker_embedder/v1alpha1`) | per-token chunk-boundary MLP; embedding head with late-chunking mean pool; optional SPLADE | ModernBERT-base | `src/finetune/fused_chunker*.zig`, [finetuning/FINETUNING.md](../../finetuning/FINETUNING.md#training-features-by-model-family) |
 
 Two consequences:
 
@@ -109,7 +119,9 @@ Two consequences:
   (`position_biased_input: false`). Its limits are pretraining length and
   cost, not a cap.
 
-`pipelines/chunking.zig` is fixed-size text splitting with no model.
+`pipelines/chunking.zig`, the served chunker, is fixed-size text splitting
+with no model. The fused chunker is trainable but not yet served (its
+production lane is a CPU smoke test, [finetuning/CLI.md](../../finetuning/CLI.md)).
 
 ### How GLiNER2 compares with tree-packed Laya
 
@@ -145,7 +157,9 @@ review.
      it reimplemented.
    - Alternating local (128-token window) and global attention, so cost grows
      slowly with length.
-   - Our fused Metal and CUDA kernels target ModernBERT.
+   - Our fused Metal and CUDA *inference* kernels target ModernBERT. (Fused
+     *training* attention exists only for DeBERTa today; see
+     [Training infrastructure](#training-infrastructure).)
    - One architecture covers English (ModernBERT) and multilingual (mmBERT),
      for Laya and Antenna alike. The DeBERTa multilingual option,
      `mdeberta-v3-base`, has no large size. `deberta-v3-large` is English
@@ -198,6 +212,16 @@ review.
 6. **Port the constrained decoder separately.** It consumes scores, so it can
    sit in `/ai/v1/extract` in front of any backend, Laya included, and does
    not wait on Antenna.
+7. **Build on the fused chunker; do not write new embedding and chunking
+   heads.** Its trunk is already ModernBERT, and its boundary and embedding
+   heads, losses, and training features are the ones Antenna needs.
+8. **Train in Zig.** The training stack already has most of what the run
+   needs (see [Training infrastructure](#training-infrastructure)), and the
+   kernels we write for it are the kernels customer fine-tuning ships with.
+   PyTorch is used only as the parity oracle, following the existing
+   `scripts/gliner25/oracle.py` and `scripts/laya/*_reference.py` pattern,
+   and to run the span teachers (Decide, `gliner2-large-v1`), which we do not
+   serve natively.
 
 ## Design
 
@@ -208,8 +232,8 @@ text ─► ModernBERT / mmBERT encoder ─┬─► boundary extraction head   
        (schema prefix, or tree-      ├─► classifier on [L]          (GLiNER2 classification)
         packed trunk + branches)     ├─► count / abstention heads
                                      ├─► Laya decision head         (choice, score, noul)
-                                     ├─► attention-pool embedding   (dense vector)
-                                     └─► boundary tagger            (chunk starts, per word)
+                                     ├─► embedding head             (dense, Matryoshka; optional SPLADE)
+                                     └─► chunk-boundary MLP         (chunk starts, per token)
 ```
 
 - **Encoder:** ModernBERT-large (hidden 1024, 28 layers) or mmBERT-base.
@@ -222,11 +246,12 @@ text ─► ModernBERT / mmBERT encoder ─┬─► boundary extraction head   
   MLP, unchanged except for the encoder width they read.
 - **Decision head:** Laya's head ([LAYA.md](../laya/LAYA.md)), reading the
   shared encoder.
-- **Embedding:** an attention-pool head, a learned query over the text
-  tokens plus a projection. Late-interaction (ColBERT-style) per-token
-  vectors could come from the same states later.
-- **Chunking:** a per-word binary tagger for "a chunk starts here". Spans do
-  not fit because `max_width` is 8 words.
+- **Embedding and chunking:** the fused chunker's heads, unchanged: a
+  per-token two-layer boundary MLP, an embedding head with late-chunking
+  mean pooling per chunk, and an optional SPLADE sparse head. They train
+  with InfoNCE, Matryoshka dimensions, and cross-batch negatives. A learned
+  attention pool is an ablation, not the default. Late-interaction
+  (ColBERT-style) per-token vectors could come from the same states later.
 
 ### Why embeddings force a layout decision
 
@@ -249,7 +274,7 @@ options:
    compute.
 
 The plan starts with the GLiNER2 layout (the exact distillation target) and
-decides between these options at step 5, with measurements.
+decides between these options at step 7, with measurements.
 
 ### Expected cost
 
@@ -295,7 +320,7 @@ Hidden-state matching is optional, and would need a word-level alignment.
 | Extraction (multilingual) | `fastino/gliner2.5-multi-v1` (`aaecfe45db1d828c963717054ccb868e8ad1f1d5`) | mDeBERTa-based; covers `antenna-multilingual` |
 | Decisions | released Laya, or a packed Laya fine-tune | as in `prepare_laya_packed_distillation.py` |
 | Long documents | windowed teachers for extraction; an LLM teacher for document-level classification (LAYA.md step 2a) | |
-| Embeddings | the embedder currently served for the index | plus a contrastive objective |
+| Embeddings | ModernBERT-family embedders: [`ibm-granite/granite-embedding-english-r2`](https://huggingface.co/ibm-granite/granite-embedding-english-r2) (English), [`ibm-granite/granite-embedding-311m-multilingual-r2`](https://huggingface.co/ibm-granite/granite-embedding-311m-multilingual-r2) (multilingual; its config reports `modernbert`, presumably mmBERT-based) | plus the fused chunker's InfoNCE objective. Check that our embedding pipeline loads ModernBERT embedders before relying on them |
 
 ### Losses
 
@@ -334,20 +359,97 @@ The teachers are zero-shot, so both texts and schemas can be generated:
 - Keep a provenance and hash sidecar for every generated set, as the Laya
   distillation script does.
 
+## Training infrastructure
+
+Antenna trains natively. This inventory was taken from the tree on
+2026-09-25 (`src/finetune/`, `src/graph/`, `lib/ml/src/graph/`,
+[finetuning/FINETUNING.md](../../finetuning/FINETUNING.md)).
+
+### Already in Zig
+
+| Capability | Where | Notes |
+| --- | --- | --- |
+| Autodiff graph; AdamW, schedule-free AdamW, layer-wise LR decay, global gradient clipping, gradient accumulation | `lib/ml/src/graph/`, `src/finetune/` | all model families |
+| LoRA, LoRA+, QLoRA (NF4), recursive LoRA | `src/finetune/lora*.zig`, `qlora_nf4.zig`, `recursive_lora.zig` | |
+| Activation checkpointing and bounded recomputation | `lib/ml/src/graph/checkpoint.zig`, `src/graph/recomputed_training.zig` | |
+| Device-resident training on Metal and CUDA | `src/graph/resident_training_*.zig` | GLiNER2.5 and Laya |
+| Fused training attention with backward | `src/ops/cuda/gliner25.zig` (`debertaTrainingAttentionBackwardV1`) | **DeBERTa only**, CUDA |
+| Contrastive and embedding losses: InfoNCE, Matryoshka, cross-batch memory, SPLADE with FLOPS regularization, NEFTune | `src/finetune/fused_chunker_train.zig`, `infonce_cpu.zig` | fused chunker |
+| Data-parallel training | `src/graph/distributed_training.zig`, `collective_ops.zig` | wired for ColQwen2 and Gemma4 |
+| PJRT (XLA) training path | `src/graph/pjrt_*` | ColQwen2 and Gemma4 |
+| Native GLiNER2.5 inference | `src/architectures/gliner/boundary_*.zig` | at least 2.3× PyTorch on CUDA in every benchmark case ([scripts/gliner25/CUDA.md](../../scripts/gliner25/CUDA.md)) |
+
+The GLiNER2.5 CUDA trainer shows what the discipline buys. It started 1.9–4.2×
+slower than eager PyTorch on full fine-tuning. Reusing device allocations,
+cutting stream synchronizations (21,832 in one traced run), and replacing
+generic backward reductions brought it to 1.2–2.0× faster on full training
+and 1.8–3.6× on head-only training, with raw-bit-identical weights and
+optimizer moments through 100 updates (small model, synthetic fixtures;
+v39 in `CUDA.md`).
+
+### Gaps, in priority order
+
+1. **Fused ModernBERT training attention, forward and backward, on CUDA and
+   Metal.** Plain attention in `lib/ml` (`Builder.sdpa`) is decomposed for
+   backward, so scores are fully materialized; that is why the Laya trainer
+   admits about 2k tokens at batch 1. The kernel needs RoPE at explicit
+   logical positions, the 128-token sliding window for local layers,
+   variable-length packing (no padding), and the per-query segment ranges
+   the inference-side segment attention already takes. It is the ModernBERT
+   counterpart of `debertaTrainingAttentionBackwardV1`, and it also unblocks
+   Laya's long-context step (LAYA.md step 2c) and packed training.
+2. **BF16 training** with FP32 master weights. There is none today: the only
+   mixed-precision path was MLX-only and was removed with the MLX backend.
+3. **The fused chunker on the resident Metal and CUDA paths.** Its
+   production lane is a CPU smoke test today.
+4. **Allocation and synchronization discipline on the ModernBERT graph**, the
+   same kind of work that made the GLiNER2.5 CUDA trainer faster than
+   PyTorch. Profile each new path before optimizing, as `CUDA.md` requires.
+5. **Device all-reduce.** `collective_ops.allReduceSum` stages through the
+   host (download, sum, upload). Needed only when a run needs more than one
+   GPU.
+
+### Teacher targets
+
+- Boundary teachers (`gliner2.5-base`, `gliner2.5-multi`) run on our native
+  GLiNER2.5 inference.
+- Span teachers (Decide, `gliner2-large-v1`) run in PyTorch through
+  upstream `gliner2`, because we do not serve span checkpoints through the
+  learned heads.
+- Targets are written once, sparsely (top candidates plus sampled
+  negatives), with a provenance and hash sidecar, and read by every run.
+
+### Throughput levers, independent of kernels
+
+- Pack several examples per row with block-diagonal masks, and batch by
+  length bucket.
+- Train at 512 tokens first, then a separate long-context stage with
+  activation checkpointing.
+- Warm up the new heads with the encoder frozen before unfreezing it.
+- Use LoRA or frozen lower layers when adding heads to a trained trunk.
+- Tree-pack multi-task examples once the packed layout is qualified: for
+  Laya this cut training time 3.4× at equal accuracy.
+
 ## Plan
 
 Each step has a gate. A step starts only after the previous gate passes.
+Steps 2 and 3 are infrastructure and can run alongside step 1.
 
 | Step | Work | Gate |
 | --- | --- | --- |
 | 0. Baselines | Score Decide, `gliner2.5-base`, released Laya, and packed Laya on one harness: typed-decisions, Banking77, CLINC150, AG News, SST-5 (accuracy, soft CE, ECE), zero-shot NER (CrossNER, MIT) F1, and the `testdata/gliner25` pipeline cases. Time `gliner2.5-base` (native boundary core) against Laya's ModernBERT at 64, 512, and 2k tokens on CPU and Metal. Decide runs in PyTorch through `gliner2`. | None; this sets the targets. Record them here |
 | 0b. Constrained decoder | Port upstream's constraint AST and decoders into the extract API, scoring-backend agnostic | Decisions equal upstream's on its tests; Laya and GLiNER backends both use it |
-| 1. PyTorch prototype | Upstream `gliner2` boundary model with `model_name` = `answerdotai/ModernBERT-large` (upstream loads encoders with `AutoModel`; unverified for ModernBERT), teacher target dumps, distillation losses. Also a ModernBERT-base run against `gliner2.5-base` for a same-size comparison. Head ablation: train span heads and boundary heads on the same encoder and data (Decision 4) | Within about 2 points of the teacher's average on gold; ECE no worse; top-1 agreement and span F1 against the teacher reported. If the student is more than 2–3 points behind, stop and keep DeBERTa for short extraction and classification. Head choice: entity F1 split into 8 words or fewer and longer, relation F1, and agreement with each teacher; keep boundary heads unless span heads win clearly on short entities and long entities are rare in our data |
-| 2. Long context | Windowed-teacher and LLM-teacher labels; train at 2k–8k | No loss at 512 tokens; better than windowed `gliner2.5-base` on long documents |
-| 3. Native runtime | Generalize `gliner_boundary.Backbone` and the boundary engine to a ModernBERT/mmBERT encoder; converter; oracle fixtures and parity under the `testdata/gliner25` policy; a qualification row through the two-tier gate ([GLINER25.md](../gliner2/GLINER25.md)); boundary heads on the ModernBERT training graph Laya uses | Parity with PyTorch within the existing boundary tolerances; qualification row reviewed |
-| 4. Decision head | Laya head on the Antenna trunk, trained with the extraction distillation losses kept on as an anchor | Within noise of packed Laya on typed-decisions; extraction metrics unchanged |
-| 5. Embedding and chunk heads | Attention-pool embedding and per-word boundary tagger; choose among the three layouts above by measurement | Embedding: retrieval on the 10k Wikipedia set within an agreed tolerance of the teacher embedder. Chunking: retrieval with learned chunks no worse than fixed chunking |
-| 6. Tree-packed trunk | Schema-blind text trunk with task branches, reusing Laya's packer, segment attention, and trunk cache | Extraction F1 and classification within noise of the unpacked Antenna, the same gate as LAYA.md step 0 |
+| 1. Native pilot | Put the GLiNER2.5 boundary heads and `classifier` (and span heads, for the Decision 4 ablation) on the fused chunker's ModernBERT-base training graph at 512 tokens. Distill from the step-0 teachers' targets on a small dataset. Compare with `gliner2.5-base`, which is about the same size. Uses no new kernels; moving the graph onto a resident backend is in scope if CPU is too slow | Within about 2 points of `gliner2.5-base` on gold; ECE no worse; top-1 agreement and span F1 against the teachers reported. If the student is more than 2–3 points behind, stop and keep DeBERTa for short extraction and classification. Head choice: entity F1 split into 8 words or fewer and longer, relation F1, and agreement with each teacher; keep boundary heads unless span heads win clearly on short entities and long entities are rare in our data |
+| 2. Fused ModernBERT training attention | Gap 1 above, on CUDA and Metal | Gradient parity with a PyTorch reference, as for the DeBERTa kernel; memory linear in sequence length; Laya trains at 8k tokens |
+| 3. BF16 training | Gap 2 above | Loss curve within tolerance of FP32 over a fixed number of updates; final evaluation within 0.5 points (the `CUDA.md` quality bar) |
+| 4. Full distillation | `antenna-large` (ModernBERT-large) and `antenna-multilingual` (mmBERT-base) on the full dataset, then a 2k–8k long-context stage with windowed-teacher and LLM-teacher labels | Within about 2 points of the teachers on gold at 512 tokens; better than windowed `gliner2.5-base` on long documents |
+| 5. Native serving | Generalize `gliner_boundary.Backbone` and the boundary engine to ModernBERT and mmBERT; converter; oracle fixtures and parity under the `testdata/gliner25` policy; a qualification row through the two-tier gate ([GLINER25.md](../gliner2/GLINER25.md)) | Parity with the trained checkpoint within the existing boundary tolerances; qualification row reviewed |
+| 6. Decision head | Laya head on the Antenna trunk, trained with the extraction distillation losses kept on as an anchor | Within noise of packed Laya on typed-decisions; extraction metrics unchanged |
+| 7. Embedding and chunk heads | The fused chunker's heads and losses on the Antenna trunk; choose among the three layouts above by measurement | Embedding: retrieval on the 10k Wikipedia set within an agreed tolerance of the teacher embedder. Chunking: retrieval with learned chunks no worse than fixed chunking. Extraction metrics unchanged |
+| 8. Tree-packed trunk | Schema-blind text trunk with task branches, reusing Laya's packer, segment attention, and trunk cache | Extraction F1 and classification within noise of the unpacked Antenna, the same gate as LAYA.md step 0 |
+
+Gaps 4 and 5 (allocation discipline, device all-reduce) are taken on when
+profiling or run size calls for them, each with its own benchmark evidence.
 
 Independent of Antenna, serving span checkpoints (Decide) through the
 learned `classifier` would fix the legacy classification path. It is not on
@@ -361,10 +463,13 @@ the critical path because step 0 can score Decide in PyTorch.
 - **Embedding quality:** a head on an extraction encoder will not match a
   dedicated embedder without contrastive fine-tuning of the encoder, which
   risks the extraction heads. Multi-task batches and the distillation anchor
-  are the mitigation; step 5 measures it.
-- **Training memory:** the native training graph materializes attention and
-  admits about 2k tokens at batch 1 (LAYA.md step 2c). Steps 1–2 run in
-  PyTorch for this reason.
+  are the mitigation; step 7 measures it.
+- **Training kernels:** long-context training depends on the fused ModernBERT
+  training attention (step 2). Until it lands, native training is limited to
+  about 2k tokens at batch 1, which is enough for step 1 and the 512-token
+  stage of step 4.
+- **Pilot backend:** the fused chunker trains on CPU today. If the step 1
+  pilot is too slow there, moving it to a resident backend comes first.
 - **Vendor figures:** Decide's benchmark and latency numbers are Fastino's.
   Step 0 replaces them with ours.
 - **Multilingual teachers:** `gliner2.5-multi-v1` is base size; whether it is
