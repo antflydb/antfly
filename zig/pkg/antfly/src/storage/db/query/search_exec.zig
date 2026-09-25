@@ -18157,6 +18157,82 @@ fn appendHighlightFragments(
     }
 }
 
+fn normalizeHighlightSpans(alloc: Allocator, fragment: *types.HighlightFragment) !void {
+    std.mem.sort(types.HighlightSpan, fragment.spans, {}, struct {
+        fn lessThan(_: void, a: types.HighlightSpan, b: types.HighlightSpan) bool {
+            return if (a.start == b.start) a.end > b.end else a.start < b.start;
+        }
+    }.lessThan);
+    var write: usize = 0;
+    for (fragment.spans) |span| {
+        if (write > 0 and span.start <= fragment.spans[write - 1].end) {
+            fragment.spans[write - 1].end = @max(fragment.spans[write - 1].end, span.end);
+        } else {
+            fragment.spans[write] = span;
+            write += 1;
+        }
+    }
+    if (write != fragment.spans.len) {
+        const normalized = try alloc.dupe(types.HighlightSpan, fragment.spans[0..write]);
+        alloc.free(fragment.spans);
+        fragment.spans = normalized;
+    }
+}
+
+fn finalizeHighlightFragments(
+    alloc: Allocator,
+    fragments: *std.ArrayListUnmanaged(types.HighlightFragment),
+    max_fragments: u32,
+) !void {
+    for (fragments.items) |*fragment| try normalizeHighlightSpans(alloc, fragment);
+
+    // Each query and each array item selected its own windows. Apply the
+    // public limit once per field after all query windows have been combined.
+    std.mem.sort(types.HighlightFragment, fragments.items, {}, struct {
+        fn lessThan(_: void, a: types.HighlightFragment, b: types.HighlightFragment) bool {
+            if (a.spans.len != b.spans.len) return a.spans.len > b.spans.len;
+            if (a.item != b.item) return (a.item orelse 0) < (b.item orelse 0);
+            return a.offset < b.offset;
+        }
+    }.lessThan);
+    const keep = @min(fragments.items.len, @as(usize, @intCast(max_fragments)));
+    // A discarded window can overlap a retained one even when the two came
+    // from different analyzers. Carry its visible spans into the retained
+    // window before freeing it, so the limit does not hide nearby matches.
+    if (keep < fragments.items.len) {
+        for (fragments.items[0..keep]) |*selected| {
+            var combined = std.ArrayListUnmanaged(types.HighlightSpan).empty;
+            defer combined.deinit(alloc);
+            try combined.appendSlice(alloc, selected.spans);
+            const selected_end = selected.offset + @as(u32, @intCast(selected.text.len));
+            for (fragments.items[keep..]) |other| {
+                if (other.item != selected.item) continue;
+                for (other.spans) |span| {
+                    const start = other.offset + span.start;
+                    const end = other.offset + span.end;
+                    if (start >= selected_end or end <= selected.offset) continue;
+                    try combined.append(alloc, .{
+                        .start = @max(start, selected.offset) - selected.offset,
+                        .end = @min(end, selected_end) - selected.offset,
+                    });
+                }
+            }
+            const merged = try combined.toOwnedSlice(alloc);
+            alloc.free(selected.spans);
+            selected.spans = merged;
+            try normalizeHighlightSpans(alloc, selected);
+        }
+    }
+    for (fragments.items[keep..]) |*fragment| types.freeHighlightFragment(alloc, fragment);
+    fragments.items.len = keep;
+    std.mem.sort(types.HighlightFragment, fragments.items, {}, struct {
+        fn lessThan(_: void, a: types.HighlightFragment, b: types.HighlightFragment) bool {
+            if (a.item != b.item) return (a.item orelse 0) < (b.item orelse 0);
+            return a.offset < b.offset;
+        }
+    }.lessThan);
+}
+
 /// Attach `_highlights` to every hit that carries stored source. Matchers are
 /// derived from the same lowering the query executed with, so stemmed,
 /// stop-word-filtered, and substring-companion clauses all highlight the
@@ -18273,6 +18349,7 @@ pub fn attachHighlightsWithIndexQueries(
                 }
             }
             if (fragments.items.len == 0) continue;
+            try finalizeHighlightFragments(alloc, &fragments, max_fragments);
             const owned_field = try alloc.dupe(u8, field);
             errdefer alloc.free(owned_field);
             try highlighted.append(alloc, .{ .field = owned_field, .fragments = try fragments.toOwnedSlice(alloc) });
@@ -18409,6 +18486,41 @@ test "named highlight queries use their own index analyzers" {
         }
     }
     try std.testing.expect(saw_handbook and saw_runner);
+}
+
+test "highlight fragment limit applies across queries and array items" {
+    const alloc = std.testing.allocator;
+    var hits = [_]types.SearchHit{
+        .{ .id = try alloc.dupe(u8, "doc:1"), .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx omega\"}") },
+        .{ .id = try alloc.dupe(u8, "doc:2"), .stored_data = try alloc.dupe(u8, "{\"title\":[\"alpha\",\"omega\"]}") },
+    };
+    defer for (&hits) |*hit| hit.deinit(alloc);
+    const queries = [_]types.TextQuery{
+        .{ .match = .{ .field = "title", .text = "alpha" } },
+        .{ .match = .{ .field = "title", .text = "omega" } },
+    };
+    try attachHighlights(alloc, .{ .fragment_size = 16, .max_fragments = 1 }, &queries, &hits, null, .{}, null);
+    for (hits) |hit| {
+        try std.testing.expectEqual(@as(usize, 1), hit.highlights.len);
+        try std.testing.expectEqual(@as(usize, 1), hit.highlights[0].fragments.len);
+    }
+}
+
+test "limited highlight window retains nearby matches from other queries" {
+    const alloc = std.testing.allocator;
+    var hits = [_]types.SearchHit{.{
+        .id = try alloc.dupe(u8, "doc:1"),
+        .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha omega\"}"),
+    }};
+    defer hits[0].deinit(alloc);
+    const queries = [_]types.TextQuery{
+        .{ .match = .{ .field = "title", .text = "alpha" } },
+        .{ .match = .{ .field = "title", .text = "omega" } },
+    };
+    try attachHighlights(alloc, .{ .fragment_size = 10, .max_fragments = 1 }, &queries, &hits, null, .{}, null);
+    try std.testing.expectEqual(@as(usize, 1), hits[0].highlights[0].fragments.len);
+    const spans = hits[0].highlights[0].fragments[0].spans;
+    try std.testing.expectEqual(@as(usize, 2), spans.len);
 }
 
 /// The analyzer to apply to *query* text for a field. A substring companion is

@@ -57,7 +57,153 @@ pub const CharFilter = enum {
             .zero_width_non_joiner => applyZwnj(alloc, text),
         };
     }
+
+    fn applyMapped(self: CharFilter, alloc: Allocator, input: MappedText) !MappedText {
+        const output = try self.apply(alloc, input.text);
+        errdefer alloc.free(output);
+        const starts = try alloc.alloc(u32, output.len);
+        errdefer alloc.free(starts);
+        const ends = try alloc.alloc(u32, output.len);
+        errdefer alloc.free(ends);
+        var mapping = OffsetWriter{ .input = input, .starts = starts, .ends = ends };
+        switch (self) {
+            .html_strip => try mapHtmlStripOffsets(alloc, &mapping, output),
+            .ascii_fold => try mapAsciiFoldOffsets(&mapping, output),
+            .zero_width_non_joiner => try mapZwnjOffsets(&mapping),
+        }
+        if (mapping.cursor != output.len) return error.InvalidData;
+        return .{ .text = output, .starts = starts, .ends = ends };
+    }
 };
+
+const MappedText = struct {
+    text: []u8,
+    starts: []u32,
+    ends: []u32,
+
+    fn identity(alloc: Allocator, text: []const u8) !MappedText {
+        const owned = try alloc.dupe(u8, text);
+        errdefer alloc.free(owned);
+        const starts = try alloc.alloc(u32, text.len);
+        errdefer alloc.free(starts);
+        const ends = try alloc.alloc(u32, text.len);
+        errdefer alloc.free(ends);
+        for (starts, ends, 0..) |*start, *end, i| {
+            start.* = @intCast(i);
+            end.* = @intCast(i + 1);
+        }
+        return .{ .text = owned, .starts = starts, .ends = ends };
+    }
+
+    fn deinit(self: MappedText, alloc: Allocator) void {
+        alloc.free(self.text);
+        alloc.free(self.starts);
+        alloc.free(self.ends);
+    }
+};
+
+const OffsetWriter = struct {
+    input: MappedText,
+    starts: []u32,
+    ends: []u32,
+    cursor: usize = 0,
+
+    fn copy(self: *OffsetWriter, start: usize, end: usize) !void {
+        if (start > end or end > self.input.text.len or self.cursor > self.starts.len or end - start > self.starts.len - self.cursor) return error.InvalidData;
+        for (start..end) |i| {
+            self.starts[self.cursor] = self.input.starts[i];
+            self.ends[self.cursor] = self.input.ends[i];
+            self.cursor += 1;
+        }
+    }
+
+    fn replace(self: *OffsetWriter, start: usize, end: usize, output_len: usize) !void {
+        if (start >= end or end > self.input.text.len or self.cursor > self.starts.len or output_len > self.starts.len - self.cursor) return error.InvalidData;
+        for (0..output_len) |_| {
+            self.starts[self.cursor] = self.input.starts[start];
+            self.ends[self.cursor] = self.input.ends[end - 1];
+            self.cursor += 1;
+        }
+    }
+};
+
+fn mapHtmlStripOffsets(alloc: Allocator, mapping: *OffsetWriter, output: []const u8) !void {
+    const text = mapping.input.text;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '<') {
+            const start = i;
+            i += 1;
+            while (i < text.len and text[i] != '>') : (i += 1) {}
+            if (i < text.len) i += 1;
+            if (mapping.cursor > 0 and output[mapping.cursor - 1] != ' ') try mapping.replace(start, i, 1);
+        } else if (text[i] == '&') {
+            const start = i;
+            i += 1;
+            if (i < text.len and text[i] == '#') {
+                i += 1;
+                const hex = i < text.len and (text[i] == 'x' or text[i] == 'X');
+                if (hex) i += 1;
+                while (i < text.len and text[i] != ';') : (i += 1) {
+                    const c = text[i];
+                    if (hex) {
+                        if (!std.ascii.isHex(c)) break;
+                    } else if (!std.ascii.isDigit(c)) break;
+                }
+                if (i < text.len and text[i] == ';') i += 1;
+            } else {
+                const name_start = i;
+                while (i < text.len and text[i] != ';' and i - name_start < 10) : (i += 1) {}
+                if (i < text.len and text[i] == ';') i += 1;
+            }
+            const replacement = try applyHtmlStrip(alloc, text[start..i]);
+            defer alloc.free(replacement);
+            if (std.mem.eql(u8, replacement, text[start..i])) {
+                try mapping.copy(start, i);
+            } else {
+                try mapping.replace(start, i, replacement.len);
+            }
+        } else {
+            try mapping.copy(i, i + 1);
+            i += 1;
+        }
+    }
+}
+
+fn mapAsciiFoldOffsets(mapping: *OffsetWriter, output: []const u8) !void {
+    const text = mapping.input.text;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (i + 1 < text.len and (text[i] == 0xC3 or text[i] == 0xC4 or text[i] == 0xC5) and
+            mapping.cursor < output.len and output[mapping.cursor] < 0x80)
+        {
+            try mapping.replace(i, i + 2, 1);
+            i += 2;
+        } else {
+            try mapping.copy(i, i + 1);
+            i += 1;
+        }
+    }
+}
+
+fn mapZwnjOffsets(mapping: *OffsetWriter) !void {
+    const text = mapping.input.text;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (i + 2 < text.len and text[i] == 0xE2 and text[i + 1] == 0x80 and
+            (text[i + 2] == 0x8C or text[i + 2] == 0x8B or text[i + 2] == 0x8D))
+        {
+            i += 3;
+            continue;
+        }
+        if (i + 2 < text.len and text[i] == 0xEF and text[i + 1] == 0xBB and text[i + 2] == 0xBF) {
+            i += 3;
+            continue;
+        }
+        try mapping.copy(i, i + 1);
+        i += 1;
+    }
+}
 
 fn applyHtmlStrip(alloc: Allocator, text: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -1365,6 +1511,30 @@ pub const Analyzer = struct {
         var tokens = try self.tokenizer.tokenize(alloc, processed);
         for (self.filters) |filter| {
             tokens = try filter.apply(alloc, tokens);
+        }
+        return tokens;
+    }
+
+    /// Analyze stored text while returning token positions in the original
+    /// bytes. Character filters may remove or replace bytes, so their token
+    /// offsets cannot be used directly to highlight the stored value.
+    pub fn analyzeWithSourceOffsets(self: *const Analyzer, alloc: Allocator, text: []const u8) ![]Token {
+        if (self.char_filters.len == 0) return self.analyze(alloc, text);
+
+        var mapped = try MappedText.identity(alloc, text);
+        defer mapped.deinit(alloc);
+        for (self.char_filters) |filter| {
+            const next = try filter.applyMapped(alloc, mapped);
+            mapped.deinit(alloc);
+            mapped = next;
+        }
+
+        var tokens = try self.tokenizer.tokenize(alloc, mapped.text);
+        for (self.filters) |filter| tokens = try filter.apply(alloc, tokens);
+        for (tokens) |*token| {
+            if (token.start_byte >= token.end_byte or token.end_byte > mapped.text.len) continue;
+            token.start_byte = mapped.starts[token.start_byte];
+            token.end_byte = mapped.ends[token.end_byte - 1];
         }
         return tokens;
     }

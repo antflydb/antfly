@@ -94,7 +94,7 @@ pub fn highlightMatchers(
 ) ![]Fragment {
     if (text.len == 0 or matchers.len == 0 or max_fragments == 0) return &.{};
 
-    const tokens = try analyzer.analyze(alloc, text);
+    const tokens = try analyzer.analyzeWithSourceOffsets(alloc, text);
     defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
 
     var spans = std.ArrayListUnmanaged(Span).empty;
@@ -255,36 +255,40 @@ fn collectContainsSpans(
                 else => continue,
             };
             if (needle.len == 0) continue;
-            if (indexOfIgnoreCase(surface, needle)) |index| {
+            var search_at: usize = 0;
+            while (search_at + needle.len <= surface.len) {
+                const relative = indexOfIgnoreCase(surface[search_at..], needle) orelse break;
+                const index = search_at + relative;
                 try spans.append(alloc, .{
                     .start = word.start_byte + @as(u32, @intCast(index)),
                     .end = word.start_byte + @as(u32, @intCast(index + needle.len)),
                 });
-                continue;
+                search_at = index + 1;
             }
             // The companion joins adjacent words without a separator, so a
             // match may start inside this word and end inside the next one.
             if (i + 1 >= words.len) continue;
             const next = words[i + 1];
             const next_surface = text[next.start_byte..next.end_byte];
-            if (try joinedContainsIgnoreCase(alloc, surface, next_surface, needle)) |joined_index| {
-                if (joined_index >= surface.len or joined_index + needle.len <= surface.len) continue;
-                try spans.append(alloc, .{
-                    .start = word.start_byte + @as(u32, @intCast(joined_index)),
-                    .end = next.start_byte + @as(u32, @intCast(joined_index + needle.len - surface.len)),
-                });
+            if (surface.len + next_surface.len < needle.len) continue;
+            const joined = try alloc.alloc(u8, surface.len + next_surface.len);
+            defer alloc.free(joined);
+            @memcpy(joined[0..surface.len], surface);
+            @memcpy(joined[surface.len..], next_surface);
+            search_at = 0;
+            while (search_at + needle.len <= joined.len) {
+                const relative = indexOfIgnoreCase(joined[search_at..], needle) orelse break;
+                const joined_index = search_at + relative;
+                if (joined_index < surface.len and joined_index + needle.len > surface.len) {
+                    try spans.append(alloc, .{
+                        .start = word.start_byte + @as(u32, @intCast(joined_index)),
+                        .end = next.start_byte + @as(u32, @intCast(joined_index + needle.len - surface.len)),
+                    });
+                }
+                search_at = joined_index + 1;
             }
         }
     }
-}
-
-fn joinedContainsIgnoreCase(alloc: Allocator, a: []const u8, b: []const u8, needle: []const u8) !?usize {
-    if (a.len + b.len < needle.len) return null;
-    const joined = try alloc.alloc(u8, a.len + b.len);
-    defer alloc.free(joined);
-    @memcpy(joined[0..a.len], a);
-    @memcpy(joined[a.len..], b);
-    return indexOfIgnoreCase(joined, needle);
 }
 
 fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
@@ -495,6 +499,51 @@ test "highlight clips a match wider than its fragment" {
     try std.testing.expectEqual(@as(usize, 1), fragments[0].highlights.len);
     try std.testing.expectEqual(@as(u32, 0), fragments[0].highlights[0].start);
     try std.testing.expectEqual(@as(u32, 32), fragments[0].highlights[0].end);
+}
+
+test "highlight offsets follow stored text through character filters" {
+    const alloc = std.testing.allocator;
+    const html = try highlightMatchers(alloc, "<p>hello</p>", &.{.{ .term = "hello" }}, &analysis_mod.html_analyzer, 1, 100);
+    defer freeFragments(alloc, html);
+    try std.testing.expectEqualStrings("hello", html[0].text[html[0].highlights[0].start..html[0].highlights[0].end]);
+
+    const folded_analyzer = analysis_mod.Analyzer{
+        .char_filters = &.{.ascii_fold},
+        .tokenizer = .unicode_words,
+        .filters = &.{.lowercase},
+    };
+    const folded = try highlightMatchers(alloc, "café", &.{.{ .term = "cafe" }}, &folded_analyzer, 1, 100);
+    defer freeFragments(alloc, folded);
+    try std.testing.expectEqualStrings("café", folded[0].text[folded[0].highlights[0].start..folded[0].highlights[0].end]);
+
+    const joined_analyzer = analysis_mod.Analyzer{
+        .char_filters = &.{.zero_width_non_joiner},
+        .tokenizer = .unicode_words,
+        .filters = &.{.lowercase},
+    };
+    const joined = try highlightMatchers(alloc, "he\u{200C}llo", &.{.{ .term = "hello" }}, &joined_analyzer, 1, 100);
+    defer freeFragments(alloc, joined);
+    try std.testing.expectEqualStrings("he\u{200C}llo", joined[0].text[joined[0].highlights[0].start..joined[0].highlights[0].end]);
+
+    const combined_analyzer = analysis_mod.Analyzer{
+        .char_filters = &.{ .html_strip, .ascii_fold },
+        .tokenizer = .unicode_words,
+        .filters = &.{.lowercase},
+    };
+    const combined = try highlightMatchers(alloc, "<p>caf&#233;</p>", &.{.{ .term = "cafe" }}, &combined_analyzer, 1, 100);
+    defer freeFragments(alloc, combined);
+    try std.testing.expectEqualStrings("caf&#233;", combined[0].text[combined[0].highlights[0].start..combined[0].highlights[0].end]);
+}
+
+test "substring highlights include repeated and crossing occurrences" {
+    const alloc = std.testing.allocator;
+    const repeated = try highlightMatchers(alloc, "bananana", &.{.{ .contains = "ana" }}, &analysis_mod.simple_analyzer, 1, 100);
+    defer freeFragments(alloc, repeated);
+    try std.testing.expectEqualStrings("ananana", repeated[0].text[repeated[0].highlights[0].start..repeated[0].highlights[0].end]);
+
+    const crossing = try highlightMatchers(alloc, "foobarfoo bar", &.{.{ .contains = "foobar" }}, &analysis_mod.simple_analyzer, 1, 100);
+    defer freeFragments(alloc, crossing);
+    try std.testing.expectEqualStrings("foobarfoo bar", crossing[0].text[crossing[0].highlights[0].start..crossing[0].highlights[0].end]);
 }
 
 test "highlight prefix wildcard fuzzy and regexp matchers mark whole tokens" {
