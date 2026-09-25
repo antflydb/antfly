@@ -4553,6 +4553,8 @@ pub const MetadataHttpClusterVopr = struct {
     placement_intent_hash_valid: []bool,
     backend_runtimes: []db_mod.background_runtime.BackendRuntimeHandle,
     linearizable_read_drivers: []PublicApiLinearizableReadDriver,
+    restart_in_progress: []bool,
+    teardown_requested: bool = false,
     manual_clock: *platform_clock.ManualClock,
     scheduler_gate: VoprSchedulerGate = .{},
     reconcile_lease_update_in_flight: bool = false,
@@ -4573,6 +4575,16 @@ pub const MetadataHttpClusterVopr = struct {
         metadata_group_id: u64,
         configs: []const raft_vopr.ManagedHttpHostSimulationConfig,
         deps: []const raft_vopr.ManagedHttpHostSimulationDeps,
+    ) !MetadataHttpClusterVopr {
+        return initWithFilesystemIo(alloc, metadata_group_id, configs, deps, std.testing.io);
+    }
+
+    pub fn initWithFilesystemIo(
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64,
+        configs: []const raft_vopr.ManagedHttpHostSimulationConfig,
+        deps: []const raft_vopr.ManagedHttpHostSimulationDeps,
+        filesystem_io: std.Io,
     ) !MetadataHttpClusterVopr {
         const manual_clock = try alloc.create(platform_clock.ManualClock);
         errdefer alloc.destroy(manual_clock);
@@ -4678,7 +4690,7 @@ pub const MetadataHttpClusterVopr = struct {
             runtime.* = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
                 .backend = .manual,
                 .borrowed_io = if (dep.borrowed_io) |io| .{ .general = io } else null,
-                .filesystem_io = std.testing.io,
+                .filesystem_io = filesystem_io,
             });
             backend_runtime_count += 1;
         }
@@ -4701,6 +4713,9 @@ pub const MetadataHttpClusterVopr = struct {
         }
         var raft_cluster = try raft_vopr.ManagedHttpClusterSimulation.init(alloc, configs, vopr_deps);
         errdefer raft_cluster.deinit();
+        const restart_in_progress = try alloc.alloc(bool, configs.len);
+        errdefer alloc.free(restart_in_progress);
+        @memset(restart_in_progress, false);
         var cluster = MetadataHttpClusterVopr{
             .alloc = alloc,
             .metadata_group_id = metadata_group_id,
@@ -4717,6 +4732,7 @@ pub const MetadataHttpClusterVopr = struct {
             .placement_intent_hash_valid = placement_intent_hash_valid,
             .backend_runtimes = backend_runtimes,
             .linearizable_read_drivers = linearizable_read_drivers,
+            .restart_in_progress = restart_in_progress,
             .manual_clock = manual_clock,
             .reconcile_lease_update_in_flight = false,
             .metadata_proposal_in_flight = 0,
@@ -4728,6 +4744,7 @@ pub const MetadataHttpClusterVopr = struct {
 
     pub fn deinit(self: *MetadataHttpClusterVopr) void {
         self.cluster.deinit();
+        self.alloc.free(self.restart_in_progress);
         self.alloc.free(self.reconcile_leases);
         self.alloc.free(self.pending_reconcile_leases);
         self.alloc.free(self.pending_reconcile_lease_retry_at_ms);
@@ -4770,6 +4787,19 @@ pub const MetadataHttpClusterVopr = struct {
         self.scheduler_gate.lock();
         defer self.scheduler_gate.unlock();
         self.cluster.stopAll();
+    }
+
+    /// Close every current transport while preserving the restart owner's
+    /// right to finish constructing its replacement. A restart that was
+    /// already in flight closes that replacement before it returns.
+    pub fn beginTeardown(self: *MetadataHttpClusterVopr) void {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
+        if (self.teardown_requested) return;
+        self.teardown_requested = true;
+        for (self.cluster.nodes, 0..) |*host, index| {
+            if (!self.restart_in_progress[index]) host.runtime.svc.beginTransportShutdown();
+        }
     }
 
     pub fn node(self: *MetadataHttpClusterVopr, index: usize) MetadataHttpNodeVopr {
@@ -4887,7 +4917,14 @@ pub const MetadataHttpClusterVopr = struct {
     pub fn restartNode(self: *MetadataHttpClusterVopr, index: usize) !void {
         self.scheduler_gate.lock();
         defer self.scheduler_gate.unlock();
+        if (self.teardown_requested) return error.Canceled;
+        self.restart_in_progress[index] = true;
+        defer self.restart_in_progress[index] = false;
         try self.cluster.restartNode(index);
+        if (self.teardown_requested) {
+            self.cluster.nodes[index].runtime.svc.beginTransportShutdown();
+            return error.Canceled;
+        }
         self.reconcile_leases[index] = metadata_reconcile_lease.State.init(self.cluster.configs[index].host.http.host.local_node_id, .{
             .lease_ttl_ms = 2_000,
             .clock = self.manual_clock.clock(),
@@ -7567,6 +7604,9 @@ pub const VoprPublicClusterFixture = struct {
             );
             self.catalog_count += 1;
         }
+        // The host tmpDir above is only a unique namespace. The composed
+        // fixture's storage roots belong to VoprIo's modeled filesystem.
+        try std.Io.Dir.cwd().createDirPath(sim.io(), std.fs.path.dirname(self.roots[0]).?);
         for (0..node_count) |index| {
             self.factories[index] = .{
                 .alloc = alloc,
@@ -7597,7 +7637,10 @@ pub const VoprPublicClusterFixture = struct {
             makeHostVoprDepsWithBorrowedIo(&self.factories[1], sim.io()),
             makeHostVoprDepsWithBorrowedIo(&self.factories[2], sim.io()),
         };
-        self.cluster = try MetadataHttpClusterVopr.init(alloc, metadata_group_id, &configs, &deps);
+        // The composed exact-replay fixture keeps its data storage in the
+        // same modeled world as Raft and HTTP. Focused metadata differential
+        // fixtures continue to exercise the native test filesystem.
+        self.cluster = try MetadataHttpClusterVopr.initWithFilesystemIo(alloc, metadata_group_id, &configs, &deps, sim.io());
         self.cluster_live = true;
         self.cluster.setDataPlaneOwnership(data_plane_ownership);
         for (0..node_count) |index| self.catalog_sources[index] = .{
@@ -8861,6 +8904,16 @@ pub const VoprPublicClusterFixture = struct {
     pub fn beginTeardown(self: *VoprPublicClusterFixture) void {
         if (self.teardown_started) return;
         self.teardown_started = true;
+        // Lifecycle hooks deliberately park on uncancelable barriers while a
+        // fault is active. Release every owned barrier before draining tasks:
+        // cancellation cannot wake an uncancelable futex, and a replay error
+        // may stop the history at any point in the graph restart.
+        self.write_done.set(self.sim.io());
+        self.tenant_write_done.set(self.sim.io());
+        self.resource_recovered.set(self.sim.io());
+        self.graph_round_paused.set(self.sim.io());
+        self.graph_fault_recovered.set(self.sim.io());
+        self.graph_fault_workload_ready.set(self.sim.io());
         if (self.stack_live) for (&self.write_sources) |*source| source.beginTeardown();
         if (self.client_executor_live) self.client_http_executor.beginShutdown();
         if (self.forward_executor_live) self.forward_http_executor.beginShutdown();
@@ -8868,14 +8921,7 @@ pub const VoprPublicClusterFixture = struct {
             listener.requestStop();
         for (self.raft_wire_runtimes[0..self.raft_wire_runtime_count]) |*runtime|
             runtime.requestStop();
-        if (self.cluster_live) {
-            for (self.cluster.cluster.nodes) |*node|
-                node.runtime.svc.beginTransportShutdown();
-        }
-        if (self.cluster_started) {
-            self.cluster.stopAll();
-            self.cluster_started = false;
-        }
+        if (self.cluster_live) self.cluster.beginTeardown();
     }
 
     fn stopRaftWire(self: *VoprPublicClusterFixture) void {

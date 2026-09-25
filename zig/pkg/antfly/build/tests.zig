@@ -3099,6 +3099,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &.{
             "full cluster VOPR exact replays",
+            "full cluster graph inflight restart cutoff drains parked hooks",
             "full cluster VOPR initializes teardown ownership on reused memory",
             "full cluster VOPR bounded startup cleanup exact replay",
         },
@@ -3115,6 +3116,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "Run one shared-scheduler metadata, data, serverless, HTTP, and client deployment history",
     );
     full_cluster_vopr_test_step.dependOn(&run_full_cluster_vopr_tests.step);
+
+    const full_cluster_graph_replay_soak_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"full cluster VOPR graph inflight restart repeated exact replay"},
+        .max_rss = full_cluster_vopr_max_rss,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("full-cluster-graph-replay-soak-test", "Repeat the graph restart recorded history and exact replay")
+        .dependOn(&b.addRunArtifact(full_cluster_graph_replay_soak_tests).step);
+    const full_cluster_graph_cutoff_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"full cluster graph inflight restart cutoff drains parked hooks"},
+        .max_rss = full_cluster_vopr_max_rss,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("full-cluster-graph-cutoff-test", "Verify graph restart hooks drain at a bounded replay cutoff")
+        .dependOn(&b.addRunArtifact(full_cluster_graph_cutoff_tests).step);
 
     const extension_lifecycle_tests = b.addTest(.{
         .root_module = antfly_test_mod,

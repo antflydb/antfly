@@ -1365,7 +1365,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try kernel_error_identity.statusToError(abi.antfly_storage_owner_hidden_restore_json(if (resident) |*lease| lease.owner().handle else null, &.{ .operation = .read_bootstrap, .context = self.context.handle, .path = .fromSlice(path), .table_id = table_id }, &output));
         defer abi.antfly_storage_owner_buffer_destroy(&output);
         if (output.len == 0) return null;
-        if (generation != self.visibleRootGeneration(group_id)) return error.RestoreStagingScopeChanged;
+        if (generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
         return try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, output.slice(), .{ .allocate = .alloc_always });
     }
 
@@ -2770,7 +2770,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!std.mem.eql(u8, &scope, &parsed.value.scope.digest()) or
             !std.mem.eql(u8, table_name, parsed.value.table_name) or namespace.shard_id != group_id or
             namespace.table_id != descriptor.descriptor.identity.table_id or namespace.range_id != descriptor.descriptor.identity.range_id or
-            descriptor.descriptor.identity.shard_id != group_id or descriptor.descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.RestoreStagingScopeChanged;
+            descriptor.descriptor.identity.shard_id != group_id) return error.RestoreStagingScopeChanged;
+        // The root can advance after the immutable plan descriptor is read.
+        // Re-resolve it on retry; this is not a changed restore scope.
+        if (descriptor.descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
         if (plan_id) |plan| if (!std.mem.eql(u8, &plan, &parsed.value.scope.plan_id)) return error.RestoreStagingScopeChanged;
         try context.ensureActive();
         return descriptor;
@@ -2819,7 +2822,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// name lookup. Opening and all physical work remain in the compiled owner.
     pub fn primeRestoreOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor) !void {
         if (descriptor.restore_bootstrap_json.len == 0) return error.RestoreStagingScopeChanged;
-        if (descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.RestoreStagingScopeChanged;
+        if (descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
         const path = try std.fmt.allocPrint(self.alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         defer self.alloc.free(path);
         var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor);
@@ -2840,7 +2843,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try request.ensureActive();
         try input.validate(group_id);
         if (descriptor.restore_bootstrap_json.len == 0) return error.RestoreStagingScopeChanged;
-        if (descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.RestoreStagingScopeChanged;
+        if (descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
         var bootstrap = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, descriptor.restore_bootstrap_json, .{});
         defer bootstrap.deinit();
         if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &input.scope.digest())) return error.RestoreStagingScopeChanged;

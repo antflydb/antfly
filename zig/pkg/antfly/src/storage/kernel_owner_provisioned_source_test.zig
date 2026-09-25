@@ -179,6 +179,10 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
     const barrier: read_gate.ReadSafetyBarrier = .{ .ptr = &authority, .vtable = &.{ .wait_read_safe = Authority.barrier } };
     var owners = Source.init(alloc, root, table_catalog.emptyCatalogSource(), barrier);
     defer owners.deinit();
+    var stale_descriptor = descriptor;
+    stale_descriptor.lsm_root_generation +%= 1;
+    try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, owners.primeRestoreOwner(7196, "hidden", stale_descriptor));
+    try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, owners.restoreOwnerControl(alloc, 7196, "hidden", stale_descriptor, .{ .scope = scope, .action = .begin }, null, .{}, .{}));
     _ = try owners.restoreOwnerControl(alloc, 7196, "hidden", descriptor, .{ .scope = scope, .action = .begin }, null, .{}, .{});
     const before = try (staging.Progress{ .scope = scope }).encode(alloc);
     defer alloc.free(before);
@@ -190,6 +194,11 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
     owners.deinit();
     owners = Source.init(alloc, root, table_catalog.emptyCatalogSource(), barrier);
     _ = owners.withRestoreDescriptorRecovery(.{ .ptr = &authority, .recover_fn = Authority.recover });
+    authority.denied = false;
+    authority.descriptor = stale_descriptor;
+    try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, owners.resolveRestoreDescriptor(alloc, 7196, "hidden", scope.digest(), scope.plan_id, .read, .{}));
+    authority.descriptor = descriptor;
+    authority.denied = true;
     var options: db_mod.types.LookupOptions = .{ .restore_staging_scope = scope.digest(), .relational_activation_json = "{\"mode\":\"status\"}" };
     try std.testing.expectError(error.RestoreStagingScopeChanged, owners.readSource().lookupGroupLocal(alloc, 7196, "hidden", "a", options, .read_index));
     options.restore_staging_plan_id = scope.plan_id;
