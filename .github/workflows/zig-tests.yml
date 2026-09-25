@@ -73,7 +73,7 @@ jobs:
       (inputs.pr_number == '' ||
       github.run_attempt == 1) }}
     needs: admission
-    runs-on: arc-antfly-standard
+    runs-on: arc-antfly-standard-runtime
     outputs:
       zig_tests: ${{ steps.detect.outputs.zig_tests }}
       e2e: ${{ steps.detect.outputs.e2e }}
@@ -370,7 +370,7 @@ jobs:
       github.event.schedule == '0 8 * * *') }}
     name: ${{ (inputs.pr_number != '' || github.event.schedule == '0 3 * * 0') && 'zig-base / arm64-codec' || 'zig-full / arm64-codec' }}
     needs: [admission, changes]
-    runs-on: arc-antfly-publish-arm64
+    runs-on: arc-antfly-arm64-runtime
     timeout-minutes: 20
     env:
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-arm64-codec
