@@ -337,27 +337,63 @@ re-establishing against a freshly regenerated fixture independent of this
 track.
 
 `training_packed_test.zig`'s "converts an unpacked checkpoint into a
-served packed model" test (training graph vs. the exported, served model)
-went from 6.0e-8 to 2.9e-3 max probability error once `job.zig` defaulted
-to fused attention unconditionally. That is *not* explained by tile-order
-reordering noise alone -- a single forward call between the fused and dense
-attention builds agrees to ~1e-7 (see the correctness tests above) -- the
-actual mechanism, confirmed directly: this fixture's job trains 3 epochs
-over 6 examples with Adam, and that ~1e-7 per-call difference compounds
-through the optimizer into real weight drift -- diffing the two exported
-checkpoints (train the identical fixture/config twice, once
-`force_fused_attention=false` and once `=true`) gives a worst relative L2
-of 2.43% over `encoder.layers.*` weight tensors on CPU, even though each
-training run is individually correct (matches its own attention path's
-forward/VJP to ~1e-7). Fix: `job.zig` now selects fused attention only when
-a split's layout actually exceeds the dense path's own admission bound (or
+served packed model" test compares the *trainer's own* eval predictions
+(the training graph at its final weights) against *serving the exported
+model* -- the same weights on both sides, so a gap here is a bug, not
+training drift. It went from 6.0e-8 to 2.9e-3 max probability error once
+`job.zig` defaulted to fused attention unconditionally.
+
+First hypothesis (wrong): tile-order reordering noise compounding through
+training into real weight drift. Ruled out because this test compares one
+set of weights against itself through two forward paths, not two different
+trained models -- drift between separately-trained models can't explain a
+same-weights comparison.
+
+Actual root cause: the dense path's attention dropout is a *runtime* mask
+(`graph.zig`'s `drop()`, bound to all-ones by `training.inputs` when
+`training=false`, i.e. at `predict`/eval), but the fused op's
+`dropout_probability` is a *graph-time* attribute baked into
+`SegmentTrainingAttentionAttrs` when `job.zig`'s `Cache` builds its
+`Program` -- and that `Program` is reused, unrebuilt, for every training
+step and every `predict` call. With no runtime toggle, the fused op kept
+applying its seeded in-kernel dropout during eval (`head_dropout` defaults
+to 0.1), so the trainer's own eval differed from a dropout-free serving
+forward by roughly that scale -- corrupting eval predictions and
+calibration on every real long-state job, not just this test.
+
+Fix: `control`'s layout gained a runtime `apply_dropout` word (index 6,
+`SegmentTrainingAttentionAttrs.layout`'s `control_elements` now `7 +
+batch_tokens + ranges`, up from `6 + ...`), set from the same `training:
+bool` `training.inputs` already threads to the dense path's mask;
+`segment_training_attention.zig`'s `forward`/`backward` substitute `0` for
+`attrs.dropout_probability` when it's unset. Metal inherits this for free
+(the host bridge forwards the same control tensor to the same CPU decode).
+`training_packed_test.zig` gained a second case, "(forced fused
+attention)", running this exact job with `force_fused_attention=true`;
+both it and the default case now measure ~3e-8, and the test's original
+`worst < 5e-5` bound needed no widening.
+
+Separately, and *not* related to the bug above (it compares two
+differently-trained models, not one model against itself): diffing
+checkpoints from training the same fixture/config twice
+(`force_fused_attention=false` vs `=true`) gives a worst relative L2 over
+`encoder.layers.*` weight tensors of 2.43% on CPU (dropout-corrected).
+Both runs are individually correct; the tiled online-softmax's summation
+order differs from the dense masked softmax's, and on this tiny
+six-example, three-epoch fixture that ~1e-7-per-call difference compounds
+through Adam into measurable (if small) weight drift. This is a
+characterized, expected property of switching attention implementations on
+a job that could equally have trained with either, not something that
+needs hiding -- long-state jobs beyond the dense bound have no dense
+baseline to compare against in the first place.
+
+`job.zig` also now selects fused attention only when a split's layout
+actually exceeds the dense path's own admission bound (or
 `Config.force_fused_attention` asks for it explicitly) --
 `exceedsDenseAttentionBound` re-checks `architecture.validate` with
-`use_fused_attention=false` first. This fixture (`seq_len=128`, `batch=1`)
-never needed fused attention, so it now trains and evaluates on the dense
-path exactly as before this track, and the test's original `worst < 5e-5`
-tolerance (and the ~6e-8-level measured value) is restored unchanged -- no
-tolerance widening was kept.
+`use_fused_attention=false` first. This `ref` fixture (`seq_len=128`,
+`batch=1`) never needed fused attention on its own, so by default it now
+trains and evaluates on the dense path exactly as before this track.
 
 ## Long-state smoke test (2026-09-26)
 

@@ -127,6 +127,23 @@ test "laya packed training graph matches packed serving logits, alone and in a p
 }
 
 test "laya training converts an unpacked checkpoint into a served packed model" {
+    try exerciseUnpackedToPackedParity(false);
+}
+
+// Regression coverage for the fused-attention eval dropout leak: a
+// `Program`'s graph (and the fused op's graph-time `dropout_probability`)
+// is built once and reused for both training steps and `predict` eval, so
+// without a runtime `apply_dropout` toggle the trainer's own eval of its
+// final weights applied live seeded dropout that the independently
+// implemented serving path never did -- same weights on both sides, so any
+// gap here is a real bug, not training drift. `force_fused_attention`
+// exercises the fused path directly regardless of whether this small
+// fixture would need it on its own.
+test "laya training converts an unpacked checkpoint into a served packed model (forced fused attention)" {
+    try exerciseUnpackedToPackedParity(true);
+}
+
+fn exerciseUnpackedToPackedParity(force_fused_attention: bool) !void {
     const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
     const job = @import("job.zig");
     const hf = @import("inference_hf_tokenizer");
@@ -148,6 +165,7 @@ test "laya training converts an unpacked checkpoint into a served packed model" 
         .head_lr = 0.001,
         .objective = .soft_ce,
         .packing = .question,
+        .force_fused_attention = force_fused_attention,
     };
     try job.execute(a, io, c);
     const model_path = try std.fs.path.join(scratch, &.{ c.output_dir, "model" });

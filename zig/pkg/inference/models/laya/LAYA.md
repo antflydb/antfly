@@ -349,14 +349,21 @@ instead of decomposing into primitives.
 - **Op contract.** Forward leaves are `qkv` (`[Q;K;V]`, token-major
   `[3*batch*seq_len, num_heads*head_dim]`, upstream's natural QKV-linear
   layout -- no `heads()` transpose needed) and one physical i32 `control`
-  leaf: six replay limbs, `batch*seq_len` logical positions, then
-  `batch*seq_len*6` `laya_tree`-style ranges (ancestor-segment extents, as
-  `ops.SegmentAttention` already uses at serving time). `window` and
-  `dropout_probability` are graph-time attributes, not runtime tensors, so
-  the same op expresses global attention (`window = maxInt`, one full-row
-  range), sliding-window local layers (`window` set, same range), and
-  tree-packed rows (the row's actual `laya_tree.ranges`) -- whichever the
-  training graph's global/local encoder layers and packed rows need.
+  leaf: six replay limbs, an `apply_dropout` flag, `batch*seq_len` logical
+  positions, then `batch*seq_len*6` `laya_tree`-style ranges
+  (ancestor-segment extents, as `ops.SegmentAttention` already uses at
+  serving time). `window` and `dropout_probability` are graph-time
+  attributes, not runtime tensors, so the same op expresses global
+  attention (`window = maxInt`, one full-row range), sliding-window local
+  layers (`window` set, same range), and tree-packed rows (the row's actual
+  `laya_tree.ranges`) -- whichever the training graph's global/local
+  encoder layers and packed rows need. `apply_dropout` *is* a runtime
+  control value, unlike `dropout_probability`: because a `Program`'s graph
+  (and its baked-in `dropout_probability`) is built once and reused for
+  both training steps and `predict` eval, the fused op needs a per-call
+  runtime toggle to silence dropout outside training the way the dense
+  path's `drop()` does with an all-ones mask -- see "Packed job
+  training-vs-serving, and the eval dropout leak" below.
 - **Kernel.** `lib/linalg/src/attention.zig`
   (`segmentTrainingAttentionForwardHost`/`BackwardHost`), beside
   `segmentAttentionHost`: tiled online softmax (`BLOCK_Q`x`BLOCK_KV`,
@@ -432,38 +439,56 @@ fixture as it exists today, but the 0.4-0.6% band itself needs
 re-establishing (rerun `scripts/laya/prepare_laya_fixtures.sh` against
 pinned revisions and compare) before it can gate anything again.
 
-**Packed job training-vs-serving.** `training_packed_test.zig`'s "converts
-an unpacked checkpoint into a served packed model" test compares the
-*training graph's* forward pass against the *served, exported model's*
-forward pass (a real `pipeline.execute` session, not the training graph).
+**Packed job training-vs-serving, and the eval dropout leak.**
+`training_packed_test.zig`'s "converts an unpacked checkpoint into a served
+packed model" test compares the *trainer's own* `eval_predictions.json`
+(the training graph, evaluated at the run's final weights) against
+*serving the exported model* (a real `pipeline.execute` session) -- the
+same weights on both sides, so any gap here is a bug, not training drift.
 Forcing fused attention unconditionally (the first cut of this track) rose
 this from 6.0e-8 to 2.9e-3 max probability error on the 2-layer hidden-64
-`ref` fixture. That is *not* explained by tile/summation-order noise alone
-(a single forward call agrees to ~1e-7, as the correctness tests above
-show) -- the actual mechanism, confirmed directly: this fixture's job
-trains for 3 epochs over 6 examples with Adam, and a ~1e-7 per-call forward
-difference between the tiled online-softmax and the dense masked softmax
-compounds through those optimizer steps into real weight drift. Measured
-directly (train the identical fixture/config twice, once with
-`force_fused_attention=false` and once `=true`, diff the two exported
-checkpoints): worst relative L2 over `encoder.layers.*` weight tensors is
-**2.43%** (`encoder.layers.1.mlp.Wo.weight`) on CPU -- both trainings are
-individually correct (each matches its own attention path's forward/VJP to
-~1e-7), they just land at measurably different points in weight space, and
-the *serving* forward pass (a third, independently-implemented kernel) then
-disagrees with whichever training run's graph-eval it is compared against
-at roughly that same scale.
+`ref` fixture (`head_dropout` defaults to 0.1).
 
-Rather than widen the test's tolerance to paper over that drift, the fix is
-the admission gating above: this fixture's layout (`seq_len=128`,
-`batch=1`) never needed fused attention in the first place (`ml/src/graph`'s
-dense bound admits it comfortably), so `exceedsDenseAttentionBound` now
-keeps both training and eval on the dense path here, exactly as before this
-track, and the test's original `worst < 5e-5` assertion (and the ~6e-8
-measured value) is restored unchanged -- long-state jobs that actually
-exceed the dense bound are the only ones that pay the fused/dense drift
-described above, and there is no dense baseline to compare those against
-(the dense path could not run at all at that length).
+Root cause: the dense path's attention dropout is a *runtime* mask
+(`graph.zig`'s `drop()` binds an external `__laya_dropout_N` parameter that
+`training.inputs` fills with all-ones when `training=false`, i.e. at
+`predict`/eval), but the fused op's `dropout_probability` is a *graph-time*
+attribute baked into `SegmentTrainingAttentionAttrs` when the `Program` is
+built -- and `job.zig`'s `Cache` builds that `Program` once and reuses it
+for every training step and every `predict` call. With no runtime toggle,
+the fused op kept applying its seeded in-kernel dropout during eval, so the
+trainer's own eval of its final weights differed from a dropout-free
+serving forward by roughly `head_dropout`'s scale -- and would have
+corrupted eval predictions and calibration on every real long-state job,
+not just this test.
+
+Fix: `control`'s layout gained one word, `apply_dropout` (word index 6,
+before the positions/ranges that follow it -- see the "Op contract" bullet
+above and `ops.segment_training_attention.ControlView`).
+`finetune/laya/training.zig`'s `inputs` sets it from the same `training:
+bool` parameter the dense path already uses for its all-ones mask;
+`segment_training_attention.zig`'s `forward`/`backward` pass `0` instead of
+`attrs.dropout_probability` into the kernel whenever it is unset. Metal
+inherits this automatically: the host bridge forwards the same control
+tensor to the same CPU decode. Verified: `training_packed_test.zig` now has
+a second case, "... (forced fused attention)", that runs this exact job
+with `force_fused_attention=true` and asserts the original `worst < 5e-5`
+bound; both it and the default (dense, admission-gated) case measure
+~3e-8.
+
+Separately (and *not* the explanation for the gap above, since it compares
+different weights, not the same ones): training the identical fixture/config
+twice, once with `force_fused_attention=false` and once `=true`, and
+diffing the two exported checkpoints, shows a worst relative L2 over
+`encoder.layers.*` weight tensors of 2.43% on CPU (dropout-corrected). Both
+runs are individually correct -- the tiled online-softmax's summation order
+differs from the dense masked softmax's, and on this tiny six-example,
+three-epoch fixture that ~1e-7-per-call difference compounds through Adam
+into measurable (if small) weight drift. This has no dense baseline to
+compare against once a job's layout actually exceeds the dense bound (the
+dense path cannot run at that length at all), so it is noted here as a
+characterized, expected property of switching attention implementations,
+not something the admission gate needs to hide.
 
 **Long-state smoke test (2026-09-26, CPU, released 421M checkpoint).** Data
 and job recipe in `.tmp/longstate/` (gitignored): states synthesized by
@@ -801,7 +826,7 @@ All numbers are from 2026-09-24 on an Apple M4 Max (36 GiB), Zig 0.16.0.
 | Fused training graph (`training.inputs` included) matches the dense-bias graph's logits, unpacked and tree-packed, CPU | `finetune/laya/fused_attention_test.zig` | < 2e-3 |
 | Fused training graph matches the dense graph on Metal (host-bridged) | same, `SkipZigTest` without a Metal device | passes; identical to the CPU run (same bridged kernel) |
 | Released-model gradients vs float64 PyTorch, fused attention (relfix) | `finetune/laya/training_test.zig` ("... (fused segment attention)") | see "Relfix on the current fixture" below -- not the pass/fail gate, a measurement |
-| Trainer converts an unpacked checkpoint to a served packed model, fused attention | `finetune/laya/training_packed_test.zig` | training-graph vs served-model max probability error 2.9e-3 (was 6e-8 dense; tolerance widened to 1e-2, see the test) |
+| Trainer's own eval predictions vs. serving the exported model (same weights), default admission-gated and forced fused attention | `finetune/laya/training_packed_test.zig` (two cases) | max probability error ~3e-8 both ways, unchanged `worst < 5e-5` bound (see "eval dropout leak" below for the bug this catches) |
 | Fused training attention graph VJP: three leaf gradients, integer control has none, retained through lowering | `ml/src/graph/segment_training_attention_test.zig` | exact node-shape checks |
 
 Reproduce the fixture-backed tests. The fixtures are regenerated from pinned

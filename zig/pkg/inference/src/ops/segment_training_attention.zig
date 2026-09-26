@@ -87,6 +87,14 @@ pub fn dropoutSeed(attrs: Attrs, replay: Replay) u64 {
 
 pub const ControlView = struct {
     replay: Replay,
+    /// Whether dropout applies at all this call, independent of the graph-time
+    /// `attrs.dropout_probability`: the trainer's `predict`/eval path binds
+    /// this to `0` (see `finetune/laya/training.zig`'s `inputs`, `training`
+    /// param) so a program built once with nonzero head dropout still turns
+    /// it off outside actual training steps -- the fused op has no separate
+    /// runtime mask tensor the way the dense path's `drop()` does, so this
+    /// flag is the only way eval can silence it without rebuilding the graph.
+    apply_dropout: bool,
     /// `[batch*seq_len]`, borrowed from the physical control leaf.
     positions: []align(1) const i32,
     /// `[batch*seq_len*6]`, borrowed and range-checked against `seq_len`.
@@ -103,15 +111,15 @@ pub fn validateControl(attrs: Attrs, words: []align(1) const i32, options: Optio
     const count = std.math.cast(usize, layout.control_elements) orelse return error.InvalidSegmentTrainingAttentionControl;
     const tokens = std.math.cast(usize, layout.batch_tokens) orelse return error.InvalidSegmentTrainingAttentionControl;
     if (words.len != count) return error.InvalidSegmentTrainingAttentionControl;
-    const positions = words[6..][0..tokens];
-    const range_words = words[6 + tokens ..];
+    const positions = words[7..][0..tokens];
+    const range_words = words[7 + tokens ..];
     if (range_words.len != tokens * 6) return error.InvalidSegmentTrainingAttentionControl;
     for (range_words, 0..) |bound, i| {
         if (i % 4096 == 0) try options.check();
         if (bound < 0 or bound > attrs.seq_len) return error.InvalidSegmentTrainingAttentionControl;
     }
     const replay = Replay{ .seed = decodeU64(words[0..2]), .micro_batch = decodeU64(words[2..4]), .replica = decodeU64(words[4..6]) };
-    return .{ .replay = replay, .positions = positions, .ranges = range_words };
+    return .{ .replay = replay, .apply_dropout = words[6] != 0, .positions = positions, .ranges = range_words };
 }
 
 /// `inference_linalg`'s kernels take naturally aligned `[]const i32`/`[]const
@@ -156,7 +164,7 @@ pub fn forward(a: Allocator, attrs: Attrs, qkv: []const f32, control: []align(1)
         host.ranges,
         host.positions,
         attrs.window,
-        attrs.dropout_probability,
+        if (view.apply_dropout) attrs.dropout_probability else 0,
         dropoutSeed(attrs, view.replay),
         attrs.batch,
         attrs.seq_len,
@@ -190,7 +198,7 @@ pub fn backward(a: Allocator, attrs: Attrs, qkv: []const f32, control: []align(1
         host.ranges,
         host.positions,
         attrs.window,
-        attrs.dropout_probability,
+        if (view.apply_dropout) attrs.dropout_probability else 0,
         dropoutSeed(attrs, view.replay),
         attrs.batch,
         attrs.seq_len,
@@ -219,8 +227,18 @@ test "plan admits an 8k global row within default limits, and enforces the bound
 
 test "validateControl rejects out-of-range bounds and wrong lengths" {
     const attrs = Attrs{ .batch = 1, .seq_len = 4, .num_heads = 1, .head_dim = 2, .dropout_probability = 0, .dropout_stream_id = 0 };
-    var words = [_]i32{0} ** (6 + 4 + 24);
+    var words = [_]i32{0} ** (7 + 4 + 24);
     try std.testing.expectError(error.InvalidSegmentTrainingAttentionControl, validateControl(attrs, words[0..1], .{}));
-    words[6 + 4] = 5; // out of range: > seq_len
+    words[7 + 4] = 5; // out of range: > seq_len
     try std.testing.expectError(error.InvalidSegmentTrainingAttentionControl, validateControl(attrs, &words, .{}));
+}
+
+test "validateControl decodes apply_dropout from word 6" {
+    const attrs = Attrs{ .batch = 1, .seq_len = 4, .num_heads = 1, .head_dim = 2, .dropout_probability = 0.1, .dropout_stream_id = 0 };
+    var words = [_]i32{0} ** (7 + 4 + 24);
+    const off = try validateControl(attrs, &words, .{});
+    try std.testing.expect(!off.apply_dropout);
+    words[6] = 1;
+    const on = try validateControl(attrs, &words, .{});
+    try std.testing.expect(on.apply_dropout);
 }

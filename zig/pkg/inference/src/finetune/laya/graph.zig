@@ -23,10 +23,12 @@ pub const Inputs = struct {
     local_bias: Id, // encoder_bias plus the logical sliding window
     head_bias: Id, // [B*head_heads,S,S], padding and tree visibility
     rope: [2][2]Id, // [global, local][cos, sin], each [N*heads, head_dim/2]
-    /// Physical i32 control for `fusedAttention` (replay limbs, logical
-    /// positions, `laya_tree`-style ranges); see
-    /// `SegmentTrainingAttentionAttrs`. Declared unconditionally like the
-    /// three bias inputs above; unused (and unfed) unless `use_fused_attention`.
+    /// Physical i32 control for `fusedAttention` (replay limbs, an
+    /// `apply_dropout` flag, logical positions, `laya_tree`-style ranges);
+    /// see `SegmentTrainingAttentionAttrs` and
+    /// `ops.segment_training_attention.ControlView`. Declared
+    /// unconditionally like the three bias inputs above; unused (and
+    /// unfed) unless `use_fused_attention`.
     segment_control: Id,
 };
 pub const Dropout = struct { node: Id, probability: f32 };
@@ -197,7 +199,7 @@ pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f3
         .encoder_bias = try b.parameter("__laya_encoder_bias", Shape.init(.f32, &.{ l.batch * nh, l.sequence, l.sequence })),
         .local_bias = try b.parameter("__laya_local_bias", Shape.init(.f32, &.{ l.batch * nh, l.sequence, l.sequence })),
         .head_bias = try b.parameter("__laya_head_bias", Shape.init(.f32, &.{ l.batch * hh, l.sequence, l.sequence })),
-        .segment_control = try b.parameter("__laya_segment_control", Shape.init(.i32, &.{6 + n + n * 6})),
+        .segment_control = try b.parameter("__laya_segment_control", Shape.init(.i32, &.{7 + n + n * 6})),
         .rope = .{
             .{ try b.parameter("__laya_rope_global_cos", table), try b.parameter("__laya_rope_global_sin", table) },
             .{ try b.parameter("__laya_rope_local_cos", table), try b.parameter("__laya_rope_local_sin", table) },

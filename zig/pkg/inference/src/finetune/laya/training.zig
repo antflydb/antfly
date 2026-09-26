@@ -213,15 +213,30 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
     if (use_fused_attention) {
         // One physical i32 control leaf (SegmentTrainingAttentionAttrs):
         // six zeroed replay limbs (dropout is decorrelated across layers by
-        // `dropout_stream_id` alone; per-run seeding is future work), logical
-        // positions, then per-row `laya_tree`-style ranges. Padding rows and
-        // padding columns keep their zeroed (empty) range, so they see
-        // nothing and contribute a safe zero row (unused downstream: only
-        // `markers` positions are read out).
-        const control = try a.alloc(i32, 6 + ids.len + ids.len * 6);
+        // `dropout_stream_id` alone; per-run seeding is future work), one
+        // `apply_dropout` flag, logical positions, then per-row
+        // `laya_tree`-style ranges. Padding rows and padding columns keep
+        // their zeroed (empty) range, so they see nothing and contribute a
+        // safe zero row (unused downstream: only `markers` positions are
+        // read out).
+        //
+        // The fused op's dropout is a graph-time attribute
+        // (`SegmentTrainingAttentionAttrs.dropout_probability`, baked in at
+        // `Program.init` and shared by every call the cached program serves,
+        // training steps and `predict` eval alike) rather than a runtime
+        // mask the way the dense path's `drop()` is -- the dense encoder
+        // graph turns dropout off outside training by binding an all-ones
+        // mask (`training: bool` above, `if (!training) 1 else ...`); the
+        // fused op has no such mask, so `apply_dropout` is this call's only
+        // way to silence it without rebuilding the graph. Leaving it
+        // (incorrectly) on during eval would apply live seeded dropout to
+        // the trainer's own eval predictions and to every served head at
+        // predict/calibration time.
+        const control = try a.alloc(i32, 7 + ids.len + ids.len * 6);
         @memset(control, 0);
-        for (0..ids.len) |i| control[6 + i] = @intCast(positions[i]);
-        const ranges_base = 6 + ids.len;
+        control[6] = @intFromBool(training);
+        for (0..ids.len) |i| control[7 + i] = @intCast(positions[i]);
+        const ranges_base = 7 + ids.len;
         for (examples, 0..) |e, row| {
             if (e.packed_row) |p| {
                 const row_ranges = try tree.ranges(a, p.row, 0);

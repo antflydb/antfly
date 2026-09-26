@@ -524,7 +524,10 @@ pub const SegmentTrainingAttentionAttrs = struct {
         const hidden = try std.math.mul(i64, self.num_heads, self.head_dim);
         const qkv_rows = try std.math.mul(i64, 3, batch_tokens);
         const ranges_elements = try std.math.mul(i64, batch_tokens, 6);
-        const control_elements = try std.math.add(i64, 6, try std.math.add(i64, batch_tokens, ranges_elements));
+        // 6 replay limbs (seed, micro_batch, replica) + 1 `apply_dropout`
+        // flag (see `segment_training_attention.zig`'s `ControlView`) +
+        // positions + ranges.
+        const control_elements = try std.math.add(i64, 7, try std.math.add(i64, batch_tokens, ranges_elements));
         // Reject element-count overflow before Shape.numElements or VJP
         // slicing can encounter a malformed manually assembled graph.
         _ = try std.math.mul(i64, qkv_rows, hidden);
