@@ -82,6 +82,7 @@ pub const Distillation = struct {
     classifications: []const f32 = &.{},
     parents: []const f32 = &.{},
     weight: f32 = 1,
+    observer: ?distillation.Observer = null,
 };
 pub const Limits = struct {
     // This includes model/source and optimizer owners, beyond the generic
@@ -1575,7 +1576,8 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
     if (targets.query_width != q or targets.word_width != w or targets.classification_width != plan.encoder.layout.classifications) return error.BoundaryGraphShapeMismatch;
     try validateDraws(context.injection_draws, try product(bq, plan.gold_capacity));
     try validateDraws(context.negative_query_draws, bq);
-    if (plan.mode == .training and q > 0) {
+    // Injection and negative-query draws feed the heads' candidate pool only.
+    if (plan.mode == .training and q > 0 and plan.objectives.heads) {
         if (active_scales.gold_injection > 0 and active_scales.gold_injection < 1 and context.injection_draws == null) return error.MissingBoundaryTrainingInjectionDraws;
         if (plan.config.head.negative_query_ratio > 0 and context.negative_query_draws == null) return error.MissingBoundaryTrainingQueryDraws;
     }
@@ -1851,6 +1853,7 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
             };
             try groups.append(scratch, .{ .route = teacher_route, .student = logits[index], .teacher = states, .valid = valid });
         }
+        if (teacher.observer) |observer| try observer.observe(observer.ptr, plan.config.encoder.hidden_size, groups.items);
         distilled = try distillation.zspaceMse(a, plan.config.encoder.hidden_size, groups.items, teacher.weight);
         try work.charge(groups.items.len * plan.config.encoder.hidden_size);
         terms.distillation = @floatCast(distilled.?.value);

@@ -17,12 +17,45 @@
 //! collapse that task labels alone cause
 //! (work-log/completed/inference/antenna/2026-09-25-pilot.md).
 const std = @import("std");
+const processor = @import("../../pipelines/gliner_boundary_processor.zig");
+const Control = @import("../../execution_control.zig").InferenceExecutionControl;
 const Allocator = std.mem.Allocator;
 
 /// Added to the teacher's per-dimension standard deviation.
 pub const std_floor: f64 = 1e-4;
 
 pub const Route = enum { text, queries, classifications, parents };
+
+/// A frozen teacher encoder's final states at one microbatch's routes, row
+/// aligned with the student's prepared batch (see step.Distillation).
+pub const TeacherStates = struct {
+    text: []const f32,
+    queries: []const f32,
+    classifications: []const f32,
+    parents: []const f32,
+    context: ?*anyopaque = null,
+    release: ?*const fn (?*anyopaque) void = null,
+
+    pub fn deinit(self: *TeacherStates) void {
+        if (self.release) |free| free(self.context);
+        self.* = undefined;
+    }
+};
+/// Encodes the student's items with a frozen teacher. `identity` names the
+/// teacher's exact weights and settings; it is bound into the run fingerprint
+/// so a durable resume cannot silently change the distillation target.
+pub const Teacher = struct {
+    ptr: *anyopaque,
+    identity: [32]u8,
+    encode: *const fn (ptr: *anyopaque, a: Allocator, items: []const processor.Item, student: *const processor.PreparedBatch, control: ?Control) anyerror!TeacherStates,
+};
+
+/// Sees each step's aligned student and teacher rows before the loss; the
+/// neck fit accumulates its normal equations from them.
+pub const Observer = struct {
+    ptr: *anyopaque,
+    observe: *const fn (ptr: *anyopaque, hidden: usize, groups: []const Group) anyerror!void,
+};
 
 pub const Group = struct {
     route: Route,

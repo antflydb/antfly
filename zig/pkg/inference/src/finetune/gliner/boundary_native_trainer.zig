@@ -25,6 +25,8 @@ const schema = @import("../../pipelines/extraction_schema.zig");
 const targets = @import("boundary_targets.zig");
 const seeded = @import("../../graph/seeded_training.zig");
 const objectives = @import("boundary_train_objectives.zig");
+const distillation = @import("boundary_distillation.zig");
+const neck_fit = @import("boundary_distillation_fit.zig");
 const regex = @import("../../pipelines/extraction_regex.zig");
 const export_mod = @import("boundary_training_export.zig");
 const source_mod = @import("boundary_training_source.zig");
@@ -51,35 +53,16 @@ pub const Limits = struct {
     differentiation: seeded.Options = .{},
 };
 pub const DecisionEvents = @import("boundary_training_decisions.zig");
-/// A frozen teacher encoder's final states at one microbatch's routes, row
-/// aligned with the student's prepared batch (see step.Distillation).
-pub const TeacherStates = struct {
-    text: []const f32,
-    queries: []const f32,
-    classifications: []const f32,
-    parents: []const f32,
-    context: ?*anyopaque = null,
-    release: ?*const fn (?*anyopaque) void = null,
-
-    pub fn deinit(self: *TeacherStates) void {
-        if (self.release) |free| free(self.context);
-        self.* = undefined;
-    }
-};
-/// Encodes the student's items with a frozen teacher. `identity` names the
-/// teacher's exact weights and settings; it is bound into the run fingerprint
-/// so a durable resume cannot silently change the distillation target.
-pub const Teacher = struct {
-    ptr: *anyopaque,
-    identity: [32]u8,
-    encode: *const fn (ptr: *anyopaque, a: Allocator, items: []const processor.Item, student: *const processor.PreparedBatch, control: ?Control) anyerror!TeacherStates,
-};
+pub const TeacherStates = distillation.TeacherStates;
+pub const Teacher = distillation.Teacher;
 pub const Distillation = struct {
     teacher: Teacher,
     weight: f32 = 1,
     /// Also train the task heads on the rows' labels. Pure distillation
     /// builds no head, so every head weight stays exactly as loaded.
     heads: bool = false,
+    /// Fit the (identity) neck in closed form before the first update.
+    fit: neck_fit.Options = .{},
 };
 pub const Options = struct {
     /// Borrowed diagnostics over decisions already produced by the step.
@@ -330,6 +313,9 @@ pub const Trainer = struct {
             try parameters.append(scratch, .{ .name = descriptor.b_name, .canonical_name = descriptor.b_name, .dimensions = b_dims, .values = initialized.b, .kind = .adapter });
             if (initialized.magnitude) |values| try parameters.append(scratch, .{ .name = descriptor.magnitude_name.?, .canonical_name = descriptor.magnitude_name.?, .dimensions = try scratch.dupe(i32, &.{@intCast(descriptor.target.out_dim)}), .values = values, .kind = .adapter });
         };
+        if (options.distillation) |value| if (value.fit.rows != 0) {
+            try self.fitNeck(store, parameters.items, value, scratch, control);
+        };
         const selected = try self.run_plan.selectParameters(scratch, parameters.items);
         const backend_limits = backend_mod.Limits{
             .max_frozen_device_bytes = options.limits.max_backend_bytes,
@@ -417,6 +403,11 @@ pub const Trainer = struct {
             hash.update(&value.teacher.identity);
             hash.update(std.mem.asBytes(&value.weight));
             hash.update(&.{@intFromBool(value.heads)});
+            if (value.fit.rows != 0) {
+                hash.update("\x00neck_fit.ridge_normal_equations.v1\x00");
+                hash.update(std.mem.asBytes(&value.fit.rows));
+                hash.update(std.mem.asBytes(&value.fit.ridge));
+            }
         }
         self.fingerprint = hash.finalResult();
         var processor_options = options.processor;
@@ -425,6 +416,28 @@ pub const Trainer = struct {
         target_options.gold_capacity = options.capacities.gold_per_query orelse config.head.max_gold_per_query;
         try dataset.preflight(tokenizer, processor_options, target_options, control, null);
         try check(control);
+    }
+
+    /// Replaces the identity neck in `parameters` (borrowed source values) with
+    /// its closed-form fit; the optimizer copies the fitted values.
+    fn fitNeck(self: *Trainer, store: *native.WeightStore, parameters: []run.Parameter, value: Distillation, scratch: Allocator, control: ?Control) !void {
+        const config = self.model_config;
+        if (config.neck != .linear or self.options.peft != null) return error.InvalidBoundaryNeckFit;
+        const h = config.encoder.hidden_size;
+        var weight_index: ?usize = null;
+        var bias_index: ?usize = null;
+        for (parameters, 0..) |parameter, index| {
+            if (std.mem.eql(u8, parameter.name, model.neck_prefix ++ ".weight")) weight_index = index;
+            if (std.mem.eql(u8, parameter.name, model.neck_prefix ++ ".bias")) bias_index = index;
+        }
+        const w = weight_index orelse return error.InvalidBoundaryNeckFit;
+        const b = bias_index orelse return error.InvalidBoundaryNeckFit;
+        try neck_fit.requireIdentity(parameters[w].values, parameters[b].values, h);
+        var fitted = try neck_fit.fit(self.host_budget.allocator(), .{ .store = store, .config = config, .dataset = self.dataset, .tokenizer = self.tokenizer, .processor = self.options.processor, .batch_size = self.options.run.batch_size, .capacities = self.options.capacities, .limits = self.options.limits.step, .regex = self.options.regex }, value.teacher, value.fit, control);
+        defer fitted.deinit();
+        std.log.info("Antenna neck fit: rows={d} explained_variance={d:.4}", .{ fitted.rows, fitted.r2 });
+        parameters[w].values = try scratch.dupe(f32, fitted.weight);
+        parameters[b].values = try scratch.dupe(f32, fitted.bias);
     }
 
     fn initializeAdapterLayout(self: *const Trainer, a: Allocator, source: bundle.Identity, config: peft.Config, original: []const run.Parameter) !adapters.Layout {

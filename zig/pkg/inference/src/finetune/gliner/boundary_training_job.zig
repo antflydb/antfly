@@ -54,6 +54,8 @@ pub const Distillation = struct {
     weight: f32 = 1,
     /// Also train the heads on the rows' labels; pure distillation freezes them.
     heads: bool = false,
+    /// Fit an identity neck in closed form on the first rows before training.
+    fit: @import("boundary_distillation_fit.zig").Options = .{},
 };
 pub const Config = struct {
     version: u32,
@@ -180,7 +182,8 @@ pub fn validate(config: Config) !void {
     }
     if (config.expected_source) |expected| if (expected.precision != .fp32) return error.QuantizedBoundaryTrainingUnsupported;
     if (config.distillation) |value| {
-        if (!pathValid(value.teacher_dir) or !std.math.isFinite(value.weight) or value.weight <= 0 or config.activation_profile != .retained_v1) return error.InvalidBoundaryTrainingJob;
+        if (!pathValid(value.teacher_dir) or !std.math.isFinite(value.weight) or value.weight <= 0 or config.activation_profile != .retained_v1 or
+            !std.math.isFinite(value.fit.ridge) or value.fit.ridge <= 0 or (value.fit.rows != 0 and config.peft != null)) return error.InvalidBoundaryTrainingJob;
         if (value.expected_teacher) |expected| if (expected.precision != .fp32) return error.QuantizedBoundaryTrainingUnsupported;
     }
     if (config.memory.host_bytes == 0 or config.memory.backend_bytes == 0 or config.memory.combined_bytes == 0 or config.memory.optimizer_state_bytes == 0 or config.memory.optimizer_transaction_bytes == 0 or config.dataset_limits.max_host_bytes == 0) return error.InvalidBoundaryTrainingJob;
@@ -325,7 +328,7 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
         .gold_end = config.gold_end,
         .gold_hold_fraction = config.gold_hold_fraction,
         .require_gold_relation_coverage = config.require_gold_relation_coverage,
-        .distillation = if (teacher) |*value| .{ .teacher = value.teacher(), .weight = config.distillation.?.weight, .heads = config.distillation.?.heads } else null,
+        .distillation = if (teacher) |*value| .{ .teacher = value.teacher(), .weight = config.distillation.?.weight, .heads = config.distillation.?.heads, .fit = config.distillation.?.fit } else null,
         .limits = trainer_limits,
     }, control);
     defer trainer.deinit();
