@@ -193,13 +193,5 @@ test "laya training converts an unpacked checkpoint into a served packed model" 
         for (decision.probabilities, expected.logits) |p, z| worst = @max(worst, @abs(p - @exp(z - max) / sum));
     }
     std.debug.print("Laya packed export serving vs training max probability error={d}\n", .{worst});
-    // job.execute now trains through the fused segment training attention op
-    // (roadmap step 2c; finetune/laya/job.zig sets use_fused_attention),
-    // whose tiled online-softmax sums in a different order than the serving
-    // pipeline's segment-attention kernel. Both are correct softmaxes, but
-    // they no longer agree to the ~5e-5 bound a shared dense/generic
-    // computation gave; 1e-2 keeps this a real regression check (a decision
-    // that actually diverges, not float reordering) without depending on the
-    // exact tiling. See LAYA.md, "Long states".
-    try std.testing.expect(worst < 1e-2);
+    try std.testing.expect(worst < 5e-5);
 }

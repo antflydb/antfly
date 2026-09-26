@@ -381,11 +381,19 @@ instead of decomposing into primitives.
   `training.executeFramed`'s framed forward/backward without further
   changes. No `[tokens, tokens]` tensor is materialized on either side, so
   Metal jobs get the same `seq_len <= 8192` admission bound as CPU; they do
-  not get GPU parallelism for this op. `finetune/laya/job.zig` now sets
-  `use_fused_attention = true` unconditionally. A true on-device Metal
-  kernel (forward tiled online softmax plus a backward that needs either
-  atomics or a range-symmetry argument for the reverse `dK`/`dV` pass over
-  tree-packed rows) is open work; see Roadmap.
+  not get GPU parallelism for this op. Because of that host round-trip,
+  `finetune/laya/job.zig` selects fused attention only when a split's
+  layout actually needs it -- `exceedsDenseAttentionBound` re-checks the
+  dense materialized-bias path's own `batch*L^2*heads` bound with
+  `use_fused_attention=false` and takes fused only on
+  `error.LayaTrainingAttentionLimitExceeded` -- or `Config.force_fused_attention`
+  asks for it explicitly. Ordinary jobs (small states, the released
+  checkpoint's `max_len`) keep training on the on-device dense path on both
+  backends, unchanged from before this track; only long-state jobs beyond
+  the dense bound (or an explicit test) pay the host-bridge cost. A true
+  on-device Metal kernel (forward tiled online softmax plus a backward that
+  needs either atomics or a range-symmetry argument for the reverse
+  `dK`/`dV` pass over tree-packed rows) is open work; see Roadmap.
 - **Admission.** `graph.validate` drops the quadratic bound when
   `use_fused_attention` and instead only checks `seq_len <= 8192`
   (ModernBERT's pretraining length, already `laya.max_len`'s ceiling).
@@ -428,12 +436,34 @@ pinned revisions and compare) before it can gate anything again.
 an unpacked checkpoint into a served packed model" test compares the
 *training graph's* forward pass against the *served, exported model's*
 forward pass (a real `pipeline.execute` session, not the training graph).
-With fused attention as the trainer's default this rose from 6.0e-8 to
-2.9e-3 max probability error -- both are exact softmaxes, just summed in a
-different tile order, and the model here is small enough that a few
-thousand tokens' worth of reduction reordering is visible at this scale.
-The test's tolerance is widened to 1e-2 (see the test) to keep checking for
-an actual wrong decision rather than this expected reordering noise.
+Forcing fused attention unconditionally (the first cut of this track) rose
+this from 6.0e-8 to 2.9e-3 max probability error on the 2-layer hidden-64
+`ref` fixture. That is *not* explained by tile/summation-order noise alone
+(a single forward call agrees to ~1e-7, as the correctness tests above
+show) -- the actual mechanism, confirmed directly: this fixture's job
+trains for 3 epochs over 6 examples with Adam, and a ~1e-7 per-call forward
+difference between the tiled online-softmax and the dense masked softmax
+compounds through those optimizer steps into real weight drift. Measured
+directly (train the identical fixture/config twice, once with
+`force_fused_attention=false` and once `=true`, diff the two exported
+checkpoints): worst relative L2 over `encoder.layers.*` weight tensors is
+**2.43%** (`encoder.layers.1.mlp.Wo.weight`) on CPU -- both trainings are
+individually correct (each matches its own attention path's forward/VJP to
+~1e-7), they just land at measurably different points in weight space, and
+the *serving* forward pass (a third, independently-implemented kernel) then
+disagrees with whichever training run's graph-eval it is compared against
+at roughly that same scale.
+
+Rather than widen the test's tolerance to paper over that drift, the fix is
+the admission gating above: this fixture's layout (`seq_len=128`,
+`batch=1`) never needed fused attention in the first place (`ml/src/graph`'s
+dense bound admits it comfortably), so `exceedsDenseAttentionBound` now
+keeps both training and eval on the dense path here, exactly as before this
+track, and the test's original `worst < 5e-5` assertion (and the ~6e-8
+measured value) is restored unchanged -- long-state jobs that actually
+exceed the dense bound are the only ones that pay the fused/dense drift
+described above, and there is no dense baseline to compare those against
+(the dense path could not run at all at that length).
 
 **Long-state smoke test (2026-09-26, CPU, released 421M checkpoint).** Data
 and job recipe in `.tmp/longstate/` (gitignored): states synthesized by

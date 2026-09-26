@@ -52,6 +52,15 @@ pub const Config = struct {
     /// Keep the token embeddings and the lowest N encoder layers at their
     /// source values. Backward work and optimizer state cover only the rest.
     freeze_layers: u32 = 0,
+    /// Force the flash-style fused segment attention (roadmap step 2c) even
+    /// when the dense materialized-bias path would fit within its bound.
+    /// Selected automatically regardless of this flag once any split's
+    /// layout exceeds the dense `batch*L^2*heads` bound. Leave false for
+    /// ordinary jobs: the fused op is CPU-only today (see
+    /// `ops.ComputeBackend.segmentTrainingAttentionV1`), so a Metal job that
+    /// takes it runs attention host-bridged, which is correct but slower
+    /// than the on-device dense path.
+    force_fused_attention: bool = false,
 };
 
 pub fn validate(c: Config) !void {
@@ -264,7 +273,7 @@ fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.jso
 
 // A shuffled batch can combine the longest sequence with any other record.
 // Admit a conservative bound for the entire split before backend allocation.
-fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32, use_fused_attention: bool) !void {
+fn examplesLayout(cfg: modern.Config, examples: []const training.Example, batch_size: u32) !architecture.Layout {
     var layout = architecture.Layout{ .batch = @intCast(@min(batch_size, examples.len)), .sequence = 0, .options = 0, .questions = 0 };
     var questions: u32 = 0;
     for (examples) |e| {
@@ -272,10 +281,27 @@ fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_s
         layout.sequence = @max(layout.sequence, single.sequence);
         layout.options = @max(layout.options, single.options);
         questions = @max(questions, single.questions);
-        for (e.ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidLayaTrainingToken;
     }
     layout.questions = @min(questions * layout.batch, 512);
+    return layout;
+}
+
+fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32, use_fused_attention: bool) !void {
+    const layout = try examplesLayout(cfg, examples, batch_size);
+    for (examples) |e| for (e.ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidLayaTrainingToken;
     try architecture.validate(cfg, layout, dropout, use_fused_attention);
+}
+
+/// True when this split's layout would overflow the dense materialized-bias
+/// path's `batch*L^2*heads` admission bound, so fused attention is the only
+/// option regardless of `Config.force_fused_attention`.
+fn exceedsDenseAttentionBound(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32) !bool {
+    const layout = try examplesLayout(cfg, examples, batch_size);
+    architecture.validate(cfg, layout, dropout, false) catch |err| switch (err) {
+        error.LayaTrainingAttentionLimitExceeded => return true,
+        else => return err,
+    };
+    return false;
 }
 
 const Cursor = struct {
@@ -373,11 +399,17 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
         try data.disjoint(a, train, calib);
         try data.disjoint(a, eval, calib);
     }
-    // Flash-style segment attention (roadmap step 2c): no on-device Metal
-    // kernel yet, so a Metal job runs it host-bridged (see
-    // MetalCompute.segmentTrainingAttentionV1Op) -- correct and within the
-    // same 8k memory bound, but without GPU parallelism for this op.
-    const use_fused_attention = true;
+    // Flash-style segment attention (roadmap step 2c) has no on-device Metal
+    // kernel yet (see MetalCompute.segmentTrainingAttentionV1Op), so taking
+    // it on a Metal job runs attention host-bridged -- correct and within
+    // the same 8k memory bound, but without GPU parallelism for this op and
+    // measurably slower than the on-device dense path (models/laya/LAYA.md).
+    // Only select it when a split's layout actually needs it (exceeds the
+    // dense `batch*L^2*heads` bound) or the caller explicitly asks.
+    const use_fused_attention = c.force_fused_attention or
+        try exceedsDenseAttentionBound(encoder, train.examples, c.batch_size, c.head_dropout) or
+        try exceedsDenseAttentionBound(encoder, eval.examples, 1, c.head_dropout) or
+        (if (calibration) |calib| try exceedsDenseAttentionBound(encoder, calib.examples, 1, c.head_dropout) else false);
     try admitExamples(encoder, train.examples, c.batch_size, c.head_dropout, use_fused_attention);
     try admitExamples(encoder, eval.examples, 1, c.head_dropout, use_fused_attention);
     if (calibration) |calib| try admitExamples(encoder, calib.examples, 1, c.head_dropout, use_fused_attention);

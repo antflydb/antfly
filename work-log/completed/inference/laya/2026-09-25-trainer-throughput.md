@@ -257,9 +257,20 @@ any active command frame before reading (`metal_tensor.zig`:
 flush is a cheap no-op when no frame is active"), so this is safe inside
 `training.executeFramed`'s framed forward/backward without further
 changes -- no separate unframed-training carve-out was needed.
-`finetune/laya/job.zig` now sets `use_fused_attention = true`
-unconditionally (both backends); Metal jobs get the same `seq_len <= 8192`
-admission bound as CPU, without GPU parallelism for this op.
+`finetune/laya/job.zig` originally set `use_fused_attention = true`
+unconditionally (both backends); a Metal job that took the fused path
+this way runs attention host-bridged, adding a download/upload round trip
+to *every* attention call in the main trainer even when the layout was
+small enough for the on-device dense path. Changed: `job.zig` now selects
+fused attention only when a split's layout actually exceeds the dense
+path's own `batch*L^2*heads` admission bound
+(`exceedsDenseAttentionBound`, re-checking `architecture.validate` with
+`use_fused_attention=false`) or `Config.force_fused_attention` asks for it
+explicitly. Ordinary Metal jobs (anything that fit before this track) keep
+running the on-device dense path unchanged; only long-state jobs beyond
+the dense bound (the actual point of step 2c) pay the host-bridge cost.
+Metal jobs that do take it get the same `seq_len <= 8192` admission bound
+as CPU, without GPU parallelism for this op.
 
 Added a Metal variant of the fused-vs-dense parity test
 (`fused_attention_test.zig`, `SkipZigTest` without a Metal device) and a
@@ -328,9 +339,25 @@ track.
 `training_packed_test.zig`'s "converts an unpacked checkpoint into a
 served packed model" test (training graph vs. the exported, served model)
 went from 6.0e-8 to 2.9e-3 max probability error once `job.zig` defaulted
-to fused attention -- expected tile-order reordering noise at this model's
-scale, not a wrong decision; widened that test's tolerance to 1e-2 with a
-comment explaining why.
+to fused attention unconditionally. That is *not* explained by tile-order
+reordering noise alone -- a single forward call between the fused and dense
+attention builds agrees to ~1e-7 (see the correctness tests above) -- the
+actual mechanism, confirmed directly: this fixture's job trains 3 epochs
+over 6 examples with Adam, and that ~1e-7 per-call difference compounds
+through the optimizer into real weight drift -- diffing the two exported
+checkpoints (train the identical fixture/config twice, once
+`force_fused_attention=false` and once `=true`) gives a worst relative L2
+of 2.43% over `encoder.layers.*` weight tensors on CPU, even though each
+training run is individually correct (matches its own attention path's
+forward/VJP to ~1e-7). Fix: `job.zig` now selects fused attention only when
+a split's layout actually exceeds the dense path's own admission bound (or
+`Config.force_fused_attention` asks for it explicitly) --
+`exceedsDenseAttentionBound` re-checks `architecture.validate` with
+`use_fused_attention=false` first. This fixture (`seq_len=128`, `batch=1`)
+never needed fused attention, so it now trains and evaluates on the dense
+path exactly as before this track, and the test's original `worst < 5e-5`
+tolerance (and the ~6e-8-level measured value) is restored unchanged -- no
+tolerance widening was kept.
 
 ## Long-state smoke test (2026-09-26)
 
