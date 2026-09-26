@@ -79,20 +79,25 @@ pub const Row = struct {
     }
 };
 
-/// Validate a row received over a tensor boundary before any model work.
+/// Validate a row received over a tensor boundary before any model work. A
+/// row may hold more than one trunk (multi-row batching, `coalesce` below):
+/// each root segment (`parents[s] == -1`) starts an independent tree, and no
+/// segment outside the trunk may itself be a root.
 pub fn validate(row: Row, max_len: usize, max_packed_len: usize, max_options: usize) !void {
     const n = row.ids.len;
     if (n == 0 or n > max_packed_len or row.positions.len != n or row.segments.len != n or row.kinds.len != n) return error.InvalidLayaPackedRow;
     if (row.parents.len == 0 or row.parents.len > n or row.parents[0] != -1) return error.InvalidLayaPackedRow;
-    for (row.parents[1..], 1..) |parent, s| if (parent < 0 or parent >= s) return error.InvalidLayaPackedRow;
+    for (row.parents[1..], 1..) |parent, s| if (parent != -1 and (parent < 0 or parent >= s)) return error.InvalidLayaPackedRow;
     const q = row.anchors.len;
     if (q == 0 or row.width < 2 or row.width > max_options or row.markers.len != q * row.width or row.question_index.len != q) return error.InvalidLayaPackedRow;
     for (row.segments, row.positions, row.kinds) |segment, position, kind| {
         if (segment < 0 or segment >= row.parents.len or position < 0 or position >= max_len) return error.InvalidLayaPackedRow;
-        if ((segment == 0) != (kind == trunk_kind) or (kind != trunk_kind and (kind < 0 or kind > 2))) return error.InvalidLayaPackedRow;
+        const is_root = row.parents[@intCast(segment)] == -1;
+        if (is_root != (kind == trunk_kind) or (kind != trunk_kind and (kind < 0 or kind > 2))) return error.InvalidLayaPackedRow;
     }
-    // Segments are contiguous and at most three deep (trunk, question,
-    // candidate), so each token's visible keys are at most three ranges.
+    // Segments are contiguous and at most three deep from their own tree's
+    // root (trunk, question, candidate), so each token's visible keys are at
+    // most three ranges.
     for (row.segments[1..], 1..) |segment, i| {
         if (segment != row.segments[i - 1] and segment <= row.segments[i - 1]) return error.InvalidLayaPackedRow;
     }
@@ -103,7 +108,9 @@ pub fn validate(row: Row, max_len: usize, max_packed_len: usize, max_options: us
         if (depth > 3) return error.InvalidLayaPackedRow;
     }
     for (row.anchors, 0..) |anchor, question| {
-        if (anchor < 0 or anchor >= n or row.segments[@intCast(anchor)] == 0) return error.InvalidLayaPackedRow;
+        if (anchor < 0 or anchor >= n) return error.InvalidLayaPackedRow;
+        const anchor_segment: usize = @intCast(row.segments[@intCast(anchor)]);
+        if (row.parents[anchor_segment] == -1) return error.InvalidLayaPackedRow;
         const kind = row.kinds[@intCast(anchor)];
         var valid: usize = 0;
         for (row.markers[question * row.width ..][0..row.width]) |marker| {
@@ -115,6 +122,84 @@ pub fn validate(row: Row, max_len: usize, max_packed_len: usize, max_options: us
         }
         if (valid < 2) return error.InvalidLayaPackedRow;
     }
+}
+
+/// Number of independent trees (root segments) in a row.
+pub fn treeCount(row: Row) usize {
+    var count: usize = 0;
+    for (row.parents) |parent| count += @intFromBool(parent == -1);
+    return count;
+}
+
+/// Combine several independently built and valid rows into one physical row
+/// for a single session call. Each input row keeps its own trunk as a
+/// separate root segment; positions stay row-local (RoPE and the sliding
+/// window never compare positions across trees), and every visible-key range
+/// stays inside its owning row's token span, so trees are exactly as
+/// isolated as separate calls. `owners[k]` names which `rows[i]` contributed
+/// the merged row's `k`-th question, so a caller can map `question_index`
+/// back to its original per-state member list. Caller owns the returned row
+/// and `owners` slice (freed together, both from `a`).
+pub const Coalesced = struct {
+    row: Row,
+    owners: []const usize,
+
+    pub fn deinit(self: Coalesced, a: std.mem.Allocator) void {
+        self.row.deinit(a);
+        a.free(self.owners);
+    }
+};
+
+pub fn coalesce(a: std.mem.Allocator, rows: []const Row) !Coalesced {
+    if (rows.len == 0) return error.InvalidLayaPackedRow;
+    var total_tokens: usize = 0;
+    var total_segments: usize = 0;
+    var total_questions: usize = 0;
+    var width: usize = 0;
+    for (rows) |r| {
+        total_tokens += r.ids.len;
+        total_segments += r.parents.len;
+        total_questions += r.questions();
+        width = @max(width, r.width);
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const s = arena.allocator();
+    const ids = try s.alloc(i64, total_tokens);
+    const positions = try s.alloc(i64, total_tokens);
+    const segments = try s.alloc(i64, total_tokens);
+    const kinds = try s.alloc(i64, total_tokens);
+    const parents = try s.alloc(i64, total_segments);
+    const anchors = try s.alloc(i64, total_questions);
+    const markers = try s.alloc(i64, total_questions * width);
+    const question_index = try s.alloc(usize, total_questions);
+    const owners = try a.alloc(usize, total_questions);
+    errdefer a.free(owners);
+    @memset(markers, -1);
+    var token_offset: usize = 0;
+    var segment_offset: usize = 0;
+    var q_offset: usize = 0;
+    for (rows, 0..) |r, ri| {
+        const n = r.ids.len;
+        @memcpy(ids[token_offset..][0..n], r.ids);
+        @memcpy(positions[token_offset..][0..n], r.positions);
+        @memcpy(kinds[token_offset..][0..n], r.kinds);
+        for (r.segments, 0..) |seg, i| segments[token_offset + i] = seg + @as(i64, @intCast(segment_offset));
+        for (r.parents, 0..) |parent, i| parents[segment_offset + i] = if (parent == -1) -1 else parent + @as(i64, @intCast(segment_offset));
+        for (r.anchors, 0..) |anchor, i| anchors[q_offset + i] = anchor + @as(i64, @intCast(token_offset));
+        for (0..r.questions()) |qi| {
+            const dst = markers[(q_offset + qi) * width ..][0..width];
+            const src = r.markers[qi * r.width ..][0..r.width];
+            for (src, 0..) |marker, k| dst[k] = if (marker == -1) -1 else marker + @as(i64, @intCast(token_offset));
+        }
+        @memcpy(question_index[q_offset..][0..r.questions()], r.question_index);
+        for (owners[q_offset..][0..r.questions()]) |*owner| owner.* = ri;
+        token_offset += n;
+        segment_offset += r.parents.len;
+        q_offset += r.questions();
+    }
+    const row = try own(a, .{ .ids = ids, .positions = positions, .segments = segments, .parents = parents, .kinds = kinds, .anchors = anchors, .markers = markers, .question_index = question_index, .width = width });
+    return .{ .row = row, .owners = owners };
 }
 
 /// Visible key ranges of tokens `first..` for `ops.SegmentAttention`: the

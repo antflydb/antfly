@@ -298,6 +298,131 @@ test "laya packed questions are isolated and share one exact trunk encoding" {
     }
 }
 
+// Multi-row batching (LAYA.md, "Segment attention"): several rows, from
+// different states, run as one physical row in one session call.
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
+
+test "laya multi-row coalescing isolates independent states and matches running them alone" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    const states = [_][]const u8{
+        state_text,
+        "hello world this is a different and much shorter state",
+        "a third state about invoices refunds and shipping delays",
+    };
+    for ([_][]const u8{ "{\"mode\":\"question\"}", "{\"mode\":\"candidate\"}" }) |packing| {
+        var fixture = try Fixture.init(std.testing.allocator, packing);
+        defer fixture.deinit(std.testing.allocator);
+        var sub_rows: [states.len]tree.Row = undefined;
+        var alone: [states.len][2][]f32 = undefined;
+        for (&sub_rows, &alone, states) |*row, *result, text| {
+            row.* = (try tree.build(a, tok, fixture.cfg, text, &questions))[0];
+            result.* = try runRow(a, &fixture, row.*);
+        }
+        const merged = try tree.coalesce(a, &sub_rows);
+        defer merged.deinit(a);
+        try std.testing.expectEqual(@as(usize, states.len), tree.treeCount(merged.row));
+        try tree.validate(merged.row, fixture.cfg.max_len, fixture.cfg.packing.max_packed_len, fixture.cfg.maxOptions());
+        // No token of one state's tree is visible from another's.
+        var offsets: [states.len]usize = undefined;
+        var running: usize = 0;
+        for (&offsets, sub_rows) |*offset, row| {
+            offset.* = running;
+            running += row.ids.len;
+        }
+        for (sub_rows, 0..) |row, ri| for (0..row.ids.len) |i| for (sub_rows, 0..) |other, rj| {
+            if (ri == rj) continue;
+            for (0..other.ids.len) |k| try std.testing.expect(!merged.row.visible(offsets[ri] + i, offsets[rj] + k));
+        };
+        // A batched call over all three states equals each row run alone.
+        const together = try runRow(a, &fixture, merged.row);
+        var worst: f32 = 0;
+        for (merged.row.question_index, merged.owners, 0..) |local, owner, k| {
+            const q = questions[local];
+            const labels = q.labels.len;
+            worst = @max(worst, try maxError(alone[owner][0][local * sub_rows[owner].width ..][0..labels], together[0][k * merged.row.width ..][0..labels]));
+            worst = @max(worst, try maxError(alone[owner][1][local * fixture.cfg.n_act ..][0..fixture.cfg.n_act], together[1][k * fixture.cfg.n_act ..][0..fixture.cfg.n_act]));
+        }
+        std.debug.print("Laya multi-row batching {s}: isolation and exactness max error={d}\n", .{ packing, worst });
+        try std.testing.expect(worst < 1e-5);
+    }
+}
+
+test "laya multi-row coalescing holds exactly with a dozen near-identical states" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    var fixture = try Fixture.init(std.testing.allocator, "{\"mode\":\"question\"}");
+    defer fixture.deinit(std.testing.allocator);
+    const state_count = 12;
+    var sub_rows: [state_count]tree.Row = undefined;
+    var alone: [state_count][2][]f32 = undefined;
+    for (&sub_rows, &alone, 0..) |*row, *result, i| {
+        const text = try std.fmt.allocPrint(a, "{s} case number {d}", .{ state_text, i });
+        row.* = (try tree.build(a, tok, fixture.cfg, text, questions[0..2]))[0];
+        result.* = try runRow(a, &fixture, row.*);
+    }
+    const merged = try tree.coalesce(a, &sub_rows);
+    defer merged.deinit(a);
+    try std.testing.expectEqual(@as(usize, state_count), tree.treeCount(merged.row));
+    // This directly exercises forwardRow, bypassing the session's own
+    // max_packed_len budget (pipelines/laya.zig enforces that when grouping
+    // rows into batches); validate the row's structure against its own size.
+    try tree.validate(merged.row, fixture.cfg.max_len, merged.row.ids.len, fixture.cfg.maxOptions());
+    const together = try runRow(a, &fixture, merged.row);
+    var worst: f32 = 0;
+    for (merged.row.question_index, merged.owners, 0..) |local, owner, k| {
+        const q = questions[0..2][local];
+        const labels = q.labels.len;
+        worst = @max(worst, try maxError(alone[owner][0][local * sub_rows[owner].width ..][0..labels], together[0][k * merged.row.width ..][0..labels]));
+        worst = @max(worst, try maxError(alone[owner][1][local * fixture.cfg.n_act ..][0..fixture.cfg.n_act], together[1][k * fixture.cfg.n_act ..][0..fixture.cfg.n_act]));
+    }
+    std.debug.print("Laya multi-row batching, {d} near-identical states: max error={d}\n", .{ state_count, worst });
+    try std.testing.expect(worst < 1e-5);
+}
+
+test "laya packed pipeline batches many small states into fewer session calls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    var fixture = try Fixture.init(std.testing.allocator, "{\"mode\":\"question\"}");
+    defer fixture.deinit(std.testing.allocator);
+    const state_count = 12;
+    var tasks: std.ArrayListUnmanaged(pipeline.Task) = .empty;
+    for (0..state_count) |i| {
+        const text = try std.fmt.allocPrint(a, "{s} case number {d}", .{ state_text, i });
+        for (questions[0..2]) |q| try tasks.append(a, .{ .text = text, .question = q });
+    }
+    const result = try pipeline.execute(a, fixture.session, tok, fixture.cfg, tasks.items, null);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_LAYA_PACKED_BATCH", "0", 1));
+    const unbatched = try pipeline.execute(a, fixture.session, tok, fixture.cfg, tasks.items, null);
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_LAYA_PACKED_BATCH"));
+    std.debug.print("Laya multi-row batching: {d} states, batched chunks={d}, unbatched chunks={d}\n", .{ state_count, result.execution_chunks, unbatched.execution_chunks });
+    // Every state fits its own row well under the budget, so disabling
+    // batching falls back to one call per state; batching shares fewer calls
+    // across them without changing tokens processed or any decision.
+    try std.testing.expectEqual(@as(usize, state_count), unbatched.execution_chunks);
+    try std.testing.expect(result.execution_chunks < unbatched.execution_chunks);
+    try std.testing.expectEqual(unbatched.prompt_tokens, result.prompt_tokens);
+    var worst_prob: f32 = 0;
+    var worst_act: f32 = 0;
+    for (result.decisions, unbatched.decisions) |left, right| {
+        worst_prob = @max(worst_prob, try maxError(left.probabilities, right.probabilities));
+        worst_act = @max(worst_act, @abs(left.act_probability - right.act_probability));
+    }
+    std.debug.print("Laya multi-row batching: {d} states, worst probability error={d}, worst act error={d}\n", .{ state_count, worst_prob, worst_act });
+    try std.testing.expect(worst_prob < 1e-5);
+    try std.testing.expect(worst_act < 1e-5);
+}
+
 test "laya packed trunk cache reuses the state exactly across rows and requests" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -372,7 +497,9 @@ test "laya packed pipeline groups shared states and preserves request order" {
         .{ .text = state_text, .question = questions[1] },
     };
     const result = try pipeline.execute(a, fixture.session, tok, fixture.cfg, &tasks, null);
-    try std.testing.expectEqual(@as(usize, 2), result.execution_chunks);
+    // Two states, each one row well under the 512-token budget: multi-row
+    // batching (LAYA.md, "Segment attention") shares one session call.
+    try std.testing.expectEqual(@as(usize, 1), result.execution_chunks);
     var unpacked_tokens: usize = 0;
     for (tasks, result.decisions) |task, decision| {
         try std.testing.expectEqualStrings(task.question.name, decision.name);
@@ -504,5 +631,61 @@ test "laya packed benchmark shared-state cost against unpacked" {
                 tokens[0],                                 tokens[1],
             });
         }
+    }
+    // Many-states case (step 1b'): a request with many distinct short states
+    // instead of many questions about one state. Multi-row batching (LAYA.md,
+    // "Segment attention") amortizes per-call overhead across states; compare
+    // against ANTFLY_LAYA_PACKED_BATCH=0, which falls back to one call per row.
+    const many_state_questions = 4;
+    for ([_]usize{ 16, 64 }) |state_count| {
+        const tasks = try s.alloc(pipeline.Task, state_count * many_state_questions);
+        for (0..state_count) |si| {
+            const text = try std.fmt.allocPrint(s, "{s} case {d}", .{ sentence, si });
+            for (0..many_state_questions) |qi| tasks[si * many_state_questions + qi] = .{ .text = text, .question = bench_questions[qi % bench_questions.len] };
+        }
+        var unpacked_time: [samples + 1]u64 = undefined;
+        var unpacked_tokens: usize = 0;
+        for (&unpacked_time) |*t| {
+            var request = std.heap.ArenaAllocator.init(a);
+            defer request.deinit();
+            const began = platform.time.monotonicNs();
+            const result = try pipeline.executeWithScratch(request.allocator(), a, unpacked, tok, unpacked_cfg, tasks, null, null);
+            t.* = platform.time.monotonicNs() - began;
+            unpacked_tokens = result.prompt_tokens;
+        }
+        std.mem.sort(u64, unpacked_time[1..], {}, std.sort.asc(u64));
+        var batched_time: [samples + 1]u64 = undefined;
+        var batched_chunks: usize = 0;
+        var batched_tokens: usize = 0;
+        for (&batched_time) |*t| {
+            var request = std.heap.ArenaAllocator.init(a);
+            defer request.deinit();
+            const began = platform.time.monotonicNs();
+            const result = try pipeline.executeWithScratch(request.allocator(), a, packed_session, tok, packed_cfg, tasks, null, null);
+            t.* = platform.time.monotonicNs() - began;
+            batched_chunks = result.execution_chunks;
+            batched_tokens = result.prompt_tokens;
+        }
+        std.mem.sort(u64, batched_time[1..], {}, std.sort.asc(u64));
+        try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_LAYA_PACKED_BATCH", "0", 1));
+        var unbatched_time: [samples + 1]u64 = undefined;
+        var unbatched_chunks: usize = 0;
+        for (&unbatched_time) |*t| {
+            var request = std.heap.ArenaAllocator.init(a);
+            defer request.deinit();
+            const began = platform.time.monotonicNs();
+            const result = try pipeline.executeWithScratch(request.allocator(), a, packed_session, tok, packed_cfg, tasks, null, null);
+            t.* = platform.time.monotonicNs() - began;
+            unbatched_chunks = result.execution_chunks;
+        }
+        std.mem.sort(u64, unbatched_time[1..], {}, std.sort.asc(u64));
+        try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_LAYA_PACKED_BATCH"));
+        std.debug.print("LAYA_PACKED_MANY_STATES {{\"backend\":\"{s}\",\"states\":{d},\"questions_per_state\":{d},\"unpacked_ms\":{d:.1},\"packed_batched_ms\":{d:.1},\"packed_unbatched_ms\":{d:.1},\"batched_chunks\":{d},\"unbatched_chunks\":{d},\"unpacked_tokens\":{d},\"packed_tokens\":{d}}}\n", .{
+            @tagName(unpacked.backend()),                                 state_count,
+            many_state_questions,                                         @as(f64, @floatFromInt(unpacked_time[1 + samples / 2])) / 1e6,
+            @as(f64, @floatFromInt(batched_time[1 + samples / 2])) / 1e6, @as(f64, @floatFromInt(unbatched_time[1 + samples / 2])) / 1e6,
+            batched_chunks,                                               unbatched_chunks,
+            unpacked_tokens,                                              batched_tokens,
+        });
     }
 }

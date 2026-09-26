@@ -216,9 +216,9 @@ norms, the type embedding, the scorer and the action head stay dense. See
 
 | Piece | Location |
 | --- | --- |
-| Packer, visibility, masks, row validation | `src/pipelines/laya_tree.zig` |
-| Pipeline: group tasks by state text, one session run per row, request order preserved | `src/pipelines/laya.zig` (`executePacked`) |
-| Session contract and one-row forward | `src/architectures/laya_packed.zig` |
+| Packer, visibility, masks, row validation, multi-row coalescing | `src/pipelines/laya_tree.zig` |
+| Pipeline: group tasks by state text, batch rows into session calls, request order preserved | `src/pipelines/laya.zig` (`executePacked`) |
+| Session contract and one-row (or one merged multi-row) forward | `src/architectures/laya_packed.zig` |
 | Encoder with logical positions and per-layer masks | `src/architectures/modern_bert.zig` (`forwardPackedCT`) |
 | Decision head with tree mask and anchor features | `src/architectures/laya_head.zig` (`forwardPacked`) |
 | State cache (trunk keys and values across rows and requests) | `src/architectures/laya_trunk_cache.zig`, `laya_packed.forwardRow` |
@@ -314,6 +314,57 @@ the encoder and the decision head goes through it.
   separate staging calls overwrote each other. The symptom was wrong
   attention whenever a query had more than one range.
 - **Fallback:** backends without the op use the host kernel.
+
+#### Multi-row batching (step 1b′)
+
+`ComputeBackend.segmentAttention` never assumed one tree per call: ranges are
+per query, and a query's visible keys are wherever its ranges point, whatever
+else is in the same physical row. `pipelines/laya.zig` (`executePacked`) uses
+this to run several rows, from the same or different states, as one physical
+row in one session call, instead of one call per row.
+
+- **Layout:** `laya_tree.Row` already allowed one trunk (a root segment,
+  `parents[s] == -1`). `validate` now allows more than one: each root starts
+  an independent tree, and no non-root segment may itself be a root. A merged
+  row is a forest, not a single tree with a wider trunk.
+- **Coalescing (`laya_tree.coalesce`):** takes several already-built, already
+  validated rows and concatenates their tokens; segment and parent ids are
+  renumbered into one global space per row (each row's own root stays a
+  root); anchors and markers move with their tokens; `markers` is padded to
+  the widest row's option count. **Positions are not shifted** — every tree
+  keeps the positions it would have alone, restarting at its own root. RoPE
+  and the sliding window only ever compare a query's position to a key in
+  its own visible ranges, so two trees can share position values without
+  interacting. `owners[k]` records which input row contributed the merged
+  row's `k`-th question, for mapping decisions back to their task.
+- **Isolation:** unchanged from a single tree. `Row.visible` walks a
+  segment's ancestors to `-1`; a token in one tree can never reach a
+  segment in another tree's chain, so cross-tree attention is structurally
+  impossible, not just masked to zero. `laya_tree.ranges` is unchanged — it
+  already computed each token's ranges from its own ancestor chain only.
+- **Grouping:** `executePacked` still groups tasks by state text and builds
+  one or more rows per state (`laya_tree.build`, splitting only when a
+  state's own branches overflow `max_packed_len`). It then walks the built
+  rows in request order and greedily adds each next row to the current batch
+  while the combined physical length stays within `max_packed_len` — the
+  same bound `build` already enforces per state, reused instead of adding a
+  second knob. `ANTFLY_LAYA_PACKED_BATCH=0` disables batching (one call per
+  row, the previous behavior), for comparison and as a rollback switch.
+- **Trunk cache:** a merged row's `laya_tree.treeCount` is greater than one,
+  and `laya_packed.forwardRow` uses that to skip the cache and go straight to
+  `forwardFull` for a merged row. Segment attention already keeps cost
+  proportional to visible keys, so a batch's states cost the same whether or
+  not any of them are cached — batching and the state cache are simply two
+  independent ways to cut cost, not composed yet. Caching a forest of trunks
+  (reusing some trees' trunks while others miss, in one call) is future work.
+- **Exactness:** `pipelines/laya_packed_test.zig` ("laya multi-row coalescing
+  isolates independent states and matches running them alone") builds three
+  distinct states as separate rows, coalesces them, and checks every
+  cross-tree pair is invisible and that the merged row's decisions equal
+  each row run alone, in both question and candidate mode. A second test
+  drives this through the pipeline: many small states batch into fewer
+  session calls than `ANTFLY_LAYA_PACKED_BATCH=0`, with identical decisions
+  and token counts either way.
 
 ## Training methodology
 
@@ -634,6 +685,8 @@ All numbers are from 2026-09-24 on an Apple M4 Max (36 GiB), Zig 0.16.0.
 | Gradients on the released model vs float64 PyTorch, three ~330-token states | `training_test.zig` with a released-model fixture | worst per-layer relative L2 0.4–0.6% (float32) |
 | CPU segment kernel equals dense masked softmax (three ranges, window, fewer queries than keys) | `lib/linalg/src/attention.zig` | < 1e-5 |
 | Segment attention equals dense tree-masked attention on the session backend, all queries and branch queries only | `pipelines/laya_packed_test.zig` | 2.4e-7 (CPU), 3.6e-7 (Metal) |
+| Multi-row coalescing: no token of one state's tree is visible from another's; a batched call over several states equals each state's row run alone (question and candidate modes) | same, "laya multi-row coalescing isolates independent states and matches running them alone" | max probability error < 1e-5 (CPU and Metal) |
+| Pipeline batches many small states into fewer session calls than `ANTFLY_LAYA_PACKED_BATCH=0`, with identical decisions and prompt tokens either way | same, "laya packed pipeline batches many small states into fewer session calls" | exact (< 1e-5) |
 
 Reproduce the fixture-backed tests. The fixtures are regenerated from pinned
 inputs rather than committed:
@@ -713,6 +766,44 @@ packed rows through them (step 1c) is not expected to pay off on Metal.
 The full raw output of every run is in
 [`work-log/completed/inference/laya/2026-09-24-tree-packing.md`](../../../../../work-log/completed/inference/laya/2026-09-24-tree-packing.md).
 
+### Multi-row batching cost (step 1b′)
+
+The table above amortizes a shared **state**: many questions about one
+state, packed into one row. Multi-row batching amortizes the opposite shape:
+many **states**, each with only a few questions, batched into one row per
+call instead of one call per state. This is the common shape for a request
+that scores many independent short items (tickets, records, chunks) with
+the same handful of questions. Same checkpoint, machine, and build as above;
+5 warm requests each of Q=4 questions (cycling choice/boolean/score) about
+S distinct states of one repeated sentence, `ANTFLY_LAYA_PACKED_BATCH=0`
+forces one packed call per state (the pre-batching behavior) for comparison.
+
+```bash
+ANTFLY_LAYA_PACKED_BENCH=/abs/models/extractors/laya [ANTFLY_LAYA_BACKEND=metal] \
+  zig build test -Doptimize=ReleaseFast -- --test-filter "laya packed benchmark"
+```
+
+| Backend | States | Unpacked ms | Packed, batched ms | Packed, one row per state ms | Batched calls | Unbatched calls |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Metal | 16 | 578 | 321 | 1,155 | 1 | 16 |
+| Metal | 64 | 2,564 | 1,401 | 4,779 | 2 | 64 |
+| CPU | 16 | 5,897 | 3,548 | 7,154 | 1 | 16 |
+| CPU | 64 | 22,425 | 13,181 | 28,229 | 2 | 64 |
+
+At this question count, one packed call per state is **slower than not
+packing at all**: 16 (or 64) tiny per-call sessions cost more in fixed
+overhead (admission, tensor marshaling, a state's own trunk re-encoded from
+scratch each time) than packing saves on shared prefixes when there is
+little to share. This holds on both backends: one-row-per-state is 2.0×
+(Metal) to 1.2× (CPU) slower than not packing at all. Batching removes that
+overhead by merging states into few calls: 16 states go from 16 calls to 1
+(1.8× faster than unpacked on Metal, 1.7× on CPU; 3.6× and 2.0× faster than
+one-row-per-state), and 64 states from 64 calls to 2 (1.8× and 1.7× faster
+than unpacked; 3.4× and 2.1× faster than one-row-per-state).
+`laya_tree.treeCount` disables the trunk state cache for a merged row (see
+"Segment attention" above), so this gain is from batching alone; a future
+step could compose the two.
+
 ### Weight quantization (step 1d)
 
 Released `laya` (unpacked) on the 760 step-0 eval decisions through the
@@ -744,7 +835,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 | --- | --- | --- | --- |
 | 0. Qualify packed accuracy | fine-tune | question mode: single-seed parity on typed-decisions (0.574 vs 0.572), but the recipe varies 0.37–0.57 by seed, so parity needs several seeds of each layout. Candidate mode: Banking77 0.819 mean over two seeds (0.828, 0.810) with soft CE (RLCD diverges at 77 options) | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
 | 1a. State cache across rows and requests | no | done (CPU and Metal) | Exact against the full row and the oracle; follow-up questions skip trunk projections and feed-forward work |
-| 1b. Segment attention | no | done (CPU and Metal); multi-row calls not started | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call remain, which needs a per-row segment contract |
+| 1b. Segment attention | no | done (CPU and Metal); multi-row batching done (CPU and Metal, question and candidate modes) | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call: exact against running each row alone, isolated by construction; not yet composed with the trunk cache |
 | 1c. Metal and CUDA packed kernels | no | Metal: packed decisions scored on the device (2–4%); fused kernels not pursued (encoder GPU work dominates). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |
 | 1d. Weight quantization (q8_0) | no | done (CPU and Metal); pays off on Metal | Labels identical and probabilities within 2e-2 of dense on the fixture; on the released model, 36% less Metal memory at the same accuracy. CPU q8_0 kernels need work |
 | 2a. Long-context teacher (Qwen3.8-27B) | labels only | not started | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
