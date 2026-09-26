@@ -58,6 +58,9 @@ pub const Options = struct {
     regex_context: ?*anyopaque = null,
     validate_value_fn: ?*const fn (?*anyopaque, schema_mod.RegexValidator, []const u8) anyerror!bool = null,
     joint_limits: joint.Options = .{},
+    /// Feature distillation supervises every sample through its teacher, so
+    /// a distillation job may train on rows without labels.
+    allow_unsupervised: bool = false,
     control: ?Control = null,
     failure: ?*Failure = null,
 };
@@ -375,7 +378,7 @@ pub fn compileBatch(a: Allocator, samples: []const processor.Sample, schemas: []
         try compiler.validateRoutes(sample, schema);
         if (schema.joint_ie != null and (annotation.entities.len > options.joint_limits.max_nodes or annotation.relations.len > options.joint_limits.max_edges))
             return error.BoundaryTrainingTargetCapacityExceeded;
-        if (sample.queries.len == 0 and annotation.classifications.len == 0) return error.UnsupervisedBoundaryTrainingSample;
+        if (sample.queries.len == 0 and annotation.classifications.len == 0 and !options.allow_unsupervised) return error.UnsupervisedBoundaryTrainingSample;
         var mapping = try offsets_mod.OffsetMap.init(a, sample.original_text, options.max_text_bytes);
         defer mapping.deinit();
         const words = try compiler.documentWords(sample);
@@ -861,4 +864,19 @@ test "boundary training targets match pinned schema preprocessing and target pac
             }
         }
     }
+}
+
+test "boundary training targets admit unlabeled classification rows only for distillation" {
+    const a = std.testing.allocator;
+    var compiled = try schema_mod.compile(a, "{\"classifications\":[{\"name\":\"topic\",\"labels\":[\"sports\",\"science\"]}]}", .{});
+    defer compiled.deinit();
+    var tokenizer = TestTokenizer{};
+    var prepared = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = "Ada won.", .schema = &compiled }}, .{});
+    defer prepared.deinit();
+    const unlabeled = [_]Annotations{.{ .schema_fingerprint = compiled.fingerprint }};
+    try std.testing.expectError(error.UnsupervisedBoundaryTrainingSample, compileBatch(a, prepared.samples, &.{&compiled}, &unlabeled, .{}));
+    var targets = try compileBatch(a, prepared.samples, &.{&compiled}, &unlabeled, .{ .allow_unsupervised = true });
+    defer targets.deinit();
+    // The classification labels route, but nothing is supervised.
+    for (targets.classification_mask) |supervised| try std.testing.expect(!supervised);
 }

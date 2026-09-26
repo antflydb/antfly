@@ -297,8 +297,9 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
         .max_queries = config.tokenization.max_queries,
         .word_splitter = config.tokenization.word_splitter,
     };
-    if (calibration) |*value| try value.preflight(source.tokenizer(), tokenization, .{ .gold_capacity = source.config.head.max_gold_per_query }, control, null);
-    if (heldout) |*value| try value.preflight(source.tokenizer(), tokenization, .{ .gold_capacity = source.config.head.max_gold_per_query }, control, null);
+    const holdout_targets = @import("boundary_targets.zig").Options{ .gold_capacity = source.config.head.max_gold_per_query, .allow_unsupervised = config.distillation != null };
+    if (calibration) |*value| try value.preflight(source.tokenizer(), tokenization, holdout_targets, control, null);
+    if (heldout) |*value| try value.preflight(source.tokenizer(), tokenization, holdout_targets, control, null);
     const trainer_limits = try trainerLimits(config);
     var teacher: ?teacher_mod.SourceTeacher = null;
     if (teacher_source) |value| {
