@@ -89,7 +89,7 @@ test "laya packed training graph matches packed serving logits, alone and in a p
         var examples: [states.len]train.Example = undefined;
         var rows: [states.len]tree.Row = undefined;
         for (&examples, &rows, states) |*e, *row, state| {
-            row.* = (try tree.build(scratch, tok, laya, state, &questions))[0];
+            row.* = (try tree.build(scratch, tok, laya, state, &questions, null))[0];
             e.* = try packedExample(scratch, row.*);
         }
         var session = try factory.createNativeSession(a, dir);

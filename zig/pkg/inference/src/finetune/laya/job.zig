@@ -49,6 +49,13 @@ pub const Config = struct {
     /// keeps the source checkpoint's layout; released checkpoints are unpacked.
     packing: ?model.PackingMode = null,
     max_packed_len: ?u32 = null,
+    /// Two-stage choice (roadmap 2b): only valid with `packing: .candidate`.
+    /// Set to also train, alongside the ordinary candidate rows, one joint
+    /// (question-style) row per eligible `choice` record over a sampled
+    /// shortlist (`finetune/laya/data.zig`, `addStageTwo`), and export the
+    /// serving config so `pipelines/laya.zig` runs both stages.
+    two_stage_top_k: ?u32 = null,
+    two_stage_mass_cutoff: ?f32 = null,
     /// Keep the token embeddings and the lowest N encoder layers at their
     /// source values. Backward work and optimizer state cover only the rest.
     freeze_layers: u32 = 0,
@@ -66,6 +73,10 @@ pub fn validate(c: Config) !void {
     if (c.calibration_file) |value| if (!std.fs.path.isAbsolute(value)) return error.LayaJobRequiresAbsolutePaths;
     if (c.stop_after_microbatches == 0) return error.InvalidLayaJob;
     if (c.max_packed_len != null and (c.packing == null or c.packing.? == .none)) return error.InvalidLayaJob;
+    if (c.two_stage_top_k) |k| {
+        if ((c.packing orelse .none) != .candidate or k < 2 or k > model.max_packed_options) return error.InvalidLayaJob;
+    } else if (c.two_stage_mass_cutoff != null) return error.InvalidLayaJob;
+    if (c.two_stage_mass_cutoff) |m| if (!std.math.isFinite(m) or m <= 0 or m > 1) return error.InvalidLayaJob;
 }
 
 /// Apply the job's packing override with the same bounds as `laya.packing`.
@@ -74,7 +85,8 @@ fn packing(c: Config, source: model.Config) !model.Packing {
     if (mode == .none) return .{};
     const length: usize = c.max_packed_len orelse @min(4 * source.max_len, model.max_packed_len_limit);
     if (length < source.max_len or length > model.max_packed_len_limit) return error.InvalidLayaJob;
-    return .{ .mode = mode, .max_packed_len = length };
+    const two_stage: model.TwoStage = if (c.two_stage_top_k) |k| .{ .top_k = k, .mass_cutoff = c.two_stage_mass_cutoff orelse 0 } else .{};
+    return .{ .mode = mode, .max_packed_len = length, .two_stage = two_stage };
 }
 
 fn path(a: std.mem.Allocator, dir: []const u8, name: []const u8) ![]const u8 {
@@ -362,10 +374,10 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
     const tokenizer = try hf.HfTokenizer.loadFromBytes(a, tokenizer_bytes);
     const tok = tokenizer.tokenizer();
     defer tok.deinitTokenizer();
-    const train = try data.load(permanent, c.train_file, tok, laya);
-    const eval = try data.load(permanent, c.eval_file, tok, laya);
+    const train = try data.load(permanent, c.train_file, tok, laya, c.seed);
+    const eval = try data.load(permanent, c.eval_file, tok, laya, c.seed +% 1);
     try data.disjoint(a, train, eval);
-    const calibration = if (c.calibration_file) |file| try data.load(permanent, file, tok, laya) else null;
+    const calibration = if (c.calibration_file) |file| try data.load(permanent, file, tok, laya, c.seed +% 2) else null;
     if (calibration) |calib| {
         try data.disjoint(a, train, calib);
         try data.disjoint(a, eval, calib);

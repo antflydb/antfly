@@ -206,6 +206,23 @@ out-of-range lengths are rejected. The extraction API admits up to 255 labels
 per question. The model enforces its own limit: 20 unless the model is
 candidate-packed.
 
+`packing.two_stage` (candidate mode only; see
+[Two-stage choice](#two-stage-choice-roadmap-2b)) shortlists a `choice`
+question's options before comparing the survivors jointly:
+
+```json
+"packing": {
+  "mode": "candidate",
+  "max_packed_len": 2048,
+  "two_stage": { "top_k": 8, "mass_cutoff": 0.9 }
+}
+```
+
+`top_k` (2–255, required to enable it) is the largest shortlist; `mass_cutoff`
+(0–1, optional) can stop shortlisting earlier once that much of stage 1's
+probability mass is captured, never below 2 finalists. Disabled by default
+(`top_k` absent, equivalent to `top_k: 0`).
+
 `"weight_quantization": "q8_0"` (or `ANTFLY_LAYA_WEIGHT_QUANT=q8_0`) serves
 the encoder and decision-head linear weights as Q8_0, quantized from the
 dense checkpoint at load (`weight_source.quantizeDenseQ8_0`). Embeddings,
@@ -526,9 +543,60 @@ since. Several things turned up along the way:
   (`taskpolicy -B -p <pid>`) and keep the display awake. The raw logs are in
   the work log.
 
-### Trainer throughput
+### Two-stage choice (roadmap 2b)
 
-Measured 2026-09-25 on the same machine: packed question mode, batch size 1,
+Candidate branches cannot compare options before the final softmax: each
+option is scored in isolation, so the model never gets to weigh finalists
+against each other directly, only through the shared trunk. [The tree-mask
+hypothesis](#the-tree-mask-hypothesis) attributes exactly this two-step
+procedure to Jev at high option counts: "score candidates independently, then
+make an explicit choice." This section adds it to Laya and measures it on
+Banking77 against the 0.819 candidate baseline above.
+
+**Design.** Stage 1 is the unmodified candidate pass: every option is its own
+branch under the trunk, as above. When a `choice` question has more options
+than `packing.two_stage.top_k`, stage 2 packs the surviving finalists into one
+*joint* branch off the same trunk — `[CLS] head [SEP] ([MASK] option)* [SEP]`,
+the same layout `question` mode uses, so the finalists attend to each other —
+and reruns just that branch. Finalists are the highest-probability options
+under stage 1, capped at `top_k` and optionally cut off earlier once
+`mass_cutoff` of stage 1's probability mass is captured (never below 2). The
+two distributions are blended rather than replaced: writing `m` for the
+stage-1 probability mass stage 1 assigned to the shortlist, each finalist's
+final probability is `m` times its stage-2 share of that mass, and every
+non-finalist keeps its stage-1 probability unchanged. The mix still sums to 1,
+and stage 2 can only move mass among the finalists — it cannot let a
+low-probability option that stage 1 dropped resurface. Everything decodes
+through the existing calibration and readout (`decode`/`finalize`,
+`pipelines/laya.zig`), so a shortlist of `k` options is calibrated exactly
+like a `question`-mode question with `k` options would be.
+
+**One checkpoint, two branch shapes.** Serving stays one call: `executePacked`
+runs the candidate row, decodes it, and for each `choice` question over
+`top_k` options builds and runs a second, one-question row with
+`BranchStyle.question` forced regardless of the model's own `packing.mode`
+(`laya_tree.build`'s new style-override parameter). Both rows share the
+trunk's KV cache, so stage 2 costs only the joint branch's own forward. A
+checkpoint therefore has to answer both branch shapes well, which needs both
+in training: `finetune/laya/data.zig`'s `addStageTwo` adds, for every eligible
+`choice` record, one synthetic record holding the gold label plus `top_k - 1`
+other options sampled uniformly at random (deterministic in the job's seed),
+and `pack` routes it through the joint (`question`) style while the original
+record keeps its ordinary candidate branch. The job JSON's `two_stage_top_k`
+(and optional `two_stage_mass_cutoff`) enable this and are written into the
+served `packing.two_stage` config; leaving them unset trains and serves
+exactly as before.
+
+**Measured on Banking77** (400 eval messages, `packing.two_stage.top_k = 8`,
+starting from the same released checkpoint and recipe as the candidate
+baseline: one epoch, soft CE, `b77/train.jsonl` plus its synthetic stage-2
+rows, calibration on `b77/calibration.jsonl`):
+
+TWO_STAGE_TABLE_PLACEHOLDER
+
+- TWO_STAGE_FINDINGS_PLACEHOLDER
+
+
 14 microbatches of the step-0 training subset (`td/prof.json` from
 `scripts/laya/prepare_laya_training_data.sh`), median step after two warm-up
 steps, ReleaseFast.
