@@ -33,6 +33,52 @@ physical compilation matrix passed on frozen source with every original
 cache and relink assertion intact (cold, warm, read/write coordination,
 physical DB/local query, owner test, consumer root, and shared contract).
 
+## 2026-09-25: PR #889 zig-base runner preemption
+
+[Job 108307916600](https://github.com/antflydb/antfly/actions/runs/36207700839/job/108307916600)
+ended during hermetic unit tests with exit code 130 and an Actions runner
+shutdown signal. No test assertion or unit watchdog fired before shutdown.
+Kubernetes events for `arc-antfly-heavy-q8vlq-runner-4f668` record scheduler
+preemption at 2026-09-26 01:48:37 UTC by higher-priority Pod
+`74c343d5-64c3-4ece-a8eb-5e2476f60e95`, followed by a memory-pressure eviction
+at 01:48:49 UTC on node `gk3-antfly-ci-pool-2-3a7329dc-9rzj`.
+ARC recorded the container's SIGTERM exit (143) and removed the failed runner.
+
+This interruption is independent of the qualification timeout below. The
+companion Colony infrastructure change requests GKE Autopilot extended duration
+for both heavy runner profiles, allowing GKE to provision system capacity first
+and defer automatic upgrades/scale-down. It requires an infrastructure rollout
+before a rerun can validate the policy. System-priority preemption and node
+memory pressure remain possible; increasing test timeouts or retrying individual
+tests would not fix runner provisioning.
+
+## 2026-09-25: VOPR qualification audit failure and cold-build timeout
+
+[PR CI run 36189107289](https://github.com/antflydb/antfly/actions/runs/36189107289)
+cancelled the VOPR `qualify` job at its 120-minute limit. The same job had
+already failed the determinism audit because a teardown diagnostic printed a
+raw pointer from `full_cluster.zig`. The earlier
+[run 36173392068](https://github.com/antflydb/antfly/actions/runs/36173392068)
+reported that audit failure after completing qualification in 99 minutes.
+Its build summary shows the physical secret backend root taking 44 minutes
+to compile in ReleaseSafe; the regular `zig-base` lane already runs that
+target. The restore-admission replay itself took 25 seconds in that run.
+
+The teardown diagnostic now prints only stable sender and shutdown state.
+Qualification runs the small audit first and replaces the broad secrets
+target with the focused secret lifecycle VOPR replay. This keeps the VOPR
+transport, runtime, restore-admission, and secret lifecycle targets in
+qualification. The runner logs do not expose which compilation was still
+active when the later job timed out, so the
+duplicate work is the documented cost source, not a proven explanation for
+every minute of that particular timeout.
+
+PR CI dispatches its reusable workflow from `main` and checks out the PR
+revision inside the job. Therefore a PR edit to the workflow's inline
+qualification command would not run before merge. The workflow now calls a
+qualification script from the checked-out revision. A branch workflow
+dispatch can use `qualification_only` to validate workflow edits before merge.
+
 ## 2026-09-23: executable chunk embeddings and transient rewrite owner routing
 
 [PR #868 CI run 35937420037](https://github.com/antflydb/antfly/actions/runs/35937420037)
