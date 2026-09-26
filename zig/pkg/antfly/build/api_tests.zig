@@ -1890,7 +1890,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const replica_retirement_batch_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-replica-retirement-batch-tests",
         .root_module = api_table_writes_docid_test_mod,
-        .filters = &.{"replica retirement journal batches preserve every group phase"},
+        .filters = &.{
+            "replica retirement journal batches preserve every group phase",
+            "private initial child retirement requires canceled local publication",
+        },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-replica-retirement-batch-test", "Run the durable replica-retirement batch decoder regression").dependOn(&replica_retirement_batch_tests.run(b).step);

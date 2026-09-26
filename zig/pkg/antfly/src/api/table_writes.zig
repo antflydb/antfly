@@ -1424,6 +1424,10 @@ fn requireInitialChildRetirementRecord(
     };
     if (value.phase != .released and proof == null) return error.InitialFkRetirementTicketRequired;
     if (proof) |expected| {
+        // The plan identity alone cannot advance a still-hidden owner into
+        // retirement. Its local Raft publication must have durably accepted
+        // the cancellation before the physical cleanup can start.
+        if (value.phase != .canceled) return error.InitialChildPublicationChanged;
         if (value.namespace.table_id != expected.child_table_id or
             !std.mem.eql(u8, &value.plan_id, &expected.plan_id) or
             !std.mem.eql(u8, &value.plan_digest, &expected.plan_digest))
@@ -1431,7 +1435,7 @@ fn requireInitialChildRetirementRecord(
     }
 }
 
-test "private initial child retirement requires explicit proof until publication" {
+fn testPrivateInitialChildRetirementProof() !void {
     const Record = @import("../storage/db/relational_initial_child_publication.zig").Record;
     var record: Record = .{
         .phase = .hidden,
@@ -1447,10 +1451,17 @@ test "private initial child retirement requires explicit proof until publication
         .provision_index = 3,
     };
     try std.testing.expectError(error.InitialFkRetirementTicketRequired, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, null));
+    const proof: InitialFkRetirementProof = .{
+        .child_table_id = 7,
+        .plan_id = record.plan_id,
+        .plan_digest = record.plan_digest,
+    };
+    try std.testing.expectError(error.InitialChildPublicationChanged, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, proof));
     record.phase = .canceled;
     record.phase_term = 2;
     record.phase_index = 4;
     try std.testing.expectError(error.InitialFkRetirementTicketRequired, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, null));
+    try requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, proof);
     try std.testing.expectError(error.InitialChildPublicationChanged, requireInitialChildRetirementRecord(.{ .record = record }, .{
         .child_table_id = 7,
         .plan_id = @splat(8),
@@ -1458,8 +1469,13 @@ test "private initial child retirement requires explicit proof until publication
     }));
     record.phase = .released;
     try requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, null);
+    try std.testing.expectError(error.InitialChildPublicationChanged, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, proof));
     try requireInitialChildRetirementRecord(.{}, null);
     try std.testing.expectError(error.InitialChildRetirementProofUnavailable, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4 }, null));
+}
+
+test "private initial child retirement requires explicit proof until publication" {
+    try testPrivateInitialChildRetirementProof();
 }
 
 fn initialFkRetirementProofsEqual(lhs: ?InitialFkRetirementProof, rhs: ?InitialFkRetirementProof) bool {
@@ -41151,6 +41167,10 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "private initial child retirement requires canceled local publication" {
+            try testPrivateInitialChildRetirementProof();
+        }
+
         test "range tracking activation uses a fenced owner-routed Raft command" {
             const Capture = struct {
                 calls: usize = 0,
