@@ -265,6 +265,43 @@ fn builderOwnerReadReady(alloc: std.mem.Allocator, metadata: *metadata_runtime.S
     defer catalog.deinit(alloc);
 }
 
+fn awaitRestartedLocalIntegrityCatalog(alloc: std.mem.Allocator, io: std.Io, data: *data_runtime.DataServer, physical_name: []const u8, group_id: u64) !void {
+    // Metadata table visibility does not prove the restarted local owner has
+    // reopened and caught up. Do not replay a mutation to test readiness.
+    const deadline = platform.time.monotonicNs() +| 20 * std.time.ns_per_s;
+    var last_error: ?anyerror = null;
+    while (platform.time.monotonicNs() < deadline) {
+        const request_deadline = @min(deadline, platform.time.monotonicNs() +| std.time.ns_per_s);
+        const response = data.read_source.source().lookupGroupLocal(alloc, group_id, physical_name, "", .{
+            .relational_integrity_catalog = true,
+            .execution_deadline_ns = request_deadline,
+        }, .read_index) catch |err| {
+            switch (err) {
+                error.StorageReadTemporarilyUnavailable,
+                error.StorageKernelOwnerUnavailable,
+                error.IntegrityCatalogUnavailable,
+                error.IntegrityTopologyBusy,
+                error.UnknownGroup,
+                error.NotLeader,
+                => {
+                    last_error = err;
+                    try io.sleep(.fromMilliseconds(20), .awake);
+                    continue;
+                },
+                else => return err,
+            }
+        };
+        if (response) |value| {
+            var ready = value;
+            ready.deinit(alloc);
+            return;
+        }
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+    std.debug.print("self-FK restarted local catalog timeout group={d} last_error={s} raft={any}\n", .{ group_id, if (last_error) |err| @errorName(err) else "none", raftStatus(data, group_id) });
+    return error.RestartedIntegrityCatalogNotReady;
+}
+
 fn printCompactRoute(alloc: std.mem.Allocator, label: []const u8, catalog: table_catalog.CatalogSource, table_name: []const u8, group_id: u64) void {
     const epoch = table_catalog.groupTopologyEpoch(alloc, catalog, table_name, group_id) catch |err| blk: {
         std.debug.print("self-FK compact route {s} group={d} epoch err={s}\n", .{ label, group_id, @errorName(err) });
@@ -1059,6 +1096,9 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
     var after_drop = try table(alloc, transport, &headers, restarted_base);
     defer after_drop.deinit(alloc);
     try std.testing.expect(!try hasSelfFk(alloc, after_drop));
+    const restarted_physical = try tableGroup(alloc, &metadata, table_id);
+    defer alloc.free(restarted_physical.name);
+    try awaitRestartedLocalIntegrityCatalog(alloc, io, &data, restarted_physical.name, restarted_physical.group_id);
     var released = try batchOnce(alloc, transport, &headers, restarted_base, "{\"deletes\":[\"p\"],\"sync_level\":\"full_text\"}");
     defer released.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), released.status);

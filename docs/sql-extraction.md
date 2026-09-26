@@ -833,7 +833,11 @@ These changes have focused regressions, not a passing mounted DROP proof.
 The diagnostic requires a direct-leader 409 at the active fence and checks
 authoritative absence of distinct probe keys after publication. The public
 self-FK guard remains enabled while the parent-stage failure and replica
-failover matrix are unresolved.
+failover matrix are unresolved. One bounded rerun completed ADD and DROP but
+reached the final post-restart delete before the cold owner had reopened; the
+fixture now waits for a local read-index integrity-catalog read before sending
+that mutation once. Another rerun stalled earlier at parent `stage`, so the
+new readiness gate has compiled but has not yet passed its mounted path.
 
 Initial MATCH PARTIAL support-index installation now reserves the parent
 descriptor, hidden child identity, locks, and durable work in one metadata
