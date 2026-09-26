@@ -40,6 +40,7 @@ const antflyTypeEnum = z.enum([
   "html",
   "numeric",
   "search_as_you_type",
+  "substring",
   "keyword",
   "datetime",
   "geopoint",

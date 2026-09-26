@@ -12,6 +12,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.enrichment_config import EnrichmentConfig
     from ..models.full_text_artifact_index_source import FullTextArtifactIndexSource
+    from ..models.text_analysis_config import TextAnalysisConfig
 
 
 T = TypeVar("T", bound="CreateFullTextIndexRequest")
@@ -37,6 +38,34 @@ class CreateFullTextIndexRequest:
         artifact_name (str | Unset): Single-source convenience form. Mutually exclusive with sources; normalized
             responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless
             deployments.
+        analysis_config (TextAnalysisConfig | Unset): Custom text analysis for a full-text index. Component maps are
+            keyed
+            by the name that analyzers and `field_analyzers` reference. Built-in
+            analyzers (`standard`, `simple`, `keyword`, `html`, `search_as_you_type`,
+            `substring`, and the language analyzers such as `german`) are always
+            available without declaring them.
+
+            Example: split camelCase identifiers and match them as substrings.
+
+            ```json
+            {
+              "analysis_config": {
+                "field_analyzers": {"symbol": "code"},
+                "token_filters": {
+                  "tails": {"type": "suffix", "config": {"min": 3, "max": 24}}
+                },
+                "analyzers": {
+                  "code": {
+                    "type": "custom",
+                    "config": {
+                      "tokenizer": "whitespace",
+                      "token_filters": ["camel_case", "unique", "tails"]
+                    }
+                  }
+                }
+              }
+            }
+            ```
     """
 
     type_: CreateFullTextIndexRequestType
@@ -47,6 +76,7 @@ class CreateFullTextIndexRequest:
     mem_only: bool | Unset = UNSET
     field: str | Unset = UNSET
     artifact_name: str | Unset = UNSET
+    analysis_config: TextAnalysisConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -76,6 +106,10 @@ class CreateFullTextIndexRequest:
 
         artifact_name = self.artifact_name
 
+        analysis_config: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.analysis_config, Unset):
+            analysis_config = self.analysis_config.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -97,6 +131,8 @@ class CreateFullTextIndexRequest:
             field_dict["field"] = field
         if artifact_name is not UNSET:
             field_dict["artifact_name"] = artifact_name
+        if analysis_config is not UNSET:
+            field_dict["analysis_config"] = analysis_config
 
         return field_dict
 
@@ -104,6 +140,7 @@ class CreateFullTextIndexRequest:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.enrichment_config import EnrichmentConfig
         from ..models.full_text_artifact_index_source import FullTextArtifactIndexSource
+        from ..models.text_analysis_config import TextAnalysisConfig
 
         d = dict(src_dict)
         type_ = CreateFullTextIndexRequestType(d.pop("type"))
@@ -136,6 +173,13 @@ class CreateFullTextIndexRequest:
 
         artifact_name = d.pop("artifact_name", UNSET)
 
+        _analysis_config = d.pop("analysis_config", UNSET)
+        analysis_config: TextAnalysisConfig | Unset
+        if isinstance(_analysis_config, Unset):
+            analysis_config = UNSET
+        else:
+            analysis_config = TextAnalysisConfig.from_dict(_analysis_config)
+
         create_full_text_index_request = cls(
             type_=type_,
             description=description,
@@ -145,6 +189,7 @@ class CreateFullTextIndexRequest:
             mem_only=mem_only,
             field=field,
             artifact_name=artifact_name,
+            analysis_config=analysis_config,
         )
 
         create_full_text_index_request.additional_properties = d

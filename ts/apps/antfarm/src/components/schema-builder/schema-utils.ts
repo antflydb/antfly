@@ -28,6 +28,7 @@ export const ANTFLY_TYPES: { value: AntflyType; label: string }[] = [
   { value: "link", label: "Link" },
   { value: "blob", label: "Blob" },
   { value: "search_as_you_type", label: "Search as You Type" },
+  { value: "substring", label: "Substring" },
 ];
 
 export const ANTFLY_TYPE_VALUES: AntflyType[] = ANTFLY_TYPES.map((t) => t.value);
