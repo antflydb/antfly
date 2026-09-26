@@ -63,6 +63,23 @@ pub const UnaryConsumeOp = enum {
 };
 
 pub const BackendKind = backend_contracts.BackendKind;
+
+/// Attention in which query `i` may see key `k` only when `k` lies in one of
+/// its three half-open ranges `ranges[i*6 .. i*6+6]` (`start, end` pairs;
+/// empty when equal) and, unless `window == maxInt(u32)`, the logical
+/// distance `|query_positions[i] - key_positions[k]|` is at most `window`.
+/// Tree-packed rows (pipelines/laya_tree.zig) use it instead of a dense
+/// `[L, L]` mask, so work is proportional to the keys each query can see.
+pub const SegmentAttention = struct {
+    ranges: []const u32,
+    query_positions: []const i32,
+    key_positions: []const i32,
+    window: u32 = std.math.maxInt(u32),
+    queries: usize,
+    keys: usize,
+    num_heads: usize,
+    head_dim: usize,
+};
 pub const GraphDType = ml.graph.DType;
 pub const OperatorPlan = operator_plan.OperatorPlan;
 
@@ -2216,6 +2233,9 @@ pub const ComputeBackend = struct {
         /// to scaledDotProductAttention with an all-ones mask, but lets
         /// backends avoid a host mask allocation/upload.
         scaledDotProductAttentionFull: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT = null,
+        /// Segment-masked attention for tree-packed sequences; see
+        /// `SegmentAttention`. Null declines to the host implementation.
+        segmentAttention: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, request: *const SegmentAttention) anyerror!?CT = null,
 
         /// Causal self-attention for decoder layers.
         /// Q,K,V: [batch*seq_len, num_heads*head_dim].
@@ -2432,6 +2452,13 @@ pub const ComputeBackend = struct {
         residentTrainingNorm: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.NormInput, limits: resident_training.NormLimits, control: ?InferenceExecutionControl) anyerror!resident_training.NormSummary = null,
         residentTrainingValidate: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.ValidationInput, limits: resident_training.ValidationLimits, control: ?InferenceExecutionControl) anyerror!resident_training.ValidationSummary = null,
         residentTrainingInstruction: ?*const fn (ctx: *anyopaque, instruction: *const resident_program.Instruction, inputs: []const CT, limits: resident_program.Limits, control: ?InferenceExecutionControl) anyerror!CT = null,
+        /// Open a command batch owned by one resident training transaction.
+        /// Resident operations then encode into it instead of each submitting
+        /// and waiting; reductions that read results back synchronize it.
+        /// Returns false when the backend has no batching.
+        residentTrainingBeginBatch: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        /// Submit and wait for (commit) or discard (cancel) the open batch.
+        residentTrainingEndBatch: ?*const fn (ctx: *anyopaque, commit: bool) anyerror!void = null,
 
         /// Copy a tensor from another backend instance into this backend
         /// without host materialization when the two backends are compatible.
@@ -4002,6 +4029,22 @@ pub const ComputeBackend = struct {
         return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
     }
 
+    /// Token-major `Q [queries, heads*head_dim]` attending to `K`/`V`
+    /// `[keys, heads*head_dim]` through per-query key ranges (see
+    /// `SegmentAttention`). Returns token-major `[queries, heads*head_dim]`.
+    pub fn segmentAttention(self: *const ComputeBackend, allocator: std.mem.Allocator, Q: CT, K: CT, V: CT, request: *const SegmentAttention) !CT {
+        if (self.vtable.segmentAttention) |f| if (try f(self.ptr, Q, K, V, request)) |out| return out;
+        const q = try self.toFloat32(Q, allocator);
+        defer allocator.free(q);
+        const k = try self.toFloat32(K, allocator);
+        defer allocator.free(k);
+        const v = try self.toFloat32(V, allocator);
+        defer allocator.free(v);
+        const out = try @import("inference_linalg").segmentAttentionHost(allocator, q, k, v, request.ranges, request.query_positions, request.key_positions, request.window, request.queries, request.keys, request.num_heads, request.head_dim);
+        defer allocator.free(out);
+        return self.fromFloat32Shape(out, &.{ @intCast(request.queries), @intCast(request.num_heads * request.head_dim) });
+    }
+
     pub fn scaledDotProductAttentionFull(self: *const ComputeBackend, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
         if (self.vtable.scaledDotProductAttentionFull) |f| {
             return f(self.ptr, Q, K, V, attn_bias, batch, seq_len, num_heads, head_dim);
@@ -4481,6 +4524,16 @@ pub const ComputeBackend = struct {
         errdefer self.free(result);
         try self.checkExecutionControl();
         return result;
+    }
+
+    pub fn residentTrainingBeginBatch(self: *const ComputeBackend) !bool {
+        const op = self.vtable.residentTrainingBeginBatch orelse return false;
+        return op(self.ptr);
+    }
+
+    pub fn residentTrainingEndBatch(self: *const ComputeBackend, commit: bool) !void {
+        const op = self.vtable.residentTrainingEndBatch orelse return;
+        return op(self.ptr, commit);
     }
 
     pub fn copyTensorFromBackend(self: *const ComputeBackend, src_backend: *const ComputeBackend, src_tensor: CT) !?CT {

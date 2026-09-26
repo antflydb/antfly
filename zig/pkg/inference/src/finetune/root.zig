@@ -14,6 +14,7 @@
 
 pub const lora = @import("lora.zig");
 pub const laya_job = @import("laya/job.zig");
+pub const laya_evaluate = @import("laya/evaluate.zig");
 pub const command_registry = @import("command_registry.zig");
 pub const peft = @import("peft.zig");
 pub const graph_bridge = @import("graph_bridge.zig");

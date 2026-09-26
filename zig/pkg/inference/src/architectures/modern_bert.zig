@@ -290,6 +290,123 @@ pub fn forwardCT(
     batch: usize,
     seq_len: usize,
 ) !CT {
+    return forwardImpl(cb, allocator, config, input_ids, attention_mask, batch, seq_len, null, null, null);
+}
+
+/// One tree-packed row (see pipelines/laya_tree.zig), attended through
+/// `ComputeBackend.segmentAttention` instead of a dense mask. `positions`
+/// and `ranges` (three key ranges per row, `[rows * 6]`) cover the rows this
+/// forward computes; `key_positions` covers every key of the row. Local
+/// layers add the sliding window in logical positions.
+pub const Packed = struct {
+    positions: []const i64,
+    ranges: []const u32,
+    key_positions: []const i32,
+};
+
+/// Encode one tree-packed row. The result is `[seq_len, hidden]`.
+pub fn forwardPackedCT(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    packed_row: Packed,
+) !CT {
+    const seq_len = input_ids.len;
+    if (seq_len == 0 or packed_row.positions.len != seq_len) return error.InvalidInputShape;
+    for (packed_row.positions) |p| if (p < 0 or p >= config.max_position_embeddings) return error.InvalidInputShape;
+    const mask = try allocator.alloc(i64, seq_len);
+    defer allocator.free(mask);
+    @memset(mask, 1);
+    return forwardImpl(cb, allocator, config, input_ids, mask, 1, seq_len, packed_row, null, null);
+}
+
+/// Cached trunk rows for a branch-only packed forward: per encoder layer,
+/// the trunk keys (after RoPE) and values, each `[prefix_rows, hidden]`.
+pub const Branches = struct {
+    prefix_rows: usize,
+    keys: []const CT,
+    values: []const CT,
+};
+
+/// Per encoder layer keys (after RoPE) and values. Either host copies,
+/// `[tokens * hidden]` each, or dense `[tokens, hidden]` backend tensors
+/// that the caller owns (`key_tensors`/`value_tensors`, one slot per layer).
+pub const Capture = struct {
+    keys: []const []f32 = &.{},
+    values: []const []f32 = &.{},
+    key_tensors: []?CT = &.{},
+    value_tensors: []?CT = &.{},
+
+    fn layers(self: Capture) usize {
+        return @max(self.keys.len, self.key_tensors.len);
+    }
+};
+
+/// Encode only the branch tokens of a packed row whose trunk occupies rows
+/// `0..prefix_rows` with positions `0..prefix_rows-1`. `packed_row.positions`
+/// covers the branch tokens; its masks cover the whole row. The result is
+/// `[branch tokens, hidden]` and equals those rows of `forwardPackedCT`.
+pub fn forwardBranchesCT(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    branch_ids: []const i64,
+    packed_row: Packed,
+    branches: Branches,
+) !CT {
+    const rows = branch_ids.len;
+    if (rows == 0 or packed_row.positions.len != rows or branches.keys.len != config.num_hidden_layers or branches.values.len != config.num_hidden_layers) return error.InvalidInputShape;
+    for (packed_row.positions) |p| if (p < 0 or p >= config.max_position_embeddings) return error.InvalidInputShape;
+    const seq_len = branches.prefix_rows + rows;
+    const mask = try allocator.alloc(i64, seq_len);
+    defer allocator.free(mask);
+    @memset(mask, 1);
+    return forwardImpl(cb, allocator, config, branch_ids, mask, 1, seq_len, packed_row, branches, null);
+}
+
+/// The unpacked encoder forward, also copying each layer's keys (after RoPE)
+/// and values to `capture`. Used to fill the packed-trunk cache.
+pub fn forwardCapturingCT(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    capture: Capture,
+) !CT {
+    if (capture.layers() != config.num_hidden_layers or @max(capture.values.len, capture.value_tensors.len) != config.num_hidden_layers) return error.InvalidInputShape;
+    const n = input_ids.len;
+    const mask = try allocator.alloc(i64, n);
+    defer allocator.free(mask);
+    @memset(mask, 1);
+    // Run as a one-segment packed row so captured keys use the same RoPE op
+    // and layout as the branch forward that later reads them.
+    const positions = try allocator.alloc(i64, n);
+    defer allocator.free(positions);
+    const key_positions = try allocator.alloc(i32, n);
+    defer allocator.free(key_positions);
+    const ranges = try allocator.alloc(u32, 6 * n);
+    defer allocator.free(ranges);
+    for (positions, key_positions, 0..) |*p, *k, i| {
+        p.* = @intCast(i);
+        k.* = @intCast(i);
+        ranges[6 * i ..][0..6].* = .{ 0, @intCast(n), 0, 0, 0, 0 };
+    }
+    return forwardImpl(cb, allocator, config, input_ids, mask, 1, n, .{ .positions = positions, .ranges = ranges, .key_positions = key_positions }, null, capture);
+}
+
+fn forwardImpl(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+    packed_row: ?Packed,
+    branches: ?Branches,
+    capture: ?Capture,
+) !CT {
     const zero_bias: ?CT = if (config.checkpoint_layout == .huggingface_fused_qkv_no_bias)
         try makeZeroBias(cb, allocator, config.hidden_size)
     else
@@ -309,7 +426,9 @@ pub fn forwardCT(
     // does not submit and wait after every projection.  The frame is owned
     // only here; callers that already compose a frame retain control.
     var encoder_frame_active = false;
-    if (cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
+    // Interleaved packed RoPE and trunk capture read back to the host, so
+    // those forwards run unframed.
+    if ((packed_row == null or !config.rope_interleaved) and capture == null and cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
         encoder_frame_active = try cb.decoderRuntimeBeginFrame();
     }
     errdefer if (encoder_frame_active) cb.decoderRuntimeCancelFrame() catch {};
@@ -317,7 +436,7 @@ pub fn forwardCT(
     // 1. Token embeddings + embedding LayerNorm.
     //    ModernBERT has no absolute position embeddings; RoPE is applied in each
     //    attention layer instead.
-    var hidden = try embeddingsBlock(cb, config, zero_bias, input_ids, batch * seq_len);
+    var hidden = try embeddingsBlock(cb, config, zero_bias, input_ids, input_ids.len);
     errdefer cb.free(hidden);
 
     // 2. Encoder layers
@@ -334,6 +453,9 @@ pub fn forwardCT(
             layer_idx,
             zero_bias,
             resident_slots,
+            packed_row,
+            branches,
+            capture,
         );
         cb.free(hidden);
         hidden = new_hidden;
@@ -411,12 +533,18 @@ fn encoderLayer(
     layer_idx: usize,
     zero_bias: ?CT,
     resident_slots: bool,
+    packed_row: ?Packed,
+    branches: ?Branches,
+    capture: ?Capture,
 ) !CT {
     const H: usize = @intCast(config.hidden_size);
     const num_heads: usize = @intCast(config.num_attention_heads);
     const head_dim = H / num_heads;
     const intermediate: usize = @intCast(config.intermediate_size);
-    const total = batch * seq_len;
+    // A branch-only forward projects just the branch rows; attention still
+    // spans the cached trunk rows that precede them.
+    const prefix_rows: usize = if (branches) |b| b.prefix_rows else 0;
+    const total = batch * seq_len - prefix_rows;
 
     // Layers 0, 3, 6, … use full (global) attention; all others are local.
     const is_global = (layer_idx % @as(usize, @intCast(config.global_attn_every_n_layers))) == 0;
@@ -457,12 +585,27 @@ fn encoderLayer(
     // Apply RoPE to Q and K. HuggingFace ModernBERT's `rotate_half` uses
     // split-half rotation; the legacy checkpoint retains interleaved pairs.
     // rope_dim == head_dim: the full head dimension is rotated.
-    const Q = try cb.rope(qkv.q, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
+    const Q = if (packed_row) |row|
+        try ropeAtPositions(cb, allocator, qkv.q, row.positions, num_heads, head_dim, rope_theta, config.rope_interleaved)
+    else
+        try cb.rope(qkv.q, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(Q);
-    const K = try cb.rope(qkv.k, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
+    const K = if (packed_row) |row|
+        try ropeAtPositions(cb, allocator, qkv.k, row.positions, num_heads, head_dim, rope_theta, config.rope_interleaved)
+    else
+        try cb.rope(qkv.k, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(K);
 
-    const attn_out = if (!is_global and cb.kind() == .cuda)
+    if (capture) |c| try captureLayer(cb, allocator, c.keys, c.values, c.key_tensors, c.value_tensors, layer_idx, K, qkv.v, total, H);
+    var joined: [2]?CT = .{ null, null };
+    defer for (joined) |tensor| if (tensor) |t| cb.free(t);
+    if (branches) |b| {
+        joined[0] = try joinRows(cb, allocator, b.keys[layer_idx], prefix_rows, K, total, H);
+        joined[1] = try joinRows(cb, allocator, b.values[layer_idx], prefix_rows, qkv.v, total, H);
+    }
+    const attn_out = if (packed_row) |row|
+        try packedAttention(cb, allocator, Q, joined[0] orelse K, joined[1] orelse qkv.v, row, if (is_global) std.math.maxInt(u32) else config.local_attention_window / 2, total, seq_len, num_heads, head_dim)
+    else if (!is_global and cb.kind() == .cuda)
         (try cb.encoderLocalAttention(Q, K, qkv.v, attention_mask, batch, seq_len, num_heads, head_dim, config.local_attention_window / 2)) orelse return error.UnsupportedLayaBackend
     else fallback: {
         // For local layers build a sliding-window additive attention bias.
@@ -733,6 +876,121 @@ fn geGluFfn(
         hidden_size,
         wo_slot,
     );
+}
+
+/// Segment-masked attention for `queries` packed rows over all `keys`.
+pub fn packedAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, q: CT, k: CT, v: CT, row: Packed, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize) !CT {
+    if (row.positions.len != queries or row.ranges.len != queries * 6 or row.key_positions.len != keys) return error.InvalidInputShape;
+    const query_positions = try allocator.alloc(i32, queries);
+    defer allocator.free(query_positions);
+    for (query_positions, row.positions) |*dst, p| dst.* = @intCast(p);
+    return cb.segmentAttention(allocator, q, k, v, &.{
+        .ranges = row.ranges,
+        .query_positions = query_positions,
+        .key_positions = row.key_positions,
+        .window = window,
+        .queries = queries,
+        .keys = keys,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+    });
+}
+
+/// Rows `prefix..seq` of a token-major `[seq, width]` activation.
+///
+/// On Metal, row joins and slices are last-dimension ops on a flattened
+/// `[1, rows * width]` view, which run in the ordered decode stream. Metal's
+/// axis-0 concat blits outside that stream and read stale inputs while
+/// earlier work was still queued. Other backends execute eagerly and use the
+/// row gather and axis-0 concat directly.
+pub fn branchRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, prefix: usize, seq: usize, width: usize) !CT {
+    if (cb.kind() != .metal) {
+        const ids = try allocator.alloc(i64, seq - prefix);
+        defer allocator.free(ids);
+        for (ids, prefix..) |*id, row| id.* = @intCast(row);
+        return cb.embeddingLookup(input, ids, ids.len, width);
+    }
+    const flat = try reshape(cb, allocator, input, &.{ 1, @intCast(seq * width) });
+    defer cb.free(flat);
+    const tail = try cb.sliceLastDim(flat, prefix * width, seq * width);
+    defer cb.free(tail);
+    return reshape(cb, allocator, tail, &.{ @intCast(seq - prefix), @intCast(width) });
+}
+
+/// `[a_rows + b_rows, width]` from `[a_rows, width]` and `[b_rows, width]`.
+pub fn joinRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, a: CT, a_rows: usize, b: CT, b_rows: usize, width: usize) !CT {
+    if (cb.kind() != .metal) {
+        return cb.primConcatPrim(a, b, 0, &.{ @intCast(a_rows), @intCast(width) }, &.{ @intCast(b_rows), @intCast(width) });
+    }
+    const left = try reshape(cb, allocator, a, &.{ 1, @intCast(a_rows * width) });
+    defer cb.free(left);
+    const right = try reshape(cb, allocator, b, &.{ 1, @intCast(b_rows * width) });
+    defer cb.free(right);
+    const joined = try cb.concat(left, right, 1, a_rows * width, b_rows * width);
+    defer cb.free(joined);
+    return reshape(cb, allocator, joined, &.{ @intCast(a_rows + b_rows), @intCast(width) });
+}
+
+/// Store one layer's keys and values as host copies or as dense tensors.
+pub fn captureLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, host_keys: []const []f32, host_values: []const []f32, key_tensors: []?CT, value_tensors: []?CT, layer: usize, keys: CT, values: CT, rows: usize, width: usize) !void {
+    if (key_tensors.len > 0) {
+        const shape = [_]i32{ @intCast(rows), @intCast(width) };
+        key_tensors[layer] = try reshape(cb, allocator, keys, &shape);
+        value_tensors[layer] = try reshape(cb, allocator, values, &shape);
+        return;
+    }
+    for ([_]CT{ keys, values }, [_][]f32{ host_keys[layer], host_values[layer] }) |tensor, dst| {
+        const host = try cb.toFloat32(tensor, allocator);
+        defer allocator.free(host);
+        if (host.len != dst.len) return error.InvalidInputShape;
+        @memcpy(dst, host);
+    }
+}
+
+/// A new handle with a different logical shape over the same elements.
+/// Tensors a backend cannot alias (host-backed or strided views) are
+/// materialized through the host, which is ordered but synchronizes.
+pub fn reshape(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, shape: []const i32) !CT {
+    if (try cb.cloneTensorShape(input, shape)) |view| return view;
+    const values = try cb.toFloat32(input, allocator);
+    defer allocator.free(values);
+    return cb.fromFloat32Shape(values, shape);
+}
+
+/// RoPE at explicit per-token positions for a token-major `[tokens, heads *
+/// head_dim]` projection. Packed rows restart positions at every branch, which
+/// the contiguous `rope` op cannot express. The rotation matches `rope` for
+/// positions 0..n-1 (see the packed-encoder degenerate-tree test).
+///
+/// Split-half rotation is M-RoPE with every frequency pair on the first axis,
+/// so device backends that implement `mrope` rotate in place; others use the
+/// host rotation.
+fn ropeAtPositions(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    input: CT,
+    positions: []const i64,
+    num_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    interleaved: bool,
+) !CT {
+    if (!interleaved) {
+        const axes = try allocator.alloc(u32, 3 * positions.len);
+        defer allocator.free(axes);
+        for (0..3) |axis| for (positions, axes[axis * positions.len ..][0..positions.len]) |p, *dst| {
+            dst.* = @intCast(p);
+        };
+        if (try cb.mrope(input, positions.len, head_dim, theta, 1.0, axes, .{ @intCast(head_dim / 2), 0, 0 })) |rotated| return rotated;
+    }
+    const values = try cb.toFloat32(input, allocator);
+    defer allocator.free(values);
+    if (values.len != positions.len * num_heads * head_dim) return error.InvalidRoPEInput;
+    const chunks = try allocator.alloc(usize, positions.len * num_heads);
+    defer allocator.free(chunks);
+    for (chunks, 0..) |*chunk, i| chunk.* = @intCast(positions[i / num_heads]);
+    native_compute.ropeCore(values, chunks, head_dim, head_dim, theta, 1.0, interleaved);
+    return cb.fromFloat32Shape(values, &[_]i32{ @intCast(positions.len), @intCast(num_heads * head_dim) });
 }
 
 // ---------------------------------------------------------------------------

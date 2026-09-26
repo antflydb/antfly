@@ -572,6 +572,145 @@ pub fn flashAttentionHost(
     return output;
 }
 
+/// Segment-masked attention for tree-packed sequences.
+///
+/// `Q` is token-major `[queries, heads * head_dim]`; `K` and `V` are
+/// `[keys, heads * head_dim]`. Query `i` may attend to a key `k` only when `k`
+/// lies in one of its three half-open ranges `ranges[i*6 .. i*6+6]`
+/// (`start, end` pairs; empty ranges have `start == end`) and, unless
+/// `window` is `maxInt(u32)`, `|query_positions[i] - key_positions[k]| <=
+/// window`. Work is proportional to the visible keys: key chunks outside
+/// every range of a 64-query block are skipped. Rows with no visible key are
+/// zero. Returns token-major `[queries, heads * head_dim]`.
+pub fn segmentAttentionHost(
+    allocator: std.mem.Allocator,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    ranges: []const u32,
+    query_positions: []const i32,
+    key_positions: []const i32,
+    window: u32,
+    queries: usize,
+    keys: usize,
+    num_heads: usize,
+    head_dim: usize,
+) ![]f32 {
+    if (num_heads == 0 or head_dim == 0 or queries == 0 or keys == 0) return error.InvalidAttentionShape;
+    const H = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
+    if (Q.len != queries * H or K.len != keys * H or V.len != keys * H or ranges.len != queries * 6 or
+        query_positions.len != queries or key_positions.len != keys) return error.InvalidAttentionShape;
+    for (ranges) |bound| if (bound > keys) return error.InvalidAttentionShape;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const output = try allocator.alloc(f32, queries * H);
+    errdefer allocator.free(output);
+    const qh = try allocator.alloc(f32, queries * head_dim);
+    defer allocator.free(qh);
+    const kh = try allocator.alloc(f32, keys * head_dim);
+    defer allocator.free(kh);
+    const vh = try allocator.alloc(f32, keys * head_dim);
+    defer allocator.free(vh);
+    const oh = try allocator.alloc(f32, queries * head_dim);
+    defer allocator.free(oh);
+    const score_tile = try allocator.alloc(f32, BLOCK_Q * BLOCK_KV);
+    defer allocator.free(score_tile);
+    var row_max: [BLOCK_Q]f32 = undefined;
+    var row_sum: [BLOCK_Q]f32 = undefined;
+    var intervals: [BLOCK_Q * 3][2]u32 = undefined;
+
+    for (0..num_heads) |h| {
+        for (0..queries) |i| @memcpy(qh[i * head_dim ..][0..head_dim], Q[i * H + h * head_dim ..][0..head_dim]);
+        for (0..keys) |k| {
+            @memcpy(kh[k * head_dim ..][0..head_dim], K[k * H + h * head_dim ..][0..head_dim]);
+            @memcpy(vh[k * head_dim ..][0..head_dim], V[k * H + h * head_dim ..][0..head_dim]);
+        }
+        @memset(oh, 0);
+        var q_start: usize = 0;
+        while (q_start < queries) : (q_start += BLOCK_Q) {
+            const cur_bq = @min(BLOCK_Q, queries - q_start);
+            for (0..cur_bq) |r| {
+                row_max[r] = -std.math.inf(f32);
+                row_sum[r] = 0;
+            }
+            // Union of the block's ranges as sorted, disjoint intervals.
+            var count: usize = 0;
+            for (0..cur_bq) |r| for (0..3) |j| {
+                const lo = ranges[(q_start + r) * 6 + 2 * j];
+                const hi = ranges[(q_start + r) * 6 + 2 * j + 1];
+                if (lo < hi) {
+                    intervals[count] = .{ lo, hi };
+                    count += 1;
+                }
+            };
+            std.mem.sort([2]u32, intervals[0..count], {}, struct {
+                fn less(_: void, a: [2]u32, b: [2]u32) bool {
+                    return a[0] < b[0];
+                }
+            }.less);
+            var merged: usize = 0;
+            for (intervals[0..count]) |interval| {
+                if (merged > 0 and interval[0] <= intervals[merged - 1][1]) {
+                    intervals[merged - 1][1] = @max(intervals[merged - 1][1], interval[1]);
+                } else {
+                    intervals[merged] = interval;
+                    merged += 1;
+                }
+            }
+            const q_block = qh[q_start * head_dim ..][0 .. cur_bq * head_dim];
+            const out_block = oh[q_start * head_dim ..][0 .. cur_bq * head_dim];
+            for (intervals[0..merged]) |interval| {
+                var kv_start: usize = interval[0];
+                while (kv_start < interval[1]) {
+                    const kv_end = @min(kv_start + BLOCK_KV, interval[1]);
+                    const cur_bkv = kv_end - kv_start;
+                    const tile = score_tile[0 .. cur_bq * cur_bkv];
+                    gemm.sgemmTransBSequential(cur_bq, cur_bkv, head_dim, scale, q_block, kh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 0.0, tile);
+                    for (0..cur_bq) |r| {
+                        const qi = q_start + r;
+                        const own = ranges[qi * 6 ..][0..6];
+                        const qp = query_positions[qi];
+                        const row = tile[r * cur_bkv ..][0..cur_bkv];
+                        for (row, kv_start..) |*score, k| {
+                            const in_range = (k >= own[0] and k < own[1]) or (k >= own[2] and k < own[3]) or (k >= own[4] and k < own[5]);
+                            const near = window == std.math.maxInt(u32) or @abs(@as(i64, qp) - key_positions[k]) <= window;
+                            if (!in_range or !near) score.* = -std.math.inf(f32);
+                        }
+                        var block_max: f32 = -std.math.inf(f32);
+                        for (row) |score| block_max = @max(block_max, score);
+                        const new_max = @max(row_max[r], block_max);
+                        if (new_max == -std.math.inf(f32)) {
+                            @memset(row, 0);
+                            continue;
+                        }
+                        if (row_sum[r] != 0) {
+                            const rescale = @exp(row_max[r] - new_max);
+                            if (rescale != 1.0) {
+                                for (out_block[r * head_dim ..][0..head_dim]) |*o| o.* *= rescale;
+                                row_sum[r] *= rescale;
+                            }
+                        }
+                        row_sum[r] += primitives.expSubtractAndSum(row, new_max);
+                        row_max[r] = new_max;
+                    }
+                    gemm.sgemmSequential(cur_bq, head_dim, cur_bkv, 1.0, tile, vh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 1.0, out_block);
+                    kv_start = kv_end;
+                }
+            }
+            for (0..cur_bq) |r| {
+                const out_row = out_block[r * head_dim ..][0..head_dim];
+                if (row_sum[r] == 0) {
+                    @memset(out_row, 0);
+                    continue;
+                }
+                const inv = 1.0 / row_sum[r];
+                for (out_row) |*o| o.* *= inv;
+            }
+        }
+        for (0..queries) |i| @memcpy(output[i * H + h * head_dim ..][0..head_dim], oh[i * head_dim ..][0..head_dim]);
+    }
+    return output;
+}
+
 pub fn crossAttentionHost(
     allocator: std.mem.Allocator,
     Q: []const f32,
@@ -1636,4 +1775,68 @@ test "debertaDisentangledAttentionHost threaded path matches scalar reference" {
     defer allocator.free(got);
 
     for (ref, got) |a, b| try std.testing.expect(@abs(a - b) < 1e-5);
+}
+
+test "segmentAttentionHost matches dense masked softmax with ranges, window, and fewer queries" {
+    const a = std.testing.allocator;
+    const heads = 2;
+    const hd = 8;
+    const keys = 300;
+    const queries = 70;
+    const H = heads * hd;
+    var prng = std.Random.DefaultPrng.init(91);
+    const r = prng.random();
+    const Q = try a.alloc(f32, queries * H);
+    defer a.free(Q);
+    const K = try a.alloc(f32, keys * H);
+    defer a.free(K);
+    const V = try a.alloc(f32, keys * H);
+    defer a.free(V);
+    for (Q) |*x| x.* = r.floatNorm(f32);
+    for (K) |*x| x.* = r.floatNorm(f32);
+    for (V) |*x| x.* = r.floatNorm(f32);
+    // Queries are the last 70 keys; each sees a trunk [0, 100), its own
+    // block of 10 keys, and (every third query) one more range.
+    const ranges = try a.alloc(u32, queries * 6);
+    defer a.free(ranges);
+    const qpos = try a.alloc(i32, queries);
+    defer a.free(qpos);
+    const kpos = try a.alloc(i32, keys);
+    defer a.free(kpos);
+    for (kpos, 0..) |*p, k| p.* = @intCast(if (k < 100) k else 100 + (k - 100) % 25);
+    for (0..queries) |i| {
+        const key = 230 + i;
+        const own: u32 = @intCast(230 + (i / 10) * 10);
+        ranges[i * 6 ..][0..6].* = .{ 0, 100, own, own + 10, if (i % 3 == 0) 150 else 0, if (i % 3 == 0) 160 else 0 };
+        qpos[i] = kpos[key];
+    }
+    for ([_]u32{ std.math.maxInt(u32), 40 }) |window| {
+        const got = try segmentAttentionHost(a, Q, K, V, ranges, qpos, kpos, window, queries, keys, heads, hd);
+        defer a.free(got);
+        var worst: f32 = 0;
+        for (0..queries) |i| for (0..heads) |h| {
+            var scores: [keys]f32 = undefined;
+            var best: f32 = -std.math.inf(f32);
+            for (0..keys) |k| {
+                const own = ranges[i * 6 ..][0..6];
+                const visible = ((k >= own[0] and k < own[1]) or (k >= own[2] and k < own[3]) or (k >= own[4] and k < own[5])) and
+                    (window == std.math.maxInt(u32) or @abs(@as(i64, qpos[i]) - kpos[k]) <= window);
+                var dot: f32 = 0;
+                for (0..hd) |d| dot += Q[i * H + h * hd + d] * K[k * H + h * hd + d];
+                scores[k] = if (visible) dot / @sqrt(@as(f32, hd)) else -std.math.inf(f32);
+                best = @max(best, scores[k]);
+            }
+            var sum: f32 = 0;
+            for (&scores) |*s| {
+                s.* = if (s.* == -std.math.inf(f32)) 0 else @exp(s.* - best);
+                sum += s.*;
+            }
+            for (0..hd) |d| {
+                var want: f32 = 0;
+                for (0..keys) |k| want += scores[k] / sum * V[k * H + h * hd + d];
+                worst = @max(worst, @abs(want - got[i * H + h * hd + d]));
+            }
+        };
+        try std.testing.expect(worst < 1e-5);
+    }
 }

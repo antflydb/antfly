@@ -338,6 +338,7 @@ pub const t5RelativePositionBucket = attention.t5RelativePositionBucket;
 pub const ropeCore = attention.ropeCore;
 pub const flashCausalAttentionHost = attention.flashCausalAttentionHost;
 pub const flashAttentionHost = attention.flashAttentionHost;
+pub const segmentAttentionHost = attention.segmentAttentionHost;
 pub const crossAttentionHost = attention.crossAttentionHost;
 pub const debertaDisentangledAttentionHost = attention.debertaDisentangledAttentionHost;
 pub const WindowPack = layout.WindowPack;

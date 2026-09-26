@@ -105,7 +105,8 @@ fn parseQuestion(a: std.mem.Allocator, value: Value) !pipeline.Question {
     const mode = if (obj.get("mode")) |v| try string(v) else "single";
     const kind: @import("../models/laya.zig").QuestionType = if (std.mem.eql(u8, mode, "single")) .choice else if (std.mem.eql(u8, mode, "ordinal")) .score else if (std.mem.eql(u8, mode, "boolean")) .noul else return error.UnsupportedExtractionFeature;
     const raw_labels = try required(obj, "labels");
-    if (raw_labels != .array or raw_labels.array.items.len < 2 or raw_labels.array.items.len > 20) return error.InvalidLayaQuestion;
+    // The model enforces its own option limit (20, or 255 with candidate packing).
+    if (raw_labels != .array or raw_labels.array.items.len < 2 or raw_labels.array.items.len > @import("../models/laya.zig").max_packed_options) return error.InvalidLayaQuestion;
     const labels = try a.alloc([]const u8, raw_labels.array.items.len);
     const descriptions = try a.alloc([]const u8, labels.len);
     const definitions = if (obj.get("label_definitions")) |v| try object(v) else Object.empty;
