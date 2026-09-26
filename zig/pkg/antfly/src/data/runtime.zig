@@ -22016,29 +22016,22 @@ pub const DataServer = struct {
         const registration = self.store_registration orelse return;
         self.last_provision_head_check_at_ms = self.backgroundMonotonicMs();
 
-        const head = remote_metadata.fetchHead() catch |err| {
+        const initial_head = remote_metadata.fetchHead() catch |err| {
             if (@import("builtin").is_test) std.log.warn("provisioned root phase=head err={s}", .{@errorName(err)});
             return err;
         };
-        if (!self.private_provisioning_active and self.last_provision_metadata_epoch == head.metadata_epoch and self.last_provision_fingerprint != null) {
+        if (!self.private_provisioning_active and self.last_provision_metadata_epoch == initial_head.metadata_epoch and self.last_provision_fingerprint != null) {
             if (comptime @import("builtin").is_test) _ = self.provisioned_root_probe_same_head.fetchAdd(1, .monotonic);
             return;
         }
-
-        var snapshot = remote_metadata.fetchSnapshotForHead(head) catch |err| {
-            if (@import("builtin").is_test) std.log.warn("provisioned root phase=public_snapshot err={s}", .{@errorName(err)});
+        var pair = remote_metadata.fetchProvisionedRootPair(registration.node_id) catch |err| {
+            if (@import("builtin").is_test) std.log.warn("provisioned root phase=paired_snapshot err={s}", .{@errorName(err)});
             return err;
         };
-        defer freeAdminSnapshotOwned(self.alloc, &snapshot);
-
-        var private_snapshot: ?std.json.Parsed(@import("../metadata/restore_staging.zig").ProvisioningSnapshot) = remote_metadata.fetchProvisioningSnapshotForHead(head, registration.node_id) catch |err| switch (err) {
-            error.UnsupportedOperation => null,
-            else => {
-                if (@import("builtin").is_test) std.log.warn("provisioned root phase=private_snapshot err={s}", .{@errorName(err)});
-                return err;
-            },
-        };
-        defer if (private_snapshot) |*value| value.deinit();
+        defer pair.deinit(self.alloc);
+        const head = pair.head;
+        const snapshot = pair.snapshot;
+        const private_snapshot = pair.private_snapshot;
         var proof_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer proof_arena.deinit();
         const hidden = if (private_snapshot) |value| try @import("private_provisioning.zig").validate(proof_arena.allocator(), snapshot.tables, snapshot.ranges, value.value.catalog) else &.{};
@@ -23118,6 +23111,39 @@ const ControlReadGeneration = struct {
         return try alloc.dupe(u8, self.nodes.get(node_id) orelse return null);
     }
 };
+
+/// Re-pair the complete public/private observation after a metadata mutation.
+/// A private projection from a newer head must never be combined with the
+/// earlier public snapshot. Fetchers own each candidate until it is accepted.
+fn fetchProvisionedRootPairWith(comptime Fetcher: type, fetcher: *Fetcher, budget: antfly.metadata_http_client.RequestBudget) !Fetcher.Pair {
+    for (0..3) |_| {
+        try RemoteMetadataSource.ensureBudgetActive(budget);
+        const before = try fetcher.fetchHead(budget);
+        var public_snapshot = fetcher.fetchPublic(before, budget) catch |err| {
+            if (err != error.MetadataSnapshotHeadMismatch) return err;
+            fetcher.invalidate();
+            continue;
+        };
+        var public_owned = true;
+        defer if (public_owned) fetcher.freePublic(&public_snapshot);
+        var private_snapshot = fetcher.fetchPrivate(before, budget) catch |err| {
+            if (err != error.MetadataSnapshotHeadMismatch) return err;
+            fetcher.invalidate();
+            continue;
+        };
+        var private_owned = true;
+        defer if (private_owned) fetcher.freePrivate(&private_snapshot);
+        const after = try fetcher.fetchHead(budget);
+        if (!std.meta.eql(before, after)) {
+            fetcher.invalidate();
+            continue;
+        }
+        public_owned = false;
+        private_owned = false;
+        return .{ .head = before, .snapshot = public_snapshot, .private_snapshot = private_snapshot };
+    }
+    return error.MetadataSnapshotHeadMismatch;
+}
 
 const RemoteMetadataSource = struct {
     const RoutingProtocol = enum {
@@ -24514,11 +24540,16 @@ const RemoteMetadataSource = struct {
     }
 
     fn fetchProvisioningSnapshotForHead(self: *RemoteMetadataSource, expected: antfly.metadata_api.MetadataHead, node_id: u64) !std.json.Parsed(@import("../metadata/restore_staging.zig").ProvisioningSnapshot) {
+        return self.fetchProvisioningSnapshotForHeadWithBudget(expected, node_id, .{ .deadline_ns = self.awakeNs() +| remote_metadata_snapshot_timeout_ns, .io = self.io });
+    }
+
+    fn fetchProvisioningSnapshotForHeadWithBudget(self: *RemoteMetadataSource, expected: antfly.metadata_api.MetadataHead, node_id: u64, budget: antfly.metadata_http_client.RequestBudget) !std.json.Parsed(@import("../metadata/restore_staging.zig").ProvisioningSnapshot) {
         var last_err: anyerror = error.MissingMetadataApi;
         for (0..self.base_uris.len) |attempt| {
-            const index = self.metadataReadApiIndexForAttempt(attempt);
+            try ensureBudgetActive(budget);
+            const index = try self.metadataReadApiIndexForAttemptWithBudget(attempt, budget);
             var client = self.metadataClient(self.alloc);
-            var parsed = client.fetchProvisioningSnapshot(self.base_uris[index], node_id, .{ .deadline_ns = self.awakeNs() +| remote_metadata_snapshot_timeout_ns, .io = self.io }) catch |err| {
+            var parsed = client.fetchProvisioningSnapshot(self.base_uris[index], node_id, budget) catch |err| {
                 if (err == error.UnsupportedOperation) return err;
                 last_err = err;
                 continue;
@@ -24532,6 +24563,51 @@ const RemoteMetadataSource = struct {
             return parsed;
         }
         return last_err;
+    }
+
+    const ProvisionedRootPair = struct {
+        head: antfly.metadata_api.MetadataHead,
+        snapshot: antfly.metadata_api.AdminSnapshot,
+        private_snapshot: ?std.json.Parsed(@import("../metadata/restore_staging.zig").ProvisioningSnapshot),
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            freeAdminSnapshotOwned(alloc, &self.snapshot);
+            if (self.private_snapshot) |*value| value.deinit();
+        }
+    };
+
+    fn fetchProvisionedRootPair(self: *RemoteMetadataSource, node_id: u64) !ProvisionedRootPair {
+        const Capture = struct {
+            remote: *RemoteMetadataSource,
+            node_id: u64,
+            const Pair = ProvisionedRootPair;
+
+            fn fetchHead(ctx: *@This(), budget: antfly.metadata_http_client.RequestBudget) !antfly.metadata_api.MetadataHead {
+                // Bypass the one-second head cache when re-pairing a moving
+                // catalog. Both endpoints still perform authoritative reads.
+                return ctx.remote.fetchRemoteHead(budget);
+            }
+            fn fetchPublic(ctx: *@This(), head: antfly.metadata_api.MetadataHead, budget: antfly.metadata_http_client.RequestBudget) !antfly.metadata_api.AdminSnapshot {
+                return ctx.remote.fetchSnapshotForHeadWithBudget(head, budget);
+            }
+            fn fetchPrivate(ctx: *@This(), head: antfly.metadata_api.MetadataHead, budget: antfly.metadata_http_client.RequestBudget) !?std.json.Parsed(@import("../metadata/restore_staging.zig").ProvisioningSnapshot) {
+                return ctx.remote.fetchProvisioningSnapshotForHeadWithBudget(head, ctx.node_id, budget) catch |err| switch (err) {
+                    error.UnsupportedOperation => null,
+                    else => return err,
+                };
+            }
+            fn freePublic(ctx: *@This(), snapshot: *antfly.metadata_api.AdminSnapshot) void {
+                freeAdminSnapshotOwned(ctx.remote.alloc, snapshot);
+            }
+            fn freePrivate(_: *@This(), snapshot: *?std.json.Parsed(@import("../metadata/restore_staging.zig").ProvisioningSnapshot)) void {
+                if (snapshot.*) |*value| value.deinit();
+            }
+            fn invalidate(ctx: *@This()) void {
+                ctx.remote.invalidateCache();
+            }
+        };
+        var capture: Capture = .{ .remote = self, .node_id = node_id };
+        return fetchProvisionedRootPairWith(Capture, &capture, .{ .deadline_ns = self.awakeNs() +| remote_metadata_snapshot_timeout_ns, .io = self.io });
     }
 
     fn fetchSnapshotRemoteWithBudget(
@@ -43015,6 +43091,48 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "provisioned root re-pairs a changed metadata head without publishing mixed snapshots" {
+            const Fake = struct {
+                const Pair = struct { head: u64, snapshot: u64, private_snapshot: ?u64 };
+                mode: enum { private_changed, head_changed },
+                head_calls: usize = 0,
+                public_calls: usize = 0,
+                private_calls: usize = 0,
+                invalidations: usize = 0,
+                freed_public: usize = 0,
+                freed_private: usize = 0,
+
+                fn fetchHead(self: *@This(), _: antfly.metadata_http_client.RequestBudget) !u64 {
+                    self.head_calls += 1;
+                    return if (self.head_calls == 1) 1 else 2;
+                }
+                fn fetchPublic(self: *@This(), head: u64, _: antfly.metadata_http_client.RequestBudget) !u64 {
+                    self.public_calls += 1;
+                    return head;
+                }
+                fn fetchPrivate(self: *@This(), head: u64, _: antfly.metadata_http_client.RequestBudget) !?u64 {
+                    self.private_calls += 1;
+                    if (self.mode == .private_changed and head == 1) return error.MetadataSnapshotHeadMismatch;
+                    return head;
+                }
+                fn freePublic(self: *@This(), _: *u64) void { self.freed_public += 1; }
+                fn freePrivate(self: *@This(), _: *?u64) void { self.freed_private += 1; }
+                fn invalidate(self: *@This()) void { self.invalidations += 1; }
+            };
+            for ([_]Fake{ .{ .mode = .private_changed }, .{ .mode = .head_changed } }) |initial| {
+                var fake = initial;
+                const result = try fetchProvisionedRootPairWith(Fake, &fake, .{ .deadline_ns = std.math.maxInt(u64) });
+                try std.testing.expectEqual(@as(u64, 2), result.head);
+                try std.testing.expectEqual(result.head, result.snapshot);
+                try std.testing.expectEqual(result.head, result.private_snapshot.?);
+                try std.testing.expectEqual(@as(usize, 1), fake.invalidations);
+                try std.testing.expectEqual(@as(usize, 1), fake.freed_public);
+                try std.testing.expectEqual(@as(usize, if (initial.mode == .head_changed) 1 else 0), fake.freed_private);
+                try std.testing.expectEqual(@as(usize, 2), fake.public_calls);
+                try std.testing.expectEqual(@as(usize, 2), fake.private_calls);
+            }
+        }
+
         test "pure topology control bypasses only ordinary dense repair writer preflight" {
             const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
             const fence: topology.Fence = .{
