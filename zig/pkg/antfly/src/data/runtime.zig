@@ -16609,6 +16609,10 @@ pub const DataServer = struct {
     fn handleStoreStatusReportError(self: *DataServer, err: anyerror) !void {
         switch (err) {
             error.StoreReportBaselinePending, error.StoreReportRepairRequired => {},
+            // A completed future can wake its waiter before Threaded releases
+            // the reserved worker slot. Retain the queued report and retry on
+            // the next control round instead of terminating the data process.
+            error.ConcurrencyUnavailable => self.markStoreStatusDirtyImmediate(),
             // Split runtime can briefly observe placement before the
             // local replica root is fully provisioned on disk.
             error.LsmRootWriterAlreadyOpen,
@@ -30513,6 +30517,24 @@ fn consumerTests() type {
                 observations: std.atomic.Value(usize) = .init(0),
                 reject_next: std.atomic.Value(bool) = .init(false),
                 cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation = null,
+                fn dispatch(server: *DataServer, kind: StoreStatusReportKind) !void {
+                    const deadline = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+                    while (true) {
+                        try server.reportStoreStatusForControl(kind);
+                        if (server.store_report_worker_future != null) return;
+                        if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+                        platform_time.sleepNs(std.time.ns_per_ms);
+                    }
+                }
+                fn fullRound(server: *DataServer) !void {
+                    const deadline = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+                    while (true) {
+                        try server.runStoreStatusRoundOnly();
+                        if (server.store_report_worker_future != null) return;
+                        if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+                        platform_time.sleepNs(std.time.ns_per_ms);
+                    }
+                }
                 fn observe(ptr: *anyopaque) !resource_manager_mod.CapacityObservation {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     _ = self.observations.fetchAdd(1, .monotonic);
@@ -30574,7 +30596,32 @@ fn consumerTests() type {
                 server.remote_metadata = null;
                 server.deinit();
             }
-            try std.testing.expectError(error.StoreReportBaselinePending, server.reportStoreStatus());
+            // Force the same admission denial as the completed-future handoff
+            // race, without depending on the scheduler's timing.
+            const worker_io = try server.ensureBackgroundWorkerIo(.store_report);
+            var unblock: std.Io.Event = .unset;
+            const Blocker = struct {
+                fn run(io: std.Io, event: *std.Io.Event) void {
+                    event.waitUncancelable(io);
+                }
+            };
+            var blocker = try worker_io.concurrent(Blocker.run, .{ worker_io, &unblock });
+            {
+                defer {
+                    unblock.set(worker_io);
+                    blocker.await(worker_io);
+                }
+                try server.reportStoreStatusForControl(.full);
+                try server.reportStoreStatusForControl(.heartbeat);
+                try std.testing.expect(server.store_report_worker_future == null);
+                try std.testing.expect(server.store_report_collection != null);
+                try std.testing.expectEqual(DataServer.StoreReportWorkState.ready, server.store_report_work_state.load(.acquire));
+                try std.testing.expect(!server.store_report_worker_active.load(.acquire));
+                try std.testing.expect(server.store_status_dirty.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 0), fake.observations.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 0), fake.writes.load(.acquire));
+            }
+            try Fake.dispatch(&server, .full);
             const deadline = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
             while (!fake.entered.load(.acquire) and platform_time.monotonicNs() < deadline) platform_time.sleepNs(std.time.ns_per_ms);
             try std.testing.expect(fake.entered.load(.acquire));
@@ -30595,7 +30642,7 @@ fn consumerTests() type {
             try std.testing.expect(server.store_report_collection == null);
             try std.testing.expect(server.store_status_dirty.load(.acquire));
             server.store_report_update_retry_at_ms = 0;
-            try server.runStoreStatusRoundOnly();
+            try Fake.fullRound(&server);
             try std.testing.expectEqual(@as(usize, 1), fake.writes.load(.acquire));
             try std.testing.expect(!server.store_status_dirty.load(.acquire));
             // Normal clustered scheduling dispatches a cached Raft refresh
@@ -30603,14 +30650,14 @@ fn consumerTests() type {
             const observations = fake.observations.load(.acquire);
             const kind = chooseStoreStatusReportKind(store_status_report_interval_ticks, false, 42, false, false, true);
             try std.testing.expectEqual(StoreStatusReportKind.heartbeat, kind);
-            try server.reportStoreStatusForControl(kind);
+            try Fake.dispatch(&server, kind);
             server.store_report_worker_future.?.await(server.store_report_worker_lease.?.io());
             try std.testing.expectEqual(observations, fake.observations.load(.acquire));
             try std.testing.expectEqual(@as(u16, 0), server.store_report_failure.load(.acquire));
             // A rejected retained base is handled by the worker and consumed
             // by the exact dispatch/error path used by the control loop.
             fake.reject_next.store(true, .release);
-            try server.reportStoreStatusForControl(.heartbeat);
+            try Fake.dispatch(&server, .heartbeat);
             server.store_report_worker_future.?.await(server.store_report_worker_lease.?.io());
             try std.testing.expect(server.store_report_publisher.cursor == null);
             try std.testing.expectEqual(@intFromError(error.StoreReportRepairRequired), server.store_report_failure.load(.acquire));
@@ -30618,7 +30665,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u16, 0), server.store_report_failure.load(.acquire));
             try std.testing.expect(server.store_status_dirty.load(.acquire));
             server.store_report_update_retry_at_ms = 0;
-            try server.runStoreStatusRoundOnly();
+            try Fake.fullRound(&server);
             try std.testing.expect(server.store_report_publisher.cursor != null);
             try std.testing.expect(fake.observations.load(.acquire) > observations);
             // A transient read failure while collecting the next inventory
@@ -30629,22 +30676,23 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u16, 0), server.store_report_failure.load(.acquire));
             try std.testing.expect(server.store_status_dirty.load(.acquire));
             server.store_report_update_retry_at_ms = 0;
-            try server.runStoreStatusRoundOnly();
+            try Fake.fullRound(&server);
             try std.testing.expect(server.store_report_publisher.cursor != null);
             // Ownership invalidation before a queued heartbeat requires repair,
             // never publication of the cached generation or a fatal control error.
             server.invalidateLocalGroupStatusCache();
-            try server.reportStoreStatusForControl(.heartbeat);
+            try Fake.dispatch(&server, .heartbeat);
             server.store_report_worker_future.?.await(server.store_report_worker_lease.?.io());
             try server.reportStoreStatusForControl(.full);
             server.store_report_update_retry_at_ms = 0;
-            try server.runStoreStatusRoundOnly();
+            try Fake.fullRound(&server);
             const writes_before_cancel = fake.writes.load(.acquire);
             // Cancellation also joins a first collection, before a baseline exists.
             fake.entered.store(false, .release);
             fake.release.store(false, .release);
-            try std.testing.expectError(error.StoreReportBaselinePending, server.reportStoreStatus());
-            while (!fake.entered.load(.acquire) and platform_time.monotonicNs() < deadline) platform_time.sleepNs(std.time.ns_per_ms);
+            try Fake.dispatch(&server, .full);
+            const cancel_deadline = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+            while (!fake.entered.load(.acquire) and platform_time.monotonicNs() < cancel_deadline) platform_time.sleepNs(std.time.ns_per_ms);
             try std.testing.expect(fake.entered.load(.acquire));
             server.stopStoreReportWorker();
             try std.testing.expect(server.store_report_collection == null);

@@ -671,6 +671,8 @@ from .hierarchy_match_hit import HierarchyMatchHit
 from .hierarchy_match_hit_source import HierarchyMatchHitSource
 from .hierarchy_matches import HierarchyMatches
 from .hierarchy_projection import HierarchyProjection
+from .highlight_fragment import HighlightFragment
+from .highlight_span import HighlightSpan
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
@@ -1003,10 +1005,12 @@ from .query_filter_error_error import QueryFilterErrorError
 from .query_filter_error_field import QueryFilterErrorField
 from .query_filter_error_status import QueryFilterErrorStatus
 from .query_hierarchy import QueryHierarchy
+from .query_highlight import QueryHighlight
 from .query_hit import QueryHit
 from .query_hit_hierarchy import QueryHitHierarchy
 from .query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
 from .query_hit_hierarchy_level import QueryHitHierarchyLevel
+from .query_hit_highlights import QueryHitHighlights
 from .query_hit_index_scores import QueryHitIndexScores
 from .query_hit_source import QueryHitSource
 from .query_hits import QueryHits
@@ -1240,6 +1244,16 @@ from .template_field_mapping import TemplateFieldMapping
 from .template_field_mapping_missing_null_policy import TemplateFieldMappingMissingNullPolicy
 from .term_query import TermQuery
 from .term_range_query import TermRangeQuery
+from .text_analysis_component import TextAnalysisComponent
+from .text_analysis_component_config import TextAnalysisComponentConfig
+from .text_analysis_config import TextAnalysisConfig
+from .text_analysis_config_analyzers import TextAnalysisConfigAnalyzers
+from .text_analysis_config_char_filters import TextAnalysisConfigCharFilters
+from .text_analysis_config_date_time_parsers import TextAnalysisConfigDateTimeParsers
+from .text_analysis_config_field_analyzers import TextAnalysisConfigFieldAnalyzers
+from .text_analysis_config_field_date_time_parsers import TextAnalysisConfigFieldDateTimeParsers
+from .text_analysis_config_token_filters import TextAnalysisConfigTokenFilters
+from .text_analysis_config_tokenizers import TextAnalysisConfigTokenizers
 from .text_chunk_options import TextChunkOptions
 from .text_content_part import TextContentPart
 from .text_content_part_type import TextContentPartType
@@ -1986,6 +2000,8 @@ __all__ = (
     "HierarchyMatchHit",
     "HierarchyMatchHitSource",
     "HierarchyProjection",
+    "HighlightFragment",
+    "HighlightSpan",
     "ImageURL",
     "ImageURLContentPart",
     "ImageURLContentPartType",
@@ -2314,10 +2330,12 @@ __all__ = (
     "QueryFilterErrorField",
     "QueryFilterErrorStatus",
     "QueryHierarchy",
+    "QueryHighlight",
     "QueryHit",
     "QueryHitHierarchy",
     "QueryHitHierarchyAncestors",
     "QueryHitHierarchyLevel",
+    "QueryHitHighlights",
     "QueryHitIndexScores",
     "QueryHits",
     "QueryHitSource",
@@ -2551,6 +2569,16 @@ __all__ = (
     "TemplateFieldMappingMissingNullPolicy",
     "TermQuery",
     "TermRangeQuery",
+    "TextAnalysisComponent",
+    "TextAnalysisComponentConfig",
+    "TextAnalysisConfig",
+    "TextAnalysisConfigAnalyzers",
+    "TextAnalysisConfigCharFilters",
+    "TextAnalysisConfigDateTimeParsers",
+    "TextAnalysisConfigFieldAnalyzers",
+    "TextAnalysisConfigFieldDateTimeParsers",
+    "TextAnalysisConfigTokenFilters",
+    "TextAnalysisConfigTokenizers",
     "TextChunkOptions",
     "TextContentPart",
     "TextContentPartType",
