@@ -7088,6 +7088,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 );
                 return self.boundaryOwnedTensor(output);
             },
+            .fused_modernbert_training_attention_v1, .fused_modernbert_training_attention_backward_v1 => |attrs| {
+                const backward = instruction.op == .fused_modernbert_training_attention_backward_v1;
+                return self.modernBertTrainingAttention(tensors[0], inputs[1], if (backward) tensors[2] else null, attrs, control);
+            },
             .reshape, .stop_gradient, .convert_dtype => return self.residentTrainingReshape(inputs[0], shape, limits.primitive, false),
             .gather => {
                 const source = instruction.inputs[0];
@@ -7192,6 +7196,37 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .num_inputs = 4,
         };
         return residentTrainingInstructionOp(ctx, &instruction, &.{ qkv, relative, control_i32, d_out }, .{}, control);
+    }
+
+    /// ModernBERT training attention on device. The control's retained host
+    /// copy (every physical i32 upload keeps one) proves each range stays
+    /// inside its row before a kernel reads it. Unlike the strict resident
+    /// instructions this may join an active command frame (Laya's framed
+    /// trainer); the output view keeps the kernel scratch alive.
+    fn modernBertTrainingAttention(self: *MetalCompute, qkv: MetalTensor, control_ct: CT, d_out: ?MetalTensor, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) !CT {
+        if (control) |active| try active.check();
+        const control_buf = toBuf(control_ct);
+        const storage = control_buf.resident_index_storage orelse return error.UnsupportedResidentTrainingIndexProof;
+        _ = try @import("modernbert_training_attention.zig").validateControl(attrs, storage.values);
+        const control_tensor = control_buf.metal_tensor orelse return error.ResidentTrainingRequiresDeviceTensor;
+        const output = try metal_runtime.decoderRuntimeModernBertTrainingAttentionV1Device(self.provider_impl, qkv, control_tensor, d_out, attrs, control);
+        return self.boundaryOwnedTensor(output);
+    }
+
+    fn modernBertTrainingAttentionV1Op(ctx: *anyopaque, qkv_ct: CT, control_i32: CT, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
+        defer qkv.deinit();
+        return self.modernBertTrainingAttention(qkv, control_i32, null, attrs, control);
+    }
+
+    fn modernBertTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv_ct: CT, control_i32: CT, d_out_ct: CT, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
+        defer qkv.deinit();
+        var d_out = try self.ownedDeviceMetalTensorFromCt(d_out_ct);
+        defer d_out.deinit();
+        return self.modernBertTrainingAttention(qkv, control_i32, d_out, attrs, control);
     }
 
     fn residentTrainingPrimitiveOp(ctx: *anyopaque, request: *const ops.resident_training.Request, limits: ops.resident_training.Limits, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
@@ -30543,6 +30578,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // native hooks would cast this Metal context to NativeCompute.
         vt.debertaTrainingAttentionV1 = debertaTrainingAttentionV1Op;
         vt.debertaTrainingAttentionBackwardV1 = debertaTrainingAttentionBackwardV1Op;
+        vt.modernBertTrainingAttentionV1 = modernBertTrainingAttentionV1Op;
+        vt.modernBertTrainingAttentionBackwardV1 = modernBertTrainingAttentionBackwardV1Op;
         vt.causalSelfAttention = causalSelfAttentionOp;
         vt.crossAttention = crossAttentionOp;
         vt.logSoftmaxOp = logSoftmaxOp;

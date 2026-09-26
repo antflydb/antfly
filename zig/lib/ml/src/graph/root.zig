@@ -33,6 +33,7 @@ pub const NodeId = node.NodeId;
 pub const null_node = node.null_node;
 pub const OpCode = node.OpCode;
 pub const DebertaTrainingAttentionAttrs = node.DebertaTrainingAttentionAttrs;
+pub const ModernBertTrainingAttentionAttrs = node.ModernBertTrainingAttentionAttrs;
 pub const Graph = graph.Graph;
 pub const Builder = builder.Builder;
 
@@ -45,6 +46,7 @@ test {
     _ = lower;
     _ = autodiff;
     _ = @import("deberta_training_attention_test.zig");
+    _ = @import("modernbert_training_attention_test.zig");
     _ = grad_check;
     _ = optimizers;
     _ = lora;

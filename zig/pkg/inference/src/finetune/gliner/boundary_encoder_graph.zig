@@ -2,6 +2,9 @@
 //!
 //! The materialized reference retains quadratic attention masks. The explicit
 //! replay profile uses bounded tiles and compact integer controls instead.
+//! A ModernBERT encoder (`EncoderFamily.modern_bert`, the shared
+//! `modern_bert_trunk`) supports the materialized, retained profile without
+//! dropout; heads and routes are the same for both families.
 //! Admission is a caller-selected resource
 //! policy, not an architectural sequence-length limit. A training executor
 //! must additionally admit its backward graph, optimizer, and kernel scratch.
@@ -10,6 +13,8 @@ const std = @import("std");
 const ml = @import("ml");
 const boundary = @import("../../models/gliner_boundary.zig");
 const deberta = @import("../../architectures/deberta_graph.zig");
+const modern = @import("../../architectures/modern_bert.zig");
+const trunk = @import("../modern_bert_trunk.zig");
 const engine = @import("../../architectures/gliner/boundary_engine.zig");
 const processor = @import("../../pipelines/gliner_boundary_processor.zig");
 const Allocator = std.mem.Allocator;
@@ -68,10 +73,12 @@ pub const RouteKind = enum { text, queries, classifications, parents, relation_h
 pub const RouteInputs = struct { indices: NodeId = null_node, valid: NodeId = null_node, width: u32 };
 pub const Inputs = struct {
     input_ids: NodeId, // [B*S] i32, including multilingual vocabulary IDs
-    embedding_valid: NodeId, // [B*S,1] f32
-    attention_valid: NodeId, // [B*heads,S,S] f32
-    attention_bias: NodeId, // same shape, zero or -max(f32)
+    embedding_valid: NodeId, // [B*S,1] f32; DeBERTa only
+    attention_valid: NodeId, // [B*heads,S,S] f32; DeBERTa only
+    attention_bias: NodeId, // same shape, zero or -max(f32); ModernBERT: global layers
     attention_control: NodeId = null_node, // compact physical i32 replay profile
+    local_bias: NodeId = null_node, // ModernBERT local layers: key padding and sliding window
+    rope: [2][2]NodeId = .{ .{ null_node, null_node }, .{ null_node, null_node } }, // ModernBERT [global, local][cos, sin]
     routes: [6]RouteInputs,
 };
 pub const DropoutDescriptor = struct {
@@ -137,6 +144,8 @@ pub const Built = struct {
         try remapOne(&self.inputs.attention_valid, ids);
         try remapOne(&self.inputs.attention_bias, ids);
         try remapOne(&self.inputs.attention_control, ids);
+        try remapOne(&self.inputs.local_bias, ids);
+        for (&self.inputs.rope) |*pair| for (pair) |*id| try remapOne(id, ids);
         for (&self.inputs.routes) |*route| {
             try remapOne(&route.indices, ids);
             try remapOne(&route.valid, ids);
@@ -175,6 +184,7 @@ pub fn planWithProfiles(config: *const boundary.Config, layout: Layout, mode: Mo
     const e = config.encoder;
     if (config.version != boundary.config_version or config.architecture_version != boundary.architecture_version)
         return error.UnsupportedGlinerBoundaryVersion;
+    if (e.family == .modern_bert) return planModernBert(config, layout, mode, profile, activation, limits);
     if (layout.batch == 0 or layout.sequence == 0 or e.hidden_size == 0 or e.num_hidden_layers == 0 or
         e.num_attention_heads == 0 or e.hidden_size % e.num_attention_heads != 0 or e.intermediate_size == 0 or
         e.vocab_size == 0 or e.max_position_embeddings == 0 or e.position_buckets == 0 or
@@ -255,6 +265,108 @@ pub fn planWithProfiles(config: *const boundary.Config, layout: Layout, mode: Mo
     };
 }
 
+/// Training-graph config for a ModernBERT boundary encoder.
+pub fn modernConfig(e: boundary.EncoderConfig) modern.Config {
+    return .{
+        .vocab_size = e.vocab_size,
+        .hidden_size = e.hidden_size,
+        .num_hidden_layers = e.num_hidden_layers,
+        .num_attention_heads = e.num_attention_heads,
+        .intermediate_size = e.intermediate_size,
+        .max_position_embeddings = e.max_position_embeddings,
+        .global_rope_theta = e.global_rope_theta,
+        .local_rope_theta = e.local_rope_theta,
+        .global_attn_every_n_layers = e.global_attn_every_n_layers,
+        .local_attention_window = e.local_attention_window,
+        .layer_norm_eps = e.layer_norm_eps,
+        .rope_interleaved = false,
+        .checkpoint_layout = .huggingface_fused_qkv_no_bias,
+    };
+}
+
+fn planModernBert(config: *const boundary.Config, layout: Layout, mode: Mode, profile: AttentionProfile, activation: ActivationProfile, limits: Limits) !Plan {
+    const e = config.encoder;
+    // `replay_tiled_v1` selects the fused trunk attention, whose storage is
+    // linear in the sequence. Layer recomputation regions are DeBERTa-only.
+    if (activation != .retained_v1) return error.UnsupportedBoundaryEncoderProfile;
+    const fused = profile == .replay_tiled_v1;
+    // Dropout replay sites are not defined for the ModernBERT trunk yet.
+    if (mode == .train and (e.hidden_dropout_prob != 0 or e.attention_probs_dropout_prob != 0)) return error.UnsupportedBoundaryEncoderDropout;
+    const cfg = modernConfig(e);
+    trunk.validate(cfg, .{ .batch = layout.batch, .sequence = layout.sequence }) catch return error.InvalidGlinerBoundaryConfig;
+    if (e.num_hidden_layers == 0 or e.intermediate_size == 0 or e.vocab_size == 0 or e.max_position_embeddings == 0 or e.pad_token_id >= e.vocab_size)
+        return error.InvalidGlinerBoundaryConfig;
+    if (layout.batch > limits.input.max_batch or layout.sequence > limits.input.max_sequence_tokens or
+        layout.sequence > e.max_position_embeddings or
+        layout.words > limits.input.max_text_words or layout.queries > limits.input.max_queries or
+        layout.classifications > limits.input.max_classification_labels or layout.groups > limits.input.max_groups or
+        layout.relations > limits.input.max_relations)
+        return error.ResourceLimitExceeded;
+    const bs = try rows(layout.batch, layout.sequence);
+    const heads = e.num_attention_heads;
+    const half = e.hidden_size / heads / 2;
+    if (try mul(bs, e.hidden_size) > std.math.maxInt(i32) or try mul(bs, try mul(e.intermediate_size, 2)) > std.math.maxInt(i32) or
+        try mul(e.vocab_size, e.hidden_size) > std.math.maxInt(i32)) return error.ResourceLimitExceeded;
+    const full_scores = trunk.attentionScoreElements(cfg, .{ .batch = layout.batch, .sequence = layout.sequence });
+    // Only the materialized profile owns score tensors.
+    const scores: u64 = if (fused) 0 else full_scores;
+    if (scores > limits.max_attention_score_elements or scores > std.math.maxInt(i32)) return error.ResourceLimitExceeded;
+    const attention_work = try mul(try mul(full_scores, e.num_hidden_layers), if (fused and mode == .train) 3 else 1);
+    if (fused and attention_work > limits.input.max_attention_work_items) return error.ResourceLimitExceeded;
+    var routed_rows: u64 = 0;
+    for ([_]u32{ layout.words, layout.queries, layout.classifications, layout.groups, layout.relations, layout.relations }) |width|
+        routed_rows = try add(routed_rows, try rows(layout.batch, width));
+    const rope_elements = try mul(try mul(try mul(bs, heads), half), 4);
+    // Two bias planes (or the fused profile's i32 ranges and positions), four
+    // RoPE tables, token ids, and route indices and masks.
+    const mask_elements = if (fused) try mul(bs, 7) else try mul(scores, 2);
+    const binding_bytes = try mul(try add(try add(mask_elements, rope_elements), try add(bs, try mul(routed_rows, 2))), 4);
+    // Zero biases for the bias-free norms.
+    const constant_bytes = try add(4096, try mul(try mul(try add(try mul(e.num_hidden_layers, 2), 2), e.hidden_size), 4));
+    if (constant_bytes > limits.max_constant_bytes) return error.ResourceLimitExceeded;
+    const hidden = try mul(bs, e.hidden_size);
+    // Fused layers keep packed [Q;K;V] rows and per-row statistics instead.
+    const attention_bytes = if (fused) try add(try mul(hidden, 3), try mul(bs, heads)) else try mul(scores, 8);
+    const per_layer = try add(try add(attention_bytes, try mul(hidden, 32)), try mul(try mul(bs, e.intermediate_size), 8));
+    const forward_bytes = try add(try add(binding_bytes, constant_bytes), try mul(try add(try mul(e.num_hidden_layers, per_layer), try add(try mul(hidden, 4), try mul(routed_rows, e.hidden_size))), 4));
+    if (forward_bytes > limits.max_forward_tensor_bytes) return error.ResourceLimitExceeded;
+    const h = e.hidden_size;
+    // Wqkv, Wo, mlp.Wi (2*intermediate), mlp.Wo, and two norm weights per
+    // layer (layer 0 has no attn_norm); embeddings, embedding and final norms.
+    const layer_parameters = try add(try add(try mul(try mul(h, h), 4), try mul(try mul(h, e.intermediate_size), 3)), try mul(h, 2));
+    const parameters = try add(try mul(e.vocab_size, h), try add(try mul(h, 2), try mul(e.num_hidden_layers, layer_parameters)));
+    return .{
+        .attention_score_elements = scores,
+        .attention_work_items = attention_work,
+        .dropout_mask_bytes = 0,
+        .binding_bytes = binding_bytes,
+        .constant_bytes = constant_bytes,
+        .parameter_bytes = try mul(parameters, 4),
+        .forward_tensor_upper_bound_bytes = forward_bytes,
+    };
+}
+
+/// Builds the ModernBERT trunk (weights named as the checkpoint's stripped
+/// `encoder.` tensors) and fills one region per layer.
+fn buildModernEncoder(bld: *Builder, e: boundary.EncoderConfig, layout: Layout, inputs: Inputs, layers: []LayerRegion) !struct { output: NodeId, embedding_output: NodeId } {
+    var sites = trunk.Sites{ .prefix = "__gliner25.encoder" };
+    defer sites.deinit(bld.graph.allocator);
+    const fused = inputs.attention_control != null_node;
+    const output = try trunk.encoder(bld, &sites, modernConfig(e), .{ .batch = layout.batch, .sequence = layout.sequence }, .{
+        .ids = inputs.input_ids,
+        .encoder_bias = inputs.attention_bias,
+        .local_bias = inputs.local_bias,
+        .rope = inputs.rope,
+        .profile = if (fused) .fused_v1 else .materialized_v1,
+        .control = inputs.attention_control,
+    }, "");
+    // Traces: embedding norm, each layer's output, final norm.
+    const traces = sites.traces.items;
+    if (traces.len != layers.len + 2 or sites.dropouts.items.len != 0) return error.InvalidBoundaryEncoderRegion;
+    for (layers, 0..) |*region, i| region.* = .{ .ordinal = @intCast(i), .input = traces[i].node, .output = traces[i + 1].node };
+    return .{ .output = output, .embedding_output = traces[0].node };
+}
+
 pub fn layoutFromPrepared(config: *const boundary.Config, prepared: *const processor.PreparedBatch, limits: Limits) !Layout {
     const checked = try engine.plan(config, prepared, .{ .limits = limits.input });
     return .{
@@ -328,17 +440,33 @@ pub fn buildWithEmbeddingArithmetic(bld: *Builder, config: *const boundary.Confi
     if (arithmetic == .pytorch_fp32 and profile != .materialized_v1) return error.InvalidTrainingAttentionPlan;
     const admission = try planWithProfiles(config, layout, mode, profile, activation, limits);
     const e = config.encoder;
+    const modern_family = e.family == .modern_bert;
+    // The ModernBERT trunk has one attention arithmetic.
+    if (modern_family and arithmetic != .scale_after_sum) return error.InvalidTrainingAttentionPlan;
     const bs = try rows(layout.batch, layout.sequence);
     const bh = try rows(layout.batch, e.num_attention_heads);
     const score_shape = Shape.init(.f32, &.{ @intCast(bh), @intCast(layout.sequence), @intCast(layout.sequence) });
     var inputs = Inputs{
         .input_ids = try bld.parameter("__gliner25.encoder.input_ids", Shape.init(.i32, &.{@intCast(bs)})),
-        .embedding_valid = try bld.parameter("__gliner25.encoder.embedding_valid", Shape.init(.f32, &.{ @intCast(bs), 1 })),
-        .attention_valid = if (profile == .materialized_v1) try bld.parameter("__gliner25.encoder.attention_valid", score_shape) else null_node,
+        .embedding_valid = if (modern_family) null_node else try bld.parameter("__gliner25.encoder.embedding_valid", Shape.init(.f32, &.{ @intCast(bs), 1 })),
+        .attention_valid = if (profile == .materialized_v1 and !modern_family) try bld.parameter("__gliner25.encoder.attention_valid", score_shape) else null_node,
         .attention_bias = if (profile == .materialized_v1) try bld.parameter("__gliner25.encoder.attention_bias", score_shape) else null_node,
-        .attention_control = if (profile == .replay_tiled_v1) try bld.parameter("__gliner25.encoder.attention_control_v1", Shape.init(.i32, &.{@intCast(6 + @as(u64, bs) + @as(u64, layout.sequence) * 2 - 1)})) else null_node,
+        .attention_control = if (profile != .replay_tiled_v1)
+            null_node
+        else if (modern_family)
+            try bld.parameter("__gliner25.encoder.modernbert_attention_control_v1", trunk.controlShape(.{ .batch = layout.batch, .sequence = layout.sequence }))
+        else
+            try bld.parameter("__gliner25.encoder.attention_control_v1", Shape.init(.i32, &.{@intCast(6 + @as(u64, bs) + @as(u64, layout.sequence) * 2 - 1)})),
         .routes = undefined,
     };
+    if (modern_family) {
+        if (profile == .materialized_v1) inputs.local_bias = try bld.parameter("__gliner25.encoder.local_attention_bias", score_shape);
+        const table = Shape.init(.f32, &.{ @intCast(try mul(bs, e.num_attention_heads)), @intCast(e.hidden_size / e.num_attention_heads / 2) });
+        inputs.rope = .{
+            .{ try bld.parameter("__gliner25.encoder.rope_global_cos", table), try bld.parameter("__gliner25.encoder.rope_global_sin", table) },
+            .{ try bld.parameter("__gliner25.encoder.rope_local_cos", table), try bld.parameter("__gliner25.encoder.rope_local_sin", table) },
+        };
+    }
     const widths = [_]u32{ layout.words, layout.queries, layout.classifications, layout.groups, layout.relations, layout.relations };
     for (&inputs.routes, widths, 0..) |*route, width, index| {
         route.* = .{ .width = width };
@@ -354,32 +482,40 @@ pub fn buildWithEmbeddingArithmetic(bld: *Builder, config: *const boundary.Confi
     const layers = try bld.graph.allocator.alloc(LayerRegion, e.num_hidden_layers);
     errdefer bld.graph.allocator.free(layers);
     var regions = RegionBuilder{ .layers = layers };
-    const encoder = try deberta.buildForwardGraphWithOptions(bld, .{
-        .vocab_size = e.vocab_size,
-        .hidden_size = e.hidden_size,
-        .num_hidden_layers = e.num_hidden_layers,
-        .num_attention_heads = e.num_attention_heads,
-        .intermediate_size = e.intermediate_size,
-        .max_position_embeddings = e.max_position_embeddings,
-        .position_buckets = e.position_buckets,
-        .layer_norm_eps = e.layer_norm_eps,
-    }, inputs.input_ids, inputs.attention_bias, inputs.embedding_valid, layout.batch, layout.sequence, .{
-        .attention = if (profile == .materialized_v1) .materialized else .training_replay_v1,
-        .attention_arithmetic = arithmetic,
-        .word_embedding_backward = embedding_arithmetic,
-        .word_embedding_padding_index = if (embedding_arithmetic == .pytorch_embedding_v1) e.pad_token_id else null,
-        .attention_score_mask = if (profile == .materialized_v1) inputs.attention_valid else null,
-        .training_attention_v1 = if (profile == .replay_tiled_v1) .{ .control = inputs.attention_control, .probability = if (mode == .train) e.attention_probs_dropout_prob else 0 } else null,
-        .project_relative_before_gather = true,
-        .dropout = if (mode == .train) .{ .context = &dropout, .apply = DropoutBuilder.apply } else null,
-        .regions = .{ .context = &regions, .prelude = RegionBuilder.prelude, .layer = RegionBuilder.layer },
-    });
-    if (regions.count != layers.len or regions.normalized_relative == null_node or
-        layers[layers.len - 1].output != encoder.output_node) return error.InvalidBoundaryEncoderRegion;
+    const encoder_output = if (modern_family) modern_encoder: {
+        const built = try buildModernEncoder(bld, e, layout, inputs, layers);
+        regions.embedding_output = built.embedding_output;
+        regions.count = layers.len;
+        break :modern_encoder built.output;
+    } else deberta_encoder: {
+        const encoder = try deberta.buildForwardGraphWithOptions(bld, .{
+            .vocab_size = e.vocab_size,
+            .hidden_size = e.hidden_size,
+            .num_hidden_layers = e.num_hidden_layers,
+            .num_attention_heads = e.num_attention_heads,
+            .intermediate_size = e.intermediate_size,
+            .max_position_embeddings = e.max_position_embeddings,
+            .position_buckets = e.position_buckets,
+            .layer_norm_eps = e.layer_norm_eps,
+        }, inputs.input_ids, inputs.attention_bias, inputs.embedding_valid, layout.batch, layout.sequence, .{
+            .attention = if (profile == .materialized_v1) .materialized else .training_replay_v1,
+            .attention_arithmetic = arithmetic,
+            .word_embedding_backward = embedding_arithmetic,
+            .word_embedding_padding_index = if (embedding_arithmetic == .pytorch_embedding_v1) e.pad_token_id else null,
+            .attention_score_mask = if (profile == .materialized_v1) inputs.attention_valid else null,
+            .training_attention_v1 = if (profile == .replay_tiled_v1) .{ .control = inputs.attention_control, .probability = if (mode == .train) e.attention_probs_dropout_prob else 0 } else null,
+            .project_relative_before_gather = true,
+            .dropout = if (mode == .train) .{ .context = &dropout, .apply = DropoutBuilder.apply } else null,
+            .regions = .{ .context = &regions, .prelude = RegionBuilder.prelude, .layer = RegionBuilder.layer },
+        });
+        if (regions.count != layers.len or regions.normalized_relative == null_node or
+            layers[layers.len - 1].output != encoder.output_node) return error.InvalidBoundaryEncoderRegion;
+        break :deberta_encoder encoder.output_node;
+    };
     var routed: [6]NodeId = .{null_node} ** 6;
     for (inputs.routes, 0..) |route, index| {
         if (route.width == 0) continue;
-        const gathered = try bld.gather(encoder.output_node, route.indices, Shape.init(.f32, &.{ try rows(layout.batch, route.width), e.hidden_size }));
+        const gathered = try bld.gather(encoder_output, route.indices, Shape.init(.f32, &.{ try rows(layout.batch, route.width), e.hidden_size }));
         routed[index] = try bld.mul(gathered, route.valid);
     }
     const relations = if (layout.relations == 0) null_node else if (config.head.directional_relation_states)
@@ -398,9 +534,9 @@ pub fn buildWithEmbeddingArithmetic(bld: *Builder, config: *const boundary.Confi
         .limits = limits,
         .admission = admission,
         .inputs = inputs,
-        .nodes = .{ .encoder = encoder.output_node, .text = routed[0], .queries = routed[1], .classifications = routed[2], .parents = routed[3], .relation_queries = relations },
+        .nodes = .{ .encoder = encoder_output, .text = routed[0], .queries = routed[1], .classifications = routed[2], .parents = routed[3], .relation_queries = relations },
         .dropouts = try dropout.descriptors.toOwnedSlice(bld.graph.allocator),
-        .regions = .{ .embedding_output = regions.embedding_output, .normalized_relative = regions.normalized_relative, .layers = layers, .output = encoder.output_node },
+        .regions = .{ .embedding_output = regions.embedding_output, .normalized_relative = regions.normalized_relative, .layers = layers, .output = encoder_output },
     };
 }
 
@@ -453,6 +589,36 @@ fn bindRoute(a: Allocator, list: *std.ArrayListUnmanaged(Binding), node: RouteIn
     try list.append(a, .{ .node = node.valid, .shape = Shape.init(.f32, &.{ @intCast(count), 1 }), .values = .{ .f32 = valid } });
 }
 
+/// Key-padding and sliding-window masks and split-half RoPE tables for the
+/// ModernBERT trunk, for right-padded rows with positions 0..S-1 (as Hugging
+/// Face ModernBERT numbers them).
+fn bindModernEncoder(a: Allocator, list: *std.ArrayListUnmanaged(Binding), built: *const Built, config: *const boundary.Config, prepared: *const processor.PreparedBatch, layout: Layout) !void {
+    const cfg = modernConfig(config.encoder);
+    const bs = try rows(layout.batch, layout.sequence);
+    const sequence = layout.sequence;
+    const key_valid = try a.alloc(bool, bs);
+    for (prepared.attention_mask, key_valid) |valid, *out| out.* = valid != 0;
+    const trunk_layout = trunk.Layout{ .batch = layout.batch, .sequence = sequence };
+    if (built.attention_profile == .replay_tiled_v1) {
+        // The fused profile reads key ranges and positions; the window is per layer.
+        const control = try trunk.paddingControl(a, trunk_layout, key_valid);
+        try list.append(a, .{ .node = built.inputs.attention_control, .shape = trunk.controlShape(trunk_layout), .values = .{ .i32 = control } });
+    } else {
+        const biases = try trunk.paddingBiases(a, cfg, trunk_layout, key_valid);
+        const score_shape = Shape.init(.f32, &.{ @intCast(layout.batch * cfg.num_attention_heads), @intCast(sequence), @intCast(sequence) });
+        try list.append(a, .{ .node = built.inputs.attention_bias, .shape = score_shape, .values = .{ .f32 = biases[0] } });
+        try list.append(a, .{ .node = built.inputs.local_bias, .shape = score_shape, .values = .{ .f32 = biases[1] } });
+    }
+    const positions = try a.alloc(i64, bs);
+    for (positions, 0..) |*position, i| position.* = @intCast(i % sequence);
+    const head_dim = cfg.hidden_size / cfg.num_attention_heads;
+    const table_shape = Shape.init(.f32, &.{ @intCast(bs * cfg.num_attention_heads), @intCast(head_dim / 2) });
+    for (built.inputs.rope, [_]f32{ cfg.global_rope_theta, cfg.local_rope_theta }) |pair, theta| {
+        const tables = try trunk.ropeTables(a, positions, cfg.num_attention_heads, head_dim, theta);
+        for (pair, tables) |node, values| try list.append(a, .{ .node = node, .shape = table_shape, .values = .{ .f32 = values } });
+    }
+}
+
 /// Produces owned host inputs for a strict typed executor. It never converts
 /// indices to float or uploads via the legacy trainer's lossy binding helpers.
 /// For reference tests callers may replace dropout binding values with masks
@@ -489,8 +655,11 @@ fn bindPreparedInternal(allocator: Allocator, built: *const Built, config: *cons
         embedding_valid[index] = if (valid != 0) 1 else 0;
     }
     try list.append(a, .{ .node = built.inputs.input_ids, .shape = Shape.init(.i32, &.{@intCast(bs)}), .values = .{ .i32 = ids } });
-    try list.append(a, .{ .node = built.inputs.embedding_valid, .shape = Shape.init(.f32, &.{ @intCast(bs), 1 }), .values = .{ .f32 = embedding_valid } });
-    if (built.attention_profile == .replay_tiled_v1) {
+    if (built.encoder_config.family != .modern_bert)
+        try list.append(a, .{ .node = built.inputs.embedding_valid, .shape = Shape.init(.f32, &.{ @intCast(bs), 1 }), .values = .{ .f32 = embedding_valid } });
+    if (built.encoder_config.family == .modern_bert) {
+        try bindModernEncoder(a, &list, built, config, prepared, layout);
+    } else if (built.attention_profile == .replay_tiled_v1) {
         const count = 6 + @as(usize, bs) + @as(usize, layout.sequence) * 2 - 1;
         const control = try a.alloc(i32, count);
         for ([_]u64{ replay.seed, replay.micro_batch, replay.replica }, 0..) |value, i| {
@@ -919,4 +1088,165 @@ test "GLiNER2.5 CUDA attention arithmetic is explicit and within encoder admissi
     var builder = Builder.init(&graph);
     const layout = Layout{ .batch = 1, .sequence = 7, .words = 3, .queries = 2, .classifications = 0, .groups = 0, .relations = 0 };
     try std.testing.expectError(error.InvalidTrainingAttentionPlan, buildWithArithmetic(&builder, &config, layout, .train, .replay_tiled_v1, .retained_v1, .pytorch_fp32, .{}));
+}
+
+fn modernTestConfig() boundary.Config {
+    var config = testConfig();
+    config.encoder.family = .modern_bert;
+    config.encoder.num_hidden_layers = 3;
+    config.encoder.position_buckets = 0;
+    config.encoder.max_position_embeddings = 64;
+    config.encoder.hidden_dropout_prob = 0;
+    config.encoder.attention_probs_dropout_prob = 0;
+    config.encoder.global_attn_every_n_layers = 3; // layer 0 global, layers 1-2 local
+    config.encoder.local_attention_window = 4; // +-2 positions
+    config.encoder.global_rope_theta = 160000;
+    config.encoder.local_rope_theta = 10000;
+    return config;
+}
+
+test "GLiNER2.5 ModernBERT encoder graph routes the shared trunk and differentiates every encoder weight" {
+    const a = std.testing.allocator;
+    var fixture = engine.TestBatch{};
+    var prepared = fixture.prepared();
+    defer prepared.arena.deinit();
+    const config = modernTestConfig();
+    const layout = try layoutFromPrepared(&config, &prepared, .{});
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var bld = Builder.init(&graph);
+    var built = try build(&bld, &config, layout, .train, .{});
+    defer built.deinit();
+    try std.testing.expectEqual(@as(usize, 0), built.dropouts.len);
+    try std.testing.expectEqual(null_node, built.inputs.embedding_valid);
+    try std.testing.expectEqual(null_node, built.inputs.attention_valid);
+    try std.testing.expectEqual(null_node, built.inputs.attention_control);
+    try std.testing.expect(built.inputs.local_bias != null_node and built.inputs.rope[1][1] != null_node);
+    try std.testing.expectEqual(null_node, built.regions.normalized_relative);
+    try std.testing.expectEqual(@as(usize, 3), built.regions.layers.len);
+    try std.testing.expectEqual(built.regions.embedding_output, built.regions.layers[0].input);
+    for (built.regions.layers[1..], built.regions.layers[0..2]) |region, previous| try std.testing.expectEqual(previous.output, region.input);
+    try std.testing.expectEqual(built.nodes.encoder, built.regions.output);
+    try std.testing.expect(graph.node(built.nodes.text).output_shape.eq(Shape.init(.f32, &.{ @intCast(layout.batch * layout.words), 8 })));
+    var wrt: std.ArrayListUnmanaged(NodeId) = .empty;
+    defer wrt.deinit(a);
+    for (graph.parameters.items) |id| {
+        const name = graph.parameterName(graph.node(id));
+        if (std.mem.startsWith(u8, name, "__")) continue;
+        // Checkpoint `encoder.` prefixes are stripped, as for DeBERTa.
+        try std.testing.expect(!std.mem.startsWith(u8, name, "encoder."));
+        try wrt.append(a, id);
+    }
+    // Embeddings and two norms, five tensors per layer, one fewer norm at layer 0.
+    try std.testing.expectEqual(@as(usize, 3 + 3 * 6 - 1), wrt.items.len);
+    try std.testing.expectEqualStrings("embeddings.tok_embeddings.weight", graph.parameterName(graph.node(wrt.items[0])));
+    const seed = try bld.parameter("__encoder_test_seed", graph.node(built.nodes.text).output_shape);
+    var gradient = try ml.graph.autodiff.gradientWithSeeds(a, &graph, &.{.{ .output = built.nodes.text, .cotangent = seed }}, wrt.items, .{ .require_all_gradients = true });
+    defer gradient.deinit();
+}
+
+test "GLiNER2.5 ModernBERT encoder bindings mask padded keys and the local window and number positions per row" {
+    const a = std.testing.allocator;
+    var fixture = engine.TestBatch{};
+    var prepared = fixture.prepared();
+    defer prepared.arena.deinit();
+    const config = modernTestConfig();
+    const layout = try layoutFromPrepared(&config, &prepared, .{});
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var bld = Builder.init(&graph);
+    var built = try build(&bld, &config, layout, .train, .{});
+    defer built.deinit();
+    var values = try bindPrepared(a, &built, &config, &prepared, .{ .seed = 1, .micro_batch = 0 });
+    defer values.deinit();
+    const s: usize = layout.sequence;
+    const at = struct {
+        fn f(plane: []const f32, sequence: usize, row: usize, head: usize, q: usize, k: usize) f32 {
+            return plane[((row * 2 + head) * sequence + q) * sequence + k];
+        }
+    }.f;
+    const global = (try findBinding(&values, built.inputs.attention_bias)).values.f32;
+    const local = (try findBinding(&values, built.inputs.local_bias)).values.f32;
+    // The second sample is padded after token 6: its keys are masked for every query.
+    try std.testing.expectEqual(@as(f32, 0), at(global, s, 1, 1, 0, 6));
+    try std.testing.expectEqual(@as(f32, -1e9), at(global, s, 1, 1, 0, 7));
+    try std.testing.expectEqual(@as(f32, -1e9), at(global, s, 1, 0, 9, 7));
+    // Local layers keep |q - k| <= 2.
+    try std.testing.expectEqual(@as(f32, 0), at(local, s, 0, 0, 5, 3));
+    try std.testing.expectEqual(@as(f32, -1e9), at(local, s, 0, 0, 5, 2));
+    // RoPE restarts at 0 in each row: token 5 of row 1 rotates by angle 5 in
+    // its first frequency pair, for every head and both thetas.
+    const head_dim = 4;
+    for (built.inputs.rope) |pair| {
+        const cosine = (try findBinding(&values, pair[0])).values.f32;
+        const sine = (try findBinding(&values, pair[1])).values.f32;
+        const row = (s + 5) * 2 + 1; // token (row 1, index 5), head 1
+        try std.testing.expectApproxEqAbs(@cos(@as(f32, 5)), cosine[row * (head_dim / 2)], 1e-6);
+        try std.testing.expectApproxEqAbs(@sin(@as(f32, 5)), sine[row * (head_dim / 2)], 1e-6);
+    }
+    for (values.bindings) |binding| try std.testing.expect(binding.node != null_node);
+}
+
+test "GLiNER2.5 ModernBERT encoder rejects recomputation, dropout, other arithmetic, and positions past pretraining" {
+    const a = std.testing.allocator;
+    const config = modernTestConfig();
+    const layout = Layout{ .batch = 1, .sequence = 16, .words = 3, .queries = 2, .classifications = 0, .groups = 0, .relations = 0 };
+    _ = try plan(&config, layout, .train, .{});
+    try std.testing.expectError(error.UnsupportedBoundaryEncoderProfile, planWithProfiles(&config, layout, .train, .replay_tiled_v1, .layer_recompute_v1, .{}));
+    try std.testing.expectError(error.UnsupportedBoundaryEncoderProfile, planWithProfiles(&config, layout, .train, .materialized_v1, .layer_recompute_v1, .{}));
+    var dropout = config;
+    dropout.encoder.hidden_dropout_prob = 0.1;
+    try std.testing.expectError(error.UnsupportedBoundaryEncoderDropout, plan(&dropout, layout, .train, .{}));
+    _ = try plan(&dropout, layout, .eval, .{});
+    var long = layout;
+    long.sequence = 65;
+    try std.testing.expectError(error.ResourceLimitExceeded, plan(&config, long, .train, .{}));
+    var limits = Limits{};
+    limits.max_attention_score_elements = 16 * 16 * 2 - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, plan(&config, layout, .train, limits));
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var bld = Builder.init(&graph);
+    try std.testing.expectError(error.InvalidTrainingAttentionPlan, buildWithArithmetic(&bld, &config, layout, .train, .materialized_v1, .retained_v1, .pytorch_fp32, .{}));
+}
+
+test "GLiNER2.5 ModernBERT fused attention stores no scores, binds one control, and lifts the score cap" {
+    const a = std.testing.allocator;
+    var fixture = engine.TestBatch{};
+    var prepared = fixture.prepared();
+    defer prepared.arena.deinit();
+    const config = modernTestConfig();
+    const layout = try layoutFromPrepared(&config, &prepared, .{});
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var bld = Builder.init(&graph);
+    var built = try buildWithProfile(&bld, &config, layout, .train, .replay_tiled_v1, .{});
+    defer built.deinit();
+    try std.testing.expectEqual(null_node, built.inputs.attention_bias);
+    try std.testing.expectEqual(null_node, built.inputs.local_bias);
+    try std.testing.expect(built.inputs.attention_control != null_node);
+    try std.testing.expectEqual(@as(u64, 0), built.admission.attention_score_elements);
+    var fused: usize = 0;
+    for (graph.nodes.items) |node| {
+        if (node.op == .fused_modernbert_training_attention_v1) {
+            fused += 1;
+            try std.testing.expectEqual(built.inputs.attention_control, node.inputs[1]);
+        }
+        // No node holds a [B*heads,S,S] score tensor.
+        if (node.op != .parameter) try std.testing.expect(node.output_shape.rank_ < 3 or node.output_shape.dims[1] != layout.sequence or node.output_shape.dims[2] != layout.sequence);
+    }
+    try std.testing.expectEqual(@as(usize, config.encoder.num_hidden_layers), fused);
+    var values = try bindPrepared(a, &built, &config, &prepared, .{ .seed = 1, .micro_batch = 0 });
+    defer values.deinit();
+    const control = (try findBinding(&values, built.inputs.attention_control)).values.i32;
+    const s: i32 = @intCast(layout.sequence);
+    // Row 1 is padded after token 6: every query in it sees keys [S, S+7).
+    try std.testing.expectEqualSlices(i32, &.{ s, s + 7, 0, 0, 0, 0 }, control[@as(usize, @intCast(s + 9)) * 6 ..][0..6]);
+    try std.testing.expectEqual(@as(i32, 9), control[@as(usize, @intCast(2 * s)) * 6 + @as(usize, @intCast(s)) + 9]);
+    // A sequence whose materialized scores exceed the cap is admitted fused.
+    var limits = Limits{};
+    limits.max_attention_score_elements = 1;
+    const long = Layout{ .batch = 1, .sequence = 64, .words = 3, .queries = 2, .classifications = 0, .groups = 0, .relations = 0 };
+    try std.testing.expectError(error.ResourceLimitExceeded, plan(&config, long, .train, limits));
+    _ = try planWithProfile(&config, long, .train, .replay_tiled_v1, limits);
 }

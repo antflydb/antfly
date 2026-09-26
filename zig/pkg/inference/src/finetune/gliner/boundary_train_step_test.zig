@@ -195,6 +195,47 @@ test "boundary training step runs mixed live encoder candidate record relation l
     try std.testing.expect(first.host_peak_bytes > 0 and first.host_peak_bytes <= plan.limits.max_step_host_bytes);
 }
 
+test "boundary training step trains every head and the encoder on a ModernBERT trunk" {
+    const a = std.testing.allocator;
+    var schema = try schema_mod.compile(a, rich_schema, .{});
+    defer schema.deinit();
+    var tokenizer = TestTokenizer{};
+    var prepared = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = "Ada Acme", .schema = &schema }}, .{});
+    defer prepared.deinit();
+    var modern = config();
+    modern.encoder = .{ .hidden_size = 4, .intermediate_size = 8, .num_hidden_layers = 2, .num_attention_heads = 2, .vocab_size = 512, .max_position_embeddings = 256, .position_buckets = 0, .layer_norm_eps = 1e-5, .hidden_dropout_prob = 0, .attention_probs_dropout_prob = 0, .pad_token_id = 0, .family = .modern_bert, .global_rope_theta = 160000, .local_rope_theta = 10000, .local_attention_window = 8, .global_attn_every_n_layers = 2 };
+    var plan = try step.build(a, modern, &prepared, &.{&schema}, .{}, .training, .{});
+    defer plan.deinit();
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var parameters = try weights(a, &cb, &plan);
+    defer parameters.deinit();
+    try plan.finalize(parameters.wrt, .{});
+    var result = try plan.run(&cb, parameters.inputs, &prepared, &.{&schema}, &.{annotation(schema.fingerprint, true)}, .{ .identity = .{ .binding = @splat(1), .optimizer_step = 0, .microbatch = 0 }, .replay = .{ .seed = 4, .micro_batch = 0 }, .progress = .{ .optimizer_step = 0, .total_optimizer_steps = 100 }, .require_gold_relation_coverage = true }, null);
+    defer result.deinit(&cb);
+    try std.testing.expect(std.math.isFinite(result.terms.total) and result.terms.total > 0);
+    try std.testing.expect(result.terms.classification > 0 and result.terms.record_object > 0 and result.terms.record_field > 0 and result.terms.relation > 0);
+    // The loss reaches the embeddings and both the global (0) and local (1) layers.
+    var live: usize = 0;
+    for (result.backward.parameter_ids, result.backward.gradients.outputs) |id, gradient| {
+        const name = plan.graph.parameterName(plan.graph.node(id));
+        const tracked = for ([_][]const u8{ "embeddings.tok_embeddings.weight", "layers.0.attn.Wqkv.weight", "layers.1.attn.Wqkv.weight", "final_norm.weight" }) |want| {
+            if (std.mem.eql(u8, name, want)) break true;
+        } else false;
+        if (!tracked) continue;
+        const values = try cb.toFloat32(gradient, a);
+        defer a.free(values);
+        for (values) |value| if (@abs(value) > 1e-10) {
+            live += 1;
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 4), live);
+}
+
 test "boundary training step rejects aggregate allocation limits and stale schema before forward" {
     const a = std.testing.allocator;
     var schema = try schema_mod.compile(a, "{\"entities\":[\"person\"]}", .{});

@@ -108,6 +108,7 @@ test {
     _ = gliner_boundary_adapter_layout;
     _ = gliner_boundary_train_step;
     _ = @import("gliner/boundary_train_step_test.zig");
+    _ = @import("gliner/boundary_modernbert_test.zig");
     _ = gliner2_data;
     _ = gliner2_run_validation;
     _ = gliner2_boundary;

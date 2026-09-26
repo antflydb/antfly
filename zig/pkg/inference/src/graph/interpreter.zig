@@ -2835,6 +2835,16 @@ pub fn executeNode(
             return cb.debertaTrainingAttentionBackwardV1(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), V.get(ins[3]), attrs);
         },
 
+        .fused_modernbert_training_attention_v1 => |attrs| {
+            if (ins.len != 2) return error.InvalidModernBertTrainingAttentionShape;
+            return cb.modernBertTrainingAttentionV1(V.get(ins[0]), V.get(ins[1]), attrs);
+        },
+
+        .fused_modernbert_training_attention_backward_v1 => |attrs| {
+            if (ins.len != 3) return error.InvalidModernBertTrainingAttentionShape;
+            return cb.modernBertTrainingAttentionBackwardV1(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), attrs);
+        },
+
         .fused_disentangled_attention => |attrs| {
             // input0 = qkv_packed [3*B*S, H]; input1 = qr_kr_packed [2*num_rel, H];
             // input2 = attn_bias [bh, S, S]. Slice the packed inputs back into

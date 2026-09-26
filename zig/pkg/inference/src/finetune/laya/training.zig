@@ -212,6 +212,7 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
     }
     const window: u64 = cfg.local_attention_window / 2;
     for ([_]ml.NodeId{ built.inputs.encoder_bias, built.inputs.local_bias, built.inputs.head_bias }, [_]u32{ cfg.num_attention_heads, cfg.num_attention_heads, cfg.hidden_size / 64 }, [_]bool{ false, true, false }) |id, heads, local| {
+        if (id == ml.null_node) continue; // fused attention reads the control instead
         const bias = try a.alloc(f32, l.batch * heads * l.sequence * l.sequence);
         const plane = l.sequence * l.sequence;
         for (examples, 0..) |e, row| {
@@ -227,6 +228,37 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
         errdefer cb.free(value);
         try result.append(a, .{ .node_id = id, .value = value });
     }
+    if (built.inputs.control != ml.null_node) {
+        // The same visibility as the masks above: a valid query sees its
+        // tree ancestors (the whole valid prefix when unpacked), a padded
+        // query sees every valid key, and local layers add the window in attrs.
+        const tokens = l.batch * l.sequence;
+        const words = try a.alloc(i32, tokens * 7);
+        @memset(words[0 .. tokens * 6], 0);
+        for (examples, 0..) |e, row| {
+            const base: i32 = @intCast(row * l.sequence);
+            const tree_ranges: ?[]const u32 = if (e.packed_row) |p| try tree.ranges(a, p.row, 0) else null;
+            for (0..l.sequence) |i| {
+                const token = row * l.sequence + i;
+                const out = words[token * 6 ..][0..6];
+                if (i < e.ids.len and tree_ranges != null) {
+                    for (out, tree_ranges.?[i * 6 ..][0..6]) |*dst, bound| dst.* = base + @as(i32, @intCast(bound));
+                    // Empty tree slots stay empty rather than [base, base).
+                    for (0..3) |r| if (out[2 * r] == out[2 * r + 1]) {
+                        out[2 * r] = 0;
+                        out[2 * r + 1] = 0;
+                    };
+                } else {
+                    out[0] = base;
+                    out[1] = base + @as(i32, @intCast(e.ids.len));
+                }
+                words[tokens * 6 + token] = @intCast(positions[token]);
+            }
+        }
+        const value = (try cb.fromInt32Shape(words, &.{@intCast(words.len)})) orelse return error.UnsupportedLayaTrainingBackend;
+        errdefer cb.free(value);
+        try result.append(a, .{ .node_id = built.inputs.control, .value = value });
+    }
     const head_dim = cfg.hidden_size / cfg.num_attention_heads;
     for (built.inputs.rope, [_]f32{ cfg.global_rope_theta, cfg.local_rope_theta }) |ids_pair, theta| {
         const tables = try architecture.ropeTables(a, positions, cfg.num_attention_heads, head_dim, theta);
@@ -236,7 +268,7 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
             try result.append(a, .{ .node_id = id, .value = value });
         }
     }
-    for (built.dropouts.items) |entry| {
+    for (built.sites.dropouts.items) |entry| {
         const shape = graph.node(entry.node).output_shape;
         const mask = try a.alloc(f32, @intCast(shape.numElements().?));
         for (mask) |*v| v.* = if (!training) 1 else if (random.float(f32) < entry.probability) 0 else 1 / (1 - entry.probability);
@@ -265,10 +297,16 @@ pub const Program = struct {
     /// Differentiates only the parameters above the lowest `freeze_layers`
     /// encoder layers; bind the rest through `frozen`.
     pub fn initFrozen(a: std.mem.Allocator, cfg: modern.Config, l: architecture.Layout, dropout: f32, freeze_layers: u32) !Program {
+        return initProfile(a, cfg, l, dropout, freeze_layers, .materialized_v1);
+    }
+
+    /// `attention` selects materialized or fused (linear-storage) attention;
+    /// see `architecture.buildProfile`.
+    pub fn initProfile(a: std.mem.Allocator, cfg: modern.Config, l: architecture.Layout, dropout: f32, freeze_layers: u32, attention: architecture.AttentionProfile) !Program {
         var graph = ml.Graph.init(a);
         errdefer graph.deinit();
         var builder = ml.Builder.init(&graph);
-        var built = try architecture.build(&builder, cfg, l, dropout);
+        var built = try architecture.buildProfile(&builder, cfg, l, dropout, attention);
         errdefer built.deinit(a);
         try graph.markOutput(built.logits);
         const seed = try builder.parameter("__laya_cotangent", graph.node(built.logits).output_shape);

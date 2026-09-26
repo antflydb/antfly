@@ -116,6 +116,9 @@ test {
     _ = @import("hard_cancellation_watchdog.zig");
     _ = @import("models/laya.zig");
     _ = @import("finetune/laya/graph.zig");
+    _ = @import("bench/antenna_encoder_timing_test.zig");
+    _ = @import("finetune/modern_bert_trunk.zig");
+    _ = @import("finetune/modern_bert_trunk_test.zig");
     _ = @import("finetune/laya/objective.zig");
     _ = @import("finetune/laya/training_test.zig");
     _ = @import("finetune/laya/training_packed_test.zig");
@@ -177,6 +180,8 @@ test {
     _ = @import("ops/deberta_training_attention_test.zig");
     _ = @import("ops/deberta_training_attention_source_test.zig");
     _ = @import("ops/deberta_training_attention_device_test.zig");
+    _ = @import("ops/modernbert_training_attention.zig");
+    _ = @import("ops/modernbert_training_attention_device_test.zig");
     _ = @import("graph/recomputed_training_test.zig");
     _ = @import("finetune/gliner/boundary_replay_bindings.zig");
     _ = @import("finetune/gliner/boundary_recomputed_graph.zig");
