@@ -20084,6 +20084,21 @@ fn consumerTests() type {
             ));
         }
 
+        test "parseRemoteSearchResult cleans up highlights on every allocation failure" {
+            const Repro = struct {
+                fn run(alloc: std.mem.Allocator) !void {
+                    var result = try parseRemoteSearchResult(alloc,
+                        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[{"_id":"doc:1","_score":0.5,"_highlights":{"title":[{"text":"hello there","offset":0,"spans":[{"start":0,"end":5}]},{"text":"hello again","offset":20,"spans":[{"start":0,"end":5}]}],"tags":[{"text":"hello","offset":0,"item":2,"spans":[{"start":0,"end":5}]}]}}]},"took":1,"status":200,"table":"docs"}]}
+                    );
+                    defer result.deinit();
+                    try std.testing.expectEqual(@as(usize, 2), result.hits[0].highlights.len);
+                    try std.testing.expectEqualStrings("hello again", result.hits[0].highlights[0].fragments[1].text);
+                    try std.testing.expectEqual(@as(?u32, 2), result.hits[0].highlights[1].fragments[0].item);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, Repro.run, .{});
+        }
+
         test "parseRemoteSearchResult preserves grouped hierarchy matches" {
             const alloc = std.testing.allocator;
             var result = try parseRemoteSearchResult(alloc,

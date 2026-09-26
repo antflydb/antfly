@@ -4914,7 +4914,9 @@ fn parseRemoteHighlightsAlloc(
                 .spans = spans,
             });
         }
-        try out.append(alloc, .{ .field = field, .fragments = try fragments.toOwnedSlice(alloc) });
+        // Keep fragments owned by their cleanup until the destination can accept them.
+        try out.ensureUnusedCapacity(alloc, 1);
+        out.appendAssumeCapacity(.{ .field = field, .fragments = try fragments.toOwnedSlice(alloc) });
     }
     return try out.toOwnedSlice(alloc);
 }
