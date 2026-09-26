@@ -8964,9 +8964,11 @@ pub const Node = struct {
         if (manifest.gliner_architecture == .span and manifest.gliner_span_declared)
             return self.extractV2Span(scratch, model_path, &request, control, failure, response_limit, budget, working_bytes, allocation_failure);
         if (manifest.gliner_architecture != .boundary) return error.UnsupportedExtractionModel;
-        try boundary_executor.preflight(&request, execution_options);
         const test_qualification = if (builtin.is_test) self.test_allow_unqualified_gliner_boundary else false;
+        // Reject unqualified bundles at the model gate before the boundary
+        // schema preflight reports a feature error for a model we cannot run.
         if (!test_qualification and !manifest.mayLoadQualifiedGlinerBoundaryRuntime()) return error.UnsupportedGlinerBoundaryRuntime;
+        try boundary_executor.preflight(&request, execution_options);
         // The model manager owns a separate allocator and resource lifetime.
         // A previous recoverable request-heap failure cannot label its OOM as
         // a declared request limit. The real loader still validates all model

@@ -1,5 +1,23 @@
 # Zig runtime flakes
 
+## 2026-09-26: L4 smoke model prefetch in run 36203548073
+
+[CI run 36203548073](https://github.com/antflydb/antfly/actions/runs/36203548073)
+also failed the [L4 Spot smoke job](https://github.com/antflydb/antfly/actions/runs/36203548073/job/108309588813)
+at its `Prefetch inference models before server startup` step. Hardware and
+CUDA runtime verification passed; the later inference validation did not run.
+For the `smoke` scope this step pulls the Gemma 4 E2B GGUF and projector from
+Hugging Face. The GLiNER2.5-Decide branch does not change this workflow or
+model pull. This is an unrelated prefetch failure and a possible transient
+CI issue rather than evidence of a GLiNER regression. The job log
+is needed to identify the exact download error and establish whether it
+recurred; the public run metadata exposes only the failed step.
+
+The same run's `zig-base / x86_64` job failed two GLiNER boundary assertions
+because the Decide dispatch change ran boundary preflight before the existing
+runtime qualification rejection. Those are deterministic regressions and are
+fixed in the GLiNER branch, rather than classified as flakes here.
+
 ## 2026-09-25: non-GLiNER failures in run 36168024127
 
 [CI run 36168024127](https://github.com/antflydb/antfly/actions/runs/36168024127)
