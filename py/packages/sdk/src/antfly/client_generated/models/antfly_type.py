@@ -13,6 +13,7 @@ class AntflyType(StrEnum):
     LINK = "link"
     NUMERIC = "numeric"
     SEARCH_AS_YOU_TYPE = "search_as_you_type"
+    SUBSTRING = "substring"
     TEXT = "text"
 
     def __str__(self) -> str:

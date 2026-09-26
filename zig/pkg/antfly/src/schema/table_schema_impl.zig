@@ -893,6 +893,7 @@ fn physicalLayoutDischargesProperty(property: DocumentProperty) bool {
     const physical_scalar = std.mem.eql(u8, kind, "string") or std.mem.eql(u8, kind, "keyword") or
         std.mem.eql(u8, kind, "text") or std.mem.eql(u8, kind, "link") or
         std.mem.eql(u8, kind, "html") or std.mem.eql(u8, kind, "search_as_you_type") or
+        std.mem.eql(u8, kind, "substring") or
         std.mem.eql(u8, kind, "boolean") or std.mem.eql(u8, kind, "integer") or
         std.mem.eql(u8, kind, "number") or std.mem.eql(u8, kind, "numeric");
     if (!physical_scalar) return false;
@@ -1807,6 +1808,7 @@ fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]
         std.mem.eql(u8, schema_type_name, "blob") or
         std.mem.eql(u8, schema_type_name, "html") or
         std.mem.eql(u8, schema_type_name, "search_as_you_type") or
+        std.mem.eql(u8, schema_type_name, "substring") or
         std.mem.eql(u8, schema_type_name, "string") or
         std.mem.eql(u8, schema_type_name, "number") or
         std.mem.eql(u8, schema_type_name, "integer") or
@@ -2141,7 +2143,8 @@ fn fieldMappingAcceptsSchemaType(mapping_type: []const u8, schema_type: []const 
         std.mem.eql(u8, mapping_type, "link") or
         std.mem.eql(u8, mapping_type, "blob") or
         std.mem.eql(u8, mapping_type, "html") or
-        std.mem.eql(u8, mapping_type, "search_as_you_type"))
+        std.mem.eql(u8, mapping_type, "search_as_you_type") or
+        std.mem.eql(u8, mapping_type, "substring"))
     {
         return schemaTypeIsString(schema_type);
     }
@@ -2182,7 +2185,8 @@ fn schemaTypeIsString(schema_type: []const u8) bool {
         std.mem.eql(u8, schema_type, "link") or
         std.mem.eql(u8, schema_type, "blob") or
         std.mem.eql(u8, schema_type, "html") or
-        std.mem.eql(u8, schema_type, "search_as_you_type");
+        std.mem.eql(u8, schema_type, "search_as_you_type") or
+        std.mem.eql(u8, schema_type, "substring");
 }
 
 fn schemaTypeIsNumeric(schema_type: []const u8) bool {
@@ -2264,6 +2268,7 @@ pub fn runtimeFieldTypeFromName(field_type: []const u8) ?storage_schema.AntflyTy
     if (std.mem.eql(u8, field_type, "blob")) return .blob;
     if (std.mem.eql(u8, field_type, "html")) return .html;
     if (std.mem.eql(u8, field_type, "search_as_you_type")) return .search_as_you_type;
+    if (std.mem.eql(u8, field_type, "substring")) return .substring;
     return null;
 }
 
@@ -2277,7 +2282,8 @@ fn mappingTypeIsKnown(mapping_type: []const u8) bool {
         std.mem.eql(u8, mapping_type, "geoshape") or
         std.mem.eql(u8, mapping_type, "geo_shape") or
         std.mem.eql(u8, mapping_type, "blob") or
-        std.mem.eql(u8, mapping_type, "search_as_you_type");
+        std.mem.eql(u8, mapping_type, "search_as_you_type") or
+        std.mem.eql(u8, mapping_type, "substring");
 }
 
 fn validateNonNegativeInteger(value: std.json.Value) !void {

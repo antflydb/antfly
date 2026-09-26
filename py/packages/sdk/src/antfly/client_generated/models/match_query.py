@@ -13,13 +13,19 @@ T = TypeVar("T", bound="MatchQuery")
 
 @_attrs_define
 class MatchQuery:
-    """
-    Attributes:
-        match (str):
-        field (str | Unset):
-        analyzer (str | Unset):
-        boost (float | None | Unset): A floating-point number used to decrease or increase the relevance scores of a
-            query.
+    """Analyze the text with the field's analyzer and match any of the
+    resulting terms. On a `substring` companion field (`fieldName._substring`)
+    the text is lowercased and matched as a contained substring instead:
+    `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
+    Substring lookups require at least two bytes and reject a token or
+    adjacent token pair longer than 32 bytes.
+
+        Attributes:
+            match (str):
+            field (str | Unset):
+            analyzer (str | Unset):
+            boost (float | None | Unset): A floating-point number used to decrease or increase the relevance scores of a
+                query.
     """
 
     match: str

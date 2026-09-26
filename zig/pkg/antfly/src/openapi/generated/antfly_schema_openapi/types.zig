@@ -17,6 +17,7 @@ pub const AntflyType = enum {
     blob,
     link,
     search_as_you_type,
+    substring,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -32,6 +33,7 @@ pub const AntflyType = enum {
             .blob => "blob",
             .link => "link",
             .search_as_you_type => "search_as_you_type",
+            .substring => "substring",
         };
         try jw.write(s);
     }
@@ -54,6 +56,7 @@ pub const AntflyType = enum {
             .{ "blob", .blob },
             .{ "link", .link },
             .{ "search_as_you_type", .search_as_you_type },
+            .{ "substring", .substring },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -329,6 +332,7 @@ pub const FieldMappingType = enum {
     blob,
     link,
     search_as_you_type,
+    substring,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -351,6 +355,7 @@ pub const FieldMappingType = enum {
             .blob => "blob",
             .link => "link",
             .search_as_you_type => "search_as_you_type",
+            .substring => "substring",
         };
         try jw.write(s);
     }
@@ -380,6 +385,7 @@ pub const FieldMappingType = enum {
             .{ "blob", .blob },
             .{ "link", .link },
             .{ "search_as_you_type", .search_as_you_type },
+            .{ "substring", .substring },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
