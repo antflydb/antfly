@@ -74,6 +74,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime storage ownership fingerprint excludes transient placement progress",
         "owned local group status refresh releases merged status lifecycle strings",
         "data runtime retries storage ownership invalidation before publishing fingerprint",
+        "data store registration rejects same-process physical root replacement",
+        "unconfirmed hidden initial placement cannot retire admitted ordinary replica",
         "data descriptor factory separates bootstrap voters from transport peers",
         "data descriptor factory restores persisted voters before metadata peer discovery",
         "data runtime remote admin snapshot clone owns parser-backed slices",
@@ -187,6 +189,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft protocol barrier rejects unsupported future versions",
         "raft proposal materializes a default batch timestamp exactly once",
         "online merge admission distinguishes unsupported peers and fences leader authority",
+        "distributed online merge admission declines both owners and direct source proposals",
         "data raft raw topology rejection advances delegate with exact typed outcome",
         "raft batch protocol preflight fingerprint fences every applying replica set",
         "raft batch protocol plan resolves only current group applying peers",
@@ -412,7 +415,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     return .{
         .consumer = lib_data_runtime_tests,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{lib_data_runtime_tests.executable}) catch @panic("OOM"),
+        // The physical implementation suite also reaches the opaque owner
+        // clients through shared runtime tests. Link the same production
+        // provider archives as the consumer executable; keeping its physical
+        // source selection does not itself satisfy those extern symbols.
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ lib_data_runtime_tests.executable, implementation_tests }) catch @panic("OOM"),
         .run_lib_data_runtime_tests = run_lib_data_runtime_tests,
         .run_lib_data_storage_tests = run_lib_data_storage_tests,
     };

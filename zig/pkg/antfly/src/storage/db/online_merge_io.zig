@@ -147,7 +147,15 @@ fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancella
     };
     const merge = @import("merge_state.zig");
     const merge_raw = txn.get(merge.key) catch |err| switch (err) {
-        error.NotFound => null,
+        // Match the committed source-admission cut and merge checkpoint
+        // loader: pre-protection receiver state remains authoritative in its
+        // legacy key until an atomic migration removes that key. A positive
+        // discovery fact must not create an online metadata record which the
+        // later source admission can never commit.
+        error.NotFound => txn.get(merge.legacy_key) catch |legacy_err| switch (legacy_err) {
+            error.NotFound => null,
+            else => return legacy_err,
+        },
         else => return err,
     };
     if (merge_raw) |raw| {
@@ -205,6 +213,7 @@ test "relational index system online admission facts are unbound read only and r
     try db.updateRange(.{ .start = "m", .end = "z" });
     // Ordinary document owners need no coordinated integrity catalog.
     try db.core.store.delete(@import("relational_integrity_catalog.zig").key);
+    try db.addIndex(.{ .name = "text_before_admit", .kind = .full_text, .config_json = "{}" });
     const request: wire.Request = .{ .scope = .{
         .fence = .{ .admission_epoch = 0, .attempt = 0, .transition_id = 7, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = db.core.identity_namespace, .catalog_digest = @splat(0) },
         .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 },
@@ -250,6 +259,12 @@ test "relational index system online admission facts are unbound read only and r
     bound.copy_attempt = .{ .donor_term = 2, .sequence = facts.next_copy_sequence };
     var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 8, .donor_group_id = 4, .receiver_group_id = 2, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z" };
     try db.batch(.{ .merge_checkpoint = checkpoint });
+    const active_merge_raw = try db.core.store.get(alloc, @import("merge_state.zig").key);
+    defer alloc.free(active_merge_raw);
+    // A receiver has no source-retention marker. The durable merge checkpoint
+    // itself must prevent graph/artifact catalog changes during copy and tail.
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.addIndex(.{ .name = "graph_during_copy", .kind = .graph, .config_json = "{}" }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.deleteIndex("text_before_admit"));
     try std.testing.expectError(error.IntegrityTopologyBusy, Fetch.run(&db, request));
     var same_ordinary = request;
     same_ordinary.scope.fence.transition_id = 8;
@@ -264,9 +279,52 @@ test "relational index system online admission facts are unbound read only and r
     try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
     checkpoint.kind = .rollback;
     try db.batch(.{ .merge_checkpoint = checkpoint });
+    const rolled_back_merge_raw = try db.core.store.get(alloc, @import("merge_state.zig").key);
+    defer alloc.free(rolled_back_merge_raw);
+    try db.core.store.delete(@import("merge_state.zig").key);
+    try db.core.store.put(@import("merge_state.zig").legacy_key, active_merge_raw);
+    try std.testing.expectError(error.IntegrityTopologyBusy, Fetch.run(&db, request));
+    try std.testing.expect(!(try Fetch.run(&db, same_ordinary)).eligible);
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = bound } } }, .{ .term = 2, .index = 2 }));
+    try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try @import("../retained_effects.zig").load(&read)) == null);
+        try std.testing.expect((try @import("../source_pin_state.zig").load(&read)) == null);
+    }
+    try db.core.store.delete(@import("merge_state.zig").legacy_key);
+    try db.core.store.put(@import("merge_state.zig").key, rolled_back_merge_raw);
     try std.testing.expect((try Fetch.run(&db, request)).eligible);
+    // Raft admission is rejected before proposal by the data service. A
+    // committed entry must replay identically on followers even when their
+    // replica-local artifact catalogs differ; only native admission repeats
+    // the local predicate at commit (covered below).
     try db.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = bound } } }, .{ .term = 2, .index = 2 });
     try std.testing.expectError(error.IntegrityTopologyBusy, Fetch.run(&db, request));
+    // Once admission has retained the source, a new graph index or
+    // independently produced enrichment would invalidate the row-derived
+    // artifact proof. The same guard applies to ordinary catalog DDL, not
+    // only Raft topology commands; rejected DDL must not alter the catalog.
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.addIndex(.{ .name = "graph_after_admit", .kind = .graph, .config_json = "{}" }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.deleteIndex("text_before_admit"));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.addEnrichment(.{ .name = "chunks_after_admit", .kind = .chunk, .field = "body", .chunk_size = 8, .chunk_overlap = 2, .full_text_index = true }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.addResolver(.{ .name = "resolver_after_admit", .table = "entities", .source_artifact = "relations", .resolution_artifact = "resolved", .key_template = "{{ _entity.label }}", .config_generation = 1 }));
+    {
+        const indexes = try db.core.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, indexes);
+        try std.testing.expectEqual(@as(usize, 1), indexes.len);
+        try std.testing.expectEqualStrings("text_before_admit", indexes[0].name);
+        const enrichments = try db.core.listEnrichments(alloc);
+        defer types.freeEnrichmentConfigs(alloc, enrichments);
+        try std.testing.expectEqual(@as(usize, 0), enrichments.len);
+        const resolvers = try db.core.listResolvers(alloc);
+        defer {
+            for (resolvers) |*resolver| resolver.deinit(alloc);
+            if (resolvers.len != 0) alloc.free(resolvers);
+        }
+        try std.testing.expectEqual(@as(usize, 0), resolvers.len);
+    }
     checkpoint.kind = .accept;
     checkpoint.transition_id = 9;
     // Merely retaining a source (without an active topology freeze) must
@@ -315,6 +373,51 @@ test "relational index system online admission facts are unbound read only and r
     enriched.close();
     enriched = try DB.open(alloc, enriched_path, enriched_options);
     try std.testing.expect(!(try Fetch.run(&enriched, request)).eligible);
+}
+
+test "relational index system native source admission rechecks artifact DDL at commit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-source-artifact-recheck", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try DB.open(alloc, path, .{
+        .online_source_authority = .native,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.updateRange(.{ .start = "m", .end = "z" });
+    const identity = try db.relationalTopologyIdentity();
+    const scope: source.Scope = .{
+        .authority = .native,
+        .fence = .{
+            .admission_epoch = identity.next_epoch,
+            .attempt = 1,
+            .transition_id = 7,
+            .owner_group_id = 2,
+            .peer_group_id = 3,
+            .role = .rewrite_source,
+            .namespace = db.core.identity_namespace,
+            .catalog_digest = identity.catalog_digest,
+        },
+        .receiver_namespace = .{ .table_id = 9, .shard_id = 3, .range_id = 3 },
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .sequence = 1 },
+    };
+    // The discovery snapshot preceded a separately committed enrichment
+    // config. Native admission must see it inside the final serialized cut.
+    try db.addEnrichment(.{ .name = "chunks_before_admit", .kind = .chunk, .field = "body", .chunk_size = 8, .chunk_overlap = 2, .full_text_index = true });
+    try std.testing.expectError(error.OnlineSourceScopeChanged, db.batch(.{ .online_source = .{ .admit = .{ .scope = scope } } }));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try @import("../retained_effects.zig").load(&read)) == null);
+        try std.testing.expect((try @import("../source_pin_state.zig").load(&read)) == null);
+    }
 }
 
 test "relational index system online receiver status preserves persisted positioned rows after reopen" {
@@ -424,6 +527,39 @@ pub fn rowDerivedIndexesAssumeApply(db: *DB, alloc: Allocator) !bool {
     return rowDerivedTransferIndexesAssumeApply(db, alloc, false);
 }
 
+/// Discovery facts are advisory. Repeat their mutable eligibility checks
+/// inside the serialized source-admission cut, after taking the index catalog
+/// mutex and apply lock, so later graph/resolver/enrichment DDL cannot turn a
+/// stale positive observation into an untransferable committed source pin.
+pub fn requireAdmissibleSourceAtCommitAssumeApply(db: *DB, alloc: Allocator) !void {
+    var txn = try db.core.store.beginProbeTxn();
+    defer txn.abort();
+    const table = @import("table_catalog.zig");
+    const table_bytes = txn.get(table.key) catch |err| switch (err) {
+        error.NotFound => return error.IntegrityCatalogChanged,
+        else => return err,
+    };
+    const table_facts = try table.Catalog.decode(table_bytes);
+    if (!table_facts.mode_initialized or try @import("relational_integrity_retirement.zig").active(&txn))
+        return error.OnlineSourceScopeChanged;
+    if (db.core.acquireSchemaView()) |view_value| {
+        var view = view_value;
+        defer view.release();
+        if (view.hasCoordinatedConstraints()) {
+            const catalog = txn.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+                error.NotFound => return error.IntegrityCatalogChanged,
+                else => return err,
+            };
+            var compiled = try @import("relational_integrity_catalog.zig").decode(alloc, catalog);
+            defer compiled.deinit();
+            if ((try @import("relational_integrity_activation.zig").status(&txn, compiled)).state != .enforced)
+                return error.IntegrityCatalogChanged;
+        }
+    } else if (table_facts.storage_mode == .relational) return error.IntegrityCatalogChanged;
+    if (!try rowDerivedTransferIndexesAssumeApply(db, alloc, true))
+        return error.OnlineSourceScopeChanged;
+}
+
 fn rowDerivedTransferIndexesAssumeApply(db: *DB, alloc: Allocator, coordinated: bool) !bool {
     // Protocol support alone does not prove that this owner's backend can
     // produce and retain the immutable native source pin.
@@ -451,6 +587,15 @@ fn rowDerivedTransferIndexesAssumeApply(db: *DB, alloc: Allocator, coordinated: 
     const enrichments = try db.core.listEnrichments(alloc);
     defer types.freeEnrichmentConfigs(alloc, enrichments);
     if (enrichments.len != 0) return false;
+    // Resolver decisions and promotions can materialize graph artifacts
+    // independently of primary-row Raft effects. An index list alone does not
+    // prove their absence: resolver configuration is a separate catalog.
+    const resolvers = try db.core.listResolvers(alloc);
+    defer {
+        for (resolvers) |*resolver| resolver.deinit(alloc);
+        if (resolvers.len != 0) alloc.free(resolvers);
+    }
+    if (resolvers.len != 0) return false;
     const indexes = try db.core.listIndexes(alloc);
     defer types.freeIndexConfigs(alloc, indexes);
     for (indexes) |index| if (index.kind != .full_text) return false;

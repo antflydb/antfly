@@ -196,6 +196,7 @@ pub const testing = if (builtin.is_test) struct {
 } else struct {};
 
 test {
+    _ = @import("root_signing_identity.zig");
     _ = types;
     _ = merge_state;
     _ = docstore;

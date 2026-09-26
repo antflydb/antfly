@@ -321,7 +321,20 @@ pub const Driver = struct {
         switch (try decide(current, observation, canceled)) {
             .wait => return current,
             .execute => |action| {
-                try self.execute(self.ptr, current, action, &observation);
+                self.execute(self.ptr, current, action, &observation) catch |err| {
+                    if (err != error.OnlineMergeArtifactCatalogUncoordinated or
+                        @intFromEnum(current.phase) >= @intFromEnum(Phase.cutover)) return err;
+                    // A pre-gate attempt may have committed metadata before
+                    // distributed admission was disabled. A rejected new pin
+                    // or receiver checkpoint is definitively not proposed;
+                    // move the exact attempt into durable rollback instead
+                    // of retrying the same forbidden action forever. Existing
+                    // checkpointed pages can still drain forward.
+                    const next = (try advance(current, .cancel_receiver)).advance;
+                    if (!try self.compare_and_set(self.ptr, current, next, canceled))
+                        return error.OnlineMergeRevisionChanged;
+                    return next;
+                };
                 return current;
             },
             .advance => |next| {
@@ -536,6 +549,37 @@ test "metadata transition driver online observation lives through ambiguous effe
     fake.fail = false;
     try std.testing.expect(initial.eql(try driver.step(initial, false)));
     try std.testing.expectEqual(@as(usize, 2), fake.releases);
+}
+
+test "distributed online admission barrier durably cancels a pre-gate attempt" {
+    const Fake = struct {
+        durable: State,
+        effects: usize = 0,
+        fn observe(_: *anyopaque, state: State) !Observation {
+            return .{ .scope = state.scope };
+        }
+        fn execute(ptr: *anyopaque, _: State, action: Action, _: *const Observation) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = action.source_command.admit;
+            self.effects += 1;
+            return error.OnlineMergeArtifactCatalogUncoordinated;
+        }
+        fn cas(ptr: *anyopaque, previous: State, next: State, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.durable.eql(previous)) return false;
+            self.durable = next;
+            return true;
+        }
+    };
+    const initial = testState();
+    var fake: Fake = .{ .durable = initial };
+    var driver: Driver = .{ .ptr = &fake, .capabilities = .{}, .observe = Fake.observe, .execute = Fake.execute, .compare_and_set = Fake.cas };
+    inline for (std.meta.fields(Capabilities)) |field| @field(driver.capabilities, field.name) = true;
+    const next = try driver.step(initial, false);
+    try std.testing.expectEqual(Phase.cancel_receiver, next.phase);
+    try std.testing.expect(fake.durable.eql(next));
+    try std.testing.expectEqual(@as(usize, 1), fake.effects);
+    try std.testing.expectEqual(Action.cancel_receiver, (try decide(next, .{ .scope = next.scope }, false)).execute);
 }
 
 test "metadata transition driver online bounded effect retries survive lost metadata CAS" {

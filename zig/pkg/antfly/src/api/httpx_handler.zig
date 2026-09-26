@@ -383,7 +383,7 @@ fn witnessDDLError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         error.ReservedForeignKeySupportIndex => jsonErrorResponse(ctx, 400, "__fk_partial_ indexes are server-owned foreign-key support; edit or retire the foreign key instead"),
         error.ForeignKeyPartialSupportIndexConflict => jsonErrorResponse(ctx, 409, "foreign-key support index name conflicts with an existing definition"),
         error.ForeignKeyPartialSupportIndexRequired, error.RelationalIndexNotReady => jsonErrorResponse(ctx, 409, "foreign-key support changed or is still building; refresh the schema and retry"),
-        error.ForeignKeyInitialSelfReferenceUnsupported => jsonErrorResponse(ctx, 409, "initial self-referential foreign keys need child-owner publication; create the table first, then add the constraint"),
+        error.ForeignKeyInitialSelfReferenceUnsupported => jsonErrorResponse(ctx, 409, "initial self-referential foreign-key publication is unavailable on this deployment; no table was created"),
         error.ForeignKeyTargetNotUnique, error.ForeignKeyTypeMismatch, error.ForeignKeyParentTableNotFound => jsonErrorResponse(ctx, 400, "foreign key requires an existing parent with a matching ordered unique key and compatible scalar column types"),
         error.TableGenerationChanged, error.SchemaVersionChanged, error.TableTransitionActive, error.ConstraintRetirementInProgress => jsonErrorResponse(ctx, 409, "parent schema changed or has active maintenance; refresh and retry"),
         error.MetadataUnavailable, error.NotLeader, error.ProposalDropped => jsonErrorResponse(ctx, 503, "foreign-key support metadata is unavailable; retry"),
@@ -3113,6 +3113,10 @@ pub const AntflyApiHandler = struct {
             error.RetainedEffectsFull => retainedPressureResponse(ctx, true),
             error.InvalidArgument => textResponse(ctx, 400, "invalid batch request"),
             error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
+            error.OnlineMergeArtifactCatalogUncoordinated => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
+                break :blk textResponse(ctx, 409, "OnlineMergeArtifactCatalogUncoordinated");
+            },
             error.EnrichmentWaitCanceled,
             error.EnrichmentWaitTimeout,
             error.EnrichmentRetryInProgress,
@@ -3539,6 +3543,10 @@ pub const AntflyApiHandler = struct {
                 break :blk textResponse(ctx, 409, "topology changed");
             },
             error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
+            error.OnlineMergeArtifactCatalogUncoordinated => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
+                break :blk textResponse(ctx, 409, "OnlineMergeArtifactCatalogUncoordinated");
+            },
             error.EnrichmentWaitCanceled,
             error.EnrichmentWaitTimeout,
             error.EnrichmentRetryInProgress,

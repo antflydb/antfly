@@ -617,6 +617,7 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_online_source_command, .err = error.InvalidOnlineSourceCommand },
     .{ .status = .online_source_corrupt, .err = error.OnlineSourceCorrupt },
     .{ .status = .online_source_scope_changed, .err = error.OnlineSourceScopeChanged },
+    .{ .status = .online_merge_artifact_catalog_uncoordinated, .err = error.OnlineMergeArtifactCatalogUncoordinated },
     .{ .status = .invalid_retained_effects_admission, .err = error.InvalidRetainedEffectsAdmission },
     .{ .status = .retained_effects_consumer_limit, .err = error.RetainedEffectsConsumerLimit },
     .{ .status = .retained_effects_corrupt, .err = error.RetainedEffectsCorrupt },

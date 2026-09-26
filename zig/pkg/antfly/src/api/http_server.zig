@@ -13285,7 +13285,6 @@ pub const ApiHttpServer = struct {
             error.EnrichmentWorkerFailed => return error.CommittedRepairRequired,
             error.AbortDecisionNotDurable,
             error.TransactionBeginFailed,
-            error.TransactionPrepareAbortedUnavailable,
             error.PortableImportPublicationInProgress,
             error.PortableImportRecoveryRequired,
             error.PortableRuntimeActivationPending,
@@ -13294,6 +13293,10 @@ pub const ApiHttpServer = struct {
                     std.log.warn("public batch unavailable table={s} class={s}", .{ table_name, @errorName(err) });
                 return error.WriteUnavailable;
             },
+            // This marker exists only after every contacted participant has
+            // a durable abort. Unlike generic 503, the batch cannot later
+            // commit, so callers may safely retry with a new attempt.
+            error.TransactionPrepareAbortedUnavailable => return error.WriteDefinitelyAbortedUnavailable,
             error.CatalogRoutingSnapshotTimeout,
             error.CatalogRoutingUnavailable,
             error.CatalogProjectionRefreshRequired,
@@ -22644,7 +22647,7 @@ fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !contex
         error.RestoreJobPersistenceUnavailable => try contextualJsonErrorResponse(alloc, 503, "durable restore store unavailable"),
         error.RestoreJobCapacityExceeded => try contextualJsonErrorResponse(alloc, 503, "restore job history is at capacity"),
         error.RestoreJobRecordTooLarge, error.TooManyRestoreTables => try contextualJsonErrorResponse(alloc, 400, "restore request is too large"),
-        error.RestoreNewAdmissionGuarded => try contextualJsonErrorResponse(alloc, 501, "portable foreign-key restore is pending distributed fault validation"),
+        error.RestoreNewAdmissionGuarded => try contextualJsonErrorResponse(alloc, 501, "independent portable foreign-key restore is unavailable; use a sealed, dependency-complete cluster backup and restore"),
         error.DuplicateRestoreTableName => try contextualJsonErrorResponse(alloc, 400, "restore request contains duplicate table names"),
         else => try contextualJsonErrorResponse(alloc, 500, "failed to create restore job"),
     };
@@ -24076,7 +24079,7 @@ fn contextualWitnessDDLError(alloc: std.mem.Allocator, err: anyerror) !contextua
         error.ReservedForeignKeySupportIndex => contextualJsonErrorResponse(alloc, 400, "__fk_partial_ indexes are server-owned foreign-key support; edit or retire the foreign key instead"),
         error.ForeignKeyPartialSupportIndexConflict => contextualJsonErrorResponse(alloc, 409, "foreign-key support index name conflicts with an existing definition"),
         error.ForeignKeyPartialSupportIndexRequired, error.RelationalIndexNotReady => contextualJsonErrorResponse(alloc, 409, "foreign-key support changed or is still building; refresh the schema and retry"),
-        error.ForeignKeyInitialSelfReferenceUnsupported => contextualJsonErrorResponse(alloc, 409, "initial self-referential foreign keys need child-owner publication; create the table first, then add the constraint"),
+        error.ForeignKeyInitialSelfReferenceUnsupported => contextualJsonErrorResponse(alloc, 409, "initial self-referential foreign-key publication is unavailable on this deployment; no table was created"),
         error.ForeignKeyTargetNotUnique, error.ForeignKeyTypeMismatch, error.ForeignKeyParentTableNotFound => contextualJsonErrorResponse(alloc, 400, "foreign key requires an existing parent with a matching ordered unique key and compatible scalar column types"),
         error.TableGenerationChanged, error.SchemaVersionChanged, error.TableTransitionActive, error.ConstraintRetirementInProgress => contextualJsonErrorResponse(alloc, 409, "parent schema changed or has active maintenance; refresh and retry"),
         error.MetadataUnavailable, error.NotLeader, error.ProposalDropped => contextualRetryableTextResponse(alloc, 503, "foreign-key support metadata is unavailable; retry"),
@@ -38197,6 +38200,17 @@ test "api http server routes table batches through the batch commit hook" {
         try std.testing.expect(std.mem.indexOf(u8, unknown_resp.body, "write outcome unknown") != null);
         try std.testing.expectEqual(calls_before + 1, writes.batch_commit_calls);
     }
+
+    writes.commit_error = error.TransactionPrepareAbortedUnavailable;
+    var aborted_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = batch_body,
+    });
+    defer aborted_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), aborted_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, aborted_resp.body, "transaction_precommit_aborted") != null);
 
     for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress }) |wait_err| {
         writes.commit_error = wait_err;

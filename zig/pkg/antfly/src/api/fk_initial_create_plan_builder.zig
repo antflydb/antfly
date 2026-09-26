@@ -13,6 +13,20 @@ const tables = @import("tables.zig");
 const platform_time = @import("antfly_platform").time;
 const existing = @import("fk_generation_plan_builder.zig");
 
+fn retirementScopeForDeployment(mode: @import("../common/config.zig").DeploymentMode) publication.InitialRetirementScope {
+    return switch (mode) {
+        .standalone, .embedded => .local_owner,
+        .distributed, .serverless => .hosted_store,
+    };
+}
+
+test "initial FK retirement scope is trusted deployment policy, not a client option" {
+    try std.testing.expectEqual(publication.InitialRetirementScope.local_owner, retirementScopeForDeployment(.standalone));
+    try std.testing.expectEqual(publication.InitialRetirementScope.local_owner, retirementScopeForDeployment(.embedded));
+    try std.testing.expectEqual(publication.InitialRetirementScope.hosted_store, retirementScopeForDeployment(.distributed));
+    try std.testing.expectEqual(publication.InitialRetirementScope.hosted_store, retirementScopeForDeployment(.serverless));
+}
+
 fn parentsSettled(tables_snapshot: []const records.TableRecord, child_name: []const u8, derived: []const publication.DerivedTransition) !bool {
     var pending = false;
     for (derived) |item| {
@@ -207,6 +221,7 @@ pub fn build(
     }.less);
     const plan: publication.InitialCreatePlan = .{
         .id = id,
+        .retirement_scope = retirementScopeForDeployment(server.cfg.deployment_mode),
         .catalog_id = prepared.catalog_id,
         .expected_catalog_revision = prepared.expected_catalog_revision,
         .tablespace_id = prepared.tablespace_id,

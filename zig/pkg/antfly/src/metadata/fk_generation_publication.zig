@@ -104,25 +104,108 @@ pub fn initialGroupPrefixForGroup(buf: []u8, metadata_group_id: u64) ![]const u8
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:fk_initial_group:{d}:", .{metadata_group_id});
 }
 
-/// Point-resolvable hidden owner authority. The group reservation binds both
-/// the immutable plan and the child table so placement apply never scans all
-/// active publications to validate an unpublished group.
+/// Physical retirement is bound to the ingress-selected owner contract.
+/// Local AICH retirement is not interchangeable with hosted per-store work.
+pub const InitialRetirementScope = enum(u8) {
+    local_owner = 0,
+    hosted_store = 1,
+};
+
+/// Immutable identity carried by v17 hidden-placement transitions. It is
+/// deliberately independent of the placement version CAS: a stale leader's
+/// command for a recycled group cannot mutate a later CREATE reservation.
+pub const InitialPlacementProof = struct {
+    plan_id: Id,
+    plan_digest: Digest,
+    child_table_id: u64,
+    range_id: u64,
+
+    pub fn fromReservation(reservation: InitialGroupReservation) @This() {
+        return .{
+            .plan_id = reservation.plan_id,
+            .plan_digest = reservation.plan_digest,
+            .child_table_id = reservation.child_table_id,
+            .range_id = reservation.range_id,
+        };
+    }
+
+    pub fn identityMatches(self: @This(), reservation: InitialGroupReservation) bool {
+        return reservation.retirement_scope == .hosted_store and
+            self.child_table_id == reservation.child_table_id and
+            self.range_id == reservation.range_id and
+            std.mem.eql(u8, &self.plan_id, &reservation.plan_id) and
+            std.mem.eql(u8, &self.plan_digest, &reservation.plan_digest);
+    }
+
+    pub fn activeMatches(self: @This(), reservation: InitialGroupReservation) bool {
+        return !reservation.canceled and self.identityMatches(reservation);
+    }
+};
+
+/// Point-resolvable hidden owner authority. A canceled reservation remains as
+/// an immutable group-to-plan/range proof, but is not by itself authorization
+/// to retire any physical replica: that requires exact per-replica work/ACKs.
 pub const InitialGroupReservation = struct {
+    const magic = "IFGR";
+    const version: u8 = 2;
+    pub const encoded_len = 104;
+
     plan_id: Id,
     child_table_id: u64,
+    range_id: u64,
+    plan_digest: Digest,
+    retirement_scope: InitialRetirementScope,
+    canceled: bool = false,
 
-    pub fn encode(self: @This()) [24]u8 {
-        var bytes: [24]u8 = undefined;
-        @memcpy(bytes[0..16], &self.plan_id);
-        std.mem.writeInt(u64, bytes[16..24], self.child_table_id, .little);
+    pub fn encode(self: @This()) [encoded_len]u8 {
+        var bytes: [encoded_len]u8 = @splat(0);
+        @memcpy(bytes[0..4], magic);
+        bytes[4] = version;
+        bytes[5] = @intFromBool(self.canceled);
+        bytes[6] = @intFromEnum(self.retirement_scope);
+        @memcpy(bytes[8..24], &self.plan_id);
+        std.mem.writeInt(u64, bytes[24..32], self.child_table_id, .little);
+        std.mem.writeInt(u64, bytes[32..40], self.range_id, .little);
+        @memcpy(bytes[40..72], &self.plan_digest);
+        var checksum: Digest = undefined;
+        std.crypto.hash.Blake3.hash(bytes[0 .. encoded_len - 32], &checksum, .{});
+        @memcpy(bytes[encoded_len - 32 ..], &checksum);
         return bytes;
     }
 
     pub fn decode(bytes: []const u8) !@This() {
-        if (bytes.len != 24) return error.InvalidGenerationPublication;
-        return .{ .plan_id = bytes[0..16].*, .child_table_id = std.mem.readInt(u64, bytes[16..24], .little) };
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], magic) or bytes[4] != version or
+            bytes[5] > 1 or bytes[6] > @intFromEnum(InitialRetirementScope.hosted_store) or bytes[7] != 0) return error.InvalidGenerationPublication;
+        const id: Id = bytes[8..24].*;
+        const table_id = std.mem.readInt(u64, bytes[24..32], .little);
+        const range_id = std.mem.readInt(u64, bytes[32..40], .little);
+        const digest: Digest = bytes[40..72].*;
+        if (std.mem.allEqual(u8, &id, 0) or table_id == 0 or range_id == 0 or
+            std.mem.allEqual(u8, &digest, 0)) return error.InvalidGenerationPublication;
+        var checksum: Digest = undefined;
+        std.crypto.hash.Blake3.hash(bytes[0 .. encoded_len - 32], &checksum, .{});
+        if (!std.mem.eql(u8, &checksum, bytes[encoded_len - 32 ..])) return error.InvalidGenerationPublication;
+        return .{ .plan_id = id, .child_table_id = table_id, .range_id = range_id, .plan_digest = digest, .retirement_scope = @enumFromInt(bytes[6]), .canceled = bytes[5] == 1 };
     }
 };
+
+test "initial FK group reservation binds exact canceled range proof" {
+    const reservation: InitialGroupReservation = .{ .plan_id = @splat(1), .child_table_id = 17, .range_id = 29, .plan_digest = @splat(3), .retirement_scope = .hosted_store };
+    const active = reservation.encode();
+    try std.testing.expectEqualDeep(reservation, try InitialGroupReservation.decode(&active));
+    var terminal = reservation;
+    terminal.canceled = true;
+    const canceled = terminal.encode();
+    try std.testing.expectEqualDeep(terminal, try InitialGroupReservation.decode(&canceled));
+    try std.testing.expect(!std.mem.eql(u8, &active, &canceled));
+    var corrupt = canceled;
+    corrupt[32] ^= 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, InitialGroupReservation.decode(&corrupt));
+    var obsolete = active;
+    obsolete[4] = 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, InitialGroupReservation.decode(&obsolete));
+    try std.testing.expectError(error.InvalidGenerationPublication, InitialGroupReservation.decode(canceled[0 .. canceled.len - 1]));
+}
 
 pub const Transition = struct {
     child_table_id: u64,
@@ -423,6 +506,7 @@ fn supportIndexIncarnation(alloc: std.mem.Allocator, before: records.TableRecord
 /// generation. It deliberately does not invent an old schema/source receipt.
 pub const InitialCreatePlan = struct {
     id: Id,
+    retirement_scope: InitialRetirementScope,
     catalog_id: u64,
     expected_catalog_revision: u64,
     tablespace_id: u64 = 0,
@@ -835,6 +919,7 @@ pub const InitialPublication = struct {
                 try sealed.validate(alloc);
                 if (sealed.catalog_id != self.plan.catalog_id or sealed.namespace_id != self.plan.namespace_id or
                     sealed.expected_catalog_revision != self.plan.expected_catalog_revision or
+                    sealed.retirement_scope != self.plan.retirement_scope or
                     sealed.tablespace_id != self.plan.tablespace_id or
                     sealed.min_ranges_explicit != self.plan.min_ranges_explicit or
                     !std.mem.eql(u8, sealed.logical_name, self.plan.logical_name) or

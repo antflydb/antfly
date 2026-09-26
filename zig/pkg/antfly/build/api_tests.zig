@@ -995,6 +995,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api http client preserves committed visibility outcomes for forwarded raft batches",
             "api http client rejects unsupported routed batch protocol without legacy replay",
             "api http client requires explicit not-proposed marker and tracks delivery phase",
+            "online merge catalog rejection requires a not-proposed receipt before cancellation",
             "raft batch aggregation makes failures after an accepted group non-retryable",
             "prepared raft apply reclassifies every transient pre-mutation writer conflict",
             "stateless batch retries are bounded and exclude explicit OCC",
@@ -1082,6 +1083,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "retained read owner",
             "retained read RPC",
             "retained read client",
+            "api http client preserves public batch retry safety classifications",
             "relational row query response budget",
             "relational statement retries unavailable capture and releases fences before pages or deadline",
             "relational row query full-key index proof requires every routed owner",
@@ -2127,7 +2129,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     hosted_self_fk_test_mod.addImport("usermgr_storage", hosted_self_fk_usermgr_storage);
     const hosted_self_fk_guard_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
-        .filters = &.{ "mounted hosted self-FK public admission remains guarded", "public ordinary self-FK publication remains guarded before metadata admission" },
+        .filters = &.{ "mounted hosted self-FK public admission remains guarded", "public ordinary self-FK publication remains guarded before metadata admission", "self-FK diagnostic retries only a proven durable precommit abort" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-self-fk-guard-test", "Run mounted public self-FK admission guard regression")

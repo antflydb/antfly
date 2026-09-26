@@ -102,11 +102,71 @@ fn table(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []c
     return request(alloc, transport, headers, base, "/db/v1/tables/nodes", .GET, null);
 }
 fn batchOnce(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, body: []const u8) !http.HttpResponse {
+    return batchOnceWithTimeout(alloc, transport, headers, base, body, 15_000);
+}
+fn batchOnceWithTimeout(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, body: []const u8, timeout_ms: u32) !http.HttpResponse {
     const uri = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/nodes/batch", .{base});
     defer alloc.free(uri);
     // A write with a lost reply can have committed. The fixture never retries
     // generic 503 or transport failures without an exact durable receipt.
-    return transport.execute(alloc, .{ .method = .POST, .uri = uri, .headers = headers, .content_type = "application/json", .body = body, .timeout_ms = 15_000 });
+    return transport.execute(alloc, .{ .method = .POST, .uri = uri, .headers = headers, .content_type = "application/json", .body = body, .timeout_ms = timeout_ms });
+}
+fn definitelyAbortedBeforeCommit(alloc: std.mem.Allocator, response: http.HttpResponse) bool {
+    if (response.status != 503 or response.body.len > 1024) return false;
+    var parsed = std.json.parseFromSlice(struct { code: []const u8, retryable: bool }, alloc, response.body, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    return parsed.value.retryable and std.mem.eql(u8, parsed.value.code, "transaction_precommit_aborted");
+}
+fn batchAfterDefiniteAbort(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, body: []const u8) !http.HttpResponse {
+    const deadline = platform.time.monotonicNs() +| 20 * std.time.ns_per_s;
+    for (0..8) |attempt| {
+        const remaining_ms = @max(@as(u64, 1), (deadline -| platform.time.monotonicNs()) / std.time.ns_per_ms);
+        var response = try batchOnceWithTimeout(alloc, transport, headers, base, body, @intCast(@min(remaining_ms, 15_000)));
+        if (!definitelyAbortedBeforeCommit(alloc, response) or attempt == 7 or platform.time.monotonicNs() >= deadline) return response;
+        response.deinit(alloc);
+        try io.sleep(.fromMilliseconds(@min(@as(u64, 50), (deadline -| platform.time.monotonicNs()) / std.time.ns_per_ms)), .awake);
+    }
+    unreachable;
+}
+
+test "self-FK diagnostic retries only a proven durable precommit abort" {
+    const Mode = enum { proven_abort, generic_unavailable, unknown_outcome, malformed, transport_failure };
+    const Fake = struct {
+        mode: Mode,
+        calls: usize = 0,
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.mode == .transport_failure) return error.ConnectionResetByPeer;
+            const response: struct { status: u16, body: []const u8 } = switch (self.mode) {
+                .proven_abort => if (self.calls == 1)
+                    .{ .status = @as(u16, 503), .body = "{\"code\":\"transaction_precommit_aborted\",\"retryable\":true}" }
+                else
+                    .{ .status = @as(u16, 201), .body = "{}" },
+                .generic_unavailable => .{ .status = @as(u16, 503), .body = "write unavailable" },
+                .unknown_outcome => .{ .status = @as(u16, 409), .body = "write outcome unknown" },
+                .malformed => .{ .status = @as(u16, 503), .body = "{\"code\":\"transaction_precommit_aborted\",\"retryable\":false}" },
+                .transport_failure => unreachable,
+            };
+            return .{ .status = response.status, .body = try alloc.dupe(u8, response.body) };
+        }
+    };
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    inline for (std.meta.tags(Mode)) |mode| {
+        var fake: Fake = .{ .mode = mode };
+        const executor: http.RequestExecutor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } };
+        const result = batchAfterDefiniteAbort(std.testing.allocator, io_impl.io(), executor, &.{}, "http://owner.invalid", "{}");
+        if (mode == .transport_failure) {
+            try std.testing.expectError(error.ConnectionResetByPeer, result);
+        } else {
+            var response = try result;
+            defer response.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u16, if (mode == .proven_abort) 201 else if (mode == .unknown_outcome) 409 else 503), response.status);
+        }
+        try std.testing.expectEqual(@as(usize, if (mode == .proven_abort) 2 else 1), fake.calls);
+    }
 }
 fn awaitTable(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8) !u64 {
     for (0..600) |_| {
@@ -1085,12 +1145,25 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
         const api = metadata.server.owned_public_http_server orelse return error.PublicationSupervisorUnavailable;
         const reads = api.table_reads orelse return error.OwnerReadNotReady;
         for ([_][]const u8{ "during-fence-leader-probe", "during-fence-follower-probe" }) |key| {
-            var visible = try reads.lookup(alloc, physical.name, key, .{
-                .execution_deadline_ns = platform.time.monotonicNs() +| 5 * std.time.ns_per_s,
-            }, .read_index);
-            if (visible) |*response| {
-                response.deinit(alloc);
-                return error.FencedWriteCommitted;
+            // A transferred owner may be reopening after publication. Retry
+            // only this linearizable read; never replay an ambiguous write.
+            const deadline = platform.time.monotonicNs() +| 20 * std.time.ns_per_s;
+            while (true) {
+                var visible = reads.lookup(alloc, physical.name, key, .{
+                    .execution_deadline_ns = @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s),
+                }, .read_index) catch |err| switch (err) {
+                    error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerUnavailable, error.ConcurrencyUnavailable => {
+                        if (platform.time.monotonicNs() >= deadline) return err;
+                        try io.sleep(.fromMilliseconds(20), .awake);
+                        continue;
+                    },
+                    else => return err,
+                };
+                if (visible) |*response| {
+                    response.deinit(alloc);
+                    return error.FencedWriteCommitted;
+                }
+                break;
             }
         }
         if (probe_unproven) return error.FencedWriteProbeUnproven;
@@ -1128,9 +1201,20 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
     try std.testing.expect(!try hasSelfFk(alloc, after_drop));
     const restarted_physical = try tableGroup(alloc, &metadata, table_id);
     defer alloc.free(restarted_physical.name);
+    if (leader_transfer) {
+        _ = try awaitThreeVoters(io, &data, .{ peers[0].?, peers[1].? }, restarted_physical.group_id);
+    }
     try awaitRestartedLocalIntegrityCatalog(alloc, io, &data, restarted_physical.name, restarted_physical.group_id);
-    var released = try batchOnce(alloc, transport, &headers, restarted_base, "{\"deletes\":[\"p\"],\"sync_level\":\"full_text\"}");
+    if (leader_transfer) {
+        // The restarted endpoint may forward the final write to either
+        // voter. Verify every current owner can serve a linearizable read
+        // before the mutation; only an exact durable-abort response permits
+        // retry, never an ambiguous write or generic 503.
+        for (peers) |peer| try awaitRestartedLocalIntegrityCatalog(alloc, io, &peer.?.server, restarted_physical.name, restarted_physical.group_id);
+    }
+    var released = try batchAfterDefiniteAbort(alloc, io, transport, &headers, restarted_base, "{\"deletes\":[\"p\"],\"sync_level\":\"full_text\"}");
     defer released.deinit(alloc);
+    if (released.status != 201) std.debug.print("self-FK post-restart delete status={d} body={s}\n", .{ released.status, released.body });
     try std.testing.expectEqual(@as(u16, 201), released.status);
 }
 

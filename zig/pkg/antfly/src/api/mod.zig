@@ -110,6 +110,7 @@ pub const TableWriteSource = table_writes.TableWriteSource;
 pub const BoundTableWriteSource = table_writes.BoundTableWriteSource;
 pub const ProvisionedTableWriteCache = table_writes.ProvisionedTableWriteCache;
 pub const ProvisionedTableWriteSource = table_writes.ProvisionedTableWriteSource;
+pub const InitialChildRetirementObservation = table_writes.InitialChildRetirementObservation;
 pub const ProvisionedKernelOwnerSource = kernel_owner_source.ProvisionedKernelOwnerSource;
 pub const HostedProvisionedTableWriteSource = table_writes.HostedProvisionedTableWriteSource;
 pub const HostedGroupRouter = table_router.HostedGroupRouter;

@@ -49,6 +49,11 @@ pub const apply_contract = @import("raft_apply_contract.zig");
 const platform_time = @import("antfly_platform").time;
 const restore_staging = @import("../restore_staging.zig");
 const fk_generation_publication = @import("../fk_generation_publication.zig");
+const fk_initial_retirement = @import("../fk_initial_retirement.zig");
+const fk_initial_retirement_ack = @import("../fk_initial_retirement_ack.zig");
+const fk_initial_retirement_auth = @import("../fk_initial_retirement_auth.zig");
+const fk_initial_retirement_contract = @import("../fk_initial_retirement_contract.zig");
+const fk_initial_retirement_wire = @import("../fk_initial_retirement_wire.zig");
 
 pub const AppliedMetadataCheckpoint = apply_contract.AppliedMetadataCheckpoint;
 const checkpoint_magic = "AMCKPT\x00\x00";
@@ -268,6 +273,7 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
     std.mem.writeInt(u64, id[8..16], 2, .little);
     const plan: fk_generation_publication.InitialCreatePlan = .{
         .id = id,
+        .retirement_scope = .local_owner,
         .catalog_id = prepared.value.catalog_id,
         .expected_catalog_revision = prepared.value.expected_catalog_revision,
         .child = bound_child,
@@ -465,6 +471,7 @@ test "initial self FK resumes the second hidden range after a durable owner rece
     std.mem.writeInt(u64, id[8..16], 2, .little);
     const plan: fk_generation_publication.InitialCreatePlan = .{
         .id = id,
+        .retirement_scope = .local_owner,
         .catalog_id = prepared.value.catalog_id,
         .expected_catalog_revision = prepared.value.expected_catalog_revision,
         .min_ranges_explicit = true,
@@ -520,6 +527,59 @@ test "initial self FK resumes the second hidden range after a durable owner rece
     try std.testing.expect(next_work.value.?.target.child.group_id != first_group);
 }
 
+test "canceled hidden reservation permits only exact tagged placement removal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/canceled-hidden-removal", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const metadata_group_id = group_ids.main_metadata_group_id;
+    const range_group_id: u64 = 9171;
+    const node_id: u64 = 8;
+    const reservation: fk_generation_publication.InitialGroupReservation = .{
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .child_table_id = 71,
+        .range_id = 9,
+        .retirement_scope = .hosted_store,
+        .canceled = true,
+    };
+    const proof = fk_generation_publication.InitialPlacementProof.fromReservation(reservation);
+    var invalid_proof = proof;
+    invalid_proof.plan_id = @splat(0);
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, encodeTransitionCommand(alloc, .{
+        .remove_fk_initial_replica_intent = .{
+            .proof = invalid_proof,
+            .group_id = range_group_id,
+            .local_node_id = node_id,
+            .expected_metadata_version = 1,
+        },
+    }));
+    var txn = try store.store.beginWriteTxn();
+    defer txn.abort();
+    var group_key_buf: [160]u8 = undefined;
+    const reservation_bytes = reservation.encode();
+    try txn.put(try fk_generation_publication.initialGroupKey(&group_key_buf, metadata_group_id, range_group_id), &reservation_bytes);
+    var placement_key_buf: [192]u8 = undefined;
+    const placement_key = try placementKeyForGroup(&placement_key_buf, metadata_group_id, range_group_id, node_id);
+    const encoded = try encodePlacementIntent(alloc, .{
+        .record = .{ .group_id = range_group_id, .replica_id = 3, .local_node_id = node_id, .metadata_version = 1 },
+        .store_id = 30,
+        .peer_node_ids = &.{node_id},
+    });
+    defer alloc.free(encoded);
+    try txn.put(placement_key, encoded);
+    try std.testing.expect(!(try RaftApplyStore.initialPlacementProofMatchesTxn(&txn, metadata_group_id, range_group_id, proof, false)));
+    var forged = proof;
+    forged.plan_digest[0] ^= 1;
+    try store.applyPlacementRemoveIfVersionTxn(&txn, metadata_group_id, range_group_id, node_id, 1, forged);
+    try std.testing.expect((try txn.get(placement_key)).len != 0);
+    try store.applyPlacementRemoveIfVersionTxn(&txn, metadata_group_id, range_group_id, node_id, 1, proof);
+    try std.testing.expectError(error.NotFound, txn.get(placement_key));
+}
+
 test "FK generation publication initial create reserves hidden identity before any public route" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -564,6 +624,7 @@ test "FK generation publication initial create reserves hidden identity before a
     };
     const plan: fk_generation_publication.InitialCreatePlan = .{
         .id = id,
+        .retirement_scope = .hosted_store,
         .catalog_id = candidate.catalog_id,
         .expected_catalog_revision = candidate.expected_catalog_revision,
         .tablespace_id = candidate.tablespace_id,
@@ -572,6 +633,12 @@ test "FK generation publication initial create reserves hidden identity before a
         .logical_name = "child",
         .namespace_id = system_catalog.default_namespace_id,
         .parents = &.{.{ .table = parent, .ranges = &.{parent_range}, .fences = &.{parent_fence}, .transitions = &.{derived[0].transition} }},
+    };
+    const hidden_proof: fk_generation_publication.InitialPlacementProof = .{
+        .plan_id = plan.id,
+        .plan_digest = try plan.digest(alloc),
+        .child_table_id = plan.child.table_id,
+        .range_id = plan.child_ranges[0].range_id,
     };
     var forged_placement = plan;
     forged_placement.child.placement_role = "archive";
@@ -633,6 +700,225 @@ test "FK generation publication initial create reserves hidden identity before a
     defer decision.deinit();
     try std.testing.expect(!decision.value.routable);
     try std.testing.expectEqual(candidate.child.table_id, decision.value.child.table_id);
+    // The owner may disappear from current placement before cancel. Its
+    // admission history and eventual retirement work must survive removal.
+    try store.applyStandaloneCommand(group_id, .{ .register_node = .{ .node_id = 8, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
+    try store.applyStandaloneCommand(group_id, .{ .upsert_fk_initial_replica_intent = .{
+        .proof = hidden_proof,
+        .expected_metadata_version = null,
+        .expected_version_fence = 0,
+        .expected_target_drain_requested = false,
+        .replacement = .{ .record = .{ .group_id = candidate.child_ranges[0].group_id, .replica_id = 2, .local_node_id = 8 }, .store_id = 0, .peer_node_ids = &.{8} },
+    } });
+    const rejected_unbound = try store.listPlacementIntents(alloc, group_id);
+    defer store.freePlacementIntents(alloc, rejected_unbound);
+    try std.testing.expectEqual(@as(usize, 0), rejected_unbound.len);
+    try store.applyStandaloneCommand(group_id, .{ .register_store = .{
+        .store_id = 30,
+        .node_id = 8,
+        .reporter_incarnation = 17,
+        .role = "data",
+    } });
+    try store.applyStandaloneCommand(group_id, .{ .upsert_fk_initial_replica_intent = .{
+        .proof = hidden_proof,
+        .expected_metadata_version = null,
+        .expected_version_fence = 0,
+        .expected_target_drain_requested = false,
+        .replacement = .{ .record = .{ .group_id = candidate.child_ranges[0].group_id, .replica_id = 2, .local_node_id = 8 }, .store_id = 30, .peer_node_ids = &.{8} },
+    } });
+    const rejected_missing_root = try store.listPlacementIntents(alloc, group_id);
+    defer store.freePlacementIntents(alloc, rejected_missing_root);
+    try std.testing.expectEqual(@as(usize, 0), rejected_missing_root.len);
+    try store.applyStandaloneCommand(group_id, .{ .register_store = .{
+        .store_id = 30,
+        .node_id = 8,
+        .reporter_incarnation = 17,
+        .replica_root_incarnation = 41,
+        .role = "data",
+    } });
+    try store.applyStandaloneCommand(group_id, .{ .upsert_fk_initial_replica_intent = .{
+        .proof = hidden_proof,
+        .expected_metadata_version = null,
+        .expected_version_fence = 0,
+        .expected_target_drain_requested = false,
+        .replacement = .{ .record = .{ .group_id = candidate.child_ranges[0].group_id, .replica_id = 2, .local_node_id = 8 }, .store_id = 30, .peer_node_ids = &.{8} },
+    } });
+    const admitted = try store.listPlacementIntents(alloc, group_id);
+    defer store.freePlacementIntents(alloc, admitted);
+    const hidden_placement = for (admitted) |item| {
+        if (item.record.group_id == candidate.child_ranges[0].group_id and item.record.local_node_id == 8) break item;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(hidden_placement.record.initial_fk_root_generation != 0);
+    const admitted_replica: fk_initial_retirement.Replica = .{
+        .plan_id = plan.id,
+        .plan_digest = try plan.digest(alloc),
+        .child_table_id = candidate.child.table_id,
+        .group_id = candidate.child_ranges[0].group_id,
+        .range_id = candidate.child_ranges[0].range_id,
+        .node_id = 8,
+        .store_id = 30,
+        .store_incarnation = 17,
+        .store_root_incarnation = 41,
+        .replica_id = 2,
+        .root_generation = hidden_placement.record.initial_fk_root_generation,
+    };
+    const signing_seed: [32]u8 = @splat(7);
+    const signing_key_pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(signing_seed);
+    const signing_root: @import("../../storage/db/root_signing_identity.zig").State = .{
+        .root_incarnation = admitted_replica.store_root_incarnation,
+        .seed = signing_seed,
+        .public_key = signing_key_pair.public_key.toBytes(),
+    };
+    // Signing may be introduced after a v18 rollout, but that physical root
+    // can never swap or strip its verifier through a later registration.
+    try store.applyStandaloneCommand(group_id, .{ .register_store = .{
+        .store_id = 30,
+        .node_id = 8,
+        .reporter_incarnation = 17,
+        .replica_root_incarnation = 41,
+        .replica_root_public_key = signing_root.public_key,
+        .role = "data",
+    } });
+    try store.applyStandaloneCommand(group_id, .{ .register_store = .{
+        .store_id = 30,
+        .node_id = 8,
+        .reporter_incarnation = 18,
+        .replica_root_incarnation = 41,
+        .replica_root_public_key = @splat(8),
+        .role = "data",
+    } });
+    {
+        const visible = (try store.readStore(alloc, group_id, 30, false)).?;
+        defer metadata_table_manager.freeStore(alloc, visible);
+        try std.testing.expectEqualSlices(u8, &signing_root.public_key, &visible.replica_root_public_key);
+        try std.testing.expectEqual(@as(u64, 17), visible.reporter_incarnation);
+    }
+    // A same-physical-root refresh and a process restart preserve both the
+    // root generation and the one historical work item. Re-registering a
+    // replacement disk under the same store ID is rejected while live.
+    try store.applyStandaloneCommand(group_id, .{ .upsert_fk_initial_replica_intent = .{
+        .proof = hidden_proof,
+        .expected_metadata_version = hidden_placement.record.metadata_version,
+        .expected_version_fence = hidden_placement.record.metadata_version,
+        .expected_target_drain_requested = false,
+        .replacement = .{ .record = hidden_placement.record, .store_id = 30, .peer_node_ids = &.{8} },
+    } });
+    const refreshed = try store.listPlacementIntents(alloc, group_id);
+    defer store.freePlacementIntents(alloc, refreshed);
+    const refreshed_placement = for (refreshed) |item| {
+        if (item.record.group_id == admitted_replica.group_id and item.record.local_node_id == 8) break item;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(admitted_replica.root_generation, refreshed_placement.record.initial_fk_root_generation);
+    try store.applyStandaloneCommand(group_id, .{ .register_store = .{
+        .store_id = 30,
+        .node_id = 8,
+        .reporter_incarnation = 18,
+        .replica_root_incarnation = 41,
+        .replica_root_public_key = signing_root.public_key,
+        .role = "data",
+    } });
+    try store.applyStandaloneCommand(group_id, .{ .upsert_fk_initial_replica_intent = .{
+        .proof = hidden_proof,
+        .expected_metadata_version = refreshed_placement.record.metadata_version,
+        .expected_version_fence = refreshed_placement.record.metadata_version,
+        .expected_target_drain_requested = false,
+        .replacement = .{ .record = refreshed_placement.record, .store_id = 30, .peer_node_ids = &.{8} },
+    } });
+    const restarted = try store.listPlacementIntents(alloc, group_id);
+    defer store.freePlacementIntents(alloc, restarted);
+    const restarted_placement = for (restarted) |item| {
+        if (item.record.group_id == admitted_replica.group_id and item.record.local_node_id == 8) break item;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(admitted_replica.root_generation, restarted_placement.record.initial_fk_root_generation);
+    var count_key_buf: [160]u8 = undefined;
+    const count_key = try fk_initial_retirement.groupCountKey(&count_key_buf, group_id, admitted_replica.group_id);
+    {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        const count = try read.get(count_key);
+        try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, count[0..8], .little));
+    }
+    try store.applyStandaloneCommand(group_id, .{ .register_store = .{
+        .store_id = 30,
+        .node_id = 8,
+        .reporter_incarnation = 19,
+        .replica_root_incarnation = 42,
+        .role = "data",
+    } });
+    try store.applyStandaloneCommand(group_id, .{ .remove_store = .{ .store_id = 30 } });
+    {
+        const visible = (try store.readStore(alloc, group_id, 30, false)).?;
+        defer metadata_table_manager.freeStore(alloc, visible);
+        try std.testing.expectEqual(@as(u128, 41), visible.replica_root_incarnation);
+        try std.testing.expectEqual(@as(u64, 18), visible.reporter_incarnation);
+    }
+    try store.applyStandaloneCommand(group_id, .{ .remove_fk_initial_replica_intent = .{
+        .proof = hidden_proof,
+        .group_id = admitted_replica.group_id,
+        .local_node_id = admitted_replica.node_id,
+        .expected_metadata_version = restarted_placement.record.metadata_version,
+    } });
+    {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        var live_count_key_buf: [160]u8 = undefined;
+        try std.testing.expectError(error.NotFound, read.get(try fk_initial_retirement.storeLiveCountKey(&live_count_key_buf, group_id, 30)));
+    }
+    try store.applyStandaloneCommand(group_id, .{ .remove_store = .{ .store_id = 30 } });
+    try std.testing.expect((try store.readStore(alloc, group_id, 30, false)) == null);
+    try store.applyStandaloneCommand(group_id, .{ .register_store = .{
+        .store_id = 30,
+        .node_id = 8,
+        .reporter_incarnation = 19,
+        .replica_root_incarnation = 42,
+        .role = "data",
+    } });
+    {
+        const visible = (try store.readStore(alloc, group_id, 30, false)).?;
+        defer metadata_table_manager.freeStore(alloc, visible);
+        try std.testing.expectEqual(@as(u128, 42), visible.replica_root_incarnation);
+    }
+    // A full plan history rejects a new placement before any placement key is
+    // written. The cap is global across all hidden child ranges, not 4096 per
+    // range, so terminal cancellation has bounded aggregate work.
+    var plan_count_key_buf: [160]u8 = undefined;
+    const plan_count_key = try fk_initial_retirement.planCountKey(&plan_count_key_buf, group_id, candidate.child.table_id);
+    {
+        var write = try store.store.beginWriteTxn();
+        errdefer write.abort();
+        var full: [8]u8 = undefined;
+        std.mem.writeInt(u64, &full, fk_initial_retirement.max_replicas_per_group, .little);
+        try write.put(plan_count_key, &full);
+        try write.commit();
+    }
+    {
+        var write = try store.store.beginWriteTxn();
+        defer write.abort();
+        const fence = try store.loadPlacementVersionFenceTxn(&write, group_id, admitted_replica.group_id, admitted_replica.node_id);
+        try std.testing.expectError(error.InitialFkRetirementHistoryFull, store.applyPlacementCompareAndUpsertTxn(&write, group_id, null, fence, false, .{
+            .record = .{ .group_id = admitted_replica.group_id, .replica_id = 3, .local_node_id = admitted_replica.node_id },
+            .store_id = 30,
+            .peer_node_ids = &.{admitted_replica.node_id},
+        }, hidden_proof));
+    }
+    {
+        var write = try store.store.beginWriteTxn();
+        errdefer write.abort();
+        var one: [8]u8 = undefined;
+        std.mem.writeInt(u64, &one, 1, .little);
+        try write.put(plan_count_key, &one);
+        try write.commit();
+    }
+    {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        var history_key_buf: [256]u8 = undefined;
+        const raw = try read.get(try fk_initial_retirement.groupKey(&history_key_buf, group_id, admitted_replica));
+        try std.testing.expectEqualDeep(admitted_replica, try fk_initial_retirement.Replica.decode(raw));
+    }
+    var active_work = try store.fkInitialRetirementPage(alloc, group_id, 30, null, 1);
+    defer active_work.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), active_work.items.len);
     const wrapped_json = try store.fkInitialCreateWorkJson(alloc, group_id, candidate.child.table_id);
     defer alloc.free(wrapped_json);
     var wrapped = try std.json.parseFromSlice(?fk_generation_publication.InitialWork, alloc, wrapped_json, .{});
@@ -672,6 +958,7 @@ test "FK generation publication initial create reserves hidden identity before a
     };
     const plan2: fk_generation_publication.InitialCreatePlan = .{
         .id = id2,
+        .retirement_scope = .local_owner,
         .catalog_id = candidate2.catalog_id,
         .expected_catalog_revision = candidate2.expected_catalog_revision,
         .tablespace_id = candidate2.tablespace_id,
@@ -804,6 +1091,14 @@ test "FK generation publication initial create reserves hidden identity before a
     var waiting = try std.json.parseFromSlice(fk_generation_publication.InitialPublication, alloc, waiting_json, .{});
     defer waiting.deinit();
     try std.testing.expectEqual(fk_generation_publication.InitialPhase.canceling, waiting.value.phase);
+    var reservation_buf: [160]u8 = undefined;
+    {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        const value = try read.get(try fk_generation_publication.initialGroupKey(&reservation_buf, group_id, candidate.child_ranges[0].group_id));
+        const proof = try fk_generation_publication.InitialGroupReservation.decode(value);
+        try std.testing.expect(!proof.canceled);
+    }
     const waiting_tables = try store.listTables(alloc, group_id);
     defer store.freeTables(alloc, waiting_tables);
     try std.testing.expectEqual(@as(usize, 2), waiting_tables.len);
@@ -850,11 +1145,117 @@ test "FK generation publication initial create reserves hidden identity before a
     }, .{});
     defer alloc.free(parent_cancel_json);
     try recovered.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = parent_cancel_json });
+    var retirement_page = try recovered.fkInitialRetirementPage(alloc, group_id, 30, null, 1);
+    defer retirement_page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), retirement_page.items.len);
+    try std.testing.expect(retirement_page.items[0].canceled);
+    try std.testing.expectEqualDeep(admitted_replica.root_generation, retirement_page.items[0].root_generation);
+    const ticket_page_json = try recovered.fkInitialRetirementTicketPageJson(alloc, group_id, .{ .store_id = 30, .limit = 1 });
+    defer alloc.free(ticket_page_json);
+    var ticket_page = try std.json.parseFromSlice(fk_initial_retirement_wire.PageResponse, alloc, ticket_page_json, .{});
+    defer ticket_page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ticket_page.value.items.len);
+    try std.testing.expectEqualDeep("11111111111111111111111111111111".*, ticket_page.value.items[0].metadata_incarnation);
+    try std.testing.expect(ticket_page.value.items[0].cancel_revision > 0);
+    var canceled_replica = admitted_replica;
+    canceled_replica.canceled = true;
+    try std.testing.expectEqualDeep(canceled_replica, ticket_page.value.items[0].replica);
+    try ticket_page.value.validate(group_id, .{ .store_id = 30, .limit = 1 });
+    const after_ticket_page_json = try recovered.fkInitialRetirementTicketPageJson(alloc, group_id, .{
+        .store_id = 30,
+        .after_key = ticket_page.value.next_key,
+        .limit = 1,
+    });
+    defer alloc.free(after_ticket_page_json);
+    var after_ticket_page = try std.json.parseFromSlice(fk_initial_retirement_wire.PageResponse, alloc, after_ticket_page_json, .{});
+    defer after_ticket_page.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after_ticket_page.value.items.len);
+    var after_retirement = try recovered.fkInitialRetirementPage(alloc, group_id, 30, retirement_page.next_key, 1);
+    defer after_retirement.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), after_retirement.items.len);
+    {
+        var read = try recovered.store.beginReadTxn();
+        defer read.abort();
+        const value = try read.get(try fk_generation_publication.initialGroupKey(&reservation_buf, group_id, candidate.child_ranges[0].group_id));
+        const proof = try fk_generation_publication.InitialGroupReservation.decode(value);
+        try std.testing.expect(proof.canceled);
+        try std.testing.expectEqual(candidate.child_ranges[0].range_id, proof.range_id);
+        try std.testing.expectEqualSlices(u8, &plan_digest, &proof.plan_digest);
+        var work_key_buf: [256]u8 = undefined;
+        const work_raw = try read.get(try fk_initial_retirement.storeKey(&work_key_buf, group_id, admitted_replica));
+        const retirement = try fk_initial_retirement.Replica.decode(work_raw);
+        try std.testing.expect(retirement.canceled);
+        try std.testing.expect(!retirement.acked);
+        try std.testing.expectEqual(admitted_replica.root_generation, retirement.root_generation);
+    }
     const post_terminal_json = try recovered.fkInitialCreateWorkJson(alloc, group_id, candidate2.child.table_id);
     defer alloc.free(post_terminal_json);
     var post_terminal = try std.json.parseFromSlice(?fk_generation_publication.InitialWork, alloc, post_terminal_json, .{});
     defer post_terminal.deinit();
     try std.testing.expectEqual(candidate2.child.table_id, post_terminal.value.?.child_table_id);
+    // Exercise the inert Raft transaction body after a real cancellation.
+    // There is deliberately no proposer or HTTP route until the data owner
+    // can prove and fsync the exact physical unlink before signing.
+    const ticket = ticket_page.value.items[0];
+    const unlinked_intent: fk_initial_retirement_contract.Intent = .{ .ticket = ticket, .phase = .unlinked };
+    const receipt = try fk_initial_retirement_contract.Receipt.fromUnlinkedIntent(unlinked_intent, 18);
+    const signed = try fk_initial_retirement_auth.SignedReceipt.sign(signing_root, receipt);
+    try recovered.applyStandaloneCommand(group_id, .{ .register_store = .{
+        .store_id = 30,
+        .node_id = 8,
+        .reporter_incarnation = 18,
+        .replica_root_incarnation = 41,
+        .replica_root_public_key = signing_root.public_key,
+        .role = "data",
+        .live = false,
+    } });
+    {
+        var txn = try recovered.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.InitialFkRetirementReporterChanged, recovered.ackInitialFkRetirementTxn(&txn, group_id, signed));
+    }
+    try recovered.applyStandaloneCommand(group_id, .{ .register_store = .{
+        .store_id = 30,
+        .node_id = 8,
+        .reporter_incarnation = 18,
+        .replica_root_incarnation = 41,
+        .replica_root_public_key = signing_root.public_key,
+        .role = "data",
+    } });
+    {
+        var forged = signed;
+        forged.signature[0] ^= 1;
+        var txn = try recovered.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.InvalidInitialFkRetirementSignature, recovered.ackInitialFkRetirementTxn(&txn, group_id, forged));
+    }
+    {
+        var txn = try recovered.store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(fk_initial_retirement_ack.Disposition.newly_acked, try recovered.ackInitialFkRetirementTxn(&txn, group_id, signed));
+        try txn.commit();
+    }
+    {
+        var read = try recovered.store.beginReadTxn();
+        defer read.abort();
+        var group_key_buf: [256]u8 = undefined;
+        var store_key_buf: [256]u8 = undefined;
+        const group_work = try fk_initial_retirement.Replica.decode(try read.get(try fk_initial_retirement.groupKey(&group_key_buf, group_id, ticket.replica)));
+        const store_work = try fk_initial_retirement.Replica.decode(try read.get(try fk_initial_retirement.storeKey(&store_key_buf, group_id, ticket.replica)));
+        try std.testing.expect(group_work.acked);
+        try std.testing.expectEqualDeep(group_work, store_work);
+    }
+    {
+        var txn = try recovered.store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(fk_initial_retirement_ack.Disposition.already_acked, try recovered.ackInitialFkRetirementTxn(&txn, group_id, signed));
+        try txn.commit();
+    }
+    const acked_page_json = try recovered.fkInitialRetirementTicketPageJson(alloc, group_id, .{ .store_id = 30, .limit = 1 });
+    defer alloc.free(acked_page_json);
+    var acked_page = try std.json.parseFromSlice(fk_initial_retirement_wire.PageResponse, alloc, acked_page_json, .{});
+    defer acked_page.deinit();
+    try std.testing.expectEqual(@as(usize, 0), acked_page.value.items.len);
 }
 
 test "FK parent lock permits only exact read-schema retirement" {
@@ -996,6 +1397,7 @@ test "initial partial support begin survives restart and cancellation before chi
         id[8] = 1;
         plan = .{
             .id = id,
+            .retirement_scope = .local_owner,
             .catalog_id = prepared.catalog_id,
             .expected_catalog_revision = prepared.expected_catalog_revision,
             .tablespace_id = prepared.tablespace_id,
@@ -1078,6 +1480,9 @@ test "initial partial support begin survives restart and cancellation before chi
         const legitimate = (fk_generation_publication.InitialGroupReservation{
             .plan_id = plan.id,
             .child_table_id = plan.child.table_id,
+            .range_id = plan.child_ranges[0].range_id,
+            .plan_digest = try plan.digest(a),
+            .retirement_scope = plan.retirement_scope,
         }).encode();
         var forged_reservation = legitimate;
         forged_reservation[0] ^= 0xff;
@@ -1088,12 +1493,12 @@ test "initial partial support begin survives restart and cancellation before chi
             try txn.commit();
         }
         try store.applyStandaloneCommand(group_id, .{ .register_node = .{ .node_id = 7, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
-        try store.applyStandaloneCommand(group_id, .{ .upsert_replica_intent = .{
+        try std.testing.expectError(error.InvalidGenerationPublication, store.applyStandaloneCommand(group_id, .{ .upsert_replica_intent = .{
             .expected_metadata_version = null,
             .expected_version_fence = 0,
             .expected_target_drain_requested = false,
             .replacement = .{ .record = .{ .group_id = child_group_id, .replica_id = 1, .local_node_id = 7 }, .store_id = 0, .peer_node_ids = &.{7} },
-        } });
+        } }));
         const rejected_placements = try store.listPlacementIntents(a, group_id);
         try std.testing.expectEqual(@as(usize, 0), rejected_placements.len);
         {
@@ -1195,6 +1600,15 @@ test "initial partial support begin survives restart and cancellation before chi
             .action = .seal_support,
             .plan = forged_seal,
         }));
+        forged_seal = sealed;
+        forged_seal.retirement_scope = .hosted_store;
+        try std.testing.expectError(error.GenerationPublicationChanged, pending.apply(a, .{
+            .plan_id = plan.id,
+            .child_table_id = plan.child.table_id,
+            .expected_revision = 1,
+            .action = .seal_support,
+            .plan = forged_seal,
+        }));
         const accepted = try pending.apply(a, .{
             .plan_id = plan.id,
             .child_table_id = plan.child.table_id,
@@ -1220,6 +1634,16 @@ test "initial partial support begin survives restart and cancellation before chi
         const status_json = try recovered.fkInitialCreateStatusJson(a, group_id, plan.child.table_id);
         const status = try std.json.parseFromSliceLeaky(fk_generation_publication.InitialPublication, a, status_json, .{});
         try std.testing.expectEqual(fk_generation_publication.InitialPhase.canceled, status.phase);
+        var terminal_key_buf: [160]u8 = undefined;
+        var terminal_txn = try recovered.store.beginReadTxn();
+        const terminal_bytes = try terminal_txn.get(try fk_generation_publication.initialGroupKey(&terminal_key_buf, group_id, plan.child_ranges[0].group_id));
+        const terminal_proof = try fk_generation_publication.InitialGroupReservation.decode(terminal_bytes);
+        terminal_txn.abort();
+        try std.testing.expect(terminal_proof.canceled);
+        try std.testing.expectEqual(plan.child_ranges[0].range_id, terminal_proof.range_id);
+        try std.testing.expectEqual(plan.child.table_id, terminal_proof.child_table_id);
+        try std.testing.expectEqualSlices(u8, &status.plan_digest, &terminal_proof.plan_digest);
+        try std.testing.expectEqualSlices(u8, &plan.id, &terminal_proof.plan_id);
         // The canceled reservation survives restart as a compact tombstone.
         // No late placement proposal may recreate this unpublished owner.
         try recovered.applyStandaloneCommand(group_id, .{ .register_node = .{ .node_id = 8, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
@@ -1440,7 +1864,23 @@ pub const TransitionCommand = union(enum) {
         expected_target_drain_requested: bool,
         replacement: raft_reconciler.PlacementIntent,
     },
+    /// A distinct v17 wire command. Ordinary document placement retains its
+    /// existing codec, while hidden hosted placement carries an immutable
+    /// reservation identity that is checked again at deterministic apply.
+    upsert_fk_initial_replica_intent: struct {
+        proof: fk_generation_publication.InitialPlacementProof,
+        expected_metadata_version: ?u64,
+        expected_version_fence: u64,
+        expected_target_drain_requested: bool,
+        replacement: raft_reconciler.PlacementIntent,
+    },
     remove_replica_intent: struct {
+        group_id: u64,
+        local_node_id: u64,
+        expected_metadata_version: u64,
+    },
+    remove_fk_initial_replica_intent: struct {
+        proof: fk_generation_publication.InitialPlacementProof,
         group_id: u64,
         local_node_id: u64,
         expected_metadata_version: u64,
@@ -1550,6 +1990,11 @@ pub const TransitionCommand = union(enum) {
                 metadata_table_manager.freeStore(alloc, record.*);
             },
             .upsert_replica_intent => |*replacement| {
+                var record = replacement.replacement.record;
+                record.deinit(alloc);
+                if (replacement.replacement.peer_node_ids.len > 0) alloc.free(replacement.replacement.peer_node_ids);
+            },
+            .upsert_fk_initial_replica_intent => |*replacement| {
                 var record = replacement.replacement.record;
                 record.deinit(alloc);
                 if (replacement.replacement.peer_node_ids.len > 0) alloc.free(replacement.replacement.peer_node_ids);
@@ -1799,6 +2244,8 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
                 return error.InvalidReplicationCutoverIntent;
         },
         .upsert_replica_intent => |replacement| try group_ids.requireDataGroupId(replacement.replacement.record.group_id),
+        .upsert_fk_initial_replica_intent => |replacement| try group_ids.requireDataGroupId(replacement.replacement.record.group_id),
+        .remove_fk_initial_replica_intent => |record| try group_ids.requireDataGroupId(record.group_id),
         .remove_replica_intent => |record| try group_ids.requireDataGroupId(record.group_id),
         .upsert_restore_progress => |record| try group_ids.requireDataGroupId(record.group_id),
         .remove_restore_progress => |record| try group_ids.requireDataGroupId(record.group_id),
@@ -2368,7 +2815,7 @@ test "relational integrity metadata topology admission persists rollout floor an
     defer alloc.free(table_bytes);
     try txn.put(table_key, table_bytes);
     try std.testing.expect(!try store.tableMatchesTransitionContractTxn(&txn, group_id, contract));
-    const capable: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .relational_topology_protocol_version = @import("../table_manager.zig").relational_topology_protocol_version };
+    const capable: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .replica_root_incarnation = 0x1234, .replica_root_public_key = @splat(7), .relational_topology_protocol_version = @import("../table_manager.zig").relational_topology_protocol_version };
     var store_key_buf: [160]u8 = undefined;
     const store_key = try storeKeyForGroup(&store_key_buf, group_id, capable.store_id);
     const store_bytes = try encodeStoreRecord(alloc, capable);
@@ -2376,7 +2823,9 @@ test "relational integrity metadata topology admission persists rollout floor an
     try txn.put(store_key, store_bytes);
     const decoded_store = try decodeStoreRecord(alloc, store_bytes);
     defer metadata_table_manager.freeStore(alloc, decoded_store);
-    try std.testing.expectEqual(@as(u16, 1), decoded_store.relational_topology_protocol_version);
+    try std.testing.expectEqual(capable.relational_topology_protocol_version, decoded_store.relational_topology_protocol_version);
+    try std.testing.expectEqual(@as(u128, 0x1234), decoded_store.replica_root_incarnation);
+    try std.testing.expectEqualSlices(u8, &capable.replica_root_public_key, &decoded_store.replica_root_public_key);
     try std.testing.expect(try store.tableMatchesTransitionContractTxn(&txn, group_id, contract));
     // Normal production registration persists a compact header and separate
     // report pages; rollout admission needs only the header's capabilities.
@@ -2416,11 +2865,11 @@ test "relational integrity metadata topology admission persists rollout floor an
     try std.testing.expect(try admitRelationalTopologyStoreTxn(&txn, group_id, legacy));
     try txn.commit();
     open = false;
-    try std.testing.expectEqual(@as(u16, 1), try store.getRelationalTopologyProtocolActivationVersion(group_id));
+    try std.testing.expectEqual(capable.relational_topology_protocol_version, try store.getRelationalTopologyProtocolActivationVersion(group_id));
     store.active_outcome = null;
     store.deinit();
     store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
-    try std.testing.expectEqual(@as(u16, 1), try store.getRelationalTopologyProtocolActivationVersion(group_id));
+    try std.testing.expectEqual(capable.relational_topology_protocol_version, try store.getRelationalTopologyProtocolActivationVersion(group_id));
     try @import("../relational_topology_admission.zig").requireStores(&.{capable});
 }
 
@@ -7520,7 +7969,9 @@ pub const RaftApplyStore = struct {
         const reserved = (try stagingGet(&txn, try fk_generation_publication.initialGroupKey(&reservation_buf, group_id, range.group_id))) orelse return error.GenerationPublicationChanged;
         const reservation = try fk_generation_publication.InitialGroupReservation.decode(reserved);
         if (reservation.child_table_id != request.child_table_id or
-            !std.mem.eql(u8, &reservation.plan_id, &publication.plan.id)) return error.GenerationPublicationChanged;
+            reservation.range_id != range.range_id or reservation.canceled or
+            !std.mem.eql(u8, &reservation.plan_id, &publication.plan.id) or
+            !std.mem.eql(u8, &reservation.plan_digest, &publication.plan_digest)) return error.GenerationPublicationChanged;
         if (try stagingGet(&txn, try tableKeyForGroup(&key_buf, group_id, request.child_table_id)) != null or
             try stagingGet(&txn, try rangeKeyForGroup(&key_buf, group_id, request.child_group_id)) != null)
             return error.GenerationPublicationChanged;
@@ -7563,6 +8014,235 @@ pub const RaftApplyStore = struct {
         var key_buf: [160]u8 = undefined;
         const bytes = txn.get(try fk_generation_publication.initialKey(&key_buf, group_id, child_table_id)) catch return error.GenerationPublicationNotFound;
         return alloc.dupe(u8, bytes);
+    }
+
+    pub const InitialFkRetirementPage = struct {
+        items: []fk_initial_retirement.Replica,
+        next_key: ?[]u8,
+
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.items);
+            if (self.next_key) |key| alloc.free(key);
+            self.* = undefined;
+        }
+    };
+
+    /// Read-only store-local work enumeration. A canceled item is not an
+    /// unlink grant: the physical store-root UUID and exact local receipt
+    /// must be bound by the future ACK protocol before deletion is enabled.
+    pub fn fkInitialRetirementPage(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, store_id: u64, after_key: ?[]const u8, limit: u16) !InitialFkRetirementPage {
+        if (group_id == 0 or limit == 0 or limit > 128) return error.InvalidInitialFkRetirement;
+        var prefix_buf: [160]u8 = undefined;
+        const prefix = try fk_initial_retirement.storePrefix(&prefix_buf, group_id, store_id);
+        if (after_key) |key| if (!std.mem.startsWith(u8, key, prefix)) return error.InvalidInitialFkRetirement;
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entries: std.ArrayList(fk_initial_retirement.Replica) = .empty;
+        errdefer entries.deinit(alloc);
+        var next_key: ?[]u8 = null;
+        errdefer if (next_key) |key| alloc.free(key);
+        var key_buf: [256]u8 = undefined;
+        var scanned: usize = 0;
+        var row = try cursor.seekAtOrAfter(after_key orelse prefix);
+        while (row) |item| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, item.key, prefix)) break;
+            if (after_key) |key| if (std.mem.order(u8, item.key, key) != .gt) continue;
+            scanned += 1;
+            const work = try fk_initial_retirement.Replica.decode(item.value);
+            if (work.store_id != store_id or !std.mem.eql(u8, item.key, try fk_initial_retirement.storeKey(&key_buf, group_id, work))) return error.InvalidInitialFkRetirement;
+            if (work.canceled and !work.acked) try entries.append(alloc, work);
+            if (entries.items.len == limit or scanned == 512) {
+                next_key = try alloc.dupe(u8, item.key);
+                break;
+            }
+        }
+        return .{ .items = try entries.toOwnedSlice(alloc), .next_key = next_key };
+    }
+
+    /// One linearizable caller cut and one local read transaction bind each
+    /// store-indexed work item to the terminal canceled publication and exact
+    /// hosted group reservation. This is discovery only, never an unlink grant.
+    pub fn fkInitialRetirementTicketPageJson(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64,
+        request: fk_initial_retirement_wire.PageRequest,
+    ) ![]u8 {
+        try request.validate(metadata_group_id);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var incarnation_key_buf: [160]u8 = undefined;
+        const incarnation_raw = txn.get(try metadataIncarnationKeyForGroup(&incarnation_key_buf, metadata_group_id)) catch
+            return error.InvalidMetadataIncarnation;
+        const cluster_incarnation = (try decodeMetadataIncarnationRecord(incarnation_raw)).incarnation;
+        var prefix_buf: [160]u8 = undefined;
+        const prefix = try fk_initial_retirement.storePrefix(&prefix_buf, metadata_group_id, request.store_id);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const Summary = struct {
+            plan_id: fk_generation_publication.Id,
+            plan_digest: fk_generation_publication.Digest,
+            revision: u64,
+        };
+        var publication_summaries: std.AutoHashMapUnmanaged(u64, Summary) = .empty;
+        defer publication_summaries.deinit(a);
+        var tickets: std.ArrayList(fk_initial_retirement_contract.Ticket) = .empty;
+        defer tickets.deinit(a);
+        var next_key: ?[]const u8 = null;
+        var scanned: usize = 0;
+        var key_buf: [256]u8 = undefined;
+        var row = try cursor.seekAtOrAfter(request.after_key orelse prefix);
+        while (row) |item| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, item.key, prefix)) break;
+            if (request.after_key) |key| if (std.mem.order(u8, item.key, key) != .gt) continue;
+            scanned += 1;
+            const work = try fk_initial_retirement.Replica.decode(item.value);
+            if (work.store_id != request.store_id or
+                !std.mem.eql(u8, item.key, try fk_initial_retirement.storeKey(&key_buf, metadata_group_id, work)))
+                return error.InvalidInitialFkRetirement;
+            if (work.canceled and !work.acked) {
+                const reservation_raw = txn.get(try fk_generation_publication.initialGroupKey(&key_buf, metadata_group_id, work.group_id)) catch
+                    return error.InvalidInitialFkRetirement;
+                const reservation = try fk_generation_publication.InitialGroupReservation.decode(reservation_raw);
+                if (!reservation.canceled or reservation.retirement_scope != .hosted_store or
+                    reservation.child_table_id != work.child_table_id or reservation.range_id != work.range_id or
+                    !std.mem.eql(u8, &reservation.plan_id, &work.plan_id) or
+                    !std.mem.eql(u8, &reservation.plan_digest, &work.plan_digest))
+                    return error.InvalidInitialFkRetirement;
+                const summary = publication_summaries.get(work.child_table_id) orelse summary: {
+                    const publication_raw = txn.get(try fk_generation_publication.initialKey(&key_buf, metadata_group_id, work.child_table_id)) catch
+                        return error.InvalidInitialFkRetirement;
+                    var parsed = try std.json.parseFromSlice(fk_generation_publication.InitialPublication, alloc, publication_raw, .{});
+                    defer parsed.deinit();
+                    const publication = parsed.value;
+                    if (publication.phase != .canceled or publication.revision == 0 or
+                        publication.plan.retirement_scope != .hosted_store or
+                        publication.plan.child.table_id != work.child_table_id or
+                        !std.mem.eql(u8, &publication.plan.id, &work.plan_id) or
+                        !std.mem.eql(u8, &publication.plan_digest, &work.plan_digest))
+                        return error.InvalidInitialFkRetirement;
+                    const value: Summary = .{
+                        .plan_id = publication.plan.id,
+                        .plan_digest = publication.plan_digest,
+                        .revision = publication.revision,
+                    };
+                    try publication_summaries.put(a, work.child_table_id, value);
+                    break :summary value;
+                };
+                if (!std.mem.eql(u8, &summary.plan_id, &work.plan_id) or
+                    !std.mem.eql(u8, &summary.plan_digest, &work.plan_digest))
+                    return error.InvalidInitialFkRetirement;
+                const ticket: fk_initial_retirement_contract.Ticket = .{
+                    .metadata_incarnation = cluster_incarnation,
+                    .cancel_revision = summary.revision,
+                    .replica = work,
+                };
+                try ticket.validate();
+                try tickets.append(a, ticket);
+            }
+            if (tickets.items.len == request.limit or scanned == 512) {
+                next_key = try a.dupe(u8, item.key);
+                break;
+            }
+        }
+        const response: fk_initial_retirement_wire.PageResponse = .{ .items = tickets.items, .next_key = next_key };
+        try response.validate(metadata_group_id, request);
+        return std.json.Stringify.valueAlloc(alloc, response, .{});
+    }
+
+    /// Internal ACK transition only. There is intentionally no public route
+    /// or proposer until authenticated store enrollment and the local
+    /// durable-unlink fault protocol are complete. The caller supplies a
+    /// single Raft apply write transaction; every authority read and both
+    /// index writes occur under that same transaction.
+    fn ackInitialFkRetirementTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        metadata_group_id: u64,
+        signed: fk_initial_retirement_auth.SignedReceipt,
+    ) !fk_initial_retirement_ack.Disposition {
+        if (metadata_group_id == 0) return error.InvalidInitialFkRetirementAck;
+        const ticket = signed.receipt.ticket;
+        try ticket.validate();
+        var key_buf: [256]u8 = undefined;
+        const incarnation_raw = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&key_buf, metadata_group_id))) orelse
+            return error.InvalidMetadataIncarnation;
+        const cluster_incarnation = (try decodeMetadataIncarnationRecord(incarnation_raw)).incarnation;
+
+        const publication_raw = (try stagingGet(txn, try fk_generation_publication.initialKey(&key_buf, metadata_group_id, ticket.replica.child_table_id))) orelse
+            return error.InitialFkRetirementPublicationChanged;
+        var parsed = try std.json.parseFromSlice(fk_generation_publication.InitialPublication, self.alloc, publication_raw, .{});
+        defer parsed.deinit();
+        const publication = parsed.value;
+        const reservation_raw = (try stagingGet(txn, try fk_generation_publication.initialGroupKey(&key_buf, metadata_group_id, ticket.replica.group_id))) orelse
+            return error.InitialFkRetirementReservationChanged;
+        const reservation = try fk_generation_publication.InitialGroupReservation.decode(reservation_raw);
+
+        var group_key_buf: [256]u8 = undefined;
+        const group_key = try fk_initial_retirement.groupKey(&group_key_buf, metadata_group_id, ticket.replica);
+        const group_raw = (try stagingGet(txn, group_key)) orelse return error.InitialFkRetirementWorkChanged;
+        const group_work = try fk_initial_retirement.Replica.decode(group_raw);
+        var store_key_buf: [256]u8 = undefined;
+        const store_key = try fk_initial_retirement.storeKey(&store_key_buf, metadata_group_id, ticket.replica);
+        const store_raw = (try stagingGet(txn, store_key)) orelse return error.InitialFkRetirementWorkChanged;
+        const store_work = try fk_initial_retirement.Replica.decode(store_raw);
+
+        const current_store = (try self.loadStoreHeaderTxn(txn, metadata_group_id, ticket.replica.store_id)) orelse
+            return error.InitialFkRetirementReporterChanged;
+        defer metadata_table_manager.freeStore(self.alloc, current_store);
+        const current_node = (try self.loadNodeRecordTxn(txn, metadata_group_id, ticket.replica.node_id)) orelse
+            return error.InitialFkRetirementReporterChanged;
+        defer metadata_table_manager.freeNode(self.alloc, current_node);
+        const disposition = try fk_initial_retirement_ack.validate(
+            signed,
+            cluster_incarnation,
+            .{
+                .child_table_id = publication.plan.child.table_id,
+                .plan_id = publication.plan.id,
+                .plan_digest = publication.plan_digest,
+                .revision = publication.revision,
+                .hosted = publication.plan.retirement_scope == .hosted_store,
+                .canceled = publication.phase == .canceled,
+            },
+            .{
+                .child_table_id = reservation.child_table_id,
+                .range_id = reservation.range_id,
+                .plan_id = reservation.plan_id,
+                .plan_digest = reservation.plan_digest,
+                .hosted = reservation.retirement_scope == .hosted_store,
+                .canceled = reservation.canceled,
+            },
+            group_work,
+            store_work,
+            .{
+                .reporter = .{
+                    .node_id = current_store.node_id,
+                    .store_id = current_store.store_id,
+                    .reporter_incarnation = current_store.reporter_incarnation,
+                    .store_root_incarnation = current_store.replica_root_incarnation,
+                    // Draining owners may finish a previously fsynced unlink,
+                    // but an offline store or finalized node is not a
+                    // presently registered reporter. Never infer liveness
+                    // from ID equality alone.
+                    .live = current_node.node_id == current_store.node_id and
+                        current_store.live and !metadata_table_manager.nodeLifecycleFinalizing(current_node.lifecycle),
+                },
+                .public_key = current_store.replica_root_public_key,
+            },
+        );
+        if (disposition == .newly_acked) {
+            var acknowledged = group_work;
+            acknowledged.acked = true;
+            const bytes = try acknowledged.encode();
+            try txn.put(group_key, &bytes);
+            try txn.put(store_key, &bytes);
+        }
+        return disposition;
     }
 
     /// One indexed point read protects support indexes owned by an in-flight
@@ -7752,11 +8432,16 @@ pub const RaftApplyStore = struct {
             try txn.put(try fk_generation_publication.initialNameKey(&name_buf, group_id, plan.namespace_id, plan.logical_name), &plan.id);
             try txn.put(try fk_generation_publication.initialPhysicalNameKey(&name_buf, group_id, plan.child.name), &plan.id);
             try txn.put(try fk_generation_publication.initialWorkKey(&name_buf, group_id, plan.child.table_id), &plan.id);
-            const group_reservation = (fk_generation_publication.InitialGroupReservation{
-                .plan_id = plan.id,
-                .child_table_id = plan.child.table_id,
-            }).encode();
-            for (plan.child_ranges) |range| try txn.put(try fk_generation_publication.initialGroupKey(&name_buf, group_id, range.group_id), &group_reservation);
+            for (plan.child_ranges) |range| {
+                const group_reservation = (fk_generation_publication.InitialGroupReservation{
+                    .plan_id = plan.id,
+                    .child_table_id = plan.child.table_id,
+                    .range_id = range.range_id,
+                    .plan_digest = digest,
+                    .retirement_scope = plan.retirement_scope,
+                }).encode();
+                try txn.put(try fk_generation_publication.initialGroupKey(&name_buf, group_id, range.group_id), &group_reservation);
+            }
             try self.setFkInitialTableLocksTxn(txn, group_id, plan, true);
         } else {
             // apply retains immutable plan/receipt slices from the previous
@@ -7767,6 +8452,24 @@ pub const RaftApplyStore = struct {
                 for (sealed.parents) |parent| try self.validateFkGenerationTableTxn(txn, group_id, parent.table, parent.ranges);
             }
             publication = try previous.apply(a, command);
+            if (command.action == .seal_support or publication.phase == .canceled) {
+                // The support-seal changes the immutable plan digest before
+                // any hidden owner may be placed. Cancellation converts each
+                // reservation to an exact terminal proof in this same Raft
+                // transaction; a late proposal cannot revive the group.
+                var reservation_key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
+                for (publication.plan.child_ranges) |range| {
+                    const proof = (fk_generation_publication.InitialGroupReservation{
+                        .plan_id = publication.plan.id,
+                        .child_table_id = publication.plan.child.table_id,
+                        .range_id = range.range_id,
+                        .plan_digest = publication.plan_digest,
+                        .retirement_scope = publication.plan.retirement_scope,
+                        .canceled = publication.phase == .canceled,
+                    }).encode();
+                    try txn.put(try fk_generation_publication.initialGroupKey(&reservation_key_buf, group_id, range.group_id), &proof);
+                }
+            }
             if (publication.phase == .published and command.action == .publish_child) {
                 // The durable owner release ACKs precede this one visibility
                 // transaction; no user route can observe a partially ready
@@ -7793,6 +8496,7 @@ pub const RaftApplyStore = struct {
                 try system_catalog_storage.applyDelta(a, txn, group_id, .{ .upserts = &upserts, .removes = &empty, .next_id = @max(meta.next_id, next_id) }, meta, command_hash);
             }
             if (publication.phase == .published or publication.phase == .canceled) {
+                try self.terminalizeInitialFkReplicasTxn(txn, group_id, publication);
                 try self.setFkInitialTableLocksTxn(txn, group_id, publication.plan, false);
                 var name_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
                 try txn.delete(try fk_generation_publication.initialNameKey(&name_buf, group_id, publication.plan.namespace_id, publication.plan.logical_name));
@@ -11435,6 +12139,11 @@ pub const RaftApplyStore = struct {
         fk_initial_name,
         fk_initial_physical_name,
         fk_initial_group,
+        fk_initial_replica,
+        fk_initial_replica_live,
+        fk_initial_replica_live_count,
+        fk_initial_retire,
+        fk_initial_replica_count,
         range,
         reconcile_lease,
         reallocation_request,
@@ -11486,6 +12195,11 @@ pub const RaftApplyStore = struct {
         .{ .projection = .fk_initial_name, .key = .{ .prefix = fk_generation_publication.initialNamePrefixForGroup } },
         .{ .projection = .fk_initial_physical_name, .key = .{ .prefix = fk_generation_publication.initialPhysicalNamePrefixForGroup } },
         .{ .projection = .fk_initial_group, .key = .{ .prefix = fk_generation_publication.initialGroupPrefixForGroup } },
+        .{ .projection = .fk_initial_replica, .key = .{ .prefix = fk_initial_retirement.allGroupsPrefix } },
+        .{ .projection = .fk_initial_replica_live, .key = .{ .prefix = fk_initial_retirement.livePrefix } },
+        .{ .projection = .fk_initial_replica_live_count, .key = .{ .prefix = fk_initial_retirement.allStoreLiveCountsPrefix } },
+        .{ .projection = .fk_initial_retire, .key = .{ .prefix = fk_initial_retirement.allStoresPrefix } },
+        .{ .projection = .fk_initial_replica_count, .key = .{ .prefix = fk_initial_retirement.allCountsPrefix } },
         .{ .projection = .range, .key = .{ .prefix = rangePrefixForGroup } },
         .{ .projection = .reconcile_lease, .key = .{ .point = reconcileLeaseKeyForGroup } },
         .{ .projection = .reallocation_request, .key = .{ .point = reallocationRequestKeyForGroup } },
@@ -11516,16 +12230,17 @@ pub const RaftApplyStore = struct {
             .apply_sql_policies => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.catalog_revision),
             .apply_sql_policy_publication => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.catalog_revision),
             .apply_fk_generation_publication => metadataSnapshotProjectionBit(.fk_generation_publication) | metadataSnapshotProjectionBit(.fk_generation_work) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.catalog_revision),
-            .apply_fk_initial_create => metadataSnapshotProjectionBit(.fk_initial_create) | metadataSnapshotProjectionBit(.fk_initial_work) | metadataSnapshotProjectionBit(.fk_initial_name) | metadataSnapshotProjectionBit(.fk_initial_physical_name) | metadataSnapshotProjectionBit(.fk_initial_group) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.range) | metadataSnapshotProjectionBit(.catalog_revision),
+            .apply_fk_initial_create => metadataSnapshotProjectionBit(.fk_initial_create) | metadataSnapshotProjectionBit(.fk_initial_work) | metadataSnapshotProjectionBit(.fk_initial_name) | metadataSnapshotProjectionBit(.fk_initial_physical_name) | metadataSnapshotProjectionBit(.fk_initial_group) | metadataSnapshotProjectionBit(.fk_initial_replica) | metadataSnapshotProjectionBit(.fk_initial_replica_live) | metadataSnapshotProjectionBit(.fk_initial_replica_live_count) | metadataSnapshotProjectionBit(.fk_initial_retire) | metadataSnapshotProjectionBit(.fk_initial_replica_count) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.range) | metadataSnapshotProjectionBit(.catalog_revision),
             .initialize_metadata_incarnation => metadataSnapshotProjectionBit(.metadata_incarnation) |
                 metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_node, .register_node, .remove_node => metadataSnapshotProjectionBit(.node),
             .request_node_shutdown, .cancel_node_shutdown, .finalize_node_shutdown => metadataSnapshotProjectionBit(.node) | metadataSnapshotProjectionBit(.store),
             .upsert_store, .upsert_store_heartbeat, .apply_store_report_update, .register_store, .remove_store => metadataSnapshotProjectionBit(.store) | metadataSnapshotProjectionBit(.store_report_cursor),
-            .upsert_replica_intent => metadataSnapshotProjectionBit(.placement) |
-                metadataSnapshotProjectionBit(.placement_version) | metadataSnapshotProjectionBit(.restore_staging),
-            .remove_replica_intent => metadataSnapshotProjectionBit(.placement) |
-                metadataSnapshotProjectionBit(.placement_version),
+            .upsert_replica_intent, .upsert_fk_initial_replica_intent => metadataSnapshotProjectionBit(.placement) |
+                metadataSnapshotProjectionBit(.placement_version) | metadataSnapshotProjectionBit(.restore_staging) |
+                metadataSnapshotProjectionBit(.fk_initial_replica) | metadataSnapshotProjectionBit(.fk_initial_replica_live) | metadataSnapshotProjectionBit(.fk_initial_replica_live_count) | metadataSnapshotProjectionBit(.fk_initial_retire) | metadataSnapshotProjectionBit(.fk_initial_replica_count),
+            .remove_replica_intent, .remove_fk_initial_replica_intent => metadataSnapshotProjectionBit(.placement) |
+                metadataSnapshotProjectionBit(.placement_version) | metadataSnapshotProjectionBit(.fk_initial_replica_live) | metadataSnapshotProjectionBit(.fk_initial_replica_live_count),
             .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.catalog_revision),
             .apply_table_topology => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
@@ -12102,7 +12817,9 @@ pub const RaftApplyStore = struct {
                 if (record.runtime_statuses.len != 0) return error.InvalidStoreReporterFence;
                 var key_buf: [160]u8 = undefined;
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
-                const applied = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, record);
+                var applied = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, record);
+                applied.replica_root_incarnation = header.replica_root_incarnation;
+                applied.replica_root_public_key = header.replica_root_public_key;
                 if (!try admitDenseNativeStoreTxn(self, txn, group_id, applied)) return;
                 if (!try admitRelationalTopologyStoreTxn(txn, group_id, applied)) return;
                 const reports_changed = self.updateStoreComponentsTxn(txn, group_id, record.store_id, applied, true) catch |err| switch (err) {
@@ -12115,6 +12832,7 @@ pub const RaftApplyStore = struct {
                 try self.retryPendingNodeShutdownFinalizeTxn(txn, group_id, record.node_id);
             },
             .upsert_store => |record| {
+                if (!try self.storeRootUpdateAllowedTxn(txn, group_id, record)) return;
                 var key_buf: [160]u8 = undefined;
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
                 const applied = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, record);
@@ -12135,6 +12853,7 @@ pub const RaftApplyStore = struct {
                 try self.retryPendingNodeShutdownFinalizeTxn(txn, group_id, applied.node_id);
             },
             .register_store => |record| {
+                if (!try self.storeRootUpdateAllowedTxn(txn, group_id, record)) return;
                 var key_buf: [160]u8 = undefined;
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
                 const applied = try self.normalizeStoreDrainIntentTxn(txn, group_id, record);
@@ -12155,6 +12874,7 @@ pub const RaftApplyStore = struct {
                 try self.retryPendingNodeShutdownFinalizeTxn(txn, group_id, record.node_id);
             },
             .remove_store => |record| {
+                if (try initialFkStoreHasLivePlacementTxn(txn, group_id, record.store_id)) return;
                 var key_buf: [160]u8 = undefined;
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
                 const existing = try self.loadStoreHeaderTxn(txn, group_id, record.store_id);
@@ -12180,6 +12900,18 @@ pub const RaftApplyStore = struct {
                     replacement.expected_version_fence,
                     replacement.expected_target_drain_requested,
                     replacement.replacement,
+                    null,
+                );
+            },
+            .upsert_fk_initial_replica_intent => |replacement| {
+                try self.applyPlacementCompareAndUpsertTxn(
+                    txn,
+                    group_id,
+                    replacement.expected_metadata_version,
+                    replacement.expected_version_fence,
+                    replacement.expected_target_drain_requested,
+                    replacement.replacement,
+                    replacement.proof,
                 );
             },
             .remove_replica_intent => |record| {
@@ -12189,6 +12921,18 @@ pub const RaftApplyStore = struct {
                     record.group_id,
                     record.local_node_id,
                     record.expected_metadata_version,
+                    null,
+                );
+                try self.retryPendingNodeShutdownFinalizeTxn(txn, group_id, record.local_node_id);
+            },
+            .remove_fk_initial_replica_intent => |record| {
+                try self.applyPlacementRemoveIfVersionTxn(
+                    txn,
+                    group_id,
+                    record.group_id,
+                    record.local_node_id,
+                    record.expected_metadata_version,
+                    record.proof,
                 );
                 try self.retryPendingNodeShutdownFinalizeTxn(txn, group_id, record.local_node_id);
             },
@@ -13225,6 +13969,7 @@ pub const RaftApplyStore = struct {
             intent.record.group_id,
         ))) orelse return true; // Ordinary public or restore-staging placement.
         const identity = try fk_generation_publication.InitialGroupReservation.decode(reserved);
+        if (identity.canceled) return false;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -13236,21 +13981,27 @@ pub const RaftApplyStore = struct {
         const publication = try std.json.parseFromSliceLeaky(fk_generation_publication.InitialPublication, a, encoded, .{});
         try publication.validateState(a);
         if (!std.mem.eql(u8, &publication.plan.id, &identity.plan_id) or
+            !std.mem.eql(u8, &publication.plan_digest, &identity.plan_digest) or
+            publication.plan.retirement_scope != identity.retirement_scope or
             publication.phase == .preparing_support or publication.phase == .published or publication.phase == .canceled or
             publication.plan.child.table_id != identity.child_table_id) return false;
         const has_group = for (publication.plan.child_ranges) |range| {
-            if (range.group_id == intent.record.group_id and range.table_id == identity.child_table_id) break true;
+            if (range.group_id == intent.record.group_id and range.table_id == identity.child_table_id and
+                range.range_id == identity.range_id) break true;
         } else false;
         if (!has_group) return false;
         const role = publication.plan.child.placement_role;
         const node = (try self.loadNodeRecordTxn(txn, metadata_group_id, intent.record.local_node_id)) orelse return false;
         defer metadata_table_manager.freeNode(self.alloc, node);
         if (!metadata_table_manager.nodeLifecycleActive(node.lifecycle) or !std.mem.eql(u8, node.role, role)) return false;
+        if (identity.retirement_scope == .hosted_store and intent.store_id == 0) return false;
         if (intent.store_id != 0) {
             const store = (try self.loadStoreHeaderTxn(txn, metadata_group_id, intent.store_id)) orelse return false;
             defer metadata_table_manager.freeStore(self.alloc, store);
             if (store.node_id != intent.record.local_node_id or !store.live or store.drain_requested or
                 !std.mem.eql(u8, store.role, role)) return false;
+            if (identity.retirement_scope == .hosted_store and
+                (store.reporter_incarnation == 0 or store.replica_root_incarnation == 0)) return false;
         }
         return true;
     }
@@ -15383,6 +16134,7 @@ pub const RaftApplyStore = struct {
                 if (store.node_id == node_id) {
                     if (!draining_node and !store.drain_requested) return;
                     has_termination_debt = has_termination_debt or metadata_table_manager.storeHasTerminationDebt(store);
+                    has_termination_debt = has_termination_debt or try initialFkStoreHasLivePlacementTxn(txn, group_id, store.store_id);
                     try stores_to_delete.append(self.alloc, .{ .store_id = store.store_id, .node_id = store.node_id });
                 }
             }
@@ -15677,6 +16429,40 @@ pub const RaftApplyStore = struct {
         return drain_requested;
     }
 
+    /// The wire command, not mutable apply-time state alone, determines the
+    /// decoder floor. A hosted reservation therefore accepts only the v17
+    /// command bearing its exact identity; stale commands are Raft no-ops.
+    fn initialPlacementProofMatchesTxn(
+        txn: *docstore.DocStore.Txn,
+        metadata_group_id: u64,
+        range_group_id: u64,
+        proof: ?fk_generation_publication.InitialPlacementProof,
+        allow_canceled: bool,
+    ) !bool {
+        var key_buf: [160]u8 = undefined;
+        const raw = try stagingGet(txn, try fk_generation_publication.initialGroupKey(&key_buf, metadata_group_id, range_group_id));
+        if (raw == null) return proof == null;
+        const reservation = try fk_generation_publication.InitialGroupReservation.decode(raw.?);
+        if (reservation.retirement_scope == .local_owner) return proof == null;
+        return if (proof) |identity|
+            (if (allow_canceled) identity.identityMatches(reservation) else identity.activeMatches(reservation))
+        else
+            false;
+    }
+
+    /// Point-read the immutable hidden group reservation for proposal-time
+    /// command selection. The caller must re-read under catalog mutation
+    /// serialization before append; apply still checks the proof exactly.
+    pub fn initialGroupReservation(self: *RaftApplyStore, metadata_group_id: u64, range_group_id: u64) !?fk_generation_publication.InitialGroupReservation {
+        var key_buf: [160]u8 = undefined;
+        const raw = self.store.get(self.alloc, try fk_generation_publication.initialGroupKey(&key_buf, metadata_group_id, range_group_id)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        return try fk_generation_publication.InitialGroupReservation.decode(raw);
+    }
+
     fn applyPlacementCompareAndUpsertTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -15685,7 +16471,9 @@ pub const RaftApplyStore = struct {
         expected_version_fence: u64,
         expected_target_drain_requested: bool,
         replacement: raft_reconciler.PlacementIntent,
+        proof: ?fk_generation_publication.InitialPlacementProof,
     ) !void {
+        if (!try initialPlacementProofMatchesTxn(txn, metadata_group_id, replacement.record.group_id, proof, false)) return;
         const target_drain_requested = (try self.placementTargetDrainRequestedTxn(
             txn,
             metadata_group_id,
@@ -15754,6 +16542,7 @@ pub const RaftApplyStore = struct {
             hidden_initial,
             next_version,
         );
+        if (hidden_initial) try self.recordInitialFkReplicaTxn(txn, metadata_group_id, applied, existing);
         try self.stageRestorePlacementAuthorityTxn(txn, metadata_group_id, applied.record.group_id, applied.record.local_node_id);
         const value = try encodePlacementIntent(self.alloc, applied);
         defer self.alloc.free(value);
@@ -15768,6 +16557,213 @@ pub const RaftApplyStore = struct {
         });
     }
 
+    /// Retain every admitted hidden replica, including one later removed from
+    /// placement while its store is offline. The count is Raft-transactional
+    /// and caps terminal cancellation work. A live-placement point index
+    /// makes same-physical-root refreshes O(1), even across process restarts.
+    fn adjustInitialFkStoreLiveCountTxn(txn: *docstore.DocStore.Txn, metadata_group_id: u64, store_id: u64, increment: bool) !void {
+        if (store_id == 0) return;
+        var key_buf: [160]u8 = undefined;
+        const key = try fk_initial_retirement.storeLiveCountKey(&key_buf, metadata_group_id, store_id);
+        const raw = try stagingGet(txn, key);
+        const prior: u64 = if (raw) |bytes| blk: {
+            if (bytes.len != 8) return error.InvalidInitialFkRetirement;
+            break :blk std.mem.readInt(u64, bytes[0..8], .little);
+        } else 0;
+        if (!increment and prior == 0) return error.InvalidInitialFkRetirement;
+        const next = if (increment) std.math.add(u64, prior, 1) catch return error.InitialFkRetirementHistoryFull else prior - 1;
+        if (next == 0) {
+            try txn.delete(key);
+        } else {
+            var encoded: [8]u8 = undefined;
+            std.mem.writeInt(u64, &encoded, next, .little);
+            try txn.put(key, &encoded);
+        }
+    }
+
+    fn recordInitialFkReplicaTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, metadata_group_id: u64, intent: raft_reconciler.PlacementIntent, existing: ?raft_reconciler.PlacementIntent) !void {
+        var key_buf: [256]u8 = undefined;
+        const raw_reservation = (try stagingGet(txn, try fk_generation_publication.initialGroupKey(&key_buf, metadata_group_id, intent.record.group_id))) orelse return error.InvalidInitialFkRetirement;
+        const reservation = try fk_generation_publication.InitialGroupReservation.decode(raw_reservation);
+        if (reservation.canceled or intent.record.initial_fk_root_generation == 0) return error.InvalidInitialFkRetirement;
+        if (reservation.retirement_scope == .hosted_store and intent.store_id == 0) return error.InitialFkStoreRootIdentityUnavailable;
+        const store_identity: struct { reporter: u64, root: u128 } = if (intent.store_id == 0) .{ .reporter = 0, .root = 0 } else blk: {
+            const store = (try self.loadStoreHeaderTxn(txn, metadata_group_id, intent.store_id)) orelse return error.InvalidInitialFkRetirement;
+            defer metadata_table_manager.freeStore(self.alloc, store);
+            if (store.node_id != intent.record.local_node_id or store.reporter_incarnation == 0 or
+                store.replica_root_incarnation == 0) return error.InitialFkStoreRootIdentityUnavailable;
+            break :blk .{ .reporter = store.reporter_incarnation, .root = store.replica_root_incarnation };
+        };
+        var live_key_buf: [192]u8 = undefined;
+        const live_key = try fk_initial_retirement.liveKey(&live_key_buf, metadata_group_id, intent.record.group_id, intent.record.local_node_id);
+        const live_raw = try stagingGet(txn, live_key);
+        if (existing) |prior| if (prior.store_id == intent.store_id and
+            prior.record.replica_id == intent.record.replica_id and
+            prior.record.initial_fk_root_generation == intent.record.initial_fk_root_generation)
+        {
+            // A same-placement refresh may survive process restart, but a
+            // replacement physical root must first remove/re-admit the exact
+            // placement to rotate its generation. The historical admission
+            // is authoritative even if current registration now names a new
+            // disk under the same node/store ID.
+            const prior_replica = try fk_initial_retirement.Replica.decode(live_raw orelse return error.InitialFkRetirementHistoryMissing);
+            if (prior_replica.group_id != intent.record.group_id or prior_replica.node_id != intent.record.local_node_id or
+                prior_replica.store_id != intent.store_id or prior_replica.replica_id != intent.record.replica_id or
+                prior_replica.root_generation != intent.record.initial_fk_root_generation or
+                prior_replica.child_table_id != reservation.child_table_id or prior_replica.range_id != reservation.range_id or
+                !std.mem.eql(u8, &prior_replica.plan_id, &reservation.plan_id) or
+                !std.mem.eql(u8, &prior_replica.plan_digest, &reservation.plan_digest) or
+                prior_replica.canceled or prior_replica.acked)
+                return error.InvalidInitialFkRetirement;
+            if (prior_replica.store_root_incarnation != store_identity.root) return error.InitialFkStoreRootChanged;
+            var history_key_buf: [256]u8 = undefined;
+            const history = try stagingGet(txn, try fk_initial_retirement.groupKey(&history_key_buf, metadata_group_id, prior_replica));
+            if (history == null or !std.mem.eql(u8, history.?, live_raw.?)) return error.InitialFkRetirementHistoryMissing;
+            // Process incarnation is not physical identity. Reuse the exact
+            // historical work item rather than consuming the plan-wide cap.
+            return;
+        };
+        if (existing == null and live_raw != null) return error.InvalidInitialFkRetirement;
+        const prior_live = if (live_raw) |raw| try fk_initial_retirement.Replica.decode(raw) else null;
+        if (prior_live) |prior| {
+            const prior_intent = existing orelse return error.InvalidInitialFkRetirement;
+            if (prior.group_id != prior_intent.record.group_id or prior.node_id != prior_intent.record.local_node_id or
+                prior.store_id != prior_intent.store_id or prior.replica_id != prior_intent.record.replica_id or
+                prior.root_generation != prior_intent.record.initial_fk_root_generation)
+                return error.InvalidInitialFkRetirement;
+        }
+        const replica: fk_initial_retirement.Replica = .{
+            .plan_id = reservation.plan_id,
+            .plan_digest = reservation.plan_digest,
+            .child_table_id = reservation.child_table_id,
+            .group_id = intent.record.group_id,
+            .range_id = reservation.range_id,
+            .node_id = intent.record.local_node_id,
+            .store_id = intent.store_id,
+            .store_incarnation = store_identity.reporter,
+            .store_root_incarnation = store_identity.root,
+            .replica_id = intent.record.replica_id,
+            .root_generation = intent.record.initial_fk_root_generation,
+        };
+        const history_key = try fk_initial_retirement.groupKey(&key_buf, metadata_group_id, replica);
+        if (try stagingGet(txn, history_key)) |prior| {
+            const decoded = try fk_initial_retirement.Replica.decode(prior);
+            if (!std.meta.eql(decoded, replica)) return error.InvalidInitialFkRetirement;
+            return;
+        }
+        var count_buf: [160]u8 = undefined;
+        const count_key = try fk_initial_retirement.groupCountKey(&count_buf, metadata_group_id, replica.group_id);
+        const previous = if (try stagingGet(txn, count_key)) |value| blk: {
+            if (value.len != 8) return error.InvalidInitialFkRetirement;
+            break :blk std.mem.readInt(u64, value[0..8], .little);
+        } else @as(u64, 0);
+        var plan_count_buf: [160]u8 = undefined;
+        const plan_count_key = try fk_initial_retirement.planCountKey(&plan_count_buf, metadata_group_id, replica.child_table_id);
+        const plan_previous = if (try stagingGet(txn, plan_count_key)) |value| blk: {
+            if (value.len != 8) return error.InvalidInitialFkRetirement;
+            break :blk std.mem.readInt(u64, value[0..8], .little);
+        } else @as(u64, 0);
+        if (previous >= fk_initial_retirement.max_replicas_per_group or
+            plan_previous >= fk_initial_retirement.max_replicas_per_group) return error.InitialFkRetirementHistoryFull;
+        var next: [8]u8 = undefined;
+        std.mem.writeInt(u64, &next, previous + 1, .little);
+        var plan_next: [8]u8 = undefined;
+        std.mem.writeInt(u64, &plan_next, plan_previous + 1, .little);
+        const value = try replica.encode();
+        var store_key_buf: [256]u8 = undefined;
+        if (prior_live) |prior| {
+            if (prior.store_id != replica.store_id) {
+                try adjustInitialFkStoreLiveCountTxn(txn, metadata_group_id, prior.store_id, false);
+                try adjustInitialFkStoreLiveCountTxn(txn, metadata_group_id, replica.store_id, true);
+            }
+        } else try adjustInitialFkStoreLiveCountTxn(txn, metadata_group_id, replica.store_id, true);
+        try txn.put(history_key, &value);
+        try txn.put(try fk_initial_retirement.storeKey(&store_key_buf, metadata_group_id, replica), &value);
+        try txn.put(live_key, &value);
+        try txn.put(count_key, &next);
+        try txn.put(plan_count_key, &plan_next);
+    }
+
+    fn terminalizeInitialFkReplicasTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, metadata_group_id: u64, publication: fk_generation_publication.InitialPublication) !void {
+        const canceled = publication.phase == .canceled;
+        if (!canceled and publication.phase != .published) return error.InvalidInitialFkRetirement;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var plan_count_key_buf: [160]u8 = undefined;
+        const plan_count_key = try fk_initial_retirement.planCountKey(&plan_count_key_buf, metadata_group_id, publication.plan.child.table_id);
+        const plan_count_raw = try stagingGet(txn, plan_count_key);
+        const plan_count: u64 = if (plan_count_raw) |raw| blk: {
+            if (raw.len != 8) return error.InvalidInitialFkRetirement;
+            break :blk std.mem.readInt(u64, raw[0..8], .little);
+        } else 0;
+        if (plan_count > fk_initial_retirement.max_replicas_per_group) return error.InitialFkRetirementHistoryFull;
+        var seen: u64 = 0;
+        for (publication.plan.child_ranges) |range| {
+            var prefix_buf: [160]u8 = undefined;
+            const prefix = try fk_initial_retirement.groupPrefix(&prefix_buf, metadata_group_id, range.group_id);
+            var collected: std.ArrayList(fk_initial_retirement.Replica) = .empty;
+            {
+                var cursor = try txn.openCursor();
+                defer cursor.close();
+                var row = try cursor.seekAtOrAfter(prefix);
+                while (row) |item| : (row = try cursor.next()) {
+                    if (!std.mem.startsWith(u8, item.key, prefix)) break;
+                    if (collected.items.len >= fk_initial_retirement.max_replicas_per_group) return error.InitialFkRetirementHistoryFull;
+                    const replica = try fk_initial_retirement.Replica.decode(item.value);
+                    if (replica.group_id != range.group_id or replica.range_id != range.range_id or
+                        replica.child_table_id != publication.plan.child.table_id or
+                        !std.mem.eql(u8, &replica.plan_id, &publication.plan.id) or
+                        !std.mem.eql(u8, &replica.plan_digest, &publication.plan_digest) or replica.canceled or replica.acked)
+                        return error.InvalidInitialFkRetirement;
+                    try collected.append(a, replica);
+                }
+            }
+            var key_buf: [256]u8 = undefined;
+            var count_key_buf: [160]u8 = undefined;
+            const count_key = try fk_initial_retirement.groupCountKey(&count_key_buf, metadata_group_id, range.group_id);
+            const count_raw = try stagingGet(txn, count_key);
+            const count: u64 = if (count_raw) |raw| blk: {
+                if (raw.len != 8) return error.InvalidInitialFkRetirement;
+                break :blk std.mem.readInt(u64, raw[0..8], .little);
+            } else 0;
+            if (count != @as(u64, @intCast(collected.items.len))) return error.InvalidInitialFkRetirement;
+            seen += count;
+            if (seen > plan_count) return error.InvalidInitialFkRetirement;
+            for (collected.items) |replica| {
+                var history_key_buf: [256]u8 = undefined;
+                const work_key = try fk_initial_retirement.storeKey(&key_buf, metadata_group_id, replica);
+                const work = (try stagingGet(txn, work_key)) orelse return error.InvalidInitialFkRetirement;
+                if (!std.meta.eql(try fk_initial_retirement.Replica.decode(work), replica)) return error.InvalidInitialFkRetirement;
+                const history_key = try fk_initial_retirement.groupKey(&history_key_buf, metadata_group_id, replica);
+                var live_key_buf: [192]u8 = undefined;
+                const live_key = try fk_initial_retirement.liveKey(&live_key_buf, metadata_group_id, replica.group_id, replica.node_id);
+                if (try stagingGet(txn, live_key)) |raw_live| {
+                    const live = try fk_initial_retirement.Replica.decode(raw_live);
+                    if (live.store_id == replica.store_id and live.replica_id == replica.replica_id and
+                        live.root_generation == replica.root_generation and live.store_root_incarnation == replica.store_root_incarnation)
+                    {
+                        try adjustInitialFkStoreLiveCountTxn(txn, metadata_group_id, live.store_id, false);
+                        try txn.delete(live_key);
+                    }
+                }
+                if (canceled) {
+                    var terminal = replica;
+                    terminal.canceled = true;
+                    const encoded = try terminal.encode();
+                    try txn.put(history_key, &encoded);
+                    try txn.put(work_key, &encoded);
+                } else {
+                    try txn.delete(history_key);
+                    try txn.delete(work_key);
+                }
+            }
+            if (!canceled and count_raw != null) try txn.delete(count_key);
+        }
+        if (seen != plan_count) return error.InvalidInitialFkRetirement;
+        if (!canceled and plan_count_raw != null) try txn.delete(plan_count_key);
+    }
+
     fn applyPlacementRemoveIfVersionTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -15775,7 +16771,9 @@ pub const RaftApplyStore = struct {
         range_group_id: u64,
         local_node_id: u64,
         expected_metadata_version: u64,
+        proof: ?fk_generation_publication.InitialPlacementProof,
     ) !void {
+        if (!try initialPlacementProofMatchesTxn(txn, metadata_group_id, range_group_id, proof, true)) return;
         var key_buf: [192]u8 = undefined;
         const key = try placementKeyForGroup(&key_buf, metadata_group_id, range_group_id, local_node_id);
         const existing = (try self.loadPlacementIntentTxn(txn, key)) orelse return;
@@ -15788,6 +16786,19 @@ pub const RaftApplyStore = struct {
             local_node_id,
             existing.record.metadata_version,
         );
+        if (existing.record.initial_fk_root_generation != 0) {
+            var live_key_buf: [192]u8 = undefined;
+            const live_key = try fk_initial_retirement.liveKey(&live_key_buf, metadata_group_id, range_group_id, local_node_id);
+            if (try stagingGet(txn, live_key)) |raw| {
+                const live = try fk_initial_retirement.Replica.decode(raw);
+                if (live.group_id != range_group_id or live.node_id != local_node_id or
+                    live.store_id != existing.store_id or live.replica_id != existing.record.replica_id or
+                    live.root_generation != existing.record.initial_fk_root_generation)
+                    return error.InvalidInitialFkRetirement;
+                try adjustInitialFkStoreLiveCountTxn(txn, metadata_group_id, live.store_id, false);
+                try txn.delete(live_key);
+            }
+        }
         try txn.delete(key);
         self.removeProjectedPlacementIntent(metadata_group_id, range_group_id, local_node_id);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = metadata_group_id, .key = key });
@@ -15806,6 +16817,34 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
         return try decodeStoredHeader(self.alloc, encoded);
+    }
+
+    /// A replacement physical disk may not silently inherit a live hidden
+    /// child's placement merely by re-registering the same store ID. The
+    /// transactional live-placement count is a point read even for a cluster
+    /// with many unrelated placements.
+    fn storeRootUpdateAllowedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, metadata_group_id: u64, incoming: metadata.StoreRecord) !bool {
+        const prior = (try self.loadStoreHeaderTxn(txn, metadata_group_id, incoming.store_id)) orelse
+            // A missing header does not prove the physical root is new: a
+            // truncated/corrupt header must not bypass an indexed live child.
+            return !try initialFkStoreHasLivePlacementTxn(txn, metadata_group_id, incoming.store_id);
+        defer metadata_table_manager.freeStore(self.alloc, prior);
+        if (prior.replica_root_incarnation == incoming.replica_root_incarnation) {
+            // Registration credentials cannot substitute an admitted root's
+            // verifier. Rotation requires a new physical-root UUID.
+            if (!std.mem.allEqual(u8, &prior.replica_root_public_key, 0) and
+                !std.mem.eql(u8, &prior.replica_root_public_key, &incoming.replica_root_public_key)) return false;
+            return true;
+        }
+        return !try initialFkStoreHasLivePlacementTxn(txn, metadata_group_id, incoming.store_id);
+    }
+
+    fn initialFkStoreHasLivePlacementTxn(txn: *docstore.DocStore.Txn, metadata_group_id: u64, store_id: u64) !bool {
+        var count_key_buf: [160]u8 = undefined;
+        const count = try stagingGet(txn, try fk_initial_retirement.storeLiveCountKey(&count_key_buf, metadata_group_id, store_id));
+        if (count == null) return false;
+        if (count.?.len != 8) return error.InvalidInitialFkRetirement;
+        return std.mem.readInt(u64, count.?[0..8], .little) != 0;
     }
 
     fn notifyProjectionListeners(self: *RaftApplyStore, signal: ProjectionSignal) void {
@@ -15962,6 +17001,8 @@ const store_record_extension_native_restore_version: u16 = 3;
 const store_record_extension_artifact_sources_version: u16 = 4;
 const store_record_extension_version: u16 = 5;
 const store_record_extension_relational_topology_version: u16 = 6;
+const store_record_extension_root_incarnation_version: u16 = 7;
+const store_record_extension_root_signing_version: u16 = 8;
 const reallocation_request_extension_magic = "afrr1";
 const reallocation_request_extension_version: u16 = 1;
 
@@ -16240,6 +17281,8 @@ const TransitionTag = enum(u8) {
     apply_sql_policy_publication = 68,
     apply_fk_generation_publication = 69,
     apply_fk_initial_create = 70,
+    upsert_fk_initial_replica_intent = 71,
+    remove_fk_initial_replica_intent = 72,
     upsert_store_heartbeat = 55,
     apply_store_report_update = 56,
     apply_store_report_baseline = 58,
@@ -16302,6 +17345,33 @@ const TransitionTag = enum(u8) {
     admit_online_merge = 63,
     create_restore_job_with_staging = 64,
 };
+
+fn appendInitialPlacementProof(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), proof: fk_generation_publication.InitialPlacementProof) !void {
+    // Keep encoder and decoder symmetric: accepting an undecodable Raft entry
+    // locally would make follower replay fail after the entry is committed.
+    if (std.mem.allEqual(u8, &proof.plan_id, 0) or std.mem.allEqual(u8, &proof.plan_digest, 0) or
+        proof.child_table_id == 0 or proof.range_id == 0)
+        return error.InvalidMetadataTransitionEncoding;
+    try out.appendSlice(alloc, &proof.plan_id);
+    try out.appendSlice(alloc, &proof.plan_digest);
+    try appendInt(alloc, out, u64, proof.child_table_id);
+    try appendInt(alloc, out, u64, proof.range_id);
+}
+
+fn readInitialPlacementProof(encoded: []const u8, pos: *usize) !fk_generation_publication.InitialPlacementProof {
+    const end = std.math.add(usize, pos.*, 16 + 32) catch return error.InvalidMetadataTransitionEncoding;
+    if (end > encoded.len) return error.InvalidMetadataTransitionEncoding;
+    var plan_id: fk_generation_publication.Id = undefined;
+    var plan_digest: fk_generation_publication.Digest = undefined;
+    @memcpy(&plan_id, encoded[pos.* .. pos.* + 16]);
+    @memcpy(&plan_digest, encoded[pos.* + 16 .. end]);
+    pos.* = end;
+    const child_table_id = try readInt(encoded, pos, u64);
+    const range_id = try readInt(encoded, pos, u64);
+    if (std.mem.allEqual(u8, &plan_id, 0) or std.mem.allEqual(u8, &plan_digest, 0) or child_table_id == 0 or range_id == 0)
+        return error.InvalidMetadataTransitionEncoding;
+    return .{ .plan_id = plan_id, .plan_digest = plan_digest, .child_table_id = child_table_id, .range_id = range_id };
+}
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -16415,8 +17485,24 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromBool(replacement.expected_target_drain_requested));
             try appendPlacementIntent(alloc, &out, replacement.replacement);
         },
+        .upsert_fk_initial_replica_intent => |replacement| {
+            try out.append(alloc, @intFromEnum(TransitionTag.upsert_fk_initial_replica_intent));
+            try appendInitialPlacementProof(alloc, &out, replacement.proof);
+            try out.append(alloc, @intFromBool(replacement.expected_metadata_version != null));
+            if (replacement.expected_metadata_version) |version| try appendInt(alloc, &out, u64, version);
+            try appendInt(alloc, &out, u64, replacement.expected_version_fence);
+            try out.append(alloc, @intFromBool(replacement.expected_target_drain_requested));
+            try appendPlacementIntent(alloc, &out, replacement.replacement);
+        },
         .remove_replica_intent => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_replica_intent));
+            try appendInt(alloc, &out, u64, record.group_id);
+            try appendInt(alloc, &out, u64, record.local_node_id);
+            try appendInt(alloc, &out, u64, record.expected_metadata_version);
+        },
+        .remove_fk_initial_replica_intent => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_fk_initial_replica_intent));
+            try appendInitialPlacementProof(alloc, &out, record.proof);
             try appendInt(alloc, &out, u64, record.group_id);
             try appendInt(alloc, &out, u64, record.local_node_id);
             try appendInt(alloc, &out, u64, record.expected_metadata_version);
@@ -16807,8 +17893,32 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 .replacement = try readPlacementIntent(alloc, encoded, &pos),
             } };
         },
+        .upsert_fk_initial_replica_intent => blk: {
+            const proof = try readInitialPlacementProof(encoded, &pos);
+            const has_expected = try readInt(encoded, &pos, u8);
+            if (has_expected > 1) return error.InvalidMetadataTransitionEncoding;
+            const expected_metadata_version = if (has_expected == 1) try readInt(encoded, &pos, u64) else null;
+            const expected_version_fence = try readInt(encoded, &pos, u64);
+            const expected_target_drain_requested = try readInt(encoded, &pos, u8);
+            if (expected_target_drain_requested > 1) return error.InvalidMetadataTransitionEncoding;
+            break :blk .{ .upsert_fk_initial_replica_intent = .{
+                .proof = proof,
+                .expected_metadata_version = expected_metadata_version,
+                .expected_version_fence = expected_version_fence,
+                .expected_target_drain_requested = expected_target_drain_requested == 1,
+                .replacement = try readPlacementIntent(alloc, encoded, &pos),
+            } };
+        },
         .remove_replica_intent => .{
             .remove_replica_intent = .{
+                .group_id = try readInt(encoded, &pos, u64),
+                .local_node_id = try readInt(encoded, &pos, u64),
+                .expected_metadata_version = try readInt(encoded, &pos, u64),
+            },
+        },
+        .remove_fk_initial_replica_intent => .{
+            .remove_fk_initial_replica_intent = .{
+                .proof = try readInitialPlacementProof(encoded, &pos),
                 .group_id = try readInt(encoded, &pos, u64),
                 .local_node_id = try readInt(encoded, &pos, u64),
                 .expected_metadata_version = try readInt(encoded, &pos, u64),
@@ -17703,7 +18813,10 @@ fn appendStoreRecordExtensions(
     record: metadata.StoreRecord,
 ) !void {
     if (record.relational_topology_protocol_version > metadata_table_manager.relational_topology_protocol_version or
-        (record.relational_topology_protocol_version != 0 and record.reporter_incarnation == 0)) return error.InvalidStoreReporterFence;
+        (record.relational_topology_protocol_version != 0 and record.reporter_incarnation == 0) or
+        (record.replica_root_incarnation != 0 and record.reporter_incarnation == 0) or
+        (!std.mem.allEqual(u8, &record.replica_root_public_key, 0) and
+            (record.replica_root_incarnation == 0 or record.reporter_incarnation == 0))) return error.InvalidStoreReporterFence;
     if (!metadata_table_manager.reporterFenceValid(
         record.reporter_incarnation,
         record.status_generation,
@@ -17725,11 +18838,17 @@ fn appendStoreRecordExtensions(
     const has_native_restore_capability = record.native_generation_restore_version != 0;
     const has_dense_native_protocol = record.dense_native_storage_protocol_version != 0;
     const has_relational_topology = record.relational_topology_protocol_version != 0;
+    const has_root_incarnation = record.replica_root_incarnation != 0;
+    const has_root_signing = !std.mem.allEqual(u8, &record.replica_root_public_key, 0);
     if (observation_count == 0 and !has_reporter_fence and !has_artifact_protocol and
-        !has_native_restore_capability and !has_dense_native_protocol and !has_relational_topology) return;
+        !has_native_restore_capability and !has_dense_native_protocol and !has_relational_topology and !has_root_incarnation and !has_root_signing) return;
 
     try out.appendSlice(alloc, store_record_extension_magic);
-    const version: u16 = if (has_relational_topology)
+    const version: u16 = if (has_root_signing)
+        store_record_extension_root_signing_version
+    else if (has_root_incarnation)
+        store_record_extension_root_incarnation_version
+    else if (has_relational_topology)
         store_record_extension_relational_topology_version
     else if (has_dense_native_protocol)
         store_record_extension_version
@@ -17755,6 +18874,10 @@ fn appendStoreRecordExtensions(
         try appendInt(alloc, out, u16, record.dense_native_storage_protocol_version);
     if (version >= store_record_extension_relational_topology_version)
         try appendInt(alloc, out, u16, record.relational_topology_protocol_version);
+    if (version >= store_record_extension_root_incarnation_version)
+        try appendInt(alloc, out, u128, record.replica_root_incarnation);
+    if (version >= store_record_extension_root_signing_version)
+        try out.appendSlice(alloc, &record.replica_root_public_key);
     try appendInt(alloc, out, u32, observation_count);
     for (record.group_statuses, 0..) |status, status_index| {
         if (status.observed_reallocation_request_id == 0) continue;
@@ -17835,6 +18958,8 @@ fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !
         .store_id = store_id,
         .node_id = node_id,
         .reporter_incarnation = extensions.reporter_incarnation,
+        .replica_root_incarnation = extensions.replica_root_incarnation,
+        .replica_root_public_key = extensions.replica_root_public_key,
         .status_generation = extensions.status_generation,
         .artifact_sources_protocol_version = extensions.artifact_sources_protocol_version,
         .native_generation_restore_version = extensions.native_generation_restore_version,
@@ -17863,7 +18988,7 @@ fn readStoreRecordExtensions(
     encoded: []const u8,
     pos: *usize,
     group_statuses: []metadata.GroupStatusReport,
-) !struct { reporter_incarnation: u64 = 0, status_generation: u64 = 0, native_generation_restore_version: u16 = 0, artifact_sources_protocol_version: u16 = 0, dense_native_storage_protocol_version: u16 = 0, relational_topology_protocol_version: u16 = 0 } {
+) !struct { reporter_incarnation: u64 = 0, replica_root_incarnation: u128 = 0, replica_root_public_key: [32]u8 = @splat(0), status_generation: u64 = 0, native_generation_restore_version: u16 = 0, artifact_sources_protocol_version: u16 = 0, dense_native_storage_protocol_version: u16 = 0, relational_topology_protocol_version: u16 = 0 } {
     if (pos.* == encoded.len) return .{};
     if (pos.* + store_record_extension_magic.len > encoded.len or
         !std.mem.eql(
@@ -17882,7 +19007,9 @@ fn readStoreRecordExtensions(
         version != store_record_extension_native_restore_version and
         version != store_record_extension_artifact_sources_version and
         version != store_record_extension_version and
-        version != store_record_extension_relational_topology_version) return error.InvalidMetadataTransitionEncoding;
+        version != store_record_extension_relational_topology_version and
+        version != store_record_extension_root_incarnation_version and
+        version != store_record_extension_root_signing_version) return error.InvalidMetadataTransitionEncoding;
     const reporter_incarnation = if (version >= store_record_extension_reporter_version)
         try readInt(encoded, pos, u64)
     else
@@ -17908,8 +19035,20 @@ fn readStoreRecordExtensions(
         try readInt(encoded, pos, u16)
     else
         0;
+    const replica_root_incarnation = if (version >= store_record_extension_root_incarnation_version)
+        try readInt(encoded, pos, u128)
+    else
+        0;
+    var replica_root_public_key: [32]u8 = @splat(0);
+    if (version >= store_record_extension_root_signing_version) {
+        if (pos.* + replica_root_public_key.len > encoded.len) return error.InvalidMetadataTransitionEncoding;
+        @memcpy(&replica_root_public_key, encoded[pos.* .. pos.* + replica_root_public_key.len]);
+        pos.* += replica_root_public_key.len;
+        if (std.mem.allEqual(u8, &replica_root_public_key, 0)) return error.InvalidMetadataTransitionEncoding;
+    }
     if (relational_topology_protocol_version > metadata_table_manager.relational_topology_protocol_version or
-        (relational_topology_protocol_version != 0 and reporter_incarnation == 0)) return error.InvalidMetadataTransitionEncoding;
+        (relational_topology_protocol_version != 0 and reporter_incarnation == 0) or
+        (version >= store_record_extension_root_incarnation_version and (replica_root_incarnation == 0 or reporter_incarnation == 0))) return error.InvalidMetadataTransitionEncoding;
     if (!metadata_table_manager.artifactSourcesProtocolValid(
         reporter_incarnation,
         artifact_sources_protocol_version,
@@ -17931,6 +19070,8 @@ fn readStoreRecordExtensions(
     if (pos.* != encoded.len) return error.InvalidMetadataTransitionEncoding;
     return .{
         .reporter_incarnation = reporter_incarnation,
+        .replica_root_incarnation = replica_root_incarnation,
+        .replica_root_public_key = replica_root_public_key,
         .status_generation = status_generation,
         .artifact_sources_protocol_version = artifact_sources_protocol_version,
         .native_generation_restore_version = native_generation_restore_version,

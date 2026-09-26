@@ -1761,6 +1761,33 @@ test "metadata server can expose admin listener endpoints" {
     defer rejected_setting.deinit(std.heap.page_allocator);
     try std.testing.expectEqual(@as(u16, 401), rejected_setting.status);
 
+    // A forged service header must not reach the decoder-activation probe.
+    // This exercises the real host authentication middleware, not just the
+    // contextual route's additional header-presence check.
+    const readiness_uri = try std.fmt.allocPrint(std.heap.page_allocator, "{s}{s}", .{ admin_base_uri, @import("http_routes.zig").Routes.internal_store_root_readiness });
+    defer std.heap.page_allocator.free(readiness_uri);
+    var rejected_readiness = try executor.executor().execute(std.heap.page_allocator, .{
+        .method = .POST,
+        .uri = readiness_uri,
+        .headers = &.{.{ .name = @import("../api/internal_service_auth.zig").header_name, .value = wrong_service_token }},
+        .body = "",
+        .content_type = "application/json",
+    });
+    defer rejected_readiness.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 401), rejected_readiness.status);
+
+    const signing_readiness_uri = try std.fmt.allocPrint(std.heap.page_allocator, "{s}{s}", .{ admin_base_uri, @import("http_routes.zig").Routes.internal_store_root_signing_readiness });
+    defer std.heap.page_allocator.free(signing_readiness_uri);
+    var rejected_signing_readiness = try executor.executor().execute(std.heap.page_allocator, .{
+        .method = .POST,
+        .uri = signing_readiness_uri,
+        .headers = &.{.{ .name = @import("../api/internal_service_auth.zig").header_name, .value = wrong_service_token }},
+        .body = "",
+        .content_type = "application/json",
+    });
+    defer rejected_signing_readiness.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 401), rejected_signing_readiness.status);
+
     const healthz_uri = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/healthz", .{admin_base_uri});
     defer std.heap.page_allocator.free(healthz_uri);
     var healthz = try executor.executor().execute(std.heap.page_allocator, .{ .method = .GET, .uri = healthz_uri });

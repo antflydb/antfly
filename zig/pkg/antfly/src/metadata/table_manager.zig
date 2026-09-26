@@ -457,6 +457,13 @@ pub const StoreRecord = struct {
     /// Random non-zero process incarnation established by store registration.
     /// Status generations are comparable only within this incarnation.
     reporter_incarnation: u64 = 0,
+    /// Durable physical identity of the store's replica-root directory.
+    /// Unlike reporter_incarnation this survives same-disk process restart;
+    /// replacing that root must create a different value before registration.
+    replica_root_incarnation: u128 = 0,
+    /// Ed25519 verifier for retirement receipts from this exact physical root.
+    /// Once registered, the same root must never silently replace this key.
+    replica_root_public_key: [32]u8 = @splat(0),
     /// Highest status snapshot generation accepted for `reporter_incarnation`.
     status_generation: u64 = 0,
     /// Non-zero only after this store can parse, materialize, and report the
@@ -2566,6 +2573,8 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .store_id = record.store_id,
         .node_id = record.node_id,
         .reporter_incarnation = record.reporter_incarnation,
+        .replica_root_incarnation = record.replica_root_incarnation,
+        .replica_root_public_key = record.replica_root_public_key,
         .status_generation = record.status_generation,
         .artifact_sources_protocol_version = record.artifact_sources_protocol_version,
         .native_generation_restore_version = record.native_generation_restore_version,

@@ -457,12 +457,14 @@ const Builder = struct {
             tasks.await(io) catch return error.Cancelled;
             try self.control.ensureActive();
             // Drain the complete wave before retrying rejected local
-            // admissions. Keep successful observations; restarting the wave
-            // would recreate the same overload and repeat its read barriers.
+            // admissions or an owner that is briefly reopening. Both are
+            // read-only precommit observations, so one serial retry is safe.
+            // Keep successful observations; restarting the wave would
+            // recreate the same overload and repeat its read barriers.
             // Genuine network, consistency and cancellation failures are not
             // admission evidence and must never enter this fallback.
             for (slots[0..batch.len]) |slot| if (slot.failure) |err| {
-                if (err != error.ConcurrencyUnavailable) return err;
+                if (err != error.ConcurrencyUnavailable and err != error.StorageReadTemporarilyUnavailable) return err;
             };
             for (batch, slots[0..batch.len]) |key, *slot| if (slot.failure != null) {
                 try self.control.ensureActive();
@@ -1628,8 +1630,8 @@ test "distributed txn preparation pins one routing view and releases it" {
     try std.testing.expectEqual(@as(usize, 1), fixture.releases);
 }
 
-test "distributed txn primary prefetch retries only local admission after draining the wave" {
-    const Mode = enum { recover, persistent, unavailable, transport, mixed, canceled, deadline };
+test "distributed txn primary prefetch retries transient owner reads once after draining the wave" {
+    const Mode = enum { recover, persistent, unavailable, unavailable_persistent, transport, mixed, canceled, deadline };
     const Fixture = struct {
         mode: Mode,
         calls: [8]std.atomic.Value(usize) = @splat(.init(0)),
@@ -1655,12 +1657,13 @@ test "distributed txn primary prefetch retries only local admission after draini
             if (attempt != 0) try std.testing.expect(self.finished.load(.acquire) >= 8);
             if (index == 1) {
                 if (attempt == 0) switch (self.mode) {
-                    .unavailable => return error.StorageReadTemporarilyUnavailable,
+                    .unavailable, .unavailable_persistent => return error.StorageReadTemporarilyUnavailable,
                     .transport => return error.ConnectionResetByPeer,
                     .canceled => self.canceled.store(true, .release),
                     .deadline => self.now_ns.store(60, .release),
                     else => {},
                 };
+                if (self.mode == .unavailable_persistent) return error.StorageReadTemporarilyUnavailable;
                 if (attempt == 0 or self.mode == .persistent) return error.ConcurrencyUnavailable;
             }
             if (index == 3 and attempt == 0) {
@@ -1696,7 +1699,7 @@ test "distributed txn primary prefetch retries only local admission after draini
         };
         defer builder.deinit();
         const keys = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
-        if (mode == .recover) {
+        if (mode == .recover or mode == .unavailable or mode == .mixed) {
             try builder.preloadWork(&table, &keys);
             try std.testing.expectEqual(keys.len, builder.work.items.len);
             for (keys, builder.work.items) |key, work| {
@@ -1707,17 +1710,18 @@ test "distributed txn primary prefetch retries only local admission after draini
         } else {
             const expected = switch (mode) {
                 .persistent => error.ConcurrencyUnavailable,
-                .unavailable, .mixed => error.StorageReadTemporarilyUnavailable,
+                .unavailable_persistent => error.StorageReadTemporarilyUnavailable,
                 .transport => error.ConnectionResetByPeer,
                 .canceled => error.Canceled,
                 .deadline => error.DeadlineExceeded,
-                .recover => unreachable,
+                .recover, .unavailable, .mixed => unreachable,
             };
             try std.testing.expectError(expected, builder.preloadWork(&table, &keys));
             try std.testing.expectEqual(@as(usize, 0), builder.work.items.len);
         }
         for (&fixture.calls, 0..) |*calls, index| {
-            const retried = (mode == .recover and (index == 1 or index == 3)) or (mode == .persistent and index == 1);
+            const retried = ((mode == .recover or mode == .mixed) and (index == 1 or index == 3)) or
+                ((mode == .persistent or mode == .unavailable or mode == .unavailable_persistent) and index == 1);
             try std.testing.expectEqual(@as(usize, if (retried) 2 else 1), calls.load(.acquire));
         }
     }

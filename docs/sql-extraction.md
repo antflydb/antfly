@@ -309,9 +309,10 @@ three schema-derived logical defaults and one affected row.
 Typed `TIMESTAMPTZ '...'` literals use the datetime cast program, so offset
 validation and UTC normalization happen before mutation admission. Exact
 `sql-1496` has mounted native INSERT/RETURNING evidence. The adjacent
-`DEFAULT VALUES ... ON CONFLICT (id)` case remains unresolved: its unique
-arbiter requires durable constraint activation and coordinated write admission,
-which the simple mounted fixture cannot substitute with a direct batch write.
+`sql-1495` `DEFAULT VALUES ... ON CONFLICT (id)` case now has mounted evidence
+with an active coordinated UNIQUE claim: owner resolution selects the seeded
+physical row, native preparation fences the claim, and RETURNING plus a
+physical lookup verify the committed default-derived update.
 
 Remaining major items include broader isolation deployment and fault validation,
 broader correlated/mutation subqueries and MERGE, unrestricted recursion,
@@ -874,12 +875,18 @@ placement fencing, and durable ACKs before that route is released.
 Hosted cancellation must retain a bounded historical set of every hidden child
 replica actually admitted by placement, keyed by group, store incarnation, and
 replica incarnation; current placement alone is insufficient after removal or
-node loss. The terminal canceled metadata transaction should publish an indexed
-group-to-plan/child/range proof and per-replica retirement work, never for a
-published child. A returning store pages only its work, verifies its cold AICH
-bootstrap and canceled receipt against that immutable proof, fsyncs a local
-retirement intent, drains/deletes the exact root and local replica catalog, then
-submits an idempotent incarnation-fenced ACK. Metadata may compact the work
+node loss. Metadata now retains a checksummed group-to-plan/child/range proof
+and a plan-wide-capped history of exact hidden replica placements, including
+placements removed before cancellation. The terminal canceled Raft transaction
+marks their store-indexed work; publication discards it. Store-local paging is
+scan-budgeted, and a cold-restart test verifies removed-placement work survives.
+These records are discovery and fencing groundwork, not an unlink grant or ACK.
+The internal store-root retirement Ticket page is likewise read-only discovery;
+serving a canceled-work page does not authorize physical unlink or an ACK.
+A returning store must page only its work, verify its cold AICH
+bootstrap and canceled receipt against that immutable proof, fsync a local
+retirement intent, drain/delete the exact root and local replica catalog, then
+submit an idempotent incarnation-fenced ACK. Metadata may compact the work
 only after every recorded replica ACKs, retaining a stale-rejoin fence. Required
 fault tests include an offline store, placement removal before cancellation,
 crashes before the cancel CAS and between unlink and ACK, wrong bootstrap or
@@ -888,14 +895,55 @@ The metadata placement CAS now assigns a durable initial-FK root generation,
 preserves it across same-owner refresh and publication, and rotates it for a
 different node, store, or replica; the local replica catalog persists that
 generation before owner publication. This is admission identity groundwork,
-not a physical-disk identity or a deletion authorization. If an offline disk
-is replaced under the same node/store/replica while its placement remains,
-metadata could otherwise reuse the generation. Hosted GC therefore still
-requires a persistent store-root UUID proven at registration and bound to
-placements, owner receipts, work, and ACKs (or an enforced removal/re-admission
-CAS), plus an explicit bootstrap-source protocol for replacement roots. Until
-that proof and the offline fault matrix pass, hosted cancellation remains
-guarded and no generation-only ACK may compact retirement work.
+not a physical-disk identity or a deletion authorization. An offline disk can
+be replaced under the same node/store/replica while its placement remains.
+The metadata record and hidden-replica history can bind the persistent UUID
+of the fsynced physical store root. A live hidden placement rejects
+replacement-root registration until explicit removal and re-admission.
+The new store-record extension is emitted only after an authenticated
+readiness request probes every metadata voter and learner and durably activates
+decoder v17; mixed-version ordinary registrations retain their older wire
+shape. Initial CREATE carries its v17 proof through the final Raft append;
+hosted hidden-child admission fails closed without the UUID. This does
+not yet bind owner/status receipts to the UUID:
+those still fence by volatile reporter incarnation and root generation. A
+returning store also needs an explicit bootstrap-source protocol for a
+replacement root. A plan-digest-bound retirement scope distinguishes the
+standalone local-owner contract from hosted store-root retirement, and hosted
+placement rejects store ID zero. Raft-side authority for that scope and
+hosted/local origin still needs a durable, replay-safe proof. Hidden placement
+upsert/removal now has a distinct v17 command bound to the group reservation's
+plan ID, digest, child table, and range; ordinary commands are deterministic
+no-ops for hosted reservations. Request-driven reconciliation takes one
+linearizable read cut, rechecks the reservation under catalog serialization,
+and validates term/membership at append. Background reconciliation uses a
+nonblocking cached decoder proof and retries as its projection advances;
+stale ordinary commands cannot alter a hosted reservation at apply. Root-bound
+owner/status receipts, store/node retirement proposal admission, and durable
+scope origin still need a complete proof;
+the hosted public route remains guarded. Until exact root-bound owner receipts,
+physical unlink/ACK protocol, and the offline fault matrix pass,
+hosted cancellation remains guarded and no generation-only ACK may compact
+retirement work.
+The root's persistent Ed25519 signing identity is additional ACK groundwork:
+its verifier requires all-voter/learner decoder v18 activation and immutable
+same-root registration. A native shard-artifact backup does not include the
+top-level physical-root identity checkpoints. Default HA seed capture builds
+an explicit per-group artifact tree, validates an allowlist that rejects an
+unexpected top-level checkpoint, and restores groups into new staged roots;
+it also does not transfer the outer store-root signing identity. The generic recursive copy
+helper and an operator's full-root copy can clone both the root UUID and
+signing key. Replacement-root restore/publish must explicitly exclude or
+rotate both identities, with crash/restart and copied-root fault tests, before
+any signed ACK or physical deletion is activated.
+Moreover, an internal-service token alone does not authenticate first-key
+enrollment to a particular node/store: a holder could register its own verifier
+for a target root UUID before the genuine store. ACK activation also requires
+a node/store-bound registration principal or attested enrollment, not merely
+v18 decoder readiness and same-root key immutability.
+An isolated canonical signed-ACK envelope and verification predicate exist,
+but no hosted ACK mutation route, physical unlink, or work-compaction authority
+is enabled by that pure contract.
 
 Acceptance needs crash/lost-ack tests at each fence, publication and activation
 boundary, cancellation on both sides of publication, parent mutations and new

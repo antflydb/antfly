@@ -637,6 +637,7 @@ pub const Detail = enum(c_int) {
     // it across the native metadata callback instead of turning reads of an
     // unprotected table into RuntimeBoundaryFailure.
     row_policy_catalog_changed,
+    online_merge_artifact_catalog_uncoordinated,
 };
 
 pub const Status = extern struct {
@@ -732,6 +733,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.OnlineSourcePinMissing => status(.not_found, .online_source_pin_missing),
         error.OnlineSourcePinPending => status(.retryable, .online_source_pin_pending),
         error.OnlineSourceScopeChanged => status(.conflict, .online_source_scope_changed),
+        error.OnlineMergeArtifactCatalogUncoordinated => status(.conflict, .online_merge_artifact_catalog_uncoordinated),
         error.InvalidSourceSnapshot => status(.invalid_argument, .invalid_source_snapshot),
         error.SourceSnapshotCorrupt => status(.corrupt, .source_snapshot_corrupt),
         error.SourceSnapshotCutMismatch => status(.conflict, .source_snapshot_cut_mismatch),
@@ -1353,6 +1355,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .online_source_pin_missing => "OnlineSourcePinMissing",
         .online_source_pin_pending => "OnlineSourcePinPending",
         .online_source_scope_changed => "OnlineSourceScopeChanged",
+        .online_merge_artifact_catalog_uncoordinated => "OnlineMergeArtifactCatalogUncoordinated",
         .invalid_source_snapshot => "InvalidSourceSnapshot",
         .source_snapshot_corrupt => "SourceSnapshotCorrupt",
         .source_snapshot_cut_mismatch => "SourceSnapshotCutMismatch",
@@ -2076,4 +2079,10 @@ test "SQL snapshot and range protection errors preserve runtime capability seman
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
+}
+
+test "online merge admission barrier preserves exact identity across runtime archives" {
+    const err = error.OnlineMergeArtifactCatalogUncoordinated;
+    try std.testing.expect(errorHasStableDetail(err));
+    try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
 }

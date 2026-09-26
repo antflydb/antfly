@@ -27,6 +27,16 @@ const http = @import("../common/http/http_common.zig");
 const operation = @import("../api/operation.zig");
 const Allocator = std.mem.Allocator;
 
+fn raftOnlineMergeArtifactCatalogBarrierReady() bool {
+    // Re-enable only with a Raft-ordered artifact catalog epoch plus a
+    // membership barrier spanning donor admission through terminal release.
+    return false;
+}
+
+test "metadata does not authorize a new online merge without an artifact catalog barrier" {
+    try std.testing.expect(!raftOnlineMergeArtifactCatalogBarrierReady());
+}
+
 pub const Context = struct {
     record: state_mod.MergeTransitionRecord,
     donor: ?table.RangeRecord,
@@ -182,6 +192,11 @@ fn Adapter(comptime Service: type) type {
                 return existing;
             }
             if (context.record.phase != .prepare or context.record.rollback_reason != null) return null;
+            // This policy must live at metadata admission as well as the data
+            // proposal boundary: during a rolling upgrade an old data leader
+            // may still answer its owner-local eligibility probe positively.
+            // Existing committed online attempts above retain recovery.
+            if (!raftOnlineMergeArtifactCatalogBarrierReady()) return null;
             // Coordinated tables additionally require the exact immutable
             // catalog/activation proof on BOTH owners below. REF3 retains
             // integrity changes in the same committed frames as primary rows.

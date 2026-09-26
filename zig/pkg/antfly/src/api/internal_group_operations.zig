@@ -65,6 +65,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     PreDecisionDeadlineExceeded,
     TransactionPreDecisionOutcomeUnknown,
     RaftBatchWriteOutcomeUnknown,
+    OnlineMergeArtifactCatalogUncoordinated,
     DecisionConflict,
     TransactionConflict,
     TransactionTooLarge,
@@ -427,6 +428,7 @@ pub const Operations = struct {
             },
         };
         _ = (writes.batchGroupLocal(alloc, group_id, table_name, input) catch |err| switch (err) {
+            error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
@@ -602,6 +604,7 @@ pub const Operations = struct {
             break :merge .merge_replication;
         } else return error.Unavailable;
         _ = (writer.write(alloc, authority, group_id, table_name, input, forwarding, request) catch |err| switch (err) {
+            error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,

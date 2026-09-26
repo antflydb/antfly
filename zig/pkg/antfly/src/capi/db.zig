@@ -17695,7 +17695,11 @@ fn hiddenRestoreJson(alloc: std.mem.Allocator, db: *db_mod.DB, request: *const k
         // descriptor. Its core identity is not the authority for this path;
         // the durable AICH namespace is, and the caller checks the complete
         // bootstrap and terminal receipt before any retirement.
-        if (record.namespace.table_id != request.table_id) return error.InitialChildPublicationChanged;
+        // Zero is reserved for trusted local retirement classification: it
+        // discovers the cold AICH identity before metadata's exact ticket is
+        // available. Public/provisioning callers pass a nonzero table ID and
+        // retain the scoped comparison.
+        if (request.table_id != 0 and record.namespace.table_id != request.table_id) return error.InitialChildPublicationChanged;
         const encoded = try std.json.Stringify.valueAlloc(alloc, record, .{});
         out_result.* = .{ .ptr = encoded.ptr, .len = @intCast(encoded.len) };
         return;

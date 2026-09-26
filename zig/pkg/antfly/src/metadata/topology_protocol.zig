@@ -33,7 +33,10 @@ const std = @import("std");
 /// decodes inert native row-policy definitions; RLS activation is separate.
 /// Version 14 decodes the durable row-policy publication/owner-ACK transition.
 /// Version 15 decodes the durable fenced FK generation publication transition.
-pub const current_version: u16 = 16;
+/// Version 16 decodes initial FK creation. Version 17 decodes the physical
+/// store-root UUID extension in store registration records. Version 18 adds
+/// the exact physical-root Ed25519 verifier; no ACK semantics are enabled.
+pub const current_version: u16 = 18;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.
@@ -48,7 +51,9 @@ pub const sql_setting_catalog_version: u16 = 12;
 pub const sql_row_policy_catalog_version: u16 = 13;
 pub const sql_row_policy_publication_version: u16 = 14;
 pub const fk_generation_publication_version: u16 = 15;
-pub const fk_initial_create_version: u16 = 16;
+pub const fk_initial_create_version: u16 = 17;
+pub const store_root_uuid_decoder_version: u16 = 17;
+pub const store_root_signing_decoder_version: u16 = 18;
 /// Minimum decoder capability required by the atomic create/drop wire format.
 /// Later, unrelated metadata features must not unnecessarily stop table DDL
 /// when a membership change temporarily includes a lower-capability peer.

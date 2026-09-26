@@ -29830,6 +29830,15 @@ pub const DB = struct {
         apply_source: {
             var admission = self.core.snapshot_admission.acquireMutation();
             defer admission.release();
+            // Index deletion must join its derived worker before taking apply
+            // exclusive. Serialize that join and the final catalog mutation
+            // with source admission without blocking the Raft apply lane on a
+            // worker: a busy try-lock leaves this committed entry unapplied and
+            // the progress driver retries it after the index transition.
+            const catalog_admission = command == .admit;
+            if (catalog_admission and !self.index_structural_mutation_mutex.tryLock())
+                return error.StorageBusy;
+            defer if (catalog_admission) self.index_structural_mutation_mutex.unlock();
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             if (opts.raft_applied_entry_marker) |entry| switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry)) {
@@ -29870,6 +29879,14 @@ pub const DB = struct {
                 if (lsm.storage) |storage| {
                     if (!storage.supportsHostPathGenerationPublication()) return error.NativeBackupStorageBackendUnsupported;
                 }
+                // The catalog predicate is local to this DB, not Raft state.
+                // Rechecking it while applying a committed entry could reject
+                // on a follower after its leader succeeded. Distributed online
+                // merge is rejected before proposal until catalog/membership
+                // barriers are Raft-ordered; retain the local recheck for
+                // native standalone admission only.
+                if (command.scope().authority == .native)
+                    try @import("online_merge_io.zig").requireAdmissibleSourceAtCommitAssumeApply(self, self.alloc);
             }
             var txn = try self.core.store.beginWriteTxn();
             var txn_open = true;
@@ -29898,7 +29915,13 @@ pub const DB = struct {
                 // receiver transition in this admission transaction so an
                 // intervening ordinary merge cannot acquire both roles.
                 const merge_raw = txn.get(merge_state_mod.key) catch |err| switch (err) {
-                    error.NotFound => null,
+                    // Older receiver checkpoints remain authoritative until
+                    // protectForSplit atomically upgrades their key. Do not
+                    // admit a source role over an active legacy receiver.
+                    error.NotFound => txn.get(merge_state_mod.legacy_key) catch |legacy_err| switch (legacy_err) {
+                        error.NotFound => null,
+                        else => return legacy_err,
+                    },
                     else => return err,
                 };
                 if (merge_raw) |raw| {
@@ -31257,6 +31280,38 @@ pub const DB = struct {
         return state.found;
     }
 
+    /// Artifact and resolver catalog changes alter the source's materialized
+    /// state contract. REF3 retains primary-row and coordinated-integrity
+    /// effects, not independently produced graph/vector/enrichment effects.
+    /// Check after taking the apply lock, which serializes this observation
+    /// with source admission and terminal release.
+    fn requireOnlineArtifactCatalogMutableLocked(self: *DB, txn: anytype) !void {
+        var namespace: [24]u8 = undefined;
+        doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+        try @import("../source_pin_state.zig").requireNoPrepared(txn, namespace);
+        if (try @import("../retained_effects.zig").load(txn)) |retention| {
+            if (retention.active() and std.mem.eql(u8, &retention.namespace, &namespace))
+                return error.IntegrityTopologyBusy;
+        }
+        // A receiver has no retained source record. Its immutable copy/tail
+        // contract is instead owned by the durable merge checkpoint. This
+        // also closes ordinary merge DDL races, without scanning any rows.
+        const merge = @import("merge_state.zig");
+        const merge_raw = txn.get(merge.key) catch |err| switch (err) {
+            error.NotFound => txn.get(merge.legacy_key) catch |legacy_err| switch (legacy_err) {
+                error.NotFound => null,
+                else => return legacy_err,
+            },
+            else => return err,
+        };
+        if (merge_raw) |raw| {
+            var state = try merge.decodeAlloc(self.alloc, raw);
+            defer state.deinit(self.alloc);
+            if (state.phase != .none and state.phase != .finalized and state.phase != .rolled_back)
+                return error.IntegrityTopologyBusy;
+        }
+    }
+
     fn installIndexWhileEnrichmentQuiesced(
         self: *DB,
         cfg: types.IndexConfig,
@@ -31268,6 +31323,7 @@ pub const DB = struct {
             var read = try self.core.store.beginProbeTxn();
             defer read.abort();
             try @import("relational_integrity_topology.zig").requireUnfenced(&read);
+            try self.requireOnlineArtifactCatalogMutableLocked(&read);
         }
         if (admission_mode == .managed and !indexKindSupportsManagedGenerationRepair(cfg.kind))
             return error.UnsupportedOperation;
@@ -31610,6 +31666,11 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        {
+            var probe = try self.core.store.beginProbeTxn();
+            defer probe.abort();
+            try self.requireOnlineArtifactCatalogMutableLocked(&probe);
+        }
         try self.enforceVectorMigrationConfigurationGate();
         try self.core.addEnrichment(cfg);
     }
@@ -31621,6 +31682,11 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        {
+            var probe = try self.core.store.beginProbeTxn();
+            defer probe.abort();
+            try self.requireOnlineArtifactCatalogMutableLocked(&probe);
+        }
         try self.enforceVectorMigrationConfigurationGate();
         return try self.core.upsertEnrichment(cfg);
     }
@@ -31663,6 +31729,11 @@ pub const DB = struct {
             defer activity.deinit();
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
+            {
+                var probe = try self.core.store.beginProbeTxn();
+                defer probe.abort();
+                try self.requireOnlineArtifactCatalogMutableLocked(&probe);
+            }
             try self.core.addResolver(cfg);
             if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
         }
@@ -31701,6 +31772,11 @@ pub const DB = struct {
             defer activity.deinit();
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
+            {
+                var probe = try self.core.store.beginProbeTxn();
+                defer probe.abort();
+                try self.requireOnlineArtifactCatalogMutableLocked(&probe);
+            }
             const result = try self.core.upsertResolver(cfg);
             if (result != .updated_no_backfill) {
                 if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
@@ -31800,6 +31876,11 @@ pub const DB = struct {
                 return error.WriterLocked;
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
+            {
+                var probe = try self.core.store.beginProbeTxn();
+                defer probe.abort();
+                try self.requireOnlineArtifactCatalogMutableLocked(&probe);
+            }
             const cfg = (try self.resolverConfigByNameAlloc(name)) orelse return false;
             defer {
                 var owned = cfg;
@@ -32953,6 +33034,17 @@ pub const DB = struct {
     }
 
     fn deleteIndexWhileEnrichmentQuiesced(self: *DB, name: []const u8) !bool {
+        // A worker stop joins its task, which may need the apply lock. Probe
+        // before that join; the caller's structural mutex also prevents a
+        // source admission between this probe and the locked recheck below.
+        {
+            lockApplyShared(self);
+            defer self.core.unlockApplyShared();
+            var read = try self.core.store.beginProbeTxn();
+            defer read.abort();
+            try @import("relational_integrity_topology.zig").requireUnfenced(&read);
+            try self.requireOnlineArtifactCatalogMutableLocked(&read);
+        }
         self.executor.removeWorker(name);
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -32960,6 +33052,7 @@ pub const DB = struct {
             var read = try self.core.store.beginProbeTxn();
             defer read.abort();
             try @import("relational_integrity_topology.zig").requireUnfenced(&read);
+            try self.requireOnlineArtifactCatalogMutableLocked(&read);
         }
         const repair_id = try self.prepareIndexRepairForDeletion(self.alloc, name);
         defer if (repair_id != null) self.endIndexRepairLease(name);
@@ -33101,6 +33194,11 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        {
+            var probe = try self.core.store.beginProbeTxn();
+            defer probe.abort();
+            try self.requireOnlineArtifactCatalogMutableLocked(&probe);
+        }
         try self.enforceVectorMigrationConfigurationGate();
         return try self.core.deleteEnrichment(kind, name);
     }
@@ -144191,4 +144289,45 @@ test "db empty-generation install receipt survives hidden to public owner reopen
     var parsed = try std.json.parseFromSlice(?staging.GenerationAdmissionReceipt, alloc, response.json, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u64, 11), (parsed.value orelse return error.GenerationHandoffInstallMissing).applied_index);
+}
+
+test "relational index system online admission defers during index structural mutation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source-admission-index-guard", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.updateRange(.{ .start = "m", .end = "z" });
+    try db.core.store.delete(@import("relational_integrity_catalog.zig").key);
+    const identity = try db.relationalTopologyIdentity();
+    const scope: @import("online_source_contract.zig").Scope = .{
+        .fence = .{ .admission_epoch = 1, .attempt = 1, .transition_id = 7, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = db.core.identity_namespace, .catalog_digest = identity.catalog_digest },
+        .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 },
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .donor_term = 2, .sequence = 1 },
+    };
+    const command: types.BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
+    try std.testing.expect(db.index_structural_mutation_mutex.tryLock());
+    var held = true;
+    defer if (held) db.index_structural_mutation_mutex.unlock();
+    try std.testing.expectError(error.StorageBusy, db.batchRaftReplicatedApply(command, .{ .term = 2, .index = 1 }));
+    db.index_structural_mutation_mutex.unlock();
+    held = false;
+    try std.testing.expect((try db.raftAppliedEntry()) == null);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try @import("../retained_effects.zig").load(&read)) == null);
+        try std.testing.expect((try @import("../source_pin_state.zig").load(&read)) == null);
+    }
+    try db.batchRaftReplicatedApply(command, .{ .term = 2, .index = 1 });
+    try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try @import("../retained_effects.zig").load(&read)).?.active());
+    }
 }

@@ -187,7 +187,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     }
     const initial_fk_admission_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[metadata_unit_baseline_mods.len - 1],
-        .filters = &.{ "initial self FK reserves one hidden child owner", "FK generation publication initial create reserves hidden identity", "FK parent lock permits only exact read-schema retirement", "initial partial support begin survives restart", "initial MATCH PARTIAL publication pins parent witness support", "initial FK root generation" },
+        .filters = &.{ "initial self FK reserves one hidden child owner", "FK generation publication initial create reserves hidden identity", "FK parent lock permits only exact read-schema retirement", "initial partial support begin survives restart", "initial MATCH PARTIAL publication pins parent witness support", "initial FK root generation", "canceled hidden reservation permits only exact tagged placement removal", "hosted initial FK retirement", "initial FK retirement ACK signature", "retirement ACK validates exact canceled work" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const initial_fk_admission_step = b.step("antfly-metadata-initial-fk-admission-test", "Run initial-FK preflight and stale-begin metadata fault regressions");
@@ -1589,6 +1589,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "index encoders expose graph sources once in normalized config",
         "api http client round-trips public status and internal capability routes",
         "api http client requires explicit not-proposed marker and tracks delivery phase",
+        "online merge catalog rejection requires a not-proposed receipt before cancellation",
         "index activation client preserves progress and transport classifications",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
@@ -1935,6 +1936,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "host does not perform path restore without a bootstrap authority owner",
             "host records backup restore bootstrap failure when no handler is available",
             "file replica catalog persists backup restore bootstrap records across reopen",
+            "memory replica catalog point read owns its record and revision",
+            "file replica catalog persists the metadata-issued initial FK root generation",
             "replica catalog rejects invalid backup restore authority and integrity bindings",
             "restore binding pins the authenticated native generation manifest",
             "prepared native restore repair reuses target backend admission",
@@ -2372,6 +2375,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "cdc work permit ",
             "metadata proposal receipt ",
             "metadata reconciliation plan uses one terminal receipt for ordered apply",
+            "metadata reconciliation never appends an ordinary placement after hidden BEGIN races preflight",
             "table workflow cancellation stops before reconciliation lease work",
             "table workflow can drive real metadata service topology and split setup",
             "table workflow can drive placement intents through the real metadata control loop",
@@ -2397,6 +2401,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "table topology mutation ",
             "metadata http server preserves extension-owned table drop conflicts",
             "metadata http server replaces a table definition through compare-and-swap",
+            "store registration preserves physical replica root identity",
+            "store-root readiness returns only an exact durable v17 activation",
             "extension lifecycle proposal",
         },
         .test_runner = .{
@@ -5621,6 +5627,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.resolution_handoff.",
             "storage.db.resolution_runtime.",
             "storage.db.root_identity.",
+            "storage.db.root_signing_identity.",
             "storage.db.snapshot_admission.",
             "storage.db.template_remote_stub.",
             "storage.db.template_stub.",

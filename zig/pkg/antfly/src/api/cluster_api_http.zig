@@ -276,7 +276,7 @@ pub fn handleClusterRestore(
         error.RestoreValidationPending, error.RestoreStagingYield, error.RestoreStagingWait => return .{ .status = 503, .body = try alloc.dupe(u8, "restore validation is temporarily unavailable; retry later"), .retry_after_seconds = 1 },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.BackupIntegrityFailure => return .{ .status = 422, .body = try alloc.dupe(u8, backups_api.integrity_failure_message) },
-        error.PortableForeignKeyRestoreUnavailable => return .{ .status = 501, .body = try alloc.dupe(u8, "portable foreign-key restore is pending distributed fault validation") },
+        error.PortableForeignKeyRestoreUnavailable => return .{ .status = 501, .body = try alloc.dupe(u8, "independent portable foreign-key restore is unavailable; use a sealed, dependency-complete cluster backup and restore") },
         error.RestoreDestinationReauthorizationRequired => return .{ .status = 409, .body = try alloc.dupe(u8, "restore destination authorization is missing or revoked; resubmit with a currently authorized credential") },
         error.UnsupportedArtifactIndexSources => return .{
             .status = 400,

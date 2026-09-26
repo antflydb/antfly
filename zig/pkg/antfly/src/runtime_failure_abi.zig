@@ -672,6 +672,7 @@ pub const Status = enum(u32) {
     generation_publication_not_found = 713,
     generation_publication_changed = 714,
     generation_retired = 715,
+    online_merge_artifact_catalog_uncoordinated = 716,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

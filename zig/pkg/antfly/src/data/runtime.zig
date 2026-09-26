@@ -4610,6 +4610,13 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         error.UnexpectedHttpStatus,
         error.NotListening,
         error.StoreRegistrationNotVisible,
+        // A store-root capability probe or linearizable identity proof may be
+        // temporarily unavailable during metadata leadership changes. Keep
+        // the data process live and retry; an actual identity/key mismatch is
+        // deliberately absent here and remains a permanent safety failure.
+        error.StoreRootSigningIdentityUnconfirmed,
+        error.StoreRootReadinessUnavailable,
+        error.TableTopologyProtocolUpgradeRequired,
         // A concurrent metadata mutation can invalidate the local snapshot
         // cache after bootstrap reads its head but before that head is
         // published. The fenced read is intentionally rejected; retrying the
@@ -5163,6 +5170,25 @@ fn structuralRaftAppliedIndex(durable: ?u64, process_local: ?u64) ?u64 {
     return durable orelse process_local;
 }
 
+fn retainReplicaRootIncarnation(cached: *u128, observed: u128) !u128 {
+    if (observed == 0) return error.InvalidRootIdentity;
+    if (cached.* != 0 and cached.* != observed) return error.StoreRootIdentityChanged;
+    cached.* = observed;
+    return observed;
+}
+
+fn localPlacementEligible(intent: antfly.raft.PlacementIntent, registration: StoreRegistrationConfig, confirmed_hidden_root: u128) bool {
+    if (intent.record.initial_fk_root_generation != 0)
+        return confirmed_hidden_root != 0 and intent.record.local_node_id == registration.node_id and intent.store_id == registration.store_id;
+    return intent.record.local_node_id == registration.node_id or intent.store_id == registration.store_id;
+}
+
+fn storeRootRegistrationRefreshDue(confirmed: bool, active: bool, urgent: bool, last_probe_ms: u64, now_ms: u64) bool {
+    if (!confirmed or active) return false;
+    const elapsed_ms = now_ms -| last_probe_ms;
+    return elapsed_ms >= 60_000 or (urgent and elapsed_ms >= 5_000);
+}
+
 pub const DataServer = struct {
     const StoreReportWorkState = enum(u8) { idle, capturing, ready };
     const StoreReportCollection = struct {
@@ -5209,8 +5235,14 @@ pub const DataServer = struct {
     metadata_local_providers_registered: bool = false,
     store_registration: ?StoreRegistrationConfig = null,
     store_registration_confirmed: bool = false,
+    store_root_registration_active: std.atomic.Value(bool) = .init(false),
+    store_root_last_probe_at_ms: std.atomic.Value(u64) = .init(0),
+    store_root_urgent_probe_requested: std.atomic.Value(bool) = .init(false),
     reporter_incarnation_mutex: std.atomic.Mutex = .unlocked,
     reporter_incarnation: u64 = 0,
+    /// Durable physical store-root identity, protected by
+    /// reporter_incarnation_mutex but independent of process incarnation.
+    replica_root_incarnation: u128 = 0,
     store_status_generation: std.atomic.Value(u64) = .init(1),
     store_report_publisher: store_report_update.Publisher = .{},
     store_report_baseline: ?struct { prepared: store_report_update.Publisher.Prepared, plan: ?store_report_baseline.Plan = null } = null,
@@ -5959,11 +5991,39 @@ pub const DataServer = struct {
         _ = self.read_source.withLocalReadSource(owner_source.readSource());
         self.read_source.resident_db = null;
         _ = self.write_source.withLocalWriteSource(owner_source.writeSource());
+        _ = self.write_source.withInitialChildRetirementReader(.{ .ptr = self, .read = readInitialChildRetirementObservation });
         _ = self.write_source.withStorageSnapshotSource(owner_source.snapshotSource());
         _ = self.write_source.withStorageMaintenanceSource(owner_source.maintenanceSource());
-        if (self.data_raft_apply) |apply_sm| apply_sm.attachKernelOwnerSource(owner_source);
+        if (self.data_raft_apply) |apply_sm| {
+            apply_sm.attachKernelOwnerSource(owner_source);
+            _ = apply_sm.write_source.withInitialChildRetirementReader(.{ .ptr = self, .read = readInitialChildRetirementObservation });
+        }
         self.kernel_owner_source = owner_source;
         return owner_source;
+    }
+
+    fn readInitialChildRetirementObservation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) !antfly.public_api.InitialChildRetirementObservation {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        var observation: antfly.public_api.InitialChildRetirementObservation = .{};
+        if (self.data_raft) |raft| {
+            const catalog_point = blk: {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                break :blk try raft.host.http_host.host.readReplicaCatalogRecord(alloc, group_id);
+            };
+            if (catalog_point) |point_value| {
+                var point = point_value;
+                defer point.deinit(alloc);
+                if (point.record) |record|
+                    observation.initial_fk_root_generation = record.initial_fk_root_generation;
+            } else if (self.replica_catalog_path != null) {
+                // A configured durable catalog must not silently disappear.
+                return error.ReplicaCatalogUnavailable;
+            }
+        }
+        const owner_source = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        observation.record = try owner_source.readInitialChildRetirementRecord(alloc, group_id);
+        return observation;
     }
 
     fn fetchRowPolicyInstallSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../system_catalog/policies.zig").InstallRequest) ![]u8 {
@@ -6428,7 +6488,8 @@ pub const DataServer = struct {
                 if (for (initial) |candidate| {
                     if (candidate.descriptor.child_table_id == record.table_id and candidate.descriptor.namespace.shard_id == record.shard_id) break candidate;
                 } else null) |owner| {
-                    try self.primePrivateInitialChildOwner(owner);
+                    const confirmed_root = try self.hiddenInitialRootFromRemoteAuthority(owner.range.group_id);
+                    try self.primePrivateInitialChildOwner(owner, confirmed_root);
                     return (try self.ensureKernelOwnerSource()).applyHAInitialChildOwnerRecord(owner.range.group_id, owner.table.name, record);
                 }
                 const owner = for (owners) |candidate| {
@@ -7409,7 +7470,8 @@ pub const DataServer = struct {
                 if (owner.range.group_id == group_id) break owner;
             } else null) |owner| {
                 if (comptime linked_storage) {
-                    try self.primePrivateInitialChildOwner(owner);
+                    const confirmed_root = try self.hiddenInitialRootFromRemoteAuthority(owner.range.group_id);
+                    try self.primePrivateInitialChildOwner(owner, confirmed_root);
                     try (try self.ensureKernelOwnerSource()).captureHASeedInitialChildReplicaSnapshot(table.name, group_id, snapshot_token, destination_root);
                 } else return error.HASeedSnapshotIncompleteTopology;
             } else if (findHANativeRestoreOwner(native_projection.owners, group_id)) |owner| {
@@ -8451,8 +8513,22 @@ pub const DataServer = struct {
             const now_ms: u64 = @intCast(@divTrunc(self.backgroundMonotonicNs(), std.time.ns_per_ms));
             if (self.metadataBootstrapRetryDue(now_ms)) {
                 const registration_ready = blk: {
-                    if (!self.store_registration_confirmed) {
+                    const root_refresh_due = storeRootRegistrationRefreshDue(
+                        self.store_registration_confirmed,
+                        self.store_root_registration_active.load(.acquire),
+                        self.store_root_urgent_probe_requested.load(.acquire),
+                        self.store_root_last_probe_at_ms.load(.acquire),
+                        now_ms,
+                    );
+                    if (!self.store_registration_confirmed or root_refresh_due) {
                         self.registerNodeIfConfigured() catch |err| {
+                            if (self.store_registration_confirmed) {
+                                // A failed optional v17 refresh cannot take
+                                // an already registered ordinary store down.
+                                // The exact hidden-owner gate remains closed.
+                                std.log.warn("store root registration refresh deferred err={s}", .{@errorName(err)});
+                                break :blk true;
+                            }
                             try self.recordMetadataBootstrapError(err);
                             break :blk false;
                         };
@@ -9877,6 +9953,14 @@ pub const DataServer = struct {
         try context.ensureActive();
         try request.validate();
         if (request.ownerGroup() != group_id) return error.OnlineSourceScopeChanged;
+        // The artifact catalog is still replica-local. Even a singleton group
+        // can add a learner after admission, so a point-in-time ConfState
+        // probe cannot certify the source and receiver for the lifetime of an
+        // online merge. Keep distributed document and relational merges on the
+        // guarded ordinary path until a Raft-ordered catalog and membership
+        // barrier covers both groups. Native standalone rewrites are separate.
+        if (request.scope.fence.role == .merge_source)
+            return onlineMergeRaftIneligibleAdmission(alloc, request);
         // Capture leader authority and every applying member, including joint
         // voters and learners. Never hold the host mutex across network I/O.
         const authority = blk: {
@@ -11795,6 +11879,11 @@ pub const DataServer = struct {
         route: DataRaftBatchRoute,
         leader_wait_ns: u64,
     ) !void {
+        // Do not allow a private/direct batch route to bypass the metadata
+        // admission policy. This happens before a protocol barrier or a data
+        // entry can be appended, so rejection is never an ambiguous outcome.
+        if (onlineMergeRaftBatchRequiresArtifactBarrier(req))
+            return error.OnlineMergeArtifactCatalogUncoordinated;
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         var proposal_req = req;
         const required_protocol_version = requiredRaftBatchProtocolVersion(req);
@@ -16786,16 +16875,60 @@ pub const DataServer = struct {
         return self.reporter_incarnation;
     }
 
+    fn replicaRootIncarnation(self: *DataServer) !u128 {
+        // Registration is rare. Reopen the durable checkpoint on every
+        // attempt so a replaced mount cannot keep advertising the old root
+        // through this process's cached identity.
+        const runtime = try self.ensureBackendRuntime();
+        const api_io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+        const loaded = try @import("../storage/db/root_identity.zig").loadOrCreate(self.alloc, api_io, self.write_source.replica_root_dir);
+        lockAtomic(&self.reporter_incarnation_mutex);
+        defer self.reporter_incarnation_mutex.unlock();
+        return retainReplicaRootIncarnation(&self.replica_root_incarnation, loaded.incarnation);
+    }
+
     pub fn registerNodeIfConfigured(self: *DataServer) !void {
         const remote_metadata = self.remote_metadata orelse return;
         const registration = self.store_registration orelse return;
+        self.store_root_last_probe_at_ms.store(self.backgroundMonotonicMs(), .release);
+        const root_ready = try remote_metadata.storeRootReadiness();
         // Store identity must be able to bootstrap before a newly introduced
         // runtime-status envelope is activated. Advertise the dense-native
         // capability only after metadata has durably selected the framed V16
         // profile; the ordinary status heartbeat then upgrades this record and
         // participates in the separate dense-authority capability floor.
-        var protocol_snapshot = try remote_metadata.fetchSnapshot();
+        // Key enrollment is immutable for a physical root. Read the prior
+        // registration linearly, rather than trusting a cached status page:
+        // an old leader may acknowledge a JSON key it does not understand.
+        var protocol_snapshot = (try RemoteMetadataSource.remoteLinearizableSnapshot(remote_metadata, .{})) orelse
+            return error.StoreRootSigningIdentityUnconfirmed;
         defer freeAdminSnapshotOwned(self.alloc, &protocol_snapshot);
+        const zero_key: [32]u8 = @splat(0);
+        const previous_store = for (protocol_snapshot.stores) |store| {
+            if (store.store_id == registration.store_id) break store;
+        } else null;
+        const previously_enrolled = if (previous_store) |store|
+            !std.mem.eql(u8, &store.replica_root_public_key, &zero_key)
+        else
+            false;
+        const signing_ready = if (root_ready)
+            try remote_metadata.storeRootSigningReadiness()
+        else
+            false;
+        const root_incarnation = if (root_ready) try self.replicaRootIncarnation() else 0;
+        var public_key: [32]u8 = zero_key;
+        if (signing_ready) {
+            const runtime = try self.ensureBackendRuntime();
+            const api_io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+            const signing = try @import("../storage/db/root_signing_identity.zig").loadOrCreate(
+                self.alloc,
+                api_io,
+                self.write_source.replica_root_dir,
+            );
+            if (signing.root_incarnation != root_incarnation) return error.StoreRootSigningIdentityUnconfirmed;
+            public_key = signing.public_key;
+        }
+        try validatePreviousStoreRootSigning(previous_store, root_incarnation, public_key, signing_ready);
         const dense_native_capability = denseNativeCapabilityForRuntimeStatusVersion(
             protocol_snapshot.status.runtime_status_protocol_activated_version,
         );
@@ -16808,10 +16941,12 @@ pub const DataServer = struct {
             uri
         else
             "";
-        const record: antfly.metadata.table_manager.StoreRecord = .{
+        var record: antfly.metadata.table_manager.StoreRecord = .{
             .store_id = registration.store_id,
             .node_id = registration.node_id,
             .reporter_incarnation = try self.reporterIncarnation(),
+            .replica_root_incarnation = root_incarnation,
+            .replica_root_public_key = public_key,
             .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
             .relational_topology_protocol_version = if (self.data_raft != null) antfly.metadata.table_manager.relational_topology_protocol_version else 0,
@@ -16823,8 +16958,26 @@ pub const DataServer = struct {
             .failure_domain = registration.failure_domain,
             .live = true,
         };
-        try remote_metadata.registerNode(record);
-        var snapshot = try remote_metadata.fetchSnapshot();
+        while (true) {
+            remote_metadata.registerNode(record) catch |err| switch (err) {
+                error.TableTopologyProtocolUpgradeRequired => {
+                    // Only a definite pre-proposal decoder verdict permits
+                    // fallback. Once enrolled, never strip the key.
+                    if (!std.mem.eql(u8, &record.replica_root_public_key, &zero_key)) {
+                        if (previously_enrolled) return err;
+                        record.replica_root_public_key = zero_key;
+                        continue;
+                    }
+                    if (record.replica_root_incarnation == 0) return err;
+                    record.replica_root_incarnation = 0;
+                    continue;
+                },
+                else => return err,
+            };
+            break;
+        }
+        var snapshot = (try RemoteMetadataSource.remoteLinearizableSnapshot(remote_metadata, .{})) orelse
+            return error.StoreRootIdentityUnconfirmed;
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
         self.provisioned_storage.setDenseNativeAuthorityPermitted(
             snapshot.status.dense_native_storage_protocol_activated_version >=
@@ -16832,6 +16985,9 @@ pub const DataServer = struct {
         );
         if (!storeRegistrationVisible(snapshot.stores, record)) return error.StoreRegistrationNotVisible;
         self.store_registration_confirmed = true;
+        self.store_root_registration_active.store(record.replica_root_incarnation != 0, .release);
+        self.store_root_urgent_probe_requested.store(false, .release);
+        self.requestDataRaftMetadataSync();
         self.clearMetadataBootstrapRetry();
         // Startup should not block on reopening every local group DB just to
         // compute an initial best-effort status report. Mark the store dirty
@@ -17873,6 +18029,7 @@ pub const DataServer = struct {
         snapshot: *const antfly.metadata_api.AdminSnapshot,
         local_intents: []const antfly.raft.PlacementIntent,
         private_initial_owners: []const @import("private_provisioning.zig").InitialOwner,
+        retained_hidden_group_ids: []const u64,
     ) !std.AutoHashMapUnmanaged(u64, []u8) {
         var names = std.AutoHashMapUnmanaged(u64, []u8).empty;
         errdefer {
@@ -17887,6 +18044,10 @@ pub const DataServer = struct {
             const table_name = snapshotTableNameForGroup(snapshot, intent.record.group_id) orelse blk: {
                 for (private_initial_owners) |owner| if (owner.range.group_id == intent.record.group_id)
                     break :blk owner.table.name;
+                if (groupIdInSlice(retained_hidden_group_ids, intent.record.group_id)) {
+                    if (self.last_data_raft_group_table_names.get(intent.record.group_id)) |prior_name|
+                        break :blk prior_name;
+                }
                 continue;
             };
             const owned_name = try self.alloc.dupe(u8, table_name);
@@ -17956,6 +18117,52 @@ pub const DataServer = struct {
 
     const PlacementAuthority = enum { observation, linearizable };
 
+    fn confirmedHiddenInitialStoreRoot(self: *DataServer, snapshot: *const antfly.metadata_api.AdminSnapshot, registration: StoreRegistrationConfig) u128 {
+        if (!self.store_registration_confirmed) return 0;
+        const registered = for (snapshot.stores) |store| {
+            if (store.store_id == registration.store_id and store.node_id == registration.node_id) break store;
+        } else return 0;
+        if (registered.replica_root_incarnation == 0 or
+            registered.reporter_incarnation == 0 or
+            registered.reporter_incarnation != self.reporter_incarnation) return 0;
+        const local = self.replicaRootIncarnation() catch {
+            self.store_registration_confirmed = false;
+            return 0;
+        };
+        if (local != registered.replica_root_incarnation) {
+            self.store_registration_confirmed = false;
+            return 0;
+        }
+        return local;
+    }
+
+    fn hiddenInitialRootForLocalAuthority(self: *DataServer, snapshot: *const antfly.metadata_api.AdminSnapshot) !?u128 {
+        if (self.remote_metadata == null) return null;
+        const registration = self.store_registration orelse return error.StoreRootIdentityUnconfirmed;
+        const root = self.confirmedHiddenInitialStoreRoot(snapshot, registration);
+        if (root == 0) {
+            self.store_root_urgent_probe_requested.store(true, .release);
+            return error.StoreRootIdentityUnconfirmed;
+        }
+        return root;
+    }
+
+    fn hiddenInitialRootFromRemoteAuthority(self: *DataServer, group_id: u64) !?u128 {
+        const remote = self.remote_metadata orelse return null;
+        var snapshot = (try RemoteMetadataSource.remoteLinearizableSnapshot(remote, .{})) orelse
+            return error.StoreRootIdentityUnconfirmed;
+        defer freeAdminSnapshotOwned(self.alloc, &snapshot);
+        const registration = self.store_registration orelse return error.StoreRootIdentityUnconfirmed;
+        const assigned = for (snapshot.placement_intents) |intent| {
+            if (intent.record.group_id == group_id and
+                intent.record.initial_fk_root_generation != 0 and
+                intent.record.local_node_id == registration.node_id and
+                intent.store_id == registration.store_id) break true;
+        } else false;
+        if (!assigned) return error.StoreRootIdentityUnconfirmed;
+        return self.hiddenInitialRootForLocalAuthority(&snapshot);
+    }
+
     /// A cached/follower view may drive unchanged local placement. Any change
     /// needs a coherent quorum-fenced snapshot before filesystem or Raft state
     /// is mutated. Serialize the read with publication so two reconcilers
@@ -17984,14 +18191,95 @@ pub const DataServer = struct {
         const raft = self.data_raft orelse return;
         const factory = self.data_raft_factory orelse return;
         const registration = self.store_registration orelse return;
+        // Reconciliation can run before the public API listener is created.
+        // Its retirement preflight still needs the trusted cold owner reader;
+        // install it once before any desired-plan or journal side effect.
+        _ = try self.ensureKernelOwnerSource();
         const metadata_epoch = snapshot.status.metadata_epoch;
+        const has_local_hidden_initial = for (snapshot.placement_intents) |intent| {
+            if (intent.record.initial_fk_root_generation != 0 and
+                intent.record.local_node_id == registration.node_id and
+                intent.store_id == registration.store_id) break true;
+        } else false;
+        const confirmed_hidden_root = if (has_local_hidden_initial)
+            self.confirmedHiddenInitialStoreRoot(snapshot, registration)
+        else
+            0;
+        // Omitting an unproven hidden placement from a desired Raft plan would
+        // turn transient registration loss into a durable replica retirement.
+        // Defer the entire round before cache, provisioning, or Raft mutation.
+        if (has_local_hidden_initial and confirmed_hidden_root == 0) {
+            self.store_root_urgent_probe_requested.store(true, .release);
+            return error.StoreRootIdentityUnconfirmed;
+        }
+        // A removed placement is not an unlink authorization for a private
+        // initial-FK owner. Retain only that admitted group in the desired
+        // Raft plan; unrelated placements must continue to reconcile. The
+        // exact cancellation-ticket worker will retire this group separately.
+        var retained_hidden: std.ArrayListUnmanaged(u64) = .empty;
+        defer retained_hidden.deinit(self.alloc);
+        var fenced_hidden_removals: std.ArrayListUnmanaged(u64) = .empty;
+        defer fenced_hidden_removals.deinit(self.alloc);
+        if (self.last_data_raft_placement_inputs) |*previous| {
+            for (self.last_data_raft_local_intents) |admitted| {
+                if (!previous.wasHiddenInitialGroup(admitted.record.group_id) or
+                    findRangeByGroupId(snapshot.ranges, admitted.record.group_id) != null) continue;
+                const still_assigned = for (snapshot.placement_intents) |intent| {
+                    if (intent.record.group_id == admitted.record.group_id and
+                        intent.record.replica_id == admitted.record.replica_id and
+                        intent.record.local_node_id == registration.node_id and
+                        intent.store_id == registration.store_id) break true;
+                } else false;
+                if (!still_assigned) {
+                    const physical_root = self.replicaRootIncarnation() catch 0;
+                    if (previous.admitted_hidden_root_incarnation != 0 and
+                        previous.admitted_hidden_root_incarnation == physical_root)
+                        try retained_hidden.append(self.alloc, admitted.record.group_id)
+                    else
+                        try fenced_hidden_removals.append(self.alloc, admitted.record.group_id);
+                }
+            }
+        } else if (self.replica_catalog_path != null) {
+            // The in-memory admission cache is lost on restart. A durable
+            // initial-child marker identifies possible retirement debt, but
+            // it does not record the physical root UUID that admitted it. Do
+            // not synthesize an owner on this root, or interpret omission as
+            // permission to unlink it. Snapshot once for the whole cold
+            // round; the ordinary siblings still reconcile independently.
+            var catalog_snapshot = blk: {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                break :blk (try raft.host.http_host.host.snapshotReplicaCatalog(self.alloc)) orelse
+                    return error.ReplicaCatalogUnavailable;
+            };
+            defer catalog_snapshot.deinit(self.alloc);
+            for (catalog_snapshot.records) |record| {
+                if (record.initial_fk_root_generation == 0 or
+                    findRangeByGroupId(snapshot.ranges, record.group_id) != null) continue;
+                const still_assigned = for (snapshot.placement_intents) |intent| {
+                    if (intent.record.group_id == record.group_id and
+                        intent.record.replica_id == record.replica_id and
+                        intent.record.local_node_id == registration.node_id and
+                        intent.store_id == registration.store_id) break true;
+                } else false;
+                if (still_assigned) continue;
+                const observation = readInitialChildRetirementObservation(self, self.alloc, record.group_id) catch null;
+                if (observation) |value| {
+                    if (value.record) |publication| {
+                        if (publication.phase == .released) continue;
+                    }
+                }
+                try fenced_hidden_removals.append(self.alloc, record.group_id);
+                std.log.warn("quarantined omitted initial-FK owner after cold restart group={d}: exact root-bound retirement ticket required", .{record.group_id});
+            }
+        }
 
         // Compare the inputs that built the admitted plan, including remote
         // member rows and split bootstrap voters. This allocation-free check
         // works across peer changes, equal counters, and unrelated lifecycle
         // activity without reconstructing topology or obtaining another fence.
         const stable_inputs = if (self.last_data_raft_placement_inputs) |*inputs|
-            inputs.matches(snapshot)
+            !has_local_hidden_initial and retained_hidden.items.len == 0 and inputs.matches(snapshot)
         else
             false;
         stable_round: {
@@ -18034,9 +18322,27 @@ pub const DataServer = struct {
             return;
         }
 
+        var augmented_placements: std.ArrayListUnmanaged(antfly.raft.PlacementIntent) = .empty;
+        defer augmented_placements.deinit(self.alloc);
+        var effective_snapshot = snapshot.*;
+        if (retained_hidden.items.len > 0) {
+            try augmented_placements.appendSlice(self.alloc, snapshot.placement_intents);
+            const previous = &self.last_data_raft_placement_inputs.?;
+            for (previous.intents) |prior| {
+                if (!groupIdInSlice(retained_hidden.items, prior.record.group_id)) continue;
+                const present = for (snapshot.placement_intents) |current| {
+                    if (current.record.group_id == prior.record.group_id and
+                        current.record.replica_id == prior.record.replica_id and
+                        current.record.local_node_id == prior.record.local_node_id and
+                        current.store_id == prior.store_id) break true;
+                } else false;
+                if (!present) try augmented_placements.append(self.alloc, prior);
+            }
+            effective_snapshot.placement_intents = augmented_placements.items;
+        }
         var placement_topology = try PlacementTopologyIndex.initForSnapshot(
             self.alloc,
-            snapshot.placement_intents,
+            effective_snapshot.placement_intents,
             snapshot.split_transitions,
         );
         defer placement_topology.deinit();
@@ -18048,7 +18354,7 @@ pub const DataServer = struct {
             local_intents.deinit(self.alloc);
         }
         for (snapshot.placement_intents) |intent| {
-            if (intent.record.local_node_id != registration.node_id and intent.store_id != registration.store_id) continue;
+            if (!localPlacementEligible(intent, registration, confirmed_hidden_root)) continue;
             const voter_node_ids = placement_topology.initialVoters(intent.record.group_id) orelse
                 return error.MissingAuthoritativeBootstrapVoters;
             const learner_node_ids = placement_topology.learners(intent.record.group_id) orelse
@@ -18064,6 +18370,17 @@ pub const DataServer = struct {
             local_intent.learner_node_ids = owned_learners;
             try local_intents.append(self.alloc, local_intent);
         }
+        const new_local_count = local_intents.items.len;
+        for (self.last_data_raft_local_intents) |admitted| {
+            if (!groupIdInSlice(retained_hidden.items, admitted.record.group_id)) continue;
+            var retained = admitted;
+            retained.record = try admitted.record.clone(self.alloc);
+            errdefer retained.record.deinit(self.alloc);
+            retained.peer_node_ids = try self.alloc.dupe(u64, admitted.peer_node_ids);
+            errdefer self.alloc.free(retained.peer_node_ids);
+            retained.learner_node_ids = try self.alloc.dupe(u64, admitted.learner_node_ids);
+            try local_intents.append(self.alloc, retained);
+        }
         // Transfer the one fully-owned plan into the epoch cache. Building a
         // second deep clone here doubles peak memory on large topology
         // changes and provides no additional isolation: the remainder of this
@@ -18075,8 +18392,14 @@ pub const DataServer = struct {
             (self.last_data_raft_placement_inputs == null or
                 !dataRaftPlacementAuthorityMatches(self.last_data_raft_local_intents, next_cached_local_intents)))
             return error.MetadataReconciliationRequiresAuthority;
-        var next_inputs = try DataRaftPlacementInputs.clone(self.alloc, snapshot);
+        var next_inputs = try DataRaftPlacementInputs.clone(self.alloc, &effective_snapshot);
         defer next_inputs.deinit(self.alloc);
+        next_inputs.admitted_hidden_root_incarnation = if (has_local_hidden_initial)
+            confirmed_hidden_root
+        else if (retained_hidden.items.len > 0)
+            self.last_data_raft_placement_inputs.?.admitted_hidden_root_incarnation
+        else
+            0;
         // A hidden initial child has explicit placement but no public range.
         // Obtain its node-scoped immutable descriptor at this same metadata
         // head, before the Raft host may admit or apply the new group. The
@@ -18086,7 +18409,7 @@ pub const DataServer = struct {
         var private_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer private_arena.deinit();
         var private_initial_owners: []const @import("private_provisioning.zig").InitialOwner = &.{};
-        const needs_private_identity = needsPrivateInitialOwnerSnapshot(snapshot, next_cached_local_intents);
+        const needs_private_identity = needsPrivateInitialOwnerSnapshot(snapshot, next_cached_local_intents[0..new_local_count]);
         if (needs_private_identity) {
             const remote_metadata = self.remote_metadata orelse return error.MissingMetadataApi;
             // AdminSnapshot.status.metadata_epoch is a lifecycle counter, not
@@ -18097,7 +18420,16 @@ pub const DataServer = struct {
             const private_head = try remote_metadata.fetchHead();
             var paired_public = try remote_metadata.fetchSnapshotForHead(private_head);
             defer freeAdminSnapshotOwned(self.alloc, &paired_public);
-            if (!next_inputs.matches(&paired_public)) return error.MetadataSnapshotHeadMismatch;
+            if (retained_hidden.items.len == 0) {
+                if (!next_inputs.matches(&paired_public)) return error.MetadataSnapshotHeadMismatch;
+            } else {
+                // Retained private owners are deliberately absent from the
+                // current metadata publication. Compare the paired read to
+                // its unaugmented authority, not to our local safety plan.
+                var published_inputs = try DataRaftPlacementInputs.clone(self.alloc, snapshot);
+                defer published_inputs.deinit(self.alloc);
+                if (!published_inputs.matches(&paired_public)) return error.MetadataSnapshotHeadMismatch;
+            }
             private_initial_snapshot = remote_metadata.fetchProvisioningSnapshotForHead(private_head, registration.node_id) catch |err| switch (err) {
                 error.UnsupportedOperation => null,
                 else => return err,
@@ -18115,6 +18447,7 @@ pub const DataServer = struct {
             // canceled between the two reads. Split/restore destinations have
             // their own admission protocols and carry no initial-FK generation.
             for (next_cached_local_intents) |intent| {
+                if (groupIdInSlice(retained_hidden.items, intent.record.group_id)) continue;
                 if (intent.record.initial_fk_root_generation == 0 or
                     snapshotTableNameForGroup(snapshot, intent.record.group_id) != null) continue;
                 const found = for (private_initial_owners) |owner| {
@@ -18124,7 +18457,7 @@ pub const DataServer = struct {
                 if (!found) return error.InvalidGenerationPublication;
             }
         }
-        var next_group_table_names = try self.buildLocalDataRaftGroupTableNames(snapshot, next_cached_local_intents, private_initial_owners);
+        var next_group_table_names = try self.buildLocalDataRaftGroupTableNames(snapshot, next_cached_local_intents, private_initial_owners, retained_hidden.items);
         defer {
             var it = next_group_table_names.valueIterator();
             while (it.next()) |name| self.alloc.free(name.*);
@@ -18136,15 +18469,24 @@ pub const DataServer = struct {
         // storage or consult metadata after an entry has committed.
         try self.provisionSplitDestinationsBeforeRaftAdmission(snapshot, next_cached_local_intents);
         for (private_initial_owners) |owner| {
+            const belongs_to_store = for (snapshot.placement_intents) |intent| {
+                if (intent.record.group_id == owner.range.group_id and
+                    intent.record.initial_fk_root_generation != 0 and
+                    intent.record.local_node_id == registration.node_id and
+                    intent.store_id == registration.store_id) break true;
+            } else false;
+            if (!belongs_to_store) continue;
             const assigned = for (next_cached_local_intents) |intent| {
-                if (intent.record.group_id == owner.range.group_id and intent.record.local_node_id == registration.node_id)
+                if (intent.record.group_id == owner.range.group_id and
+                    intent.record.local_node_id == registration.node_id and
+                    intent.store_id == registration.store_id)
                     break true;
             } else false;
             if (!assigned) return error.InvalidGenerationPublication;
             var activity = self.liveRuntimeWriteSource().tryBeginGroupRefreshActivity(owner.table.name, owner.range.group_id) orelse
                 return error.TransitionDestinationProvisioningBusy;
             defer activity.deinit();
-            try self.primePrivateInitialChildOwner(owner);
+            try self.primePrivateInitialChildOwner(owner, confirmed_hidden_root);
         }
         try self.applyDataRaftStorageOwnershipChange(snapshot, next_cached_local_intents);
 
@@ -18154,6 +18496,7 @@ pub const DataServer = struct {
             updates.deinit(self.alloc);
         }
         for (next_cached_local_intents) |intent| {
+            if (groupIdInSlice(retained_hidden.items, intent.record.group_id)) continue;
             const transport_peers = placement_topology.peers(intent.record.group_id) orelse
                 return error.MissingPlacementPeerSet;
             for (snapshot.stores) |peer| {
@@ -18210,22 +18553,29 @@ pub const DataServer = struct {
             return err;
         };
 
-        const retirement_source = if (reconcile.removals.len > 0)
+        var ordinary_retirement_count: usize = 0;
+        for (reconcile.removals) |group_id| {
+            if (!groupIdInSlice(fenced_hidden_removals.items, group_id)) ordinary_retirement_count += 1;
+        }
+        const retirement_source = if (ordinary_retirement_count > 0)
             if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else null
         else
             null;
         const retirement_targets = if (retirement_source != null) blk: {
             const targets = try self.alloc.alloc(
                 antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementTarget,
-                reconcile.removals.len,
+                ordinary_retirement_count,
             );
-            for (reconcile.removals, targets) |group_id, *target| {
+            var target_index: usize = 0;
+            for (reconcile.removals) |group_id| {
+                if (groupIdInSlice(fenced_hidden_removals.items, group_id)) continue;
                 const table_name = replicaRetirementTableName(
                     snapshot,
                     &self.last_data_raft_group_table_names,
                     group_id,
                 );
-                target.* = .{ .group_id = group_id, .table_name = table_name };
+                targets[target_index] = .{ .group_id = group_id, .table_name = table_name };
+                target_index += 1;
             }
             break :blk targets;
         } else &.{};
@@ -18305,7 +18655,7 @@ pub const DataServer = struct {
                 if (reconcile.catalog_commit_complete) {
                     source.completePreparedReplicaRetirements(prepared) catch |retirement_err| {
                         std.log.warn("committed local replica retirement deferred groups={d} err={s}", .{
-                            reconcile.removals.len,
+                            ordinary_retirement_count,
                             @errorName(retirement_err),
                         });
                         source.requestReplicaRetirementRecovery();
@@ -18322,7 +18672,7 @@ pub const DataServer = struct {
                 // intent and recovery worker own convergence; do not roll the
                 // metadata epoch back or hold consensus progress on deletion.
                 std.log.warn("local replica retirement deferred groups={d} err={s}", .{
-                    reconcile.removals.len,
+                    ordinary_retirement_count,
                     @errorName(err),
                 });
             };
@@ -19007,8 +19357,16 @@ pub const DataServer = struct {
             try source.primeRestoreStagingWriter(self.alloc, owner.range.group_id, owner.table, range, owner.scope);
     }
 
-    fn primePrivateInitialChildOwner(self: *DataServer, owner: @import("private_provisioning.zig").InitialOwner) !void {
+    fn primePrivateInitialChildOwner(self: *DataServer, owner: @import("private_provisioning.zig").InitialOwner, confirmed_root: ?u128) !void {
         if (comptime !linked_storage) return error.InvalidInitialChildPublication;
+        if (confirmed_root) |expected| {
+            if (expected == 0 or !self.store_registration_confirmed or
+                (try self.replicaRootIncarnation()) != expected)
+            {
+                self.store_registration_confirmed = false;
+                return error.StoreRootIdentityChanged;
+            }
+        }
         const descriptor = owner.descriptor;
         const bootstrap: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap = .{
             .plan_id = descriptor.plan_id,
@@ -19035,7 +19393,10 @@ pub const DataServer = struct {
     /// validates the entire private cut before handing this exact descriptor
     /// to the same compiled owner used by clustered provisioning.
     pub fn primeInitialChildOwnerDescriptor(self: *DataServer, owner: @import("private_provisioning.zig").InitialOwner) !void {
-        return self.primePrivateInitialChildOwner(owner);
+        // Standalone metadata and the owner share one local authority; it
+        // does not consume a remotely placed store-root registration.
+        if (self.remote_metadata != null) return error.StoreRootIdentityUnconfirmed;
+        return self.primePrivateInitialChildOwner(owner, null);
     }
 
     pub fn readHiddenInitialChildRecord(self: *DataServer, group_id: u64, table_id: u64) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
@@ -22051,6 +22412,12 @@ pub const DataServer = struct {
         defer proof_arena.deinit();
         const hidden = if (private_snapshot) |value| try @import("private_provisioning.zig").validate(proof_arena.allocator(), snapshot.tables, snapshot.ranges, value.value.catalog) else &.{};
         const hidden_initial = if (private_snapshot) |value| try @import("private_provisioning.zig").validateInitial(proof_arena.allocator(), snapshot.tables, snapshot.ranges, value.value.catalog) else &.{};
+        const has_local_hidden_initial = for (snapshot.placement_intents) |intent| {
+            if (intent.record.initial_fk_root_generation != 0 and
+                intent.record.local_node_id == registration.node_id and
+                intent.store_id == registration.store_id) break true;
+        } else false;
+        const confirmed_hidden_root = if (has_local_hidden_initial) try self.hiddenInitialRootForLocalAuthority(&snapshot) else null;
         self.private_provisioning_active = hidden.len != 0 or hidden_initial.len != 0;
         const provisioning_tables = if (private_snapshot) |value| try std.mem.concat(proof_arena.allocator(), antfly.metadata.table_manager.TableRecord, &.{ snapshot.tables, value.value.catalog.tables }) else snapshot.tables;
         const desired_ranges = if (private_snapshot) |value| try std.mem.concat(proof_arena.allocator(), antfly.metadata.table_manager.RangeRecord, &.{ snapshot.ranges, value.value.catalog.ranges }) else snapshot.ranges;
@@ -22155,7 +22522,7 @@ pub const DataServer = struct {
             }
 
             const backend_runtime = try self.ensureBackendRuntime();
-            for (local_group_ids) |group_id| {
+            group_loop: for (local_group_ids) |group_id| {
                 if (group_id == head.metadata_group_id) continue;
                 const range = findRangeByGroupId(provisioning_ranges, group_id) orelse continue;
                 const table = findTableById(provisioning_tables, range.table_id) orelse continue;
@@ -22164,7 +22531,7 @@ pub const DataServer = struct {
                     // Explicit node placement plus exact immutable plan proof
                     // authorizes EMPTY root creation, never a source restore.
                     const assigned = for (snapshot.placement_intents) |intent| {
-                        if (intent.record.group_id == group_id and intent.record.local_node_id == registration.node_id) break true;
+                        if (intent.record.group_id == group_id and intent.record.local_node_id == registration.node_id and intent.store_id == registration.store_id) break true;
                     } else false;
                     if (!assigned) return error.InvalidRestoreStaging;
                     var activity = refresh_write_source.tryBeginGroupRefreshActivity(table.name, group_id) orelse return error.RestoreStagingInProgress;
@@ -22177,10 +22544,12 @@ pub const DataServer = struct {
                     const assigned = for (snapshot.placement_intents) |intent| {
                         if (intent.record.group_id == group_id and intent.record.local_node_id == registration.node_id) break true;
                     } else false;
-                    if (!assigned) return error.InvalidGenerationPublication;
+                    // The private descriptor is node-scoped. A sibling store's
+                    // hidden child is not ours to prime or refresh.
+                    if (!assigned) continue :group_loop;
                     var activity = refresh_write_source.tryBeginGroupRefreshActivity(table.name, group_id) orelse return error.GenerationAdmissionPending;
                     defer activity.deinit();
-                    try self.primePrivateInitialChildOwner(owner);
+                    try self.primePrivateInitialChildOwner(owner, confirmed_hidden_root);
                     break;
                 } else {
                     {
@@ -22653,6 +23022,7 @@ pub const DataServer = struct {
                 remote_metadata.catalogSource(),
                 backend_runtime,
             ),
+            .replica_catalog_path = cfg.replica_catalog_path,
             .status_source = remote_metadata.statusSource(),
             .api_server_cfg = cfg.api_server_cfg,
             .h1_disconnect_probe = cfg.h1_disconnect_probe,
@@ -22690,12 +23060,117 @@ test "ordinary unpublished placement does not require a private initial FK owner
     try std.testing.expect(DataServer.needsPrivateInitialOwnerSnapshot(&snapshot, &.{hidden}));
 }
 
+test "distributed online merge admission declines both owners and direct source proposals" {
+    const alloc = std.testing.allocator;
+    const contract = @import("../storage/db/online_merge_io_contract.zig");
+    const source_contract = @import("../storage/db/online_source_contract.zig");
+    const donor: @import("../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+    const receiver: @import("../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 4, .range_id = 5 };
+    const unbound: source_contract.Scope = .{
+        .fence = .{ .transition_id = 7, .attempt = 0, .owner_group_id = 2, .peer_group_id = 4, .role = .merge_source, .namespace = donor, .catalog_digest = @splat(0) },
+        .receiver_namespace = receiver,
+        .consumer_epoch = 0,
+        .copy_attempt = .{},
+    };
+    for ([_]contract.Side{ .donor, .receiver }) |side| {
+        const request: contract.Request = .{ .scope = unbound, .operation = .{ .admission = side } };
+        try request.validate();
+        const bytes = try onlineMergeRaftIneligibleAdmission(alloc, request);
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(contract.AdmissionFacts, alloc, bytes, .{});
+        defer parsed.deinit();
+        try std.testing.expect(!parsed.value.eligible);
+        try std.testing.expect(parsed.value.namespace.eql(if (side == .donor) donor else receiver));
+    }
+    var bound = unbound;
+    bound.consumer_epoch = 1;
+    bound.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+    bound.fence.attempt = 1;
+    bound.fence.admission_epoch = 1;
+    bound.fence.catalog_digest = @splat(1);
+    try bound.validate();
+    const source_admit: antfly.db.types.BatchRequest = .{ .online_source = .{ .admit = .{ .scope = bound } } };
+    try std.testing.expect(onlineMergeRaftBatchRequiresArtifactBarrier(source_admit));
+    var server: DataServer = undefined;
+    try std.testing.expectError(error.OnlineMergeArtifactCatalogUncoordinated, server.proposeRaftBatchGroupWithLeaderWait(
+        alloc,
+        2,
+        "docs",
+        source_admit,
+        .{ .discovery = .cached },
+        data_raft_batch_leader_wait_ns,
+    ));
+    const online_checkpoint: antfly.db.types.BatchRequest = .{ .merge_checkpoint = .{
+        .kind = .begin_copy,
+        .transition_id = 7,
+        .donor_group_id = 2,
+        .receiver_group_id = 4,
+        .receiver_base_start = "m",
+        .receiver_base_end = "z",
+        .merged_start = "a",
+        .merged_end = "z",
+        .page_source = .{ .namespace = donor, .pin_digest = @splat(1), .applied_index = 9, .retention = .{ .epoch = 1, .after_sequence = 1 } },
+    } };
+    try std.testing.expect(onlineMergeRaftBatchRequiresArtifactBarrier(online_checkpoint));
+    try std.testing.expectError(error.OnlineMergeArtifactCatalogUncoordinated, server.proposeRaftBatchGroupWithLeaderWait(
+        alloc,
+        4,
+        "docs",
+        online_checkpoint,
+        .{ .discovery = .cached },
+        data_raft_batch_leader_wait_ns,
+    ));
+    var ordinary_checkpoint = online_checkpoint;
+    ordinary_checkpoint.merge_checkpoint.?.page_source = null;
+    try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(ordinary_checkpoint));
+    var rollback_accept = online_checkpoint;
+    rollback_accept.merge_checkpoint.?.kind = .accept;
+    rollback_accept.merge_checkpoint.?.page_source.?.integrity = .{ .catalog_digest = @splat(2), .generation_set = @splat(3) };
+    try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(rollback_accept));
+    try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(.{ .online_source = .{ .release = bound } }));
+    try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(.{}));
+}
+
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     // Bounded spin, then yield (platform_sync): this guards the raft round
     // (which can run for milliseconds), and a pure spin here pins a core per
     // waiter — on CPU-constrained hosts (CI runners) that starves the very
     // threads that would release the lock.
     platform_sync.lockYielding(mutex);
+}
+
+fn onlineMergeRaftIneligibleAdmission(
+    alloc: std.mem.Allocator,
+    request: @import("../storage/db/online_merge_io_contract.zig").Request,
+) ![]u8 {
+    const facts: @import("../storage/db/online_merge_io_contract.zig").AdmissionFacts = .{
+        .namespace = if (request.operation.admission == .donor)
+            request.scope.fence.namespace
+        else
+            request.scope.receiver_namespace,
+        .eligible = false,
+        .catalog_digest = @splat(0),
+        .next_topology_epoch = 0,
+        .next_consumer_epoch = 0,
+        .donor_term = 0,
+        .next_copy_sequence = 0,
+    };
+    return std.json.Stringify.valueAlloc(alloc, facts, .{});
+}
+
+fn onlineMergeRaftBatchRequiresArtifactBarrier(req: antfly.db.types.BatchRequest) bool {
+    if (req.online_source) |command| {
+        if (command == .admit and command.scope().fence.role == .merge_source) return true;
+    }
+    if (req.merge_checkpoint) |checkpoint| {
+        // A source-bound accept also establishes the exact receiver receipt
+        // before rollback of a pre-gate coordinated-integrity attempt. Only
+        // begin_copy starts an online transfer; keep cancellation available.
+        if (checkpoint.kind == .begin_copy and checkpoint.page_source != null) return true;
+    }
+    // A merge page requires a previously committed receiver checkpoint with
+    // the exact source/attempt. Allow those pre-gate attempts to drain.
+    return false;
 }
 
 fn onlineMergePeerEligible(version: u16) !bool {
@@ -22839,13 +23314,22 @@ fn nodeIdInSlice(node_ids: []const u64, node_id: u64) bool {
     return false;
 }
 
+fn groupIdInSlice(group_ids: []const u64, group_id: u64) bool {
+    for (group_ids) |candidate| if (candidate == group_id) return true;
+    return false;
+}
+
 /// Owned inputs for one admitted placement plan. Operational status is absent:
 /// lifecycle ticks and peer-local counters cannot invalidate or validate it.
 /// Comparisons borrow these values; only a changed plan allocates a replacement.
 const DataRaftPlacementInputs = struct {
     metadata_group_id: u64 = 0,
     metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation = null,
+    admitted_hidden_root_incarnation: u128 = 0,
     intents: []antfly.raft.PlacementIntent = &.{},
+    /// Groups that were private at the last successful admission. The
+    /// generation marker alone is insufficient: it survives publication.
+    hidden_initial_group_ids: []u64 = &.{},
     split_destinations: []u64 = &.{},
     // Transport routes change independently of placement (for example after
     // a peer restarts on a different endpoint). Own only routing inputs, not
@@ -22864,6 +23348,19 @@ const DataRaftPlacementInputs = struct {
         };
         errdefer result.deinit(alloc);
         result.intents = try clonePlacementIntentsOwned(alloc, snapshot.placement_intents);
+        var hidden_count: usize = 0;
+        for (snapshot.placement_intents) |intent| {
+            if (intent.record.initial_fk_root_generation != 0 and
+                findRangeByGroupId(snapshot.ranges, intent.record.group_id) == null) hidden_count += 1;
+        }
+        result.hidden_initial_group_ids = try alloc.alloc(u64, hidden_count);
+        var hidden_index: usize = 0;
+        for (snapshot.placement_intents) |intent| {
+            if (intent.record.initial_fk_root_generation == 0 or
+                findRangeByGroupId(snapshot.ranges, intent.record.group_id) != null) continue;
+            result.hidden_initial_group_ids[hidden_index] = intent.record.group_id;
+            hidden_index += 1;
+        }
         result.split_destinations = try alloc.alloc(u64, snapshot.split_transitions.len);
         for (result.split_destinations, snapshot.split_transitions) |*destination, transition|
             destination.* = transition.destination_group_id;
@@ -22878,6 +23375,7 @@ const DataRaftPlacementInputs = struct {
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.intents) |intent| antfly.raft.reconciler.freeIntentOwned(alloc, intent);
         alloc.free(self.intents);
+        alloc.free(self.hidden_initial_group_ids);
         alloc.free(self.split_destinations);
         for (self.peer_routes) |route| alloc.free(route.raft_url);
         alloc.free(self.peer_routes);
@@ -22890,12 +23388,28 @@ const DataRaftPlacementInputs = struct {
             !dataRaftPlacementAuthorityMatches(self.intents, snapshot.placement_intents) or
             self.split_destinations.len != snapshot.split_transitions.len or
             self.peer_routes.len != snapshot.stores.len) return false;
+        var hidden_index: usize = 0;
+        for (snapshot.placement_intents) |intent| {
+            if (intent.record.initial_fk_root_generation == 0 or
+                findRangeByGroupId(snapshot.ranges, intent.record.group_id) != null) continue;
+            if (hidden_index >= self.hidden_initial_group_ids.len or
+                self.hidden_initial_group_ids[hidden_index] != intent.record.group_id) return false;
+            hidden_index += 1;
+        }
+        if (hidden_index != self.hidden_initial_group_ids.len) return false;
         for (self.split_destinations, snapshot.split_transitions) |destination, transition|
             if (destination != transition.destination_group_id) return false;
         for (self.peer_routes, snapshot.stores) |route, store| {
             if (route.node_id != store.node_id or !std.mem.eql(u8, route.raft_url, store.raft_url)) return false;
         }
         return true;
+    }
+
+    fn wasHiddenInitialGroup(self: *const @This(), group_id: u64) bool {
+        for (self.hidden_initial_group_ids) |hidden_group_id| {
+            if (hidden_group_id == group_id) return true;
+        }
+        return false;
     }
 };
 
@@ -26129,6 +26643,22 @@ const RemoteMetadataSource = struct {
         self.invalidateCache();
     }
 
+    fn storeRootReadiness(self: *RemoteMetadataSource) !bool {
+        return self.withMetadataApiClient(bool, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, _: void) !bool {
+                return client.storeRootReadiness(base_uri);
+            }
+        }.call, {});
+    }
+
+    fn storeRootSigningReadiness(self: *RemoteMetadataSource) !bool {
+        return self.withMetadataApiClient(bool, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, _: void) !bool {
+                return client.storeRootSigningReadiness(base_uri);
+            }
+        }.call, {});
+    }
+
     fn reportNodeStatus(self: *RemoteMetadataSource, report: antfly.metadata.table_manager.StoreStatusReport) !void {
         return self.reportNodeStatusWithBudget(report, null);
     }
@@ -27027,12 +27557,29 @@ fn storeRegistrationVisible(
         // process incarnation and stale processes lose report authority.
         if (store.reporter_incarnation != 0 and
             store.reporter_incarnation != record.reporter_incarnation) continue;
+        if (store.replica_root_incarnation != record.replica_root_incarnation) continue;
+        if (!std.mem.eql(u8, &store.replica_root_public_key, &record.replica_root_public_key)) continue;
         if (store.native_generation_restore_version != record.native_generation_restore_version) continue;
         if (store.dense_native_storage_protocol_version != record.dense_native_storage_protocol_version) continue;
         if (store.relational_topology_protocol_version != record.relational_topology_protocol_version) continue;
         return true;
     }
     return false;
+}
+
+fn validatePreviousStoreRootSigning(
+    previous: ?antfly.metadata.table_manager.StoreRecord,
+    root_incarnation: u128,
+    public_key: [32]u8,
+    signing_ready: bool,
+) !void {
+    const store = previous orelse return;
+    const zero_key: [32]u8 = @splat(0);
+    if (std.mem.eql(u8, &store.replica_root_public_key, &zero_key)) return;
+    if (!signing_ready) return error.StoreRootSigningIdentityUnconfirmed;
+    if (store.replica_root_incarnation != root_incarnation or
+        !std.mem.eql(u8, &store.replica_root_public_key, &public_key))
+        return error.StoreRootSigningIdentityChanged;
 }
 
 fn storeReporterIncarnationVisible(
@@ -34074,12 +34621,36 @@ fn consumerTests() type {
             try std.testing.expect(findRangeByGroupId(provisioning, 40) == null);
         }
 
+        test "data store registration rejects same-process physical root replacement" {
+            try std.testing.expect(!storeRootRegistrationRefreshDue(true, false, false, 1_000, 59_999));
+            try std.testing.expect(storeRootRegistrationRefreshDue(true, false, false, 1_000, 61_000));
+            try std.testing.expect(!storeRootRegistrationRefreshDue(true, false, true, 1_000, 5_999));
+            try std.testing.expect(storeRootRegistrationRefreshDue(true, false, true, 1_000, 6_000));
+            try std.testing.expect(!storeRootRegistrationRefreshDue(true, true, true, 1_000, 61_000));
+            var cached_root: u128 = 0;
+            try std.testing.expectEqual(@as(u128, 0x5678), try retainReplicaRootIncarnation(&cached_root, 0x5678));
+            try std.testing.expectEqual(@as(u128, 0x5678), try retainReplicaRootIncarnation(&cached_root, 0x5678));
+            try std.testing.expectError(error.StoreRootIdentityChanged, retainReplicaRootIncarnation(&cached_root, 0x5679));
+            try std.testing.expectEqual(@as(u128, 0x5678), cached_root);
+            try std.testing.expectError(error.InvalidRootIdentity, retainReplicaRootIncarnation(&cached_root, 0));
+            const registration: StoreRegistrationConfig = .{ .node_id = 9, .store_id = 19 };
+            const ordinary: antfly.raft.PlacementIntent = .{ .record = .{ .group_id = 7, .replica_id = 1, .local_node_id = 9 }, .store_id = 19 };
+            var hidden = ordinary;
+            hidden.record.initial_fk_root_generation = 4;
+            try std.testing.expect(localPlacementEligible(ordinary, registration, 0));
+            try std.testing.expect(!localPlacementEligible(hidden, registration, 0));
+            try std.testing.expect(localPlacementEligible(hidden, registration, cached_root));
+            hidden.store_id = 20;
+            try std.testing.expect(!localPlacementEligible(hidden, registration, cached_root));
+        }
+
         test "data store registration waits for native generation capability acknowledgment" {
             const expected = antfly.metadata.table_manager.StoreRecord{
                 .store_id = 101,
                 .node_id = 11,
                 .role = "data",
                 .reporter_incarnation = 0x1234,
+                .replica_root_incarnation = 0x5678,
                 .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
                 .dense_native_storage_protocol_version = antfly.metadata.table_manager.dense_native_storage_protocol_version,
             };
@@ -34093,6 +34664,12 @@ fn consumerTests() type {
             try std.testing.expect(!storeRegistrationVisible(&.{committed}, expected));
             committed.dense_native_storage_protocol_version = antfly.metadata.table_manager.dense_native_storage_protocol_version;
             try std.testing.expect(storeRegistrationVisible(&.{committed}, expected));
+            committed.replica_root_incarnation = 0x5679;
+            try std.testing.expect(!storeRegistrationVisible(&.{committed}, expected));
+            committed.replica_root_incarnation = expected.replica_root_incarnation;
+            committed.replica_root_public_key = @splat(7);
+            try std.testing.expect(!storeRegistrationVisible(&.{committed}, expected));
+            committed.replica_root_public_key = expected.replica_root_public_key;
             try std.testing.expect(storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
             try std.testing.expect(!runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.v0_2_0_record_version));
             try std.testing.expect(runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.native_restore_identity_record_version));
@@ -34105,6 +34682,27 @@ fn consumerTests() type {
                 antfly.metadata.table_manager.dense_native_storage_protocol_version,
                 denseNativeCapabilityForRuntimeStatusVersion(16),
             );
+        }
+
+        test "enrolled store root signing key never downgrades or changes" {
+            const enrolled = antfly.metadata.table_manager.StoreRecord{
+                .store_id = 19,
+                .node_id = 9,
+                .replica_root_incarnation = 0x5678,
+                .replica_root_public_key = @splat(7),
+            };
+            try std.testing.expectError(error.StoreRootSigningIdentityUnconfirmed, validatePreviousStoreRootSigning(enrolled, 0x5678, @splat(0), false));
+            try std.testing.expectError(error.StoreRootSigningIdentityChanged, validatePreviousStoreRootSigning(enrolled, 0x5678, @splat(0), true));
+            try std.testing.expectError(error.StoreRootSigningIdentityChanged, validatePreviousStoreRootSigning(enrolled, 0x5679, @splat(7), true));
+            try std.testing.expectError(error.StoreRootSigningIdentityChanged, validatePreviousStoreRootSigning(enrolled, 0x5678, @splat(8), true));
+            try validatePreviousStoreRootSigning(enrolled, 0x5678, @splat(7), true);
+            var unenrolled = enrolled;
+            unenrolled.replica_root_public_key = @splat(0);
+            try validatePreviousStoreRootSigning(unenrolled, 0x5678, @splat(0), false);
+            try std.testing.expect(isRetryableMetadataBootstrapError(error.StoreRootSigningIdentityUnconfirmed));
+            try std.testing.expect(isRetryableMetadataBootstrapError(error.StoreRootReadinessUnavailable));
+            try std.testing.expect(isRetryableMetadataBootstrapError(error.TableTopologyProtocolUpgradeRequired));
+            try std.testing.expect(!isRetryableMetadataBootstrapError(error.StoreRootSigningIdentityChanged));
         }
 
         test "data runtime module compiles" {
@@ -35202,6 +35800,166 @@ fn consumerTests() type {
             server.requestDataRaftMetadataSync();
             try std.testing.expect(server.data_raft_metadata_sync_requested.swap(false, .acq_rel));
             try std.testing.expect(!server.data_raft_metadata_sync_requested.swap(false, .acq_rel));
+        }
+
+        test "unconfirmed hidden initial placement cannot retire admitted ordinary replica" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/unconfirmed-hidden-placement", .{tmp.sub_path});
+            defer alloc.free(replica_root);
+            var server = try DataServer.initFromMetadataApiUrl(alloc, .{
+                .replica_root_dir = replica_root,
+                .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://127.0.0.1:1" },
+            }, "http://127.0.0.1:2");
+            defer server.deinit();
+
+            const table = [_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }};
+            const range = [_]antfly.metadata.table_manager.RangeRecord{.{ .group_id = 77, .table_id = 7, .start_key = "", .end_key = null }};
+            const store = [_]antfly.metadata.table_manager.StoreRecord{.{ .store_id = 1, .node_id = 1, .role = "data", .live = true, .health_class = "healthy", .api_url = "http://127.0.0.1:1", .raft_url = "http://127.0.0.1:2" }};
+            var intents = [_]antfly.raft.PlacementIntent{.{
+                .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 },
+                .store_id = 1,
+                .peer_node_ids = &.{1},
+            }};
+            var snapshot: antfly.metadata_api.AdminSnapshot = .{
+                .status = .{ .metadata_group_id = 9, .metadata_epoch = 1, .metrics = .{} },
+                .tables = @constCast(&table),
+                .ranges = @constCast(&range),
+                .stores = @constCast(&store),
+                .placement_intents = &intents,
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+            try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
+            const admitted = server.last_data_raft_local_intents.ptr;
+            const ownership = server.last_data_raft_storage_ownership_fingerprint;
+            try std.testing.expectEqual(antfly.raft.host.HostedReplicaStatus.active, server.data_raft.?.host.status(77));
+
+            // A hidden generation appears in the same local placement. Until
+            // the exact physical root is registered, this round must not
+            // replace the desired plan or prepare any retirement.
+            intents[0].record.initial_fk_root_generation = 4;
+            snapshot.status.metadata_epoch += 1;
+            try std.testing.expectError(error.StoreRootIdentityUnconfirmed, server.syncDataRaftFromSnapshot(&snapshot, .linearizable));
+            try std.testing.expectEqual(admitted, server.last_data_raft_local_intents.ptr);
+            try std.testing.expectEqual(ownership, server.last_data_raft_storage_ownership_fingerprint);
+            try std.testing.expectEqual(antfly.raft.host.HostedReplicaStatus.active, server.data_raft.?.host.status(77));
+
+            // A second store on this node can own a hidden child without
+            // freezing this store's ordinary replica or borrowing its root.
+            intents[0].record.initial_fk_root_generation = 0;
+            var sibling = intents[0];
+            sibling.record.group_id = 88;
+            sibling.record.initial_fk_root_generation = 5;
+            sibling.store_id = 2;
+            var mixed = [_]antfly.raft.PlacementIntent{ intents[0], sibling };
+            snapshot.placement_intents = &mixed;
+            snapshot.status.metadata_epoch += 1;
+            try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
+            try std.testing.expectEqual(@as(usize, 1), server.last_data_raft_local_intents.len);
+            try std.testing.expectEqual(@as(u64, 77), server.last_data_raft_local_intents[0].record.group_id);
+            try std.testing.expectEqual(antfly.raft.host.HostedReplicaStatus.active, server.data_raft.?.host.status(77));
+
+            // Admit a second ordinary group, then model a previously admitted
+            // private owner whose placement disappears. Its prior full peer
+            // set remains in the desired plan, while the ordinary sibling
+            // keeps reconciling independently.
+            var ordinary = intents[0];
+            ordinary.record.group_id = 78;
+            const two_ranges = [_]antfly.metadata.table_manager.RangeRecord{
+                range[0],
+                .{ .group_id = 78, .table_id = 7, .start_key = "m", .end_key = null },
+            };
+            var two_local = [_]antfly.raft.PlacementIntent{ intents[0], ordinary, sibling };
+            snapshot.ranges = @constCast(&two_ranges);
+            snapshot.placement_intents = &two_local;
+            snapshot.status.metadata_epoch += 1;
+            try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
+            try std.testing.expectEqual(antfly.raft.host.HostedReplicaStatus.active, server.data_raft.?.host.status(78));
+
+            const previous = &server.last_data_raft_placement_inputs.?;
+            alloc.free(previous.hidden_initial_group_ids);
+            previous.hidden_initial_group_ids = try alloc.dupe(u64, &.{77});
+            previous.admitted_hidden_root_incarnation = try server.replicaRootIncarnation();
+            previous.intents[0].record.initial_fk_root_generation = 4;
+            server.last_data_raft_local_intents[0].record.initial_fk_root_generation = 4;
+            const only_ordinary_range = [_]antfly.metadata.table_manager.RangeRecord{two_ranges[1]};
+            snapshot.ranges = @constCast(&only_ordinary_range);
+            ordinary.record.metadata_version += 1;
+            var after_hidden_omission = [_]antfly.raft.PlacementIntent{ ordinary, sibling };
+            snapshot.placement_intents = &after_hidden_omission;
+            snapshot.status.metadata_epoch += 1;
+            try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
+            try std.testing.expectEqual(antfly.raft.host.HostedReplicaStatus.active, server.data_raft.?.host.status(77));
+            try std.testing.expectEqual(antfly.raft.host.HostedReplicaStatus.active, server.data_raft.?.host.status(78));
+            try std.testing.expect(server.last_data_raft_placement_inputs.?.wasHiddenInitialGroup(77));
+
+            // The next metadata round may remove the ordinary sibling while
+            // hidden owner 77 stays admitted, including across cache refresh.
+            snapshot.ranges = &.{};
+            snapshot.placement_intents = (&sibling)[0..1];
+            snapshot.status.metadata_epoch += 1;
+            try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
+            try std.testing.expectEqual(antfly.raft.host.HostedReplicaStatus.active, server.data_raft.?.host.status(77));
+            try std.testing.expectEqual(antfly.raft.host.HostedReplicaStatus.absent, server.data_raft.?.host.status(78));
+        }
+
+        test "cold omitted initial child quarantines only its own root" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cold-initial-child", .{tmp.sub_path});
+            defer alloc.free(replica_root);
+            const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cold-initial-child-catalog", .{tmp.sub_path});
+            defer alloc.free(catalog_path);
+            const hidden_root = try std.fmt.allocPrint(alloc, "{s}/group-77", .{replica_root});
+            defer alloc.free(hidden_root);
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            try fs_paths.createDirPathPortable(io_impl.io(), hidden_root);
+            {
+                var catalog = try antfly.raft.FileReplicaCatalog.init(alloc, catalog_path);
+                defer catalog.deinit();
+                try catalog.catalog().upsertReplica(.{
+                    .group_id = 77,
+                    .replica_id = 1,
+                    .local_node_id = 1,
+                    .metadata_version = 1,
+                    .initial_fk_root_generation = 4,
+                });
+            }
+            var server = try DataServer.initFromMetadataApiUrl(alloc, .{
+                .replica_root_dir = replica_root,
+                .replica_catalog_path = catalog_path,
+                .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://127.0.0.1:1" },
+            }, "http://127.0.0.1:2");
+            defer server.deinit();
+            try std.testing.expect(server.last_data_raft_placement_inputs == null);
+            var cold_point = (try server.data_raft.?.host.http_host.host.readReplicaCatalogRecord(alloc, 77)) orelse
+                return error.ReplicaCatalogUnavailable;
+            defer cold_point.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 4), cold_point.record.?.initial_fk_root_generation);
+            const table = [_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }};
+            const ranges = [_]antfly.metadata.table_manager.RangeRecord{.{ .group_id = 78, .table_id = 7, .start_key = "", .end_key = null }};
+            const stores = [_]antfly.metadata.table_manager.StoreRecord{.{ .store_id = 1, .node_id = 1, .role = "data", .live = true, .health_class = "healthy", .api_url = "http://127.0.0.1:1", .raft_url = "http://127.0.0.1:2" }};
+            const intents = [_]antfly.raft.PlacementIntent{.{
+                .record = .{ .group_id = 78, .replica_id = 1, .local_node_id = 1 },
+                .store_id = 1,
+                .peer_node_ids = &.{1},
+            }};
+            const snapshot: antfly.metadata_api.AdminSnapshot = .{
+                .status = .{ .metadata_group_id = 9, .metadata_epoch = 2, .metrics = .{} },
+                .tables = @constCast(&table),
+                .ranges = @constCast(&ranges),
+                .stores = @constCast(&stores),
+                .placement_intents = @constCast(&intents),
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+            try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
+            try std.testing.expectEqual(antfly.raft.host.HostedReplicaStatus.active, server.data_raft.?.host.status(78));
+            _ = try std.Io.Dir.cwd().statFile(io_impl.io(), hidden_root, .{ .follow_symlinks = false });
         }
 
         test "data raft ticker advances consensus independently of control rounds" {
@@ -43678,6 +44436,18 @@ fn implementationTests() type {
                 const fixture_absolute = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), fixture_root, scratch);
                 const capture_absolute = try std.fs.path.join(scratch, &.{ fixture_absolute, "seed-captures" });
                 try DataServer.validateHASeedPreparedSnapshot(alloc, capture_absolute, "private-owner-seed", raw_absolute);
+                // A root signing secret belongs to the physical replica root,
+                // never to a transportable HA seed. Reject even a checkpoint
+                // injected after the seed manifest was prepared.
+                const injected_key_path = try std.fs.path.join(scratch, &.{ raw_absolute, "root_signing_identity.checkpoint" });
+                {
+                    const injected = try std.Io.Dir.cwd().createFile(io_impl.io(), injected_key_path, .{ .exclusive = true });
+                    injected.close(io_impl.io());
+                }
+                {
+                    defer std.Io.Dir.cwd().deleteFile(io_impl.io(), injected_key_path) catch {};
+                    try std.testing.expectError(error.HASeedSnapshotUnexpectedArtifact, DataServer.validateHASeedPreparedSnapshot(alloc, capture_absolute, "private-owner-seed", raw_absolute));
+                }
                 const metadata_topology_path = try std.fs.path.join(scratch, &.{ raw_absolute, ha_seed_snapshot_topology_name });
                 const metadata_topology_json = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), metadata_topology_path, scratch, .limited(antfly.hot_standby.seed_materialization.max_topology_bytes));
                 var metadata_topology = try std.json.parseFromSlice(HASeedSnapshotTopology, alloc, metadata_topology_json, .{});
@@ -43950,7 +44720,11 @@ fn implementationTests() type {
                     try std.testing.expectEqual(@as(usize, if (has_private) 1 else 0), parsed_topology.value.replicas.len);
                     var legacy_empty = parsed_topology.value;
                     legacy_empty.standalone_metadata = null;
-                    try std.testing.expectError(error.InvalidSeedTopology, antfly.hot_standby.seed_materialization.validateTopology(alloc, io_impl.io(), empty_seed.root, generation, legacy_empty));
+                    // Empty public catalogs may use the released metadata-less
+                    // seed shape; a private owner has its own authenticated
+                    // projection. The unmodified prepared seed still verifies
+                    // its full standalone metadata checkpoint above.
+                    try antfly.hot_standby.seed_materialization.validateTopology(alloc, io_impl.io(), empty_seed.root, generation, legacy_empty);
                     const empty_live = try std.fs.path.join(scratch, &.{ parent_absolute, generation });
                     var empty_materialized = try antfly.hot_standby.seed_materialization.materialize(alloc, .{ .io = io_impl.io(), .raw_generation_root = empty_seed.root, .live_installing_root = empty_live, .generation = generation, .target_local_node_id = 1, .seed_receipt_sha256 = "a" ** 64, .capture_receipt_sha256 = "b" ** 64, .raw_manifest_sha256 = "c" ** 64, .raw_aggregate_sha256 = "d" ** 64 });
                     defer empty_materialized.deinit(alloc);

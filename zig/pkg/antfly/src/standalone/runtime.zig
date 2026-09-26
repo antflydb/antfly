@@ -2340,6 +2340,7 @@ const LocalStandaloneMetadata = struct {
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
             .fk_generation_publication_source_decision,
+            .fk_initial_retirement_page,
             => return error.UnsupportedOperation,
             .fk_initial_create_prepare => |request| {
                 if (!context.fk_generation_publication_authority or !self.localFkPublicationSupported()) return error.UnsupportedOperation;
@@ -11249,6 +11250,7 @@ test "standalone initial self FK private owners publish two ranges after restart
     std.mem.writeInt(u64, id[8..16], 2, .little);
     const plan: publication.InitialCreatePlan = .{
         .id = id,
+        .retirement_scope = .local_owner,
         .catalog_id = prepared.value.catalog_id,
         .expected_catalog_revision = prepared.value.expected_catalog_revision,
         .min_ranges_explicit = true,
@@ -11385,6 +11387,7 @@ test "standalone canceled initial self FK retires exact private owners after res
     std.mem.writeInt(u64, id[8..16], 3, .little);
     const plan: publication.InitialCreatePlan = .{
         .id = id,
+        .retirement_scope = .local_owner,
         .catalog_id = prepared.value.catalog_id,
         .expected_catalog_revision = prepared.value.expected_catalog_revision,
         .min_ranges_explicit = true,

@@ -116,6 +116,91 @@ fn systemCatalogIdentityCall(comptime Service: type) *const fn (*anyopaque) anye
     }.call;
 }
 
+fn storeRootReadinessCall(comptime Service: type) *const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.StoreRootReadiness {
+    return storeRootCapabilityReadinessCall(Service, @import("topology_protocol.zig").store_root_uuid_decoder_version);
+}
+
+fn storeRootCapabilityReadinessCall(comptime Service: type, comptime required_version: u16) *const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.StoreRootReadiness {
+    return struct {
+        fn call(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.StoreRootReadiness {
+            const svc: *Service = @ptrCast(@alignCast(ptr));
+            const proof = try svc.ensureTableTopologyProtocolReadyWithContext(request, required_version);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const activation = (try store.topologyActivation(svc.metadata_group_id)) orelse return error.TableTopologyProtocolUpgradeRequired;
+            if (!activation.satisfies(.{
+                .version = required_version,
+                .incarnation = proof.metadata_incarnation orelse return error.MetadataIncarnationUnavailable,
+                .member_count = proof.protected_member_count,
+                .membership_fingerprint = proof.protected_membership_fingerprint,
+            })) return error.TableTopologyProtocolUpgradeRequired;
+            try svc.validateTableTopologyProtocolReadinessWithContext(request, proof);
+            return .{ .activated_version = activation.version };
+        }
+    }.call;
+}
+
+test "store-root readiness returns only an exact durable v17 activation" {
+    const protocol = @import("topology_protocol.zig");
+    const incarnation: @import("incarnation.zig").MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+    const proof: service.TableTopologyProtocolReadiness = .{
+        .term = 7,
+        .required_version = protocol.store_root_uuid_decoder_version,
+        .metadata_incarnation = incarnation,
+        .protected_member_count = 2,
+        .protected_membership_fingerprint = @splat(3),
+    };
+    const FakeStore = struct {
+        activation: ?protocol.Activation,
+        fn topologyActivation(self: *@This(), _: u64) !?protocol.Activation {
+            return self.activation;
+        }
+    };
+    const Fake = struct {
+        metadata_group_id: u64 = 21,
+        store: FakeStore,
+        proof: service.TableTopologyProtocolReadiness,
+        validated: bool = false,
+        fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: operation.RequestContext, required: u16) !service.TableTopologyProtocolReadiness {
+            try std.testing.expectEqual(self.proof.required_version, required);
+            return self.proof;
+        }
+        fn projectedStore(self: *@This()) ?*FakeStore {
+            return &self.store;
+        }
+        fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, ready: service.TableTopologyProtocolReadiness) !void {
+            try std.testing.expectEqualDeep(self.proof, ready);
+            self.validated = true;
+        }
+    };
+    const activation: protocol.Activation = .{
+        .version = 17,
+        .incarnation = incarnation,
+        .member_count = 2,
+        .membership_fingerprint = proof.protected_membership_fingerprint,
+    };
+    var fake: Fake = .{ .store = .{ .activation = activation }, .proof = proof };
+    const call = comptime storeRootReadinessCall(Fake);
+    try std.testing.expectEqual(@as(u16, 17), (try call(&fake, .{})).activated_version);
+    try std.testing.expect(fake.validated);
+    fake.validated = false;
+    fake.store.activation.?.membership_fingerprint[0] ^= 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, call(&fake, .{}));
+    try std.testing.expect(!fake.validated);
+    fake.store.activation = null;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, call(&fake, .{}));
+    var signing_proof = proof;
+    signing_proof.required_version = protocol.store_root_signing_decoder_version;
+    var signing_fake: Fake = .{ .store = .{ .activation = activation }, .proof = signing_proof };
+    const signing_call = comptime storeRootCapabilityReadinessCall(Fake, protocol.store_root_signing_decoder_version);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, signing_call(&signing_fake, .{}));
+    signing_fake.store.activation.?.version = protocol.store_root_signing_decoder_version;
+    try std.testing.expectEqual(protocol.store_root_signing_decoder_version, (try signing_call(&signing_fake, .{})).activated_version);
+    signing_fake.validated = false;
+    signing_fake.store.activation.?.member_count += 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, signing_call(&signing_fake, .{}));
+    try std.testing.expect(!signing_fake.validated);
+}
+
 pub const AdminSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -126,6 +211,8 @@ pub const AdminSource = struct {
 
         head: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataHead = null,
         linearizable_head: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.MetadataHead = null,
+        ensure_store_root_readiness: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.StoreRootReadiness = null,
+        ensure_store_root_signing_readiness: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.StoreRootReadiness = null,
         linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.AdminSnapshot = null,
         provisioning_snapshot: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, node_id: u64) anyerror!@import("restore_staging.zig").ProvisioningSnapshot = null,
         restore_staging_authority: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, input: @import("restore_staging.zig").AuthorityRequest) anyerror!@import("restore_staging.zig").AuthorityResponse = null,
@@ -220,6 +307,16 @@ pub const AdminSource = struct {
 
     pub fn linearizableHead(self: AdminSource, request: operation.RequestContext) !metadata_api.MetadataHead {
         const fn_ptr = self.vtable.linearizable_head orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn ensureStoreRootReadiness(self: AdminSource, request: operation.RequestContext) !metadata_api.StoreRootReadiness {
+        const fn_ptr = self.vtable.ensure_store_root_readiness orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn ensureStoreRootSigningReadiness(self: AdminSource, request: operation.RequestContext) !metadata_api.StoreRootReadiness {
+        const fn_ptr = self.vtable.ensure_store_root_signing_readiness orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, request);
     }
 
@@ -544,6 +641,8 @@ pub const AdminSource = struct {
                 .catalog_identity = comptime systemCatalogIdentityCall(service.MetadataService),
                 .head = metadataServiceHead,
                 .linearizable_head = metadataServiceLinearizableHead,
+                .ensure_store_root_readiness = comptime storeRootReadinessCall(service.MetadataService),
+                .ensure_store_root_signing_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataService, @import("topology_protocol.zig").store_root_signing_decoder_version),
                 .linearizable_snapshot = metadataServiceLinearizableSnapshot,
                 .runtime_topology = metadataServiceRuntimeTopology,
                 .status = metadataServiceStatus,
@@ -611,6 +710,8 @@ pub const AdminSource = struct {
                 .catalog_identity = comptime systemCatalogIdentityCall(service.MetadataHttpService),
                 .head = metadataHttpServiceHead,
                 .linearizable_head = metadataHttpServiceLinearizableHead,
+                .ensure_store_root_readiness = comptime storeRootReadinessCall(service.MetadataHttpService),
+                .ensure_store_root_signing_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataHttpService, @import("topology_protocol.zig").store_root_signing_decoder_version),
                 .linearizable_snapshot = metadataHttpServiceLinearizableSnapshot,
                 .runtime_topology = metadataHttpServiceRuntimeTopology,
                 .status = metadataHttpServiceStatus,
@@ -1852,6 +1953,8 @@ pub const MetadataHttpServer = struct {
         // POST prevents intermediary GET caches from bypassing the read-index
         // barrier that gives this endpoint its meaning.
         try server.post(routes.Routes.internal_linearizable_head, httpx.Handler.bind(self, metadataLinearizableHead));
+        try server.post(routes.Routes.internal_store_root_readiness, httpx.Handler.bind(self, metadataStoreRootReadiness));
+        try server.post(routes.Routes.internal_store_root_signing_readiness, httpx.Handler.bind(self, metadataStoreRootSigningReadiness));
         try server.post(routes.Routes.internal_linearizable_snapshot, httpx.Handler.bind(self, metadataLinearizableSnapshot));
         try server.post(routes.Routes.internal_provisioning_snapshot, httpx.Handler.bind(self, metadataProvisioningSnapshot));
         try server.post(routes.Routes.internal_restore_staging_authority, httpx.Handler.bind(self, metadataRestoreStagingAuthority));
@@ -1963,7 +2066,7 @@ pub const MetadataHttpServer = struct {
         // administrator. Never infer an admin grant from request JSON.
         const authority = @import("../system_catalog/setting_authority.zig");
         const admin_grant = parsed.value == .setting_mutate or parsed.value == .policy_definition_mutate or parsed.value == .policy_publication_mutate or parsed.value == .policy_publication_begin or parsed.value == .fk_generation_publication_begin or parsed.value == .fk_generation_publication_mutate or parsed.value == .fk_initial_create_begin or parsed.value == .fk_initial_create_mutate;
-        const fk_publication_read = parsed.value == .fk_generation_publication_status or parsed.value == .fk_generation_publication_work or parsed.value == .fk_generation_publication_decision or parsed.value == .fk_generation_publication_source_decision or parsed.value == .fk_initial_create_prepare or parsed.value == .fk_initial_child_decision or parsed.value == .fk_initial_create_status or parsed.value == .fk_generation_table_locked or parsed.value == .fk_initial_create_work or parsed.value == .fk_initial_parent_decision;
+        const fk_publication_read = parsed.value == .fk_generation_publication_status or parsed.value == .fk_generation_publication_work or parsed.value == .fk_generation_publication_decision or parsed.value == .fk_generation_publication_source_decision or parsed.value == .fk_initial_create_prepare or parsed.value == .fk_initial_child_decision or parsed.value == .fk_initial_create_status or parsed.value == .fk_generation_table_locked or parsed.value == .fk_initial_create_work or parsed.value == .fk_initial_parent_decision or parsed.value == .fk_initial_retirement_page;
         if (admin_grant or fk_publication_read or parsed.value == .setting_snapshot or parsed.value == .policy_snapshot or parsed.value == .policy_install_snapshot or parsed.value == .policy_publication_status or parsed.value == .policy_publication_work) {
             if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null) return ctx.status(403).text("setting authority requires an authenticated service");
             authority.verify(
@@ -2286,6 +2389,27 @@ pub const MetadataHttpServer = struct {
     fn metadataLinearizableHead(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const request = requestContext(ctx);
         const result = self.readOperations().linearizableHead(request) catch |err| return metadataReadError(ctx, err);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return self.trackedJson(ctx, result);
+    }
+
+    fn metadataStoreRootReadiness(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        // Existing internal-service middleware authenticates the capability;
+        // reject a request without the claim even if that middleware is
+        // accidentally omitted in a test or future host configuration.
+        if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null)
+            return ctx.status(403).text("authenticated service required");
+        const request = requestContext(ctx);
+        const result = self.source.ensureStoreRootReadiness(request) catch |err| return metadataMutationError(ctx, err);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return self.trackedJson(ctx, result);
+    }
+
+    fn metadataStoreRootSigningReadiness(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null)
+            return ctx.status(403).text("authenticated service required");
+        const request = requestContext(ctx);
+        const result = self.source.ensureStoreRootSigningReadiness(request) catch |err| return metadataMutationError(ctx, err);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return self.trackedJson(ctx, result);
     }
@@ -3040,7 +3164,7 @@ pub const MetadataHttpServer = struct {
             error.RuntimeStatusProtocolUnavailable => ctx.status(503).text("runtime status protocol is not ready"),
             error.ActiveNodeFinalizeRejected => ctx.status(409).text("node is not ready to finalize"),
             error.RelationalTopologyProtocolUpgradeRequired => ctx.status(409).text("upgrade every table-serving data runtime to relational topology protocol v1 before registration or constrained split/merge"),
-            error.TableTopologyProtocolUpgradeRequired => ctx.status(426).text("upgrade metadata voters and learners to topology protocol v7 before registering a relational topology-capable data runtime"),
+            error.TableTopologyProtocolUpgradeRequired => ctx.status(426).text("upgrade every metadata voter and learner to the decoder version required by this store registration"),
             error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
             else => metadataReadError(ctx, err),
         };
@@ -4036,6 +4160,8 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         store_id: u64,
         node_id: u64,
         reporter_incarnation: ?u64 = null,
+        replica_root_incarnation: ?u128 = null,
+        replica_root_public_key: ?[32]u8 = null,
         status_generation: ?u64 = null,
         artifact_sources_protocol_version: ?u16 = null,
         native_generation_restore_version: ?u16 = null,
@@ -4066,6 +4192,13 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.status_generation orelse 0,
     )) return error.InvalidStoreReporterFence;
+    if ((parsed.value.replica_root_incarnation orelse 0) != 0 and (parsed.value.reporter_incarnation orelse 0) == 0)
+        return error.InvalidStoreReporterFence;
+    if (parsed.value.replica_root_public_key) |public_key| {
+        if (std.mem.allEqual(u8, &public_key, 0) or
+            (parsed.value.replica_root_incarnation orelse 0) == 0 or
+            (parsed.value.reporter_incarnation orelse 0) == 0) return error.InvalidStoreReporterFence;
+    }
     if (!metadata_table_manager.artifactSourcesProtocolValid(
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.artifact_sources_protocol_version orelse 0,
@@ -4084,6 +4217,8 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         .store_id = parsed.value.store_id,
         .node_id = parsed.value.node_id,
         .reporter_incarnation = parsed.value.reporter_incarnation orelse 0,
+        .replica_root_incarnation = parsed.value.replica_root_incarnation orelse 0,
+        .replica_root_public_key = parsed.value.replica_root_public_key orelse @splat(0),
         .status_generation = parsed.value.status_generation orelse 0,
         .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
         .native_generation_restore_version = parsed.value.native_generation_restore_version orelse 0,
@@ -4499,6 +4634,37 @@ test "relational topology admission JSON preserves capability in registrations a
     try std.testing.expectEqual(metadata_table_manager.relational_topology_protocol_version, heartbeat.relational_topology_protocol_version);
     try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreRecord(alloc, "{\"store_id\":20,\"node_id\":20,\"relational_topology_protocol_version\":2}"));
     try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreStatusReport(alloc, "{\"store_id\":20,\"reporter_incarnation\":77,\"relational_topology_protocol_version\":3}"));
+}
+
+test "store registration preserves physical replica root identity" {
+    const alloc = std.testing.allocator;
+    const registration = try parseStoreRecord(alloc,
+        \\{"store_id":20,"node_id":20,"reporter_incarnation":77,"replica_root_incarnation":340282366920938463463374607431768211455}
+    );
+    defer metadata_table_manager.freeStore(alloc, registration);
+    try std.testing.expectEqual(std.math.maxInt(u128), registration.replica_root_incarnation);
+    try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreRecord(alloc,
+        \\{"store_id":20,"node_id":20,"replica_root_incarnation":42}
+    ));
+    const signing_json = try std.json.Stringify.valueAlloc(alloc, .{
+        .store_id = @as(u64, 20),
+        .node_id = @as(u64, 20),
+        .reporter_incarnation = @as(u64, 77),
+        .replica_root_incarnation = @as(u128, 42),
+        .replica_root_public_key = [_]u8{7} ** 32,
+    }, .{});
+    defer alloc.free(signing_json);
+    const signing = try parseStoreRecord(alloc, signing_json);
+    defer metadata_table_manager.freeStore(alloc, signing);
+    try std.testing.expectEqualSlices(u8, &([_]u8{7} ** 32), &signing.replica_root_public_key);
+    const invalid_signing_json = try std.json.Stringify.valueAlloc(alloc, .{
+        .store_id = @as(u64, 20),
+        .node_id = @as(u64, 20),
+        .reporter_incarnation = @as(u64, 77),
+        .replica_root_public_key = [_]u8{7} ** 32,
+    }, .{});
+    defer alloc.free(invalid_signing_json);
+    try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreRecord(alloc, invalid_signing_json));
 }
 
 fn parseU64Field(value: std.json.Value) !u64 {

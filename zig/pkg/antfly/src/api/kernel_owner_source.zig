@@ -1686,6 +1686,17 @@ pub const ProvisionedKernelOwnerSource = struct {
         return parsed.value;
     }
 
+    /// Trusted local retirement preflight only. Reads the cold AICH without
+    /// assuming metadata's current table ID; the caller must still compare
+    /// the exact ticket before any unlink or ACK.
+    pub fn readInitialChildRetirementRecord(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+        return self.readHiddenInitialChildRecord(alloc, group_id, 0);
+    }
+
     pub fn captureHASeedHiddenReplicaSnapshot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, scope: [32]u8, snapshot_token: []const u8, destination_root: []const u8) !void {
         var descriptor = (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) orelse return error.RestoreStagingScopeChanged;
         defer descriptor.deinit(alloc);

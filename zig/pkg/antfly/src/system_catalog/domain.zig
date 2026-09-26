@@ -958,6 +958,8 @@ pub const Call = union(enum) {
     fk_generation_table_locked: u64,
     fk_initial_create_work: u64,
     fk_initial_parent_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
+    /// Internal, read-only discovery. A ticket is not authority to unlink.
+    fk_initial_retirement_page: @import("../metadata/fk_initial_retirement_wire.zig").PageRequest,
     setting_mutate: @import("settings.zig").Request,
     list_tables: TableList,
     export_snapshot: void,
@@ -977,7 +979,7 @@ pub fn httpStatus(err: anyerror) u16 {
     return switch (err) {
         error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.TableNotFound => 404,
         error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.GenerationPublicationChanged, error.GenerationPublicationNotFound, error.ForeignKeyGenerationPublicationRequired, error.RowPolicyCatalogChanged, error.RowPolicyInstallationPending, error.RowPolicyReadersActive, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.TableAlreadyExists => 409,
-        error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidGenerationPublication, error.InvalidRowPolicyPublication, error.InvalidRowPolicyRecord, error.InvalidSettingRecord, error.InvalidSettingValue, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
+        error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidGenerationPublication, error.InvalidInitialFkRetirementPage, error.InvalidRowPolicyPublication, error.InvalidRowPolicyRecord, error.InvalidSettingRecord, error.InvalidSettingValue, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
         error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge, error.RowPolicyLimitExceeded => 413,
         error.TableTopologyProtocolUpgradeRequired, error.RowPolicyUnsupported => 426,
         error.Forbidden => 403,
@@ -985,6 +987,10 @@ pub fn httpStatus(err: anyerror) u16 {
         error.MetadataMutationOutcomeUnknown, error.NotLeader, error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded => 503,
         else => 500,
     };
+}
+
+test "invalid initial FK retirement page is a client error" {
+    try std.testing.expectEqual(@as(u16, 400), httpStatus(error.InvalidInitialFkRetirementPage));
 }
 
 /// Only trusted native ingress constructs these immutable routing identities.

@@ -57,6 +57,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-metadata-relational-topology-test", "Run distributed integrity topology capability and admission contracts").dependOn(&addFilteredTestRunArtifact(b, relational_topology_tests).step);
+    const store_root_signing_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{
+            "store-root readiness returns only an exact durable v17 activation",
+            "store registration preserves physical replica root identity",
+            "store root readiness accepts only authenticated complete decoder proof",
+            "metadata server can expose admin listener endpoints",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-store-root-signing-test", "Run v18 store-root signing decoder, registration, and readiness admission contracts").dependOn(&addFilteredTestRunArtifact(b, store_root_signing_tests).step);
 
     const lib_metadata_table_workflow_tests = b.addTest(.{
         .root_module = antfly_test_mod,

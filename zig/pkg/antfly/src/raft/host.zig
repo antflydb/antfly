@@ -682,6 +682,18 @@ pub const Host = struct {
         return try replica_catalog.snapshotReplicas(alloc);
     }
 
+    /// Reads one durable ownership record and its revision without cloning the
+    /// entire catalog. A null outer optional means this host has no catalog;
+    /// a null point record means the catalog has no entry for the group.
+    pub fn readReplicaCatalogRecord(
+        self: *Host,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) !?catalog.ReplicaCatalogPoint {
+        const replica_catalog = self.deps.replica_catalog orelse return null;
+        return try replica_catalog.readReplica(alloc, group_id);
+    }
+
     /// Returns the durable admission decision, independently of whether the
     /// live runtime has finished installing or removing the replica.
     pub fn replicaCatalogContains(self: *Host, group_id: u64) ?bool {
@@ -1849,6 +1861,7 @@ test "host can ensure and remove a replica" {
                     .contains_replica = containsReplica,
                     .list_replicas = listReplicas,
                     .snapshot_replicas = snapshotReplicas,
+                    .read_replica = readReplica,
                     .revision = revision,
                     .apply_batch = applyBatch,
                     .prepare_batch = prepareBatch,
@@ -1878,6 +1891,13 @@ test "host can ensure and remove a replica" {
                 .token = revision(ptr),
                 .records = try listReplicas(ptr, alloc),
             };
+        }
+
+        fn readReplica(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) !catalog.ReplicaCatalogPoint {
+            _ = ptr;
+            _ = alloc;
+            _ = group_id;
+            return .{ .token = .{ .revision = 1 }, .record = null };
         }
 
         fn revision(_: *anyopaque) catalog.ReplicaCatalogToken {

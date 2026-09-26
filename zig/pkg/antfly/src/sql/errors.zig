@@ -74,7 +74,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.RowPolicyUnsupported, error.RowPolicyTopologyUnsupported => .{ .code = "0A000", .message = "Row policy publication is not supported for this table shape.", .hint = "Remove unsupported indexes or topology features before enabling the policy; no publication was started.", .retryable = false },
         error.ForeignKeyGenerationPublicationRequired => .{ .code = "0A000", .message = "This foreign-key definition requires parent-owner generation publication.", .hint = "Use a deployment with coordinated foreign-key publication; no schema change was admitted.", .retryable = false },
         error.ForeignKeyPartialSupportIndexRequired => .{ .code = "0A000", .message = "Initial MATCH PARTIAL foreign keys require atomic parent support-index publication.", .hint = "Create the table without that constraint, then add it with ALTER TABLE. No table publication was admitted.", .retryable = false },
-        error.ForeignKeyInitialSelfReferenceUnsupported => .{ .code = "0A000", .message = "An initial self-referential foreign key requires a child-owner publication fence.", .hint = "Create the table without that constraint, then add it with ALTER TABLE. No table publication was admitted.", .retryable = false },
+        error.ForeignKeyInitialSelfReferenceUnsupported => .{ .code = "0A000", .message = "Initial self-referential foreign-key publication is not available on this deployment.", .hint = "No table was created. Use a deployment with coordinated self-FK publication before relying on this constraint.", .retryable = false },
         error.ForeignKeySelfPublicationNotActivated => .{ .code = "0A000", .message = "Self-referential foreign-key publication is not active on this deployment.", .hint = "No schema publication was admitted; keep the current table definition.", .retryable = false },
         error.SqlRowIdentityRequired => .{ .code = "0A000", .message = "This mutation requires an explicit row identity.", .hint = "Provide a non-null _id for each inserted row." },
         error.SqlStatementSnapshotRequired => .{ .code = "0A000", .message = "This query requires a consistent statement snapshot that is not available.", .hint = "Narrow the query to one bounded page or use a runtime with statement snapshots." },
@@ -156,6 +156,14 @@ test "SQL diagnostics hide unrecognized implementation errors" {
     try std.testing.expect(std.mem.indexOf(u8, value.message, "Secret") == null);
     try std.testing.expectEqual(@as(u16, 500), value.httpStatus());
     try std.testing.expectEqual(@as(u16, 409), describe(error.SqlMutationOutcomeUnknown).httpStatus());
+}
+
+test "initial self-FK diagnostic does not recommend a guarded ALTER path" {
+    const value = describe(error.ForeignKeyInitialSelfReferenceUnsupported);
+    try std.testing.expectEqualStrings("0A000", value.code);
+    try std.testing.expectEqual(@as(?bool, false), value.retryable);
+    try std.testing.expect(std.mem.indexOf(u8, value.hint.?, "add it with ALTER TABLE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, value.hint.?, "No table was created") != null);
 }
 
 test "durable SQL destination credential rejection is forbidden, not internal" {

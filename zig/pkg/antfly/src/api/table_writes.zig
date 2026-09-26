@@ -1401,6 +1401,67 @@ pub const InitialFkRetirementProof = struct {
     }
 };
 
+pub const InitialChildRetirementObservation = struct {
+    /// Durable local replica-catalog marker, not metadata's current desired
+    /// placement. It survives process restart and protects an AICH that has
+    /// not yet been provisioned or is temporarily unreadable.
+    initial_fk_root_generation: u64 = 0,
+    record: ?@import("../storage/db/relational_initial_child_publication.zig").Record = null,
+};
+
+pub const InitialChildRetirementReader = struct {
+    ptr: *anyopaque,
+    read: *const fn (*anyopaque, std.mem.Allocator, u64) anyerror!InitialChildRetirementObservation,
+};
+
+fn requireInitialChildRetirementRecord(
+    observation: InitialChildRetirementObservation,
+    proof: ?InitialFkRetirementProof,
+) !void {
+    const value = observation.record orelse {
+        if (observation.initial_fk_root_generation != 0) return error.InitialChildRetirementProofUnavailable;
+        return;
+    };
+    if (value.phase != .released and proof == null) return error.InitialFkRetirementTicketRequired;
+    if (proof) |expected| {
+        if (value.namespace.table_id != expected.child_table_id or
+            !std.mem.eql(u8, &value.plan_id, &expected.plan_id) or
+            !std.mem.eql(u8, &value.plan_digest, &expected.plan_digest))
+            return error.InitialChildPublicationChanged;
+    }
+}
+
+test "private initial child retirement requires explicit proof until publication" {
+    const Record = @import("../storage/db/relational_initial_child_publication.zig").Record;
+    var record: Record = .{
+        .phase = .hidden,
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 11 },
+        .schema_version = 1,
+        .row_count = 0,
+        .schema_digest = @splat(3),
+        .public_schema_json_digest = @splat(4),
+        .catalog_digest = @splat(5),
+        .provision_term = 2,
+        .provision_index = 3,
+    };
+    try std.testing.expectError(error.InitialFkRetirementTicketRequired, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, null));
+    record.phase = .canceled;
+    record.phase_term = 2;
+    record.phase_index = 4;
+    try std.testing.expectError(error.InitialFkRetirementTicketRequired, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, null));
+    try std.testing.expectError(error.InitialChildPublicationChanged, requireInitialChildRetirementRecord(.{ .record = record }, .{
+        .child_table_id = 7,
+        .plan_id = @splat(8),
+        .plan_digest = record.plan_digest,
+    }));
+    record.phase = .released;
+    try requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, null);
+    try requireInitialChildRetirementRecord(.{}, null);
+    try std.testing.expectError(error.InitialChildRetirementProofUnavailable, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4 }, null));
+}
+
 fn initialFkRetirementProofsEqual(lhs: ?InitialFkRetirementProof, rhs: ?InitialFkRetirementProof) bool {
     if (lhs == null or rhs == null) return lhs == null and rhs == null;
     return std.meta.eql(lhs.?, rhs.?);
@@ -8083,6 +8144,7 @@ pub const ProvisionedTableWriteSource = struct {
     /// coalescing, admission, and lifecycle remain on this source; a compiled
     /// storage owner supplies only group-local operations.
     local_write_source: ?TableWriteSource = null,
+    initial_child_retirement_reader: ?InitialChildRetirementReader = null,
     storage_snapshot_source: ?storage_snapshot_source.Source = null,
     storage_maintenance_source: ?storage_maintenance_source.Source = null,
     seed_create_table_writers: bool = true,
@@ -9053,6 +9115,14 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
+    pub fn withInitialChildRetirementReader(
+        self: *ProvisionedTableWriteSource,
+        reader: InitialChildRetirementReader,
+    ) *ProvisionedTableWriteSource {
+        self.initial_child_retirement_reader = reader;
+        return self;
+    }
+
     pub fn withStorageSnapshotSource(
         self: *ProvisionedTableWriteSource,
         snapshot_source: ?storage_snapshot_source.Source,
@@ -9520,13 +9590,61 @@ pub const ProvisionedTableWriteSource = struct {
         return retry_required;
     }
 
+    /// A placement omission or a committed generic retirement journal is not
+    /// authority to erase a still-private initial-FK owner. Inspect the cold
+    /// durable publication record even when this process has no cached owner
+    /// (for example after a restart). Published children resume the ordinary
+    /// replica lifecycle; hidden/canceled children require an explicit
+    /// metadata-bound retirement proof.
+    fn requireInitialChildRetirementProof(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        proof: ?InitialFkRetirementProof,
+    ) !void {
+        const group_path = try std.fmt.allocPrint(alloc, "{s}/group-{d}", .{ self.replica_root_dir, group_id });
+        defer alloc.free(group_path);
+        const io = self.tableActivityIo();
+        _ = std.Io.Dir.cwd().statFile(io, group_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(db_path);
+        const db_present = if (std.Io.Dir.cwd().statFile(io, db_path, .{ .follow_symlinks = false })) |_| true else |err| switch (err) {
+            error.FileNotFound => false,
+            else => return err,
+        };
+        const observation = if (self.initial_child_retirement_reader) |reader|
+            try reader.read(reader.ptr, alloc, group_id)
+        else if (comptime control_only_storage_sources)
+            return error.InitialChildRetirementProofUnavailable
+        else blk: {
+            if (!db_present) break :blk InitialChildRetirementObservation{};
+            var db = try db_mod.DB.open(alloc, db_path, .{
+                .backend_runtime = self.backend_runtime,
+                .open_mode = .query_readonly,
+                .primary_only_readonly = true,
+                .start_index_workers = false,
+                .start_optional_runtimes = false,
+            });
+            defer db.close();
+            break :blk InitialChildRetirementObservation{ .record = try db.readInitialChildPublicationRecord() };
+        };
+        if (!db_present and observation.initial_fk_root_generation != 0)
+            return error.InitialChildRetirementProofUnavailable;
+        try requireInitialChildRetirementRecord(observation, proof);
+    }
+
     fn executeReplicaRetirementCleanup(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: ?[]const u8,
+        initial_fk_proof: ?InitialFkRetirementProof,
     ) !void {
         if (group_id == 0) return error.InvalidArgument;
+        try self.requireInitialChildRetirementProof(alloc, group_id, initial_fk_proof);
         try self.beginReplicaRetirementActivity(group_id, table_name);
         var retirement_active = true;
         errdefer if (retirement_active) self.endReplicaRetirementActivity(group_id);
@@ -9665,7 +9783,7 @@ pub const ProvisionedTableWriteSource = struct {
         for (loaded_batch.intents, states) |intent, state| switch (state) {
             .retained => {},
             .retiring => retry_required = true,
-            .retired => self.executeReplicaRetirementCleanup(alloc, intent.group_id, intent.table_name) catch |err| {
+            .retired => self.executeReplicaRetirementCleanup(alloc, intent.group_id, intent.table_name, intent.initial_fk_proof) catch |err| {
                 std.log.warn("replica retirement batch cleanup deferred group_id={d} path={s} err={s}", .{
                     intent.group_id,
                     path,
@@ -9793,7 +9911,7 @@ pub const ProvisionedTableWriteSource = struct {
                 retry_required = true;
                 continue;
             }
-            self.executeReplicaRetirementCleanup(alloc, group_id, intent.table_name) catch |err| {
+            self.executeReplicaRetirementCleanup(alloc, group_id, intent.table_name, null) catch |err| {
                 std.log.warn("replica retirement deferred group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
                 retry_required = true;
                 continue;
@@ -9841,6 +9959,11 @@ pub const ProvisionedTableWriteSource = struct {
             .alloc = alloc,
             .intents = try alloc.alloc(PersistedReplicaRetirementIntent, 0),
         };
+        // Fail before creating even a prepared journal entry. Recovery repeats
+        // this cold proof immediately before the physical rename, so a process
+        // restart cannot turn an old generic journal into hidden-owner unlink.
+        for (targets) |target|
+            try self.requireInitialChildRetirementProof(alloc, target.group_id, target.initial_fk_proof);
 
         // Clone and canonicalize caller memory before reserving any shared
         // state. The short ownership phase below contains no filesystem work.
