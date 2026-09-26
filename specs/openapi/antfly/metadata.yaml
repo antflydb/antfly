@@ -10387,7 +10387,7 @@ components:
           description: Byte offset of the fragment within the field value.
         item:
           type: integer
-          description: Array index of the value when the field is an array of strings.
+          description: Array index for one array; flattened value ordinal for paths through multiple arrays.
         spans:
           type: array
           items:

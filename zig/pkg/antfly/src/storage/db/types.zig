@@ -2214,7 +2214,7 @@ pub const HighlightSpan = struct {
 pub const HighlightFragment = struct {
     text: []u8,
     offset: u32,
-    /// Array index when the highlighted field value is an array of strings.
+    /// Array index for one array; flattened value ordinal for paths through multiple arrays.
     item: ?u32 = null,
     spans: []HighlightSpan,
 };

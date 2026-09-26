@@ -105,11 +105,8 @@ pub fn highlightMatchers(
     for (matchers) |matcher| {
         switch (matcher) {
             .literal => |needle| {
-                if (needle.len == 0) continue;
-                var offset: usize = 0;
-                while (std.mem.indexOfPos(u8, text, offset, needle)) |start| {
-                    try spans.append(alloc, .{ .start = @intCast(start), .end = @intCast(start + needle.len) });
-                    offset = start + needle.len;
+                if (needle.len > 0 and std.mem.eql(u8, text, needle)) {
+                    try spans.append(alloc, .{ .start = 0, .end = @intCast(text.len) });
                 }
             },
             .literal_prefix => |prefix| {
@@ -502,6 +499,8 @@ test "keyword matchers highlight a whole value across three words" {
 
     const wrong_case = try highlightMatchers(alloc, text, &.{.{ .literal = "new york city" }}, &analysis_mod.simple_analyzer, 1, 100);
     try std.testing.expectEqual(@as(usize, 0), wrong_case.len);
+    const substring = try highlightMatchers(alloc, text, &.{.{ .literal = "York" }}, &analysis_mod.simple_analyzer, 1, 100);
+    try std.testing.expectEqual(@as(usize, 0), substring.len);
 }
 
 test "highlight clips a match wider than its fragment" {

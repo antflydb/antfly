@@ -505,6 +505,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db exact sort resolves mapped geo metadata filters from typed doc values",
         "_all highlights the source fields emitted into the index",
         "keyword companion pattern matches highlight the whole indexed value",
+        "dotted highlight paths traverse arrays of objects",
+        "exact keyword highlights only the matching array value",
     };
     const lib_db_query_tests = b.addTest(.{
         .root_module = antfly_test_mod,

@@ -18064,7 +18064,7 @@ fn collectHighlightMatchers(
         .term => |term| try out.append(arena, .{
             .field = highlightRootField(term.field),
             .indexed_field = term.field,
-            .matcher = if (highlightFieldIsKeyword(term.field)) .{ .literal = term.term } else if (highlightFieldIsSubstring(term.field)) .{ .contains = term.term } else .{ .term = term.term },
+            .matcher = if (highlightFieldIsSubstring(term.field)) .{ .contains = term.term } else .{ .term = term.term },
         }),
         .term_phrase => |phrase| for (phrase.terms) |term| {
             try out.append(arena, .{ .field = highlightRootField(phrase.field), .indexed_field = phrase.field, .matcher = highlightPhraseMatcher(term, phrase.max_edits, phrase.auto_fuzzy) });
@@ -18104,17 +18104,43 @@ fn collectHighlightMatchers(
     }
 }
 
-fn jsonValueAtDottedPath(root: std.json.Value, path: []const u8) ?std.json.Value {
-    var current = root;
-    var remaining = path;
-    while (remaining.len > 0) {
-        if (current != .object) return null;
-        if (current.object.get(remaining)) |direct| return direct;
-        const dot = std.mem.indexOfScalar(u8, remaining, '.') orelse return null;
-        current = current.object.get(remaining[0..dot]) orelse return null;
-        remaining = remaining[dot + 1 ..];
+const HighlightSourceValue = struct {
+    text: []const u8,
+    item: ?u32,
+    array_depth: u32,
+};
+
+/// Follow the same dotted paths through arrays of objects that the document
+/// mapper indexes. Direct keys containing dots take precedence over traversal.
+fn collectHighlightSourceValues(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(HighlightSourceValue),
+    value: std.json.Value,
+    path: []const u8,
+    first_item: ?u32,
+    array_depth: u32,
+) !void {
+    switch (value) {
+        .array => |items| {
+            for (items.items, 0..) |child, index| {
+                try collectHighlightSourceValues(alloc, out, child, path, first_item orelse @as(u32, @intCast(index)), array_depth + 1);
+            }
+        },
+        .string => |text| {
+            if (path.len == 0) try out.append(alloc, .{ .text = text, .item = first_item, .array_depth = array_depth });
+        },
+        .object => |object| {
+            if (path.len == 0) return;
+            if (object.get(path)) |direct| {
+                try collectHighlightSourceValues(alloc, out, direct, "", first_item, array_depth);
+                return;
+            }
+            const dot = std.mem.indexOfScalar(u8, path, '.') orelse return;
+            const child = object.get(path[0..dot]) orelse return;
+            try collectHighlightSourceValues(alloc, out, child, path[dot + 1 ..], first_item, array_depth);
+        },
+        else => {},
     }
-    return current;
 }
 
 fn appendHighlightFragments(
@@ -18370,7 +18396,20 @@ pub fn attachHighlightsWithIndexQueries(
             highlighted.deinit(alloc);
         }
         for (fields.items) |field| {
-            const value = jsonValueAtDottedPath(parsed, field) orelse continue;
+            var source_values = std.ArrayListUnmanaged(HighlightSourceValue).empty;
+            try collectHighlightSourceValues(hit_arena, &source_values, parsed, field, null, 0);
+            if (source_values.items.len == 0) continue;
+            var has_nested_arrays = false;
+            for (source_values.items) |source_value| {
+                if (source_value.array_depth > 1) has_nested_arrays = true;
+            }
+            if (has_nested_arrays) {
+                // The wire format has one `item` index. Use the flattened
+                // value ordinal when a path passes through multiple arrays.
+                for (source_values.items, 0..) |*source_value, index| {
+                    source_value.item = @intCast(index);
+                }
+            }
             var fragments = std.ArrayListUnmanaged(types.HighlightFragment).empty;
             errdefer {
                 for (fragments.items) |*fragment| types.freeHighlightFragment(alloc, fragment);
@@ -18409,14 +18448,10 @@ pub fn attachHighlightsWithIndexQueries(
                     // expanding every indexed suffix while highlighting.
                     const analyzer_field = if (std.mem.eql(u8, entry.indexed_field, "_all") or
                         highlightFieldIsSubstring(entry.indexed_field)) field else entry.indexed_field;
-                    const analyzer = (resolveQueryAnalyzer(analyzer_field, null, indexed.text_analysis, indexed.runtime_schema) catch null) orelse &analysis_mod.default_analyzer;
-                    switch (value) {
-                        .string => |text| try appendHighlightFragments(alloc, &fragments, text, null, matchers.items, analyzer, max_fragments, fragment_size),
-                        .array => |items| for (items.items, 0..) |item, item_index| {
-                            if (item != .string) continue;
-                            try appendHighlightFragments(alloc, &fragments, item.string, @intCast(item_index), matchers.items, analyzer, max_fragments, fragment_size);
-                        },
-                        else => {},
+                    const analyzer = (resolveQueryAnalyzer(analyzer_field, null, indexed.text_analysis, indexed.runtime_schema) catch null) orelse
+                        (if (highlightFieldIsKeyword(entry.indexed_field)) &analysis_mod.keyword_analyzer else &analysis_mod.default_analyzer);
+                    for (source_values.items) |source_value| {
+                        try appendHighlightFragments(alloc, &fragments, source_value.text, source_value.item, matchers.items, analyzer, max_fragments, fragment_size);
                     }
                 }
             }
@@ -18585,6 +18620,56 @@ test "keyword companion pattern matches highlight the whole indexed value" {
         const fragment = hits[0].highlights[0].fragments[0];
         try std.testing.expectEqualStrings("New York City", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
     }
+}
+
+test "dotted highlight paths traverse arrays of objects" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        source: []const u8,
+        field: []const u8,
+        expected_item: u32,
+    }{
+        .{
+            .source = "{\"items\":[{\"name\":\"Quiet\"},{\"name\":\"River\"}]}",
+            .field = "items.name",
+            .expected_item = 1,
+        },
+        .{
+            .source = "{\"sections\":[{\"items\":[{\"name\":\"Quiet\"}]},{\"items\":[{\"name\":\"River\"}]}]}",
+            .field = "sections.items.name",
+            .expected_item = 1,
+        },
+    };
+    for (cases) |case| {
+        var hits = [_]types.SearchHit{.{
+            .id = try alloc.dupe(u8, "doc:1"),
+            .stored_data = try alloc.dupe(u8, case.source),
+        }};
+        defer hits[0].deinit(alloc);
+        const query: types.TextQuery = .{ .match = .{ .field = case.field, .text = "river" } };
+        try attachHighlights(alloc, .{}, &.{query}, &hits, null, .{}, null);
+        try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+        try std.testing.expectEqualStrings(case.field, hits[0].highlights[0].field);
+        const fragment = hits[0].highlights[0].fragments[0];
+        try std.testing.expectEqual(@as(?u32, case.expected_item), fragment.item);
+        try std.testing.expectEqualStrings("River", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
+    }
+}
+
+test "exact keyword highlights only the matching array value" {
+    const alloc = std.testing.allocator;
+    var hits = [_]types.SearchHit{.{
+        .id = try alloc.dupe(u8, "doc:1"),
+        .stored_data = try alloc.dupe(u8, "{\"place\":[\"New York City\",\"York\"]}"),
+    }};
+    defer hits[0].deinit(alloc);
+    const query: types.TextQuery = .{ .term = .{ .field = "place.keyword", .term = "York" } };
+    try attachHighlights(alloc, .{ .max_fragments = 3 }, &.{query}, &hits, null, .{}, null);
+    try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+    try std.testing.expectEqual(@as(usize, 1), hits[0].highlights[0].fragments.len);
+    const fragment = hits[0].highlights[0].fragments[0];
+    try std.testing.expectEqual(@as(?u32, 1), fragment.item);
+    try std.testing.expectEqualStrings("York", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
 }
 
 test "named highlight queries use their own index analyzers" {

@@ -10811,7 +10811,7 @@ export interface components {
             text: string;
             /** @description Byte offset of the fragment within the field value. */
             offset: number;
-            /** @description Array index of the value when the field is an array of strings. */
+            /** @description Array index for one array; flattened value ordinal for paths through multiple arrays. */
             item?: number;
             spans: components["schemas"]["HighlightSpan"][];
         };

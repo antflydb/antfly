@@ -5692,7 +5692,7 @@ pub const HighlightFragment = struct {
     text: []const u8,
     /// Byte offset of the fragment within the field value.
     offset: i64,
-    /// Array index of the value when the field is an array of strings.
+    /// Array index for one array; flattened value ordinal for paths through multiple arrays.
     item: ?i64 = null,
     spans: []const HighlightSpan,
 

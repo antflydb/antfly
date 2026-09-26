@@ -17985,7 +17985,7 @@ type HierarchyProjection struct {
 
 // HighlightFragment defines model for HighlightFragment.
 type HighlightFragment struct {
-	// Item Array index of the value when the field is an array of strings.
+	// Item Array index for one array; flattened value ordinal for paths through multiple arrays.
 	Item int `json:"item,omitempty,omitzero"`
 
 	// Offset Byte offset of the fragment within the field value.

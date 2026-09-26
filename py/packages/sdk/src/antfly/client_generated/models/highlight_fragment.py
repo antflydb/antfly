@@ -22,7 +22,7 @@ class HighlightFragment:
         text (str): The fragment of the stored field value.
         offset (int): Byte offset of the fragment within the field value.
         spans (list[HighlightSpan]):
-        item (int | Unset): Array index of the value when the field is an array of strings.
+        item (int | Unset): Array index for one array; flattened value ordinal for paths through multiple arrays.
     """
 
     text: str
