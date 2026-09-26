@@ -4109,11 +4109,13 @@ fn loadEphemeralQuantizedLazyWeight(
     self: *NativeCompute,
     entry: *LazyWeightEntry,
     name: []const u8,
+    prepare_matrix: bool,
 ) !?CT {
     if (!shouldDegradeQuantBudgetPressure(entry)) return null;
     const tensor_store = self.data.tensor_store orelse return null;
     var storage = (try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref)) orelse return null;
-    try prepareNativeQuantizedStorage(&storage);
+    errdefer storage.deinit();
+    if (prepare_matrix) try prepareNativeQuantizedStorage(&storage);
     return self.makeBufWithOwnedQuantizedStorage(name, entry, storage);
 }
 
@@ -4654,6 +4656,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .getIo = &getIo,
     .getWeight = &getWeight,
     .acquireWeight = &acquireWeight,
+    .getEmbeddingWeight = &getEmbeddingWeight,
     .prefetchWeightHint = &prefetchWeightHint,
     .drainPrefetchBudget = &drainPrefetchBudget,
     .embeddingLookup = &embeddingLookup,
@@ -4881,6 +4884,12 @@ fn maybeDiscardMappedWeightAfterUse(self: *NativeCompute, weight: CT) void {
 fn acquireWeightReservation(self: *NativeCompute, name: []const u8, bytes: usize) !?run_memory.Reservation {
     if (self.run_budget == null or name.len == 0 or bytes == 0) return null;
     if (self.weight_reservations.getPtr(name)) |state| {
+        // A gather can precede matrix preparation of the same weight. Charge
+        // the larger shared footprint once before accepting another borrower.
+        if (bytes > state.reservation.bytes) {
+            _ = try self.run_budget.?.tryReserveWeight(.host, bytes - state.reservation.bytes);
+            state.reservation.bytes = bytes;
+        }
         state.count += 1;
         return state.reservation;
     }
@@ -5030,7 +5039,7 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     // key, whose lifetime also covers views after an early handle release.
     const stable_name = self.data.resident_weights.getKey(name) orelse
         self.data.lazy_weights.getKey(name) orelse name;
-    const tensor = try loadWeight(self, stable_name);
+    const tensor = try loadWeight(self, stable_name, true);
     toBuf(tensor).weight_handle_name = owned_name;
     toBuf(tensor).weight_handle_refs = 1;
     self.weight_handles.putAssumeCapacityNoClobber(owned_name, tensor);
@@ -5041,13 +5050,20 @@ fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const stable_name = self.data.resident_weights.getKey(name) orelse
         self.data.lazy_weights.getKey(name) orelse name;
-    return loadWeight(self, stable_name);
+    return loadWeight(self, stable_name, true);
 }
 
-fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
+fn getEmbeddingWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const stable_name = self.data.resident_weights.getKey(name) orelse
+        self.data.lazy_weights.getKey(name) orelse name;
+    return loadWeight(self, stable_name, false);
+}
+
+fn loadWeight(self: *NativeCompute, name: []const u8, prepare_matrix: bool) !CT {
     if (self.data.resident_weights.getPtr(name)) |w| {
         if (w.quantized_storage) |*storage| {
-            try ensurePreparedKBlock(self, storage, null);
+            if (prepare_matrix) try ensurePreparedKBlock(self, storage, null);
             const view = if (w.tensor.data.len > 0)
                 try tensorF32View(self, &w.tensor)
             else
@@ -5076,12 +5092,12 @@ fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
     self.data.prefetch.lock();
     defer self.data.prefetch.unlock();
     if (self.data.lazy_weights.getPtr(name)) |entry| {
-        ensureLazyWeightLoadedLocked(self.data, self.run_budget, entry) catch |err| switch (err) {
+        ensureLazyWeightLoadedForUseLocked(self.data, self.run_budget, entry, prepare_matrix) catch |err| switch (err) {
             error.MemoryBudgetExceeded => {
                 if (self.data.tier_cache) |*tier_cache| {
                     logSharedCacheDenial("get_weight_host_load", tier_cache, name);
                 }
-                if (try loadEphemeralQuantizedLazyWeight(self, entry, name)) |ephemeral_quantized| {
+                if (try loadEphemeralQuantizedLazyWeight(self, entry, name, prepare_matrix)) |ephemeral_quantized| {
                     return ephemeral_quantized;
                 }
                 if (canFallbackDenseBudgetPressure(name, entry)) {
@@ -5092,6 +5108,10 @@ fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
             else => return err,
         };
         const loaded = &(entry.loaded.?);
+        if (prepare_matrix) {
+            if (loaded.quantized_storage) |*storage|
+                try ensurePreparedKBlock(self, storage, &entry.loaded_bytes);
+        }
         const reservation = try acquireWeightReservation(
             self,
             name,
@@ -5101,7 +5121,6 @@ fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
         entry.pin_count += 1;
         errdefer entry.pin_count -= 1;
         if (loaded.quantized_storage) |*storage| {
-            try ensurePreparedKBlock(self, storage, &entry.loaded_bytes);
             const view = if (loaded.tensor.data.len > 0)
                 try tensorF32View(self, &loaded.tensor)
             else
@@ -5197,6 +5216,10 @@ fn prefetchPriority(entry: *LazyWeightEntry) u64 {
 }
 
 pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory.RunBudget, entry: *LazyWeightEntry) !void {
+    return ensureLazyWeightLoadedForUseLocked(data, run_budget, entry, true);
+}
+
+fn ensureLazyWeightLoadedForUseLocked(data: *WeightStore, run_budget: ?*run_memory.RunBudget, entry: *LazyWeightEntry, prepare_matrix: bool) !void {
     const trace = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_LAZY_TRACE");
     const trace_start = platform.time.monotonicNs();
     if (trace) {
@@ -5235,7 +5258,7 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
     if (data.allow_direct_quant) {
         direct_quant_storage = try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref);
         if (direct_quant_storage) |*storage| {
-            expected_bytes = expectedQuantizedStorageLoadBytes(storage);
+            expected_bytes = if (prepare_matrix) expectedQuantizedStorageLoadBytes(storage) else quantizedStorageBudgetBytes(storage);
         }
     }
     if (entry.expert_coord) |coord| {
@@ -5265,7 +5288,7 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
             // representation reported by expectedQuantizedStorageLoadBytes.
             // Rechecking those bytes here would double-charge the same growth
             // and can incorrectly suppress preparation near the cache ceiling.
-            try prepareNativeQuantizedStorage(storage_ref);
+            if (prepare_matrix) try prepareNativeQuantizedStorage(storage_ref);
             entry.loaded = .{
                 .tensor = .{
                     .data = empty_u8[0..],
@@ -47210,6 +47233,161 @@ test "native Qwen3 quantized-only weight handle preserves shape and lookup witho
         try quant_codec.dequantizeRow(.{ .known = .Q8_0 }, raw, 32, source_row, &expected);
         try std.testing.expectEqualSlices(f32, &expected, getData(result)[output_row * 32 ..][0..32]);
     }
+}
+
+test "native gather reservation growth is deduplicated and fails without leaking borrowers" {
+    const allocator = std.testing.allocator;
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitPrefetchQueue(&store);
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 128 });
+    var compute = NativeCompute.init(allocator, &store, &budget);
+    defer compute.deinit();
+    _ = try acquireWeightReservation(&compute, "weight", 32);
+    _ = try acquireWeightReservation(&compute, "weight", 96);
+    try std.testing.expectEqual(@as(usize, 96), budget.host_weight_bytes);
+    try std.testing.expectError(error.MemoryBudgetExceeded, acquireWeightReservation(&compute, "weight", 160));
+    try std.testing.expectEqual(@as(usize, 96), budget.host_weight_bytes);
+    releaseWeightReservation(&compute, "weight");
+    try std.testing.expectEqual(@as(usize, 96), budget.host_weight_bytes);
+    releaseWeightReservation(&compute, "weight");
+    try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 0), compute.weight_reservations.count());
+}
+
+test "native gather weight avoids matrix packing and reserves only raw storage" {
+    const allocator = std.testing.allocator;
+    const name = "cls.output.weight";
+    var dense = [_]f32{0} ** 64;
+    for (&dense, 0..) |*value, index| value.* = @floatFromInt(index);
+    const raw = try quant_codec.quantizeQ8_0FromF32(allocator, &dense);
+    defer allocator.free(raw);
+    const shape = [_]i64{ 2, 32 };
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.resident_weights.deinit(allocator);
+    try store.resident_weights.put(allocator, name, .{
+        .tensor = .{
+            .data = &.{},
+            .shape = &.{},
+            .dtype = .f32,
+            .name = name,
+            .allocator = allocator,
+            .owns_data = false,
+            .owns_shape = false,
+        },
+        .quantized = true,
+        .quantized_storage = .{
+            .tensor_type = .{ .known = .Q8_0 },
+            .raw_bytes = raw,
+            .shape = &shape,
+            .raw_owned = false,
+            .allocator = allocator,
+        },
+    });
+    const weight_bytes = raw.len;
+    const output_bytes = 2 * 32 * @sizeOf(f32);
+    // No capacity exists for matrix packing: a gather needs only raw rows.
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = weight_bytes + output_bytes });
+    const output_estimate = run_memory.Estimate{
+        .prompt_tokens = 0,
+        .retained_tokens = 0,
+        .kv_bytes = 0,
+        .kv_tier = .host,
+        .scratch_bytes = output_bytes,
+        .scratch_tier = .host,
+    };
+    try budget.reserveEstimate(output_estimate);
+    defer budget.releaseEstimate(output_estimate);
+    defer store.resident_weights.getPtr(name).?.quantized_storage.?.prepared.deinit(allocator);
+    var compute = NativeCompute.init(allocator, &store, &budget);
+    defer compute.deinit();
+    const weight = try getEmbeddingWeight(&compute, name);
+    var released = false;
+    defer if (!released) freeTensor(&compute, weight);
+    try std.testing.expectEqual(@as(usize, 0), toBuf(weight).data.len);
+    try std.testing.expectEqualSlices(i64, &shape, toBuf(weight).logical_shape.?);
+    try std.testing.expectEqual(@as(usize, 0), toBuf(weight).quantized_storage.?.prepared.ownedBytes());
+    try std.testing.expectEqual(weight_bytes, budget.host_weight_bytes);
+    try std.testing.expectEqual(output_bytes, budget.host_scratch_bytes);
+    const result = try embeddingLookup(&compute, weight, &.{ 1, 0 }, 2, 32);
+    defer freeTensor(&compute, result);
+    var expected = [_]f32{0} ** 32;
+    for ([_]usize{ 1, 0 }, 0..) |source_row, output_row| {
+        try quant_codec.dequantizeRow(.{ .known = .Q8_0 }, raw, 32, source_row, &expected);
+        try std.testing.expectEqualSlices(f32, &expected, getData(result)[output_row * 32 ..][0..32]);
+    }
+    freeTensor(&compute, weight);
+    released = true;
+    try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
+}
+
+test "native gather lazy handles retain pins and allow later matrix preparation" {
+    const allocator = std.testing.allocator;
+    const name = "embedding.weight";
+    const dense = [_]f32{1} ** 128;
+    const raw = try quant_codec.quantizeQ8_0FromF32(allocator, &dense);
+    defer allocator.free(raw);
+    const shape = [_]i64{ 4, 32 };
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer {
+        deinitPrefetchQueue(&store);
+        store.lazy_weights.getPtr(name).?.loaded.?.quantized_storage.?.prepared.deinit(allocator);
+        store.lazy_weights.deinit(allocator);
+    }
+    try store.lazy_weights.put(allocator, name, .{
+        .tensor_ref = .{ .name = name, .byte_len = raw.len },
+        .loaded = .{
+            .tensor = .{
+                .data = &.{},
+                .shape = &.{},
+                .dtype = .f32,
+                .name = name,
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            },
+            .quantized = true,
+            .quantized_storage = .{
+                .tensor_type = .{ .known = .Q8_0 },
+                .raw_bytes = raw,
+                .shape = &shape,
+                .raw_owned = false,
+                .allocator = allocator,
+            },
+        },
+        .loaded_bytes = raw.len,
+        .active_tier = .host,
+    });
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 4096 });
+    var compute = NativeCompute.init(allocator, &store, &budget);
+    defer compute.deinit();
+    const first = try getEmbeddingWeight(&compute, name);
+    var first_live = true;
+    defer if (first_live) freeTensor(&compute, first);
+    const second = try getEmbeddingWeight(&compute, name);
+    var second_live = true;
+    defer if (second_live) freeTensor(&compute, second);
+    try std.testing.expect(first != second);
+    const entry = store.lazy_weights.getPtr(name).?;
+    try std.testing.expectEqual(@as(usize, 2), entry.pin_count);
+    try std.testing.expectEqual(raw.len, entry.loaded_bytes);
+    try std.testing.expectEqual(@as(usize, 0), entry.loaded.?.quantized_storage.?.prepared.ownedBytes());
+    freeTensor(&compute, first);
+    first_live = false;
+    try std.testing.expectEqual(@as(usize, 1), entry.pin_count);
+    try std.testing.expectEqual(raw.len, budget.host_weight_bytes);
+    const matrix = try acquireWeight(&compute, name);
+    var matrix_live = true;
+    defer if (matrix_live) freeTensor(&compute, matrix);
+    try std.testing.expect(entry.loaded.?.quantized_storage.?.prepared.ownedBytes() > 0);
+    try std.testing.expectEqual(quantizedStorageBudgetBytes(&entry.loaded.?.quantized_storage.?), entry.loaded_bytes);
+    try std.testing.expectEqual(entry.loaded_bytes, budget.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 2), entry.pin_count);
+    freeTensor(&compute, matrix);
+    matrix_live = false;
+    freeTensor(&compute, second);
+    second_live = false;
+    try std.testing.expectEqual(@as(usize, 0), entry.pin_count);
+    try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
 }
 
 test "native typed BF16 lazy weight stays pinned until all handles are freed" {

@@ -22618,7 +22618,10 @@ pub const ResolvedExecutorKind = enum {
     native_dense_embedding,
     native_sparse_embedding,
     native_florence_reader,
+    /// Boundary extraction retains its qualified one-item request limit.
     native_gliner_extraction,
+    /// Span extraction accepts multiple texts across its schema variants.
+    native_gliner_span_extraction,
     /// Pointwise reranking that projects each document's images into a
     /// vision-language decoder (Qwen3-VL GGUF bundle with its projector).
     native_projector_reranking,
@@ -22635,20 +22638,23 @@ pub const ResolvedExecutorKind = enum {
 test "microbatch registration qualifies concrete GLiNER bundles and Qwen embedding profiles" {
     const gliner = manifest_mod.ModelManifest{
         .allocator = std.testing.allocator,
+        .model_type = .extractor,
         .gliner_model_type = "gliner2",
         .gguf_path = "encoder.gguf",
         .gliner_head_gguf_path = "head.gguf",
     };
-    try std.testing.expectEqual(.native_gliner_extraction, resolvedExecutorKind("extract", &gliner));
-    // The concrete GLiNER boundary executor is recognized as its own kind
-    // (never falls back to the generic compatibility loop), but its reviewed
-    // qualification covers exactly one item per request today, so it must
-    // not advertise native batching beyond that -- see
-    // resolvedExecutorBatchImplementation's doc comment.
+    try std.testing.expectEqual(.native_gliner_span_extraction, resolvedExecutorKind("extract", &gliner));
+    // The request contract spans packed v1 extraction and serial v2
+    // classification, so advertise compatibility batching conservatively.
     const gliner_batch = resolvedExecutorBatchImplementation("extract", resolvedExecutorKind("extract", &gliner));
-    try std.testing.expectEqual(.none, gliner_batch.mode);
-    try std.testing.expectEqual(@as(usize, 1), gliner_batch.max_items);
-    try std.testing.expectEqual(@as(usize, 1), gliner_batch.preferred_items);
+    try std.testing.expectEqual(.serial_compatibility, gliner_batch.mode);
+    try std.testing.expectEqual(max_serial_family_batch_items, gliner_batch.max_items);
+    try std.testing.expectEqual(@as(usize, 8), gliner_batch.preferred_items);
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    const span_contract = try resolvedInferenceExecutorContract(&node, "extract", &gliner);
+    try validateTextExecutorInvocation(span_contract, 2, &.{ "Elon Musk founded SpaceX.", "Musk also runs Tesla." }, 12, 16, 2, 0);
+    try std.testing.expectError(error.InferenceBatchTooLarge, validateTextExecutorInvocation(span_contract, gliner_batch.max_items + 1, &.{"text"}, 0, 1, 1, 0));
     const onnx = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .gliner_model_type = "gliner2" };
     try std.testing.expectEqual(.compatibility, resolvedExecutorKind("extract", &onnx));
     // A boundary-architecture checkpoint (gliner2.5 from safetensors) has no
@@ -22663,6 +22669,8 @@ test "microbatch registration qualifies concrete GLiNER bundles and Qwen embeddi
     const boundary_batch = resolvedExecutorBatchImplementation("extract", resolvedExecutorKind("extract", &boundary));
     try std.testing.expectEqual(.none, boundary_batch.mode);
     try std.testing.expectEqual(@as(usize, 1), boundary_batch.max_items);
+    const boundary_contract = try resolvedInferenceExecutorContract(&node, "extract", &boundary);
+    try std.testing.expectError(error.InferenceBatchTooLarge, validateTextExecutorInvocation(boundary_contract, 2, &.{ "one", "two" }, 0, 2, 1, 0));
     const qwen = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .embedding_style = .qwen3_embedding };
     try std.testing.expectEqual(.native_dense_embedding, resolvedExecutorKind("embed", &qwen));
     try std.testing.expectEqual(.compatibility, resolvedExecutorKind("generate", &qwen));
@@ -22684,18 +22692,10 @@ pub fn resolvedExecutorKind(
     }
     if (std.mem.eql(u8, resolved_task, "read") and manifest.native_arch_hint == .florence)
         return .native_florence_reader;
-    // Both concrete GLiNER executors are their own kind: the split
-    // encoder+head GGUF bundle (gliner2) and the boundary architecture
-    // (gliner2.5, served from safetensors or its converted bundle through
-    // extractV2InMemory -> boundary_executor). Classifying the boundary
-    // architecture as `.compatibility` advertised the generic serial batch
-    // contract (max_items=128), which let the antfly asset-producer batcher
-    // group several documents into one request that the boundary executor's
-    // one-item LengthContract then rejected with
-    // GlinerBoundaryRequestItemsLimitExceeded for the whole group.
-    if (std.mem.eql(u8, resolved_task, "extract") and
-        (manifest.isSplitGlinerBundle() or manifest.gliner_architecture == .boundary))
-        return .native_gliner_extraction;
+    if (std.mem.eql(u8, resolved_task, "extract")) {
+        if (manifest.gliner_architecture == .boundary) return .native_gliner_extraction;
+        if (manifest.isSplitGlinerBundle()) return .native_gliner_span_extraction;
+    }
     if (std.mem.eql(u8, resolved_task, "rerank")) return resolvedRerankExecutorKind(manifest);
     return .compatibility;
 }

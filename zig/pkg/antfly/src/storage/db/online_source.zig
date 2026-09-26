@@ -358,7 +358,7 @@ pub fn stage(txn: anytype, command: Command, applied_index: u64) !void {
 }
 
 test "relational index system online source controls survive LSM reopen with atomic abort and final fences" {
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -462,7 +462,7 @@ test "relational index system online source controls survive LSM reopen with ato
 }
 
 test "relational index system online source standby replay preserves admission certificate and final cut clocks" {
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const effects = @import("../hot_standby/effects.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -547,7 +547,7 @@ test "relational index system native rewrite source clock is forwarded by durabl
 }
 
 fn sourceOutboxRecovery(native_authority: bool) !void {
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const primary_mod = @import("../hot_standby/primary.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -622,7 +622,7 @@ fn sourceOutboxRecovery(native_authority: bool) !void {
 }
 
 test "relational index system native rewrite authority clocks survive pin crash ordinary writes and exact standby replay" {
-    const DB = @import("db.zig");
+    const DB = @import("antfly_source_root").antfly_sources.physical_db;
     const clock = @import("../source_authority.zig");
     const effects = @import("../hot_standby/effects.zig");
     const pin = @import("source_pin.zig");
@@ -709,7 +709,7 @@ test "relational index system native rewrite authority clocks survive pin crash 
 }
 
 test "relational index system unknown identity summary never preserves false empty admission after mutation" {
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const identity = @import("doc_identity.zig");
     const internal = @import("../internal_keys.zig");
     const alloc = std.testing.allocator;
@@ -746,7 +746,7 @@ test "relational index system unknown identity summary never preserves false emp
 }
 
 test "relational index system native source authority preserves same namespace and rebinds only durable adopted identity" {
-    const DB = @import("db.zig");
+    const DB = @import("antfly_source_root").antfly_sources.physical_db;
     const clock = @import("../source_authority.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

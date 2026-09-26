@@ -23,7 +23,7 @@ const catalog_mod = @import("../storage/db/relational_integrity_catalog.zig");
 const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
 const planner = @import("relational_integrity_commit.zig");
 const reads = @import("table_read_source.zig");
-const writes = @import("table_writes.zig");
+const writes = @import("table_write_source.zig");
 const contract = @import("distributed_txn_contract.zig");
 const schema_api = @import("../schema/mod.zig");
 const schema = @import("../storage/schema.zig");
@@ -479,7 +479,7 @@ test "distributed txn retirement verifies large owner barriers in bounded restar
 }
 
 fn testRetirementDrain(pressure: RetirementPressure) !void {
-    const db_mod = @import("../storage/db/db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const types = @import("../storage/db/types.zig");
     const read_gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;

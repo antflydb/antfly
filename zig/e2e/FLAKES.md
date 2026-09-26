@@ -1,5 +1,58 @@
 # Zig E2E flakes
 
+## 2026-09-25: main HA promotion retry and CPU inference diagnostics
+
+[Main run 36200131260](https://github.com/antflydb/antfly/actions/runs/36200131260)
+failed HA `test_empty_seed_then_first_table_replication_and_fenced_promotion`
+with a 500 response after `MetadataHABindingBusy` and `HAPrimaryNotConfigured`.
+Promotion had already transferred its primary WAL to the runtime, but an
+unconditional local `errdefer` closed that transferred handle when metadata
+binding failed. Promotion also discarded its retry configuration before
+binding completed. The runtime now retains ownership and the retry state,
+and keeps public reads and writes gated until every binding succeeds.
+The background loop treats metadata binding contention as nonfatal and retains
+its exact diagnostic while scheduling another round.
+The deterministic regression injects repeated metadata binding contention,
+checks closed public gates, retries successfully, and tears down without leaks.
+
+The same run's inference suite timed out in dictate cleanup after 600 seconds;
+four later dictate requests and three embedding requests returned capacity
+errors. Two local CPU baseline invocations completed in 182 and 158 seconds,
+so the CI timeout has not been reproduced locally. Their supervisor cleanup
+failed under the local sandbox's process-group signaling restrictions; these
+are test-level observations, not successful soak invocations. A CPU sample
+identified whole-table matrix preparation during Gemma PLE row gathering.
+Gather-only weight lookup now retains raw quantized rows and skips matrix
+packing, including on the lazy-load path. Other backends retain their existing
+weight lookup semantics, and ordinary matrix consumers retain preparation.
+Regressions cover exact row values, raw-only request accounting, reservation
+release, lazy handle pins, and later matrix preparation. Shared request
+reservations grow once when a matrix borrower needs a larger footprint; a
+denied growth does not add a borrower or leak its original charge. This removes
+observed unnecessary work; it does not establish the exact cause of the CI timeout.
+
+The regression loop now selects the inference project's environment for
+inference selectors and preserves complete server output beside its reports.
+Full inference CI also uploads those logs, rather than relying on a short
+failure tail. GLiNER span extraction's multi-text contract is independent of
+the boundary extractor's qualified singleton contract; the span registration
+now accepts multi-text requests again while boundary limits remain enforced.
+
+
+Validation used the repository's `zig-e2e-regression-loop.sh` for the HA
+selector: two workers, three repetitions, six passed invocations with no skips,
+errors, or failures. The CPU inference sequence used `run_e2e_case.py` to
+supervise two independent pytest sessions, each containing all five dictate
+cases, the three failing embedding cases, and the resolver extraction case.
+All 18 invocations passed with no skips, errors, or failures; retained logs
+confirm native CPU selection. Each session used a one-model limit and CI's
+300-second request deadline. The soak binary contained the HA and inference
+fixes; later import-only coordination changes were validated separately.
+These runs do not reproduce the original 600-second CI timeout or prove a
+before/after latency improvement: the earlier baseline binary was a different
+build configuration.
+
+
 ## 2026-09-25: schema rewrite reply-loss recovery retries under leader churn
 
 [PR #882's recovery-0 job](https://github.com/antflydb/antfly/actions/runs/36173392068/job/108211921323)

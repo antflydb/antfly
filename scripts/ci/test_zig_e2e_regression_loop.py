@@ -24,6 +24,7 @@ class RegressionEvidenceTests(unittest.TestCase):
         cluster_restore=False,
         profile="",
         report=True,
+        selector="example.py::test_restore",
     ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -37,6 +38,7 @@ class RegressionEvidenceTests(unittest.TestCase):
                 "path = next((arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--junitxml=')), None)\n"
                 "if path is None: print('stub invoked without junit'); sys.exit(0)\n"
                 "print('stub invoked with junit')\n"
+                "print('project=' + sys.argv[sys.argv.index('--project') + 1])\n"
                 "mode = os.environ['STUB_JUNIT_MODE']\n"
                 "if mode != 'missing':\n"
                 "    child = '<skipped/>' if mode == 'skip' or (mode == 'normal-skip' and '/normal/' in path) else ''\n"
@@ -53,7 +55,7 @@ class RegressionEvidenceTests(unittest.TestCase):
                     else (
                         [str(SCRIPT.with_name("zig-e2e-autograph-soak.sh"))]
                         if autograph
-                        else [str(SCRIPT), "example.py::test_restore"]
+                        else [str(SCRIPT), selector]
                     )
                 ),
                 env={
@@ -76,6 +78,18 @@ class RegressionEvidenceTests(unittest.TestCase):
                 str(p.relative_to(reports)): p.read_text()
                 for p in reports.rglob("*.xml")
             }
+
+    def test_inference_selector_uses_its_project_and_requires_passes(self):
+        result, _ = self.run_loop(
+            selector="e2e/inference/test_dictate.py::test_dictate_cleanup_rewrites_transcript"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("project=e2e/inference", result.stdout)
+        result, _ = self.run_loop(
+            selector="e2e/inference/test_dictate.py::test_dictate_cleanup_rewrites_transcript",
+            mode="skip",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
     def test_without_report_directory_still_validates_junit_evidence(self):
         result, reports = self.run_loop(report=False)

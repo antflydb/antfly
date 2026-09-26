@@ -6744,7 +6744,7 @@ pub fn storageOwnerBackupPinControlJson(owner: ?*anyopaque, request: *const kern
     var parsed = std.json.parseFromSlice(seal.Request, handle.alloc, request.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
     defer parsed.deinit();
     const control: backups_api.BackupOperationControl = .{ .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else std.math.maxInt(u64), .cancellation = ownerQueryCancellation(request) };
-    const response = antfly.capi_dependencies.api_table_writes.executeBackupPinControl(handle.alloc, &handle.db, handle.storage_owner_group_id, parsed.value, control) catch |err| {
+    const response = antfly.capi_dependencies.storage_db_backup_pin_control.execute(handle.alloc, &handle.db, handle.storage_owner_group_id, parsed.value, control) catch |err| {
         if (backup_pin_diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs()))
             std.log.warn("backup pin failed phase=native_capture action={s} group_id={d} class={s}", .{ @tagName(parsed.value), handle.storage_owner_group_id, @errorName(err) });
         return storageOwnerStatusFromError(err);

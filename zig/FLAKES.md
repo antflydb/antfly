@@ -1,5 +1,38 @@
 # Zig runtime flakes
 
+## 2026-09-25: physical storage compilation isolation and retained measurements
+
+[Main run 36200131260](https://github.com/antflydb/antfly/actions/runs/36200131260)
+lost its build-cache runner during the physical storage compilation check.
+GitHub's annotation reports lost runner communication; no compiler log or
+measurement establishes the exact cause, including whether it was an OOM.
+The checker now uses the same bounded compiler wrapper as other Zig builds,
+and CI restricts its CPU affinity to eight CPUs from the runner's actual mask.
+Measurements are published atomically before each build and every 30 seconds,
+so an interrupted job retains its last observed RSS and active case. A timeout
+kills the build group, retains its report, and marks CPU accounting incomplete.
+The cache ownership assertions remain unchanged.
+
+The local matrix also exposed two concrete dependency leaks. The backup cohort
+driver imported full read/write implementations in test builds although it
+only needed their source contracts. Those literal imports pulled coordination
+code into the storage compiler manifest. The C ABI also imported the complete
+write coordinator for physical backup pin control. The driver and relational workers now import narrow contracts directly.
+Restore validation and consumer fixtures select concrete adapters through
+the compilation root instead of literal imports. Backup pin control lives
+beside its physical DB owner with a compatibility alias for existing callers. Literal DB implementation imports in source transfer, restore, relational
+code, and test helpers also bypassed root ownership. They now select the
+physical DB through the existing root mechanism, preserving implementation
+identity for physical callers while avoiding compilation in other roots.
+This keeps physical storage independent of coordination changes and consumer
+code independent of physical implementation changes without weakening the checker.
+All ten storage-owner backup regressions passed. The final API selection
+passed ten restore/backup tests, including six backup heartbeat cases, and
+all 92 transaction regressions passed with the root-selected imports. The complete nine-case
+physical compilation matrix passed on frozen source with every original
+cache and relink assertion intact (cold, warm, read/write coordination,
+physical DB/local query, owner test, consumer root, and shared contract).
+
 ## 2026-09-23: executable chunk embeddings and transient rewrite owner routing
 
 [PR #868 CI run 35937420037](https://github.com/antflydb/antfly/actions/runs/35937420037)

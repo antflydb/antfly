@@ -23,7 +23,7 @@ const fs = @import("../../common/fs_paths.zig");
 const state = @import("../source_pin_state.zig");
 const snapshot = @import("../source_snapshot.zig");
 const portable = @import("../portable_backup.zig");
-const DB = @import("db.zig").DB;
+const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const Allocator = std.mem.Allocator;
 const Cancellation = @import("types.zig").CancellationToken;
 const gc = @import("source_pin_gc.zig");
@@ -557,7 +557,7 @@ test "relational index system source pin cancellation releases a prepared cut be
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cancel-source", .{tmp.sub_path});
     defer alloc.free(path);
-    const options: @import("db.zig").OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    const options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     var db = try DB.open(alloc, path, options);
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
@@ -582,7 +582,7 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cleanup-source", .{tmp.sub_path});
     defer alloc.free(path);
-    const options: @import("db.zig").OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    const options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     var db = try DB.open(alloc, path, options);
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
@@ -739,7 +739,7 @@ test "relational index system source pin prepared reopen pages abandoned staging
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-gc", .{tmp.sub_path});
     defer alloc.free(path);
-    const options: @import("db.zig").OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    const options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     var scope: ledger.Scope = undefined;
     {
         var db = try DB.open(alloc, path, options);
@@ -783,7 +783,7 @@ test "relational index system source pin prepared reopen pages abandoned staging
 }
 
 test "relational index system source pin prepared crash blocks markers then reopens exact immutable artifact" {
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

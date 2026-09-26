@@ -17,7 +17,7 @@
 //! recapture is permitted. A replica-local cache only avoids repeated decoding
 //! of the same oversized row and is never authoritative progress.
 const std = @import("std");
-const DB = @import("db.zig").DB;
+const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const source = @import("online_source.zig");
 const pages = @import("merge_page_contract.zig");
 const types = @import("types.zig");
@@ -223,7 +223,7 @@ test "relational index system online snapshot locator resumes immutable rows and
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/snapshot", .{tmp.sub_path});
         defer alloc.free(path);
-        const options: @import("db.zig").OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+        const options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
         var large = try alloc.alloc(u8, 2 * pages.max_bytes + 16);
         defer alloc.free(large);
         @memset(large, 'x');

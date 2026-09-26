@@ -18,7 +18,7 @@
 //! verification. Interrupted transfer resumes at an exact bounded byte offset.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const DB = @import("db.zig").DB;
+const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const pin = @import("source_pin.zig");
 const seal = @import("native_backup_seal.zig");
 const backup = @import("native_backup.zig");

@@ -4,7 +4,7 @@
 //! Consumer integration wiring. Only test roots import this fixture; the
 //! production provider has no dependency on its source or test allocator.
 const std = @import("std");
-const table_writes = @import("table_writes.zig");
+const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const owner_source = @import("kernel_owner_source.zig");
 const client = @import("../storage/kernel_owner_client.zig");
 const services = @import("../storage/kernel_runtime_services.zig");
