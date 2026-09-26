@@ -98,6 +98,11 @@ const Laya = @import("../models/laya.zig").Config;
 /// requests, and only the branch tokens are encoded (laya_trunk_cache.zig).
 pub fn forwardRow(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row, cache: ?*trunk_cache.Cache) ![]Tensor {
     const store = cache orelse return forwardFull(cb, a, cfg, laya, row);
+    // A multi-row batch (pipelines/laya.zig, laya_tree.coalesce) packs
+    // several states' trees into one row. Segment attention already keeps
+    // their cost proportional to visible keys, so batching pays off without
+    // the trunk cache; caching a forest of trunks is not implemented yet.
+    if (tree.treeCount(row) != 1) return forwardFull(cb, a, cfg, laya, row);
     const trunk = trunkRows(row) orelse return forwardFull(cb, a, cfg, laya, row);
     if (store.limit_bytes == 0 or trunk < store.min_tokens or trunk == row.ids.len) return forwardFull(cb, a, cfg, laya, row);
     const layers = cfg.num_hidden_layers + laya.head_layers;

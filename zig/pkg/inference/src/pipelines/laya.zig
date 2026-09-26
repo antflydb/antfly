@@ -275,6 +275,10 @@ pub fn executeWithScratch(a: std.mem.Allocator, scratch: std.mem.Allocator, sess
     return .{ .decisions = result, .prompt_tokens = tokens, .execution_chunks = execution_chunks, .padded_tokens = padded_tokens };
 }
 
+/// One packed row (or a group of rows for one state that overflowed a single
+/// row) plus the absolute task index of each of its questions.
+const Planned = struct { row: tree.Row, members: []const usize };
+
 /// Tree-packed execution: every task that shares a state text shares one
 /// trunk encoding (see pipelines/laya_tree.zig). Rows are built and validated
 /// for the whole request before any model work is admitted.
@@ -291,7 +295,6 @@ fn executePacked(a: std.mem.Allocator, scratch: std.mem.Allocator, session: Sess
         if (!entry.found_existing) entry.value_ptr.* = .empty;
         try entry.value_ptr.append(plan, i);
     }
-    const Planned = struct { row: tree.Row, members: []const usize };
     var rows: std.ArrayListUnmanaged(Planned) = .empty;
     var tokens: usize = 0;
     for (groups.keys(), groups.values()) |text, members| {
@@ -312,30 +315,69 @@ fn executePacked(a: std.mem.Allocator, scratch: std.mem.Allocator, session: Sess
         for (decisions, done) |decision, filled| if (filled) a.free(decision.probabilities);
         a.free(decisions);
     }
-    for (rows.items) |planned| {
+    // Several rows, possibly from different states, share one session call
+    // when their combined physical length fits the row budget (models/laya
+    // LAYA.md, "Segment attention"). Segment attention already keeps cost
+    // proportional to visible keys, so a batched call does the same work as
+    // separate calls, minus their per-call overhead. Greedy in request
+    // order: add the next row while it still fits, then flush.
+    const batching = platform.env.getenvBoolDefault("ANTFLY_LAYA_PACKED_BATCH", true);
+    const batch_limit = cfg.packing.max_packed_len;
+    var start: usize = 0;
+    var execution_chunks: usize = 0;
+    while (start < rows.items.len) {
         if (control) |active| try active.check();
-        const row = planned.row;
-        const questions = row.questions();
-        const outputs = try runPackedRow(session, scratch, row, questions, control);
-        defer {
-            for (outputs) |*output| output.deinit();
-            scratch.free(outputs);
-        }
-        if (outputs.len != 2 or outputs[0].dtype != .f32 or outputs[1].dtype != .f32) return error.UnexpectedOutputShape;
-        const logits = outputs[0].asFloat32();
-        const acts = outputs[1].asFloat32();
-        if (logits.len != questions * row.width or acts.len != questions * cfg.n_act) return error.UnexpectedOutputShape;
-        for (row.question_index, 0..) |local, qi| {
-            const index = planned.members[local];
-            const q = tasks[index].question;
-            decisions[index] = try decode(a, cfg, q, logits[qi * row.width ..][0..q.labels.len], acts[qi * cfg.n_act ..][0..cfg.n_act]);
-            done[index] = true;
-            decoded += 1;
-        }
+        var end = start + 1;
+        var used = rows.items[start].row.ids.len;
+        if (batching) while (end < rows.items.len) : (end += 1) {
+            const next = rows.items[end].row.ids.len;
+            if (used + next > batch_limit) break;
+            used += next;
+        };
+        try runPackedBatch(a, plan, scratch, session, cfg, tasks, rows.items[start..end], decisions, done, &decoded, control);
+        execution_chunks += 1;
+        start = end;
     }
     if (decoded != tasks.len) return error.UnexpectedOutputShape;
     if (control) |active| try active.check();
-    return .{ .decisions = decisions, .prompt_tokens = tokens, .execution_chunks = rows.items.len };
+    return .{ .decisions = decisions, .prompt_tokens = tokens, .execution_chunks = execution_chunks };
+}
+
+/// Run one session call over `batch`, a run of `Planned` rows (one call
+/// already, or several coalesced into one physical row). `plan` is an arena
+/// scoped to the whole request; `scratch` backs the model's temporaries.
+fn runPackedBatch(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.mem.Allocator, session: Session, cfg: model.Config, tasks: []const Task, batch: []const Planned, decisions: []Decision, done: []bool, decoded: *usize, control: ?Control) !void {
+    // `plan` is the request arena; a coalesced row's memory is reclaimed
+    // with everything else when `executePacked` tears it down.
+    var row: tree.Row = undefined;
+    var owners: []const usize = &.{};
+    if (batch.len == 1) {
+        row = batch[0].row;
+    } else {
+        const sub_rows = try plan.alloc(tree.Row, batch.len);
+        for (sub_rows, batch) |*dst, planned| dst.* = planned.row;
+        const merged = try tree.coalesce(plan, sub_rows);
+        row = merged.row;
+        owners = merged.owners;
+    }
+    const questions = row.questions();
+    const outputs = try runPackedRow(session, scratch, row, questions, control);
+    defer {
+        for (outputs) |*output| output.deinit();
+        scratch.free(outputs);
+    }
+    if (outputs.len != 2 or outputs[0].dtype != .f32 or outputs[1].dtype != .f32) return error.UnexpectedOutputShape;
+    const logits = outputs[0].asFloat32();
+    const acts = outputs[1].asFloat32();
+    if (logits.len != questions * row.width or acts.len != questions * cfg.n_act) return error.UnexpectedOutputShape;
+    for (row.question_index, 0..) |local, qi| {
+        const owner = if (owners.len > 0) owners[qi] else 0;
+        const index = batch[owner].members[local];
+        const q = tasks[index].question;
+        decisions[index] = try decode(a, cfg, q, logits[qi * row.width ..][0..q.labels.len], acts[qi * cfg.n_act ..][0..cfg.n_act]);
+        done[index] = true;
+        decoded.* += 1;
+    }
 }
 
 fn runPackedRow(session: Session, scratch: std.mem.Allocator, row: tree.Row, questions: usize, control: ?Control) ![]Tensor {
