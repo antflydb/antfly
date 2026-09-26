@@ -561,16 +561,19 @@ different sizes; see the report for caveats).
   36 GB Mac.
 - The span-versus-boundary head ablation (Decision 4) is not run: span heads
   exist natively only on DeBERTa.
-- **Pilot result:** the ModernBERT-base student collapses to constant outputs
-  (in-domain classification 0.13, NER F1 0.0), with fresh or with
-  gliner2.5-base's trained heads, in the native trainer and in upstream's
-  PyTorch trainer alike. The same recipe on gliner2.5-base lifts in-domain
-  classification 0.728 → 0.808 and NER F1 0.543 → 0.723, but that encoder is
-  already GLiNER-trained: raw DeBERTa-v3-base with the same fresh heads
-  collapses too, faster. The pilot recipe (fresh heads, 4,560 rows) cannot
-  teach GLiNER's label matching to a raw encoder; head warmup, lower encoder
-  learning rate, feature rescaling and cosine feature distillation do not fix
-  it. Next: relational distillation and a larger teacher-labeled set.
+- **Pilot result:** the ModernBERT-base student trained directly on task
+  labels collapses to constant outputs (classification 0.13, NER F1 0.0), in
+  the native trainer and upstream's alike. Raw DeBERTa-v3-base collapses the
+  same way: any freshly initialized component on top of an encoder that is not
+  GLiNER-trained makes a constant output the fastest early descent.
+- **What works:** feature distillation from gliner2.5-base's encoder over
+  unlabeled text under random schemas, through a projection fitted in closed
+  form before training (z-space MSE on aligned words and schema markers).
+  After 14,000 steps (two hours on the Studio) the student, read through
+  gliner2.5-base's own heads, scores 0.662 / 0.378 classification and
+  0.449 / 0.364 NER F1 (in-domain / held-out; gliner2.5-base 0.728 / 0.483
+  and 0.543 / 0.515). Next: a native feature-distillation objective, a larger
+  and more diverse text pool, then task distillation on top.
   Details:
   [work-log/completed/inference/antenna/2026-09-25-pilot.md](../../../../../work-log/completed/inference/antenna/2026-09-25-pilot.md).
 
