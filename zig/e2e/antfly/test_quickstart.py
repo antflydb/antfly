@@ -1100,6 +1100,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     single_item_enrichment_batches,
     backup_api,
     progressive_openai_embedder,
+    request: pytest.FixtureRequest,
 ):
     """Time-to-first-result gate, separate from complete-generation readiness."""
     _ = single_item_enrichment_batches
@@ -1469,10 +1470,14 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         timeout_s=5.0,
         interval_s=0.05,
     )
+    activation_elapsed = time.monotonic() - activation_started
+    request.node.user_properties.append(
+        ("progressive_index_activation_seconds", activation_elapsed)
+    )
     assert activated is not None, __import__("json").dumps(
         activation_samples[-3:], indent=2, sort_keys=True
     )
-    assert __import__("time").monotonic() - activation_started < 5.0
+    assert activation_elapsed < 5.0
     second_incarnation = activated["readiness"]["incarnation"]
     second_publication_samples = deque(maxlen=3)
 
