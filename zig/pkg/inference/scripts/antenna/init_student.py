@@ -55,6 +55,25 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     # The saved name is provenance, not a path; ModernBERT is identified by
     # encoder_config/config.json.
     model.config.model_name = f"{args.encoder}@{args.revision}"
+    heads_from = None
+    if args.heads_from:
+        # Trained boundary heads from a checkpoint of the same width (e.g.
+        # gliner2.5-base on DeBERTa-v3-base, 768) replace the fresh heads;
+        # only the encoder underneath changes.
+        from safetensors.torch import load_file
+
+        source = load_file(str(args.heads_from / "model.safetensors"))
+        heads = {name: tensor for name, tensor in source.items() if not name.startswith("encoder.")}
+        own = model.state_dict()
+        for name, tensor in heads.items():
+            if name not in own or own[name].shape != tensor.shape:
+                raise oracle.ContractError(f"head tensor does not fit the student: {name}")
+        missing = sorted(name for name in own if not name.startswith("encoder.") and name not in heads)
+        if missing:
+            raise oracle.ContractError(f"source lacks student head tensors: {missing[:5]}")
+        model.load_state_dict(heads, strict=False)
+        heads_from = {"path": str(args.heads_from), "tensors": len(heads),
+                      "model_sha256": oracle.sha256_file(args.heads_from / "model.safetensors")}
     tokenizer = model.processor.tokenizer
     batch = model.processor.collate_fn_inference(
         [(case["text"], oracle.build_extract_schema(case["upstream_schema"]).build()) for case in reference.CASES],
@@ -76,7 +95,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         })
         oracle.write_json(directory / "student.json", {
             "format_version": 1, "encoder": args.encoder, "encoder_revision": args.revision,
-            "head_seed": args.seed, "head_settings": "published gliner2.5-base boundary_head",
+            "head_seed": args.seed, "head_settings": "published gliner2.5-base boundary_head", "heads_from": heads_from,
             "vocab_size": model.encoder.config.vocab_size, "tokenizer_length": len(tokenizer),
             "parameters": sum(p.numel() for p in model.parameters()),
             "provenance": provenance, "generator_sha256": oracle.sha256_file(Path(__file__)),
@@ -93,6 +112,7 @@ def main() -> int:
     parser.add_argument("--encoder", default=ENCODER)
     parser.add_argument("--revision", default=ENCODER_REVISION)
     parser.add_argument("--seed", type=int, default=HEAD_SEED)
+    parser.add_argument("--heads-from", type=Path, help="checkpoint whose trained heads replace the fresh ones (same width)")
     print(json.dumps(build(parser.parse_args()), sort_keys=True))
     return 0
 
