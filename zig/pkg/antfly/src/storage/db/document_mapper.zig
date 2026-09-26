@@ -2594,14 +2594,10 @@ pub fn highlightTextFieldsFromValue(
 ) ![]const HighlightTextField {
     const extracted = try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null);
     var fields = std.ArrayListUnmanaged(HighlightTextField).empty;
-    for (extracted.fields, 0..) |field, index| {
-        const source_field = if (std.mem.eql(u8, field.field_name, "_all") and index > 0)
-            extracted.fields[index - 1].field_name
-        else
-            field.field_name;
+    for (extracted.fields) |field| {
         try fields.append(alloc, .{
             .indexed_field = field.field_name,
-            .source_field = source_field,
+            .source_field = field.source_field orelse field.field_name,
             .text = field.text,
             .analyzer = introducer_mod.effectiveTextFieldAnalyzer(field, text_analysis),
         });
@@ -2640,12 +2636,14 @@ fn appendSchemaTextFields(
         for (values.items) |text| {
             try fields.append(alloc, .{
                 .field_name = field.emitted_name,
+                .source_field = field.path,
                 .text = text,
                 .analyzer = analyzer,
             });
             if (field.include_in_all) {
                 try fields.append(alloc, .{
                     .field_name = "_all",
+                    .source_field = field.path,
                     .text = text,
                     .analyzer = analyzer,
                 });
@@ -3048,7 +3046,7 @@ fn appendMappedSubfieldTextFields(
         };
         const mapping = field.mapping;
         if (!isTextFieldType(mapping.field_type)) continue;
-        try appendMappedTextField(alloc, fields, subfield_path, text, mapping, text_analysis);
+        if (mapping.do_index) try appendNamedTextField(alloc, fields, subfield_path, path, text, mapping.analyzer, mapping.include_in_all, text_analysis);
         if (observed_field_analyzers) |collector| {
             try appendObservedFieldAnalyzer(alloc, collector, subfield_path, mapping);
         }
@@ -3151,7 +3149,7 @@ fn appendMappedGeoPointTextField(
     const precision = geo_mod.index_geohash_precision;
     const geohash = geo_mod.encode(.{ .lat = point.lat, .lon = point.lon }, precision);
     const term = try alloc.dupe(u8, geohash[0..precision]);
-    try appendNamedTextField(alloc, fields, path, term, "keyword", false, text_analysis);
+    try appendNamedTextField(alloc, fields, path, path, term, "keyword", false, text_analysis);
 }
 
 fn appendMappedTextField(
@@ -3165,7 +3163,7 @@ fn appendMappedTextField(
     if (!mapping.do_index) return;
 
     switch (mapping.field_type) {
-        .text, .html, .keyword, .link, .search_as_you_type, .substring => try appendNamedTextField(alloc, fields, path, text, mapping.analyzer, mapping.include_in_all, text_analysis),
+        .text, .html, .keyword, .link, .search_as_you_type, .substring => try appendNamedTextField(alloc, fields, path, path, text, mapping.analyzer, mapping.include_in_all, text_analysis),
         else => {},
     }
 }
@@ -3188,6 +3186,7 @@ fn appendDynamicRuleTextField(
             alloc,
             fields,
             field_name,
+            path,
             text,
             variant.analyzer,
             variant.include_in_all,
@@ -3200,20 +3199,25 @@ fn appendNamedTextField(
     alloc: Allocator,
     fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
     field_name: []const u8,
+    source_field: []const u8,
     text: []const u8,
     analyzer_name: []const u8,
     include_in_all: bool,
     text_analysis: introducer_mod.TextAnalysisConfig,
 ) !void {
     const analyzer = introducer_mod.resolveAnalyzerName(analyzer_name, text_analysis);
+    const owned_name = try alloc.dupe(u8, field_name);
+    const owned_source = if (std.mem.eql(u8, field_name, source_field)) owned_name else try alloc.dupe(u8, source_field);
     try fields.append(alloc, .{
-        .field_name = try alloc.dupe(u8, field_name),
+        .field_name = owned_name,
+        .source_field = owned_source,
         .text = text,
         .analyzer = analyzer,
     });
     if (include_in_all) {
         try fields.append(alloc, .{
             .field_name = "_all",
+            .source_field = owned_source,
             .text = text,
             .analyzer = analyzer,
         });
@@ -3230,7 +3234,7 @@ fn appendDynamicSchemaLessStringTextFields(
 ) !void {
     // Unmapped dynamic strings have the same cross-field search default as
     // schemaless strings. Explicit mappings are handled before this fallback.
-    try appendNamedTextField(alloc, fields, path, text, "standard", true, text_analysis);
+    try appendNamedTextField(alloc, fields, path, path, text, "standard", true, text_analysis);
     if (observed_field_analyzers) |collector| {
         try appendObservedFieldAnalyzer(alloc, collector, path, .{
             .field_type = .text,
@@ -3245,7 +3249,7 @@ fn appendDynamicSchemaLessStringTextFields(
 
     const exact_field = try schemaLessExactFieldNameAlloc(alloc, path);
     defer alloc.free(exact_field);
-    try appendNamedTextField(alloc, fields, exact_field, text, "keyword", false, text_analysis);
+    try appendNamedTextField(alloc, fields, exact_field, path, text, "keyword", false, text_analysis);
     if (observed_field_analyzers) |collector| {
         try appendObservedFieldAnalyzer(alloc, collector, exact_field, .{
             .field_type = .keyword,
@@ -3556,18 +3560,22 @@ fn appendSchemaLessStringTextFields(
     path: []const u8,
     text: []const u8,
 ) !void {
+    const owned_path = try alloc.dupe(u8, path);
     try fields.append(alloc, .{
-        .field_name = try alloc.dupe(u8, path),
+        .field_name = owned_path,
+        .source_field = owned_path,
         .text = text,
     });
     try fields.append(alloc, .{
         .field_name = "_all",
+        .source_field = owned_path,
         .text = text,
     });
     if (text.len > schema_less_exact_max_bytes or std.mem.endsWith(u8, path, schema_less_exact_field_suffix)) return;
     const exact_field = try schemaLessExactFieldNameAlloc(alloc, path);
     try fields.append(alloc, .{
         .field_name = exact_field,
+        .source_field = owned_path,
         .text = text,
         .analyzer = &analysis_mod.keyword_analyzer,
     });

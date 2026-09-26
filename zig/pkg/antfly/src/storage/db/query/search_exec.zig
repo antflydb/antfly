@@ -17987,7 +17987,6 @@ const highlight_mod = @import("../../../search/highlight.zig");
 const highlight_regex_mod = @import("../../../search/regex.zig");
 
 const HighlightMatcherEntry = struct {
-    field: []const u8,
     indexed_field: []const u8,
     matcher: highlight_mod.Matcher,
     query_index: usize = 0,
@@ -18001,24 +18000,6 @@ pub const HighlightQuery = struct {
 
 fn highlightUsesSchemaLessText(indexed: HighlightQuery) bool {
     return if (indexed.runtime_schema) |schema| !mapper_mod.runtimeHasSchemaDrivenText(schema) else true;
-}
-
-const highlight_companion_suffixes = [_][]const u8{
-    "._substring",
-    "._2gram",
-    "._3gram",
-    "._index_prefix",
-    "._root_prefix",
-    ".keyword",
-};
-
-/// Map an indexed field name back to the stored source field it was derived
-/// from, so highlights land on the text the client actually sees.
-fn highlightRootField(field: []const u8) []const u8 {
-    for (highlight_companion_suffixes) |suffix| {
-        if (field.len > suffix.len and std.mem.endsWith(u8, field, suffix)) return field[0 .. field.len - suffix.len];
-    }
-    return field;
 }
 
 fn highlightAutoFuzziness(term: []const u8) u8 {
@@ -18059,27 +18040,25 @@ fn collectHighlightMatchers(
         .match => |match| {
             const analyzer = match.analyzer orelse &analysis_mod.default_analyzer;
             const tokens = try analyzer.analyze(arena, match.text);
-            for (tokens) |token| try out.append(arena, .{ .field = highlightRootField(match.field), .indexed_field = match.field, .matcher = .{ .term = token.term } });
+            for (tokens) |token| try out.append(arena, .{ .indexed_field = match.field, .matcher = .{ .term = token.term } });
         },
         .phrase => |phrase| {
             const analyzer = phrase.analyzer orelse &analysis_mod.default_analyzer;
             const tokens = try analyzer.analyze(arena, phrase.text);
             for (tokens) |token| try out.append(arena, .{
-                .field = highlightRootField(phrase.field),
                 .indexed_field = phrase.field,
                 .matcher = highlightPhraseMatcher(token.term, phrase.max_edits, phrase.auto_fuzzy),
             });
         },
         .term => |term| try out.append(arena, .{
-            .field = highlightRootField(term.field),
             .indexed_field = term.field,
             .matcher = .{ .term = term.term },
         }),
         .term_phrase => |phrase| for (phrase.terms) |term| {
-            try out.append(arena, .{ .field = highlightRootField(phrase.field), .indexed_field = phrase.field, .matcher = highlightPhraseMatcher(term, phrase.max_edits, phrase.auto_fuzzy) });
+            try out.append(arena, .{ .indexed_field = phrase.field, .matcher = highlightPhraseMatcher(term, phrase.max_edits, phrase.auto_fuzzy) });
         },
         .multi_phrase => |phrase| for (phrase.terms) |alternatives| for (alternatives) |term| {
-            try out.append(arena, .{ .field = highlightRootField(phrase.field), .indexed_field = phrase.field, .matcher = highlightPhraseMatcher(term, phrase.max_edits, phrase.auto_fuzzy) });
+            try out.append(arena, .{ .indexed_field = phrase.field, .matcher = highlightPhraseMatcher(term, phrase.max_edits, phrase.auto_fuzzy) });
         },
         .fuzzy => |fuzzy| {
             const needle: highlight_mod.Matcher.Fuzzy = .{
@@ -18088,22 +18067,19 @@ fn collectHighlightMatchers(
                 .prefix_len = fuzzy.prefix_len,
             };
             try out.append(arena, .{
-                .field = highlightRootField(fuzzy.field),
                 .indexed_field = fuzzy.field,
                 .matcher = .{ .fuzzy = needle },
             });
         },
         .prefix => |prefix| try out.append(arena, .{
-            .field = highlightRootField(prefix.field),
             .indexed_field = prefix.field,
             .matcher = .{ .prefix = prefix.prefix },
         }),
-        .wildcard => |wildcard| try out.append(arena, .{ .field = highlightRootField(wildcard.field), .indexed_field = wildcard.field, .matcher = .{ .wildcard = wildcard.pattern } }),
+        .wildcard => |wildcard| try out.append(arena, .{ .indexed_field = wildcard.field, .matcher = .{ .wildcard = wildcard.pattern } }),
         .regexp => |regexp| {
             const compiled = try arena.create(highlight_regex_mod.RegexAutomaton);
             compiled.* = highlight_regex_mod.compile(arena, regexp.pattern) catch return;
             try out.append(arena, .{
-                .field = highlightRootField(regexp.field),
                 .indexed_field = regexp.field,
                 .matcher = .{ .regexp = .{ .pattern = regexp.pattern, .compiled = compiled } },
             });
@@ -18155,15 +18131,6 @@ fn collectHighlightSourceValues(
         },
         else => {},
     }
-}
-
-fn hasLiteralDottedHighlightValue(alloc: Allocator, root: std.json.Value, path: []const u8) !bool {
-    var values = std.ArrayListUnmanaged(HighlightSourceValue).empty;
-    try collectHighlightSourceValues(alloc, &values, root, path, null, 0, false);
-    for (values.items) |value| {
-        if (value.literal_dotted) return true;
-    }
-    return false;
 }
 
 // Source identity is private to fragment selection: separate stored values
@@ -18364,22 +18331,6 @@ pub fn attachHighlightsWithIndexQueries(
     }
     if (entries.items.len == 0) return;
 
-    var default_fields = std.ArrayListUnmanaged([]const u8).empty;
-    if (options.fields.len > 0) {
-        for (options.fields) |field| try default_fields.append(arena, field);
-    } else {
-        for (entries.items) |entry| {
-            if (std.mem.eql(u8, entry.field, "_all")) continue;
-            var seen = false;
-            for (default_fields.items) |existing| {
-                if (std.mem.eql(u8, existing, entry.field)) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen) try default_fields.append(arena, entry.field);
-        }
-    }
     const fragment_size = @max(options.fragment_size, 1);
     const max_fragments = @max(options.max_fragments, 1);
 
@@ -18400,59 +18351,21 @@ pub fn attachHighlightsWithIndexQueries(
         const hit_arena = hit_arena_state.allocator();
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, hit_arena, stored, .{}) catch continue;
 
-        const all_fields = try hit_arena.alloc([]const []const u8, indexed_queries.len);
         const text_fields = try hit_arena.alloc([]const mapper_mod.HighlightTextField, indexed_queries.len);
         var fields = std.ArrayListUnmanaged([]const u8).empty;
-        try fields.appendSlice(hit_arena, default_fields.items);
+        if (options.fields.len > 0) try fields.appendSlice(hit_arena, options.fields);
         for (indexed_queries, 0..) |indexed, query_index| {
-            var needs_all = false;
-            for (entries.items) |entry| {
-                if (entry.query_index == query_index and std.mem.eql(u8, entry.indexed_field, "_all")) {
-                    needs_all = true;
-                    break;
-                }
-            }
             text_fields[query_index] = try mapper_mod.highlightTextFieldsFromValue(hit_arena, parsed, indexed.text_analysis, indexed.runtime_schema);
-            var all_names = std.ArrayListUnmanaged([]const u8).empty;
-            if (needs_all) {
-                for (text_fields[query_index]) |contribution| {
-                    if (std.mem.eql(u8, contribution.indexed_field, "_all")) try all_names.append(hit_arena, contribution.source_field);
-                }
-            }
-            all_fields[query_index] = all_names.items;
-            if (needs_all and options.fields.len == 0) {
-                for (all_fields[query_index]) |indexed_field| {
-                    const field = highlightRootField(indexed_field);
-                    var seen = false;
-                    for (fields.items) |existing| {
-                        if (std.mem.eql(u8, existing, field)) {
-                            seen = true;
-                            break;
-                        }
-                    }
-                    if (!seen) try fields.append(hit_arena, field);
-                }
-            }
-            if (options.fields.len == 0 and highlightUsesSchemaLessText(indexed)) {
-                for (entries.items) |entry| {
-                    if (entry.query_index != query_index) continue;
-                    const candidate_fields: []const []const u8 = if (std.mem.eql(u8, entry.indexed_field, "_all"))
-                        all_fields[query_index]
-                    else
-                        &.{entry.indexed_field};
-                    for (candidate_fields) |candidate| {
-                        if (std.mem.eql(u8, highlightRootField(candidate), candidate) or
-                            !try hasLiteralDottedHighlightValue(hit_arena, parsed, candidate)) continue;
-                        var seen = false;
-                        for (fields.items) |existing| {
-                            if (std.mem.eql(u8, existing, candidate)) {
-                                seen = true;
-                                break;
-                            }
-                        }
-                        if (!seen) try fields.append(hit_arena, candidate);
-                    }
-                }
+            if (options.fields.len > 0) continue;
+            for (text_fields[query_index]) |contribution| {
+                const referenced = for (entries.items) |entry| {
+                    if (entry.query_index == query_index and std.mem.eql(u8, entry.indexed_field, contribution.indexed_field)) break true;
+                } else false;
+                if (!referenced) continue;
+                const seen = for (fields.items) |existing| {
+                    if (std.mem.eql(u8, existing, contribution.source_field)) break true;
+                } else false;
+                if (!seen) try fields.append(hit_arena, contribution.source_field);
             }
         }
 
@@ -18485,14 +18398,10 @@ pub fn attachHighlightsWithIndexQueries(
                 var processed = std.ArrayListUnmanaged([]const u8).empty;
                 for (entries.items) |entry| {
                     if (entry.query_index != query_index) continue;
-                    const matches_field = if (std.mem.eql(u8, entry.indexed_field, "_all")) blk: {
-                        for (all_fields[query_index]) |indexed_field| {
-                            if (std.mem.eql(u8, highlightRootField(indexed_field), field) or
-                                (highlightUsesSchemaLessText(indexed) and std.mem.eql(u8, indexed_field, field))) break :blk true;
-                        }
-                        break :blk false;
-                    } else std.mem.eql(u8, entry.field, field) or
-                        (highlightUsesSchemaLessText(indexed) and std.mem.eql(u8, entry.indexed_field, field));
+                    const matches_field = for (text_fields[query_index]) |contribution| {
+                        if (std.mem.eql(u8, contribution.indexed_field, entry.indexed_field) and
+                            std.mem.eql(u8, contribution.source_field, field)) break true;
+                    } else false;
                     if (!matches_field) continue;
                     var seen = false;
                     for (processed.items) |prior| {
@@ -18518,8 +18427,7 @@ pub fn attachHighlightsWithIndexQueries(
                         for (text_fields[query_index]) |contribution| {
                             if (!std.mem.eql(u8, contribution.indexed_field, entry.indexed_field) or
                                 !std.mem.eql(u8, contribution.text, source_value.text) or
-                                (!std.mem.eql(u8, highlightRootField(contribution.source_field), field) and
-                                    !std.mem.eql(u8, contribution.source_field, field))) continue;
+                                !std.mem.eql(u8, contribution.source_field, field)) continue;
                             var seen_analyzer = false;
                             for (processed_analyzers.items) |prior| {
                                 if (prior == contribution.analyzer) seen_analyzer = true;
@@ -31257,4 +31165,58 @@ pub fn geoPointPolygonsToSearchPolygons(
         initialized += 1;
     }
     return out;
+}
+
+test "highlights resolve real schema fields ending in companion suffixes" {
+    const alloc = std.testing.allocator;
+    const schema: runtime_schema_mod.TableSchema = .{ .full_text_documents = &.{.{ .name = "_default", .fields = &.{
+        .{ .path = "code.keyword", .emitted_name = "code.keyword", .analyzer = "standard" },
+    } }} };
+    const source = "{\"code\":{\"keyword\":\"River\"}}";
+    const segment = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{.{ .key = "doc:1", .value = source }}, .{}, schema)).?;
+    defer alloc.free(segment);
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+    try std.testing.expect((try reader.invertedIndex("code.keyword")).?.lookup("river") != null);
+    var hits = [_]types.SearchHit{.{ .id = try alloc.dupe(u8, "doc:1"), .stored_data = try alloc.dupe(u8, source) }};
+    defer hits[0].deinit(alloc);
+    const query: types.TextQuery = .{ .term = .{ .field = "code.keyword", .term = "river" } };
+    try attachHighlights(alloc, .{}, &.{query}, &hits, null, .{}, schema);
+    try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+    try std.testing.expectEqualStrings("code.keyword", hits[0].highlights[0].field);
+    const fragment = hits[0].highlights[0].fragments[0];
+    try std.testing.expectEqualStrings("River", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
+}
+
+test "highlights resolve arbitrary mapped subfields to stored source" {
+    const alloc = std.testing.allocator;
+    const schema: runtime_schema_mod.TableSchema = .{ .exact_fields = &.{
+        .{ .source_field = "title", .field = "title", .mapping = .{ .field_type = .text, .analyzer = "standard" } },
+        .{ .source_field = "title", .field = "title.raw", .mapping = .{ .field_type = .keyword, .analyzer = "keyword", .include_in_all = true } },
+    } };
+    const source = "{\"title\":\"River Quiet\"}";
+    const segment = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{.{ .key = "doc:1", .value = source }}, .{}, schema)).?;
+    defer alloc.free(segment);
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+    try std.testing.expect((try reader.invertedIndex("title.raw")).?.lookup("River Quiet") != null);
+    try std.testing.expect((try reader.invertedIndex("_all")).?.lookup("River Quiet") != null);
+    var hits = [_]types.SearchHit{.{ .id = try alloc.dupe(u8, "doc:1"), .stored_data = try alloc.dupe(u8, source) }};
+    defer hits[0].deinit(alloc);
+    const query: types.TextQuery = .{ .term = .{ .field = "title.raw", .term = "River Quiet" } };
+    try attachHighlights(alloc, .{ .fields = &.{"title"} }, &.{query}, &hits, null, .{}, schema);
+    try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+    try std.testing.expectEqualStrings("title", hits[0].highlights[0].field);
+    const fragment = hits[0].highlights[0].fragments[0];
+    try std.testing.expectEqualStrings("River Quiet", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
+    var automatic = [_]types.SearchHit{.{ .id = try alloc.dupe(u8, "doc:2"), .stored_data = try alloc.dupe(u8, source) }};
+    defer automatic[0].deinit(alloc);
+    try attachHighlights(alloc, .{}, &.{query}, &automatic, null, .{}, schema);
+    try std.testing.expectEqualStrings("title", automatic[0].highlights[0].field);
+    var all = [_]types.SearchHit{.{ .id = try alloc.dupe(u8, "doc:3"), .stored_data = try alloc.dupe(u8, source) }};
+    defer all[0].deinit(alloc);
+    const all_query: types.TextQuery = .{ .term = .{ .field = "_all", .term = "River Quiet" } };
+    try attachHighlights(alloc, .{}, &.{all_query}, &all, null, .{}, schema);
+    try std.testing.expectEqual(@as(usize, 1), all[0].highlights.len);
+    try std.testing.expectEqualStrings("title", all[0].highlights[0].field);
 }

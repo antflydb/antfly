@@ -521,6 +521,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_db_query_step = b.step("antfly-storage-db-query-test", "Run root-module DB query/indexing tests");
     lib_db_query_step.dependOn(&run_lib_db_query_tests.step);
 
+    const highlight_filters = [_][]const u8{
+        "highlight",
+        "attachHighlights",
+        "schema-driven dotted path ignores unindexed literal key",
+        "text analysis rejects invalid shingle bounds",
+        "document mapper emits mapped keyword subfield",
+    };
+    const highlight_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &highlight_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_highlight_tests = b.addRunArtifact(highlight_tests);
+    addRuntimeTestFilters(b, run_highlight_tests, &highlight_filters);
+    b.step("antfly-storage-highlight-test", "Run source mapping and highlight analysis regressions")
+        .dependOn(&run_highlight_tests.step);
+
     const lib_db_text_query_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{

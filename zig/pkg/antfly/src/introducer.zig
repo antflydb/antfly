@@ -276,6 +276,8 @@ pub const TextDocument = struct {
 
 pub const TextField = struct {
     field_name: []const u8,
+    /// Stored source path, including for generated companions and `_all`.
+    source_field: ?[]const u8 = null,
     text: []const u8,
     analyzer: ?*const analysis_mod.Analyzer = null,
 };

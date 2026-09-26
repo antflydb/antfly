@@ -751,3 +751,78 @@ test "highlight fragments respect size and count limits" {
     }
     try std.testing.expect(fragments[0].offset < fragments[1].offset);
 }
+
+test "highlight custom shingle suffix offsets preserve source separators and character filters" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "quiet   river", "quiet---river", "quiet\nriver", "quiet café" }) |text| {
+        const analyzer: analysis_mod.Analyzer = .{ .tokenizer = .unicode_words, .filters = &.{
+            .lowercase, .{ .shingle = .{ .min = 2, .max = 2, .separator = .none } }, .{ .suffix = .{} },
+        } };
+        const needle = if (std.mem.endsWith(u8, text, "café")) "café" else "river";
+        const fragments = try highlightMatchers(alloc, text, &.{.{ .term = needle }}, &analyzer, 1, 64);
+        defer freeFragments(alloc, fragments);
+        try std.testing.expectEqual(@as(usize, 1), fragments.len);
+        try std.testing.expectEqualStrings(needle, fragments[0].text[fragments[0].highlights[0].start..fragments[0].highlights[0].end]);
+        // Terms and positions must stay identical to index analysis.
+        const indexed = try analyzer.analyze(alloc, text);
+        defer analysis_mod.Analyzer.freeTokens(alloc, indexed);
+        const mapped = try analyzer.analyzeWithSourceOffsets(alloc, text);
+        defer analysis_mod.Analyzer.freeTokens(alloc, mapped);
+        try std.testing.expectEqual(indexed.len, mapped.len);
+        for (indexed, mapped) |left, right| {
+            try std.testing.expectEqualStrings(left.term, right.term);
+            try std.testing.expectEqual(left.position, right.position);
+            try std.testing.expect(right.source_offsets == null);
+        }
+    }
+    const html: analysis_mod.Analyzer = .{ .char_filters = &.{.html_strip}, .tokenizer = .unicode_words, .filters = &.{
+        .lowercase, .{ .shingle = .{ .min = 2, .max = 2, .separator = .none } }, .{ .suffix = .{} },
+    } };
+    const fragments = try highlightMatchers(alloc, "quiet <b>River</b>", &.{.{ .term = "river" }}, &html, 1, 64);
+    defer freeFragments(alloc, fragments);
+    try std.testing.expectEqualStrings("River", fragments[0].text[fragments[0].highlights[0].start..fragments[0].highlights[0].end]);
+}
+
+test "highlight custom suffix chains preserve capped ends and reversed byte mappings" {
+    const alloc = std.testing.allocator;
+    const capped: analysis_mod.Analyzer = .{ .tokenizer = .unicode_words, .filters = &.{
+        .{ .shingle = .{ .min = 2, .max = 2, .separator = .none } }, .{ .suffix = .{ .min = 2, .max = 2 } }, .{ .suffix = .{ .min = 2, .max = 2 } },
+    } };
+    const fragments = try highlightMatchers(alloc, "quiet   river", &.{.{ .term = "ri" }}, &capped, 1, 64);
+    defer freeFragments(alloc, fragments);
+    try std.testing.expectEqualStrings("ri", fragments[0].text[fragments[0].highlights[0].start..fragments[0].highlights[0].end]);
+    const reversed: analysis_mod.Analyzer = .{ .tokenizer = .unicode_words, .filters = &.{
+        .{ .shingle = .{ .min = 2, .max = 2, .separator = .none } }, .reverse, .{ .suffix = .{} },
+    } };
+    const reverse_fragments = try highlightMatchers(alloc, "quiet   river", &.{.{ .term = "teiuq" }}, &reversed, 1, 64);
+    defer freeFragments(alloc, reverse_fragments);
+    try std.testing.expectEqualStrings("quiet", reverse_fragments[0].text[reverse_fragments[0].highlights[0].start..reverse_fragments[0].highlights[0].end]);
+}
+
+test "highlight suffixes map through camel case elision apostrophe grams truncation and stemming" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        text: []const u8,
+        term: []const u8,
+        expected: []const u8,
+        tokenizer: analysis_mod.Tokenizer = .unicode_words,
+        filters: []const analysis_mod.TokenFilter,
+    };
+    for ([_]Case{
+        .{ .text = "quiet   River", .term = "river", .expected = "River", .filters = &.{ .{ .shingle = .{ .min = 2, .max = 2, .separator = .none } }, .camel_case, .{ .suffix = .{} } } },
+        .{ .text = "l'river", .term = "iver", .expected = "iver", .tokenizer = .keyword, .filters = &.{ .elision, .{ .suffix = .{} } } },
+        .{ .text = "river's", .term = "iver", .expected = "iver", .tokenizer = .keyword, .filters = &.{ .apostrophe, .{ .suffix = .{} } } },
+        .{ .text = "quiet---river", .term = "ri", .expected = "ri", .filters = &.{ .{ .ngram = .{ .min = 3, .max = 3 } }, .{ .suffix = .{ .min = 2, .max = 2 } } } },
+        .{ .text = "quiet---river", .term = "er", .expected = "er", .filters = &.{ .{ .edge_ngram = .{ .min = 3, .max = 3, .side = .back } }, .{ .suffix = .{ .min = 2, .max = 2 } } } },
+        .{ .text = "river", .term = "ri", .expected = "ri", .filters = &.{ .{ .truncate = .{ .max_len = 4 } }, .{ .suffix = .{ .min = 2, .max = 2 } } } },
+        // A replacement stem has no exact per-byte surface alignment; its
+        // slices retain the original surface token instead of guessing.
+        .{ .text = "running", .term = "un", .expected = "running", .filters = &.{ .stemmer, .{ .suffix = .{} } } },
+    }) |case| {
+        const analyzer: analysis_mod.Analyzer = .{ .tokenizer = case.tokenizer, .filters = case.filters };
+        const fragments = try highlightMatchers(alloc, case.text, &.{.{ .term = case.term }}, &analyzer, 1, 64);
+        defer freeFragments(alloc, fragments);
+        try std.testing.expectEqual(@as(usize, 1), fragments.len);
+        try std.testing.expectEqualStrings(case.expected, fragments[0].text[fragments[0].highlights[0].start..fragments[0].highlights[0].end]);
+    }
+}

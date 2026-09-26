@@ -38,7 +38,34 @@ pub const Token = struct {
     position: u32,
     start_byte: u32,
     end_byte: u32,
+    /// Borrowed scratch mapping used only during analyzeWithSourceOffsets.
+    /// Each analyzed byte records its range in the character-filtered input.
+    /// The analyzer clears this before returning owned tokens to its caller.
+    source_offsets: ?[]const SourceOffset = null,
+
+    const SourceOffset = struct { start: u32, end: u32 };
 };
+
+fn tokenSlice(tok: Token, start: usize, end: usize) Token {
+    var result = tok;
+    result.term = tok.term[start..end];
+    if (tok.source_offsets) |offsets| {
+        const selected = offsets[start..end];
+        result.source_offsets = selected;
+        if (selected.len > 0) {
+            result.start_byte = selected[0].start;
+            result.end_byte = selected[0].end;
+            for (selected[1..]) |offset| {
+                result.start_byte = @min(result.start_byte, offset.start);
+                result.end_byte = @max(result.end_byte, offset.end);
+            }
+        }
+    } else {
+        result.start_byte = tok.start_byte + @as(u32, @intCast(start));
+        result.end_byte = tok.start_byte + @as(u32, @intCast(end));
+    }
+    return result;
+}
 
 // ============================================================================
 // Character Filters
@@ -845,13 +872,9 @@ fn applyNgramFilter(alloc: Allocator, tokens: []Token, cfg: NgramConfig) ![]Toke
         while (n <= cfg.max) : (n += 1) {
             var start: usize = 0;
             while (start + n <= word.len) : (start += 1) {
-                const term = try alloc.dupe(u8, word[start..][0..n]);
-                try result.append(alloc, .{
-                    .term = term,
-                    .position = tok.position,
-                    .start_byte = tok.start_byte + @as(u32, @intCast(start)),
-                    .end_byte = tok.start_byte + @as(u32, @intCast(start + n)),
-                });
+                var part = tokenSlice(tok, start, start + n);
+                part.term = try alloc.dupe(u8, part.term);
+                try result.append(alloc, part);
             }
         }
         alloc.free(@constCast(tok.term));
@@ -869,16 +892,14 @@ fn applyEdgeNgramFilter(alloc: Allocator, tokens: []Token, cfg: EdgeNgramConfig)
         const word = tok.term;
         var n: u8 = cfg.min;
         while (n <= cfg.max and n <= word.len) : (n += 1) {
-            const term = if (cfg.side == .front)
-                try alloc.dupe(u8, word[0..n])
-            else
-                try alloc.dupe(u8, word[word.len - n ..]);
-            try result.append(alloc, .{
-                .term = term,
-                .position = tok.position,
-                .start_byte = tok.start_byte,
-                .end_byte = tok.end_byte,
-            });
+            const start = if (cfg.side == .front) 0 else word.len - n;
+            var part = tokenSlice(tok, start, start + n);
+            part.term = try alloc.dupe(u8, part.term);
+            // Edge n-grams highlight the whole surface token. Keep the byte
+            // mapping for subsequent filters that slice this gram again.
+            part.start_byte = tok.start_byte;
+            part.end_byte = tok.end_byte;
+            try result.append(alloc, part);
         }
         alloc.free(@constCast(tok.term));
     }
@@ -915,12 +936,27 @@ fn applyShingle(alloc: Allocator, tokens: []Token, cfg: TokenFilter.ShingleConfi
                 @memcpy(term[pos..][0..tokens[i + j].term.len], tokens[i + j].term);
                 pos += tokens[i + j].term.len;
             }
-            try result.append(alloc, .{
+            const offsets = if (tokens[i].source_offsets != null) try alloc.alloc(Token.SourceOffset, total_len) else null;
+            if (offsets) |mapped| {
+                var cursor: usize = 0;
+                for (tokens[i .. i + n], 0..) |tok, j| {
+                    if (j > 0 and separator_len > 0) {
+                        mapped[cursor] = .{ .start = @min(tokens[i + j - 1].end_byte, tok.start_byte), .end = @max(tokens[i + j - 1].end_byte, tok.start_byte) };
+                        cursor += 1;
+                    }
+                    @memcpy(mapped[cursor..][0..tok.term.len], tok.source_offsets.?);
+                    cursor += tok.term.len;
+                }
+            }
+            var joined: Token = .{
                 .term = term,
                 .position = tokens[i].position,
                 .start_byte = tokens[i].start_byte,
                 .end_byte = tokens[i + n - 1].end_byte,
-            });
+                .source_offsets = offsets,
+            };
+            if (offsets != null) joined = tokenSlice(joined, 0, term.len);
+            try result.append(alloc, joined);
         }
     }
 
@@ -958,6 +994,7 @@ fn applyTruncate(alloc: Allocator, tokens: []Token, cfg: TokenFilter.TruncateCon
             const truncated = try alloc.dupe(u8, tok.term[0..cfg.max_len]);
             alloc.free(@constCast(tok.term));
             tok.term = truncated;
+            if (tok.source_offsets) |offsets| tok.source_offsets = offsets[0..truncated.len];
         }
     }
     return tokens;
@@ -995,6 +1032,11 @@ fn applyReverse(alloc: Allocator, tokens: []Token) ![]Token {
         }
         alloc.free(@constCast(tok.term));
         tok.term = reversed;
+        if (tok.source_offsets) |offsets| {
+            const mapped = try alloc.alloc(Token.SourceOffset, offsets.len);
+            for (offsets, 0..) |offset, index| mapped[offsets.len - 1 - index] = offset;
+            tok.source_offsets = mapped;
+        }
     }
     return tokens;
 }
@@ -1015,12 +1057,12 @@ fn applySuffix(alloc: Allocator, tokens: []Token, cfg: TokenFilter.SuffixConfig)
             if (suffix.len < min_len) break;
             const end = utf8BoundaryAtOrBefore(suffix, @min(suffix.len, max_len));
             if (end < min_len) continue;
-            try result.append(alloc, .{
-                .term = try alloc.dupe(u8, suffix[0..end]),
-                .position = tok.position,
-                .start_byte = tok.start_byte + @as(u32, @intCast(start)),
-                .end_byte = tok.end_byte,
-            });
+            var part = tokenSlice(tok, start, start + end);
+            part.term = try alloc.dupe(u8, part.term);
+            // Ordinary indexing retains its existing offsets. Highlight
+            // analysis uses the mapping, including capped suffix endings.
+            if (tok.source_offsets == null) part.end_byte = tok.end_byte;
+            try result.append(alloc, part);
         }
         alloc.free(@constCast(tok.term));
     }
@@ -1056,25 +1098,18 @@ fn applyCamelCase(alloc: Allocator, tokens: []Token) ![]Token {
         while (i < word.len) : (i += 1) {
             if (word[i] >= 'A' and word[i] <= 'Z' and i > start) {
                 // Split here
-                const part = try toLowerDupe(alloc, word[start..i]);
-                try result.append(alloc, .{
-                    .term = part,
-                    .position = tok.position,
-                    .start_byte = tok.start_byte + @as(u32, @intCast(start)),
-                    .end_byte = tok.start_byte + @as(u32, @intCast(i)),
-                });
+                var part = tokenSlice(tok, start, i);
+                part.term = try toLowerDupe(alloc, part.term);
+                try result.append(alloc, part);
                 start = i;
             }
         }
         // Last part
         if (start < word.len) {
-            const part = try toLowerDupe(alloc, word[start..]);
-            try result.append(alloc, .{
-                .term = part,
-                .position = tok.position,
-                .start_byte = tok.start_byte + @as(u32, @intCast(start)),
-                .end_byte = tok.end_byte,
-            });
+            var part = tokenSlice(tok, start, word.len);
+            part.term = try toLowerDupe(alloc, part.term);
+            if (tok.source_offsets == null) part.end_byte = tok.end_byte;
+            try result.append(alloc, part);
         }
         alloc.free(@constCast(tok.term));
     }
@@ -1100,6 +1135,7 @@ fn applyElision(alloc: Allocator, tokens: []Token) ![]Token {
                 const new_term = try alloc.dupe(u8, tok.term[prefix.len..]);
                 alloc.free(@constCast(tok.term));
                 tok.term = new_term;
+                if (tok.source_offsets) |offsets| tok.source_offsets = offsets[prefix.len..];
                 break;
             }
         }
@@ -1120,6 +1156,7 @@ fn applyApostrophe(alloc: Allocator, tokens: []Token) ![]Token {
                     const new_term = try alloc.dupe(u8, tok.term[0..i]);
                     alloc.free(@constCast(tok.term));
                     tok.term = new_term;
+                    if (tok.source_offsets) |offsets| tok.source_offsets = offsets[0..i];
                 }
                 break;
             }
@@ -1162,6 +1199,11 @@ fn applyStemmerLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Token 
     for (tokens) |*tok| {
         const stemmed = try stemmers_mod.stem(alloc, tok.term, lang);
         if (stemmed.ptr != tok.term.ptr) {
+            if (tok.source_offsets != null and !std.mem.eql(u8, tok.term, stemmed)) {
+                const mapped = try alloc.alloc(Token.SourceOffset, stemmed.len);
+                for (mapped) |*offset| offset.* = .{ .start = tok.start_byte, .end = tok.end_byte };
+                tok.source_offsets = mapped;
+            }
             alloc.free(@constCast(tok.term));
             tok.term = stemmed;
         }
@@ -1521,6 +1563,12 @@ pub const Analyzer = struct {
     /// bytes. Character filters may remove or replace bytes, so their token
     /// offsets cannot be used directly to highlight the stored value.
     pub fn analyzeWithSourceOffsets(self: *const Analyzer, alloc: Allocator, text: []const u8) ![]Token {
+        // Slicing a transformed token needs byte provenance, not arithmetic
+        // on its surface start. Keep this scratch work out of normal indexing.
+        for (self.filters) |filter| switch (filter) {
+            .suffix, .ngram, .edge_ngram, .camel_case => return self.analyzeWithMappedTokenOffsets(alloc, text),
+            else => {},
+        };
         if (self.char_filters.len == 0) return self.analyze(alloc, text);
 
         var mapped = try MappedText.identity(alloc, text);
@@ -1539,6 +1587,44 @@ pub const Analyzer = struct {
             token.end_byte = mapped.ends[token.end_byte - 1];
         }
         return tokens;
+    }
+
+    fn analyzeWithMappedTokenOffsets(self: *const Analyzer, alloc: Allocator, text: []const u8) ![]Token {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+        var mapped = try MappedText.identity(arena, text);
+        for (self.char_filters) |filter| mapped = try filter.applyMapped(arena, mapped);
+        var tokens = try self.tokenizer.tokenize(arena, mapped.text);
+        for (tokens) |*tok| {
+            const offsets = try arena.alloc(Token.SourceOffset, tok.term.len);
+            const start = if (self.tokenizer == .edge_ngram and self.tokenizer.edge_ngram.side == .back)
+                tok.end_byte - @as(u32, @intCast(tok.term.len))
+            else
+                tok.start_byte;
+            for (offsets, 0..) |*offset, index| {
+                offset.* = .{ .start = start + @as(u32, @intCast(index)), .end = start + @as(u32, @intCast(index + 1)) };
+            }
+            tok.source_offsets = offsets;
+        }
+        for (self.filters) |filter| tokens = try filter.apply(arena, tokens);
+        const result = try alloc.alloc(Token, tokens.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |tok| alloc.free(@constCast(tok.term));
+            alloc.free(result);
+        }
+        for (tokens, result) |tok, *out| {
+            out.* = tok;
+            out.term = try alloc.dupe(u8, tok.term);
+            out.source_offsets = null;
+            if (tok.start_byte < tok.end_byte and tok.end_byte <= mapped.text.len) {
+                out.start_byte = mapped.starts[tok.start_byte];
+                out.end_byte = mapped.ends[tok.end_byte - 1];
+            }
+            initialized += 1;
+        }
+        return result;
     }
 
     fn isDefaultEnglishNoCharFilters(self: *const Analyzer) bool {

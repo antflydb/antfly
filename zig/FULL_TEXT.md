@@ -126,9 +126,13 @@ the query is lowered once more with the same
 analysis config, each positive clause becomes a `highlight.Matcher` (`term`,
 `prefix`, `wildcard`, `fuzzy`, `regexp`, or `contains`), and the stored field
 value is re-analyzed with the field's analyzer so stemmed and stop-word-filtered
-terms mark their surface form. Companion suffixes (`._substring`, `.keyword`,
-`._2gram`, ...) resolve to their root field. `contains` matchers, which come
-from `substring` companions, are evaluated over the plain surface words (the
+terms mark their surface form. The mapper carries the stored source path for
+each indexed contribution, including arbitrary mapped subfields and `_all`;
+field names ending in `.keyword` or `._substring` are not assumed to be
+companions. Custom token filters carry byte mappings through joined shingles,
+suffixes, and other token slices before character-filter offsets are mapped
+back to stored text. Replacement stems retain their original surface span.
+`contains` matchers, which come from `substring` companions, are evaluated over the plain surface words (the
 same tokenization the companion indexed) rather than the root analyzer's
 tokens, so a stop word the root analyzer dropped can never be bridged; they
 mark the exact contained bytes and may span two adjacent words. Negative
