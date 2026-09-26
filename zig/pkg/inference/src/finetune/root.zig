@@ -32,6 +32,7 @@ pub const gliner_boundary_peft_graph = @import("gliner/boundary_peft_graph.zig")
 pub const gliner_boundary_adapter = @import("gliner/boundary_adapter.zig");
 pub const gliner_boundary_adapter_layout = @import("gliner/boundary_adapter_layout.zig");
 pub const gliner_boundary_train_step = @import("gliner/boundary_train_step.zig");
+pub const gliner_boundary_distillation = @import("gliner/boundary_distillation.zig");
 pub const gliner2_data = @import("gliner2_data.zig");
 pub const gliner2_run_validation = @import("gliner2_run_validation.zig");
 pub const gliner2_boundary = @import("gliner2_boundary.zig");
@@ -97,6 +98,7 @@ test {
     _ = @import("seeded_device_transaction.zig");
     _ = @import("gliner/boundary_training_backend_test.zig");
     _ = gliner_boundary_targets;
+    _ = gliner_boundary_distillation;
     _ = gliner_boundary_selection;
     _ = gliner_boundary_matching;
     _ = gliner_boundary_record_loss;

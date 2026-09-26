@@ -104,6 +104,10 @@ const Weights = struct {
     }
 };
 fn weights(a: Allocator, cb: *const ops.ComputeBackend, plan: *const step.Plan) !Weights {
+    return weightsWith(a, cb, plan, null);
+}
+const Adjust = struct { name: []const u8, index: usize, delta: f32 };
+fn weightsWith(a: Allocator, cb: *const ops.ComputeBackend, plan: *const step.Plan, adjust: ?Adjust) !Weights {
     var list = std.ArrayListUnmanaged(interpreter.RuntimeInput).empty;
     errdefer {
         for (list.items) |input| cb.free(input.value);
@@ -121,6 +125,9 @@ fn weights(a: Allocator, cb: *const ops.ComputeBackend, plan: *const step.Plan) 
         for (values, 0..) |*value, i| {
             value.* = if (std.mem.endsWith(u8, name, ".bias")) 0 else if (std.mem.endsWith(u8, name, ".weight") and (std.mem.indexOf(u8, name, "norm") != null or std.mem.indexOf(u8, name, "LayerNorm") != null)) 1 else 0.07 * @sin(@as(f32, @floatFromInt(i + @as(usize, id) * 13 + 1)));
         }
+        if (adjust) |change| if (std.mem.eql(u8, name, change.name)) {
+            values[change.index] += change.delta;
+        };
         var dims: [8]i32 = undefined;
         for (shape.dims[0..shape.rank_], dims[0..shape.rank_]) |dim, *out| out.* = @intCast(dim);
         const tensor = try cb.fromFloat32Shape(values, dims[0..shape.rank_]);
@@ -246,6 +253,138 @@ fn trainsModernBert(neck: @import("../../models/gliner_boundary.zig").Neck) !voi
         };
     }
     try std.testing.expectEqual(expected, live);
+}
+
+fn modernNecked() @import("../../models/gliner_boundary.zig").Config {
+    var modern = config();
+    modern.encoder = .{ .hidden_size = 4, .intermediate_size = 8, .num_hidden_layers = 2, .num_attention_heads = 2, .vocab_size = 512, .max_position_embeddings = 256, .position_buckets = 0, .layer_norm_eps = 1e-5, .hidden_dropout_prob = 0, .attention_probs_dropout_prob = 0, .pad_token_id = 0, .family = .modern_bert, .global_rope_theta = 160000, .local_rope_theta = 10000, .local_attention_window = 8, .global_attn_every_n_layers = 2 };
+    modern.neck = .linear;
+    return modern;
+}
+
+/// Deterministic stand-in teacher states for every route row.
+const Teacher = struct {
+    values: [4][]f32,
+    fn init(a: Allocator, prepared: *const processor.PreparedBatch, hidden: usize) !Teacher {
+        var result: Teacher = undefined;
+        const rows = [_]usize{ prepared.text_word_mask.len, prepared.query_marker_mask.len, prepared.cls_marker_mask.len, prepared.parent_marker_mask.len };
+        for (&result.values, rows, 0..) |*values, count, route| {
+            values.* = try a.alloc(f32, count * hidden);
+            for (values.*, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i * 7 + route * 31 + 3)) * 0.37) + 0.5 * @as(f32, @floatFromInt(i % hidden));
+        }
+        return result;
+    }
+    fn deinit(self: *Teacher, a: Allocator) void {
+        for (self.values) |values| a.free(values);
+    }
+    fn context(self: *const Teacher, microbatch: u64) step.StepContext {
+        return .{ .identity = .{ .binding = @splat(7), .optimizer_step = 0, .microbatch = microbatch }, .replay = .{ .seed = 4, .micro_batch = microbatch }, .progress = .{ .optimizer_step = 0, .total_optimizer_steps = 100 }, .distillation = .{ .text = self.values[0], .queries = self.values[1], .classifications = self.values[2], .parents = self.values[3], .weight = 1 } };
+    }
+};
+
+fn gradientOf(a: Allocator, cb: *const ops.ComputeBackend, plan: *const step.Plan, result: *const step.StepResult, name: []const u8) ![]f32 {
+    for (result.backward.parameter_ids, result.backward.gradients.outputs) |id, gradient| {
+        if (std.mem.eql(u8, plan.graph.parameterName(plan.graph.node(id)), name)) return cb.toFloat32(gradient, a);
+    }
+    return error.MissingTestGradient;
+}
+
+test "boundary training step distills necked ModernBERT states without building any head" {
+    const a = std.testing.allocator;
+    var schema = try schema_mod.compile(a, rich_schema, .{});
+    defer schema.deinit();
+    var tokenizer = TestTokenizer{};
+    var prepared = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = "Ada Acme", .schema = &schema }}, .{});
+    defer prepared.deinit();
+    const modern = modernNecked();
+    var plan = try step.buildWithObjectives(a, modern, &prepared, &.{&schema}, .{}, .training, .materialized_v1, .retained_v1, .{}, .{ .heads = false, .distillation = true }, .{});
+    defer plan.deinit();
+    // Only the trunk and the neck exist: no head weight can move.
+    for (plan.graph.parameters.items) |id| {
+        const name = plan.graph.parameterName(plan.graph.node(id));
+        if (std.mem.startsWith(u8, name, "__")) continue;
+        const trunk = std.mem.startsWith(u8, name, "embeddings.") or std.mem.startsWith(u8, name, "layers.") or std.mem.startsWith(u8, name, "final_norm.");
+        if (!trunk and !std.mem.startsWith(u8, name, "gliner_neck.")) {
+            std.debug.print("unexpected parameter {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var parameters = try weights(a, &cb, &plan);
+    defer parameters.deinit();
+    try plan.finalize(parameters.wrt, .{});
+    var teacher = try Teacher.init(a, &prepared, modern.encoder.hidden_size);
+    defer teacher.deinit(a);
+    const annotations = [_]targets.Annotations{annotation(schema.fingerprint, true)};
+    var without = teacher.context(0);
+    without.distillation = null;
+    try std.testing.expectError(error.MissingBoundaryTrainingDistillation, plan.run(&cb, parameters.inputs, &prepared, &.{&schema}, &annotations, without, null));
+
+    var result = try plan.run(&cb, parameters.inputs, &prepared, &.{&schema}, &annotations, teacher.context(1), null);
+    defer result.deinit(&cb);
+    try std.testing.expect(result.terms.distillation > 0);
+    try std.testing.expectEqual(result.terms.distillation, result.terms.total);
+    try std.testing.expectEqual(@as(f32, 0), result.terms.classification);
+    // The loss reaches the whole trunk through the neck.
+    for ([_][]const u8{ "embeddings.tok_embeddings.weight", "layers.0.attn.Wqkv.weight", "layers.1.mlp.Wo.weight", "gliner_neck.weight" }) |name| {
+        const values = try gradientOf(a, &cb, &plan, &result, name);
+        defer a.free(values);
+        var live = false;
+        for (values) |value| live = live or @abs(value) > 1e-10;
+        try std.testing.expect(live);
+    }
+    // The neck bias gradient matches a central difference of the loss.
+    const bias = try gradientOf(a, &cb, &plan, &result, "gliner_neck.bias");
+    defer a.free(bias);
+    const step_size: f32 = 1e-2;
+    for (0..bias.len) |index| {
+        var losses: [2]f32 = undefined;
+        for ([_]f32{ step_size, -step_size }, &losses, 0..) |delta, *loss, run_index| {
+            var moved = try weightsWith(a, &cb, &plan, .{ .name = "gliner_neck.bias", .index = index, .delta = delta });
+            defer moved.deinit();
+            var shifted = try plan.run(&cb, moved.inputs, &prepared, &.{&schema}, &annotations, teacher.context(2 + index * 2 + run_index), null);
+            defer shifted.deinit(&cb);
+            loss.* = shifted.terms.distillation;
+        }
+        const numeric = (losses[0] - losses[1]) / (2 * step_size);
+        try std.testing.expectApproxEqAbs(numeric, bias[index], 2e-2 * @max(1, @abs(numeric)));
+    }
+}
+
+test "boundary training step combines task heads with feature distillation" {
+    const a = std.testing.allocator;
+    var schema = try schema_mod.compile(a, rich_schema, .{});
+    defer schema.deinit();
+    var tokenizer = TestTokenizer{};
+    var prepared = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = "Ada Acme", .schema = &schema }}, .{});
+    defer prepared.deinit();
+    const modern = modernNecked();
+    var plan = try step.buildWithObjectives(a, modern, &prepared, &.{&schema}, .{}, .training, .materialized_v1, .retained_v1, .{}, .{ .heads = true, .distillation = true }, .{});
+    defer plan.deinit();
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var parameters = try weights(a, &cb, &plan);
+    defer parameters.deinit();
+    try plan.finalize(parameters.wrt, .{});
+    var teacher = try Teacher.init(a, &prepared, modern.encoder.hidden_size);
+    defer teacher.deinit(a);
+    var context = teacher.context(0);
+    context.require_gold_relation_coverage = true;
+    var result = try plan.run(&cb, parameters.inputs, &prepared, &.{&schema}, &.{annotation(schema.fingerprint, true)}, context, null);
+    defer result.deinit(&cb);
+    try std.testing.expect(result.terms.distillation > 0 and result.terms.classification > 0 and result.terms.relation > 0);
+    try std.testing.expect(result.terms.total > result.terms.distillation);
+    // Distillation does not rewrite plan identity for plans without it.
+    var plain = try step.build(a, modern, &prepared, &.{&schema}, .{}, .training, .{});
+    defer plain.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &plain.fingerprint, &plan.fingerprint));
 }
 
 test "boundary training step rejects aggregate allocation limits and stale schema before forward" {
