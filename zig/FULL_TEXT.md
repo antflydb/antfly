@@ -135,6 +135,13 @@ mark the exact contained bytes and may span two adjacent words. Negative
 clauses never highlight, and traversal requests (`hierarchy.children`) reject
 the option.
 
+Substring highlighting follows the resolved field analyzer, including an
+`analysis_config` override on a source field. Exact terms and wildcard, fuzzy,
+and regexp queries replay the indexed suffixes and map their matches back
+through source separators. Regexp highlights use the same complete-term
+automaton matching as dictionary queries. Fragment merging retains the identity
+of each source value so dotted-key collisions cannot combine unrelated spans.
+
 ## Search-As-You-Type Design
 
 The JSON Schema surface stays valid JSON Schema; the standard `type` field is

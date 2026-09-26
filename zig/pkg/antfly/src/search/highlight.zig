@@ -52,6 +52,7 @@ pub const Matcher = union(enum) {
     fuzzy: Fuzzy,
     regexp: Regexp,
     /// Pattern queries against a suffix-indexed substring companion.
+    substring_term: []const u8,
     substring_wildcard: []const u8,
     substring_fuzzy: Fuzzy,
     substring_regexp: Regexp,
@@ -130,7 +131,7 @@ pub fn highlightMatchers(
     var has_substring_pattern = false;
     for (matchers) |matcher| {
         has_contains = has_contains or matcher == .contains;
-        has_substring_pattern = has_substring_pattern or matcher == .substring_wildcard or
+        has_substring_pattern = has_substring_pattern or matcher == .substring_term or matcher == .substring_wildcard or
             matcher == .substring_fuzzy or matcher == .substring_regexp;
     }
     if (has_contains or has_substring_pattern) {
@@ -243,12 +244,24 @@ fn collectMatchSpans(
                         try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte });
                     }
                 },
-                .regexp => |regexp| if (regex_mod.matchesCompiled(regexp.pattern, regexp.compiled, tok.term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
-                .contains, .substring_wildcard, .substring_fuzzy, .substring_regexp => {},
+                .regexp => |regexp| if (regexpMatchesTerm(regexp, tok.term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
+                .contains, .substring_term, .substring_wildcard, .substring_fuzzy, .substring_regexp => {},
                 .literal, .literal_prefix => {},
             }
         }
     }
+}
+
+// Dictionary regexp queries feed the whole term to the automaton. The
+// regex library's text-search helper intentionally permits partial matches.
+fn regexpMatchesTerm(regexp: Matcher.Regexp, term: []const u8) bool {
+    const aut = regexp.compiled.automaton();
+    var state = aut.start();
+    for (term) |byte| {
+        if (!aut.canMatch(state)) return false;
+        state = aut.accept(state, byte);
+    }
+    return aut.isMatch(state);
 }
 
 /// Replay the substring companion's one-word and adjacent-word suffixes,
@@ -291,8 +304,9 @@ fn collectSubstringPatternTermSpans(
 
         for (matchers) |matcher| {
             const matches = switch (matcher) {
+                .substring_term => |needle| std.mem.eql(u8, needle, indexed_term),
                 .substring_wildcard => |pattern| wildcard_mod.match(pattern, indexed_term),
-                .substring_regexp => |regexp| regex_mod.matchesCompiled(regexp.pattern, regexp.compiled, indexed_term),
+                .substring_regexp => |regexp| regexpMatchesTerm(regexp, indexed_term),
                 .substring_fuzzy => |fuzzy| blk: {
                     const prefix_len: usize = fuzzy.prefix_len;
                     if (indexed_term.len < prefix_len or fuzzy.term.len < prefix_len or
@@ -696,6 +710,22 @@ test "substring pattern matchers map joined suffixes to source bytes" {
     const second_word = try highlightMatchers(alloc, text, &.{.{ .substring_wildcard = "we*" }}, &analysis_mod.default_analyzer, 1, 100);
     defer freeFragments(alloc, second_word);
     try std.testing.expectEqualStrings("Weaver", second_word[0].text[second_word[0].highlights[0].start..second_word[0].highlights[0].end]);
+}
+
+test "regexp highlights use complete dictionary terms" {
+    const alloc = std.testing.allocator;
+    var compiled = try regex_mod.compile(alloc, "cat");
+    defer compiled.deinit();
+    const fragments = try highlightMatchers(alloc, "cat bobcat cats", &.{.{ .regexp = .{ .pattern = "cat", .compiled = &compiled } }}, &analysis_mod.simple_analyzer, 1, 100);
+    defer freeFragments(alloc, fragments);
+    try std.testing.expectEqual(@as(usize, 1), fragments[0].highlights.len);
+    try std.testing.expectEqualStrings("cat", fragments[0].text[fragments[0].highlights[0].start..fragments[0].highlights[0].end]);
+
+    var suffix_regex = try regex_mod.compile(alloc, "g3we.*");
+    defer suffix_regex.deinit();
+    const suffix_fragments = try highlightMatchers(alloc, "Rag3-Weaver", &.{.{ .substring_regexp = .{ .pattern = "g3we.*", .compiled = &suffix_regex } }}, &analysis_mod.simple_analyzer, 1, 100);
+    defer freeFragments(alloc, suffix_fragments);
+    try std.testing.expectEqualStrings("g3-Weaver", suffix_fragments[0].text[suffix_fragments[0].highlights[0].start..suffix_fragments[0].highlights[0].end]);
 }
 
 test "highlight fragments respect size and count limits" {
