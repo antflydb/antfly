@@ -503,15 +503,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "mixed numeric concrete sort keys share one cursor domain",
         "schema boolean doc values back native sort planner",
         "db exact sort resolves mapped geo metadata filters from typed doc values",
-        "_all highlights the source fields emitted into the index",
-        "keyword companion pattern matches highlight the whole indexed value",
-        "substring companion pattern queries highlight matched suffixes",
-        "configured substring source fields highlight indexed suffixes",
-        "exact substring terms highlight only matching dictionary suffixes",
-        "schema-less dotted source collisions highlight both indexed values",
+        "highlight",
+        "attachHighlights",
         "schema-driven dotted path ignores unindexed literal key",
-        "dotted highlight paths traverse arrays of objects",
-        "exact keyword highlights only the matching array value",
+        "text analysis rejects invalid shingle bounds",
     };
     const lib_db_query_tests = b.addTest(.{
         .root_module = antfly_test_mod,

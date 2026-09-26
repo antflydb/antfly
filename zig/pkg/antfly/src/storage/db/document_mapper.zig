@@ -2577,22 +2577,36 @@ fn extractTextFieldsFromValue(
     return try extractSchemaLessTextAndTypedFields(alloc, root.object, text_analysis);
 }
 
-/// Return the indexed fields whose values were also emitted into `_all`.
-/// Keep this in the mapper so highlighting follows the same schema and
-/// dynamic-field decisions as indexing.
-pub fn allSourceTextFieldsFromValue(
+/// Analyzer provenance for one value emitted into the text index. Highlight
+/// from these contributions instead of guessing analysis from a source name.
+pub const HighlightTextField = struct {
+    indexed_field: []const u8,
+    source_field: []const u8,
+    text: []const u8,
+    analyzer: *const analysis_mod.Analyzer,
+};
+
+pub fn highlightTextFieldsFromValue(
     alloc: Allocator,
     root: std.json.Value,
     text_analysis: introducer_mod.TextAnalysisConfig,
     schema: ?runtime_schema.TableSchema,
-) ![]const []const u8 {
+) ![]const HighlightTextField {
     const extracted = try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null);
-    var names = std.ArrayListUnmanaged([]const u8).empty;
+    var fields = std.ArrayListUnmanaged(HighlightTextField).empty;
     for (extracted.fields, 0..) |field, index| {
-        if (!std.mem.eql(u8, field.field_name, "_all") or index == 0) continue;
-        try names.append(alloc, extracted.fields[index - 1].field_name);
+        const source_field = if (std.mem.eql(u8, field.field_name, "_all") and index > 0)
+            extracted.fields[index - 1].field_name
+        else
+            field.field_name;
+        try fields.append(alloc, .{
+            .indexed_field = field.field_name,
+            .source_field = source_field,
+            .text = field.text,
+            .analyzer = introducer_mod.effectiveTextFieldAnalyzer(field, text_analysis),
+        });
     }
-    return try names.toOwnedSlice(alloc);
+    return try fields.toOwnedSlice(alloc);
 }
 
 pub fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {

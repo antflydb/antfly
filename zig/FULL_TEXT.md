@@ -142,6 +142,14 @@ through source separators. Regexp highlights use the same complete-term
 automaton matching as dictionary queries. Fragment merging retains the identity
 of each source value so dotted-key collisions cannot combine unrelated spans.
 
+Highlighting obtains analyzer provenance from the document mapper for each
+indexed value, including each contribution to `_all`. This preserves the
+analyzer that actually produced the terms when a source field has an override
+or a literal key happens to end in a companion suffix. Index field overrides
+take priority over schema-derived analyzers during both indexing and querying.
+Configured shingle filters require `1 <= min <= max <= 255`; the full range is
+safe to iterate.
+
 ## Search-As-You-Type Design
 
 The JSON Schema surface stays valid JSON Schema; the standard `type` field is

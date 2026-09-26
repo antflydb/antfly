@@ -635,7 +635,8 @@ fn tokenizeNgram(alloc: Allocator, text: []const u8, cfg: NgramConfig) ![]Token 
     var position: u32 = 0;
     const len = text.len;
 
-    var n: u8 = cfg.min;
+    if (cfg.min == 0 or cfg.max < cfg.min) return error.InvalidArgument;
+    var n: usize = cfg.min;
     while (n <= cfg.max) : (n += 1) {
         var start: usize = 0;
         while (start + n <= len) : (start += 1) {
@@ -891,7 +892,8 @@ fn applyShingle(alloc: Allocator, tokens: []Token, cfg: TokenFilter.ShingleConfi
     defer result.deinit(alloc);
 
     const count = tokens.len;
-    var n: u8 = cfg.min;
+    if (cfg.min == 0 or cfg.max < cfg.min) return error.InvalidArgument;
+    var n: usize = cfg.min;
     while (n <= cfg.max) : (n += 1) {
         if (n > count) continue;
         var i: usize = 0;

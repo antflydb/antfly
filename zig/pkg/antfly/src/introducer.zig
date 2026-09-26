@@ -616,7 +616,7 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
     var field_indices = std.StringHashMapUnmanaged(u16).empty;
     defer field_indices.deinit(alloc);
 
-    var analyzer_cache = std.StringHashMapUnmanaged(*const analysis_mod.Analyzer).empty;
+    var analyzer_cache = std.StringHashMapUnmanaged(?*const analysis_mod.Analyzer).empty;
     defer analyzer_cache.deinit(alloc);
 
     var doc_ordinals = std.ArrayListUnmanaged(u32).empty;
@@ -1205,20 +1205,26 @@ fn compareSortF64(a: f64, b: f64) std.math.Order {
     return std.math.order(a, b);
 }
 
+/// Resolve the analyzer used to index this exact field contribution. `_all`
+/// can receive values with different schema analyzers, so preserve the
+/// contribution's analyzer unless the index explicitly overrides this field.
+pub fn effectiveTextFieldAnalyzer(field: TextField, text_analysis: TextAnalysisConfig) *const analysis_mod.Analyzer {
+    return resolveFieldAnalyzer(field.field_name, text_analysis) orelse field.analyzer orelse &analysis_mod.default_analyzer;
+}
+
 fn cachedFieldAnalyzer(
     alloc: Allocator,
-    cache: *std.StringHashMapUnmanaged(*const analysis_mod.Analyzer),
+    cache: *std.StringHashMapUnmanaged(?*const analysis_mod.Analyzer),
     field: TextField,
     default_analyzer: *const analysis_mod.Analyzer,
     text_analysis: TextAnalysisConfig,
 ) !*const analysis_mod.Analyzer {
-    if (field.analyzer) |analyzer| return analyzer;
     const gop = try cache.getOrPut(alloc, field.field_name);
     if (!gop.found_existing) {
         gop.key_ptr.* = field.field_name;
-        gop.value_ptr.* = resolveFieldAnalyzer(field.field_name, text_analysis) orelse default_analyzer;
+        gop.value_ptr.* = resolveFieldAnalyzer(field.field_name, text_analysis);
     }
-    return gop.value_ptr.*;
+    return gop.value_ptr.* orelse field.analyzer orelse default_analyzer;
 }
 
 fn addSingleTextFieldToBuilders(
@@ -1227,7 +1233,7 @@ fn addSingleTextFieldToBuilders(
     field_builders: *std.StringHashMapUnmanaged(FieldPostingsBuilder),
     field_indices: *std.StringHashMapUnmanaged(u16),
     seg_writer: *segment_mod.SegmentWriter,
-    analyzer_cache: *std.StringHashMapUnmanaged(*const analysis_mod.Analyzer),
+    analyzer_cache: *std.StringHashMapUnmanaged(?*const analysis_mod.Analyzer),
     doc_idx: u32,
     field: TextField,
     default_analyzer: *const analysis_mod.Analyzer,
@@ -2265,11 +2271,10 @@ fn resolveTokenFilterComponent(component: std.json.Value, component_type: []cons
         } };
     }
     if (std.mem.eql(u8, component_type, "shingle")) {
-        return .{ .shingle = .{
-            .min = try configU8(config_val, "min", 2),
-            .max = try configU8(config_val, "max", 2),
-            .separator = try configShingleSeparator(config_val),
-        } };
+        const min = try configU8(config_val, "min", 2);
+        const max = try configU8(config_val, "max", 2);
+        if (min == 0 or max < min) return error.InvalidArgument;
+        return .{ .shingle = .{ .min = min, .max = max, .separator = try configShingleSeparator(config_val) } };
     }
     if (std.mem.eql(u8, component_type, "suffix")) {
         return .{ .suffix = .{
