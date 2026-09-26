@@ -43,8 +43,26 @@ test "laya training ReLU uses the PyTorch zero subgradient" {
 }
 
 test "laya training forward objective and every parameter gradient match PyTorch" {
+    try exerciseGradientParity(std.testing.allocator, false);
+}
+
+// Same reference fixture, but through the flash-style fused segment
+// attention graph (roadmap step 2c) instead of the dense materialized-bias
+// one. The reference gradients were computed against upstream's dense
+// attention; this checks the fused op does not move the relative L2 error
+// materially away from the dense path's (LAYA.md, "Verification":
+// 0.4-0.6% worst per-layer relative L2 on the released-model fixture).
+test "laya training forward objective and every parameter gradient match PyTorch (fused segment attention)" {
+    try exerciseGradientParity(std.testing.allocator, true);
+}
+
+fn exerciseGradientParity(a: std.mem.Allocator, use_fused_attention: bool) !void {
     const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
-    const a = std.testing.allocator;
+    // The fused kernel sums in a different tile order than the dense
+    // generic matmul/softmax path, so it earns a looser (but still tight)
+    // tolerance here rather than sharing the dense path's exact bound.
+    const abs_tol: f32 = if (use_fused_attention) 2e-3 else 2e-4;
+    const mismatch_scale: f32 = if (use_fused_attention) 0.02 else 0.002;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -65,7 +83,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     for (examples, ref.sequences, ref.targets) |*dst, seq, target| dst.* = .{ .ids = seq.ids, .markers = seq.markers, .kind = @enumFromInt(seq.qtype), .target = target[0..seq.markers.len] };
     const config_path = try std.fmt.allocPrint(scratch, "{s}/model/config.json", .{root});
     const config = try modern.parseConfig(scratch, try files.readFile(scratch, config_path));
-    var program = try train.Program.init(a, config, try train.bucketedLayout(examples, config), 0);
+    var program = try train.Program.initFrozenFused(a, config, try train.bucketedLayout(examples, config), 0, 0, null, use_fused_attention);
     defer program.deinit();
     var weights = try safetensors.MMapReader.openFileAbsolute(a, try std.fmt.allocPrint(scratch, "{s}/model/model.safetensors", .{root}));
     defer weights.deinit();
@@ -84,7 +102,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     var trainer = try train.controller.Trainer.init(a, cb, parameters, .{ .execution = execution, .limits = .{ .max_state_bytes = 16 * 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0.000025 } }, .{ .schedule = .{ .constant = 0.0001 } } } });
     defer trainer.deinit();
     var prng = std.Random.DefaultPrng.init(715);
-    const runtime = try train.inputs(scratch, cb, &program.graph, program.built, config, examples, prng.random(), false);
+    const runtime = try train.inputs(scratch, cb, &program.graph, program.built, config, examples, prng.random(), false, use_fused_attention);
     defer for (runtime) |input| cb.free(input.value);
     var binding = try trainer.bind(&program.graph, null);
     defer binding.deinit();
@@ -100,7 +118,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     if (trace) try compareTraces(scratch, root, &program, cb, forward.outputs[1..], "forward");
     const logits = try cb.toFloat32(forward.outputs[0], scratch);
     const l = try train.bucketedLayout(examples, config);
-    for (examples, ref.logits, 0..) |e, expected, row| for (0..e.target.len) |k| try std.testing.expectApproxEqAbs(expected[k], logits[row * l.options + k], 2e-4);
+    for (examples, ref.logits, 0..) |e, expected, row| for (0..e.target.len) |k| try std.testing.expectApproxEqAbs(expected[k], logits[row * l.options + k], abs_tol);
     const rows = try scratch.alloc(objective.Row, examples.len);
     for (rows, examples) |*row, e| row.* = .{ .kind = e.kind, .target = e.target };
     // The PyTorch noise has the unpadded option width; the graph's options are
@@ -113,11 +131,11 @@ test "laya training forward objective and every parameter gradient match PyTorch
     const cotangent = try scratch.alloc(f32, logits.len);
     @memset(cotangent, 0);
     for (0..examples.len) |row| @memcpy(cotangent[row * l.options ..][0..width], loss.gradient[row * width ..][0..width]);
-    try std.testing.expectApproxEqAbs(ref.loss, loss.loss, 2e-4);
-    try std.testing.expectApproxEqAbs(ref.ce, loss.ce, 2e-4);
-    try std.testing.expectApproxEqAbs(ref.policy, loss.policy, 2e-4);
-    try std.testing.expectApproxEqAbs(ref.reward, loss.reward, 2e-4);
-    for (ref.cotangent, loss.gradient) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 2e-4);
+    try std.testing.expectApproxEqAbs(ref.loss, loss.loss, abs_tol);
+    try std.testing.expectApproxEqAbs(ref.ce, loss.ce, abs_tol);
+    try std.testing.expectApproxEqAbs(ref.policy, loss.policy, abs_tol);
+    try std.testing.expectApproxEqAbs(ref.reward, loss.reward, abs_tol);
+    for (ref.cotangent, loss.gradient) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, abs_tol);
     const backward_inputs = try scratch.alloc(interpreter.RuntimeInput, combined.len + 1);
     for (combined, backward_inputs[0..combined.len]) |input, *dst| dst.* = .{ .node_id = program.gradients.id_map[input.node_id], .value = input.value };
     const seed = try cb.fromFloat32Shape(cotangent, &.{ @intCast(l.questions), @intCast(l.options) });
@@ -149,12 +167,12 @@ test "laya training forward objective and every parameter gradient match PyTorch
         }
         worst = @max(worst, error_max);
         worst_relative = @max(worst_relative, @sqrt(error_sq / @max(expected_sq, 1e-30)));
-        if (error_max > 5e-5 + magnitude * 0.002) {
+        if (error_max > 5e-5 + magnitude * mismatch_scale) {
             std.debug.print("Laya gradient mismatch {s}: error={d} scale={d} relative_l2={d}\n", .{ name, error_max, magnitude, @sqrt(error_sq / @max(expected_sq, 1e-30)) });
             mismatches += 1;
         }
     }
-    std.debug.print("Laya {s}: {d} gradient tensors, max absolute error={d}, max relative L2 error={d}\n", .{ @tagName(execution), program.wrt.len, worst, worst_relative });
+    std.debug.print("Laya {s} fused_attention={} : {d} gradient tensors, max absolute error={d}, max relative L2 error={d}\n", .{ @tagName(execution), use_fused_attention, program.wrt.len, worst, worst_relative });
     try std.testing.expectEqual(@as(usize, 0), mismatches);
 }
 

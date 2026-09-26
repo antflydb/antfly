@@ -31,6 +31,7 @@ const native = @import("../backends/native.zig");
 const activations_mod = @import("../backends/activations.zig");
 const deberta_tiled = @import("deberta_tiled_attention.zig");
 const deberta_training = @import("deberta_training_attention.zig");
+const segment_training = @import("segment_training_attention.zig");
 const LoadedWeight = @import("../models/weight_source.zig").LoadedWeight;
 const QuantizedStorage = @import("../models/weight_source.zig").QuantizedStorage;
 const runtime = @import("../runtime/root.zig");
@@ -4799,6 +4800,8 @@ pub const vtable_impl = ComputeBackend.VTable{
     .disentangledRelativeAttentionBackward = &disentangledRelativeAttentionBackwardOp,
     .debertaTrainingAttentionV1 = &debertaTrainingAttentionV1Op,
     .debertaTrainingAttentionBackwardV1 = &debertaTrainingAttentionBackwardV1Op,
+    .segmentTrainingAttentionV1 = &segmentTrainingAttentionV1Op,
+    .segmentTrainingAttentionBackwardV1 = &segmentTrainingAttentionBackwardV1Op,
     .windowedSelfAttention = &windowedSelfAttentionOp,
     .channelSelfAttention = &channelSelfAttentionOp,
     .tokenGridConv2d = &tokenGridConv2dOp,
@@ -35580,6 +35583,65 @@ fn debertaTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, relative: CT, 
     const cotangent = try debertaTrainingF32(self, dout, layout.outputShape());
     defer if (cotangent.owned) |data| self.allocator.free(data);
     const output = try deberta_training.backward(self.allocator, attrs, qkv_data.data, relative_data.data, words, cotangent.data, .{ .control = control, .io = self.io });
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    const shape = layout.gradientShape();
+    return self.withLogicalShape(result, shape.dims[0..shape.rank_]);
+}
+
+fn segmentTrainingShape(tensor: CT, expected: @import("ml").graph.Shape) !void {
+    const actual = tensorStoredShape(tensor) orelse return error.InvalidSegmentTrainingAttentionShape;
+    if (!std.mem.eql(i64, actual, expected.dims[0..expected.rank_])) return error.InvalidSegmentTrainingAttentionShape;
+}
+
+fn segmentTrainingF32(self: *NativeCompute, tensor: CT, expected: @import("ml").graph.Shape) !WeightF32View {
+    try segmentTrainingShape(tensor, expected);
+    if (try tensorDTypeOp(self, tensor) != .f32) return error.InvalidSegmentTrainingAttentionDType;
+    const buf = toBuf(tensor);
+    // This dedicated execution profile consumes F32 activations. Quantized
+    // storage cannot be promoted implicitly through the generic view helper.
+    if (buf.quantized_storage != null or buf.owned_quantized_storage != null) return error.InvalidSegmentTrainingAttentionDType;
+    if (buf.view_strides != null) return .{ .data = try getDataChecked(tensor) };
+    if (buf.source_tensor) |source| {
+        if (source.dtype != .f32) return error.InvalidSegmentTrainingAttentionDType;
+        return tensorF32View(self, source);
+    }
+    return denseTensorView(self, tensor);
+}
+
+fn segmentTrainingControl(tensor: CT, expected: @import("ml").graph.Shape) ![]align(1) const i32 {
+    try segmentTrainingShape(tensor, expected);
+    const buf = toBuf(tensor);
+    const source = buf.source_tensor orelse return error.InvalidSegmentTrainingAttentionDType;
+    if (source.dtype != .i32 or buf.view_strides != null) return error.InvalidSegmentTrainingAttentionDType;
+    _ = try integerTensorCount(source);
+    return std.mem.bytesAsSlice(i32, source.data);
+}
+
+fn segmentTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: segment_training.Attrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (control) |c| try c.check();
+    const layout = try attrs.layout();
+    const words = try segmentTrainingControl(control_i32, layout.controlShape());
+    const qkv_data = try segmentTrainingF32(self, qkv, layout.qkvShape());
+    defer if (qkv_data.owned) |data| self.allocator.free(data);
+    const output = try segment_training.forward(self.allocator, attrs, qkv_data.data, words, .{ .control = control, .io = self.io });
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    const shape = layout.outputShape();
+    return self.withLogicalShape(result, shape.dims[0..shape.rank_]);
+}
+
+fn segmentTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, dout: CT, attrs: segment_training.Attrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (control) |c| try c.check();
+    const layout = try attrs.layout();
+    const words = try segmentTrainingControl(control_i32, layout.controlShape());
+    const qkv_data = try segmentTrainingF32(self, qkv, layout.qkvShape());
+    defer if (qkv_data.owned) |data| self.allocator.free(data);
+    const cotangent = try segmentTrainingF32(self, dout, layout.outputShape());
+    defer if (cotangent.owned) |data| self.allocator.free(data);
+    const output = try segment_training.backward(self.allocator, attrs, qkv_data.data, words, cotangent.data, .{ .control = control, .io = self.io });
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
     const shape = layout.gradientShape();

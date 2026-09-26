@@ -401,6 +401,190 @@ that share `group_id` and state text into packed examples, and records map to
 `(example, question)` placements. Metrics, calibration, and prediction files
 stay per record.
 
+### Long states (step 2c)
+
+`architecture.buildWithAttention(..., use_fused_attention: true)` replaces the
+three dense masks above (`__laya_encoder_bias`, `__laya_local_bias`,
+`__laya_head_bias`, each `[batch*heads, S, S]`) with one flash-style op,
+`fused_segment_training_attention_v1` (`ml/src/graph/node.zig`), and its
+hand-written backward `..._backward_v1`. Both are new: they join the existing
+fused training-attention ops (`fused_boundary_training_attention_v1`,
+`fused_deberta_training_attention_v1`) that already carry their own VJP
+instead of decomposing into primitives.
+
+- **Op contract.** Forward leaves are `qkv` (`[Q;K;V]`, token-major
+  `[3*batch*seq_len, num_heads*head_dim]`, upstream's natural QKV-linear
+  layout -- no `heads()` transpose needed) and one physical i32 `control`
+  leaf: six replay limbs, an `apply_dropout` flag, `batch*seq_len` logical
+  positions, then `batch*seq_len*6` `laya_tree`-style ranges
+  (ancestor-segment extents, as `ops.SegmentAttention` already uses at
+  serving time). `window` and `dropout_probability` are graph-time
+  attributes, not runtime tensors, so the same op expresses global
+  attention (`window = maxInt`, one full-row range), sliding-window local
+  layers (`window` set, same range), and tree-packed rows (the row's actual
+  `laya_tree.ranges`) -- whichever the training graph's global/local
+  encoder layers and packed rows need. `apply_dropout` *is* a runtime
+  control value, unlike `dropout_probability`: because a `Program`'s graph
+  (and its baked-in `dropout_probability`) is built once and reused for
+  both training steps and `predict` eval, the fused op needs a per-call
+  runtime toggle to silence dropout outside training the way the dense
+  path's `drop()` does with an all-ones mask -- see "Packed job
+  training-vs-serving, and the eval dropout leak" below.
+- **Kernel.** `lib/linalg/src/attention.zig`
+  (`segmentTrainingAttentionForwardHost`/`BackwardHost`), beside
+  `segmentAttentionHost`: tiled online softmax (`BLOCK_Q`x`BLOCK_KV`,
+  merged query-block ranges, exactly `segmentAttentionHost`'s masking) saves
+  only per-query `(row_max, row_sum)`, never a `[tokens, tokens]` tensor.
+  Backward recomputes the forward (for `O` and the stats) and makes one more
+  tiled sweep that recomputes scores per tile for the exact `dQ`/`dK`/`dV`
+  -- the same recompute-not-persist shape as
+  `ops/deberta_training_attention.zig`. Dropout is a seeded counter mix
+  (`segmentAttentionDropoutKeep`, independent of
+  `deberta_training_attention.mix` so `lib/linalg` has no `pkg/inference`
+  dependency) addressed by `(batch, head, query, key)`, replayed identically
+  in both sweeps -- no probability mask is ever persisted.
+- **Metal: host-bridged, not an on-device kernel.**
+  `MetalCompute.segmentTrainingAttentionV1Op`/`BackwardV1Op`
+  (`ops/metal_compute.zig`) download `qkv`/`control`/`dOut`, run the exact
+  same CPU kernel through a `NativeCompute` instance, and upload the result
+  back -- the same `HostFallbackNative` bridge `hostFallbackSdpa` and
+  `hostFallbackDisentangledRelativeAttention` already use for their
+  device-kernel-missing cases. `MetalTensor.toHostSlice` already flushes any
+  active command frame before reading, so this is safe inside
+  `training.executeFramed`'s framed forward/backward without further
+  changes. No `[tokens, tokens]` tensor is materialized on either side, so
+  Metal jobs get the same `seq_len <= 8192` admission bound as CPU; they do
+  not get GPU parallelism for this op. Because of that host round-trip,
+  `finetune/laya/job.zig` selects fused attention only when a split's
+  layout actually needs it -- `exceedsDenseAttentionBound` re-checks the
+  dense materialized-bias path's own `batch*L^2*heads` bound with
+  `use_fused_attention=false` and takes fused only on
+  `error.LayaTrainingAttentionLimitExceeded` -- or `Config.force_fused_attention`
+  asks for it explicitly. Ordinary jobs (small states, the released
+  checkpoint's `max_len`) keep training on the on-device dense path on both
+  backends, unchanged from before this track; only long-state jobs beyond
+  the dense bound (or an explicit test) pay the host-bridge cost. A true
+  on-device Metal kernel (forward tiled online softmax plus a backward that
+  needs either atomics or a range-symmetry argument for the reverse
+  `dK`/`dV` pass over tree-packed rows) is open work; see Roadmap.
+- **Admission.** `graph.validate` drops the quadratic bound when
+  `use_fused_attention` and instead only checks `seq_len <= 8192`
+  (ModernBERT's pretraining length, already `laya.max_len`'s ceiling).
+  Memory is O(batch*heads*seq_len*head_dim), not O(batch*heads*seq_len^2).
+- **Correctness.** `lib/linalg/src/attention.zig` tests the forward against
+  a dense masked-softmax reference (global, local window, tree segments) and
+  the backward against finite differences (with and without dropout).
+  `finetune/laya/fused_attention_test.zig` runs the real training graph
+  (`training.inputs` included) through the CPU backend and checks the fused
+  and dense builds produce matching logits on an unpacked example and on a
+  tree-packed row, with the same random weights. All of the above pass on
+  both CPU and Metal (host-bridged), 2026-09-26.
+
+**Relfix on the current fixture.** `training_test.zig`'s "every parameter
+gradient match PyTorch" test's own hard gate (zero per-tensor mismatches
+against a `5e-5 + 0.2%*magnitude` bound) does not pass against the current
+`relfix` fixture for **either** attention path -- dense fails it too, with
+the identical unmodified tolerance, so this is a pre-existing fixture/dense
+gap, not something this track introduced. Reading the printed worst
+per-tensor `relative_l2` values instead (LAYA.md's original 0.4-0.6%
+number is this same metric):
+
+| Backend | Dense: mismatches / worst relative_l2 | Fused: mismatches / worst relative_l2 |
+| --- | --- | --- |
+| CPU | 52 / 4.0% | 6 / 4.3% |
+| Metal | 42 / 2.3% | 4 / 4.1% |
+
+Fused attention has *fewer* tensors over the strict per-tensor threshold
+than dense in both backends, but its single worst tensor is somewhat higher
+(4.1-4.3% vs 2.3-4.0%). Neither is close to the previously-documented
+0.4-0.6% band; since dense (byte-for-byte unchanged code, same tolerance)
+shows the same order of magnitude, the fixture (or the released checkpoint
+it pins) has likely drifted since that number was recorded, independent of
+this track. Fused attention is not a regression relative to dense on the
+fixture as it exists today, but the 0.4-0.6% band itself needs
+re-establishing (rerun `scripts/laya/prepare_laya_fixtures.sh` against
+pinned revisions and compare) before it can gate anything again.
+
+**Packed job training-vs-serving, and the eval dropout leak.**
+`training_packed_test.zig`'s "converts an unpacked checkpoint into a served
+packed model" test compares the *trainer's own* `eval_predictions.json`
+(the training graph, evaluated at the run's final weights) against
+*serving the exported model* (a real `pipeline.execute` session) -- the
+same weights on both sides, so any gap here is a bug, not training drift.
+Forcing fused attention unconditionally (the first cut of this track) rose
+this from 6.0e-8 to 2.9e-3 max probability error on the 2-layer hidden-64
+`ref` fixture (`head_dropout` defaults to 0.1).
+
+Root cause: the dense path's attention dropout is a *runtime* mask
+(`graph.zig`'s `drop()` binds an external `__laya_dropout_N` parameter that
+`training.inputs` fills with all-ones when `training=false`, i.e. at
+`predict`/eval), but the fused op's `dropout_probability` is a *graph-time*
+attribute baked into `SegmentTrainingAttentionAttrs` when the `Program` is
+built -- and `job.zig`'s `Cache` builds that `Program` once and reuses it
+for every training step and every `predict` call. With no runtime toggle,
+the fused op kept applying its seeded in-kernel dropout during eval, so the
+trainer's own eval of its final weights differed from a dropout-free
+serving forward by roughly `head_dropout`'s scale -- and would have
+corrupted eval predictions and calibration on every real long-state job,
+not just this test.
+
+Fix: `control`'s layout gained one word, `apply_dropout` (word index 6,
+before the positions/ranges that follow it -- see the "Op contract" bullet
+above and `ops.segment_training_attention.ControlView`).
+`finetune/laya/training.zig`'s `inputs` sets it from the same `training:
+bool` parameter the dense path already uses for its all-ones mask;
+`segment_training_attention.zig`'s `forward`/`backward` pass `0` instead of
+`attrs.dropout_probability` into the kernel whenever it is unset. Metal
+inherits this automatically: the host bridge forwards the same control
+tensor to the same CPU decode. Verified: `training_packed_test.zig` now has
+a second case, "... (forced fused attention)", that runs this exact job
+with `force_fused_attention=true` and asserts the original `worst < 5e-5`
+bound; both it and the default (dense, admission-gated) case measure
+~3e-8.
+
+Separately (and *not* the explanation for the gap above, since it compares
+different weights, not the same ones): training the identical fixture/config
+twice, once with `force_fused_attention=false` and once `=true`, and
+diffing the two exported checkpoints, shows a worst relative L2 over
+`encoder.layers.*` weight tensors of 2.43% on CPU (dropout-corrected). Both
+runs are individually correct -- the tiled online-softmax's summation order
+differs from the dense masked softmax's, and on this tiny six-example,
+three-epoch fixture that ~1e-7-per-call difference compounds through Adam
+into measurable (if small) weight drift. This has no dense baseline to
+compare against once a job's layout actually exceeds the dense bound (the
+dense path cannot run at that length at all), so it is noted here as a
+characterized, expected property of switching attention implementations,
+not something the admission gate needs to hide.
+
+**Long-state smoke test (2026-09-26, CPU, released 421M checkpoint).** Data
+and job recipe in `.tmp/longstate/` (gitignored): states synthesized by
+concatenating distinct `td/train.jsonl` records to ~2k/4k/8k tokens
+(word-count estimate; actual tokenization untested), `laya.max_len` raised
+to 8192 in a copy of the released checkpoint's `config.json` and
+`rl_agent_config.json`, `zig build -Doptimize=ReleaseFast --prefix <dir>`
+once, then `/usr/bin/time -l <dir>/bin/antfly-inference finetune train laya
+job_2k.json` under the gpu lock.
+
+The 2k run reached 15.3 GB peak memory footprint (21.6 GB max RSS) over
+748 s wall before `error.OutOfMemory` on a `dot_general` (a `[6656, 5248]`
+MLP intermediate), before finishing even one full step or logging a
+`"step"` event -- not a bug in the fused op specifically (nothing here is
+attention-shaped; it is the encoder's ordinary MLP matmul), but this
+machine's system-wide memory was critically low at the time (`vm_stat`:
+under 70 MB free, all nine agents' tracks running full released-model
+work concurrently). 4k and 8k were not attempted: they need strictly more
+memory than a 2k run that already used 15-22 GB on a shared 36 GB
+machine with near-zero headroom, and the task's own guidance is to stop
+near 20 GB. Rerun `.tmp/longstate/job_{2k,4k,8k}.json` (currently
+`stop_after_microbatches: 3`, reduced from a first attempt at 10 that made
+the same throughput point more slowly) once the machine has real headroom,
+and watch `vm_stat`/`/usr/bin/time -l` peak footprint, not just this
+session's numbers.
+
+Tree packing does not raise the logical length limit. Reaching Jev-like state
+lengths additionally needs a long-context fine-tune: the ModernBERT encoder
+was pretrained at 8,192 tokens.
+
 ### Converting a released checkpoint
 
 Set `packing` in the job JSON. The released weights are the starting point,
@@ -451,9 +635,11 @@ antfly inference finetune train laya job.json
 
 Tree packing does not raise the logical length limit. Reaching Jev-like state
 lengths additionally needs a long-context fine-tune: the ModernBERT encoder
-was pretrained at 8,192 tokens. That in turn needs a non-materialized
-attention in the training graph, because the current graph admits
-`batch · L² · heads ≤ 64M` elements, about 2k tokens at batch 1.
+was pretrained at 8,192 tokens. The CPU trainer can now build the graph with
+fused segment attention (`use_fused_attention`, see
+[Long states](#long-states-step-2c)) to remove the quadratic admission bound
+that used to cap this at about 2k tokens at batch 1; the fine-tune on
+teacher-labelled long states itself is still open (step 2a).
 
 ### LoRA
 
@@ -828,8 +1014,7 @@ snapshotting weights and moments first.
 Raw per-step logs and the investigation are in
 [`work-log/completed/inference/laya/2026-09-25-trainer-throughput.md`](../../../../../work-log/completed/inference/laya/2026-09-25-trainer-throughput.md).
 
-Segment attention in the training graph (which step 2c needs anyway) remains
-open. Batching still helps little, because cost is per token. LoRA is
+Segment attention in the training graph landed with step 2c (below). Batching still helps little, because cost is per token. LoRA is
 implemented ([LoRA](#lora)); its own step-time, memory, and accuracy numbers
 are below.
 
@@ -989,6 +1174,10 @@ estimate) and `backend_peak_bytes` (the Metal runtime's own
 `device_owned_peak_live_bytes`, reset at admission so it reflects this run
 alone), alongside the existing `host_peak_bytes`.
 
+Segment attention in the training graph landed on CPU (step 2c, see
+[Long states](#long-states-step-2c)); a device kernel remains open (LoRA is implemented, see [LoRA](#lora)).
+Batching still helps little, because cost is per token.
+
 ## Verification
 
 All numbers are from 2026-09-24 on an Apple M4 Max (36 GiB), Zig 0.16.0.
@@ -1025,6 +1214,14 @@ All numbers are from 2026-09-24 on an Apple M4 Max (36 GiB), Zig 0.16.0.
 | Segment attention equals dense tree-masked attention on the session backend, all queries and branch queries only | `pipelines/laya_packed_test.zig` | 2.4e-7 (CPU), 3.6e-7 (Metal) |
 | Multi-row coalescing: no token of one state's tree is visible from another's; a batched call over several states equals each state's row run alone (question and candidate modes) | same, "laya multi-row coalescing isolates independent states and matches running them alone" | max probability error < 1e-5 (CPU and Metal) |
 | Pipeline batches many small states into fewer session calls than `ANTFLY_LAYA_PACKED_BATCH=0`, with identical decisions and prompt tokens either way | same, "laya packed pipeline batches many small states into fewer session calls" | exact (< 1e-5) |
+
+| Fused training attention forward equals dense masked softmax (global, local window, tree segments) | `lib/linalg/src/attention.zig` | < 1e-4 |
+| Fused training attention backward equals finite differences (with and without dropout) | same | analytic within 2e-2 of central difference |
+| Fused training graph (`training.inputs` included) matches the dense-bias graph's logits, unpacked and tree-packed, CPU | `finetune/laya/fused_attention_test.zig` | < 2e-3 |
+| Fused training graph matches the dense graph on Metal (host-bridged) | same, `SkipZigTest` without a Metal device | passes; identical to the CPU run (same bridged kernel) |
+| Released-model gradients vs float64 PyTorch, fused attention (relfix) | `finetune/laya/training_test.zig` ("... (fused segment attention)") | see "Relfix on the current fixture" below -- not the pass/fail gate, a measurement |
+| Trainer's own eval predictions vs. serving the exported model (same weights), default admission-gated and forced fused attention | `finetune/laya/training_packed_test.zig` (two cases) | max probability error ~3e-8 both ways, unchanged `worst < 5e-5` bound (see "eval dropout leak" below for the bug this catches) |
+| Fused training attention graph VJP: three leaf gradients, integer control has none, retained through lowering | `ml/src/graph/segment_training_attention_test.zig` | exact node-shape checks |
 
 Reproduce the fixture-backed tests. The fixtures are regenerated from pinned
 inputs rather than committed:
@@ -1310,7 +1507,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 | 1d. Weight quantization (q8_0) | no | done (CPU and Metal). After the CPU kernel fix (dequant+SGEMM), q8_0 matches dense speed on both backends over 760 decisions (CPU 497 vs 491 s, Metal 48 vs 49 s) and saves 37% of Metal memory | Labels identical and probabilities within 2e-2 of dense on the fixture. CPU footprint is still higher than dense (mmap'd dense weights vs allocated quantized bytes; see step 1d), not lower as hoped; a weight-storage-only footprint breakdown is open |
 | 2a. Long-context teacher (Qwen3.8-27B) | labels only | not started | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
 | 2b. Two-stage choice for many options | same fine-tune | implemented and measured; **negative result** | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. On Banking77, stage 2 made accuracy *worse* than stage 1 alone on the same checkpoint (0.8475 → 0.8350 mean over 2 seeds), despite 99%+ top-8 recall. Not adopted; see [Two-stage choice](#two-stage-choice-roadmap-2b) |
-| 2c. 8k states | yes | not started | Memory-efficient attention in the training graph (today about 2k tokens at batch 1), `max_len` 8192 (ModernBERT's pretraining length), fine-tune on teacher-labelled long states |
+| 2c. 8k states | yes | Fused segment attention op done (forward+backward, no `[L,L]` tensor), admission raised to `seq_len` 8192, both backends (CPU native, Metal host-bridged -- no on-device kernel yet), `zig build test -- --test-filter laya` green on CPU and Metal; long-state smoke test at 2k OOM'd under this session's system-wide memory pressure before completing one step (15-22 GB used on a loaded 36 GB machine), 4k/8k not attempted; fine-tune on teacher-labelled long states not started | Forward and gradients match the dense path (unpacked, local window, tree-packed, with and without dropout) on both backends; step time/memory at 4k/8k and a real long-state fine-tune remain open, the former blocked on this machine having headroom to rerun the smoke test |
 | 2d. ModernBERT-base student | yes | not started | ~150M parameters, about 2–3× cheaper than Laya-large; keep if its agreement with the teacher stays within tolerance of the large model |
 
 On size and speed: an encoder student beats a small decoder student (for

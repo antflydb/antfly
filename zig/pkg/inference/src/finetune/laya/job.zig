@@ -70,6 +70,15 @@ pub const Config = struct {
     /// Low-rank adaptation (models/laya/LAYA.md, "LoRA for Laya training").
     /// Null trains every unfrozen parameter directly, as before.
     lora: ?Lora = null,
+    /// Force the flash-style fused segment attention (roadmap step 2c) even
+    /// when the dense materialized-bias path would fit within its bound.
+    /// Selected automatically regardless of this flag once any split's
+    /// layout exceeds the dense `batch*L^2*heads` bound. Leave false for
+    /// ordinary jobs: the fused op is CPU-only today (see
+    /// `ops.ComputeBackend.segmentTrainingAttentionV1`), so a Metal job that
+    /// takes it runs attention host-bridged, which is correct but slower
+    /// than the on-device dense path.
+    force_fused_attention: bool = false,
 };
 
 pub const Lora = struct {
@@ -158,6 +167,9 @@ const Cache = struct {
     dropout: f32,
     freeze_layers: u32 = 0,
     lora: ?architecture.Lora = null,
+    /// See `training.Program.initFrozenFused`: CPU-only today. Set when a split needs it
+    /// or `Config.force_fused_attention` asks.
+    use_fused_attention: bool = false,
     frozen: []const training.Frozen = &.{},
     program: ?training.Program = null,
     last: architecture.Layout = .{ .batch = 0, .sequence = 0, .options = 0, .questions = 0 },
@@ -166,7 +178,7 @@ const Cache = struct {
         if (self.program == null or !std.meta.eql(l, self.last)) {
             if (self.program) |*p| p.deinit();
             self.program = null;
-            self.program = try training.Program.initFrozen(self.allocator, self.config, l, self.dropout, self.freeze_layers, self.lora);
+            self.program = try training.Program.initFrozenFused(self.allocator, self.config, l, self.dropout, self.freeze_layers, self.lora, self.use_fused_attention);
             self.last = l;
         }
         self.program.?.frozen = self.frozen;
@@ -367,16 +379,28 @@ fn combinedLayout(cfg: modern.Config, examples: []const training.Example, batch_
         layout.sequence = @max(layout.sequence, single.sequence);
         layout.options = @max(layout.options, single.options);
         questions = @max(questions, single.questions);
-        for (e.ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidLayaTrainingToken;
     }
     layout.questions = @min(questions * layout.batch, 512);
     return layout;
 }
 
 // Admit a conservative bound for the entire split before backend allocation.
-fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32, lora: ?architecture.Lora) !void {
+fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32, lora: ?architecture.Lora, use_fused_attention: bool) !void {
     const layout = try combinedLayout(cfg, examples, batch_size);
-    try architecture.validate(cfg, layout, dropout, lora);
+    for (examples) |e| for (e.ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidLayaTrainingToken;
+    try architecture.validate(cfg, layout, dropout, lora, use_fused_attention);
+}
+
+/// True when this split's layout would overflow the dense materialized-bias
+/// path's `batch*L^2*heads` admission bound, so fused attention is the only
+/// option regardless of `Config.force_fused_attention`.
+fn exceedsDenseAttentionBound(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32) !bool {
+    const layout = try combinedLayout(cfg, examples, batch_size);
+    architecture.validate(cfg, layout, dropout, null, false) catch |err| switch (err) {
+        error.LayaTrainingAttentionLimitExceeded => return true,
+        else => return err,
+    };
+    return false;
 }
 
 fn mulBytes(a: usize, b: usize) !usize {
@@ -415,7 +439,9 @@ fn weightStateBytes(trainable_elements: usize, frozen_elements: usize) !usize {
 /// an admission bound, not a measured footprint: it excludes the decision
 /// head, RoPE tables, and dropout masks, which the fixed overhead below folds
 /// in from measurement instead of modeling directly.
-fn activationBytes(cfg: modern.Config, l: architecture.Layout, freeze_layers: u32) !usize {
+/// With fused segment attention (roadmap 2c) no `[seq, seq]` tensor exists;
+/// the op keeps two floats per query and head, folded into the hidden term.
+fn activationBytes(cfg: modern.Config, l: architecture.Layout, freeze_layers: u32, use_fused_attention: bool) !usize {
     const batch: usize = @intCast(l.batch);
     const sequence: usize = @intCast(l.sequence);
     const hidden: usize = @intCast(cfg.hidden_size);
@@ -428,7 +454,7 @@ fn activationBytes(cfg: modern.Config, l: architecture.Layout, freeze_layers: u3
     // Eight buffers of this size: three dense biases (encoder_bias, local_bias,
     // head_bias in `architecture.Inputs`), forward scores and softmax
     // probabilities, and their backward cotangents.
-    const attn_bytes = try mulBytes(attn_elements, 8 * 4);
+    const attn_bytes = if (use_fused_attention) 0 else try mulBytes(attn_elements, 8 * 4);
     const per_layer = try addBytes(try addBytes(hidden_bytes, mlp_bytes), attn_bytes);
     const forward_layers: usize = @intCast(cfg.num_hidden_layers);
     const backward_layers: usize = @intCast(cfg.num_hidden_layers - @min(freeze_layers, cfg.num_hidden_layers));
@@ -446,11 +472,11 @@ const fixed_backend_overhead_bytes: usize = 4 * 1024 * 1024 * 1024;
 /// Upper-bound estimate of `backend: metal` device memory for one run: the
 /// admission gate in `execute` compares this against `max_backend_bytes`
 /// before creating the output directory or allocating any device weights.
-fn estimateBackendBytes(cfg: modern.Config, selected: []const training.controller.Parameter, frozen_elements: usize, layouts: []const architecture.Layout, freeze_layers: u32) !usize {
+fn estimateBackendBytes(cfg: modern.Config, selected: []const training.controller.Parameter, frozen_elements: usize, layouts: []const architecture.Layout, freeze_layers: u32, use_fused_attention: bool) !usize {
     var trainable_elements: usize = 0;
     for (selected) |p| trainable_elements = try addBytes(trainable_elements, p.values.len);
     var activation: usize = 0;
-    for (layouts) |l| activation = @max(activation, try activationBytes(cfg, l, freeze_layers));
+    for (layouts) |l| activation = @max(activation, try activationBytes(cfg, l, freeze_layers, use_fused_attention));
     const state = try weightStateBytes(trainable_elements, frozen_elements);
     return addBytes(try addBytes(state, activation), fixed_backend_overhead_bytes);
 }
@@ -563,13 +589,26 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         try data.disjoint(a, eval, calib);
     }
     const lora = try resolveLora(c.lora);
+    // Flash-style segment attention (roadmap step 2c) has no on-device Metal
+    // kernel yet (see MetalCompute.segmentTrainingAttentionV1Op), so taking
+    // it on a Metal job runs attention host-bridged -- correct and within
+    // the same 8k memory bound, but without GPU parallelism for this op and
+    // measurably slower than the on-device dense path (models/laya/LAYA.md).
+    // Only select it when a split's layout actually needs it (exceeds the
+    // dense `batch*L^2*heads` bound) or the caller explicitly asks.
+    const use_fused_attention = c.force_fused_attention or
+        try exceedsDenseAttentionBound(encoder, train.examples, c.batch_size, c.head_dropout) or
+        try exceedsDenseAttentionBound(encoder, eval.examples, 1, c.head_dropout) or
+        (if (calibration) |calib| try exceedsDenseAttentionBound(encoder, calib.examples, 1, c.head_dropout) else false);
     const train_layout = try combinedLayout(encoder, train.examples, c.batch_size);
-    try architecture.validate(encoder, train_layout, c.head_dropout, lora);
+    try architecture.validate(encoder, train_layout, c.head_dropout, lora, use_fused_attention);
     const eval_layout = try combinedLayout(encoder, eval.examples, 1);
-    try architecture.validate(encoder, eval_layout, c.head_dropout, lora);
+    try architecture.validate(encoder, eval_layout, c.head_dropout, lora, use_fused_attention);
     const calib_layout = if (calibration) |calib| try combinedLayout(encoder, calib.examples, 1) else null;
-    if (calib_layout) |cl| try architecture.validate(encoder, cl, c.head_dropout, lora);
-    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = c.freeze_layers, .lora = lora };
+    if (calib_layout) |cl| try architecture.validate(encoder, cl, c.head_dropout, lora, use_fused_attention);
+    for ([_][]const training.Example{ train.examples, eval.examples }) |examples| for (examples) |e| for (e.ids) |id| if (id < 0 or id >= encoder.vocab_size) return error.InvalidLayaTrainingToken;
+    if (calibration) |calib| for (calib.examples) |e| for (e.ids) |id| if (id < 0 or id >= encoder.vocab_size) return error.InvalidLayaTrainingToken;
+    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = c.freeze_layers, .lora = lora, .use_fused_attention = use_fused_attention };
     defer cache.deinit();
     // Release the raw source snapshot before optimizer initialization/restore.
     // Only owned trainable values, frozen values, and export metadata survive.
@@ -618,7 +657,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         layout_count = 3;
     }
     const backend_estimate: usize = if (c.backend == .metal)
-        try estimateBackendBytes(encoder, selected, frozen_elements, layouts[0..layout_count], c.freeze_layers)
+        try estimateBackendBytes(encoder, selected, frozen_elements, layouts[0..layout_count], c.freeze_layers, use_fused_attention)
     else
         0;
     if (c.backend == .metal and backend_estimate > c.max_backend_bytes) return error.LayaBackendMemoryLimitExceeded;
@@ -822,12 +861,12 @@ test "laya admission checks late long sequences and token vocabulary before trai
     const short = training.Example{ .ids = ids[0..2], .markers = &.{ 0, 1 }, .kind = .noul, .target = &.{ 1, 0 } };
     var long = short;
     long.ids = &ids;
-    try admitExamples(cfg, &.{ short, short }, 2, 0, null);
-    try admitExamples(cfg, &.{long}, 1, 0, null);
-    try std.testing.expectError(error.LayaTrainingAttentionLimitExceeded, admitExamples(cfg, &.{ short, short, long }, 2, 0, null));
+    try admitExamples(cfg, &.{ short, short }, 2, 0, null, false);
+    try admitExamples(cfg, &.{long}, 1, 0, null, false);
+    try std.testing.expectError(error.LayaTrainingAttentionLimitExceeded, admitExamples(cfg, &.{ short, short, long }, 2, 0, null, false));
     var invalid = short;
     invalid.ids = &.{ 0, cfg.vocab_size };
-    try std.testing.expectError(error.InvalidLayaTrainingToken, admitExamples(cfg, &.{ short, invalid }, 1, 0, null));
+    try std.testing.expectError(error.InvalidLayaTrainingToken, admitExamples(cfg, &.{ short, invalid }, 1, 0, null, false));
 }
 
 test "laya job config rejects out-of-range backend memory ceilings" {
@@ -851,11 +890,11 @@ test "laya activation estimate grows with layout and shrinks with frozen layers"
     const cfg = modern.Config{};
     const small = architecture.Layout{ .batch = 1, .sequence = 64, .options = 2, .questions = 1 };
     const large = architecture.Layout{ .batch = 1, .sequence = 512, .options = 2, .questions = 1 };
-    const small_bytes = try activationBytes(cfg, small, 0);
-    const large_bytes = try activationBytes(cfg, large, 0);
+    const small_bytes = try activationBytes(cfg, small, 0, false);
+    const large_bytes = try activationBytes(cfg, large, 0, false);
     try std.testing.expect(large_bytes > small_bytes);
     // Freezing every layer still charges one forward pass, never zero.
-    const frozen_bytes = try activationBytes(cfg, large, cfg.num_hidden_layers);
+    const frozen_bytes = try activationBytes(cfg, large, cfg.num_hidden_layers, false);
     try std.testing.expect(frozen_bytes > 0 and frozen_bytes < large_bytes);
 }
 
@@ -864,12 +903,23 @@ test "laya backend estimate covers weights, activations, and the fixed overhead 
     var values: [1024]f32 = undefined;
     const params = [_]training.controller.Parameter{.{ .name = "w", .values = &values, .dimensions = &.{1024}, .group = 0 }};
     const layout = architecture.Layout{ .batch = 1, .sequence = 64, .options = 2, .questions = 1 };
-    const estimate = try estimateBackendBytes(cfg, &params, 0, &.{layout}, 0);
+    const estimate = try estimateBackendBytes(cfg, &params, 0, &.{layout}, 0, false);
     try std.testing.expect(estimate > fixed_backend_overhead_bytes);
     // A larger admitted layout never lowers the estimate.
     const bigger_layout = architecture.Layout{ .batch = 1, .sequence = 512, .options = 2, .questions = 1 };
-    const bigger = try estimateBackendBytes(cfg, &params, 0, &.{bigger_layout}, 0);
+    const bigger = try estimateBackendBytes(cfg, &params, 0, &.{bigger_layout}, 0, false);
     try std.testing.expect(bigger > estimate);
+}
+
+test "laya admission drops the quadratic bound when fused segment attention is selected" {
+    const cfg = modern.Config{ .laya = .{ .max_len = 2048 }, .checkpoint_layout = .huggingface_fused_qkv_no_bias, .rope_interleaved = false };
+    const ids = [_]i64{0} ** 2048;
+    const short = training.Example{ .ids = ids[0..2], .markers = &.{ 0, 1 }, .kind = .noul, .target = &.{ 1, 0 } };
+    var long = short;
+    long.ids = &ids;
+    // Same three-row batch the dense path above rejects: fused admission is
+    // O(batch*heads*seq*visible_keys), not O(batch*heads*seq^2).
+    try admitExamples(cfg, &.{ short, short, long }, 2, 0, null, true);
 }
 
 test "laya training rejects malformed encoder metadata instead of defaulting" {

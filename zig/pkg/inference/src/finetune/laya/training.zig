@@ -210,7 +210,7 @@ pub fn rows(a: std.mem.Allocator, examples: []const Example) ![]objective.Row {
 }
 
 /// CTs must be freed before the backend; metadata uses the caller's arena.
-pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const ml.Graph, built: architecture.Built, cfg: modern.Config, examples: []const Example, random: std.Random, training: bool) ![]interpreter.RuntimeInput {
+pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const ml.Graph, built: architecture.Built, cfg: modern.Config, examples: []const Example, random: std.Random, training: bool, use_fused_attention: bool) ![]interpreter.RuntimeInput {
     const l = try bucketedLayout(examples, cfg);
     var result: std.ArrayListUnmanaged(interpreter.RuntimeInput) = .empty;
     errdefer for (result.items) |input| cb.free(input.value);
@@ -250,22 +250,66 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
         errdefer cb.free(value);
         try result.append(a, .{ .node_id = built.inputs.type_mask, .value = value });
     }
-    const window: u64 = cfg.local_attention_window / 2;
-    for ([_]ml.NodeId{ built.inputs.encoder_bias, built.inputs.local_bias, built.inputs.head_bias }, [_]u32{ cfg.num_attention_heads, cfg.num_attention_heads, cfg.hidden_size / 64 }, [_]bool{ false, true, false }) |id, heads, local| {
-        const bias = try a.alloc(f32, l.batch * heads * l.sequence * l.sequence);
-        const plane = l.sequence * l.sequence;
+    if (use_fused_attention) {
+        // One physical i32 control leaf (SegmentTrainingAttentionAttrs):
+        // six zeroed replay limbs (dropout is decorrelated across layers by
+        // `dropout_stream_id` alone; per-run seeding is future work), one
+        // `apply_dropout` flag, logical positions, then per-row
+        // `laya_tree`-style ranges. Padding rows and padding columns keep
+        // their zeroed (empty) range, so they see nothing and contribute a
+        // safe zero row (unused downstream: only `markers` positions are
+        // read out).
+        //
+        // The fused op's dropout is a graph-time attribute
+        // (`SegmentTrainingAttentionAttrs.dropout_probability`, baked in at
+        // `Program.init` and shared by every call the cached program serves,
+        // training steps and `predict` eval alike) rather than a runtime
+        // mask the way the dense path's `drop()` is -- the dense encoder
+        // graph turns dropout off outside training by binding an all-ones
+        // mask (`training: bool` above, `if (!training) 1 else ...`); the
+        // fused op has no such mask, so `apply_dropout` is this call's only
+        // way to silence it without rebuilding the graph. Leaving it
+        // (incorrectly) on during eval would apply live seeded dropout to
+        // the trainer's own eval predictions and to every served head at
+        // predict/calibration time.
+        const control = try a.alloc(i32, 7 + ids.len + ids.len * 6);
+        @memset(control, 0);
+        control[6] = @intFromBool(training);
+        for (0..ids.len) |i| control[7 + i] = @intCast(positions[i]);
+        const ranges_base = 7 + ids.len;
         for (examples, 0..) |e, row| {
-            const first = bias[row * heads * plane ..][0..plane];
-            for (0..l.sequence) |q| for (0..l.sequence) |k| {
-                var ok = k < e.ids.len and (q >= e.ids.len or e.visible(q, k));
-                if (ok and local) ok = @abs(positions[row * l.sequence + q] - positions[row * l.sequence + k]) <= window;
-                first[q * l.sequence + k] = if (ok) 0 else -1e9;
-            };
-            for (1..heads) |h| @memcpy(bias[(row * heads + h) * plane ..][0..plane], first);
+            if (e.packed_row) |p| {
+                const row_ranges = try tree.ranges(a, p.row, 0);
+                defer a.free(row_ranges);
+                for (row_ranges, 0..) |bound, i| control[ranges_base + row * l.sequence * 6 + i] = @intCast(bound);
+            } else {
+                for (0..e.ids.len) |q| {
+                    control[ranges_base + (row * l.sequence + q) * 6 + 0] = 0;
+                    control[ranges_base + (row * l.sequence + q) * 6 + 1] = @intCast(e.ids.len);
+                }
+            }
         }
-        const value = try floatInput(cb, bias, &.{ @intCast(l.batch * heads), @intCast(l.sequence), @intCast(l.sequence) });
+        const value = (try cb.fromInt32Shape(control, &.{@intCast(control.len)})) orelse return error.UnsupportedLayaTrainingBackend;
         errdefer cb.free(value);
-        try result.append(a, .{ .node_id = id, .value = value });
+        try result.append(a, .{ .node_id = built.inputs.segment_control, .value = value });
+    } else {
+        const window: u64 = cfg.local_attention_window / 2;
+        for ([_]ml.NodeId{ built.inputs.encoder_bias, built.inputs.local_bias, built.inputs.head_bias }, [_]u32{ cfg.num_attention_heads, cfg.num_attention_heads, cfg.hidden_size / 64 }, [_]bool{ false, true, false }) |id, heads, local| {
+            const bias = try a.alloc(f32, l.batch * heads * l.sequence * l.sequence);
+            const plane = l.sequence * l.sequence;
+            for (examples, 0..) |e, row| {
+                const first = bias[row * heads * plane ..][0..plane];
+                for (0..l.sequence) |q| for (0..l.sequence) |k| {
+                    var ok = k < e.ids.len and (q >= e.ids.len or e.visible(q, k));
+                    if (ok and local) ok = @abs(positions[row * l.sequence + q] - positions[row * l.sequence + k]) <= window;
+                    first[q * l.sequence + k] = if (ok) 0 else -1e9;
+                };
+                for (1..heads) |h| @memcpy(bias[(row * heads + h) * plane ..][0..plane], first);
+            }
+            const value = try floatInput(cb, bias, &.{ @intCast(l.batch * heads), @intCast(l.sequence), @intCast(l.sequence) });
+            errdefer cb.free(value);
+            try result.append(a, .{ .node_id = id, .value = value });
+        }
     }
     const head_dim = cfg.hidden_size / cfg.num_attention_heads;
     for (built.inputs.rope, [_]f32{ cfg.global_rope_theta, cfg.local_rope_theta }) |ids_pair, theta| {
@@ -297,6 +341,10 @@ pub const Program = struct {
     gradients: ml.autodiff.GradientResult,
     /// Values bound for parameters outside `wrt`; borrowed, set by the owner.
     frozen: []const Frozen = &.{},
+    /// Whether `built` uses `fusedAttention` (roadmap step 2c): CPU-only
+    /// today. `inputs` must build a `segment_control` runtime value instead
+    /// of the three dense bias tensors when this is set.
+    use_fused_attention: bool = false,
 
     pub fn init(a: std.mem.Allocator, cfg: modern.Config, l: architecture.Layout, dropout: f32) !Program {
         return initFrozen(a, cfg, l, dropout, 0, null);
@@ -306,10 +354,17 @@ pub const Program = struct {
     /// encoder layers and outside any `lora`-adapted linear; bind the rest
     /// through `frozen`.
     pub fn initFrozen(a: std.mem.Allocator, cfg: modern.Config, l: architecture.Layout, dropout: f32, freeze_layers: u32, lora: ?architecture.Lora) !Program {
+        return initFrozenFused(a, cfg, l, dropout, freeze_layers, lora, false);
+    }
+
+    /// `use_fused_attention` selects the flash-style segment attention op
+    /// (`architecture.buildWithAttention`) over the dense materialized-bias
+    /// graph, removing the quadratic admission bound up to `max_len` 8192.
+    pub fn initFrozenFused(a: std.mem.Allocator, cfg: modern.Config, l: architecture.Layout, dropout: f32, freeze_layers: u32, lora: ?architecture.Lora, use_fused_attention: bool) !Program {
         var graph = ml.Graph.init(a);
         errdefer graph.deinit();
         var builder = ml.Builder.init(&graph);
-        var built = try architecture.build(&builder, cfg, l, dropout, lora);
+        var built = try architecture.buildWithAttention(&builder, cfg, l, dropout, lora, use_fused_attention);
         errdefer built.deinit(a);
         try graph.markOutput(built.logits);
         const seed = try builder.parameter("__laya_cotangent", graph.node(built.logits).output_shape);
@@ -325,7 +380,7 @@ pub const Program = struct {
         errdefer gradients.deinit();
         gradients.graph.outputs.clearRetainingCapacity();
         for (gradients.param_grads) |id| try gradients.graph.markOutput(id);
-        return .{ .graph = graph, .built = built, .seed = seed, .wrt = wrt, .gradients = gradients };
+        return .{ .graph = graph, .built = built, .seed = seed, .wrt = wrt, .gradients = gradients, .use_fused_attention = use_fused_attention };
     }
     pub fn deinit(self: *Program) void {
         self.built.deinit(self.graph.allocator);
@@ -361,7 +416,7 @@ pub fn step(a: std.mem.Allocator, program: *Program, trainer: *controller.Traine
     const scratch = arena.allocator();
     const cb = trainer.owner.compute_backend;
     var prng = std.Random.DefaultPrng.init(seed_value);
-    const runtime = try inputs(scratch, cb, &program.graph, program.built, cfg, examples, prng.random(), true);
+    const runtime = try inputs(scratch, cb, &program.graph, program.built, cfg, examples, prng.random(), true, program.use_fused_attention);
     defer for (runtime) |input| cb.free(input.value);
     var binding = try trainer.bind(&program.graph, null);
     var bound = true;
@@ -425,7 +480,7 @@ pub fn predict(a: std.mem.Allocator, program: *Program, trainer: *controller.Tra
     const scratch = arena.allocator();
     const cb = trainer.owner.compute_backend;
     var prng = std.Random.DefaultPrng.init(0);
-    const runtime = try inputs(scratch, cb, &program.graph, program.built, cfg, examples, prng.random(), false);
+    const runtime = try inputs(scratch, cb, &program.graph, program.built, cfg, examples, prng.random(), false, program.use_fused_attention);
     defer for (runtime) |input| cb.free(input.value);
     var binding = try trainer.bind(&program.graph, null);
     defer binding.deinit();
