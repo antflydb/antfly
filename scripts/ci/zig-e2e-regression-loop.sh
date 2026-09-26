@@ -214,9 +214,14 @@ for ((iteration = 1; iteration <= repeats; iteration++)); do
       exit 2
     fi
     report_args=("--junitxml=$report_path")
+    case_project=e2e/antfly
+    if [[ "$test_name" == e2e/inference/* ]]; then
+      case_project=e2e/inference
+    fi
+    ANTFLY_INFERENCE_SERVER_LOG_DIR="$report_dir" \
     ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE="$preserve_root" \
       python3 "$script_dir/run_e2e_case.py" \
-      uv run --project e2e/antfly pytest -q -s --durations=10 ${report_args[@]+"${report_args[@]}"} "$test_name" &
+      uv run --project "$case_project" pytest -q -s --durations=10 ${report_args[@]+"${report_args[@]}"} "$test_name" &
     active_case=$!
     if wait "$active_case"; then
       status=0
