@@ -52,11 +52,14 @@ pub const Config = struct {
     /// transient snapshot, and the largest admitted layout's activations
     /// (models/laya/LAYA.md, "Training memory"). Ignored on `backend: cpu`,
     /// where the encoder runs in host memory bounded by `max_host_bytes`.
-    max_backend_bytes: usize = 24 * 1024 * 1024 * 1024,
+    max_backend_bytes: usize = 32 * 1024 * 1024 * 1024,
     /// Train (and export) a tree-packed layout (models/laya/LAYA.md). Null
     /// keeps the source checkpoint's layout; released checkpoints are unpacked.
     packing: ?model.PackingMode = null,
     max_packed_len: ?u32 = null,
+    /// Train a question-aware trunk (`packing.trunk_sees: "questions"`):
+    /// state tokens also attend to their questions. Requires `packing`.
+    trunk_sees_questions: bool = false,
     /// Two-stage choice (roadmap 2b): only valid with `packing: .candidate`.
     /// Set to also train, alongside the ordinary candidate rows, one joint
     /// (question-style) row per eligible `choice` record over a sampled
@@ -123,6 +126,7 @@ pub fn validate(c: Config) !void {
     if (c.calibration_file) |value| if (!std.fs.path.isAbsolute(value)) return error.LayaJobRequiresAbsolutePaths;
     if (c.stop_after_microbatches == 0) return error.InvalidLayaJob;
     if (c.max_packed_len != null and (c.packing == null or c.packing.? == .none)) return error.InvalidLayaJob;
+    if (c.trunk_sees_questions and (c.packing == null or c.packing.? == .none)) return error.InvalidLayaJob;
     _ = try resolveLora(c.lora);
     if (c.two_stage_top_k) |k| {
         if ((c.packing orelse .none) != .candidate or k < 2 or k > model.max_packed_options) return error.InvalidLayaJob;
@@ -137,7 +141,7 @@ fn packing(c: Config, source: model.Config) !model.Packing {
     const length: usize = c.max_packed_len orelse @min(4 * source.max_len, model.max_packed_len_limit);
     if (length < source.max_len or length > model.max_packed_len_limit) return error.InvalidLayaJob;
     const two_stage: model.TwoStage = if (c.two_stage_top_k) |k| .{ .top_k = k, .mass_cutoff = c.two_stage_mass_cutoff orelse 0 } else .{};
-    return .{ .mode = mode, .max_packed_len = length, .two_stage = two_stage };
+    return .{ .mode = mode, .max_packed_len = length, .two_stage = two_stage, .trunk_sees_questions = c.trunk_sees_questions };
 }
 
 fn path(a: std.mem.Allocator, dir: []const u8, name: []const u8) ![]const u8 {
@@ -294,6 +298,7 @@ fn packingConfigJson(a: std.mem.Allocator, layout: model.Packing) !std.json.Valu
         if (layout.two_stage.mass_cutoff > 0) try two_stage.put(a, "mass_cutoff", .{ .float = layout.two_stage.mass_cutoff });
         try object.put(a, "two_stage", .{ .object = two_stage });
     }
+    if (layout.trunk_sees_questions) try object.put(a, "trunk_sees", .{ .string = "questions" });
     return .{ .object = object };
 }
 
@@ -660,7 +665,10 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         try estimateBackendBytes(encoder, selected, frozen_elements, layouts[0..layout_count], c.freeze_layers, use_fused_attention)
     else
         0;
-    if (c.backend == .metal and backend_estimate > c.max_backend_bytes) return error.LayaBackendMemoryLimitExceeded;
+    if (c.backend == .metal and backend_estimate > c.max_backend_bytes) {
+        std.log.err("laya training needs an estimated {d} MiB of device memory, above max_backend_bytes ({d} MiB)", .{ backend_estimate >> 20, c.max_backend_bytes >> 20 });
+        return error.LayaBackendMemoryLimitExceeded;
+    }
     if (comptime @import("build_options").enable_metal) if (c.backend == .metal) metal_tensor.resetMemoryStats();
     // `max_host_bytes` is already a generous safety-net ceiling enforced by
     // `budget` (BoundedAllocator), not actual usage, so it is not also

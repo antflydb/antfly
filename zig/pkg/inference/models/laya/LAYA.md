@@ -1170,8 +1170,13 @@ nothing, and cutting it needs a transaction-contract change (skip
 re-validating already-committed state, write AdamW out of place) that is
 still open.
 
-**Admission.** The Laya job Config gained `max_backend_bytes` (default 24
-GiB), a device/unified-memory ceiling alongside the existing `max_host_bytes`.
+**Admission.** The Laya job Config gained `max_backend_bytes` (default 32
+GiB; an initial 24 GiB default refused the standard packed recipe, whose
+estimate is above that and whose measured peak is ~25.9 GB), a
+device/unified-memory ceiling alongside the existing `max_host_bytes`. A
+refusal logs the estimate and the ceiling. The live system-memory check is
+what protects a busy machine: it refuses a job that would not fit in the
+memory available right now.
 `execute` estimates the run's device need right after selecting trainable
 parameters and before any device weight or optimizer-state allocation (well
 before creating the output directory), and refuses with
