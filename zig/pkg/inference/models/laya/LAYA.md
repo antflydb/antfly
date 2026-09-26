@@ -435,6 +435,31 @@ thousand tokens' worth of reduction reordering is visible at this scale.
 The test's tolerance is widened to 1e-2 (see the test) to keep checking for
 an actual wrong decision rather than this expected reordering noise.
 
+**Long-state smoke test (2026-09-26, CPU, released 421M checkpoint).** Data
+and job recipe in `.tmp/longstate/` (gitignored): states synthesized by
+concatenating distinct `td/train.jsonl` records to ~2k/4k/8k tokens
+(word-count estimate; actual tokenization untested), `laya.max_len` raised
+to 8192 in a copy of the released checkpoint's `config.json` and
+`rl_agent_config.json`, `zig build -Doptimize=ReleaseFast --prefix <dir>`
+once, then `/usr/bin/time -l <dir>/bin/antfly-inference finetune train laya
+job_2k.json` under the gpu lock.
+
+The 2k run reached 15.3 GB peak memory footprint (21.6 GB max RSS) over
+748 s wall before `error.OutOfMemory` on a `dot_general` (a `[6656, 5248]`
+MLP intermediate), before finishing even one full step or logging a
+`"step"` event -- not a bug in the fused op specifically (nothing here is
+attention-shaped; it is the encoder's ordinary MLP matmul), but this
+machine's system-wide memory was critically low at the time (`vm_stat`:
+under 70 MB free, all nine agents' tracks running full released-model
+work concurrently). 4k and 8k were not attempted: they need strictly more
+memory than a 2k run that already used 15-22 GB on a shared 36 GB
+machine with near-zero headroom, and the task's own guidance is to stop
+near 20 GB. Rerun `.tmp/longstate/job_{2k,4k,8k}.json` (currently
+`stop_after_microbatches: 3`, reduced from a first attempt at 10 that made
+the same throughput point more slowly) once the machine has real headroom,
+and watch `vm_stat`/`/usr/bin/time -l` peak footprint, not just this
+session's numbers.
+
 Tree packing does not raise the logical length limit. Reaching Jev-like state
 lengths additionally needs a long-context fine-tune: the ModernBERT encoder
 was pretrained at 8,192 tokens.
@@ -863,7 +888,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 | 1d. Weight quantization (q8_0) | no | done (CPU and Metal); pays off on Metal | Labels identical and probabilities within 2e-2 of dense on the fixture; on the released model, 36% less Metal memory at the same accuracy. CPU q8_0 kernels need work |
 | 2a. Long-context teacher (Qwen3.8-27B) | labels only | not started | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
 | 2b. Two-stage choice for many options | same fine-tune | not started | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. Measured on Banking77 |
-| 2c. 8k states | yes | Fused segment attention op done (forward+backward, no `[L,L]` tensor), admission raised to `seq_len` 8192, both backends (CPU native, Metal host-bridged -- no on-device kernel yet); fine-tune on teacher-labelled long states not started | Forward and gradients match the dense path (unpacked, local window, tree-packed, with and without dropout) on both backends; a real long-state fine-tune depends on step 2a's teacher labels |
+| 2c. 8k states | yes | Fused segment attention op done (forward+backward, no `[L,L]` tensor), admission raised to `seq_len` 8192, both backends (CPU native, Metal host-bridged -- no on-device kernel yet), `zig build test -- --test-filter laya` green on CPU and Metal; long-state smoke test at 2k OOM'd under this session's system-wide memory pressure before completing one step (15-22 GB used on a loaded 36 GB machine), 4k/8k not attempted; fine-tune on teacher-labelled long states not started | Forward and gradients match the dense path (unpacked, local window, tree-packed, with and without dropout) on both backends; step time/memory at 4k/8k and a real long-state fine-tune remain open, the former blocked on this machine having headroom to rerun the smoke test |
 | 2d. ModernBERT-base student | yes | not started | ~150M parameters, about 2–3× cheaper than Laya-large; keep if its agreement with the teacher stays within tolerance of the large model |
 
 On size and speed: an encoder student beats a small decoder student (for

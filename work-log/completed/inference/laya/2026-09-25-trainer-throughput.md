@@ -332,8 +332,30 @@ to fused attention -- expected tile-order reordering noise at this model's
 scale, not a wrong decision; widened that test's tolerance to 1e-2 with a
 comment explaining why.
 
-The long-state smoke test (2k/4k/8k synthetic states, tens of fine-tune
-steps, step time and peak memory under the gpu lock) recipe (data
-synthesized from `td/train.jsonl` by concatenation, `laya.max_len` raised
-to 8192 in a released-checkpoint copy) is in `.tmp/longstate/`; results
-below once run.
+## Long-state smoke test (2026-09-26)
+
+Recipe in `.tmp/longstate/` (gitignored): 2k/4k/8k-token synthetic states
+built by concatenating distinct `td/train.jsonl` records (word-count
+estimate for the target length, actual tokenization unverified),
+`laya.max_len` raised to 8192 in a copy of the released checkpoint's
+`config.json`/`rl_agent_config.json`, job JSON per size (CPU backend,
+`stop_after_microbatches: 3`, reduced from an initial attempt at 10 that
+demonstrated the same per-step cost more slowly), release binary via
+`zig build -Doptimize=ReleaseFast --prefix .tmp/longstate/rel`, then
+`with-lock gpu -- /usr/bin/time -l .tmp/longstate/rel/bin/antfly-inference
+finetune train laya job_2k.json`.
+
+Result: the 2k run ran 748 s wall, reaching 15.3 GB peak memory footprint
+(21.6 GB max RSS), then failed with `error.OutOfMemory` on an ordinary MLP
+`dot_general` (`[6656, 5248]`) before completing one full step (no
+`"step"` event logged). `vm_stat` at the time showed under 70 MB free
+system-wide -- this session's nine concurrent agent tracks, each running
+released-model work, had exhausted the shared 36 GB machine's memory
+independent of this run. This is not an attention-specific bug (the
+failing op is a dense linear layer, not `fused_segment_training_attention`),
+but it means no clean per-step timing was captured, and 4k/8k were not
+attempted: they need strictly more memory than a 2k run that already used
+15-22 GB with near-zero system headroom, and stopping near 20 GB was the
+explicit guidance. The recipe and reduced-step job configs are ready to
+rerun once the machine has headroom; `vm_stat` is worth checking
+immediately before doing so.
