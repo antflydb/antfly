@@ -216,6 +216,14 @@ pub const EncoderConfig = struct {
     }
 };
 
+/// An Antenna GLiNER neck: a learned map from the trunk's final hidden states
+/// into the space the boundary heads read, applied to every token before
+/// routing. It lets a trunk distilled against another encoder's feature space
+/// keep that encoder's heads. Declared as the top-level `antenna_neck`; only
+/// ModernBERT checkpoints carry one.
+pub const Neck = enum { none, linear };
+pub const neck_prefix = "gliner_neck";
+
 pub const Config = struct {
     version: u32,
     architecture_version: u32,
@@ -223,6 +231,7 @@ pub const Config = struct {
     backbone: Backbone,
     head: HeadConfig,
     encoder: EncoderConfig,
+    neck: Neck = .none,
 };
 
 /// Detect from executable architecture metadata, never from repository names.
@@ -297,8 +306,14 @@ pub fn parseConfig(allocator: std.mem.Allocator, bytes: []const u8, encoder_byte
     const head = try parseHeadConfig(head_value.object);
     try head.validate();
     const encoder = if (modern_encoder) try parseModernBertEncoderConfig(allocator, encoder_bytes) else try parseEncoderConfig(allocator, encoder_bytes, backbone);
+    const neck: Neck = if (obj.get("antenna_neck")) |value| switch (value) {
+        .null => .none,
+        .string => |name| std.meta.stringToEnum(Neck, name) orelse return error.UnsupportedGlinerBoundaryConfiguration,
+        else => return error.InvalidGlinerBoundaryConfig,
+    } else .none;
+    if (neck != .none and !modern_encoder) return error.UnsupportedGlinerBoundaryConfiguration;
     // Without a word limit, the encoder's position limit bounds the words.
-    return .{ .version = version, .architecture_version = arch_version, .max_len = if (unlimited) encoder.max_position_embeddings else max_len, .backbone = backbone, .head = head, .encoder = encoder };
+    return .{ .version = version, .architecture_version = arch_version, .max_len = if (unlimited) encoder.max_position_embeddings else max_len, .backbone = backbone, .head = head, .encoder = encoder, .neck = neck };
 }
 
 pub fn parseHeadConfig(obj: std.json.ObjectMap) !HeadConfig {
@@ -625,4 +640,34 @@ test "gliner boundary parses a ModernBERT encoder from its own config and bounds
         try std.testing.expect(!std.mem.eql(u8, encoder, modern_encoder_json));
         if (parseConfig(a, bytes, encoder)) |_| return error.TestExpectedError else |_| {}
     }
+}
+
+test "gliner boundary reads an Antenna neck only on a ModernBERT checkpoint" {
+    const a = std.testing.allocator;
+    const bytes = try modernConfigBytes(a);
+    defer a.free(bytes);
+    try std.testing.expectEqual(Neck.none, (try parseConfig(a, bytes, modern_encoder_json)).neck);
+    for ([_]struct { []const u8, ?Neck }{
+        .{ "\"antenna_neck\": \"linear\"", .linear },
+        .{ "\"antenna_neck\": null", .none },
+        .{ "\"antenna_neck\": \"mlp\"", null },
+        .{ "\"antenna_neck\": true", null },
+    }) |case| {
+        const replacement = try std.fmt.allocPrint(a, "\"max_len\": null, {s}", .{case[0]});
+        defer a.free(replacement);
+        const necked = try std.mem.replaceOwned(u8, a, bytes, "\"max_len\": null", replacement);
+        defer a.free(necked);
+        if (case[1]) |want| {
+            try std.testing.expectEqual(want, (try parseConfig(a, necked, modern_encoder_json)).neck);
+        } else if (parseConfig(a, necked, modern_encoder_json)) |_| return error.TestExpectedError else |_| {}
+    }
+    // Published DeBERTa checkpoints never carry a neck.
+    const base_config = try loadFixture(a, .base, "config.json");
+    defer a.free(base_config);
+    const base_encoder = try loadFixture(a, .base, "encoder_config.json");
+    defer a.free(base_encoder);
+    const necked_base = try std.mem.replaceOwned(u8, a, base_config, "\"max_len\":", "\"antenna_neck\": \"linear\", \"max_len\":");
+    defer a.free(necked_base);
+    try std.testing.expect(!std.mem.eql(u8, necked_base, base_config));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryConfiguration, parseConfig(a, necked_base, base_encoder));
 }

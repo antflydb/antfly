@@ -160,7 +160,7 @@ pub const Source = struct {
             descriptors[index] = .{ .name = entry.key_ptr.*, .shape = meta.shape, .encoding = .{ .dense = meta.dtype }, .byte_len = @intCast(meta.data_end - meta.data_start), .quantized = false };
         }
         _ = if (self.config.backbone == .modern_bert)
-            try artifact.validateDerived(a, self.config.encoder, descriptors, control)
+            try artifact.validateDerived(a, self.config.encoder, self.config.neck, descriptors, control)
         else
             try artifact.validate(a, self.config.backbone, .fp32, descriptors, control);
         try self.buildStore(data_offset, control);

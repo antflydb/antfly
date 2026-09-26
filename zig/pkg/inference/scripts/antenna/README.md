@@ -101,6 +101,13 @@ the pinned commit.
   freshly initialized published heads. The native training source loads it
   unchanged, and its `processor.json` pins upstream's token ids for that
   tokenizer (`ANTFLY_GLINER25_MODERNBERT_STUDENT=<dir>` runs the check).
+  `--heads-from <checkpoint>` takes trained heads of the same width instead,
+  and `--neck identity` or `--neck-from <fitted>` adds the GLiNER neck
+  (`gliner_neck.{weight,bias}`, config `"antenna_neck": "linear"`).
+- `neck.py` loads checkpoints with or without a neck for the upstream oracle:
+  upstream loads state dicts strictly, so the neck is removed before its load
+  and attached to the encoder output after. `baselines.py` and
+  `upstream_control.py` load through it.
 - `teacher_targets.py` writes boundary training rows from the train splits of
   Banking77 and AG News (classification) and CrossNER ai/literature/music and
   MIT Restaurant (entities). Classification rows carry per-label
@@ -122,4 +129,5 @@ defaults, which are sized for the small DeBERTa checkpoint: for example
 22 GiB, "optimizer_state_bytes": 8 GiB, "optimizer_transaction_bytes": 8 GiB}`
 and `"training_limits": {"differentiation": {"max_tape_bytes": 12 GiB}}`
 (values in bytes). The exported `model/` directory loads with upstream
-`AutoExtractor.from_pretrained`, so the baseline harness evaluates it.
+`AutoExtractor.from_pretrained` (through `neck.py` when it has a neck), so the
+baseline harness evaluates it.

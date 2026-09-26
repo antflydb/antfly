@@ -27,6 +27,9 @@ sys.path.insert(0, str(HERE.parent / "gliner25"))
 import oracle  # noqa: E402
 import modernbert_reference as reference  # noqa: E402
 
+sys.path.insert(0, str(HERE))
+import neck  # noqa: E402
+
 ENCODER = "answerdotai/ModernBERT-base"
 ENCODER_REVISION = "8949b909ec900327062f0ebf497f51aef5e6f0c8"
 HEAD_SEED = 20260925
@@ -38,6 +41,20 @@ def download(repo: str, revision: str, destination: Path) -> Path:
     return Path(snapshot_download(repo, revision=revision, local_dir=str(destination),
                                   allow_patterns=["config.json", "model.safetensors", "tokenizer.json",
                                                   "tokenizer_config.json", "special_tokens_map.json"]))
+
+
+def load_neck(path: Path) -> tuple[Any, Any]:
+    """A fitted neck: safetensors with gliner_neck.{weight,bias}, or a feature
+    distillation state (torch) whose "proj" holds a Linear's weight and bias."""
+    if path.suffix == ".safetensors":
+        from safetensors.torch import load_file
+
+        tensors = load_file(str(path))
+        return tensors[neck.NECK + ".weight"], tensors[neck.NECK + ".bias"]
+    import torch
+
+    state = torch.load(str(path), map_location="cpu", weights_only=True)
+    return state["proj"]["weight"], state["proj"]["bias"]
 
 
 def build(args: argparse.Namespace) -> dict[str, Any]:
@@ -74,6 +91,20 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         model.load_state_dict(heads, strict=False)
         heads_from = {"path": str(args.heads_from), "tensors": len(heads),
                       "model_sha256": oracle.sha256_file(args.heads_from / "model.safetensors")}
+    neck_info = None
+    if args.neck != "none" or args.neck_from:
+        # An Antenna neck between the trunk and the heads (scripts/antenna/neck.py):
+        # identity, or a projection fitted by feature distillation.
+        hidden = model.encoder.config.hidden_size
+        if args.neck_from:
+            weight, bias = load_neck(args.neck_from)
+            if tuple(weight.shape) != (hidden, hidden) or tuple(bias.shape) != (hidden,):
+                raise oracle.ContractError(f"neck does not fit width {hidden}: {tuple(weight.shape)}")
+            neck_info = {"source": str(args.neck_from), "sha256": oracle.sha256_file(args.neck_from)}
+        else:
+            weight, bias = neck.identity(hidden)
+            neck_info = {"source": "identity"}
+        neck.attach(model, weight.float(), bias.float())
     tokenizer = model.processor.tokenizer
     batch = model.processor.collate_fn_inference(
         [(case["text"], oracle.build_extract_schema(case["upstream_schema"]).build()) for case in reference.CASES],
@@ -96,6 +127,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         oracle.write_json(directory / "student.json", {
             "format_version": 1, "encoder": args.encoder, "encoder_revision": args.revision,
             "head_seed": args.seed, "head_settings": "published gliner2.5-base boundary_head", "heads_from": heads_from,
+            "neck": neck_info,
             "vocab_size": model.encoder.config.vocab_size, "tokenizer_length": len(tokenizer),
             "parameters": sum(p.numel() for p in model.parameters()),
             "provenance": provenance, "generator_sha256": oracle.sha256_file(Path(__file__)),
@@ -113,6 +145,8 @@ def main() -> int:
     parser.add_argument("--revision", default=ENCODER_REVISION)
     parser.add_argument("--seed", type=int, default=HEAD_SEED)
     parser.add_argument("--heads-from", type=Path, help="checkpoint whose trained heads replace the fresh ones (same width)")
+    parser.add_argument("--neck", choices=("none", "identity"), default="none", help="add an Antenna neck (scripts/antenna/neck.py)")
+    parser.add_argument("--neck-from", type=Path, help="fitted neck: gliner_neck safetensors or a distillation state with 'proj'")
     print(json.dumps(build(parser.parse_args()), sort_keys=True))
     return 0
 

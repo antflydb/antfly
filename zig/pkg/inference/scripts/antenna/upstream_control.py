@@ -25,6 +25,9 @@ sys.path.insert(0, str(HERE.parent / "gliner25"))
 
 import oracle  # noqa: E402
 
+sys.path.insert(0, str(HERE))
+import neck  # noqa: E402
+
 
 def examples(path: Path) -> list[Any]:
     from gliner2.training.data import Classification, InputExample
@@ -50,12 +53,10 @@ def examples(path: Path) -> list[Any]:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     provenance, torch = oracle.prepare_runtime(args.upstream)
-    from gliner2 import AutoExtractor
     from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
     torch.manual_seed(args.seed)
-    model = AutoExtractor.from_pretrained(str(args.student), local_files_only=True, map_location=args.device,
-                                          use_flashdeberta=False).float()
+    model = neck.load(args.student, local_files_only=True, map_location=args.device, use_flashdeberta=False).float()
     train = examples(args.train)
     config = TrainingConfig(output_dir=str(args.output / "trainer"), num_epochs=args.epochs, batch_size=args.batch_size,
                             gradient_accumulation_steps=args.accumulation, encoder_lr=args.encoder_lr,

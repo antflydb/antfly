@@ -242,15 +242,28 @@ review.
    `scripts/gliner25/oracle.py` and `scripts/laya/*_reference.py` pattern,
    and to run the span teachers (Decide, `gliner2-large-v1`), which we do not
    serve natively.
+9. **Bootstrap the trunk by feature distillation, through a GLiNER neck.**
+   Training a raw trunk on task labels collapses it (see Status). Instead the
+   trunk first learns gliner2.5-base's encoder states over unlabeled text
+   under random schemas, through a linear map fitted in closed form before
+   training. That map stays in the model as the **GLiNER neck**
+   (`gliner_neck`, declared by `"antenna_neck": "linear"`): it belongs to the
+   GLiNER head family, not the trunk, so the Laya, embedding and chunk heads
+   read raw trunk states, and a later trunk (mmBERT, a larger ModernBERT)
+   reuses the same heads by distilling into the same space. It costs about
+   0.7% of ModernBERT-base's per-token compute. Absorbing it into the trunk
+   instead would buy only stock-upstream loading, at the price of another
+   training stage with collapse risk; the oracle loads it through
+   `scripts/antenna/neck.py`.
 
 ## Design
 
 ### Model
 
 ```
-text ─► ModernBERT / mmBERT encoder ─┬─► boundary extraction head   (entities, relations, records)
-       (schema prefix, or tree-      ├─► classifier on [L]          (GLiNER2 classification)
-        packed trunk + branches)     ├─► count / abstention heads
+text ─► ModernBERT / mmBERT encoder ─┬─► GLiNER neck ─┬─► boundary extraction head (entities, relations, records)
+       (schema prefix, or tree-      │                ├─► classifier on [L]        (GLiNER2 classification)
+        packed trunk + branches)     │                └─► count / abstention heads
                                      ├─► Laya decision head         (choice, score, noul)
                                      ├─► embedding head             (dense, Matryoshka; optional SPLADE)
                                      └─► chunk-boundary MLP         (chunk starts, per token)
@@ -263,7 +276,9 @@ text ─► ModernBERT / mmBERT encoder ─┬─► boundary extraction head   
   `token_pooling: first`. The word splitter must match upstream's so that
   teacher and student outputs align (see below).
 - **Extraction and classification:** GLiNER2.5 boundary head and `classifier`
-  MLP, unchanged except for the encoder width they read.
+  MLP, unchanged except for the encoder width they read, behind the GLiNER
+  neck (decision 9): a hidden x hidden linear map applied to every token
+  before routing.
 - **Decision head:** Laya's head ([LAYA.md](../laya/LAYA.md)), reading the
   shared encoder.
 - **Embedding and chunking:** the fused chunker's head designs: a per-token

@@ -218,10 +218,10 @@ def main() -> int:
     sys.path.insert(0, str(args.upstream.resolve()))
     import torch
     import transformers
-    from gliner2 import AutoExtractor
+    import neck
 
-    model = AutoExtractor.from_pretrained(str(args.model), local_files_only=True, map_location="cpu",
-                                          use_flashdeberta=False).float().eval()
+    # Antenna students may carry a neck between trunk and heads.
+    model = neck.load(args.model, local_files_only=True, map_location="cpu", use_flashdeberta=False).float().eval()
     model.to(args.device)
     report: dict[str, Any] = {
         "format_version": 1,
@@ -229,7 +229,8 @@ def main() -> int:
                   "architecture": getattr(model, "architecture", None),
                   "encoder": getattr(getattr(model, "encoder", None), "config", None).model_type
                   if getattr(model, "encoder", None) is not None else None,
-                  "weights_sha256": sha256(args.model / "model.safetensors")},
+                  "weights_sha256": sha256(args.model / "model.safetensors"),
+                  "neck": neck.declared(args.model)},
         "upstream_commit": commit, "device": args.device, "seed": args.seed, "full": args.full,
         "versions": {"python": platform.python_version(), "torch": torch.__version__,
                      "transformers": transformers.__version__, "machine": platform.machine()},

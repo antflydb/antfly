@@ -99,10 +99,11 @@ const View = struct {
     sidecars: [4][]const u8,
     /// Selects the config-derived inventory for a ModernBERT source.
     encoder: model.EncoderConfig = std.mem.zeroes(model.EncoderConfig),
+    neck: model.Neck = .none,
 
     fn of(a: Allocator, source: *const source_mod.Source) !View {
         if (source.config.backbone != source.identity.backbone) return error.InvalidBoundaryTrainingSource;
-        var result = View{ .identity = source.identity, .parameters = source.parameters, .sidecars = undefined, .encoder = source.config.encoder };
+        var result = View{ .identity = source.identity, .parameters = source.parameters, .sidecars = undefined, .encoder = source.config.encoder, .neck = source.config.neck };
         for (&result.sidecars, 0..) |*bytes, index| bytes.* = try source.sidecar(index);
         try validateSourceMetadata(a, result, null);
         return result;
@@ -369,7 +370,7 @@ fn prepare(a: Allocator, source: View, snapshot: Snapshot, limits: Limits, contr
 
 fn validateSourceMetadata(a: Allocator, source: View, control: ?Control) !void {
     try validateSourceIdentity(source);
-    var derived: ?policy.Derived = if (source.identity.backbone == .modern_bert) try policy.modernBertSpecs(a, source.encoder) else null;
+    var derived: ?policy.Derived = if (source.identity.backbone == .modern_bert) try policy.modernBertSpecs(a, source.encoder, source.neck) else null;
     defer if (derived) |*value| value.deinit();
     const expected = if (derived) |value| value.specs else policy.specs(source.identity.backbone);
     if (source.parameters.len != expected.len or source.identity.weight.size_bytes == 0) return error.InvalidBoundaryTrainingSource;

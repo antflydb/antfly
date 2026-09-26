@@ -185,6 +185,7 @@ pub fn planWithProfiles(config: *const boundary.Config, layout: Layout, mode: Mo
     if (config.version != boundary.config_version or config.architecture_version != boundary.architecture_version)
         return error.UnsupportedGlinerBoundaryVersion;
     if (e.family == .modern_bert) return planModernBert(config, layout, mode, profile, activation, limits);
+    if (config.neck != .none) return error.UnsupportedGlinerBoundaryConfiguration;
     if (layout.batch == 0 or layout.sequence == 0 or e.hidden_size == 0 or e.num_hidden_layers == 0 or
         e.num_attention_heads == 0 or e.hidden_size % e.num_attention_heads != 0 or e.intermediate_size == 0 or
         e.vocab_size == 0 or e.max_position_embeddings == 0 or e.position_buckets == 0 or
@@ -328,13 +329,16 @@ fn planModernBert(config: *const boundary.Config, layout: Layout, mode: Mode, pr
     // Fused layers keep packed [Q;K;V] rows and per-row statistics instead.
     const attention_bytes = if (fused) try add(try mul(hidden, 3), try mul(bs, heads)) else try mul(scores, 8);
     const per_layer = try add(try add(attention_bytes, try mul(hidden, 32)), try mul(try mul(bs, e.intermediate_size), 8));
-    const forward_bytes = try add(try add(binding_bytes, constant_bytes), try mul(try add(try mul(e.num_hidden_layers, per_layer), try add(try mul(hidden, 4), try mul(routed_rows, e.hidden_size))), 4));
+    // The neck adds one [B*S,H] output plus its retained linear storage.
+    const neck_hidden: u64 = if (config.neck == .linear) try mul(hidden, 2) else 0;
+    const forward_bytes = try add(try add(binding_bytes, constant_bytes), try mul(try add(try add(try mul(e.num_hidden_layers, per_layer), neck_hidden), try add(try mul(hidden, 4), try mul(routed_rows, e.hidden_size))), 4));
     if (forward_bytes > limits.max_forward_tensor_bytes) return error.ResourceLimitExceeded;
     const h = e.hidden_size;
     // Wqkv, Wo, mlp.Wi (2*intermediate), mlp.Wo, and two norm weights per
     // layer (layer 0 has no attn_norm); embeddings, embedding and final norms.
     const layer_parameters = try add(try add(try mul(try mul(h, h), 4), try mul(try mul(h, e.intermediate_size), 3)), try mul(h, 2));
-    const parameters = try add(try mul(e.vocab_size, h), try add(try mul(h, 2), try mul(e.num_hidden_layers, layer_parameters)));
+    const neck_parameters: u64 = if (config.neck == .linear) try add(try mul(h, h), h) else 0;
+    const parameters = try add(try add(try mul(e.vocab_size, h), neck_parameters), try add(try mul(h, 2), try mul(e.num_hidden_layers, layer_parameters)));
     return .{
         .attention_score_elements = scores,
         .attention_work_items = attention_work,
@@ -512,10 +516,16 @@ pub fn buildWithEmbeddingArithmetic(bld: *Builder, config: *const boundary.Confi
             layers[layers.len - 1].output != encoder.output_node) return error.InvalidBoundaryEncoderRegion;
         break :deberta_encoder encoder.output_node;
     };
+    // The Antenna neck maps every token into the heads' space; the encoder
+    // region still ends at the trunk output.
+    const head_input = switch (config.neck) {
+        .none => encoder_output,
+        .linear => try trunk.linear(bld, encoder_output, boundary.neck_prefix, bs, e.hidden_size, e.hidden_size, true),
+    };
     var routed: [6]NodeId = .{null_node} ** 6;
     for (inputs.routes, 0..) |route, index| {
         if (route.width == 0) continue;
-        const gathered = try bld.gather(encoder_output, route.indices, Shape.init(.f32, &.{ try rows(layout.batch, route.width), e.hidden_size }));
+        const gathered = try bld.gather(head_input, route.indices, Shape.init(.f32, &.{ try rows(layout.batch, route.width), e.hidden_size }));
         routed[index] = try bld.mul(gathered, route.valid);
     }
     const relations = if (layout.relations == 0) null_node else if (config.head.directional_relation_states)
@@ -534,7 +544,7 @@ pub fn buildWithEmbeddingArithmetic(bld: *Builder, config: *const boundary.Confi
         .limits = limits,
         .admission = admission,
         .inputs = inputs,
-        .nodes = .{ .encoder = encoder_output, .text = routed[0], .queries = routed[1], .classifications = routed[2], .parents = routed[3], .relation_queries = relations },
+        .nodes = .{ .encoder = head_input, .text = routed[0], .queries = routed[1], .classifications = routed[2], .parents = routed[3], .relation_queries = relations },
         .dropouts = try dropout.descriptors.toOwnedSlice(bld.graph.allocator),
         .regions = .{ .embedding_output = regions.embedding_output, .normalized_relative = regions.normalized_relative, .layers = layers, .output = encoder_output },
     };
