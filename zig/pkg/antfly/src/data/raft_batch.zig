@@ -204,8 +204,9 @@ fn consumerTests() type {
             try std.testing.expect(merge_copy_attempt_protocol_version > merge_artifacts_protocol_version);
             try std.testing.expect(merge_page_protocol_version > merge_copy_attempt_protocol_version);
             try std.testing.expect(source_scope_protocol_version > relational_transfer_protocol_version);
-            try std.testing.expectEqual(protocol_version, source_scope_protocol_version);
-            try std.testing.expectEqual(protocol_version, source_pin_protocol_version);
+            try std.testing.expect(source_scope_protocol_version < completion_protocol_version);
+            try std.testing.expectEqual(source_scope_protocol_version, source_pin_protocol_version);
+            try std.testing.expectEqual(protocol_version, mutation_completion_protocol_version);
             const encoded = try encodeProtocolBarrier(std.testing.allocator, "docs", timestamp_protocol_version);
             defer std.testing.allocator.free(encoded);
 

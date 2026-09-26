@@ -6725,6 +6725,14 @@ pub const DataServer = struct {
         self.write_source.setLocalChangeHook(self.localChangeHook());
         self.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
+        if (self.data_raft != null) {
+            _ = self.write_source.withDistributedTransactionRouting(
+                self.dataReadGroupRouter(),
+                try self.distributedReadExecutor(),
+                api_server_cfg.internal_service_secret,
+                api_server_cfg.internal_service_issuer,
+            );
+        }
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
         }
@@ -9833,6 +9841,7 @@ pub const DataServer = struct {
                 .group_leader_node_id = dataReadRouterGroupLeaderNodeId,
                 .node_base_uri = dataReadRouterNodeBaseUri,
                 .node_base_uri_for_group = dataReadRouterNodeBaseUriForGroup,
+                .node_control_base_uri_for_group = dataReadRouterNodeControlBaseUriForGroup,
                 .group_node_ids = dataReadRouterGroupNodeIds,
                 .resolve_group_routes = dataReadRouterResolveGroupRoutes,
             },
@@ -10196,6 +10205,30 @@ pub const DataServer = struct {
         if (!store.live or !std.mem.eql(u8, store.health_class, "healthy") or store.api_url.len == 0)
             return null;
         return try alloc.dupe(u8, store.api_url);
+    }
+
+    fn dataReadRouterNodeControlBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, budget: antfly.public_api.table_router.RouteBudget) !?[]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.remote_metadata) |metadata| {
+            const peers = try metadata.acquireControlReadGeneration(budget);
+            defer peers.release();
+            if (!peers.readable(group_id, node_id)) return null;
+            return peers.nodeControlUri(alloc, node_id);
+        }
+        var snapshot = try self.read_source.catalog.adminSnapshot();
+        defer self.read_source.catalog.freeAdminSnapshot(&snapshot);
+        var readable_placement = false;
+        for (snapshot.placement_intents) |intent| {
+            if (intent.record.group_id != group_id or intent.record.local_node_id != node_id) continue;
+            if (!antfly.raft.reconciler.placementReadableWithPeers(snapshot.placement_intents, intent)) continue;
+            readable_placement = true;
+            break;
+        }
+        if (!readable_placement) return null;
+        const store = findSnapshotStoreByNodeId(snapshot.stores, node_id) orelse return null;
+        if (!store.live or !std.mem.eql(u8, store.health_class, "healthy") or store.api_url.len == 0)
+            return null;
+        return try alloc.dupe(u8, if (store.internal_api_url.len != 0) store.internal_api_url else store.api_url);
     }
 
     fn onlineMergeIo(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("../storage/db/online_merge_io_contract.zig").Request, context: antfly.public_api.operation.RequestContext) ![]u8 {
@@ -22908,6 +22941,7 @@ const ControlReadGeneration = struct {
     alloc: std.mem.Allocator,
     references: std.atomic.Value(usize) = .init(1),
     nodes: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
+    control_nodes: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
     groups: std.AutoHashMapUnmanaged(u64, Group) = .empty,
 
     planning: *antfly.public_api.join_planning.Generation,
@@ -22935,6 +22969,13 @@ const ControlReadGeneration = struct {
             };
             if (entry.found_existing) alloc.free(entry.value_ptr.*);
             entry.value_ptr.* = url;
+            const control_url = try alloc.dupe(u8, if (store.internal_api_url.len != 0) store.internal_api_url else store.api_url);
+            const control_entry = self.control_nodes.getOrPut(alloc, store.node_id) catch |err| {
+                alloc.free(control_url);
+                return err;
+            };
+            if (control_entry.found_existing) alloc.free(control_entry.value_ptr.*);
+            control_entry.value_ptr.* = control_url;
             try store_nodes.put(alloc, store.store_id, store.node_id);
         }
         for (snapshot.placement_intents) |intent| {
@@ -22975,6 +23016,9 @@ const ControlReadGeneration = struct {
         var nodes = self.nodes.valueIterator();
         while (nodes.next()) |url| self.alloc.free(url.*);
         self.nodes.deinit(self.alloc);
+        var control_nodes = self.control_nodes.valueIterator();
+        while (control_nodes.next()) |url| self.alloc.free(url.*);
+        self.control_nodes.deinit(self.alloc);
         var groups = self.groups.valueIterator();
         while (groups.next()) |group| group.nodes.deinit(self.alloc);
         self.groups.deinit(self.alloc);
@@ -22989,6 +23033,10 @@ const ControlReadGeneration = struct {
 
     fn nodeUri(self: *const ControlReadGeneration, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
         return try alloc.dupe(u8, self.nodes.get(node_id) orelse return null);
+    }
+
+    fn nodeControlUri(self: *const ControlReadGeneration, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+        return try alloc.dupe(u8, self.control_nodes.get(node_id) orelse return null);
     }
 };
 
@@ -27735,8 +27783,9 @@ fn findSnapshotStoreByNodeId(
     return null;
 }
 
-/// Only recovery-status RPCs use this endpoint. General group routing still
-/// needs the public URL because the protected listener has a narrow route set.
+/// Recovery-status RPCs use this endpoint. General group routing still needs
+/// the public URL because the protected listener has a narrow route set; the
+/// signed first-decision RPC selects its control URL through the router.
 fn recoveryStatusEndpoint(store: antfly.metadata.StoreRecord, authenticated: bool) ?[]const u8 {
     if (authenticated and store.internal_api_url.len != 0) return store.internal_api_url;
     if (store.api_url.len != 0) return store.api_url;
@@ -36067,28 +36116,28 @@ fn consumerTests() type {
                 .{ .online_source = .{ .reclaim = .{ .scope = source_scope, .frame_limit = 1, .byte_limit = 1 } } },
                 .{ .timestamp_ns = 303, .writes = &.{.{ .key = "doc:tail", .value = "{\"title\":\"continued\"}" }} },
             };
-            apply_sm.test_faults.semantic_rejection_once = .{ .index = 18, .reason = error.RetainedEffectsFull };
+            apply_sm.test_faults.semantic_rejection_once = .{ .index = 21, .reason = error.RetainedEffectsFull };
             for (source_commands, 0..) |request, offset| {
-                const index: u64 = 16 + @as(u64, @intCast(offset));
+                const index: u64 = 19 + @as(u64, @intCast(offset));
                 const encoded = try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, "docs", request, if (descriptor) |*value| value.view() else null);
                 defer alloc.free(encoded);
                 const entry = [_]raft_engine.core.Entry{.{ .term = 2, .index = index, .entry_type = .normal, .data = encoded }};
                 try apply_sm.registerApplyOutcomeWaiter(group_id, index, 2);
                 try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entry, &.{});
                 const outcome = apply_sm.takeApplyOutcome(group_id, index).?;
-                if (index == 18) try std.testing.expectEqual(error.RetainedEffectsFull, outcome.failed.toError()) else try std.testing.expectEqual(.succeeded, outcome);
+                if (index == 21) try std.testing.expectEqual(error.RetainedEffectsFull, outcome.failed.toError()) else try std.testing.expectEqual(.succeeded, outcome);
             }
-            try std.testing.expectEqual(@as(u64, 21), apply_sm.appliedIndex(group_id));
+            try std.testing.expectEqual(@as(u64, 24), apply_sm.appliedIndex(group_id));
             const committed_resolution: antfly.db.types.BatchRequest = .{ .transaction = .{ .resolve = .{ .txn_id = txn_a, .status = .committed, .commit_version = 400 } } };
             try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.forRequest(error.RetainedEffectsFull, committed_resolution));
             const committed_payload = try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, "docs", committed_resolution, if (descriptor) |*value| value.view() else null);
             defer alloc.free(committed_payload);
-            const committed_entry = [_]raft_engine.core.Entry{.{ .term = 2, .index = 22, .entry_type = .normal, .data = committed_payload }};
-            apply_sm.test_faults.semantic_rejection_once = .{ .index = 22, .reason = error.RetainedEffectsFull };
-            try apply_sm.registerApplyOutcomeWaiter(group_id, 22, 2);
+            const committed_entry = [_]raft_engine.core.Entry{.{ .term = 2, .index = 25, .entry_type = .normal, .data = committed_payload }};
+            apply_sm.test_faults.semantic_rejection_once = .{ .index = 25, .reason = error.RetainedEffectsFull };
+            try apply_sm.registerApplyOutcomeWaiter(group_id, 25, 2);
             try std.testing.expectError(error.RaftApplyWriterUnavailable, RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &committed_entry, &.{}));
-            try std.testing.expectEqual(@as(u64, 21), apply_sm.appliedIndex(group_id));
-            try std.testing.expectEqual(.pending, apply_sm.takeApplyOutcome(group_id, 22).?);
+            try std.testing.expectEqual(@as(u64, 24), apply_sm.appliedIndex(group_id));
+            try std.testing.expectEqual(.pending, apply_sm.takeApplyOutcome(group_id, 25).?);
         }
 
         test "data runtime structural raft progress prefers durable restart state over process-local outcomes" {
@@ -36226,6 +36275,10 @@ fn consumerTests() type {
                 .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
             };
+            // The completion guard consults the metadata cache before a
+            // bootstrap campaign; direct fixture reconciliation alone does
+            // not publish that authority.
+            server.remote_metadata.?.cached_snapshot = try cloneAdminSnapshotOwned(alloc, snapshot);
             try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
             try std.testing.expectEqual(@as(?u64, 17), server.last_data_raft_reconciled_metadata_epoch);
             try std.testing.expectEqual(@as(usize, 1), server.last_data_raft_local_intents.len);
@@ -42513,11 +42566,19 @@ fn consumerTests() type {
             second_reader.release();
             var server: DataServer = undefined;
             server.data_raft = null;
+            server.remote_metadata = &source;
             var pinned: DataServer.PinnedReadPeerRouter = .{ .server = &server, .peers = retained };
             var route = (try antfly.public_api.table_router.resolveGroupRoute(alloc, undefined, pinned.router(), 77, .prefer_leader)).?;
             defer route.deinit(alloc);
             try std.testing.expectEqualStrings("http://new", route.remote.base_uri);
             try std.testing.expectEqual(@as(u64, 2), route.remote.node_id);
+            const control_uri = (try server.dataReadGroupRouter().nodeControlBaseUriForGroup(alloc, 77, 2)).?;
+            defer alloc.free(control_uri);
+            try std.testing.expectEqualStrings("http://new-internal", control_uri);
+            try std.testing.expect((try server.dataReadGroupRouter().nodeControlBaseUriForGroup(alloc, 77, 1)) == null);
+            const rolling_peer_uri = (try retained.nodeControlUri(alloc, 1)).?;
+            defer alloc.free(rolling_peer_uri);
+            try std.testing.expectEqualStrings("http://old", rolling_peer_uri);
             try std.testing.expectEqualStrings("http://new-internal", recoveryStatusEndpoint(stores[1], true).?);
             try std.testing.expectEqualStrings("http://new", recoveryStatusEndpoint(stores[1], false).?);
             try std.testing.expectEqualStrings("http://old", recoveryStatusEndpoint(stores[0], true).?);

@@ -8215,6 +8215,14 @@ pub const ProvisionedTableWriteSource = struct {
     local_change_hook: ?LocalChangeHook = null,
     local_index_repair_debt_hook: ?LocalIndexRepairDebtHook = null,
     raft_batcher: ?RaftBatcher = null,
+    /// Direct DATA ingress needs a leader-aware coordinator for the first
+    /// decision. Group-local Raft decision remains strictly local-only.
+    transaction_route: ?struct {
+        router: table_router.HostedGroupRouter,
+        executor: http_common.RequestExecutor,
+        internal_service_secret: ?[]const u8,
+        internal_service_issuer: ?[]const u8,
+    } = null,
     local_write_owner: ?*ProvisionedTableWriteSource = null,
     /// Optional local physical-operation provider. Top-level routing,
     /// coalescing, admission, and lifecycle remain on this source; a compiled
@@ -8943,6 +8951,22 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn withRaftBatcher(self: *ProvisionedTableWriteSource, batcher: ?RaftBatcher) *ProvisionedTableWriteSource {
         self.raft_batcher = batcher;
+        return self;
+    }
+
+    pub fn withDistributedTransactionRouting(
+        self: *ProvisionedTableWriteSource,
+        router: table_router.HostedGroupRouter,
+        executor: http_common.RequestExecutor,
+        internal_service_secret: ?[]const u8,
+        internal_service_issuer: ?[]const u8,
+    ) *ProvisionedTableWriteSource {
+        self.transaction_route = .{
+            .router = router,
+            .executor = executor,
+            .internal_service_secret = internal_service_secret,
+            .internal_service_issuer = internal_service_issuer,
+        };
         return self;
     }
 
@@ -23276,12 +23300,19 @@ pub const ProvisionedTableWriteSource = struct {
         if (context) |bounded| try distributed_txn.ensurePreDecisionContextActive(bounded);
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        var worker_impl = distributed_txn.LocalTableWriteParticipantWorker.init(self.source());
+        var local_worker = distributed_txn.LocalTableWriteParticipantWorker.init(self.source());
+        var routed_worker: distributed_txn.HostedParticipantWorker = undefined;
+        var worker = local_worker.worker();
+        if (self.transaction_route) |route| {
+            routed_worker = distributed_txn.HostedParticipantWorker.init(self.catalog, route.router, self.source(), route.executor);
+            _ = routed_worker.withInternalServiceAuth(route.internal_service_secret, route.internal_service_issuer);
+            worker = routed_worker.worker();
+        }
         const commit_version = begin_timestamp + 1;
         return try distributed_txn.executeMultiTableCommitWithOptions(
             alloc,
             self.catalog,
-            worker_impl.worker(),
+            worker,
             txn_id,
             begin_timestamp,
             commit_version,
