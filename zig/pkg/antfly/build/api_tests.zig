@@ -919,6 +919,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "hosted participant attempt deadline preserves the server outcome window",
             "hosted participant rediscovery retries only pre-decision leader unavailability",
             "distributed txn coordinator aborts only participants that may have begun",
+            "DistributedEntitySink deletes an old pinned copy while moving a key",
+            "DistributedEntitySink live replay preserves curator redirects and alias union",
+            "DistributedEntitySink upserts a merge transform per entity",
+            "DistributedEntitySink overwrites the redirect for a merged tombstone",
+            "DistributedEntitySink records a cross-table redirect",
             "DistributedEntitySink atomic promotion batch prefers stateless batch commit",
             "DistributedEntitySink commits a re-key across pinned physical tables atomically",
             "DistributedEntitySink batch commit remains compatible with transaction-only sources",
@@ -1514,6 +1519,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         lib_serverless_docid_runtime_filters,
     );
     const run_api_transactions_docid_tests = addFilteredTestRunArtifact(b, api_transactions_docid_tests);
+    b.step("antfly-api-transaction-commit-test", "Run routed transaction commit and entity promotion contracts").dependOn(&run_api_transactions_docid_tests.step);
     const write_implementation_tests = b.addTest(.{
         .name = "api-table-write-implementation-tests",
         .root_module = write_implementation_module,

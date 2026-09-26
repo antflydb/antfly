@@ -1802,3 +1802,95 @@ failed). Scoping those controls to schema-index work completed the identical
 three-metadata/three-data-node test in 30.24 s. Restore retains cancellation and
 ownership fences; index repair retains its scheduling quantum. The E2E proxy
 keeps the latency injection as a regression alongside the stalled status route.
+
+
+## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
+
+Scheduled run `36247286560` passed qualification, all five campaigns, and the
+corpus. Its cluster-restore jobs failed repeatedly on a renamed selector;
+production E2E also failed restore, Autograph, and large-catalog cases. The
+Autograph evidence verifier additionally expected an unparameterized test name,
+although that selector now produces both `prefix` and `exact_key` cases.
+
+The cluster-restore selector is now `test_backup_restore_discovers_leader_past_stalled_topology`.
+The regression loop collects all selectors before building or admitting workers,
+so a missing test fails once rather than consuming a whole soak. Evidence checks
+still require exact case inventories and reject failures, errors, and skips.
+
+A retained restore root logged `AddressInUse` and exited, while its fixture
+accepted another server's HTTP readiness. This permits an isolated restore
+to observe another fixture's catalog, matching the four-table contamination
+signature. Listener allocation now
+avoids the configured client ephemeral range and retains a cross-process
+advisory lease throughout handoff, child lifetime, pauses, and restarts. Readiness
+checks the owned process before and after HTTP; standalone also requires a bind
+log from the current process incarnation. Advisory leases coordinate fixtures;
+external listeners are still handled by failing startup, not by accepting their
+HTTP replies.
+
+A live Autograph promotion unconditionally removed destination redirects. Its
+remote commit can succeed before source promotion state is persisted, so replay
+could erase a curator's `merged_into` and `merged_into_table`. Live promotion now
+preserves redirect authority while unioning aliases; explicit re-key tombstones
+still update redirects. Physical moves exclude source-copy redirects while
+preserving destination curation under the existing version/digest predicates.
+The deterministic transform regression fails against the original sink, as does
+the cross-process handoff regression against the original port allocator.
+
+The catalog logs include a 17.5-second metadata WAL sync and transient leadership
+loss. Public catalog mutations now retain the existing Raft non-admission proof,
+including through the HTTP adapter. The exclusively owned resource helper retries
+only proven non-admission, observes unknown delivery/commit outcomes without
+replaying, and checks initial ownership and the final resource. It does not make
+slow storage fast or treat a read showing absence as permission to replay an
+uncertain create. Readiness, mutation, and observation retain finite deadlines.
+
+Local validation uses macOS arm64 ReleaseFast CPU builds. Linux scheduled-run
+validation remains required; successful native soaks alone do not establish that
+the original Linux persistence timing has disappeared.
+
+Final native evidence (macOS arm64, ReleaseFast CPU):
+
+- Python fixture and admission contracts: **129 passed**, one Linux-only live
+  port-range check skipped. Regression-loop supervisor contracts: **14 passed**.
+- Routed promotion/transaction contracts: **17 passed**. Catalog API contracts,
+  including the public HTTP admission-proof regression: **106 passed**.
+- Existing deterministic metadata WAL-stall recovery scenario: **1 passed**,
+  with a replacement leader, completed read barriers, and no continued term churn.
+- Standalone restore: **200/200 passed**, two workers × 50 repetitions × two cases.
+- Catalog: **100/100 passed**, 50 per normal/constrained profile.
+- Cluster restore: **40/40 passed**, 20 per normal/constrained profile; each
+  profile used two workers × five repetitions × two selectors.
+- Autograph: **300/300 passed**, 150 per normal/constrained profile; each
+  profile contains 50 prefix, 50 exact-key, and 50 data-restart cases.
+
+With the unchanged-main executable, native baselines passed **200/200**
+standalone restore cases and **12/12** catalog cases. They did not reproduce Linux's slow-WAL signature;
+the old-versus-new deterministic regressions provide the isolated defect proof.
+Earlier relocated-binary attempts with a renamed executable were invalid: the
+fixtures use its `antfly` basename to select the launch mode. Those attempts are
+excluded from every final count. The qualified profiles use a frozen executable
+named `antfly`, SHA-256
+`8e7e0d77b8012536d1e108221f1f5ade59a3845949e038b78b8dc49c4e2cb790`.
+
+Run the same bounded profiles from the repository root with a CPU executable
+whose filename is `antfly`:
+
+```sh
+export ANTFLY_BIN=/absolute/path/to/bin/antfly SKIP_BUILD=1
+export ANTFLY_E2E_REGRESSION_WORKERS=2
+ANTFLY_E2E_REGRESSION_REPEATS=50 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/restore-soak \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_backup_restore.py::test_cluster_restore_modes \
+  e2e/antfly/test_backup_restore.py::test_cluster_restore_modes_with_concurrent_observers
+ANTFLY_E2E_REGRESSION_REPEATS=25 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/autograph-soak \
+  scripts/ci/zig-e2e-autograph-soak.sh
+ANTFLY_E2E_REGRESSION_REPEATS=25 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/catalog-soak \
+  scripts/ci/zig-e2e-catalog-soak.sh
+ANTFLY_E2E_REGRESSION_REPEATS=5 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/cluster-restore-soak \
+  scripts/ci/zig-e2e-cluster-restore-soak.sh
+```

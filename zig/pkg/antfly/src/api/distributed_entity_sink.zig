@@ -217,7 +217,12 @@ pub const DistributedEntitySink = struct {
             var old = try reads.lookup(a, old_physical, e.key, .{ .include_primary_digest = true }, .read_index);
             defer if (old) |*row| row.deinit(a);
             if (old) |row| {
-                try mergePromotionDocument(a, &move.value_ptr.document, try parsePromotionDocument(a, row.json));
+                var source = try parsePromotionDocument(a, row.json);
+                // Redirects on the retired physical copy do not describe the
+                // destination. Preserve the destination's own curation.
+                _ = source.object.swapRemove("merged_into");
+                _ = source.object.swapRemove("merged_into_table");
+                try mergePromotionDocument(a, &move.value_ptr.document, source);
             }
             // Fence the observed absence too. Another promotion can recreate
             // this old copy between the read and commit; the batch must then
@@ -248,11 +253,6 @@ pub const DistributedEntitySink = struct {
         }
         for (moves.values()) |*move| {
             const batch = try promotionTableBatch(a, &tables, move.physical);
-            // The survivor is live even when either stored copy was a
-            // tombstone. Match the ordinary promotion transform's redirect
-            // clearing before replacing its complete document.
-            _ = move.document.object.swapRemove("merged_into");
-            _ = move.document.object.swapRemove("merged_into_table");
             try batch.writes.append(a, .{ .key = move.key, .value = try std.json.Stringify.valueAlloc(a, move.document, .{}) });
             try batch.predicates.append(a, .{ .key = move.key, .expected_version = move.version, .expected_content_digest = move.digest });
         }
@@ -363,20 +363,24 @@ fn buildMergeOps(a: std.mem.Allocator, doc_json: []const u8) ![]db_mod.types.Tra
             }
         }
     }
-    // A re-keyed mention's tombstone must OVERWRITE the live document's
-    // redirect (set, not set_on_insert), and a live promotion must clear a
-    // stale redirect: a key that is a current canonical target cannot keep
-    // pointing elsewhere, or candidates would follow the redirect away from
-    // a live node.
+    // Absence of a redirect in a live promotion is not an instruction to
+    // remove a curator's redirect. The sink can be replayed after its remote
+    // commit succeeds but before the source persists its promotion state.
+    // Only an explicit re-key tombstone owns a redirect update; it also clears
+    // an earlier cross-table qualifier when redirecting within the same table.
     if (obj.get("merged_into")) |v| {
-        if (v == .string) try ops.append(a, .{ .op = .set, .path = "merged_into", .value_json = try jsonStringAlloc(a, v.string) });
-    } else {
-        try ops.append(a, .{ .op = .unset, .path = "merged_into", .value_json = null });
-    }
-    if (obj.get("merged_into_table")) |v| {
-        if (v == .string) try ops.append(a, .{ .op = .set, .path = "merged_into_table", .value_json = try jsonStringAlloc(a, v.string) }) else try ops.append(a, .{ .op = .unset, .path = "merged_into_table", .value_json = null });
-    } else {
-        try ops.append(a, .{ .op = .unset, .path = "merged_into_table", .value_json = null });
+        if (v == .string) {
+            try ops.append(a, .{ .op = .set, .path = "merged_into", .value_json = try jsonStringAlloc(a, v.string) });
+            if (obj.get("merged_into_table")) |table| {
+                if (table == .string) {
+                    try ops.append(a, .{ .op = .set, .path = "merged_into_table", .value_json = try jsonStringAlloc(a, table.string) });
+                } else {
+                    try ops.append(a, .{ .op = .unset, .path = "merged_into_table" });
+                }
+            } else {
+                try ops.append(a, .{ .op = .unset, .path = "merged_into_table" });
+            }
+        }
     }
     return try ops.toOwnedSlice(a);
 }
@@ -558,10 +562,36 @@ test "DistributedEntitySink upserts a merge transform per entity" {
     try testing.expect(std.mem.indexOf(u8, ops, "set_on_insert entity_type=\"person\"") != null);
     try testing.expect(std.mem.indexOf(u8, ops, "set_on_insert canonical_name=\"Ada Lovelace\"") != null);
     try testing.expect(std.mem.indexOf(u8, ops, "add_to_set aliases=\"Ada Lovelace\"") != null);
-    // A live promotion clears any stale redirect: the key is a current
-    // canonical target.
-    try testing.expect(std.mem.indexOf(u8, ops, "unset merged_into=;") != null);
-    try testing.expect(std.mem.indexOf(u8, ops, "unset merged_into_table=;") != null);
+    // Live promotions leave destination redirect authority untouched.
+    try testing.expect(std.mem.indexOf(u8, ops, "merged_into") == null);
+}
+
+test "DistributedEntitySink live replay preserves curator redirects and alias union" {
+    const alloc = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const operations = try buildMergeOps(arena.allocator(),
+        \\{"entity_type":"person","canonical_name":"Ada","aliases":["Ada","Countess"]}
+    );
+    const transform: db_mod.types.DocumentTransform = .{ .key = "person/ada", .operations = operations, .upsert = true };
+    const resolve = @import("../storage/db/transform.zig").resolveDocumentTransform;
+    const curated =
+        \\{"entity_type":"person","canonical_name":"Curated Ada","aliases":["Ada"],"merged_into":"person/curated","merged_into_table":"curated_people","curator_note":true}
+    ;
+    const first = (try resolve(alloc, curated, transform)).?;
+    defer alloc.free(first);
+    const replay = (try resolve(alloc, first, transform)).?;
+    defer alloc.free(replay);
+    try testing.expectEqualStrings(first, replay);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, replay, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try testing.expect(object.get("merged_into") != null);
+    try testing.expectEqualStrings("person/curated", object.get("merged_into").?.string);
+    try testing.expectEqualStrings("curated_people", object.get("merged_into_table").?.string);
+    try testing.expectEqualStrings("Curated Ada", object.get("canonical_name").?.string);
+    try testing.expect(object.get("curator_note").?.bool);
+    try testing.expectEqual(@as(usize, 2), object.get("aliases").?.array.items.len);
 }
 
 test "DistributedEntitySink overwrites the redirect for a merged tombstone" {
@@ -743,7 +773,7 @@ test "DistributedEntitySink deletes an old pinned copy while moving a key" {
             self.new_reads += 1;
             if (self.invalid_aliases) return .{ .json = try a.dupe(u8, "{\"aliases\":42}"), .version = 3 };
             if (self.scalar_aliases) return .{ .json = try a.dupe(u8, "{\"aliases\":\"Countess Ada\",\"new_note\":true}"), .version = 3 };
-            return .{ .json = try a.dupe(u8, "{\"canonical_name\":\"New Ada\",\"aliases\":[\"Countess Ada\"],\"new_note\":true,\"merged_into_table\":\"other_people\"}"), .version = 3 };
+            return .{ .json = try a.dupe(u8, "{\"canonical_name\":\"New Ada\",\"aliases\":[\"Countess Ada\"],\"new_note\":true,\"merged_into\":\"person/curated\",\"merged_into_table\":\"other_people\"}"), .version = 3 };
         }
 
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) anyerror!?table_reads.ScanResponse {
@@ -790,8 +820,8 @@ test "DistributedEntitySink deletes an old pinned copy while moving a key" {
     );
     var moved = try std.json.parseFromSlice(std.json.Value, alloc, fake.write_docs.items[0], .{});
     defer moved.deinit();
-    try testing.expect(moved.value.object.get("merged_into") == null);
-    try testing.expect(moved.value.object.get("merged_into_table") == null);
+    try testing.expectEqualStrings("person/curated", moved.value.object.get("merged_into").?.string);
+    try testing.expectEqualStrings("other_people", moved.value.object.get("merged_into_table").?.string);
     try testing.expectEqualSlices(u64, &.{ 7, 3 }, fake.predicate_versions.items);
 
     var missing_reads = FakeReads{ .old_exists = false };

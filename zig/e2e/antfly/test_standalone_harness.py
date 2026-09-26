@@ -937,3 +937,83 @@ def test_cluster_replication_requires_matching_ready_topology_on_every_node(defe
         backups.ThreeByThreeBackupCluster.fully_replicated_topology(cluster, "docs")
         is None
     )
+
+
+def test_startup_rejects_foreign_response_when_own_process_exits(monkeypatch):
+    class Process:
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    process = Process()
+
+    def foreign_response(*args, **kwargs):
+        process.returncode = 1  # Our bind failed while another server answered.
+        return SimpleNamespace(ok=True, status_code=200)
+
+    monkeypatch.setattr(e2e_conftest.requests, "get", foreign_response)
+    assert not e2e_conftest.wait_for_server(
+        "http://127.0.0.1:12345", processes=[("server", process)], timeout=1
+    )
+
+
+def test_startup_requires_own_listener_acknowledgement(monkeypatch):
+    calls = []
+    bound = False
+
+    def response(*args, **kwargs):
+        calls.append(True)
+        return SimpleNamespace(ok=True, status_code=200)
+
+    monkeypatch.setattr(e2e_conftest.requests, "get", response)
+    assert not e2e_conftest.wait_for_server(
+        "http://127.0.0.1:12345", timeout=0.01, listener_ready=lambda: bound
+    )
+    assert not calls  # Never send test traffic to an unacknowledged listener.
+    bound = True
+    assert e2e_conftest.wait_for_server(
+        "http://127.0.0.1:12345", timeout=1, listener_ready=lambda: bound
+    )
+    assert len(calls) == 2
+
+
+def test_listener_startup_proof_excludes_previous_process_log(tmp_path):
+    path = tmp_path / "server.log"
+    message = "standalone public api listening on http://127.0.0.1:12345"
+    path.write_text(message + "\n")
+    offset = path.stat().st_size
+    assert not e2e_conftest._log_contains_since(path, offset, message)
+    with path.open("a") as log:
+        log.write("new process starting\n" + message + "\n")
+    assert e2e_conftest._log_contains_since(path, offset, message)
+
+
+def test_scaling_readiness_rejects_process_exit_during_second_foreign_reply(
+    monkeypatch,
+):
+    import test_scaling
+
+    replies = [0]
+
+    class Process:
+        returncode = 1
+
+        def poll(self):
+            return 1 if replies[0] >= 2 else None
+
+    def get(*args, **kwargs):
+        replies[0] += 1
+        return SimpleNamespace(ok=True)
+
+    cluster = object.__new__(test_scaling.MultiNodeScalingCluster)
+    cluster.data_proc_by_node_id = {101: Process()}
+    cluster.startup_timeout = lambda value: value
+    cluster.data_api_url_for_node = lambda node: "http://foreign/db/v1"
+    cluster.debug_logs = lambda: "owned child lost the listener"
+    monkeypatch.setattr(test_scaling.requests, "get", get)
+    with pytest.raises(RuntimeError, match="exited before becoming ready"):
+        cluster._wait_for_data_nodes_http(
+            [{"id": 101}], public_api=True, max_timeout_s=2, label="Data API"
+        )
+    assert replies[0] == 2

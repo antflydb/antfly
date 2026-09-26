@@ -1422,6 +1422,13 @@ pub const AntflyApiHandler = struct {
                 try ctx.setHeader("Retry-After", retry_after);
             }
         }
+        if (@hasField(Response, "metadata_mutation_not_admitted")) {
+            if (resp.metadata_mutation_not_admitted) {
+                try ctx.setHeader(http_common.metadata_mutation_not_admitted_header, http_common.metadata_mutation_not_admitted_value);
+                try ctx.setHeader(metadata_http_routes.Routes.raft_mutation_outcome_header, metadata_http_routes.Routes.raft_mutation_outcome_not_proposed);
+                try ctx.setHeader("Retry-After", "1");
+            }
+        }
         if (@hasField(Response, "metadata_mutation_outcome")) {
             if (resp.metadata_mutation_outcome) |outcome| {
                 try ctx.setHeader(

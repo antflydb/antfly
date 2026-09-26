@@ -53307,3 +53307,35 @@ test "system catalog identity failures remain unavailable across status adapters
         try std.testing.expectEqualStrings("CatalogRoutingUnavailable", response.body);
     }
 }
+
+test "system catalog public mutation retains admission proof across the HTTP adapter" {
+    const Fixture = struct {
+        err: anyerror,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn call(ptr: *anyopaque, _: std.mem.Allocator, _: api_operation.RequestContext, _: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.err;
+        }
+    };
+    var fixture = Fixture{ .err = error.NotLeader };
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .system_catalog = Fixture.call } }, null, null);
+    defer server.deinit();
+    for ([_]anyerror{ error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataMutationOutcomeUnknown }) |err| {
+        fixture.err = err;
+        var mutation = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = "/databases/owned", .content_type = "application/json", .body = "{}" });
+        defer mutation.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 503), mutation.status);
+        if (err == error.MetadataMutationOutcomeUnknown) {
+            try std.testing.expect(mutation.header(http_common.metadata_mutation_not_admitted_header) == null);
+            try std.testing.expectEqualStrings(metadata_http_routes.Routes.raft_mutation_outcome_unknown, mutation.header(metadata_http_routes.Routes.raft_mutation_outcome_header).?);
+        } else {
+            try std.testing.expectEqualStrings(http_common.metadata_mutation_not_admitted_value, mutation.header(http_common.metadata_mutation_not_admitted_header).?);
+            try std.testing.expectEqualStrings(metadata_http_routes.Routes.raft_mutation_outcome_not_proposed, mutation.header(metadata_http_routes.Routes.raft_mutation_outcome_header).?);
+        }
+        var read = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/databases/owned" });
+        defer read.deinit(std.testing.allocator);
+        try std.testing.expect(read.header(http_common.metadata_mutation_not_admitted_header) == null);
+    }
+}

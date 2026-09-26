@@ -19,12 +19,12 @@ from __future__ import annotations
 import errno
 import socket
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
 import pytest
-
 from conftest import (
     AntflyServer,
     PublicAntflyServer,
@@ -92,8 +92,8 @@ def test_reserve_excluding_releases_collisions_and_is_bounded():
             assert port == 0
             return next(self.ports)
 
-        def release(self, *ports: int) -> None:
-            self.released.extend(ports)
+        def _discard_unused(self, port: int) -> None:
+            self.released.append(port)
 
     reservations = StubReservations((40001, 40002, 41000))
     assert reservations.reserve_excluding({40001, 40002}, attempts=3) == 41000
@@ -347,3 +347,87 @@ def test_embedded_inference_server_releases_ports_when_setup_fails(
     for port in listener_ports:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
             contender.bind(("127.0.0.1", port))
+
+
+def test_port_lease_survives_unbound_child_handoff_and_process_boundary():
+    with LoopbackPortReservations() as reservations:
+        port = reservations.reserve()
+        child = reservations.handoff_to(
+            (port,),
+            lambda: subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"]
+            ),
+        )
+        try:
+            # The child has not bound yet. A kernel-only reservation would let
+            # another fixture steal this listener during its startup work.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as unbound:
+                unbound.bind(("127.0.0.1", port))
+            code = """
+import errno, sys
+from port_reservations import LoopbackPortReservations
+with LoopbackPortReservations() as other:
+    try:
+        other.reserve(int(sys.argv[1]))
+    except OSError as error:
+        assert error.errno == errno.EADDRINUSE
+    else:
+        raise AssertionError("stole another fixture's handed-off port")
+"""
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(port)],
+                cwd=Path(__file__).parent,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
+    with LoopbackPortReservations() as other:
+        assert other.reserve(port) == port
+
+
+def test_listener_ports_do_not_use_linux_client_ephemeral_range():
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux port range is supplied by procfs")
+    lower, upper = map(
+        int, Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()
+    )
+    with LoopbackPortReservations() as reservations:
+        assert all(not lower <= port <= upper for port in reservations.reserve_many(32))
+
+
+@pytest.mark.parametrize(
+    "client_range, expected",
+    [("32768 60999", (10000, 30000)), ("10000 20000", (20001, 65536))],
+)
+def test_listener_range_excludes_configured_client_ports(
+    monkeypatch, client_range, expected
+):
+    import port_reservations
+
+    monkeypatch.setattr(port_reservations.sys, "platform", "linux")
+    monkeypatch.setattr(port_reservations.Path, "read_text", lambda _self: client_range)
+    assert port_reservations._listener_range.__wrapped__() == expected
+
+
+def test_socket_allocation_failure_does_not_leak_port_lease(monkeypatch):
+    import port_reservations
+
+    with LoopbackPortReservations() as initial:
+        port = initial.reserve()
+    original_socket = port_reservations.socket.socket
+
+    def fail(*args, **kwargs):
+        raise OSError(errno.EMFILE, "descriptor limit")
+
+    with LoopbackPortReservations() as failed:
+        with monkeypatch.context() as patch:
+            patch.setattr(port_reservations.socket, "socket", fail)
+            with pytest.raises(OSError, match="descriptor limit"):
+                failed.reserve(port)
+        assert port_reservations.socket.socket is original_socket
+        with LoopbackPortReservations() as next_owner:
+            assert next_owner.reserve(port) == port

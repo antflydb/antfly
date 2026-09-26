@@ -543,7 +543,8 @@ jobs:
               assert len(reports) == 100, (profile, len(reports))
               cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
               assert Counter(case.attrib["name"] for case in cases) == {
-                  "test_multinode_autograph_resolves_promotes_and_hydrates_entities": 50,
+                  "test_multinode_autograph_resolves_promotes_and_hydrates_entities[prefix]": 50,
+                  "test_multinode_autograph_resolves_promotes_and_hydrates_entities[exact_key]": 50,
                   "test_multinode_autograph_recovers_after_data_restart": 50,
               }, profile
               assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), profile
@@ -637,7 +638,7 @@ jobs:
           cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
           assert Counter(case.attrib["name"] for case in cases) == {
               "test_three_by_three_cluster_backup_restore_through_metadata_public_api": 50,
-              "test_backup_restore_discovers_leader_past_stalled_status": 50,
+              "test_backup_restore_discovers_leader_past_stalled_topology": 50,
           }
           assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases)
           PYVERIFY
