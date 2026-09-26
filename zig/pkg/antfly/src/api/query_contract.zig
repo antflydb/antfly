@@ -15241,6 +15241,12 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("doc:a", children.req.hierarchy_children.?.parent_id);
             try std.testing.expectEqualStrings("_hierarchy.position", children.req.order_by[0].field);
 
+            const children_with_highlight =
+                \\{"fields":[],"hierarchy":{"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},"order_by":[{"field":"_hierarchy.position"}],"highlight":{}}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", children_with_highlight));
+            try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs", children_with_highlight));
+
             const internal_children_body =
                 \\{
                 \\  "fields": [],

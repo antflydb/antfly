@@ -27326,8 +27326,7 @@ pub const MatchNoneQuery = struct {
     }
 };
 
-/// Match a phrase using the field's analyzer. On a `substring` companion, one or two words match contained text across token separators. Three or more words are rejected because the suffix index cannot verify their word boundaries; lookups over 32 bytes are also rejected.
-/// Match a phrase using the field's analyzer. On a `substring` companion, one or two words match contained text across token separators. Three or more words are rejected because the suffix index cannot verify Nonzero or automatic fuzziness is rejected on substring fields; use a standalone fuzzy query instead.
+/// Match a phrase using the field's analyzer. On a `substring` companion, one or two words match contained text across token separators. Three or more words are rejected because the suffix index cannot verify their word boundaries; lookups over 32 bytes are also rejected. Nonzero or automatic fuzziness is rejected on substring fields; use a standalone fuzzy query instead.
 pub const MatchPhraseQuery = struct {
     match_phrase: []const u8,
     field: ?[]const u8 = null,

@@ -8904,6 +8904,7 @@ components:
                   - required: [graph_metric]
                   - required: [graph_metric_rerank]
                   - required: [analyses]
+                  - required: [highlight]
                   - required: [aggregations]
                   - required: [graph_queries]
                   - required: [document_renderer]
