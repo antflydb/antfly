@@ -825,7 +825,22 @@ requires identical labels and probabilities within 2e-2
 (`pipelines/laya_quantized_test.zig`). The fused resident Metal path reads
 dense weights, so a quantized checkpoint runs the generic encoder.
 
-**CPU kernel fix (2026-09-26).** Two problems explained the CPU loss:
+**After the CPU kernel fix (2026-09-26),** same 760 decisions, ReleaseFast,
+one job at a time (no other GPU work):
+
+| Weights | Backend | Accuracy | Soft CE | Peak footprint | Eval time |
+| --- | --- | ---: | ---: | ---: | ---: |
+| dense | Metal | 0.3868 | 1.3080 | 7.92 GB | 48.6 s |
+| q8_0 | Metal | 0.3842 | 1.3067 | **5.02 GB** | 48.1 s |
+| dense | CPU | 0.3868 | 1.3080 | 1.06 GB | 490.5 s |
+| q8_0 | CPU | 0.3842 | 1.3067 | 1.53 GB | 497.4 s |
+
+q8_0 now runs at dense speed on both backends and saves 37% of Metal memory.
+The CPU footprint stays above dense because dense weights are read through a
+read-only mmap, which the footprint barely counts, while the Q8_0 bytes are
+allocated. The earlier table's CPU numbers overlapped other jobs.
+
+Two problems explained the CPU loss:
 
 - **Wrong kernel selected.** `native_compute.zig` already has a
   dequant-once-then-Accelerate-SGEMM fast path for other quantized
@@ -952,7 +967,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 | 1a. State cache across rows and requests | no | done (CPU and Metal) | Exact against the full row and the oracle; follow-up questions skip trunk projections and feed-forward work |
 | 1b. Segment attention | no | done (CPU and Metal); multi-row batching done (CPU and Metal, question and candidate modes) | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call: exact against running each row alone, isolated by construction; not yet composed with the trunk cache |
 | 1c. Metal and CUDA packed kernels | no | Metal: fused kernels not pursued (encoder GPU work dominates; device scoring gave 2–4% and was reverted after a race). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |
-| 1d. Weight quantization (q8_0) | no | done (CPU and Metal). CPU kernel fixed 2026-09-26 (dequant+SGEMM instead of the native int8 kernel): q8_0 CPU eval time now matches dense (was 2.6x slower); Metal q8_0 confirmed 32-36% less memory and now faster than dense on a 200-decision subset | Labels identical and probabilities within 2e-2 of dense on the fixture. CPU footprint is still higher than dense (mmap'd dense weights vs allocated quantized bytes; see step 1d), not lower as hoped — full-760 re-run and a weight-storage-only footprint breakdown are open |
+| 1d. Weight quantization (q8_0) | no | done (CPU and Metal). After the CPU kernel fix (dequant+SGEMM), q8_0 matches dense speed on both backends over 760 decisions (CPU 497 vs 491 s, Metal 48 vs 49 s) and saves 37% of Metal memory | Labels identical and probabilities within 2e-2 of dense on the fixture. CPU footprint is still higher than dense (mmap'd dense weights vs allocated quantized bytes; see step 1d), not lower as hoped; a weight-storage-only footprint breakdown is open |
 | 2a. Long-context teacher (Qwen3.8-27B) | labels only | not started | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
 | 2b. Two-stage choice for many options | same fine-tune | not started | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. Measured on Banking77 |
 | 2c. 8k states | yes | not started | Memory-efficient attention in the training graph (today about 2k tokens at batch 1), `max_len` 8192 (ModernBERT's pretraining length), fine-tune on teacher-labelled long states |
