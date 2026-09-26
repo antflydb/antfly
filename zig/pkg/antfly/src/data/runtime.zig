@@ -4304,6 +4304,7 @@ const HAStandbyReplicationErrorCode = enum(u8) {
     InvalidMagic,
     HeaderCrcMismatch,
     PayloadCrcMismatch,
+    MetadataHABindingBusy,
     Other,
 };
 
@@ -4362,12 +4363,14 @@ fn haStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
         error.InvalidMagic => .InvalidMagic,
         error.HeaderCrcMismatch => .HeaderCrcMismatch,
         error.PayloadCrcMismatch => .PayloadCrcMismatch,
+        error.MetadataHABindingBusy => .MetadataHABindingBusy,
         else => .Other,
     };
 }
 
 fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u8 {
     return switch (code) {
+        .MetadataHABindingBusy => "MetadataHABindingBusy",
         .none => null,
         .HttpConnectionClosing => "HttpConnectionClosing",
         .ConnectionResetByPeer => "ConnectionResetByPeer",
@@ -4473,6 +4476,7 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
         // standby's resources. Keep the process available and fail closed so
         // operators can repair configuration or storage and the next round
         // can resume the idempotent adoption.
+        error.MetadataHABindingBusy,
         error.HAPromotedPrimaryLogMissing,
         error.HAPromotedPrimarySlotsMissing,
         error.HAStandbyOwnershipRequired,
@@ -6931,7 +6935,8 @@ pub const DataServer = struct {
             handoff,
             .{ .slot_store_options = .{ .wal_options = standby.progress_wal_options } },
         );
-        errdefer promoted_primary.close();
+        var owns_promoted_primary = true;
+        errdefer if (owns_promoted_primary) promoted_primary.close();
 
         self.ha_public_gate_state.beginPromotion();
         self.ha_cfg.standby_owner.?.* = null;
@@ -6942,11 +6947,13 @@ pub const DataServer = struct {
         }
 
         self.ha_promoted_primary = promoted_primary;
+        // Retryable binding failures now belong to the runtime owner. Closing
+        // the transferred local copy here would leave its live WAL dangling.
+        owns_promoted_primary = false;
         const promoted_primary_handle = &self.ha_promoted_primary.?;
         self.ha_cfg.internal_primary = promoted_primary_handle;
-        // Keep the owned pair independently of this config. Promotion cannot
-        // allocate or drop strings still borrowed by a replication round.
-        self.ha_cfg.standby_replication = null;
+        // Preserve the retry configuration until every promotion mirror binds.
+        // The metadata owner can be busy after durable resource adoption.
         const promoted_node_id = self.ha_cfg.admin_context.?.standby_node_id;
         self.ha_cfg.admin_context.?.primary = promoted_primary_handle;
         self.ha_cfg.admin_context.?.primary_node_id = promoted_node_id;
@@ -7038,6 +7045,10 @@ pub const DataServer = struct {
             return;
         }
         if (ctx.primary != null) {
+            if (self.ha_promoted_primary != null and self.ha_cfg.standby_replication != null) {
+                self.ha_public_gate_state.beginPromotion();
+                return;
+            }
             self.ha_public_gate_state.publishPrimaryFence(haContextPrimaryIsFenced(ctx));
         }
     }
@@ -32039,6 +32050,7 @@ fn consumerTests() type {
                 try std.testing.expectEqualStrings(@errorName(err), haStandbyReplicationErrorName(code).?);
             }
             inline for (.{
+                error.MetadataHABindingBusy,
                 error.InvalidInternalReplicationRequest,
                 error.InternalReplicationEndpointNotFound,
                 error.UnsupportedOperation,
@@ -39093,7 +39105,46 @@ fn consumerTests() type {
 
             if (slot_blocker) |*handle| handle.close();
             slot_blocker = null;
+            const BindingProbe = struct {
+                busy: bool = true,
+                attempts: usize = 0,
+                fn bind(ptr: *anyopaque, _: ?antfly.db.HAWriteGate, _: ?antfly.db.HAAsyncEffectMirror) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.attempts += 1;
+                    if (self.busy) return error.MetadataHABindingBusy;
+                }
+                fn prepare(_: *anyopaque) !void {}
+                fn apply(_: *anyopaque, _: antfly.hot_standby.replication_record.RecordView) !void {
+                    return error.TestUnexpectedResult;
+                }
+                fn capture(_: *anyopaque, _: std.Io, _: []const u8) !@import("../api/standalone_hot_standby.zig").Checkpoint {
+                    return error.TestUnexpectedResult;
+                }
+                fn private(_: *anyopaque, _: std.mem.Allocator, _: u64) !?std.json.Parsed(@import("../metadata/restore_provisioning_contract.zig").ProvisioningProjection) {
+                    return error.TestUnexpectedResult;
+                }
+            };
+            var binding = BindingProbe{};
+            server.status_source.standalone_hot_standby = .{ .ptr = &binding, .vtable = &.{ .bind_mirror = BindingProbe.bind, .prepare_checkpoint = BindingProbe.prepare, .apply_record = BindingProbe.apply, .capture_checkpoint = BindingProbe.capture, .capture_private = BindingProbe.private } };
+            try std.testing.expectError(error.MetadataHABindingBusy, server.runHAStandbyReplicationRound());
+            try std.testing.expect(standby == null);
+            try std.testing.expect(server.ha_promoted_primary != null);
+            try std.testing.expect(server.ha_cfg.standby_replication != null);
+            server.refreshHAPublicGateState();
+            try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate.check());
+            try std.testing.expectError(error.HAReadRequiresPrimary, public_read_gate.check(.stale));
+            lockAtomic(&server.ha_state_mutex);
+            DataServer.haPublicGateStateChangedCallback(&server);
+            server.ha_state_mutex.unlock();
+            try std.testing.expectEqual(@as(usize, 2), binding.attempts);
+            try std.testing.expect(server.ha_cfg.standby_replication != null);
+            try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate.check());
+            binding.busy = false;
+            server.clearHAStandbyReplicationRetry();
             try server.runHAStandbyReplicationRound();
+            try std.testing.expectEqual(@as(usize, 3), binding.attempts);
+            try std.testing.expect(server.ha_cfg.standby_replication == null);
+            try public_write_gate.check();
             try std.testing.expect(standby == null);
             try std.testing.expect(server.ha_promoted_primary != null);
             try std.testing.expect(server.ha_cfg.admin_context.?.standby == null);
