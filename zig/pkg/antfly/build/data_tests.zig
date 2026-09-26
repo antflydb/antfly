@@ -109,6 +109,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime repair queue links and removes debt in constant time",
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
         "data runtime raft status changes force immediate store status publication",
+        "system catalog initial report collection is isolated fenced and cancellable",
         "data runtime reallocation request refreshes group status once per request",
         "data runtime replicated split policy is identity and phase aware",
         "data runtime structural changes preserve physical root generations",

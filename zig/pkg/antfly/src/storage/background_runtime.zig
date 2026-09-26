@@ -2478,7 +2478,11 @@ test "backend runtime threaded durable lane sees initialized jobs" {
     defer handle.deinit();
 
     const owner_id = try handle.ptr().allocOwnerId();
-    var ctxs: [64]Ctx = [_]Ctx{.{}} ** 64;
+    // The runtime reserves one of its bounded durable-lane slots for the
+    // reaper. This test checks initialized job handoff within the admission
+    // contract; saturation/rejection is covered by the lane-limit tests.
+    const job_count = default_io_concurrent_limit - 1;
+    var ctxs: [job_count]Ctx = [_]Ctx{.{}} ** job_count;
     for (&ctxs) |*ctx| {
         try handle.ptr().durable_jobs.submit(.{
             .owner_id = owner_id,

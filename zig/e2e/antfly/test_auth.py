@@ -742,6 +742,7 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(
     assert scan_result[0]["title"] == "gold doc"
 
 
+@pytest.mark.e2e_resource("antfly_process")
 @pytest.mark.parametrize("fixture_name", ["auth_api", "stateful_auth_api"])
 def test_system_catalog_scoped_permissions_and_row_filters(request, fixture_name):
     api = request.getfixturevalue(fixture_name)

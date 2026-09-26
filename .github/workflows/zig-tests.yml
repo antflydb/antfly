@@ -1220,7 +1220,7 @@ jobs:
       needs.changes.outputs.trace_validate == 'true' )) }}
     name: zig-base
     needs: [admission, changes, zig-base-tests, arm64-codec]
-    runs-on: arc-antfly-standard
+    runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify zig-base shards
         env:
@@ -1249,7 +1249,7 @@ jobs:
       github.event.schedule == '0 8 * * *' )) }}
     name: zig-full
     needs: [admission, changes, zig-full-tests, zig-build-cache-tests, arm64-codec]
-    runs-on: arc-antfly-standard
+    runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify zig-full shards
         env:
@@ -1275,14 +1275,12 @@ jobs:
       needs.changes.outputs.e2e == 'true') }}
     name: e2e-base / build
     needs: [admission, changes]
-    runs-on: arc-antfly-heavy
+    runs-on: arc-antfly-heavy-runtime
     timeout-minutes: 90
     env:
       # Override ARC's 20 GiB default: storage reserves 22 GiB. The 24 GiB
       # pod still has 2 GiB outside the aggregate compiler reservation.
       ANTFLY_ZIG_MAX_RSS: "23622320128"
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
-      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       ANTFLY_CI_TRACE: "1"
       # The PR E2E artifact is also the release-packaging smoke artifact. Build
       # the partitioned graph once, test that exact binary, and reuse its
@@ -1312,10 +1310,10 @@ jobs:
           version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
-      - name: Restore ARC Zig cache dirs
+      - name: Prepare job-local Zig cache dirs
         run: |
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
-          global_cache="/mnt/cache/antfly/zig/zig-global"
+          local_cache="${RUNNER_TEMP}/antfly/zig/zig-local"
+          global_cache="${RUNNER_TEMP}/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
@@ -1347,7 +1345,7 @@ jobs:
       needs.e2e-base-build.result == 'success') }}
     name: e2e-base / ${{ matrix.suite }}
     needs: [admission, changes, e2e-base-build]
-    runs-on: arc-antfly-heavy
+    runs-on: arc-antfly-heavy-runtime
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -1362,15 +1360,11 @@ jobs:
           - suite: inference
             shard: all
     env:
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
-      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
-      UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
-      HF_HOME: /mnt/cache/antfly/zig/hf
-      ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
-      # Multi-node tests already create several WALs each. Keep a single
-      # cluster workload per runner so latency/availability checks are not
-      # invalidated by another test's concurrent durable commits.
-      ANTFLY_E2E_PROCESS_SLOTS: "1"
+      # Mixed stateful/serverless groups need two processes on one worker.
+      # Limit process-owning workers instead, so separate cluster workloads
+      # cannot add concurrent durable commits to latency/availability tests.
+      ANTFLY_E2E_PROCESS_SLOTS: "2"
+      ANTFLY_E2E_PROCESS_WORKERS: "1"
       # Permit the diagnostic debugger to attach to disposable test children.
       ANTFLY_E2E_NATIVE_STACKS: "1"
       ANTFLY_CI_TRACE: "1"
@@ -1396,24 +1390,31 @@ jobs:
           version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
-      - name: Restore ARC cache dirs
+      - name: Prepare job-local cache dirs
         run: |
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
-          global_cache="/mnt/cache/antfly/zig/zig-global"
+          cache_root="${RUNNER_TEMP}/antfly/zig"
+          local_cache="$cache_root/zig-local"
+          global_cache="$cache_root/zig-global"
+          uv_cache="$cache_root/uv"
+          hf_home="$cache_root/hf"
+          duration_file="$cache_root/e2e-durations/antfly-v1.json"
           # Keep WAL/fsync-heavy disposable databases on runner-local disk,
-          # not the network-attached cache PVC. Do not use memory tmpfs: these
-          # tests must exercise diskful crash/reopen and retain failure logs.
+          # not memory tmpfs: these tests exercise diskful crash/reopen and
+          # retain failure logs.
           test_tmp="${RUNNER_TEMP}/antfly-e2e/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
           {
             echo "ZIG_LOCAL_CACHE_DIR=$local_cache"
             echo "ZIG_GLOBAL_CACHE_DIR=$global_cache"
+            echo "UV_CACHE_DIR=$uv_cache"
+            echo "HF_HOME=$hf_home"
+            echo "ANTFLY_E2E_DURATION_FILE=$duration_file"
             echo "TMPDIR=$test_tmp"
           } >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache" "$test_tmp" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
-          mkdir -p "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}"
+          mkdir -p "$local_cache" "$global_cache" "$test_tmp" "$uv_cache" "$hf_home" "$(dirname "$duration_file")"
+          mkdir -p "$cache_root/home-cache-${{ matrix.suite }}" "$cache_root/home-antfly-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
-          ln -s "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" ~/.cache
-          ln -s "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}" ~/.antfly
+          ln -s "$cache_root/home-cache-${{ matrix.suite }}" ~/.cache
+          ln -s "$cache_root/home-antfly-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
         uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
@@ -1531,7 +1532,7 @@ jobs:
       needs.changes.outputs.e2e == 'true') }}
     name: e2e-base
     needs: [admission, changes, e2e-base-build, e2e-base-tests]
-    runs-on: arc-antfly-standard
+    runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify base E2E shards
         env:
@@ -1557,12 +1558,10 @@ jobs:
       github.event.schedule == '0 8 * * *') }}
     name: e2e-full / build
     needs: [admission, changes]
-    runs-on: arc-antfly-heavy
+    runs-on: arc-antfly-heavy-runtime
     timeout-minutes: 90
     env:
       ANTFLY_ZIG_MAX_RSS: "23622320128"
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
-      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       # Keep production optimization while preserving runtime-safety checks and
       # std.debug.assert invariants exercised by the full E2E suite.
       ANTFLY_CI_ZIG_OPTIMIZE: ReleaseSafe
@@ -1591,10 +1590,10 @@ jobs:
           version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
-      - name: Restore ARC cache dirs
+      - name: Prepare job-local Zig cache dirs
         run: |
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
-          global_cache="/mnt/cache/antfly/zig/zig-global"
+          local_cache="${RUNNER_TEMP}/antfly/zig/zig-local"
+          global_cache="${RUNNER_TEMP}/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
@@ -1630,16 +1629,18 @@ jobs:
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full / ${{ matrix.suite }}
     needs: [admission, changes, e2e-full-build]
-    runs-on: arc-antfly-heavy
+    runs-on: ${{ matrix.suite == 'antfly' && 'arc-antfly-heavy-runtime' || 'arc-antfly-heavy' }}
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
         suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference"]' || '["inference","antfly"]') }}
     env:
-      UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
-      HF_HOME: /mnt/cache/antfly/zig/hf
-      ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
+      # Full Antfly E2E has the same multi-process groups as the base shards.
+      # Keep one process-owning worker per runner while lightweight tests may
+      # continue on the other pytest workers.
+      ANTFLY_E2E_PROCESS_SLOTS: "2"
+      ANTFLY_E2E_PROCESS_WORKERS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1658,15 +1659,29 @@ jobs:
 
       - name: Prepare ARC test cache dirs
         run: |
-          # Cache/model downloads stay on the PVC; crash-test databases use
+          # Inference model downloads retain the PVC. Antfly's measured cache
+          # footprint fits on job-local disk; crash-test databases also use
           # runner-local disk (not tmpfs), just like the required base lanes.
           test_tmp="${RUNNER_TEMP}/antfly-e2e/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
-          echo "TMPDIR=$test_tmp" >> "$GITHUB_ENV"
-          mkdir -p "$test_tmp" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
-          mkdir -p "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-full-${{ matrix.suite }}"
+          if [[ "${{ matrix.suite }}" == "antfly" ]]; then
+            home_cache_root="${RUNNER_TEMP}/antfly/zig"
+          else
+            home_cache_root="/mnt/cache/antfly/zig"
+          fi
+          uv_cache="$home_cache_root/uv"
+          hf_home="$home_cache_root/hf"
+          duration_file="$home_cache_root/e2e-durations/antfly-v1.json"
+          {
+            echo "TMPDIR=$test_tmp"
+            echo "UV_CACHE_DIR=$uv_cache"
+            echo "HF_HOME=$hf_home"
+            echo "ANTFLY_E2E_DURATION_FILE=$duration_file"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$test_tmp" "$uv_cache" "$hf_home" "$(dirname "$duration_file")"
+          mkdir -p "$home_cache_root/home-cache-full-${{ matrix.suite }}" "$home_cache_root/home-antfly-full-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
-          ln -s "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" ~/.cache
-          ln -s "/mnt/cache/antfly/zig/home-antfly-full-${{ matrix.suite }}" ~/.antfly
+          ln -s "$home_cache_root/home-cache-full-${{ matrix.suite }}" ~/.cache
+          ln -s "$home_cache_root/home-antfly-full-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
         uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
@@ -1821,7 +1836,7 @@ jobs:
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full
     needs: [admission, changes, e2e-full-build, e2e-full-tests]
-    runs-on: arc-antfly-standard
+    runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify full E2E suites
         env:

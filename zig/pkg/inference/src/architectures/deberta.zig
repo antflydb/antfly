@@ -483,6 +483,31 @@ pub fn forwardCt(
     return forwardCtProfiled(cb, allocator, config, input_ids, attention_mask, batch, seq_len, prefer_weight_mirrors, null);
 }
 
+/// Approximate dense FLOPs of one encoder layer over `tokens` rows
+/// (Q/K/V/output projections plus the two FFN projections).
+fn encoderLayerWork(config: Config, tokens: usize) f64 {
+    const h: f64 = @floatFromInt(config.hidden_size);
+    const i: f64 = @floatFromInt(config.intermediate_size);
+    const t: f64 = @floatFromInt(tokens);
+    return 2 * t * (4 * h * h + 2 * h * i);
+}
+
+/// Under execution control the Metal encoder frame is submitted and awaited
+/// once this much work is pending, bounding the device work a hard
+/// cancellation can wait behind. The bound equals two deberta-v3-base layers
+/// at 512 tokens (the former fixed two-layer cadence at its longest
+/// sequence); shorter or larger-model requests no longer idle the GPU after
+/// every two layers (GLiNER2.5-Decide, 102 tokens: ~59 ms vs 68-98 ms).
+const cancellation_frame_work: f64 = 2 * 2 * 512 * (4 * 768 * 768 + 2 * 768 * 3072);
+
+test "encoder cancellation cadence keeps the base 512-token bound" {
+    const base = Config{};
+    try std.testing.expectEqual(cancellation_frame_work, 2 * encoderLayerWork(base, 512));
+    const large = Config{ .hidden_size = 1024, .num_hidden_layers = 24, .num_attention_heads = 16, .intermediate_size = 4096 };
+    // deberta-v3-large at 102 tokens: a submit every 6 layers, not every 2.
+    try std.testing.expectEqual(@as(f64, 6), @ceil(cancellation_frame_work / encoderLayerWork(large, 102)));
+}
+
 pub fn forwardCtProfiled(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -515,6 +540,8 @@ pub fn forwardCtProfiled(
     defer if (rel_emb.full_to_unique) |ids| allocator.free(ids);
     if (profile) |p| p.relative_position_ns += profileElapsed(timer);
 
+    const layer_work = encoderLayerWork(config, total);
+    var pending_work: f64 = 0;
     for (0..config.num_hidden_layers) |layer| {
         try cb.checkExecutionControl();
         timer = profileStart(profile);
@@ -522,9 +549,11 @@ pub fn forwardCtProfiled(
         cb.free(hidden);
         hidden = new_hidden;
         if (profile) |p| p.layer_total_ns += profileElapsed(timer);
+        pending_work += layer_work;
         if (cb.execution_control != null and encoder_frame_active and
-            (layer + 1) % 2 == 0 and layer + 1 < config.num_hidden_layers)
+            pending_work >= cancellation_frame_work and layer + 1 < config.num_hidden_layers)
         {
+            pending_work = 0;
             try cb.decoderRuntimeSubmitAndWaitFrame();
             encoder_frame_active = false;
             try cb.checkExecutionControl();

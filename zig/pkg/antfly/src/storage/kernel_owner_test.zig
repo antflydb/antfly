@@ -86,7 +86,7 @@ test "opaque owner retained relational read crosses checked archive boundary" {
     try std.testing.expectError(error.PreparedGenerationChanged, provider.open(alloc, "rows", "", "", .{ .relational_query = .{ .schema_version = 2, .fields = &.{} }, .limit = 1 }));
 }
 
-test "opaque owner retries a stale schema descriptor without regressing durable state" {
+test "opaque owner retains newer durable schema when reopening a stale descriptor" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -111,11 +111,15 @@ test "opaque owner retries a stale schema descriptor without regressing durable 
         var owner = try client.Owner.open(options);
         owner.deinit();
     }
-    // Reconciliation advanced the durable schema after this caller captured
-    // version one. The failure must cross the archive boundary as retryable.
+    // Raft catch-up can reopen a pinned descriptor from an older entry after
+    // reconciliation has advanced the durable schema. That open must succeed
+    // without downgrading the installed schema or losing the existing row.
     var stale = options;
     stale.schema_json = .fromSlice("{\"version\":1}");
-    try std.testing.expectError(error.StorageBusy, client.Owner.open(stale));
+    {
+        var owner = try client.Owner.open(stale);
+        owner.deinit();
+    }
     {
         var owner = try client.Owner.open(options);
         defer owner.deinit();
@@ -123,8 +127,9 @@ test "opaque owner retries a stale schema descriptor without regressing durable 
         defer row.deinit();
         try std.testing.expect(std.mem.indexOf(u8, row.bytes(), "\"n\":1") != null);
     }
-    // A successful fresh reopen must not make the old descriptor admissible.
-    try std.testing.expectError(error.StorageBusy, client.Owner.open(stale));
+    // A fresh owner has not made the pinned descriptor invalid either.
+    var owner = try client.Owner.open(stale);
+    owner.deinit();
 }
 
 test "opaque owner standalone rewrite authority is durable and cannot be selected by a request" {

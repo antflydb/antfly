@@ -223,6 +223,41 @@ pub fn detectArchitecture(allocator: std.mem.Allocator, bytes: []const u8) !Arch
     return detectArchitectureObject(parsed.value.object);
 }
 
+/// Whether a span checkpoint declares the gliner2 2.x processor and marker
+/// contract implemented by the schema-v2 classifier route. Other span models
+/// can retain their legacy route without being guessed into this one.
+pub fn declaresSpanArchitecture(allocator: std.mem.Allocator, bytes: []const u8) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return false;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const obj = parsed.value.object;
+    const model_type_value = obj.get("model_type") orelse return false;
+    if (model_type_value != .string or !std.mem.eql(u8, model_type_value.string, "extractor")) return false;
+    const architecture = obj.get("architecture") orelse return false;
+    if (architecture != .string or !std.mem.eql(u8, architecture.string, "span")) return false;
+    const version = obj.get("config_version") orelse return false;
+    const arch_version = obj.get("architecture_version") orelse return false;
+    if (version != .integer or version.integer != config_version or
+        arch_version != .integer or arch_version.integer != architecture_version) return false;
+    const head = obj.get("span_head") orelse return false;
+    if (head != .object) return false;
+    const mode = head.object.get("span_mode") orelse return false;
+    return mode == .string and std.mem.eql(u8, mode.string, "markerV0");
+}
+
+test "declared span architecture requires the supported marker contract" {
+    const a = std.testing.allocator;
+    const supported = "{\"model_type\":\"extractor\",\"architecture\":\"span\",\"config_version\":3,\"architecture_version\":1,\"span_head\":{\"span_mode\":\"markerV0\"}}";
+    try std.testing.expect(try declaresSpanArchitecture(a, supported));
+    try std.testing.expect(!try declaresSpanArchitecture(a, "{\"model_type\":\"extractor\",\"architecture\":\"span\",\"config_version\":4,\"architecture_version\":1,\"span_head\":{\"span_mode\":\"markerV0\"}}"));
+    try std.testing.expect(!try declaresSpanArchitecture(a, "{\"model_type\":\"extractor\",\"architecture\":\"span\",\"config_version\":3,\"architecture_version\":1,\"span_head\":{\"span_mode\":\"other\"}}"));
+    try std.testing.expect(!try declaresSpanArchitecture(a, "{\"model_type\":\"extractor\"}"));
+    try std.testing.expect(!try declaresSpanArchitecture(a, "not json"));
+}
+
 fn detectArchitectureObject(obj: std.json.ObjectMap) !Architecture {
     const model = obj.get("model_type");
     const is_extractor = model != null and model.? == .string and std.mem.eql(u8, model.?.string, "extractor");
