@@ -149,6 +149,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "remote metadata catalog source provides compact routing",
         "remote metadata routing negotiation upgrades the N-1 adapter",
         "data runtime treats transient metadata failures as retryable bootstrap failures",
+        "DataServer store status retries leadership and socket failures on borrowed VoprIo",
         "data runtime retries incomplete split provisioning projections",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "data runtime heartbeat cache cannot regress to an older full report",

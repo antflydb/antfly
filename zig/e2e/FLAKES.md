@@ -1841,6 +1841,33 @@ cause. The initial recovery baseline passed four invocations of each selected
 case across two concurrent workers. Linux's slow-persistence signature remains
 distinct from a successful native soak.
 
+
+A longer FK baseline reproduced a different production failure: during retained
+reference probes, a data node exited after `store report worker deferred
+err=SocketUnconnected` and `data server round failed err=SocketUnconnected`.
+The HTTP executor boundary now normalizes that disconnected-socket variant to
+`ConnectionResetByPeer`. Raw control transport adapters use the same mapping.
+Delivery tracking remains uncertain and the boundary does not replay requests.
+The registered deterministic store-report regression covers registration and
+publication, completion-based backoff, and permanent errors after backoff. The
+failed baseline is retained and is not passing acceptance evidence.
+
+[Run 36274408215](https://github.com/antflydb/antfly/actions/runs/36274408215)
+also failed Python formatting and the secret follower forwarding integration
+fixture. Formatting is corrected. That fixture now gives each metadata node an
+independent production-cadence progress driver; one node's WAL sync cannot block
+its peer's ticker. Explicit unknown-outcome responses are reconciled through
+exact committed revision and value reads, without replaying PUT or DELETE.
+Arbitrary 503s fail. DELETE selects the current follower after PUT confirmation.
+
+The latest run also repeated schema rewrite `publication-coordinator` and added
+FK cascade `transaction_resolve-owner` admission failures. Preserved logs show
+uncommitted data Raft proposals, metadata leader unavailability, and native
+threads in `fsync`. The exact downloaded CI binary is stripped, so these stacks
+cannot establish a complete wait chain. These availability signatures remain
+under investigation; socket-error regression coverage does not by itself prove
+that slow-persistence recovery is fixed.
+
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
 
 Scheduled run `36247286560` passed qualification, all five campaigns, and the

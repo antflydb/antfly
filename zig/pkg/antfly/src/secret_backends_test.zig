@@ -618,25 +618,32 @@ test "secret backend follower API forwards encrypted PUT and DELETE through Raft
     }
     for (0..2) |i| try servers[i].bootstrapCluster(1, i + 1, &peers);
     const Progress = struct {
-        servers: *[2]runtime.Server,
+        server: *runtime.Server,
         stop: std.atomic.Value(bool) = .init(false),
         failed: std.atomic.Value(bool) = .init(false),
         fn run(self: *@This()) void {
             while (!self.stop.load(.acquire)) {
-                for (self.servers) |*server| server.runRaftRoundOnly() catch {
+                self.server.runRaftRoundOnly() catch {
                     self.failed.store(true, .release);
                     return;
                 };
-                time.sleepNs(10 * std.time.ns_per_ms);
+                time.sleepNs(100 * std.time.ns_per_ms);
             }
         }
     };
     try servers[0].server.svc.campaignMetadataGroup();
-    var progress = Progress{ .servers = &servers };
-    const thread = try std.Thread.spawn(.{}, Progress.run, .{&progress});
+    // A stalled disk on one node must not stop its peer's consensus progress.
+    // Production owns a separate, 100 ms Raft ticker for every metadata node.
+    var progress = [_]Progress{ .{ .server = &servers[0] }, .{ .server = &servers[1] } };
+    var threads: [2]std.Thread = undefined;
+    var started: usize = 0;
     defer {
-        progress.stop.store(true, .release);
-        thread.join();
+        for (progress[0..started]) |*driver| driver.stop.store(true, .release);
+        for (threads[0..started]) |thread| thread.join();
+    }
+    for (&progress, &threads) |*driver, *thread| {
+        thread.* = try std.Thread.spawn(.{}, Progress.run, .{driver});
+        started += 1;
     }
     const deadline = time.monotonicNs() + 10 * std.time.ns_per_s;
     while (servers[0].server.svc.localMetadataLeadershipTerm() == null and time.monotonicNs() < deadline) time.sleepNs(10 * std.time.ns_per_ms);
@@ -647,16 +654,51 @@ test "secret backend follower API forwards encrypted PUT and DELETE through Raft
     defer executor.deinit();
     var put = try executor.executor().execute(alloc, .{ .method = .PUT, .uri = uri, .body = "{\"value\":\"follower-write\"}", .content_type = "application/json", .timeout_ms = 10_000 });
     defer put.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), put.status);
-    var found = try natives[0].source().resolve(alloc, "scope", "token", .{ .min_revision = 1 });
+    try expectSecretMutationResponse(put, 200);
+    var found = try awaitSecretRevision(natives[0].source(), 1);
     defer found.deinit(alloc);
+    try std.testing.expect(found.value != null);
     try std.testing.expectEqualStrings("follower-write", found.value.?.secret.bytes);
-    var deleted = try executor.executor().execute(alloc, .{ .method = .DELETE, .uri = uri, .timeout_ms = 10_000 });
+    // Consensus may elect a different leader while confirming the PUT. Route
+    // DELETE through the current follower to retain forwarding coverage.
+    const delete_follower: usize = if (servers[0].server.svc.localMetadataLeadershipTerm() != null) 1 else 0;
+    try std.testing.expect(servers[delete_follower].server.svc.localMetadataLeadershipTerm() == null);
+    try std.testing.expect(servers[1 - delete_follower].server.svc.localMetadataLeadershipTerm() != null);
+    const delete_uri = try std.fmt.allocPrint(a, "{s}/db/v1/secrets/token", .{peers[delete_follower].orchestration_url.?});
+    var deleted = try executor.executor().execute(alloc, .{ .method = .DELETE, .uri = delete_uri, .timeout_ms = 10_000 });
     defer deleted.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 204), deleted.status);
-    var absent = try natives[0].source().resolve(alloc, "scope", "token", .{ .min_revision = 2 });
+    try expectSecretMutationResponse(deleted, 204);
+    var absent = try awaitSecretRevision(natives[0].source(), 2);
     defer absent.deinit(alloc);
     try std.testing.expect(absent.value == null);
-    try std.testing.expect(servers[1].server.svc.localMetadataLeadershipTerm() == null);
-    try std.testing.expect(!progress.failed.load(.acquire));
+    for (&progress) |*driver| try std.testing.expect(!driver.failed.load(.acquire));
+}
+
+fn expectSecretMutationResponse(response: @import("raft/transport/http_common.zig").HttpResponse, success: u16) !void {
+    if (response.status == success) return;
+    // Slow durable persistence may outlive synchronous confirmation. Never
+    // replay the mutation or treat an arbitrary 503 as successful admission.
+    try std.testing.expectEqual(@as(u16, 503), response.status);
+    try std.testing.expectEqualStrings("secret write outcome unknown; inspect the committed revision before retrying", response.body);
+}
+
+fn awaitSecretRevision(source: @import("common/secret_contract.zig").Source, revision: u64) !@import("common/secret_contract.zig").Lookup {
+    const time = @import("antfly_platform").time;
+    const deadline = time.monotonicNs() + 10 * std.time.ns_per_s;
+    while (time.monotonicNs() < deadline) {
+        const lookup = source.resolve(alloc, "scope", "token", .{ .min_revision = revision }) catch |err| {
+            if (err != error.Unavailable and !@import("metadata/authority.zig").isRetryableError(err)) return err;
+            time.sleepNs(10 * std.time.ns_per_ms);
+            continue;
+        };
+        // This fixture exclusively owns the scope. Exact revision and value
+        // checks prove the one submitted mutation, including a late commit.
+        errdefer {
+            var owned = lookup;
+            owned.deinit(alloc);
+        }
+        try std.testing.expectEqual(revision, lookup.revision);
+        return lookup;
+    }
+    return error.SecretRevisionNotConfirmed;
 }

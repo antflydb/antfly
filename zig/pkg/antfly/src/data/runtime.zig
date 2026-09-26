@@ -4309,7 +4309,7 @@ const HAStandbyReplicationErrorCode = enum(u8) {
 };
 
 fn haStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
-    return switch (err) {
+    return switch (@import("../common/http/http_common.zig").canonicalTransportError(err)) {
         error.HttpConnectionClosing => .HttpConnectionClosing,
         error.ConnectionResetByPeer => .ConnectionResetByPeer,
         error.ConnectionRefused => .ConnectionRefused,
@@ -32122,6 +32122,7 @@ fn consumerTests() type {
             inline for (.{
                 error.HttpConnectionClosing,
                 error.ConnectionResetByPeer,
+                error.SocketUnconnected,
                 error.ConnectionRefused,
                 error.BrokenPipe,
                 error.EndOfStream,
@@ -43565,7 +43566,7 @@ fn implementationTests() type {
             // would already have elapsed, for both publication and registration.
             server.setRemoteMetadataFetchErrorForTest(null);
             for ([_]bool{ true, false }) |registered| {
-                for ([_]anyerror{ error.NotLeader, error.ConnectionResetByPeer }) |transport_error| {
+                for ([_]anyerror{ error.NotLeader, error.ConnectionResetByPeer, error.SocketUnconnected }) |transport_error| {
                     server.clearMetadataBootstrapRetry();
                     server.store_registration_confirmed = registered;
                     server.store_status_dirty.store(true, .release);
@@ -43574,7 +43575,7 @@ fn implementationTests() type {
                     // The metadata client owns one bounded retry for replay-safe
                     // control requests after a socket reset. Backoff begins only
                     // after that whole attempt finishes, not after its first send.
-                    const attempt_count: usize = if (!registered and transport_error == error.ConnectionResetByPeer) 2 else 1;
+                    const attempt_count: usize = if (!registered and @import("../common/http/http_common.zig").canonicalTransportError(transport_error) == error.ConnectionResetByPeer) 2 else 1;
                     const started_at_ms = server.backgroundMonotonicMs();
                     const requests_before = metadata_transport.requests;
                     try RuntimeRound.run(&server, &vopr_io);

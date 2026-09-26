@@ -718,7 +718,12 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     source.freeAdminSnapshot(&hidden);
     _ = try server.restore_job_store.retryRunning(a, worker.value, "RestoreStagingYield", 0);
     const started_ns = @import("antfly_platform").time.monotonicNs();
-    for (0..(if (policy.restart_after_commit) @as(usize, 6000) else 120)) |_| {
+    // Debug and contended runs can admit one row per cooperative slice. Scale
+    // the fixture's work bound with its corpus instead of assuming that every
+    // owner imports hundreds of rows within the same CPU quantum.
+    const corpus_slice_budget = 120 + 8 * policy.benchmark_rows * fixture.owner_count;
+    const slice_budget = @max(corpus_slice_budget, if (policy.restart_after_commit) @as(usize, 6000) else 120);
+    for (0..slice_budget) |_| {
         try Driver.work(&server, worker.value.job_id);
         // A routing/authentication setup error is not a simulated owner retry.
         // Fail promptly with the first bounded HTTP diagnostic above instead
