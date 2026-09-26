@@ -21,6 +21,12 @@ active when the later job timed out, so the
 duplicate work is the documented cost source, not a proven explanation for
 every minute of that particular timeout.
 
+PR CI dispatches its reusable workflow from `main` and checks out the PR
+revision inside the job. Therefore a PR edit to the workflow's inline
+qualification command would not run before merge. The workflow now calls a
+qualification script from the checked-out revision. A branch workflow
+dispatch can use `qualification_only` to validate workflow edits before merge.
+
 ## 2026-09-23: executable chunk embeddings and transient rewrite owner routing
 
 [PR #868 CI run 35937420037](https://github.com/antflydb/antfly/actions/runs/35937420037)

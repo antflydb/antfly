@@ -140,12 +140,16 @@ class SoakTests(unittest.TestCase):
         ).read_text()
         self.assertLess(
             workflow.index("      - name: Audit replayable VOPR sources\n"),
-            workflow.index("      - name: Test production transport and runtime scheduling\n"),
+            workflow.index(
+                "      - name: Test production transport and runtime scheduling\n"
+            ),
         )
-        for step_name, targets in (
-            ("Audit replayable VOPR sources", ["vopr-determinism-audit"]),
+        self.assertIn("ref: ${{ inputs.head_sha || github.sha }}", workflow)
+        for step_name, mode, targets in (
+            ("Audit replayable VOPR sources", "audit", ["vopr-determinism-audit"]),
             (
                 "Test production transport and runtime scheduling",
+                "runtime",
                 [
                     "antfly-raft-transport-test",
                     "standby-vopr-test",
@@ -154,7 +158,7 @@ class SoakTests(unittest.TestCase):
                     "secrets-vopr-test",
                 ],
             ),
-            ("Build campaign runner", ["vopr-build"]),
+            ("Build campaign runner", None, ["vopr-build"]),
         ):
             with (
                 self.subTest(step=step_name),
@@ -167,6 +171,10 @@ class SoakTests(unittest.TestCase):
                     Path(__file__).with_name("measure_disk_usage.py"),
                     root / "scripts/ci/measure_disk_usage.py",
                 )
+                shutil.copyfile(
+                    Path(__file__).with_name("zig_vopr_qualify.sh"),
+                    root / "scripts/ci/zig_vopr_qualify.sh",
+                )
                 (root / "tools/run_bounded_zig_build.py").write_text(
                     "import json, sys\n"
                     "from pathlib import Path\n"
@@ -175,14 +183,27 @@ class SoakTests(unittest.TestCase):
                 )
                 step = workflow.split(f"      - name: {step_name}\n", 1)[1]
                 step = step.split("      - name:", 1)[0]
-                if "        run: |\n" in step:
-                    command = textwrap.dedent(step.split("        run: |\n", 1)[1])
-                else:
-                    command = " ".join(
-                        textwrap.dedent(step.split("        run: >-\n", 1)[1]).splitlines()
+                if mode is not None:
+                    self.assertIn(
+                        f'run: bash "$GITHUB_WORKSPACE/scripts/ci/zig_vopr_qualify.sh" {mode}',
+                        step,
                     )
+                    command = [
+                        "bash",
+                        str(root / "scripts/ci/zig_vopr_qualify.sh"),
+                        mode,
+                    ]
+                else:
+                    command = [
+                        "bash",
+                        "-e",
+                        "-o",
+                        "pipefail",
+                        "-c",
+                        textwrap.dedent(step.split("        run: |\n", 1)[1]),
+                    ]
                 result = subprocess.run(
-                    ["bash", "-e", "-o", "pipefail", "-c", command],
+                    command,
                     cwd=root,
                     env={
                         **os.environ,

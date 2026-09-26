@@ -15,6 +15,10 @@ on:
     - cron: '0 10 * * *'
   workflow_dispatch:
     inputs:
+      qualification_only:
+        description: Run qualification without the full soak campaign
+        type: boolean
+        default: false
       histories:
         description: Histories per shard (0 uses scenario budgets)
         type: number
@@ -118,17 +122,10 @@ jobs:
           python3 -m unittest discover -s scripts/ci -p test_zig_e2e_regression_loop.py
       - name: Audit replayable VOPR sources
         working-directory: zig
-        run: >-
-          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build
-          vopr-determinism-audit -Doptimize=ReleaseSafe --summary all
-          --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
+        run: bash "$GITHUB_WORKSPACE/scripts/ci/zig_vopr_qualify.sh" audit
       - name: Test production transport and runtime scheduling
         working-directory: zig
-        run: |
-          python3 "$GITHUB_WORKSPACE/scripts/ci/measure_disk_usage.py" --output "$RUNNER_TEMP/vopr-qualify-disk.json" --path /mnt/cache --path "$GITHUB_WORKSPACE" -- \
-            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-raft-transport-test standby-vopr-test vopr-runtime-test restore-admission-vopr-test secrets-vopr-test \
-            -Doptimize=ReleaseSafe --summary all \
-            --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
+        run: bash "$GITHUB_WORKSPACE/scripts/ci/zig_vopr_qualify.sh" runtime
       - name: Retain qualification disk measurements
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
