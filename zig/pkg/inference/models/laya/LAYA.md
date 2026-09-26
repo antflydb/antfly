@@ -674,16 +674,49 @@ its two AdamW moments drop out, replaced by `A` (`[rank, in]`) and `B`
 linears (`hidden 1024`, `mlp 6144`) that is decisively true, so the expected
 win is optimizer-transaction bytes and peak memory, not wall time per step.
 
-This section's numbers (median step time and peak `/usr/bin/time -l` memory
-on `td/prof.json`, rank 16 and rank 64, versus the 1.38 s/step full fine-tune
-baseline; step-0 packed accuracy over seeds 42/43/44 at rank 16 and rank 64
-against the 0.450/0.512 baselines) were not collected this session: the
-shared GPU/build lock stayed held by other agents' training and evaluation
-runs for the session's full duration, including several multi-hour queues.
-Running a released-model job needs both locks for several minutes per seed,
-and none opened up. The correctness evidence above (CPU, synthetic fixture)
-stands on its own for the graph, freeze/target logic, export merge, and
-resume; the throughput and accuracy claims are the open item.
+Measured 2026-09-26 on an Apple M4 Max, ReleaseFast, Metal trainer, released
+`convaiinnovations/laya`, `targets: ["encoder","head"]`, `alpha` 32,
+`dropout` 0.
+
+**Step time and memory.** `td/prof.json`-style job (packed question mode,
+batch size 1, 14 microbatches of the step-0 training subset), median step
+after two warm-up steps, peak `/usr/bin/time -l` footprint. The full
+fine-tune row is remeasured here (same job, same machine state) rather than
+reusing the 1.38 s/step figure from [Trainer
+throughput](#trainer-throughput), so the two rows are directly comparable:
+
+| Trainer | Median step | Peak footprint |
+| --- | ---: | ---: |
+| Full fine-tune (remeasured) | 1.31 s | 25.88 GB |
+| LoRA rank 16 | 1.23 s | 14.43 GB |
+
+LoRA is not slower despite the extra adapter matmuls: it tracks far fewer
+optimizer-managed parameters (two small `A`/`B` matrices per targeted linear
+instead of the full `[out, in]` weight and its two AdamW moments), and the
+optimizer transaction was ~15% of full fine-tune's step time (its own
+[Trainer throughput](#trainer-throughput) breakdown), so the saving there
+outweighs the small added forward/backward cost. Peak memory drops 44%
+(1.79x).
+
+**Accuracy (step 0, packed question mode).** Same recipe, data, and serving
+evaluator as [Accuracy (step 0)](#accuracy-step-0) and [Run-to-run
+variance](#run-to-run-variance), rank 16:
+
+| Trainer | Seed 42 | Seed 43 | Seed 44 | Mean | SD |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Current trainer (full fine-tune) | 0.434 | 0.461 | 0.455 | 0.450 | 0.014 |
+| LoRA rank 16 | 0.480 | 0.478 | 0.454 | 0.471 | 0.014 |
+
+LoRA rank 16 scores at or above the full fine-tune baseline, with the same
+seed-to-seed spread (SD 0.014 in both). It lands between the unfrozen
+baseline (0.450) and `freeze_layers: 11` (0.512): training only a small
+delta on top of frozen base weights plausibly regularizes this small
+(400-case) recipe similarly to freezing lower layers, without freezing any
+layer outright. Three seeds is still not enough to resolve a difference this
+size against the 0.450 baseline ([Run-to-run
+variance](#run-to-run-variance) makes the same point about the existing
+rows), so read this as "not worse," not as a confirmed improvement. Rank 64
+was not measured (time did not allow it in this session).
 
 ## Verification
 
@@ -712,7 +745,8 @@ All numbers are from 2026-09-24 on an Apple M4 Max (36 GiB), Zig 0.16.0.
 | LoRA: one adapter pair per targeted linear, both target groups differentiated | `finetune/laya/graph.zig` | exact (12 `lora_A`/12 `lora_B` for rank 4, 2 encoder layers + 1 head layer, both targets) |
 | LoRA target/freeze/prefix helpers identify exactly the six adapted linears and their bias, and compose correctly with `freeze_layers` | `finetune/laya/graph.zig`, `training_test.zig` | exact |
 | LoRA merge equals `base + scale·B·A` on a hand-computed case; rejects a shape mismatch | `finetune/laya/job.zig` | exact |
-| LoRA end-to-end job (CPU, synthetic fixture): a targeted weight moves, its bias and every non-targeted frozen tensor stay exact, no `lora_A`/`lora_B` reaches the served checkpoint, interrupted-then-resumed reproduces the uninterrupted export | `finetune/laya/training_test.zig` | exact (digest match); confirmed on CPU. Metal not independently re-run this session (shared-machine build/GPU lock contention); the graph uses the same generic ops (`linearNoBias`/`add`/`mul`) as every other Laya training path already qualified on Metal |
+| LoRA end-to-end job (synthetic fixture): a targeted weight moves, its bias and every non-targeted frozen tensor stay exact, no `lora_A`/`lora_B` reaches the served checkpoint, interrupted-then-resumed reproduces the uninterrupted export | `finetune/laya/training_test.zig` | exact (digest match), CPU and Metal |
+| Full `--test-filter laya` suite unaffected by widening `training.frozen`'s signature and `architecture.build`'s parameter list | all laya tests | 64 selected, 56 passed, 0 failed (8 skipped: CUDA, packed benchmark, export-reference — unrelated to this track), CPU and Metal, including the 45-tensor PyTorch gradient parity test (max abs error 2.4e-6 native / 1.9e-6 resident Metal, unchanged from before this track) |
 | q8_0 linears keep every decision; probabilities close to dense | `pipelines/laya_quantized_test.zig` | labels identical; max probability error 9e-7 (CPU), 5e-6 (Metal) on the fixture |
 | Metal linears read the current weight after it is replaced | `ops/resident_training_metal_test.zig` | exact; fails without the slot-cache fix |
 | Gradients on the released model vs float64 PyTorch, three ~330-token states | `training_test.zig` with a released-model fixture | worst per-layer relative L2 0.4–0.6% (float32) |
@@ -848,9 +882,10 @@ Other open items:
   softmax (step 2b).
 - **Trainer throughput:** device slices, device-resident gradients, command
   frames, the batched optimizer, device inputs, frozen lower layers, and LoRA
-  are done ([Trainer throughput](#trainer-throughput), [LoRA](#lora)). LoRA's
-  own step-time/memory/accuracy measurement on the released model is not done
-  (shared-machine lock contention; see [LoRA throughput and
-  accuracy](#lora-throughput-and-accuracy)). Segment attention with a
-  backward pass in the training graph, alongside step 2c, is next. A
-  qualification run with frozen layers has not been done.
+  are done ([Trainer throughput](#trainer-throughput), [LoRA](#lora)).
+  LoRA rank 16 on the released model: 1.23 s/step and 14.43 GB peak vs 1.31 s
+  and 25.88 GB full fine-tune (remeasured), and step-0 accuracy at or above
+  the full-fine-tune baseline over 3 seeds ([LoRA throughput and
+  accuracy](#lora-throughput-and-accuracy)); rank 64 not measured. Segment
+  attention with a backward pass in the training graph, alongside step 2c,
+  is next. A qualification run with frozen layers has not been done.
