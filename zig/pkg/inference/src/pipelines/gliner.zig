@@ -36,6 +36,8 @@ const runtime = @import("../runtime/root.zig");
 
 pub const Entity = @import("ner.zig").Entity;
 
+pub const ClassificationHead = enum { none, label_marker_mlp };
+
 pub const GlinerConfig = struct {
     max_width: u32 = 12,
     max_length: u32 = 512,
@@ -46,14 +48,211 @@ pub const GlinerConfig = struct {
     relation_threshold: f32 = 0.0,
     model_type: []const u8 = "",
     capabilities: []const []const u8 = &.{},
+    classification_head: ClassificationHead = .none,
     // Special token IDs parsed from added_tokens.json
     token_p: i32 = 0, // [P]
     token_c: i32 = 0, // [C]
+    token_l: i32 = 0, // [L]
     token_e: i32 = 0, // [E]
     token_r: i32 = 0, // [R]
+    token_sep_struct: i32 = 0, // [SEP_STRUCT]
     token_sep_text: i32 = 0, // [SEP_TEXT]
     distributed: runtime.distributed.Config = .{},
 };
+
+fn freePreparedDecisionRow(a: std.mem.Allocator, row: PreparedDecisionRow) void {
+    a.free(row.input_ids);
+    a.free(row.attention_mask);
+    a.free(row.marker_positions);
+    a.free(row.marker_mask);
+    a.free(row.task_indexes);
+}
+
+fn decisionSpecialId(a: std.mem.Allocator, tok: Tokenizer, text_value: []const u8) !i64 {
+    const ids = try tok.encode(a, text_value);
+    defer a.free(ids);
+    if (ids.len != 1 or ids[0] < 0 or ids[0] == tok.specialTokens().unk_id) return error.InvalidGlinerTokenizer;
+    return ids[0];
+}
+
+fn appendEncoded(out: *std.ArrayListUnmanaged(i32), a: std.mem.Allocator, tok: Tokenizer, value: []const u8) !void {
+    if (value.len != 0) try tok.encodeInto(a, value, out);
+}
+
+fn validateDecisionTask(task: DecisionTask) !void {
+    if (task.name.len == 0 or task.labels.len < 2 or task.labels.len > 1000 or
+        !std.math.isFinite(task.temperature) or task.temperature <= 0 or
+        !std.math.isFinite(task.threshold) or task.threshold < 0 or task.threshold > 1 or
+        task.top_k == 0 or task.top_k > task.labels.len)
+        return error.InvalidDecisionTask;
+    for (task.labels, 0..) |label, i| {
+        if (label.name.len == 0) return error.InvalidDecisionTask;
+        for (task.labels[0..i]) |prior| if (std.mem.eql(u8, prior.name, label.name)) return error.InvalidDecisionTask;
+    }
+}
+
+fn encodeDecisionTask(
+    a: std.mem.Allocator,
+    tok: Tokenizer,
+    task: DecisionTask,
+    p_id: i64,
+    l_id: i64,
+    desc_id: i64,
+    example_id: i64,
+    output_id: i64,
+) !struct { ids: []const i32, markers: []const usize } {
+    _ = desc_id;
+    _ = example_id;
+    _ = output_id;
+    var ids = std.ArrayListUnmanaged(i32).empty;
+    try appendEncoded(&ids, a, tok, "(");
+    try ids.append(a, @intCast(p_id));
+    var prompt = std.ArrayListUnmanaged(u8).empty;
+    try prompt.appendSlice(a, task.name);
+    if (task.prompt.len != 0) {
+        try prompt.appendSlice(a, ": ");
+        try prompt.appendSlice(a, task.prompt);
+    }
+    if (task.example_mode == .descriptions or task.example_mode == .both) for (task.labels) |label| {
+        if (label.description.len == 0) continue;
+        try prompt.appendSlice(a, " [DESCRIPTION] ");
+        try prompt.appendSlice(a, label.name);
+        try prompt.appendSlice(a, ": ");
+        try prompt.appendSlice(a, label.description);
+    };
+    if (task.example_mode == .few_shot or task.example_mode == .both) for (task.examples) |example| {
+        if (example.input.len == 0 or example.output.len == 0) return error.InvalidDecisionTask;
+        var known = false;
+        for (task.labels) |label| if (std.mem.eql(u8, label.name, example.output)) {
+            known = true;
+            break;
+        };
+        if (!known) return error.InvalidDecisionTask;
+        try prompt.appendSlice(a, " [EXAMPLE] ");
+        try prompt.appendSlice(a, example.input);
+        try prompt.appendSlice(a, " [OUTPUT] ");
+        try prompt.appendSlice(a, example.output);
+    };
+    try appendEncoded(&ids, a, tok, prompt.items);
+    try appendEncoded(&ids, a, tok, "(");
+    const markers = try a.alloc(usize, task.labels.len);
+    for (task.labels, 0..) |label, i| {
+        markers[i] = ids.items.len;
+        try ids.append(a, @intCast(l_id));
+        try appendEncoded(&ids, a, tok, label.name);
+    }
+    try appendEncoded(&ids, a, tok, ")");
+    try appendEncoded(&ids, a, tok, ")");
+    return .{ .ids = try ids.toOwnedSlice(a), .markers = markers };
+}
+
+fn decisionTextIds(a: std.mem.Allocator, tok: Tokenizer, text_value: []const u8) ![]i32 {
+    var words = std.ArrayListUnmanaged([]const u8).empty;
+    defer words.deinit(a);
+    var starts = std.ArrayListUnmanaged(usize).empty;
+    defer starts.deinit(a);
+    var ends = std.ArrayListUnmanaged(usize).empty;
+    defer ends.deinit(a);
+    try splitIntoWords(a, text_value, &words, &starts, &ends);
+    var ids = std.ArrayListUnmanaged(i32).empty;
+    errdefer ids.deinit(a);
+    var lower = std.ArrayListUnmanaged(u8).empty;
+    defer lower.deinit(a);
+    for (words.items) |word| {
+        lower.clearRetainingCapacity();
+        try lower.ensureUnusedCapacity(a, word.len);
+        for (word) |c| lower.appendAssumeCapacity(std.ascii.toLower(c));
+        try tok.encodeInto(a, lower.items, &ids);
+    }
+    return ids.toOwnedSlice(a);
+}
+
+fn decisionGroupEnds(a: std.mem.Allocator, task_sizes: []const usize, fixed: usize, maximum: usize) ![]usize {
+    if (task_sizes.len == 0 or fixed >= maximum) return error.DecisionInputTooLong;
+    var ends = std.ArrayListUnmanaged(usize).empty;
+    errdefer ends.deinit(a);
+    var first: usize = 0;
+    while (first < task_sizes.len) {
+        var end = first;
+        var schema: usize = 0;
+        while (end < task_sizes.len) {
+            const separator: usize = if (end == first) 0 else 1;
+            const candidate = try std.math.add(usize, schema, try std.math.add(usize, separator, task_sizes[end]));
+            if (try std.math.add(usize, candidate, fixed) > maximum) break;
+            schema = candidate;
+            end += 1;
+        }
+        if (end == first) return error.DecisionInputTooLong;
+        try ends.append(a, end);
+        first = end;
+    }
+    return ends.toOwnedSlice(a);
+}
+
+fn softmaxDecision(probabilities: []f32, logits: []const f32, temperature: f32) void {
+    var maximum = -std.math.inf(f32);
+    for (logits) |value| maximum = @max(maximum, value / temperature);
+    var sum: f32 = 0;
+    for (logits, probabilities) |value, *probability| {
+        probability.* = @exp(value / temperature - maximum);
+        sum += probability.*;
+    }
+    for (probabilities) |*probability| probability.* /= sum;
+}
+
+fn decodeDecisionTasks(a: std.mem.Allocator, tasks: []const DecisionTask, raw: []const f32, ranges: []const DecisionTaskRange) ![]DecisionTaskResult {
+    if (tasks.len != ranges.len) return error.UnexpectedOutputShape;
+    const out = try a.alloc(DecisionTaskResult, tasks.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| a.free(item.selections);
+        a.free(out);
+    }
+    for (tasks, ranges, out, 0..) |task, range, *result, task_index| {
+        if (range.task_index != task_index or range.end > raw.len or range.end - range.start != task.labels.len) return error.UnexpectedOutputShape;
+        const logits = raw[range.start..range.end];
+        const probabilities = try a.alloc(f32, logits.len);
+        defer a.free(probabilities);
+        const use_sigmoid = switch (task.activation) {
+            .sigmoid => true,
+            .softmax => false,
+            .auto => task.multi_label,
+        };
+        if (use_sigmoid) {
+            for (logits, probabilities) |value, *probability| probability.* = 1 / (1 + @exp(-(value / task.temperature)));
+        } else {
+            softmaxDecision(probabilities, logits, task.temperature);
+        }
+        var selected = std.ArrayListUnmanaged(DecisionSelection).empty;
+        errdefer selected.deinit(a);
+        if (task.multi_label) {
+            for (logits, probabilities, 0..) |logit, probability, label_index| if (probability >= task.threshold)
+                try selected.append(a, .{ .label_index = label_index, .logit = logit, .probability = probability });
+            if (selected.items.len == 0) {
+                var best: usize = 0;
+                for (probabilities[1..], 1..) |probability, i| if (probability > probabilities[best]) {
+                    best = i;
+                };
+                try selected.append(a, .{ .label_index = best, .logit = logits[best], .probability = probabilities[best] });
+            }
+        } else {
+            const chosen = try a.alloc(bool, logits.len);
+            defer a.free(chosen);
+            @memset(chosen, false);
+            for (0..task.top_k) |_| {
+                var best: ?usize = null;
+                for (probabilities, 0..) |probability, i| {
+                    if (!chosen[i] and (best == null or probability > probabilities[best.?])) best = i;
+                }
+                chosen[best.?] = true;
+                try selected.append(a, .{ .label_index = best.?, .logit = logits[best.?], .probability = probabilities[best.?] });
+            }
+        }
+        result.* = .{ .task_index = task_index, .selections = try selected.toOwnedSlice(a) };
+        initialized += 1;
+    }
+    return out;
+}
 
 pub const ClassificationConfig = struct {
     threshold: f32 = 0.0,
@@ -64,6 +263,110 @@ pub const ClassificationConfig = struct {
 pub const ClassificationResult = struct {
     label: []const u8,
     score: f32,
+};
+
+pub const DecisionActivation = enum { auto, sigmoid, softmax };
+pub const DecisionExampleMode = enum { none, descriptions, few_shot, both };
+
+pub const DecisionLabel = struct {
+    name: []const u8,
+    description: []const u8 = "",
+};
+
+pub const DecisionExample = struct {
+    input: []const u8,
+    output: []const u8,
+};
+
+/// One independently decoded classification head. Labels remain an
+/// indivisible group during sequence-budget planning: splitting them changes
+/// both the encoder context and the single-label softmax denominator.
+pub const DecisionTask = struct {
+    name: []const u8,
+    prompt: []const u8 = "",
+    labels: []const DecisionLabel,
+    examples: []const DecisionExample = &.{},
+    example_mode: DecisionExampleMode = .descriptions,
+    multi_label: bool = false,
+    activation: DecisionActivation = .auto,
+    temperature: f32 = 1,
+    threshold: f32 = 0.5,
+    top_k: usize = 1,
+};
+
+pub const DecisionRequest = struct {
+    text: []const u8,
+    tasks: []const DecisionTask,
+};
+
+pub const DecisionTaskRange = struct {
+    task_index: usize,
+    start: usize,
+    end: usize,
+};
+
+pub const DecisionSelection = struct {
+    label_index: usize,
+    logit: f32,
+    probability: f32,
+};
+
+pub const DecisionTaskResult = struct {
+    task_index: usize,
+    selections: []DecisionSelection,
+};
+
+/// Logits and ranges are in original task/label order even when execution was
+/// split into several greedily packed rows.
+pub const DecisionResult = struct {
+    raw_logits: []f32,
+    task_ranges: []DecisionTaskRange,
+    tasks: []DecisionTaskResult,
+    prompt_tokens: usize,
+    execution_chunks: usize,
+
+    pub fn deinit(self: *DecisionResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.raw_logits);
+        allocator.free(self.task_ranges);
+        for (self.tasks) |task| allocator.free(task.selections);
+        allocator.free(self.tasks);
+        self.* = undefined;
+    }
+};
+
+const PreparedDecisionRow = struct {
+    request_index: usize,
+    input_ids: []i64,
+    attention_mask: []i64,
+    marker_positions: []i64,
+    marker_mask: []i64,
+    /// Original task indexes represented by this row, in schema order.
+    task_indexes: []usize,
+};
+
+pub const PreparedDecisionBatch = struct {
+    allocator: std.mem.Allocator,
+    requests: []const DecisionRequest,
+    rows: []PreparedDecisionRow,
+    task_ranges: [][]DecisionTaskRange,
+    logits_len: []usize,
+    prompt_tokens: []usize,
+
+    pub fn deinit(self: *PreparedDecisionBatch) void {
+        for (self.rows) |row| {
+            self.allocator.free(row.input_ids);
+            self.allocator.free(row.attention_mask);
+            self.allocator.free(row.marker_positions);
+            self.allocator.free(row.marker_mask);
+            self.allocator.free(row.task_indexes);
+        }
+        for (self.task_ranges) |ranges| self.allocator.free(ranges);
+        self.allocator.free(self.rows);
+        self.allocator.free(self.task_ranges);
+        self.allocator.free(self.logits_len);
+        self.allocator.free(self.prompt_tokens);
+        self.* = undefined;
+    }
 };
 
 pub const Relation = struct {
@@ -173,6 +476,22 @@ pub const GlinerPipeline = struct {
         texts: []const []const u8,
         labels: []const []const u8,
     ) !usize {
+        if (texts.len == 0) return 0;
+        if (self.config.classification_head == .label_marker_mlp) {
+            const a = self.allocator;
+            const decision_labels = try a.alloc(DecisionLabel, labels.len);
+            defer a.free(decision_labels);
+            for (labels, decision_labels) |label, *out| out.* = .{ .name = label };
+            const tasks = [_]DecisionTask{.{ .name = "classification", .labels = decision_labels, .example_mode = .none }};
+            const requests = try a.alloc(DecisionRequest, texts.len);
+            defer a.free(requests);
+            for (texts, requests) |text_value, *request| request.* = .{ .text = text_value, .tasks = &tasks };
+            var prepared = try self.prepareDecisionBatch(requests);
+            defer prepared.deinit();
+            var peak: usize = 0;
+            for (prepared.rows) |row| peak = @max(peak, row.input_ids.len);
+            return peak;
+        }
         const label_token = if (self.config.token_c != 0) self.config.token_c else self.config.token_e;
         var result: usize = 0;
         for (texts) |text| {
@@ -338,6 +657,8 @@ pub const GlinerPipeline = struct {
     ) ![][]ClassificationResult {
         const alloc = self.allocator;
         if (labels.len == 0) return error.NoLabelsProvided;
+        if (texts.len == 0) return alloc.alloc([]ClassificationResult, 0);
+        if (self.config.classification_head == .label_marker_mlp) return self.classifyDecisionBatch(texts, labels, config);
 
         const scores = if (self.supportsClassification() and self.session.backend() != .onnx)
             try self.scoreLabelsBatch(texts, labels)
@@ -364,6 +685,245 @@ pub const GlinerPipeline = struct {
         }
 
         return results;
+    }
+
+    fn classifyDecisionBatch(self: *GlinerPipeline, texts: []const []const u8, labels: []const []const u8, config: ClassificationConfig) ![][]ClassificationResult {
+        const a = self.allocator;
+        const decision_labels = try a.alloc(DecisionLabel, labels.len);
+        defer a.free(decision_labels);
+        for (labels, decision_labels) |label, *out| out.* = .{ .name = label };
+        const task = DecisionTask{
+            .name = "classification",
+            .labels = decision_labels,
+            .example_mode = .none,
+            .multi_label = config.multi_label,
+            .threshold = config.threshold,
+            .top_k = if (config.top_k != 0) config.top_k else if (config.multi_label) labels.len else 1,
+        };
+        const task_slice = [_]DecisionTask{task};
+        const requests = try a.alloc(DecisionRequest, texts.len);
+        defer a.free(requests);
+        for (texts, requests) |text_value, *request| request.* = .{ .text = text_value, .tasks = &task_slice };
+        const decisions = try self.decideBatch(requests);
+        defer {
+            for (decisions) |*decision| decision.deinit(a);
+            a.free(decisions);
+        }
+        const out = try a.alloc([]ClassificationResult, texts.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |row| a.free(row);
+            a.free(out);
+        }
+        for (decisions, out) |decision, *row| {
+            const selections = decision.tasks[0].selections;
+            const values = try a.alloc(ClassificationResult, selections.len);
+            for (selections, values) |selection, *value| value.* = .{ .label = labels[selection.label_index], .score = selection.probability };
+            std.mem.sort(ClassificationResult, values, {}, struct {
+                fn lessThan(_: void, left: ClassificationResult, right: ClassificationResult) bool {
+                    return left.score > right.score;
+                }
+            }.lessThan);
+            row.* = values;
+            initialized += 1;
+        }
+        return out;
+    }
+
+    /// Compile every request and every greedily packed schema row before any
+    /// session work. Callers may use this directly when admission/preflight
+    /// must be separated from execution.
+    pub fn prepareDecisionBatch(self: *GlinerPipeline, requests: []const DecisionRequest) !PreparedDecisionBatch {
+        const a = self.allocator;
+        if (requests.len == 0) return error.InvalidDecisionRequest;
+        const max_length: usize = self.config.max_length;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+
+        const p_id = try decisionSpecialId(scratch, self.tok, "[P]");
+        const l_id = try decisionSpecialId(scratch, self.tok, "[L]");
+        const sep_struct_id = try decisionSpecialId(scratch, self.tok, "[SEP_STRUCT]");
+        const sep_text_id = try decisionSpecialId(scratch, self.tok, "[SEP_TEXT]");
+        const desc_id = try decisionSpecialId(scratch, self.tok, "[DESCRIPTION]");
+        const example_id = try decisionSpecialId(scratch, self.tok, "[EXAMPLE]");
+        const output_id = try decisionSpecialId(scratch, self.tok, "[OUTPUT]");
+
+        var rows = std.ArrayListUnmanaged(PreparedDecisionRow).empty;
+        errdefer {
+            for (rows.items) |row| freePreparedDecisionRow(a, row);
+            rows.deinit(a);
+        }
+        const all_ranges = try a.alloc([]DecisionTaskRange, requests.len);
+        errdefer a.free(all_ranges);
+        var range_requests: usize = 0;
+        errdefer for (all_ranges[0..range_requests]) |ranges| a.free(ranges);
+        const logits_len = try a.alloc(usize, requests.len);
+        errdefer a.free(logits_len);
+        const prompt_tokens = try a.alloc(usize, requests.len);
+        errdefer a.free(prompt_tokens);
+
+        for (requests, 0..) |request, request_index| {
+            if (request.tasks.len == 0) return error.InvalidDecisionRequest;
+            const text_ids = try decisionTextIds(scratch, self.tok, request.text);
+            const fixed = try std.math.add(usize, 1, text_ids.len); // [SEP_TEXT] + full text
+            if (fixed >= max_length) return error.DecisionInputTooLong;
+
+            const EncodedTask = struct { ids: []const i32, markers: []const usize };
+            const encoded = try scratch.alloc(EncodedTask, request.tasks.len);
+            const ranges = try a.alloc(DecisionTaskRange, request.tasks.len);
+            all_ranges[request_index] = ranges;
+            range_requests += 1;
+            var flat: usize = 0;
+            for (request.tasks, encoded, ranges, 0..) |task, *out, *range, task_index| {
+                try validateDecisionTask(task);
+                const prepared_task = try encodeDecisionTask(scratch, self.tok, task, p_id, l_id, desc_id, example_id, output_id);
+                out.* = .{ .ids = prepared_task.ids, .markers = prepared_task.markers };
+                if (try std.math.add(usize, fixed, out.ids.len) > max_length) return error.DecisionInputTooLong;
+                const end = try std.math.add(usize, flat, task.labels.len);
+                range.* = .{ .task_index = task_index, .start = flat, .end = end };
+                flat = end;
+            }
+            logits_len[request_index] = flat;
+            prompt_tokens[request_index] = 0;
+
+            // Stable first-fit-in-order packing. Whole tasks are indivisible.
+            const task_sizes = try scratch.alloc(usize, encoded.len);
+            for (encoded, task_sizes) |task, *size| size.* = task.ids.len;
+            const group_ends = try decisionGroupEnds(scratch, task_sizes, fixed, max_length);
+            var first: usize = 0;
+            for (group_ends) |end| {
+                var schema_len: usize = 0;
+                for (encoded[first..end], 0..) |task, local| schema_len = try std.math.add(usize, schema_len, try std.math.add(usize, if (local == 0) 0 else 1, task.ids.len));
+                const total = try std.math.add(usize, schema_len, fixed);
+                var row_transferred = false;
+                const ids = try a.alloc(i64, total);
+                errdefer if (!row_transferred) a.free(ids);
+                const attention = try a.alloc(i64, total);
+                errdefer if (!row_transferred) a.free(attention);
+                @memset(attention, 1);
+                var marker_count: usize = 0;
+                for (encoded[first..end]) |task| marker_count = try std.math.add(usize, marker_count, task.markers.len);
+                const markers = try a.alloc(i64, marker_count);
+                errdefer if (!row_transferred) a.free(markers);
+                const marker_mask = try a.alloc(i64, marker_count);
+                errdefer if (!row_transferred) a.free(marker_mask);
+                @memset(marker_mask, 1);
+                const task_indexes = try a.alloc(usize, end - first);
+                errdefer if (!row_transferred) a.free(task_indexes);
+
+                var pos: usize = 0;
+                var marker_at: usize = 0;
+                for (encoded[first..end], first..) |task, task_index| {
+                    if (task_index != first) {
+                        ids[pos] = sep_struct_id;
+                        pos += 1;
+                    }
+                    const base = pos;
+                    for (task.ids) |id| {
+                        ids[pos] = id;
+                        pos += 1;
+                    }
+                    for (task.markers) |relative| {
+                        markers[marker_at] = @intCast(base + relative);
+                        marker_at += 1;
+                    }
+                    task_indexes[task_index - first] = task_index;
+                }
+                ids[pos] = sep_text_id;
+                pos += 1;
+                for (text_ids) |id| {
+                    ids[pos] = id;
+                    pos += 1;
+                }
+                std.debug.assert(pos == total and marker_at == marker_count);
+                try rows.append(a, .{ .request_index = request_index, .input_ids = ids, .attention_mask = attention, .marker_positions = markers, .marker_mask = marker_mask, .task_indexes = task_indexes });
+                row_transferred = true;
+                prompt_tokens[request_index] = try std.math.add(usize, prompt_tokens[request_index], total);
+                first = end;
+            }
+        }
+        return .{ .allocator = a, .requests = requests, .rows = try rows.toOwnedSlice(a), .task_ranges = all_ranges, .logits_len = logits_len, .prompt_tokens = prompt_tokens };
+    }
+
+    pub fn decideBatch(self: *GlinerPipeline, requests: []const DecisionRequest) ![]DecisionResult {
+        var prepared = try self.prepareDecisionBatch(requests);
+        defer prepared.deinit();
+        return self.decidePrepared(&prepared);
+    }
+
+    pub fn decidePrepared(self: *GlinerPipeline, prepared: *const PreparedDecisionBatch) ![]DecisionResult {
+        const a = self.allocator;
+        const results = try a.alloc(DecisionResult, prepared.requests.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |*result| result.deinit(a);
+            a.free(results);
+        }
+        for (prepared.requests, 0..) |_, i| {
+            const raw_logits = try a.alloc(f32, prepared.logits_len[i]);
+            errdefer a.free(raw_logits);
+            const task_ranges = try a.dupe(DecisionTaskRange, prepared.task_ranges[i]);
+            errdefer a.free(task_ranges);
+            const decoded_tasks = try a.alloc(DecisionTaskResult, 0);
+            errdefer a.free(decoded_tasks);
+            results[i] = .{
+                .raw_logits = raw_logits,
+                .task_ranges = task_ranges,
+                .tasks = decoded_tasks,
+                .prompt_tokens = prepared.prompt_tokens[i],
+                .execution_chunks = 0,
+            };
+            initialized += 1;
+        }
+        for (prepared.rows) |row| {
+            const outputs = try self.runDecisionRow(row);
+            defer {
+                for (outputs) |*output| output.deinit();
+                a.free(outputs);
+            }
+            if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 2 or outputs[0].shape[0] != 1 or outputs[0].shape[1] != @as(i64, @intCast(row.marker_positions.len)))
+                return error.UnexpectedOutputShape;
+            const logits = outputs[0].asFloat32();
+            for (logits) |logit| if (!std.math.isFinite(logit)) return error.InvalidDecisionLogits;
+            var source: usize = 0;
+            for (row.task_indexes) |task_index| {
+                const range = prepared.task_ranges[row.request_index][task_index];
+                const count = range.end - range.start;
+                @memcpy(results[row.request_index].raw_logits[range.start..range.end], logits[source..][0..count]);
+                source += count;
+            }
+            if (source != logits.len) return error.UnexpectedOutputShape;
+            results[row.request_index].execution_chunks += 1;
+        }
+        for (results, prepared.requests) |*result, request| {
+            const decoded = try decodeDecisionTasks(a, request.tasks, result.raw_logits, result.task_ranges);
+            a.free(result.tasks);
+            result.tasks = decoded;
+        }
+        return results;
+    }
+
+    fn runDecisionRow(self: *GlinerPipeline, row: PreparedDecisionRow) ![]Tensor {
+        const a = self.allocator;
+        const seq: i64 = @intCast(row.input_ids.len);
+        const labels: i64 = @intCast(row.marker_positions.len);
+        const input_elements = try std.math.mul(usize, try std.math.add(usize, row.input_ids.len, row.marker_positions.len), 2);
+        const input_bytes = try std.math.mul(usize, input_elements, @sizeOf(i64));
+        var permit = try self.session.admit(.{ .batch = 1, .sequence = row.input_ids.len, .input_bytes = input_bytes, .host_preprocess_bytes = 0 });
+        defer permit.deinit();
+        var inputs: [4]Tensor = undefined;
+        var initialized: usize = 0;
+        defer for (inputs[0..initialized]) |*input| input.deinit();
+        inputs[0] = try Tensor.initInt64(a, "input_ids", &.{ 1, seq }, row.input_ids);
+        initialized += 1;
+        inputs[1] = try Tensor.initInt64(a, "attention_mask", &.{ 1, seq }, row.attention_mask);
+        initialized += 1;
+        inputs[2] = try Tensor.initInt64(a, "decision_marker_positions", &.{ 1, labels }, row.marker_positions);
+        initialized += 1;
+        inputs[3] = try Tensor.initInt64(a, "decision_marker_mask", &.{ 1, labels }, row.marker_mask);
+        initialized += 1;
+        return self.lockedSessionRun(&permit, &inputs, a);
     }
 
     /// Recognize entities in a single text.
@@ -1883,6 +2443,8 @@ fn splitIntoWords(
             startsWithAsciiIgnoreCase(text[i..], "www."))
         {
             i = consumeUntilWhitespace(text, i);
+        } else if (emailTokenEnd(text, i)) |end| {
+            i = end;
         } else if (text[i] == '@' and i + 1 < text.len and isWordScalar(text[i + 1 ..])) {
             i += 1;
             while (i < text.len and isWordScalar(text[i..])) i += utf8ScalarLen(text[i..]);
@@ -1907,6 +2469,24 @@ fn splitIntoWords(
         try starts.append(alloc, start);
         try ends.append(alloc, i);
     }
+}
+
+fn emailTokenEnd(text: []const u8, start: usize) ?usize {
+    var i = start;
+    while (i < text.len and (std.ascii.isAlphanumeric(text[i]) or
+        std.mem.indexOfScalar(u8, "._%+-", text[i]) != null)) : (i += 1)
+    {}
+    if (i == start or i >= text.len or text[i] != '@') return null;
+    i += 1;
+    const domain_start = i;
+    while (i < text.len and (std.ascii.isAlphanumeric(text[i]) or text[i] == '.' or text[i] == '-')) : (i += 1) {}
+    while (i > domain_start and (text[i - 1] == '.' or text[i - 1] == '-')) i -= 1;
+    if (i == domain_start) return null;
+    const dot = std.mem.lastIndexOfScalar(u8, text[domain_start..i], '.') orelse return null;
+    const suffix = text[domain_start + dot + 1 .. i];
+    if (suffix.len < 2) return null;
+    for (suffix) |c| if (!std.ascii.isAlphabetic(c)) return null;
+    return i;
 }
 
 fn isAsciiWhitespace(c: u8) bool {
@@ -2005,6 +2585,53 @@ test "scoreLabelsFromLogits returns sigmoid of max logit per label" {
 
     try std.testing.expectApproxEqAbs(sigmoid(0.7), scores[0], 1e-6);
     try std.testing.expectApproxEqAbs(sigmoid(1.2), scores[1], 1e-6);
+}
+
+test "decision decoding preserves task ranges and upstream activation semantics" {
+    const a = std.testing.allocator;
+    const labels = [_]DecisionLabel{ .{ .name = "low" }, .{ .name = "high" }, .{ .name = "other" } };
+    const tasks = [_]DecisionTask{
+        .{ .name = "priority", .labels = &labels, .multi_label = false, .top_k = 2 },
+        .{ .name = "tags", .labels = &labels, .multi_label = true, .threshold = 0.9 },
+    };
+    const raw = [_]f32{ 0, 2, 1, -2, -3, -4 };
+    const ranges = [_]DecisionTaskRange{
+        .{ .task_index = 0, .start = 0, .end = 3 },
+        .{ .task_index = 1, .start = 3, .end = 6 },
+    };
+    const decoded = try decodeDecisionTasks(a, &tasks, &raw, &ranges);
+    defer {
+        for (decoded) |task| a.free(task.selections);
+        a.free(decoded);
+    }
+    try std.testing.expectEqual(@as(usize, 2), decoded[0].selections.len);
+    try std.testing.expectEqual(@as(usize, 1), decoded[0].selections[0].label_index);
+    try std.testing.expectEqual(@as(usize, 2), decoded[0].selections[1].label_index);
+    // No sigmoid probability reaches 0.9, so upstream semantics retain argmax.
+    try std.testing.expectEqual(@as(usize, 1), decoded[1].selections.len);
+    try std.testing.expectEqual(@as(usize, 0), decoded[1].selections[0].label_index);
+}
+
+test "decision task validation rejects ambiguous and invalid decoding contracts" {
+    const duplicate = [_]DecisionLabel{ .{ .name = "yes" }, .{ .name = "yes" } };
+    try std.testing.expectError(error.InvalidDecisionTask, validateDecisionTask(.{ .name = "answer", .labels = &duplicate }));
+    const valid = [_]DecisionLabel{ .{ .name = "yes" }, .{ .name = "no" } };
+    try std.testing.expectError(error.InvalidDecisionTask, validateDecisionTask(.{ .name = "answer", .labels = &valid, .temperature = 0 }));
+    try std.testing.expectError(error.InvalidDecisionTask, validateDecisionTask(.{ .name = "answer", .labels = &valid, .threshold = 2 }));
+}
+
+test "decision schema planner greedily packs whole tasks and rejects indivisible overflow" {
+    const a = std.testing.allocator;
+    // fixed=60 includes [SEP_TEXT] and the complete text. A separator is
+    // charged only between tasks in the same row.
+    const ends = try decisionGroupEnds(a, &.{ 20, 19, 25 }, 60, 100);
+    defer a.free(ends);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 3 }, ends);
+    const exact = try decisionGroupEnds(a, &.{40}, 60, 100);
+    defer a.free(exact);
+    try std.testing.expectEqualSlices(usize, &.{1}, exact);
+    try std.testing.expectError(error.DecisionInputTooLong, decisionGroupEnds(a, &.{41}, 60, 100));
+    try std.testing.expectError(error.DecisionInputTooLong, decisionGroupEnds(a, &.{1}, 100, 100));
 }
 
 test "gliner classification microbatch matches singleton scores without padded-word contamination" {
@@ -2161,6 +2788,21 @@ test "gliner splitIntoWords separates punctuation like Python processor" {
         try std.testing.expectEqualStrings(want, words.items[i]);
         try std.testing.expectEqualStrings(want, text[starts.items[i]..ends.items[i]]);
     }
+}
+
+test "gliner splitIntoWords keeps upstream email token intact" {
+    const alloc = std.testing.allocator;
+    const input = "Email alice@example.com about the refund.";
+    var words = std.ArrayListUnmanaged([]const u8).empty;
+    defer words.deinit(alloc);
+    var starts = std.ArrayListUnmanaged(usize).empty;
+    defer starts.deinit(alloc);
+    var ends = std.ArrayListUnmanaged(usize).empty;
+    defer ends.deinit(alloc);
+    try splitIntoWords(alloc, input, &words, &starts, &ends);
+    const expected = [_][]const u8{ "Email", "alice@example.com", "about", "the", "refund", "." };
+    try std.testing.expectEqual(expected.len, words.items.len);
+    for (expected, 0..) |word, i| try std.testing.expectEqualStrings(word, words.items[i]);
 }
 
 test "gliner splitIntoWords keeps utf8 word text intact" {

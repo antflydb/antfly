@@ -20,6 +20,7 @@
 const std = @import("std");
 const Dir = std.Io.Dir;
 const bert = @import("bert.zig");
+const deberta = @import("deberta.zig");
 const gpt = @import("gpt.zig");
 const gliner_boundary = @import("gliner_boundary.zig");
 const gliner_qualification = @import("gliner_boundary_qualification.zig");
@@ -117,6 +118,11 @@ pub const ModelTypeOrigin = enum {
     tasks,
     heuristic,
     bundle,
+};
+
+pub const GlinerClassificationHead = enum {
+    none,
+    label_marker_mlp,
 };
 
 pub const TokenizerType = enum {
@@ -351,12 +357,18 @@ pub const ModelManifest = struct {
     gliner_default_labels: [][]const u8 = &.{},
     gliner_relation_labels: [][]const u8 = &.{},
     gliner_relation_threshold: f32 = 0.0,
+    /// Explicit document-classification contract. Legacy GLiNER checkpoints
+    /// must not gain classification serving merely because they happen to
+    /// contain tensors whose names start with `classifier`.
+    gliner_classification_head: GlinerClassificationHead = .none,
 
     // GLiNER special token IDs (from added_tokens.json)
     gliner_token_p: i32 = 0, // [P] token ID
     gliner_token_c: i32 = 0, // [C] token ID
+    gliner_token_l: i32 = 0, // [L] document-classification label token ID
     gliner_token_e: i32 = 0, // [E] token ID
     gliner_token_r: i32 = 0, // [R] token ID
+    gliner_token_sep_struct: i32 = 0, // [SEP_STRUCT] schema separator token ID
     gliner_token_sep_text: i32 = 0, // [SEP_TEXT] token ID
 
     // Capabilities (from model_manifest.json)
@@ -1177,6 +1189,42 @@ fn parseBoundaryConfigFromCatalog(
     return true;
 }
 
+/// Published span GLiNER checkpoints keep the DeBERTa geometry in a nested
+/// encoder config. The wrapper config describes only the span head.
+fn parseSpanEncoderConfigFromCatalog(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    catalog: *const ArtifactCatalog,
+    wrapper_config: []const u8,
+) !void {
+    if (manifest.gliner_architecture != .span or
+        !std.mem.eql(u8, manifest.config_model_arch, "extractor")) return;
+    const bytes = try catalog.readOptional("encoder_config/config.json") orelse {
+        // Older span bundles put complete encoder geometry in config.json.
+        // Native bundles whose wrapper omits it need the nested sidecar.
+        if (try catalog.exists("model.safetensors")) {
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, wrapper_config, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.MissingGlinerSpanEncoderConfig;
+            inline for (.{ "hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads", "vocab_size", "max_position_embeddings" }) |field| {
+                const value = parsed.value.object.get(field) orelse return error.MissingGlinerSpanEncoderConfig;
+                if (jsonU32(value) == null) return error.MissingGlinerSpanEncoderConfig;
+            }
+        }
+        return;
+    };
+    defer allocator.free(bytes);
+    const config = try deberta.parseConfig(allocator, bytes);
+    manifest.hidden_size = config.hidden_size;
+    manifest.intermediate_size = config.intermediate_size;
+    manifest.num_hidden_layers = config.num_hidden_layers;
+    manifest.num_attention_heads = config.num_attention_heads;
+    manifest.bert_vocab_size = config.vocab_size;
+    manifest.bert_type_vocab_size = 0;
+    manifest.bert_layer_norm_eps = config.layer_norm_eps;
+    manifest.max_position_embeddings = config.max_position_embeddings;
+}
+
 fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !ModelManifest {
     const model_dir_path = catalog.model_dir_path;
     var manifest = ModelManifest{ .allocator = allocator };
@@ -1192,6 +1240,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
         defer allocator.free(config_bytes);
         if (!try parseBoundaryConfigFromCatalog(&manifest, allocator, catalog, config_bytes)) {
             try ignoreNonResourceMetadataError(parseConfigJson(&manifest, allocator, config_bytes));
+            try parseSpanEncoderConfigFromCatalog(&manifest, allocator, catalog, config_bytes);
             try applySpanEncoderGeometry(&manifest, allocator, catalog, config_bytes);
         }
     }
@@ -1384,6 +1433,15 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     if (try catalog.readOptional("added_tokens.json")) |at_bytes| {
         defer allocator.free(at_bytes);
         try ignoreNonResourceMetadataError(parseAddedTokens(&manifest, at_bytes));
+    }
+    // Decide's small tokenizer config declares [L] and [SEP_STRUCT] IDs.
+    // Discovery needs these IDs to validate the explicit head without
+    // materializing the multi-megabyte tokenizer.json on every request.
+    if (manifest.gliner_classification_head == .label_marker_mlp) {
+        if (try catalog.readOptional("tokenizer_config.json")) |tokenizer_config_bytes| {
+            defer allocator.free(tokenizer_config_bytes);
+            try parseTokenizerConfig(&manifest, allocator, tokenizer_config_bytes);
+        }
     }
     try applyListingGlinerHint(&manifest, allocator, &catalog);
 
@@ -1625,6 +1683,23 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         if (manifest.gliner_model_type.len == 0) {
             manifest.gliner_model_type = try manifest.allocator.dupe(u8, gliner_type);
         }
+    }
+
+    if (manifest.gliner_classification_head == .label_marker_mlp) {
+        if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or
+            manifest.gliner_token_l == 0 or manifest.gliner_token_sep_struct == 0)
+            return error.InvalidModelManifest;
+        if (manifest.capabilities.len != 1 or manifest.tasks.len != 1 or
+            manifest.inputs.len != 1 or !std.mem.eql(u8, manifest.inputs[0], "text"))
+            return error.InvalidModelManifest;
+        for (manifest.capabilities) |capability|
+            if (!std.mem.eql(u8, capability, "classification")) return error.InvalidModelManifest;
+        for (manifest.tasks) |task|
+            if (!std.mem.eql(u8, task, "extract")) return error.InvalidModelManifest;
+        if (manifest.model_manifest_declarations.model_type and manifest.model_type != .extractor)
+            return error.InvalidModelManifest;
+        manifest.model_type = .extractor;
+        manifest.model_type_origin = .manifest;
     }
 
     // `type` is executable Antfly metadata. Path names, upstream architecture
@@ -2853,6 +2928,12 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
         manifest.model_manifest_declarations.inputs = true;
     }
 
+    if (obj.get("gliner_classification_head")) |v| {
+        if (v != .string or !std.mem.eql(u8, v.string, "label_marker_mlp"))
+            return error.InvalidModelManifest;
+        manifest.gliner_classification_head = .label_marker_mlp;
+    }
+
     if (obj.get("sparse_3d_output_layout")) |v| {
         manifest.sparse_3d_output_layout = try parseManifestSparse3DOutputLayoutJson(v);
         if (obj.get("sparse_output_layout")) |legacy| {
@@ -3750,11 +3831,17 @@ fn parseAddedTokens(manifest: *ModelManifest, json_bytes: []const u8) !void {
     if (obj.get("[C]")) |v| {
         if (v == .integer) manifest.gliner_token_c = @intCast(v.integer);
     }
+    if (obj.get("[L]")) |v| {
+        if (v == .integer) manifest.gliner_token_l = @intCast(v.integer);
+    }
     if (obj.get("[E]")) |v| {
         if (v == .integer) manifest.gliner_token_e = @intCast(v.integer);
     }
     if (obj.get("[R]")) |v| {
         if (v == .integer) manifest.gliner_token_r = @intCast(v.integer);
+    }
+    if (obj.get("[SEP_STRUCT]")) |v| {
+        if (v == .integer) manifest.gliner_token_sep_struct = @intCast(v.integer);
     }
     if (obj.get("[SEP_TEXT]")) |v| {
         if (v == .integer) manifest.gliner_token_sep_text = @intCast(v.integer);
@@ -3764,8 +3851,10 @@ fn parseAddedTokens(manifest: *ModelManifest, json_bytes: []const u8) !void {
 fn setGlinerSpecialToken(manifest: *ModelManifest, content: []const u8, token_id: i32) void {
     if (std.mem.eql(u8, content, "[P]")) manifest.gliner_token_p = token_id;
     if (std.mem.eql(u8, content, "[C]")) manifest.gliner_token_c = token_id;
+    if (std.mem.eql(u8, content, "[L]")) manifest.gliner_token_l = token_id;
     if (std.mem.eql(u8, content, "[E]")) manifest.gliner_token_e = token_id;
     if (std.mem.eql(u8, content, "[R]")) manifest.gliner_token_r = token_id;
+    if (std.mem.eql(u8, content, "[SEP_STRUCT]")) manifest.gliner_token_sep_struct = token_id;
     if (std.mem.eql(u8, content, "[SEP_TEXT]")) manifest.gliner_token_sep_text = token_id;
 }
 
@@ -4022,10 +4111,67 @@ test "parseModelManifestJson parses inputs array" {
     try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
 }
 
+test "explicit GLiNER label-marker decision head is extraction-v2 classification only" {
+    const a = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = a };
+    defer manifest.deinit();
+    try parseModelManifestJson(&manifest, a,
+        \\{"type":"extractor","tasks":["extract"],"capabilities":["classification"],"inputs":["text"],"gliner_classification_head":"label_marker_mlp"}
+    );
+    manifest.gliner_model_type = try a.dupe(u8, "gliner2");
+    manifest.gliner_token_l = 128007;
+    manifest.gliner_token_sep_struct = 128001;
+    try applyImplicitModelTypeHints(&manifest, "/models/local/decide");
+    try std.testing.expectEqual(GlinerClassificationHead.label_marker_mlp, manifest.gliner_classification_head);
+    try std.testing.expectEqual(ModelType.extractor, manifest.model_type);
+
+    var invalid = ModelManifest{ .allocator = a };
+    defer invalid.deinit();
+    try parseModelManifestJson(&invalid, a,
+        \\{"type":"extractor","tasks":["extract"],"capabilities":["extraction"],"inputs":["text"],"gliner_classification_head":"label_marker_mlp"}
+    );
+    invalid.gliner_model_type = try a.dupe(u8, "gliner2");
+    invalid.gliner_token_l = 128007;
+    invalid.gliner_token_sep_struct = 128001;
+    try std.testing.expectError(error.InvalidModelManifest, applyImplicitModelTypeHints(&invalid, "/models/local/decide"));
+}
+
+test "Decide listing reads small marker sidecar for declared classification head" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"extractor\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"extractor\",\"tasks\":[\"extract\"],\"capabilities\":[\"classification\"],\"inputs\":[\"text\"],\"gliner_classification_head\":\"label_marker_mlp\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "special_tokens_map.json", .data = "{\"[P]\":0,\"[C]\":0,\"[E]\":0,\"[R]\":0,\"[SEP_TEXT]\":0}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"added_tokens_decoder\":{\"128007\":{\"content\":\"[L]\"},\"128001\":{\"content\":\"[SEP_STRUCT]\"}}}" });
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    var listing = try loadListingFromDir(a, path);
+    defer listing.deinit();
+    try std.testing.expectEqual(GlinerClassificationHead.label_marker_mlp, listing.gliner_classification_head);
+    try std.testing.expectEqual(@as(i32, 128007), listing.gliner_token_l);
+    try std.testing.expectEqual(@as(i32, 128001), listing.gliner_token_sep_struct);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "[]" });
+    try std.testing.expectError(error.InvalidTokenizerConfig, loadListingFromDir(a, path));
+}
+
+test "GLiNER tokenizer metadata keeps classification and schema separator markers distinct" {
+    var manifest = ModelManifest{ .allocator = std.testing.allocator };
+    parseAddedTokens(&manifest,
+        \\{"[C]":128004,"[L]":128007,"[SEP_STRUCT]":128001,"[SEP_TEXT]":128002}
+    ) catch unreachable;
+    try std.testing.expectEqual(@as(i32, 128004), manifest.gliner_token_c);
+    try std.testing.expectEqual(@as(i32, 128007), manifest.gliner_token_l);
+    try std.testing.expectEqual(@as(i32, 128001), manifest.gliner_token_sep_struct);
+    try std.testing.expectEqual(@as(i32, 128002), manifest.gliner_token_sep_text);
+}
+
 fn parseTokenizerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
+    if (parsed.value != .object) return error.InvalidTokenizerConfig;
     const obj = parsed.value.object;
 
     if (obj.get("added_tokens_decoder")) |v| {
@@ -4747,6 +4893,29 @@ test "GLiNER sidecars preserve explicit model type provenance and accept the leg
         try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
         try std.testing.expectEqualStrings("gliner2", manifest.gliner_model_type);
     }
+}
+
+test "span GLiNER native config uses nested encoder geometry without breaking ONNX-only bundles" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/config.json", .data = "{\"model_type\":\"extractor\",\"max_width\":8}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.onnx", .data = "" });
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(path);
+    var onnx = try loadFromDir(allocator, path);
+    onnx.deinit();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.safetensors", .data = "" });
+    try std.testing.expectError(error.MissingGlinerSpanEncoderConfig, loadFromDir(allocator, path));
+    try tmp.dir.createDirPath(io, "model/encoder_config");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/encoder_config/config.json", .data = "{\"model_type\":\"deberta-v2\",\"hidden_size\":1024,\"intermediate_size\":4096,\"num_hidden_layers\":24,\"num_attention_heads\":16}" });
+    var native = try loadFromDir(allocator, path);
+    defer native.deinit();
+    try std.testing.expectEqual(@as(u32, 1024), native.hidden_size);
+    try std.testing.expectEqual(@as(u32, 24), native.num_hidden_layers);
 }
 
 test "listing candidate rejection classification fails operational errors visible" {

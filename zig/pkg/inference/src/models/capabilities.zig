@@ -42,6 +42,14 @@ pub fn modelSupportsCapability(
     // gliner_boundary_qualification.require() before any request executes.
     if (std.mem.eql(u8, gliner_model_type, gliner_boundary.model_type) and !gliner_boundary.runtime_available) return false;
     if (hasCapability(capabilities, capability)) return true;
+    // A recognized serving capability list is authoritative. This lets a
+    // GLiNER span artifact expose only its reviewed decision head without
+    // inheriting the legacy family's entity and relation capabilities.
+    for (capabilities) |declared| {
+        if (std.mem.eql(u8, declared, "classification") or
+            std.mem.eql(u8, declared, "relations") or
+            std.mem.eql(u8, declared, "extraction")) return false;
+    }
     if (std.mem.eql(u8, model_kind, "classifier")) {
         return std.mem.eql(u8, capability, "classification");
     }
@@ -105,6 +113,13 @@ test "modelSupportsCapability infers gliner2 extraction and classification" {
     try std.testing.expect(modelSupportsCapability("extractor", "gliner2", &.{"labels"}, "relations"));
     try std.testing.expect(modelSupportsCapability("extractor", "gliner2", &.{"labels"}, "extraction"));
     try std.testing.expect(!modelSupportsCapability("extractor", "", &.{"labels"}, "extraction"));
+}
+
+test "explicit GLiNER serving capabilities do not gain family capabilities" {
+    const decision_capabilities = &.{"classification"};
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", decision_capabilities, "classification"));
+    try std.testing.expect(!modelSupportsCapability("extractor", "gliner2", decision_capabilities, "relations"));
+    try std.testing.expect(!modelSupportsCapability("extractor", "gliner2", decision_capabilities, "extraction"));
 }
 
 test "modelKindAcceptsInput infers text and image modalities" {

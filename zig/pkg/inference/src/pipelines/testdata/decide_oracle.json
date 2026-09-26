@@ -1,0 +1,268 @@
+{
+  "cases": [
+    {
+      "input_ids": [
+        287,
+        128003,
+        9481,
+        287,
+        128007,
+        1453,
+        128007,
+        2330,
+        128007,
+        5678,
+        1263,
+        1263,
+        128001,
+        287,
+        128003,
+        889,
+        287,
+        128007,
+        1822,
+        128007,
+        2643,
+        128007,
+        876,
+        128007,
+        3083,
+        1263,
+        1263,
+        128002,
+        262,
+        1822,
+        269,
+        1390,
+        366,
+        304,
+        262,
+        2643,
+        6834,
+        416,
+        2657,
+        323
+      ],
+      "l_marker_positions": [
+        4,
+        6,
+        8,
+        17,
+        19,
+        21,
+        23
+      ],
+      "name": "mixed_product_review",
+      "schema_tokens": [
+        [
+          "(",
+          "[P]",
+          "sentiment",
+          "(",
+          "[L]",
+          "positive",
+          "[L]",
+          "negative",
+          "[L]",
+          "neutral",
+          ")",
+          ")"
+        ],
+        [
+          "(",
+          "[P]",
+          "issue",
+          "(",
+          "[L]",
+          "camera",
+          "[L]",
+          "battery",
+          "[L]",
+          "performance",
+          "[L]",
+          "none",
+          ")",
+          ")"
+        ]
+      ],
+      "tasks": {
+        "issue": {
+          "labels": [
+            "camera",
+            "battery",
+            "performance",
+            "none"
+          ],
+          "logits": {
+            "battery": 3.86103535,
+            "camera": -3.29277062,
+            "none": -5.40297747,
+            "performance": -5.18010235
+          },
+          "probabilities": {
+            "battery": 0.999005896,
+            "camera": 0.000781105316,
+            "none": 9.46800342e-05,
+            "performance": 0.000118318278
+          },
+          "winner": "battery"
+        },
+        "sentiment": {
+          "labels": [
+            "positive",
+            "negative",
+            "neutral"
+          ],
+          "logits": {
+            "negative": -0.630252004,
+            "neutral": -1.56286025,
+            "positive": 0.147121295
+          },
+          "probabilities": {
+            "negative": 0.28016889,
+            "neutral": 0.110253731,
+            "positive": 0.60957738
+          },
+          "winner": "positive"
+        }
+      },
+      "text": "The camera is excellent, but the battery fails before lunch."
+    },
+    {
+      "input_ids": [
+        287,
+        128003,
+        5875,
+        287,
+        128007,
+        6257,
+        128007,
+        2064,
+        616,
+        19443,
+        128007,
+        1160,
+        1263,
+        1263,
+        128001,
+        287,
+        128003,
+        16113,
+        287,
+        128007,
+        759,
+        128007,
+        2434,
+        128007,
+        459,
+        1263,
+        1263,
+        128002,
+        811,
+        6257,
+        262,
+        13478,
+        1541,
+        323,
+        584,
+        333,
+        298,
+        389,
+        2064,
+        408,
+        323
+      ],
+      "l_marker_positions": [
+        4,
+        6,
+        10,
+        19,
+        21,
+        23
+      ],
+      "name": "support_request",
+      "schema_tokens": [
+        [
+          "(",
+          "[P]",
+          "intent",
+          "(",
+          "[L]",
+          "refund",
+          "[L]",
+          "technical_support",
+          "[L]",
+          "sales",
+          ")",
+          ")"
+        ],
+        [
+          "(",
+          "[P]",
+          "urgency",
+          "(",
+          "[L]",
+          "low",
+          "[L]",
+          "medium",
+          "[L]",
+          "high",
+          ")",
+          ")"
+        ]
+      ],
+      "tasks": {
+        "intent": {
+          "labels": [
+            "refund",
+            "technical_support",
+            "sales"
+          ],
+          "logits": {
+            "refund": 2.14949417,
+            "sales": -3.17211246,
+            "technical_support": -2.08433104
+          },
+          "probabilities": {
+            "refund": 0.980986779,
+            "sales": 0.00479202149,
+            "technical_support": 0.0142211995
+          },
+          "winner": "refund"
+        },
+        "urgency": {
+          "labels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "logits": {
+            "high": -1.22463441,
+            "low": 0.585676551,
+            "medium": -1.1396749
+          },
+          "probabilities": {
+            "high": 0.12193604,
+            "low": 0.745315488,
+            "medium": 0.132748472
+          },
+          "winner": "low"
+        }
+      },
+      "text": "Please refund the duplicate charge. I do not need technical help."
+    }
+  ],
+  "format": "antfly_gliner25_decide_oracle_v1",
+  "model": {
+    "model_safetensors_sha256": "40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997",
+    "model_safetensors_size": 1945828140,
+    "repo": "fastino/GLiNER2.5-Decide",
+    "revision": "7ee5da4c2415e32259bcdc0b1a7367c32ce8d6f6"
+  },
+  "runtime": {
+    "device": "cpu",
+    "dtype": "float32",
+    "max_len": 512
+  },
+  "upstream_source_sha256": "606276564df9fa8eb0c0cb9d78f6b696e68a6f25c957ba93175c1d5c408c4f63"
+}

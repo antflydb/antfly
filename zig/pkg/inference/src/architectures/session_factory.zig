@@ -55,6 +55,7 @@ const clap_arch = @import("clap.zig");
 const florence_arch = @import("florence.zig");
 const deberta_arch = @import("deberta.zig");
 const gliner_head = @import("gliner_head.zig");
+const gliner_decision_head = @import("gliner_decision_head.zig");
 const gliner_boundary_model = @import("../models/gliner_boundary.zig");
 const gliner_head_graph = @import("gliner_head_graph.zig");
 const kernel_jit = @import("../graph/kernel_jit.zig");
@@ -2677,7 +2678,11 @@ test "architecture detection ignores an unselected colocated GGUF" {
 }
 
 fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8, mf: manifest_mod.ModelManifest, cfg: *deberta_mod.Config) !void {
-    if (mf.gliner_token_c != 0) cfg.classification_token_id = mf.gliner_token_c;
+    cfg.label_marker_decision_head = mf.gliner_classification_head == .label_marker_mlp;
+    if (mf.gliner_classification_head == .label_marker_mlp and mf.gliner_token_l != 0)
+        cfg.classification_token_id = mf.gliner_token_l
+    else if (mf.gliner_token_c != 0)
+        cfg.classification_token_id = mf.gliner_token_c;
     if (mf.gliner_token_e != 0) cfg.entity_token_id = mf.gliner_token_e;
     if (mf.gliner_token_r != 0) cfg.relation_token_id = mf.gliner_token_r;
 
@@ -2687,7 +2692,8 @@ fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8
         defer allocator.free(at_bytes);
         const at_parsed = try std.json.parseFromSlice(std.json.Value, allocator, at_bytes, .{});
         defer at_parsed.deinit();
-        if (at_parsed.value.object.get("[C]")) |v| {
+        const classification_marker = if (mf.gliner_classification_head == .label_marker_mlp) "[L]" else "[C]";
+        if (at_parsed.value.object.get(classification_marker)) |v| {
             if (v == .integer) cfg.classification_token_id = v.integer;
         }
         if (at_parsed.value.object.get("[E]")) |v| {
@@ -7020,6 +7026,10 @@ test "BERT architecture regression declarations compile" {
     std.testing.refAllDecls(bert_arch);
 }
 
+test "GLiNER decision head declarations compile" {
+    std.testing.refAllDecls(gliner_decision_head);
+}
+
 fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) !?ResidentOutputs {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (self.task == .classifier or self.task == .extractor) return null;
@@ -9038,6 +9048,95 @@ fn archRunImpl(
         },
         .gliner_boundary => return error.BoundaryExtractionRequiresSchema,
         .gliner => |cfg| {
+            var decision_positions_tensor: ?Tensor = null;
+            var decision_mask_tensor: ?Tensor = null;
+            for (inputs) |input| {
+                if (std.mem.eql(u8, input.name, "decision_marker_positions")) {
+                    if (decision_positions_tensor != null) return error.DuplicateInputs;
+                    decision_positions_tensor = input;
+                }
+                if (std.mem.eql(u8, input.name, "decision_marker_mask")) {
+                    if (decision_mask_tensor != null) return error.DuplicateInputs;
+                    decision_mask_tensor = input;
+                }
+            }
+            if ((decision_positions_tensor == null) != (decision_mask_tensor == null))
+                return error.MissingInputs;
+            if (decision_positions_tensor) |positions_tensor| {
+                if (!cfg.label_marker_decision_head) return error.UnsupportedGlinerDecisionHead;
+                const marker_mask_tensor = decision_mask_tensor.?;
+                var input_ids_tensor: ?Tensor = null;
+                var attention_mask_tensor: ?Tensor = null;
+                for (inputs) |input| {
+                    if (std.mem.eql(u8, input.name, "input_ids")) {
+                        if (input_ids_tensor != null) return error.DuplicateInputs;
+                        input_ids_tensor = input;
+                    }
+                    if (std.mem.eql(u8, input.name, "attention_mask")) {
+                        if (attention_mask_tensor != null) return error.DuplicateInputs;
+                        attention_mask_tensor = input;
+                    }
+                }
+                const ids_tensor = input_ids_tensor orelse return error.MissingInputs;
+                const mask_tensor = attention_mask_tensor orelse return error.MissingInputs;
+                if (ids_tensor.dtype != .i64 or mask_tensor.dtype != .i64 or
+                    positions_tensor.dtype != .i64 or marker_mask_tensor.dtype != .i64 or
+                    ids_tensor.shape.len != 2 or mask_tensor.shape.len != 2 or
+                    positions_tensor.shape.len != 2 or marker_mask_tensor.shape.len != 2 or
+                    !std.mem.eql(i64, ids_tensor.shape, mask_tensor.shape) or
+                    !std.mem.eql(i64, positions_tensor.shape, marker_mask_tensor.shape) or
+                    ids_tensor.shape[0] <= 0 or ids_tensor.shape[1] <= 0 or positions_tensor.shape[1] <= 0 or
+                    positions_tensor.shape[0] != ids_tensor.shape[0])
+                    return error.InvalidInputShape;
+                const batch: usize = @intCast(ids_tensor.shape[0]);
+                const seq_len: usize = @intCast(ids_tensor.shape[1]);
+                const labels: usize = @intCast(positions_tensor.shape[1]);
+                if (seq_len > @as(usize, cfg.max_position_embeddings)) return error.InvalidInputShape;
+                const token_count = std.math.mul(usize, batch, seq_len) catch return error.InvalidInputShape;
+                const marker_count = std.math.mul(usize, batch, labels) catch return error.InvalidInputShape;
+                const token_bytes = std.math.mul(usize, token_count, @sizeOf(i64)) catch return error.InvalidInputShape;
+                const marker_bytes = std.math.mul(usize, marker_count, @sizeOf(i64)) catch return error.InvalidInputShape;
+                if (ids_tensor.data.len != token_bytes or mask_tensor.data.len != token_bytes or
+                    positions_tensor.data.len != marker_bytes or marker_mask_tensor.data.len != marker_bytes or
+                    !ids_tensor.isAlignedFor(i64) or !mask_tensor.isAlignedFor(i64) or
+                    !positions_tensor.isAlignedFor(i64) or !marker_mask_tensor.isAlignedFor(i64))
+                    return error.InvalidInputShape;
+                const input_ids = ids_tensor.asInt64();
+                const attention_mask = mask_tensor.asInt64();
+                const marker_positions = positions_tensor.asInt64();
+                const marker_mask = marker_mask_tensor.asInt64();
+                for (marker_positions, marker_mask) |position, valid| {
+                    if (valid != 0 and valid != 1) return error.InvalidGlinerDecisionMarkerMask;
+                    if (valid == 1 and (position < 0 or position >= @as(i64, @intCast(seq_len)))) return error.InvalidGlinerDecisionMarkerPosition;
+                }
+
+                cb.preferEagerQuantMirrors(true);
+                const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, true);
+                defer cb.free(hidden);
+                const decision = try gliner_decision_head.forwardCt(
+                    &cb,
+                    allocator,
+                    hidden,
+                    marker_positions,
+                    marker_mask,
+                    batch,
+                    seq_len,
+                    labels,
+                    cfg.hidden_size,
+                );
+                defer cb.free(decision.logits);
+                const logits = try cb.toFloat32(decision.logits, allocator);
+                defer allocator.free(logits);
+                for (marker_mask, logits) |valid, *logit| if (valid == 0) {
+                    logit.* = -1.0e4;
+                };
+                const output_shape = [_]i64{ @intCast(batch), @intCast(labels) };
+                var output = try Tensor.initFloat32(allocator, "logits", &output_shape, logits);
+                errdefer output.deinit();
+                const result = try allocator.alloc(Tensor, 1);
+                result[0] = output;
+                return result;
+            }
             // GLiNER2: DeBERTa encoder + span classification head
             // Inputs: input_ids, attention_mask, words_mask, span_idx
             if (inputs.len < 4) return error.MissingInputs;
