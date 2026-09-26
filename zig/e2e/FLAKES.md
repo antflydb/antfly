@@ -1804,6 +1804,43 @@ ownership fences; index repair retains its scheduling quantum. The E2E proxy
 keeps the latency injection as a regression alongside the stalled status route.
 
 
+## 2026-09-26: PR #891 recovery and label-routed Autograph investigation
+
+[Run 36271592595](https://github.com/antflydb/antfly/actions/runs/36271592595)
+failed the FK merge `release-reply_loss` case during child-table seed admission,
+before its release fault. The retained data log reports an apply-wait timeout
+with a contended Raft mutex; the public batch returned `write unavailable`
+before a subsequent request exhausted the seed helper's remaining deadline.
+This evidence establishes an availability failure, not lost UNIQUE claims or
+retained references. The same run's schema rewrite `publication-coordinator`
+case reached validation but did not finish within its terminal wait.
+
+Inspection found an independent handoff defect: copying normalizes owner
+routing gaps to same-attempt waits, but validation, cutover, and publication
+used the generic job retry. Missing owner routes now retain their explicit
+`GroupLeaderUnavailable` classification, and staged execution parks the same
+pinned attempt for that condition. It does not invent a receipt or change
+ambiguous owner-write handling. The deterministic mixed-cohort regression
+injects repeated validation routing gaps and checks the original attempt
+through publication.
+
+The ordinary shard reported a failed label-routed Autograph case, but the run
+was cancelled before pytest's final failure summary and before server-log
+artifact upload. Its available console log contains no traceback. The E2E
+controller now flushes each failed report immediately, preserving the existing
+report and exit status; workers do not print duplicate reports.
+
+Native macOS arm64 ReleaseFast CPU reproduction used the repository's
+supervised regression loop with isolated clusters and retained failure roots.
+The label-routed Autograph case passed **200/200**, two workers with 100
+repetitions each, with no failures, errors, or skips. That cohort used the
+previously qualified executable named `antfly`, SHA-256
+`8e7e0d77b8012536d1e108221f1f5ade59a3845949e038b78b8dc49c4e2cb790`.
+It did not reproduce the cancelled job's failure, so it does not establish its
+cause. The initial recovery baseline passed four invocations of each selected
+case across two concurrent workers. Linux's slow-persistence signature remains
+distinct from a successful native soak.
+
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
 
 Scheduled run `36247286560` passed qualification, all five campaigns, and the

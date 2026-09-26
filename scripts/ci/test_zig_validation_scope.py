@@ -114,7 +114,7 @@ class ZigValidationScopeTests(unittest.TestCase):
             selected(
                 "e2e-full-tests",
                 full=True,
-                **{"needs.e2e-base-build.result": "failure"}
+                **{"needs.e2e-base-build.result": "failure"},
             )
         )
 

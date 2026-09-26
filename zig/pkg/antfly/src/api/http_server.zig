@@ -16541,7 +16541,9 @@ pub const ApiHttpServer = struct {
         if (self.cfg.deployment_mode == .standalone) return (self.cfg.restore_owner orelse return error.RestoreValidationPending).execute(alloc, table_name, group_id, request, context);
         var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
         const router = self.cfg.session_router orelse fallback.router();
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.RestoreValidationPending;
+        // No route means no owner request was sent. Preserve that readiness
+        // classification instead of conflating it with an unknown owner write.
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
         defer route.deinit(alloc);
         switch (route) {
             .local => return (self.cfg.restore_owner orelse return error.RestoreValidationPending).execute(alloc, table_name, group_id, request, context),
@@ -16664,6 +16666,10 @@ pub const ApiHttpServer = struct {
         return switch (err) {
             error.RestoreStagingYield => error.RestoreStagingYield,
             error.RestoreStagingWait => error.RestoreStagingWait,
+            // Routing gaps also occur during global validation and cutover,
+            // after the rewrite driver has handed off. Their durable owner
+            // progress is still resumable within this same attempt.
+            error.GroupLeaderUnavailable => error.RestoreStagingWait,
             // Owner transitions can report StorageBusy while the pinned plan
             // is progressing. Retry the next cooperative slice on the same
             // durable attempt; a readiness fence uses the longer wait below.
@@ -20845,6 +20851,7 @@ pub const RestoreWorkerTestDriver = if (builtin.is_test) struct {
 test "staged restore worker publishes a dependency complete mixed native cohort" {
     try @import("restore_worker_fixture.zig").run(RestoreWorkerTestDriver, false);
     try @import("restore_worker_fixture.zig").run(RestoreWorkerTestDriver, true);
+    try @import("restore_worker_fixture.zig").runWithPolicy(RestoreWorkerTestDriver, false, null, null, .{ .validation_route_gaps = 3 });
 }
 
 test "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners" {
@@ -21075,6 +21082,11 @@ test "native restore validation uncertainty remains an asynchronous retry" {
 }
 
 test "busy staged restore owner retains its pinned attempt" {
+    const routed_wait = ApiHttpServer.stagedRestoreError(error.GroupLeaderUnavailable);
+    try std.testing.expectEqual(error.RestoreStagingWait, routed_wait);
+    try std.testing.expectEqual(restore_staging_wait_ns, restoreRetryDelayNs(routed_wait, 42, 8));
+    // Ambiguous owner writes retain the receipt-reconciliation retry path.
+    try std.testing.expectEqual(error.RestoreValidationPending, ApiHttpServer.stagedRestoreError(error.RaftBatchWriteOutcomeUnknown));
     try std.testing.expectEqual(
         @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreStagingWait),
         ApiHttpServer.stagedRestoreError(error.RestoreStagingWait),
