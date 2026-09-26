@@ -110,44 +110,6 @@ fn scoreHost(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32
     return actionHead(cb, a, cfg, f, logits, batch, count, dim);
 }
 
-/// `scoreHost` with the hidden states left on the device: marker and anchor
-/// rows are gathered there, so only the scorer logits (for the action
-/// statistics) and the action logits are read back. `markers` indexes rows
-/// of `hidden`, -1 padded.
-fn scoreDevice(cb: *const CB, a: std.mem.Allocator, cfg: Config, hidden: CT, markers: []const i64, anchors: []const i64, count: usize, dim: usize) ![]Tensor {
-    const batch = anchors.len;
-    if (markers.len != batch * count) return error.UnexpectedOutputShape;
-    const rows = try a.alloc(i64, markers.len);
-    defer a.free(rows);
-    for (markers, rows) |marker, *row| row.* = @max(marker, 0);
-    const gathered = try cb.embeddingLookup(hidden, rows, rows.len, dim);
-    defer cb.free(gathered);
-    const n = try norm(cb, gathered, "scorer.0", dim);
-    defer cb.free(n);
-    const s1 = try linear(cb, n, "scorer.1", batch * count, dim, dim);
-    defer cb.free(s1);
-    const sg = try exactGelu(cb, s1);
-    defer cb.free(sg);
-    const s2 = try linear(cb, sg, "scorer.3", batch * count, dim, 1);
-    defer cb.free(s2);
-    const logits = try cb.toFloat32(s2, a);
-    defer a.free(logits);
-    if (logits.len != batch * count) return error.UnexpectedOutputShape;
-    for (markers, logits) |pos, *logit| if (pos < 0) {
-        logit.* = -1e4;
-    };
-    const stats = try a.alloc(f32, batch * 4);
-    defer a.free(stats);
-    for (0..batch) |row| actionStats(logits[row * count ..][0..count], markers[row * count ..][0..count], stats[row * 4 ..][0..4]);
-    const anchored = try cb.embeddingLookup(hidden, anchors, batch, dim);
-    defer cb.free(anchored);
-    const stats_ct = try cb.fromFloat32Shape(stats, &.{ @intCast(batch), 4 });
-    defer cb.free(stats_ct);
-    const f = try cb.concat(anchored, stats_ct, batch, dim, 4);
-    defer cb.free(f);
-    return actionHead(cb, a, cfg, f, logits, batch, count, dim);
-}
-
 /// Top probability, margin, normalized entropy and option count of one
 /// decision's (masked) scorer logits; the action head's non-hidden features.
 fn actionStats(z: []const f32, markers: []const i64, dst: *[4]f32) void {
@@ -276,11 +238,6 @@ fn packedHead(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, seg
     @memset(mask, 1);
     const hidden = try layers(cb, a, cfg, try cb.add(encoder, type_ct), mask, segments, 1, seq, dim, prefix, null);
     defer cb.free(hidden);
-    for (anchors) |anchor| if (anchor < 0 or anchor >= rows) return error.InvalidLayaInputs;
-    for (markers) |marker| if (marker >= rows) return error.InvalidLayaInputs;
-    // Metal keeps the hidden states on the device; a full readback would
-    // synchronize the frame and copy every row to score a few of them.
-    if (cb.kind() == .metal) return scoreDevice(cb, a, cfg, hidden, markers, anchors, width, dim);
     const host = try cb.toFloat32(hidden, a);
     defer a.free(host);
     if (host.len != rows * dim) return error.UnexpectedOutputShape;
