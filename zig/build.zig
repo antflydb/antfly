@@ -260,6 +260,42 @@ pub fn create(b: *std.Build) ?Artifacts {
     sql_generated_check.dependOn(&yacc_steps.run_generated.step);
     b.step("lib-sql-parser-test", "Run the storage-independent SQL lexer and parser tests").dependOn(&yacc_steps.run_parser_tests.step);
     b.step("lib-sql-parser-bench", "Build and install lib-sql-parser-bench").dependOn(&b.addInstallArtifact(yacc_steps.benchmark, .{}).step);
+    const sql_parser_mod = b.createModule(.{
+        .root_source_file = b.path("lib/sql/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const sql_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/sql_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sql_test_mod.addImport("sql_parser", sql_parser_mod);
+    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = b.args orelse &.{} });
+    const run_sql_tests = b.addRunArtifact(sql_tests);
+    // These storage-independent owners must not inherit the multi-GiB claims
+    // reserved for the full database compilation and integration test roots.
+    sql_tests.step.max_rss = 1024 * 1024 * 1024;
+    // The complete compiler/executor corpus includes exhaustive allocation-fault
+    // runs (about 137 MiB process RSS in ReleaseSafe). This scheduling estimate
+    // is independent of the executor's per-statement memory admission tests.
+    run_sql_tests.step.max_rss = 192 * 1024 * 1024;
+    b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
+    const pgwire_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/pgwire_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    pgwire_test_mod.addImport("sql_parser", sql_parser_mod);
+    const pgwire_tests = b.addTest(.{
+        .root_module = pgwire_test_mod,
+        .filters = b.args orelse &.{},
+    });
+    const run_pgwire_tests = b.addRunArtifact(pgwire_tests);
+    pgwire_tests.step.max_rss = 1024 * 1024 * 1024;
+    run_pgwire_tests.step.max_rss = 64 * 1024 * 1024;
+    b.step("pgwire-test", "Run PostgreSQL wire framing, session, and lifecycle tests").dependOn(&run_pgwire_tests.step);
     const openapi_root_check = addOpenApiRootCheckStep(b);
     openapi_check_step.dependOn(&openapi_root_check.step);
     const openapi_modules = pkg_antfly_build_codegen.createCommittedModules(b, .{
@@ -695,6 +731,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const inference_steps = @import("pkg/inference/build/integration.zig").add(inference_workflow, inference_wasm_jinja, inference_wasm_platform);
 
     const antfly_imports = AntflyRootImports{
+        .sql_parser = sql_parser_mod,
         .storage_boundary = @import("pkg/antfly/build/storage_boundary.zig").create(b, b.path("pkg/antfly/src"), target, optimize),
         .build_info = build_info,
         .build_options = build_options,
@@ -1235,6 +1272,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(&run_sql_tests.step);
+    unit_test_step.dependOn(&run_pgwire_tests.step);
     unit_test_step.dependOn(&pdf_integration.run.step);
     // HTTP client lifecycle tests belong to lib-test; keep their focused target.
     const vopr_test_step = owner_tests.vopr_test_step;
@@ -1396,8 +1435,14 @@ pub fn create(b: *std.Build) ?Artifacts {
         inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
             tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     }
+    const standalone_initial_fk_tests = owner_tests.standalone_initial_fk_tests;
+    standalone_initial_fk_tests.root_module.addObject(consumer_test_metadata.object);
+    inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+        standalone_initial_fk_tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
+    const run_standalone_initial_fk_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_initial_fk_tests);
+    b.step("antfly-standalone-initial-fk-test", "Run linked native standalone initial-FK owner publication tests").dependOn(&run_standalone_initial_fk_tests.step);
 
-    const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, runtime_library_artifacts);
+    const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, lmdb_engine_mod, runtime_library_artifacts);
     b.step("antfly-storage-owner-test", "Run real compiled storage owner ABI regressions").dependOn(&storage_owner_runs.runs[0].step);
     b.step("antfly-storage-owner-source-test", "Run compiled owner source and callback regressions").dependOn(&storage_owner_runs.runs[1].step);
     for (storage_owner_runs.runs) |run| {

@@ -842,6 +842,36 @@ pub const DeleteSecretPathParams = struct {
     key: []const u8,
 };
 
+/// Parse the JSON request body for administerSqlSettings.
+pub fn parseAdministerSqlSettingsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SqlSettingMutationRequest) {
+    return std.json.parseFromSlice(types.SqlSettingMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for executeSQL.
+pub fn parseExecuteSQLBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLRequest) {
+    return std.json.parseFromSlice(types.SQLRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for prepareSQL.
+pub fn parsePrepareSQLBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLPrepareRequest) {
+    return std.json.parseFromSlice(types.SQLPrepareRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Release a durable prepared SQL resource
+pub const ClosePreparedSQLPathParams = struct {
+    prepared_id: []const u8,
+};
+
+/// Execute a durable prepared SQL resource
+pub const ExecutePreparedSQLPathParams = struct {
+    prepared_id: []const u8,
+};
+
+/// Parse the JSON request body for executePreparedSQL.
+pub fn parseExecutePreparedSQLBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLPreparedExecutionRequest) {
+    return std.json.parseFromSlice(types.SQLPreparedExecutionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 pub const ListTablesParams = struct {
     /// Filter tables by name prefix (e.g., "prod_")
     prefix: ?[]const u8 = null,
@@ -1551,6 +1581,11 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/settings", .operation_id = "administerSqlSettings", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/sql", .operation_id = "executeSQL", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/sql/prepared", .operation_id = "prepareSQL", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/sql/prepared/{prepared_id}", .operation_id = "closePreparedSQL", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/sql/prepared/{prepared_id}/execute", .operation_id = "executePreparedSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/status", .operation_id = "getStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables", .operation_id = "listTables", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}", .operation_id = "getTable", .request_body = .none, .streaming_response = false },
@@ -1708,6 +1743,11 @@ pub const routes = [_]Route{
 //   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
+//   fn administerSqlSettings(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn executeSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn prepareSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn closePreparedSQL(self: *Impl, ctx: *httpx.Context, prepared_id: []const u8) !httpx.Response
+//   fn executePreparedSQL(self: *Impl, ctx: *httpx.Context, prepared_id: []const u8) !httpx.Response
 //   fn getStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listTables(self: *Impl, ctx: *httpx.Context, params: ListTablesParams) !httpx.Response
 //   fn getTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

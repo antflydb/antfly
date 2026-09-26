@@ -451,6 +451,12 @@ pub const CatalogRouteFence = struct {
         try jw.write(self.wire());
     }
 
+    /// The binary-safe durable transaction encoder also uses the wire-only
+    /// projection; borrowed process-local admission callbacks are never data.
+    pub fn nativeJsonProjection(self: @This()) Wire {
+        return self.wire();
+    }
+
     pub fn jsonParse(alloc: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(Wire, alloc, source, options);
         return .{
@@ -468,6 +474,19 @@ pub const CatalogRouteFence = struct {
         if (self.protocol != catalog_route_fence_protocol_current) return error.UnsupportedCatalogRouteFence;
         if (self.metadata_group_id == 0 or self.table_id == 0 or self.route.group_id == 0) return error.InvalidCatalogRouteFence;
         if (self.route.identity_namespace.table_id != self.table_id) return error.InvalidCatalogRouteFence;
+    }
+
+    pub fn jsonParseFromValue(alloc: std.mem.Allocator, value: std.json.Value, options: std.json.ParseOptions) !@This() {
+        const parsed = try std.json.innerParseFromValue(Wire, alloc, value, options);
+        return .{
+            .protocol = parsed.protocol,
+            .metadata_group_id = parsed.metadata_group_id,
+            .metadata_incarnation = parsed.metadata_incarnation,
+            .catalog_revision = parsed.catalog_revision,
+            .table_id = parsed.table_id,
+            .topology_epoch = parsed.topology_epoch,
+            .route = parsed.route,
+        };
     }
 };
 

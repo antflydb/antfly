@@ -263,6 +263,7 @@ fn printUsage(argv0: []const u8) void {
         \\  index          Manage indexes (create, drop, list, get)
         \\  artifact       Manage generated artifact enrichments and reprocessing
         \\  query          Query data from a table
+        \\  sql            Execute a typed SQL statement
         \\  lookup         Look up a document by key
         \\  load           Bulk load data from NDJSON file
         \\  insert         Insert a single document

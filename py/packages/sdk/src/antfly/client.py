@@ -47,6 +47,12 @@ from antfly.client_generated.models import (
     OllamaEmbedderConfig,
     OpenAIEmbedderConfig,
     QueryResponses,
+    SQLDiagnostic,
+    SQLPreparedExecutionRequest,
+    SQLPreparedResponse,
+    SQLPrepareRequest,
+    SQLRequest,
+    SQLResponse,
 )
 from antfly.client_generated.models import (
     EmbedderConfig as EmbedderConfig,
@@ -627,6 +633,15 @@ class IndexOperations:
         self._client._request("DELETE", f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}")
 
 
+class SQLExecutionError(AntflyException):
+    """SQLSTATE diagnostic and optional native transaction reconciliation receipt."""
+
+    def __init__(self, status_code: int, diagnostic: SQLDiagnostic) -> None:
+        self.status_code = status_code
+        self.diagnostic = diagnostic
+        super().__init__(f"SQL execution failed ({diagnostic.code}): {diagnostic.message}")
+
+
 class AntflyClient:
     """High-level client for Antfly database and inference APIs."""
 
@@ -743,6 +758,14 @@ class AntflyClient:
                         msg = text
                     if not msg:
                         msg = response.reason_phrase or f"HTTP {response.status_code}"
+                    if (
+                        (path == "/db/v1/sql" or path.startswith("/db/v1/sql/prepared"))
+                        and error_body is not None
+                        and isinstance(error_body.get("code"), str)
+                        and len(error_body["code"]) == 5
+                        and isinstance(error_body.get("message"), str)
+                    ):
+                        raise SQLExecutionError(response.status_code, SQLDiagnostic.from_dict(error_body))
                     if (
                         response.status_code == 429
                         and error_body is not None
@@ -979,6 +1002,59 @@ class AntflyClient:
             AntflyException: If dropping table fails
         """
         self._request("DELETE", f"/db/v1/tables/{quote(name, safe='')}")
+
+    def execute_sql(self, request: SQLRequest) -> SQLResponse:
+        """Execute one bound SQL statement without retrying ambiguous mutations.
+
+        Integer-typed result cells are decimal strings. Other JSON numbers retain
+        Python's native integer precision. The response body is bounded to 16 MiB.
+        """
+        return self._sql_result(self._sql_request("POST", "/db/v1/sql", request.to_dict()))
+
+    def prepare_sql(self, request: SQLPrepareRequest) -> SQLPreparedResponse:
+        """Create an owner-bound durable resource independent of transactions."""
+        return SQLPreparedResponse.from_dict(self._sql_request("POST", "/db/v1/sql/prepared", request.to_dict()))
+
+    def execute_prepared_sql(self, prepared_id: str, request: SQLPreparedExecutionRequest) -> SQLResponse:
+        """Execute with fresh authorization, without replaying ambiguous mutations."""
+        return self._sql_result(
+            self._sql_request("POST", f"/db/v1/sql/prepared/{quote(prepared_id, safe='')}/execute", request.to_dict())
+        )
+
+    def close_prepared_sql(self, prepared_id: str) -> None:
+        """Close a resource; already admitted executions may finish."""
+        self._sql_request("DELETE", f"/db/v1/sql/prepared/{quote(prepared_id, safe='')}", None)
+
+    def _sql_request(self, method: str, path: str, value: dict[str, Any] | None) -> dict[str, Any]:
+        from .sql_transport import encode_sql_request
+
+        try:
+            encoded = encode_sql_request(value) if value is not None else b""
+        except (TypeError, ValueError) as error:
+            raise AntflyException(f"Invalid SQL request: {error}") from error
+        return self._request(
+            method,
+            path,
+            content=encoded,
+            headers={"Content-Type": "application/json"},
+            follow_redirects=False,
+            _expected_status=200,
+            _max_response_bytes=16 << 20,
+        )
+
+    @staticmethod
+    def _sql_result(body: dict[str, Any]) -> SQLResponse:
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("rows"), list)
+            or not isinstance(body.get("columns"), list)
+        ):
+            raise AntflyException("Invalid SQL response")
+        if len(body["rows"]) > 4096:
+            raise AntflyException("SQL response exceeds 4096 rows")
+        if any(not isinstance(row, list) or len(row) != len(body["columns"]) for row in body["rows"]):
+            raise AntflyException("SQL row width differs from column metadata")
+        return SQLResponse.from_dict(body)
 
     def query(
         self,

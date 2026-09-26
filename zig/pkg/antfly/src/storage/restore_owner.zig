@@ -279,19 +279,35 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     // Metadata/owner receipts survive restart; physical index coverage belongs
     // to this replica. Recheck it before acknowledging recovered readiness.
     // Cancellation must remain available even when a projection is broken.
-    if ((input.action == .status or input.action == .validate or input.action == .publish) and
+    if ((input.action == .status or input.action == .validate or input.action == .install_generation_admissions or input.action == .publish) and
         (before.value.phase == .validated or before.value.phase == .published))
     {
         if (!try target.prepareRestoreStagingIndexesStep(alloc, input.scope.digest())) return error.RestoreValidationPending;
     }
     if (input.action == .status) {
+        const admission_receipt = try target.restoreGenerationAdmissionReceipt();
+        const admission_digest: ?staging.Digest = if (admission_receipt) |receipt|
+            if (std.mem.eql(u8, &receipt.scope, &input.scope.digest())) receipt.logical_digest else null
+        else
+            null;
         const resume_offset = if (before.value.rewrite) |progress| blk: {
             if (!progress.snapshot_complete or progress.final_cut != null) break :blk 0;
+            target.restore_decoder_cache.retire(env.io);
             var transition = try generation.beginProcessExclusiveWithRuntimeAndIo(env.cache_path, env.runtime, env.io);
             defer transition.deinit();
             break :blk try @import("rewrite_tail_spool.zig").resumeOffset(alloc, env.io, env.cache_path, input.scope, progress.sequence);
         } else 0;
-        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite, .tail_next = resume_offset };
+        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .generation_admission_receipt = admission_digest, .rewrite = before.value.rewrite, .tail_next = resume_offset };
+    }
+    if (input.action == .install_generation_admissions) {
+        if (try target.restoreGenerationAdmissionReceipt()) |receipt| {
+            const command = input.generation_admissions.?;
+            if (!std.mem.eql(u8, &receipt.scope, &command.scope) or
+                !std.mem.eql(u8, &receipt.logical_digest, &try @import("db/restore_staging_contract.zig").admissionReceiptDigest(command)))
+                return error.RestoreStagingScopeChanged;
+            return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .generation_admission_receipt = receipt.logical_digest };
+        }
+        if (before.value.phase != .validated) return error.RestoreStagingInProgress;
     }
     const desired: ?staging.Phase = switch (input.action) {
         .validate => .validated,
@@ -300,6 +316,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         else => null,
     };
     if (desired) |phase| if (before.value.phase == phase) {
+        target.restore_decoder_cache.retire(env.io);
         target.rewrite_program_cache.evict(env.io);
         target.rewrite_tail_cache.mutex.lockUncancelable(env.io);
         target.rewrite_tail_cache.clear();
@@ -317,6 +334,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     if (input.action == .import_page and input.source != null and
         before.value.rewrite != null and before.value.rewrite.?.snapshot_complete)
     {
+        target.restore_decoder_cache.retire(env.io);
         return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite };
     }
     if (input.action == .begin and before.value.phase != .reserved) {
@@ -331,12 +349,14 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     var source_next_offset: u64 = 0;
     switch (input.action) {
         .begin => try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .begin = input.scope } }, context),
+        .install_generation_admissions => try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .install_generation_admissions = input.generation_admissions.? } }, context),
         .import_page => import: {
             if (admit_snapshot) {
                 try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .begin = input.scope } }, context);
                 break :import;
             }
             if (input.rewrite_finish) |receipt| {
+                target.restore_decoder_cache.retire(env.io);
                 try receipt.validate(input.scope.rewrite.?);
                 var page = try @import("db/relational_rewrite_staging.zig").prepareFinish(target, alloc, input.scope, receipt.cut);
                 defer page.deinit();
@@ -351,6 +371,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
             const program = if (program_lease) |lease| lease.program() else null;
             try context.ensureActive();
             if (input.rewrite_tail) |chunk| {
+                target.restore_decoder_cache.retire(env.io);
                 const progress = before.value.rewrite orelse return error.InvalidRestoreStagingCommand;
                 if (!progress.snapshot_complete or progress.final_cut != null) return error.RestoreStagingInProgress;
                 if (chunk.sequence <= progress.sequence) break :import;
@@ -379,10 +400,64 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                 }
                 break :import;
             }
-            if (!try ensureSource(alloc, env, input, target.core.byteRange(), context, &source_next_offset, program)) return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite, .source_next_offset = source_next_offset };
-            var decoder = try db.DB.open(alloc, env.cache_path, .{ .backend_runtime = env.runtime, .identity_namespace = input.scope.source_namespace, .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
-            defer decoder.close();
-            var page = if (program) |compiled| try target.prepareRewriteStagingPage(alloc, input.scope, &decoder, input.max_rows, context.cancellation, compiled) else try target.prepareRestoreStagingPage(alloc, input.scope, &decoder, input.max_rows, context.cancellation);
+            const cache = &target.restore_decoder_cache;
+            const cache_key: @import("restore_decoder_cache.zig").Key = .{
+                .scope = input.scope.digest(),
+                .artifact = input.scope.source_artifact_digest,
+                .descriptor = input.scope.source_descriptor_digest,
+                .namespace = input.scope.source_namespace,
+                .path = env.cache_path,
+            };
+            source_next_offset = if (input.source.?.peer_descriptor) |descriptor| descriptor.total_bytes else 0;
+            // A hit retains the verified immutable published generation. A
+            // miss retires the prior read lease before ensureSource takes its
+            // exclusive publication transition. A pin protects source-owned
+            // batch values through Raft proposal without holding this mutex.
+            var page_pinned = false;
+            defer if (page_pinned) cache.unpin(env.io);
+            var one_shot_decoder: ?*db.DB = null;
+            defer if (one_shot_decoder) |decoder| {
+                decoder.close();
+                target.alloc.destroy(decoder);
+            };
+            var page = page: {
+                try cache.mutex.lock(env.io);
+                defer cache.mutex.unlock(env.io);
+                cache.expireLocked(env.io);
+                if (cache.getLocked(cache_key) == null) {
+                    cache.clearLocked();
+                    if (!try ensureSource(alloc, env, input, target.core.byteRange(), context, &source_next_offset, program)) return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite, .source_next_offset = source_next_offset };
+                    // The owner cache outlives this request arena. Both the
+                    // wrapper and its LSM allocations belong to the resident
+                    // target allocator, including one-shot fallback cleanup.
+                    const decoder = try target.alloc.create(db.DB);
+                    var opened = false;
+                    var transferred = false;
+                    defer if (!transferred) {
+                        if (opened) decoder.close();
+                        target.alloc.destroy(decoder);
+                    };
+                    decoder.* = try db.DB.open(target.alloc, env.cache_path, .{ .backend_runtime = env.runtime, .resource_manager = target.core.index_manager.resource_manager, .identity_namespace = input.scope.source_namespace, .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
+                    opened = true;
+                    if (!try cache.installLocked(target.alloc, env.io, env.runtime, target.core.index_manager.resource_manager, cache_key, decoder, target.stable_address)) {
+                        // No idle timer on this stable owner: preserve bounded
+                        // lease lifetime by using the verified decoder once.
+                        // Keep it alive through Raft proposal: prepared batch
+                        // values may still refer to source-owned buffers.
+                        one_shot_decoder = decoder;
+                        transferred = true;
+                        break :page if (program) |compiled| try target.prepareRewriteStagingPage(alloc, input.scope, decoder, input.max_rows, context.cancellation, compiled) else try target.prepareRestoreStagingPage(alloc, input.scope, decoder, input.max_rows, context.cancellation);
+                    }
+                    transferred = true;
+                }
+                try context.ensureActive();
+                const decoder = cache.getLocked(cache_key) orelse return error.RestoreStagingScopeChanged;
+                cache.pinLocked();
+                page_pinned = true;
+                const prepared = if (program) |compiled| try target.prepareRewriteStagingPage(alloc, input.scope, decoder, input.max_rows, context.cancellation, compiled) else try target.prepareRestoreStagingPage(alloc, input.scope, decoder, input.max_rows, context.cancellation);
+                cache.touchLocked(env.io);
+                break :page prepared;
+            };
             defer page.deinit();
             if (program_lease) |*lease| lease.deinit();
             program_lease = null;
@@ -400,13 +475,15 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     var after = (try target.restoreStagingStatus(alloc)) orelse return error.RestoreStagingScopeChanged;
     defer after.deinit();
     if (after.value.phase == .published or after.value.phase == .canceled) {
+        target.restore_decoder_cache.retire(env.io);
         target.rewrite_program_cache.evict(env.io);
         target.rewrite_tail_cache.mutex.lockUncancelable(env.io);
         target.rewrite_tail_cache.clear();
         target.rewrite_tail_cache.mutex.unlock(env.io);
         try releaseSource(alloc, env, input.scope);
     }
-    return .{ .phase = after.value.phase, .rows = after.value.rows, .receipt = after.value.receipt(), .rewrite = after.value.rewrite, .tail_next = tail_next, .source_next_offset = source_next_offset };
+    const admission_receipt = if (input.action == .install_generation_admissions) try target.restoreGenerationAdmissionReceipt() else null;
+    return .{ .phase = after.value.phase, .rows = after.value.rows, .receipt = after.value.receipt(), .generation_admission_receipt = if (admission_receipt) |receipt| receipt.logical_digest else null, .rewrite = after.value.rewrite, .tail_next = tail_next, .source_next_offset = source_next_offset };
 }
 
 test "restore owner verified decoder rewrite history compiles once across production tail pages" {
@@ -753,8 +830,13 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
     defer alloc.free(copied);
     try std.testing.expectEqualSlices(u8, document, copied);
     try std.testing.expectEqual(descriptor.total_bytes, response.source_next_offset);
+    // Snapshot completion releases the decoder before tail/status takes an
+    // exclusive source-generation transition.
+    try std.testing.expect(target.restore_decoder_cache.decoder == null);
     _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .cancel }, .{});
     try std.testing.expect(target.rewrite_program_cache.entry == null);
+    try std.testing.expect(target.restore_decoder_cache.decoder == null);
+    try std.testing.expect(!try generation.hasPublishedGenerationReadWithIo(cache_path, std.testing.io));
     try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(alloc, &target, env, request, .{}));
 }
 
@@ -819,6 +901,14 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
             try context.ensureActive();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.index += 1;
+            if (self.index == 2) {
+                // The prepared first row is in flight. A concurrent pressure
+                // callback must not close its source generation until this
+                // proposal returns and the page pin is released.
+                try std.testing.expectEqual(@as(u32, 1), self.target.restore_decoder_cache.active_pages);
+                try std.testing.expectEqual(@as(u64, 0), self.target.restore_decoder_cache.reclaimForTest());
+                try std.testing.expect(self.target.restore_decoder_cache.decoder != null);
+            }
             var batch = request;
             batch.restore_staging_scope = scopeDigest(self.target);
             try self.target.batchRaftReplicatedApply(batch, .{ .index = self.index, .term = 1 });
@@ -886,12 +976,34 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     test_fail_after_source_publication = true;
     defer test_fail_after_source_publication = false;
     try std.testing.expectError(error.InjectedSourcePublicationFailure, executeResident(alloc, &target, env, .{ .scope = scope, .action = .import_page, .source = staged_source, .max_rows = 1 }, .{}));
-    const first = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .import_page, .source = staged_source, .max_rows = 1 }, .{});
+    const first = blk: {
+        var request_arena = std.heap.ArenaAllocator.init(alloc);
+        defer request_arena.deinit();
+        break :blk try executeResident(request_arena.allocator(), &target, env, .{ .scope = scope, .action = .import_page, .source = staged_source, .max_rows = 1 }, .{});
+    };
+    // The request arena is gone before the next cached page; only the
+    // resident target allocator may own the decoder and its cache key.
     try std.testing.expectEqual(@as(u64, 1), first.rows);
+    const pinned_decoder = target.restore_decoder_cache.decoder orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try generation.hasPublishedGenerationReadWithIo(cache_path, std.testing.io));
+    var changed_descriptor = scope;
+    changed_descriptor.source_descriptor_digest[0] ^= 1;
+    try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(alloc, &target, env, .{ .scope = changed_descriptor, .action = .import_page, .source = staged_source }, .{}));
+    try std.testing.expect(target.restore_decoder_cache.decoder == pinned_decoder);
     // An unavailable repository after page one must not trigger another read.
     var unavailable = source_request;
     unavailable.location = "/does-not-exist/restore-owner-test";
-    var last = first;
+    var last = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .import_page, .source = unavailable, .max_rows = 1 }, .{});
+    try std.testing.expectEqual(@as(u64, 2), last.rows);
+    try std.testing.expect(target.restore_decoder_cache.decoder == pinned_decoder);
+    // Owner restart drops the volatile lease; the third page reopens the
+    // immutable source and resumes exclusively from the durable target cursor.
+    target.close();
+    target_open = false;
+    try std.testing.expect(!try generation.hasPublishedGenerationReadWithIo(cache_path, std.testing.io));
+    target = try db.DB.open(alloc, target_path, target_options);
+    target_open = true;
+    try std.testing.expect(target.restore_decoder_cache.decoder == null);
     for (0..5) |_| {
         last = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .import_page, .source = unavailable, .max_rows = 1 }, .{});
         if (last.phase == .imported) break;
@@ -901,6 +1013,8 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .validate }, .{});
     const published = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .publish }, .{});
     try std.testing.expectEqual(staging.Phase.published, published.phase);
+    try std.testing.expect(target.restore_decoder_cache.decoder == null);
+    try std.testing.expect(!try generation.hasPublishedGenerationReadWithIo(cache_path, std.testing.io));
     const repeated = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .publish }, .{});
     try std.testing.expectEqualSlices(u8, &published.receipt, &repeated.receipt);
     try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(alloc, &target, env, .{ .scope = scope, .action = .import_page, .source = source_request }, .{}));

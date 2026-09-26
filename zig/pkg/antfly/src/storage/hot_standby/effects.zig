@@ -47,6 +47,16 @@ pub const AppendMetadataMutationOptions = struct {
 };
 
 pub const BatchMutationPayload = struct {
+    /// Initial hidden FK owner controls are Raft decisions. Standby replay
+    /// must preserve that exact entry identity for owner receipts and reject
+    /// an ordinary batch carrying the same private command.
+    initial_child_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+    /// Graph owner seals bind a durable receipt to the primary's exact Raft
+    /// apply entry; a standby must replay the same term/index.
+    graph_retirement_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+    /// Imported FK proof becomes target admission only at this exact primary
+    /// Raft entry. A standby may not invent a local term/index for its receipt.
+    restore_generation_admission_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
     /// Original source cut identity, assigned by native apply, never by a caller.
     online_source_applied_index: ?u64 = null,
     restore_staging_bootstrap: ?@import("../db/restore_staging_contract.zig").OwnerBootstrap = null,
@@ -57,6 +67,14 @@ pub const BatchMutationPayload = struct {
 /// Page semantics cannot be silently ignored by older standbys. Their V1
 /// decoder rejects V2 before applying rows, independently of Raft negotiation.
 fn batchMutationVersion(request: db_types.BatchRequest) u32 {
+    if (request.restore_staging) |command| if (command == .import_page and command.import_page.source_generation_proof_page) return 11;
+    if (request.restore_staging) |command| if (command == .install_generation_admissions) return 10;
+    if (request.relational_topology) |command| switch (command.action) {
+        .provision_initial_child, .release_initial_child, .cancel_initial_child => return 8,
+        .seal_graph_retirement => return 9,
+        else => {},
+    };
+    if (request.relational_topology) |command| if (command.action == .begin and command.graph_retirement != null) return 9;
     if (request.restore_staging != null or request.online_source != null or
         (if (request.merge_page) |page| page.source.retention != null else false) or
         (if (request.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| source.retention != null else false else false)) return 7;
@@ -71,6 +89,136 @@ fn batchMutationVersion(request: db_types.BatchRequest) u32 {
     if (request.merge_checkpoint) |checkpoint|
         if (checkpoint.page_source != null or checkpoint.page_receiver_namespace != null) return 2;
     return 1;
+}
+
+test "storage.hot_standby graph retirement begin and seal require versioned standby decoder" {
+    const alloc = std.testing.allocator;
+    const scope: @import("../db/graph_retirement_seal.zig").Scope = .{
+        .fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .admission_epoch = 1, .peer_group_id = 401, .owner_group_id = 301, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) },
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .target_table_id = 10,
+        .graph_config_digest = @splat(3),
+    };
+    inline for (.{ .begin, .seal_graph_retirement }) |action| {
+        const request: db_types.BatchRequest = .{ .relational_topology = .{ .action = action, .fence = scope.fence, .graph_retirement = scope } };
+        const encoded = if (action == .seal_graph_retirement)
+            try encodeGraphRetirementSealMutationRequestAlloc(alloc, request, .{ .term = 2, .index = 3 })
+        else
+            try encodeBatchMutationRequestAlloc(alloc, request);
+        defer alloc.free(encoded);
+        var record: replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = encoded };
+        var decoded = try decodeBatchMutationRequest(alloc, record);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(u32, 9), decoded.value.schema_version);
+        try std.testing.expect(decoded.value.request.relational_topology.?.graph_retirement.?.eql(scope));
+        if (action == .seal_graph_retirement) {
+            try std.testing.expectEqual(@as(u64, 3), decoded.value.graph_retirement_raft_entry.?.index);
+            try std.testing.expectError(error.InvalidGraphRetirementSeal, encodeBatchMutationRequestAlloc(alloc, request));
+        } else try std.testing.expect(decoded.value.graph_retirement_raft_entry == null);
+        const downgraded = try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .request = request }, .{});
+        defer alloc.free(downgraded);
+        record.payload = downgraded;
+        try std.testing.expectError(error.UnsupportedBatchMutationPayloadVersion, decodeBatchMutationRequest(alloc, record));
+    }
+}
+
+test "storage.hot_standby mapped restore admissions require original Raft receipt identity" {
+    const alloc = std.testing.allocator;
+    const contract = @import("../db/restore_staging_contract.zig");
+    const mappings = [_]contract.GenerationAdmissionMapping{.{
+        .source_child_table_id = 11,
+        .source_child_table_name = "children",
+        .target_child_table_id = 21,
+        .target_child_table_name = "children",
+        .constraint_name = "parent_fk",
+        .source_generation = @splat(1),
+        .target_generation = @splat(2),
+        .source_scope_digest = @splat(3),
+    }};
+    const request: db_types.BatchRequest = .{ .restore_staging = .{ .install_generation_admissions = .{
+        .scope = @splat(4),
+        .source_summary_digest = @splat(5),
+        .mappings = &mappings,
+    } } };
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, encodeBatchMutationRequestAlloc(alloc, request));
+    const encoded = try encodeRestoreGenerationAdmissionMutationRequestAlloc(alloc, request, .{ .term = 6, .index = 7 });
+    defer alloc.free(encoded);
+    var record: replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = encoded };
+    var decoded = try decodeBatchMutationRequest(alloc, record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 10), decoded.value.schema_version);
+    try std.testing.expectEqual(@as(u64, 6), decoded.value.restore_generation_admission_raft_entry.?.term);
+    const missing = try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .schema_version = 10, .request = request }, .{});
+    defer alloc.free(missing);
+    record.payload = missing;
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, decodeBatchMutationRequest(alloc, record));
+    const downgraded = try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .schema_version = 7, .request = request }, .{});
+    defer alloc.free(downgraded);
+    record.payload = downgraded;
+    try std.testing.expectError(error.UnsupportedBatchMutationPayloadVersion, decodeBatchMutationRequest(alloc, record));
+}
+
+test "storage.hot_standby source generation proof page requires versioned standby decoder" {
+    const alloc = std.testing.allocator;
+    const request: db_types.BatchRequest = .{ .restore_staging = .{ .import_page = .{
+        .expected = @splat(1),
+        .next = "proof progress",
+        .scope = @splat(2),
+        .timestamps = &.{},
+        .source_generation_proof_page = true,
+        .artifacts = &.{},
+    } } };
+    const encoded = try encodeBatchMutationRequestAlloc(alloc, request);
+    defer alloc.free(encoded);
+    var record: replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = encoded };
+    var decoded = try decodeBatchMutationRequest(alloc, record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 11), decoded.value.schema_version);
+    try std.testing.expect(decoded.value.request.restore_staging.?.import_page.source_generation_proof_page);
+    const downgraded = try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .schema_version = 7, .request = request }, .{});
+    defer alloc.free(downgraded);
+    record.payload = downgraded;
+    try std.testing.expectError(error.UnsupportedBatchMutationPayloadVersion, decodeBatchMutationRequest(alloc, record));
+}
+
+pub fn encodeInitialChildMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.RaftAppliedEntryIdentity) ![]u8 {
+    if (batchMutationVersion(request) != 8 or entry.term == 0 or entry.index == 0) return error.InvalidInitialChildPublication;
+    try validatePageFields(request);
+    return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{
+        .schema_version = 8,
+        .request = request,
+        .initial_child_raft_entry = entry,
+    }, .{});
+}
+
+test "storage.hot_standby initial hidden FK HA payload preserves exact Raft receipt identity" {
+    const alloc = std.testing.allocator;
+    const fence: @import("../db/relational_integrity_topology_contract.zig").Fence = .{
+        .role = .child_generation_source,
+        .transition_id = 7,
+        .attempt = 1,
+        .admission_epoch = 1,
+        .peer_group_id = 9,
+        .owner_group_id = 9,
+        .namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 9 },
+        .catalog_digest = @splat(3),
+    };
+    const req: db_types.BatchRequest = .{ .relational_topology = .{ .action = .cancel_initial_child, .fence = fence, .initial_child_control = .{
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .schema_version = 0,
+        .schema_digest = @splat(4),
+        .public_schema_json_digest = @splat(5),
+        .catalog_digest = @splat(3),
+    } } };
+    try std.testing.expectError(error.InvalidInitialChildPublication, encodeBatchMutationRequestAlloc(alloc, req));
+    const encoded = try encodeInitialChildMutationRequestAlloc(alloc, req, .{ .term = 2, .index = 5 });
+    defer alloc.free(encoded);
+    var parsed = try std.json.parseFromSlice(BatchMutationPayload, alloc, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 8), parsed.value.schema_version);
+    try std.testing.expectEqual(@as(u64, 5), parsed.value.initial_child_raft_entry.?.index);
 }
 
 fn validatePageFields(request: db_types.BatchRequest) !void {
@@ -309,24 +457,95 @@ test "storage.hot_standby source controls preserve original cut and require vers
 
 pub const MetadataMutationKind = enum {
     schema,
+    row_policy,
 };
 
 pub const MetadataMutationPayload = struct {
     schema_version: u32 = 2,
     kind: MetadataMutationKind,
-    schema_bytes: []const u8,
+    schema_bytes: []const u8 = "",
     public_schema_json: ?[]const u8 = null,
+    published_child: ?PublishedChildSchema = null,
+    row_policy_bundle: ?[]const u8 = null,
+    row_policy_request: ?@import("../../system_catalog/policies.zig").InstallRequest = null,
+    row_policy_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+};
+
+/// Policy installation is an owner Raft decision, not a schema update. The
+/// exact signed snapshot and Raft identity travel in one ordered HA record.
+pub fn encodeRowPolicyMetadataMutationAlloc(
+    alloc: Allocator,
+    bundle: []const u8,
+    request: @import("../../system_catalog/policies.zig").InstallRequest,
+    entry: db_types.RaftAppliedEntryIdentity,
+) ![]u8 {
+    if (bundle.len == 0 or entry.term == 0 or entry.index == 0) return error.InvalidMetadataMutationPayload;
+    return std.json.Stringify.valueAlloc(alloc, MetadataMutationPayload{
+        .schema_version = 4,
+        .kind = .row_policy,
+        .row_policy_bundle = bundle,
+        .row_policy_request = request,
+        .row_policy_raft_entry = entry,
+    }, .{});
+}
+
+/// An HA standby must replay the same source-fence cut as the primary, not a
+/// generic schema update that would bypass (or fail) FK generation admission.
+pub const PublishedChildSchema = struct {
+    fence: @import("../db/relational_integrity_topology_contract.zig").Fence,
+    before_schema_json_digest: [32]u8,
+    schema_json_digest: [32]u8,
+    before_catalog_digest: [32]u8,
+    after_catalog_digest: [32]u8,
+    applied_term: u64,
+    applied_index: u64,
 };
 
 pub fn encodeBatchMutationRequestAlloc(
     alloc: Allocator,
     request: db_types.BatchRequest,
 ) ![]u8 {
+    if (batchMutationVersion(request) == 8) return error.InvalidInitialChildPublication;
+    if (batchMutationVersion(request) == 10) return error.InvalidRestoreStagingCommand;
+    if (request.relational_topology) |command| if (command.action == .seal_graph_retirement) return error.InvalidGraphRetirementSeal;
     if (request.online_source != null) return error.MissingOnlineSourceAppliedIndex;
     try validatePageFields(request);
     return try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{
         .schema_version = batchMutationVersion(request),
         .request = request,
+    }, .{});
+}
+
+pub fn encodeGraphRetirementSealMutationRequestAlloc(
+    alloc: Allocator,
+    request: db_types.BatchRequest,
+    entry: db_types.RaftAppliedEntryIdentity,
+) ![]u8 {
+    const command = request.relational_topology orelse return error.InvalidGraphRetirementSeal;
+    if (command.action != .seal_graph_retirement or command.graph_retirement == null or
+        entry.term == 0 or entry.index == 0) return error.InvalidGraphRetirementSeal;
+    try validatePageFields(request);
+    return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{
+        .schema_version = 9,
+        .request = request,
+        .graph_retirement_raft_entry = entry,
+    }, .{});
+}
+
+pub fn encodeRestoreGenerationAdmissionMutationRequestAlloc(
+    alloc: Allocator,
+    request: db_types.BatchRequest,
+    entry: db_types.RaftAppliedEntryIdentity,
+) ![]u8 {
+    const command = request.restore_staging orelse return error.InvalidRestoreStagingCommand;
+    if (command != .install_generation_admissions or entry.term == 0 or entry.index == 0)
+        return error.InvalidRestoreStagingCommand;
+    try command.install_generation_admissions.validate();
+    try validatePageFields(request);
+    return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{
+        .schema_version = 10,
+        .request = request,
+        .restore_generation_admission_raft_entry = entry,
     }, .{});
 }
 
@@ -386,6 +605,15 @@ pub fn decodeBatchMutationRequest(
     });
     errdefer parsed.deinit();
     if (parsed.value.schema_version != batchMutationVersion(parsed.value.request)) return error.UnsupportedBatchMutationPayloadVersion;
+    if ((parsed.value.schema_version == 8) != (parsed.value.initial_child_raft_entry != null)) return error.InvalidInitialChildPublication;
+    if (parsed.value.initial_child_raft_entry) |entry| if (entry.term == 0 or entry.index == 0) return error.InvalidInitialChildPublication;
+    const graph_seal = if (parsed.value.request.relational_topology) |command| command.action == .seal_graph_retirement else false;
+    if (graph_seal != (parsed.value.graph_retirement_raft_entry != null)) return error.InvalidGraphRetirementSeal;
+    if (parsed.value.graph_retirement_raft_entry) |entry| if (entry.term == 0 or entry.index == 0) return error.InvalidGraphRetirementSeal;
+    if ((parsed.value.schema_version == 10) != (parsed.value.restore_generation_admission_raft_entry != null))
+        return error.InvalidRestoreStagingCommand;
+    if (parsed.value.restore_generation_admission_raft_entry) |entry| if (entry.term == 0 or entry.index == 0)
+        return error.InvalidRestoreStagingCommand;
     if ((parsed.value.request.online_source != null) != (parsed.value.online_source_applied_index != null)) return error.MissingOnlineSourceAppliedIndex;
     try validatePageFields(parsed.value.request);
     return parsed;
@@ -449,6 +677,20 @@ pub fn encodeSchemaMetadataMutationAlloc(
     }, .{});
 }
 
+pub fn encodePublishedChildSchemaMetadataMutationAlloc(alloc: Allocator, schema: schema_mod.TableSchema, public_schema_json: []const u8, published: PublishedChildSchema) ![]u8 {
+    if ((published.fence.role != .child_generation_source and published.fence.role != .child_generation_dual) or
+        published.applied_term == 0 or published.applied_index == 0) return error.InvalidGenerationPublication;
+    const schema_bytes = try schema_mod.serializeSchema(alloc, schema);
+    defer alloc.free(schema_bytes);
+    return try std.json.Stringify.valueAlloc(alloc, MetadataMutationPayload{
+        .schema_version = 3,
+        .kind = .schema,
+        .schema_bytes = schema_bytes,
+        .public_schema_json = public_schema_json,
+        .published_child = published,
+    }, .{});
+}
+
 pub fn appendSchemaMetadataMutation(
     alloc: Allocator,
     primary: *primary_mod.Primary,
@@ -488,7 +730,23 @@ pub fn decodeMetadataMutation(
         .allocate = .alloc_always,
     });
     errdefer parsed.deinit();
-    if (parsed.value.schema_version != 1 and parsed.value.schema_version != 2) return error.UnsupportedMetadataMutationPayloadVersion;
+    if (parsed.value.schema_version < 1 or parsed.value.schema_version > 4) return error.UnsupportedMetadataMutationPayloadVersion;
+    switch (parsed.value.kind) {
+        .schema => {
+            if (parsed.value.schema_version == 4 or parsed.value.schema_bytes.len == 0 or
+                (parsed.value.schema_version == 3) != (parsed.value.published_child != null) or
+                parsed.value.row_policy_bundle != null or parsed.value.row_policy_request != null or
+                parsed.value.row_policy_raft_entry != null) return error.InvalidMetadataMutationPayload;
+        },
+        .row_policy => {
+            if (parsed.value.schema_version != 4 or parsed.value.schema_bytes.len != 0 or
+                parsed.value.public_schema_json != null or parsed.value.published_child != null or
+                parsed.value.row_policy_bundle == null or parsed.value.row_policy_bundle.?.len == 0 or
+                parsed.value.row_policy_request == null or parsed.value.row_policy_raft_entry == null or
+                parsed.value.row_policy_raft_entry.?.term == 0 or parsed.value.row_policy_raft_entry.?.index == 0)
+                return error.InvalidMetadataMutationPayload;
+        },
+    }
     return parsed;
 }
 
@@ -496,6 +754,7 @@ pub const DecodedSchemaMetadataMutation = struct {
     alloc: Allocator,
     schema: schema_mod.TableSchema,
     public_schema_json: ?[]u8,
+    published_child: ?PublishedChildSchema,
 
     pub fn deinit(self: *DecodedSchemaMetadataMutation) void {
         schema_mod.freeSchema(self.alloc, self.schema);
@@ -521,6 +780,7 @@ pub fn decodeSchemaMetadataMutation(
         .alloc = alloc,
         .schema = schema,
         .public_schema_json = public_schema_json,
+        .published_child = parsed.value.published_child,
     };
 }
 
@@ -706,6 +966,54 @@ test "storage.hot_standby effects appends schema metadata payload as HA metadata
     try std.testing.expectEqual(@as(u64, 123), decoded.schema.ttl_duration_ns);
     try std.testing.expectEqualStrings("expires_at", decoded.schema.ttl_field);
     try std.testing.expectEqualStrings("{\"version\":7}", decoded.public_schema_json.?);
+    try std.testing.expect(decoded.published_child == null);
+
+    const published_fence: @import("../db/relational_integrity_topology_contract.zig").Fence = .{
+        .role = .child_generation_source,
+        .transition_id = 11,
+        .attempt = 1,
+        .peer_group_id = 31,
+        .owner_group_id = 21,
+        .namespace = .{ .table_id = 41, .shard_id = 21, .range_id = 21 },
+        .catalog_digest = @splat(1),
+    };
+    const published = PublishedChildSchema{
+        .fence = published_fence,
+        .before_schema_json_digest = @splat(2),
+        .schema_json_digest = @splat(3),
+        .before_catalog_digest = @splat(4),
+        .after_catalog_digest = @splat(5),
+        .applied_term = 7,
+        .applied_index = 11,
+    };
+    const payload = try encodePublishedChildSchemaMetadataMutationAlloc(alloc, .{ .version = 8, .default_type = "row" }, "{\"version\":8}", published);
+    defer alloc.free(payload);
+    const published_lsn = try appendEncodedSchemaMetadataMutation(&primary, payload, .{});
+    var published_entry = (try primary.log.entryAt(alloc, published_lsn)) orelse return error.TestExpectedEqual;
+    defer published_entry.deinit(alloc);
+    var decoded_published = try decodeSchemaMetadataMutation(alloc, published_entry.record);
+    defer decoded_published.deinit();
+    try std.testing.expectEqual(@as(u32, 8), decoded_published.schema.version);
+    try std.testing.expect(decoded_published.published_child.?.fence.eql(published_fence));
+    try std.testing.expectEqual(@as(u64, 11), decoded_published.published_child.?.applied_index);
+
+    var dual = published;
+    dual.fence.role = .child_generation_dual;
+    dual.fence.peer_group_id = dual.fence.owner_group_id;
+    const dual_payload = try encodePublishedChildSchemaMetadataMutationAlloc(alloc, .{ .version = 8, .default_type = "row" }, "{\"version\":8}", dual);
+    defer alloc.free(dual_payload);
+    const dual_lsn = try appendEncodedSchemaMetadataMutation(&primary, dual_payload, .{});
+    var dual_entry = (try primary.log.entryAt(alloc, dual_lsn)) orelse return error.TestExpectedEqual;
+    defer dual_entry.deinit(alloc);
+    var decoded_dual = try decodeSchemaMetadataMutation(alloc, dual_entry.record);
+    defer decoded_dual.deinit();
+    try std.testing.expect(decoded_dual.published_child.?.fence.eql(dual.fence));
+    var invalid_dual = dual;
+    invalid_dual.fence.role = .child_generation_parent;
+    try std.testing.expectError(error.InvalidGenerationPublication, encodePublishedChildSchemaMetadataMutationAlloc(alloc, .{ .version = 8, .default_type = "row" }, "{\"version\":8}", invalid_dual));
+    invalid_dual = dual;
+    invalid_dual.applied_index = 0;
+    try std.testing.expectError(error.InvalidGenerationPublication, encodePublishedChildSchemaMetadataMutationAlloc(alloc, .{ .version = 8, .default_type = "row" }, "{\"version\":8}", invalid_dual));
 
     const legacy_schema_bytes = try schema_mod.serializeSchema(alloc, .{
         .version = 6,
@@ -837,12 +1145,62 @@ test "storage.hot_standby effects rejects unsupported metadata mutation payloads
         .epoch = 1,
         .lsn = 1,
         .previous_lsn = 0,
-        .payload = "{\"schema_version\":3,\"kind\":\"schema\",\"schema_bytes\":\"\"}",
+        .payload = "{\"schema_version\":5,\"kind\":\"schema\",\"schema_bytes\":\"\"}",
     };
     try std.testing.expectError(
         error.UnsupportedMetadataMutationPayloadVersion,
         decodeMetadataMutation(std.testing.allocator, bad_version),
     );
+
+    var malformed_v3 = bad_version;
+    malformed_v3.payload = "{\"schema_version\":3,\"kind\":\"schema\",\"schema_bytes\":\"\"}";
+    try std.testing.expectError(
+        error.InvalidMetadataMutationPayload,
+        decodeMetadataMutation(std.testing.allocator, malformed_v3),
+    );
+}
+
+test "storage.hot_standby row policy publication carries exact owner Raft identity" {
+    const alloc = std.testing.allocator;
+    const request: @import("../../system_catalog/policies.zig").InstallRequest = .{
+        .table_id = 7,
+        .expected_generation = 3,
+        .expected_catalog_epoch = 9,
+        .expected_phase = .pending_install,
+        .owner_group_id = 11,
+        .expected_descriptor_digest = @splat(4),
+    };
+    const encoded = try encodeRowPolicyMetadataMutationAlloc(alloc, "signed-publication", request, .{ .term = 5, .index = 13 });
+    defer alloc.free(encoded);
+    var record = replication_record.Record{
+        .kind = .metadata_mutation,
+        .payload_codec = .json,
+        .cluster_id = 1,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = encoded,
+    };
+    var decoded = try decodeMetadataMutation(alloc, record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(MetadataMutationKind.row_policy, decoded.value.kind);
+    try std.testing.expectEqualDeep(request, decoded.value.row_policy_request.?);
+    try std.testing.expectEqual(@as(u64, 13), decoded.value.row_policy_raft_entry.?.index);
+    try std.testing.expectEqualSlices(u8, "signed-publication", decoded.value.row_policy_bundle.?);
+    try std.testing.expectError(error.UnsupportedMetadataMutationKind, decodeSchemaMetadataMutation(alloc, record));
+
+    const missing_identity = try std.json.Stringify.valueAlloc(alloc, MetadataMutationPayload{
+        .schema_version = 4,
+        .kind = .row_policy,
+        .row_policy_bundle = "signed-publication",
+        .row_policy_request = request,
+    }, .{});
+    defer alloc.free(missing_identity);
+    record.payload = missing_identity;
+    try std.testing.expectError(error.InvalidMetadataMutationPayload, decodeMetadataMutation(alloc, record));
+    record.payload = "{\"schema_version\":3,\"kind\":\"row_policy\",\"schema_bytes\":\"\"}";
+    try std.testing.expectError(error.InvalidMetadataMutationPayload, decodeMetadataMutation(alloc, record));
 }
 
 test "storage.hot_standby effects rejects non-binary encoded change records before append" {

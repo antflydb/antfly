@@ -124,6 +124,8 @@ pub const MetadataServer = struct {
         var service_cfg = cfg.service;
         service_cfg.internal_service_secret = cfg.api_server_cfg.internal_service_secret;
         service_cfg.internal_service_issuer = cfg.api_server_cfg.internal_service_issuer;
+        service_cfg.setting_authority_secret = cfg.api_server_cfg.trusted_principal_secret;
+        service_cfg.setting_authority_issuer = cfg.api_server_cfg.trusted_principal_issuer;
         service_cfg.destination_authorizer = .{
             .manager = cfg.api_server_cfg.user_manager,
             .auth_enabled = cfg.api_server_cfg.auth_enabled,
@@ -236,6 +238,8 @@ pub const MetadataServer = struct {
                 alloc,
                 .{
                     .internal_service_auth_capability = cfg.api_server_cfg.internal_service_auth_capability,
+                    .setting_authority_secret = cfg.api_server_cfg.trusted_principal_secret,
+                    .setting_authority_issuer = cfg.api_server_cfg.trusted_principal_issuer,
                     .secret_store = cfg.api_server_cfg.secret_store,
                 },
                 metadata_http_server.AdminSource.fromMetadataHttpService(svc),
@@ -282,6 +286,8 @@ pub const MetadataServer = struct {
                     catalog,
                     raft.read_gate.alreadyReadSafeBarrier(),
                 );
+                owner_source.row_policy_authority_secret = cfg.api_server_cfg.trusted_principal_secret;
+                owner_source.row_policy_authority_issuer = cfg.api_server_cfg.trusted_principal_issuer;
                 _ = owner_source.withRemoteContent(cfg.api_server_cfg.remote_content);
                 owned_kernel_owner_source = owner_source;
                 _ = public_read_source.withLocalReadSource(owner_source.readSource());
@@ -331,15 +337,18 @@ pub const MetadataServer = struct {
             };
 
             const public_http_server = try alloc.create(public_api_kernel.ApiHttpServer);
-            public_http_server.* = public_api_kernel.ApiHttpServer.initWithProcessRequestAllocator(
+            public_http_server.* = public_api_kernel.ApiHttpServer.initWithProcessRequestAllocatorFallible(
                 alloc,
                 api_server_cfg,
                 public_api_http_server.StatusSource.fromMetadataHttpService(svc),
                 public_read_source.source(),
                 public_write_source.source(),
-            );
-            try public_http_server.attachReplicatedRestoreJobStore(metadataRestoreJobPersistence(svc));
+            ) catch |err| {
+                alloc.destroy(public_http_server);
+                return err;
+            };
             owned_public_http_server = public_http_server;
+            try public_http_server.attachReplicatedRestoreJobStore(metadataRestoreJobPersistence(svc));
             public_http_server.bindIncomingGraphRoutes(public_read_source.source());
 
             const mux = try alloc.create(MetadataAdminMux);
@@ -1677,6 +1686,12 @@ test "metadata server can expose admin listener endpoints" {
             },
         },
         .admin_listener = .{},
+        .api_server_cfg = .{
+            .internal_service_secret = "metadata-service-secret-0123456789abcdef",
+            .internal_service_issuer = "metadata-node",
+            .trusted_principal_secret = "metadata-setting-secret-0123456789abcdef",
+            .trusted_principal_issuer = "metadata-gateway",
+        },
     }, .{
         .http = .{
             .http = .{
@@ -1717,6 +1732,34 @@ test "metadata server can expose admin listener endpoints" {
     var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
     defer executor.deinit();
     var client = metadata_http_client.MetadataHttpClient.init(std.heap.page_allocator, executor.executor());
+
+    // Exercise the real host router: a correctly signed setting grant cannot
+    // substitute for the independently authenticated internal-service token.
+    const setting_call = @import("../system_catalog/domain.zig").Call{ .setting_snapshot = .{ .principal = "alice", .database = "main" } };
+    const setting_body = try std.json.Stringify.valueAlloc(std.heap.page_allocator, setting_call, .{});
+    defer std.heap.page_allocator.free(setting_body);
+    const now_seconds: i64 = @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s));
+    const grant = try @import("../system_catalog/setting_authority.zig").sign(std.heap.page_allocator, "metadata-setting-secret-0123456789abcdef", "metadata-gateway", .read, setting_body, now_seconds);
+    defer std.heap.page_allocator.free(grant);
+    const wrong_service_token = try @import("../api/internal_service_auth.zig").tokenAlloc(std.heap.page_allocator, .{ .secret = "different-service-secret-0123456789abcdef", .issuer = "metadata-node" }, now_seconds);
+    defer std.heap.page_allocator.free(wrong_service_token);
+    const setting_uri = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/internal/v1/system-catalog", .{admin_base_uri});
+    defer std.heap.page_allocator.free(setting_uri);
+    var rejected_setting = try executor.executor().execute(std.heap.page_allocator, .{
+        .method = .POST,
+        .uri = setting_uri,
+        .headers = &.{
+            .{ .name = @import("../api/internal_service_auth.zig").header_name, .value = wrong_service_token },
+            .{ .name = @import("../system_catalog/setting_authority.zig").header_name, .value = grant },
+            .{ .name = "X-Antfly-Raft-Mutation-Remaining-Ms", .value = "5000" },
+            .{ .name = "X-Antfly-Raft-Mutation-Forwards-Remaining", .value = "0" },
+            .{ .name = "X-Antfly-Raft-Mutation-Campaign-Allowed", .value = "false" },
+        },
+        .body = setting_body,
+        .content_type = "application/json",
+    });
+    defer rejected_setting.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 401), rejected_setting.status);
 
     const healthz_uri = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/healthz", .{admin_base_uri});
     defer std.heap.page_allocator.free(healthz_uri);

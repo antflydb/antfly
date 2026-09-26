@@ -26,6 +26,7 @@
 const std = @import("std");
 const time = @import("antfly_platform").time;
 const transactions = @import("../transactions.zig");
+const generation_retirement = @import("relational_integrity_generation_retirement.zig");
 const Allocator = std.mem.Allocator;
 pub const Operation = @import("types.zig").TransactionIntegrityOperation;
 pub const namespace = @import("relational_integrity_contract.zig").namespace;
@@ -166,7 +167,8 @@ const Builder = struct {
         while (entry) |item| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, item.key, &prefix)) break;
             if (self.positions.get(item.key)) |position| if (self.operations.items[position].kind == .delete) continue;
-            _ = try Reference.decode(item.key, item.value);
+            const reference = try Reference.decode(item.key, item.value);
+            if (try generation_retirement.isRetired(txn, reference)) continue;
             return error.ForeignKeyReferenced;
         }
     }
@@ -205,7 +207,7 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
         for (commands) |command| {
             const command_phase: usize = switch (command.operation) {
                 .detach, .repair_detach => continue,
-                .check_owner => 0,
+                .compare_claim, .check_owner => 0,
                 .release, .repair_release => 1,
                 .establish => 2,
                 .attach => 3,
@@ -216,6 +218,12 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
             const claim_key = address.claimKey();
             switch (command.operation) {
                 .detach, .repair_detach => {},
+                .compare_claim => |expected| {
+                    const observed = try builder.current(txn, &claim_key);
+                    const encoded = if (expected) |claim| try claim.encode(owned, address) else null;
+                    if (!optionalEqual(observed, encoded)) return error.PreparedReadSetChanged;
+                    try builder.add(txn, address, &claim_key, .guard, null);
+                },
                 .check_owner => |owner| {
                     const claim = try Claim.decode(&claim_key, try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing);
                     try requireOwner(claim, owner.parent_table, owner.parent_key);
@@ -235,6 +243,7 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
                     try builder.add(txn, address, &claim_key, .put, try claim.encode(owned, address));
                 },
                 .attach => |reference| {
+                    if (try generation_retirement.isRetired(txn, reference)) return error.GenerationRetired;
                     const raw = try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing;
                     const claim = try Claim.decode(&claim_key, raw);
                     if (claim.state != .live) return error.ForeignKeyActionInProgress;
@@ -360,7 +369,8 @@ fn requireEmptyOperations(txn: anytype, address: Address, operations: []const Op
     while (entry) |item| : (entry = try cursor.next()) {
         if (!std.mem.startsWith(u8, item.key, &prefix)) break;
         if (overlay.get(item.key)) |position| if (operations[position].kind == .delete) continue;
-        _ = try Reference.decode(item.key, item.value);
+        const reference = try Reference.decode(item.key, item.value);
+        if (try generation_retirement.isRetired(txn, reference)) continue;
         return error.ForeignKeyReferenced;
     }
 }
@@ -372,7 +382,8 @@ fn requireReboundReferences(txn: anytype, address: Address, operations: []const 
     var entry = try cursor.seekAtOrAfter(&prefix);
     while (entry) |item| : (entry = try cursor.next()) {
         if (!std.mem.startsWith(u8, item.key, &prefix)) break;
-        _ = try Reference.decode(item.key, item.value);
+        const reference = try Reference.decode(item.key, item.value);
+        if (try generation_retirement.isRetired(txn, reference)) continue;
         const position = overlay.get(item.key) orelse return error.ForeignKeyReferenced;
         // A guard-only attach is not a reference rebind. Only a detached old
         // relationship, optionally reattached to the final tuple owner, may
@@ -401,6 +412,7 @@ pub fn validatePreparedEffects(alloc: Allocator, txn: anytype, operations: []con
         const claim_key = parsed.address.claimKey();
         switch (parsed.kind) {
             .reference => {
+                if (op.kind == .put and try generation_retirement.isRetired(txn, try Reference.decode(op.key, op.value.?))) return error.GenerationRetired;
                 const claim_op = operations[overlay.get(&claim_key) orelse return error.IntegrityClaimGuardRequired];
                 const current_claim = if (claim_op.kind == .put) claim_op.value else claim_op.expected_value;
                 const claim = try Claim.decode(&claim_key, current_claim orelse return error.ForeignKeyParentMissing);
@@ -522,6 +534,7 @@ pub fn actionPageWithBudget(alloc: Allocator, io: ?std.Io, txn: anytype, address
     defer cursor.close();
     var references: std.ArrayList(Reference) = .empty;
     var bytes: usize = 0;
+    var inspected: usize = 0;
     var entry = try cursor.seekAtOrAfter(if (job.phase == .validating and job.cursor.len != 0) job.cursor else &prefix);
     if (entry) |item| if (job.phase == .validating and std.mem.eql(u8, item.key, job.cursor)) {
         entry = try cursor.next();
@@ -532,17 +545,25 @@ pub fn actionPageWithBudget(alloc: Allocator, io: ?std.Io, txn: anytype, address
         if (!std.mem.startsWith(u8, item.key, &prefix)) break;
         if (io) |runtime_io| try runtime_io.checkCancel();
         const item_bytes = std.math.add(usize, item.key.len, item.value.len) catch return error.IntegrityRecordTooLarge;
-        if (references.items.len == max_rows or item_bytes > max_bytes - bytes or
-            (references.items.len != 0 and time.monotonicNs() -| started >= budget.time_ns))
+        if (inspected == max_rows or item_bytes > max_bytes - bytes or
+            (inspected != 0 and time.monotonicNs() -| started >= budget.time_ns))
         {
-            if (references.items.len == 0) return error.IntegrityRecordTooLarge;
+            if (inspected == 0) return error.IntegrityRecordTooLarge;
             complete = false;
             break;
+        }
+        const reference = try Reference.decode(item.key, item.value);
+        if (try generation_retirement.isRetired(txn, reference)) {
+            next_cursor = try owned.dupe(u8, item.key);
+            bytes += item_bytes;
+            inspected += 1;
+            continue;
         }
         const value = try owned.dupe(u8, item.value);
         try references.append(owned, try Reference.decode(item.key, value));
         next_cursor = try owned.dupe(u8, item.key);
         bytes += item_bytes;
+        inspected += 1;
     }
     const reference_items = try references.toOwnedSlice(owned);
     return .{ .arena = arena, .claim = claim, .job = job, .next_cursor = next_cursor, .references = reference_items, .complete = complete };
@@ -623,6 +644,52 @@ fn testPrepareEffects(store: *@import("../docstore.zig").DocStore, manager: *tra
     try manager.writeIntents(id, intents.items, predicates.items);
 }
 
+test "relational index system integrity compare claim fences absence and exact owner before combined writes" {
+    const Fake = struct {
+        value: ?[]const u8 = null,
+        pub fn get(self: *@This(), _: []const u8) ![]const u8 {
+            return self.value orelse error.NotFound;
+        }
+        const Cursor = struct {
+            const Entry = struct { key: []const u8, value: []const u8 };
+            pub fn close(_: *@This()) void {}
+            pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
+                return null;
+            }
+            pub fn next(_: *@This()) !?Entry {
+                return null;
+            }
+        };
+        pub fn openCursor(_: *@This()) !Cursor {
+            return .{};
+        }
+    };
+    const alloc = std.testing.allocator;
+    const address = try Address.init(@splat(7), "tuple");
+    const claim: Claim = .{ .tuple = "tuple", .parent_table = "items", .parent_key = "first", .schema_version = 1 };
+    const encoded = try claim.encode(alloc, address);
+    defer alloc.free(encoded);
+    var empty: Fake = .{};
+    var insertion = try prepare(alloc, &empty, &.{
+        .{ .address = address, .operation = .{ .establish = claim } },
+        .{ .address = address, .operation = .{ .compare_claim = null } },
+    });
+    defer insertion.deinit();
+    try std.testing.expectEqual(@as(usize, 1), insertion.operations.len);
+    try std.testing.expect(insertion.operations[0].kind == .put);
+    try std.testing.expect(insertion.operations[0].expected_value == null);
+    var occupied: Fake = .{ .value = encoded };
+    try std.testing.expectError(error.PreparedReadSetChanged, prepare(alloc, &occupied, &.{.{ .address = address, .operation = .{ .compare_claim = null } }}));
+    var guard = try prepare(alloc, &occupied, &.{.{ .address = address, .operation = .{ .compare_claim = claim } }});
+    defer guard.deinit();
+    try std.testing.expectEqual(@as(usize, 1), guard.operations.len);
+    try std.testing.expectEqualStrings(encoded, guard.operations[0].expected_value.?);
+    var changed = claim;
+    changed.schema_version += 1;
+    try std.testing.expectError(error.PreparedReadSetChanged, prepare(alloc, &occupied, &.{.{ .address = address, .operation = .{ .compare_claim = changed } }}));
+    try std.testing.expectError(error.VersionConflict, validatePreparedEffects(alloc, &empty, guard.operations));
+}
+
 fn testCommands(store: *@import("../docstore.zig").DocStore, manager: *transactions.TxnManager, id: transactions.TxnId, commands: []const Command, commit: bool) !void {
     var read = try CurrentView.init(store);
     defer read.deinit();
@@ -666,6 +733,22 @@ test "relational integrity shared parent guards and fenced bounded action recove
         try std.testing.expectError(error.IntentConflict, testPrepareEffects(&store, &manager, @splat(4), stale_release.operations));
         try manager.resolveIntents(@splat(2), .committed, 2);
         try manager.resolveIntents(@splat(3), .committed, 2);
+        // A staged TRUNCATE parent tombstone is not a publication receipt.
+        // Native RESTRICT planning and participant validation still see the
+        // committed child references.
+        const topology = @import("relational_integrity_topology.zig");
+        const retirement = @import("relational_integrity_generation_retirement.zig");
+        const fence: topology.Fence = .{ .role = .truncate_parent, .transition_id = 11, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = .{ .table_id = 41, .shard_id = 31, .range_id = 31 }, .catalog_digest = @splat(4) };
+        const encoded_fence = try fence.encode();
+        try store.put(topology.fence_key, &encoded_fence);
+        const pending = try retirement.encodePending(alloc, fence, @splat(5), &.{.{ .child_table_id = 51, .child_table_name = first.child_table, .constraint_name = first.constraint_name, .generation = first.constraint_generation, .next_generation = @splat(8) }});
+        defer alloc.free(pending);
+        try store.put(retirement.key, pending);
+        var pending_read = try store.beginReadTxn();
+        defer pending_read.abort();
+        try std.testing.expectError(error.ForeignKeyReferenced, prepare(alloc, &pending_read, &.{
+            .{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "p" } } },
+        }));
         // Claim bytes did not change. Participant prefix proof must still
         // reject the release planned before the two child references existed.
         try std.testing.expectError(error.ForeignKeyReferenced, testPrepareEffects(&store, &manager, @splat(4), stale_release.operations));
@@ -723,6 +806,53 @@ test "relational integrity shared parent guards and fenced bounded action recove
         defer unchanged.deinit();
         try std.testing.expectEqual(@as(usize, 2), unchanged.operations.len);
         for (unchanged.operations) |operation| try std.testing.expectEqual(.guard, operation.kind);
+    }
+}
+
+test "distributed txn deferred unique swaps fence concurrent claims and survive prepared restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const a = try Address.init(@splat(9), "one");
+    const b = try Address.init(@splat(9), "two");
+    const first: Claim = .{ .tuple = "one", .parent_table = "rows", .parent_key = "a", .schema_version = 1 };
+    const second: Claim = .{ .tuple = "two", .parent_table = "rows", .parent_key = "b", .schema_version = 1 };
+    var swapped_first = first;
+    swapped_first.parent_key = "b";
+    var swapped_second = second;
+    swapped_second.parent_key = "a";
+    const commands = [_]Command{
+        .{ .address = a, .operation = .{ .establish = swapped_first } },
+        .{ .address = b, .operation = .{ .establish = swapped_second } },
+        .{ .address = a, .operation = .{ .release = .{ .parent_table = "rows", .parent_key = "a" } } },
+        .{ .address = b, .operation = .{ .release = .{ .parent_table = "rows", .parent_key = "b" } } },
+    };
+    {
+        var backend = try @import("../lsm_backend.zig").Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try @import("../docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try transactions.TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try testCommands(&store, &manager, @splat(1), &.{ .{ .address = a, .operation = .{ .establish = first } }, .{ .address = b, .operation = .{ .establish = second } } }, true);
+        try testCommands(&store, &manager, @splat(2), &commands, false);
+        try std.testing.expectError(error.IntentConflict, testCommands(&store, &manager, @splat(3), &commands, false));
+    }
+    {
+        var backend = try @import("../lsm_backend.zig").Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try @import("../docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try transactions.TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.resolveIntents(@splat(2), .committed, 3);
+        var read = try CurrentView.init(&store);
+        defer read.deinit();
+        try std.testing.expectEqualStrings("b", (try Claim.decode(&a.claimKey(), try read.get(&a.claimKey()))).parent_key);
+        try std.testing.expectEqualStrings("a", (try Claim.decode(&b.claimKey(), try read.get(&b.claimKey()))).parent_key);
+        try std.testing.expectError(error.UniqueConstraintViolation, prepare(alloc, &read, &.{.{ .address = a, .operation = .{ .establish = first } }}));
     }
 }
 

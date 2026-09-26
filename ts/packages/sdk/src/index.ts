@@ -50,6 +50,7 @@ export {
   ResearchJobAdvanceConflictError,
   type RestoreOptions,
   type SchemaMutationOptions,
+  SQLExecutionError,
   StorageReadTemporarilyUnavailableError,
   StorageResourceExhaustedError,
 } from "./client.js";
@@ -452,6 +453,15 @@ export type {
   SignificanceAlgorithm,
   SortProfile,
   SparseEmbedding,
+  SQLColumn,
+  SQLColumnType,
+  SQLDiagnostic,
+  SQLMutationOutcome,
+  SQLPreparedExecutionRequest,
+  SQLPreparedResponse,
+  SQLPrepareRequest,
+  SQLRequest,
+  SQLResponse,
   SSEStepStarted,
   SSEToolMode,
   // Table types

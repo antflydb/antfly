@@ -629,6 +629,14 @@ pub const Detail = enum(c_int) {
     http_connection_closing,
     raft_batch_write_transport_outcome_unknown,
     concurrency_unavailable,
+    sql_range_tracking_required,
+    sql_statement_snapshot_required,
+    invalid_range_tracking_state,
+    range_tracking_generation_exhausted,
+    // Absence of a policy publication is an expected proof result. Preserve
+    // it across the native metadata callback instead of turning reads of an
+    // unprotected table into RuntimeBoundaryFailure.
+    row_policy_catalog_changed,
 };
 
 pub const Status = extern struct {
@@ -646,6 +654,10 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.SqlRangeTrackingRequired => status(.unsupported, .sql_range_tracking_required),
+        error.SqlStatementSnapshotRequired => status(.unsupported, .sql_statement_snapshot_required),
+        error.InvalidRangeTrackingState => status(.corrupt, .invalid_range_tracking_state),
+        error.RangeTrackingGenerationExhausted => status(.unavailable, .range_tracking_generation_exhausted),
         error.HASeedSnapshotRuntimeBusy => status(.unavailable, .ha_seed_snapshot_runtime_busy),
         error.HASeedCaptureAlreadyInProgress => status(.unavailable, .ha_seed_capture_already_in_progress),
         error.StorageKernelOwnerUnavailable => status(.unavailable, .storage_kernel_owner_unavailable),
@@ -672,6 +684,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidTablespacePlacementPolicy => status(.invalid_argument, .invalid_tablespace_placement_policy),
         error.CatalogCommandTooLarge => status(.invalid_argument, .catalog_command_too_large),
         error.InvalidCatalogRecord => status(.corrupt, .invalid_catalog_record),
+        error.RowPolicyCatalogChanged => status(.conflict, .row_policy_catalog_changed),
         error.CatalogIdExhausted => status(.internal, .catalog_id_exhausted),
 
         error.RelationalRewriteTypeChange => status(.invalid_argument, .relational_rewrite_type_change),
@@ -1264,6 +1277,10 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .sql_range_tracking_required => "SqlRangeTrackingRequired",
+        .sql_statement_snapshot_required => "SqlStatementSnapshotRequired",
+        .invalid_range_tracking_state => "InvalidRangeTrackingState",
+        .range_tracking_generation_exhausted => "RangeTrackingGenerationExhausted",
         .concurrency_unavailable => "ConcurrencyUnavailable",
         .table_topology_protocol_upgrade_required => "TableTopologyProtocolUpgradeRequired",
         .database_not_found => "DatabaseNotFound",
@@ -1288,6 +1305,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_tablespace_placement_policy => "InvalidTablespacePlacementPolicy",
         .catalog_command_too_large => "CatalogCommandTooLarge",
         .invalid_catalog_record => "InvalidCatalogRecord",
+        .row_policy_catalog_changed => "RowPolicyCatalogChanged",
         .catalog_id_exhausted => "CatalogIdExhausted",
 
         .restore_job_commit_not_applied => "RestoreJobCommitNotApplied",
@@ -2050,5 +2068,12 @@ test "metadata proposal recovery errors preserve identity across runtime archive
     for ([_]anyerror{ error.MetadataProposalSuperseded, error.MetadataProposalApplyTimeout, error.MetadataMutationOutcomeUnknown }) |err| {
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(statusFromErrorWithFallback(err, error.RestoreJobPersistenceUnavailable)));
+    }
+}
+
+test "SQL snapshot and range protection errors preserve runtime capability semantics" {
+    for ([_]anyerror{ error.SqlRangeTrackingRequired, error.SqlStatementSnapshotRequired, error.InvalidRangeTrackingState, error.RangeTrackingGenerationExhausted }) |err| {
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
 }

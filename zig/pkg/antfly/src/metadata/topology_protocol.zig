@@ -29,7 +29,11 @@ const std = @import("std");
 /// Version 11 additionally requires relational topology, coordinated
 /// backup/restore/retirement, Scope-v2 sources, staged rewrite final cuts, and
 /// table storage metadata. Main's v10 decoders do not understand these commands.
-pub const current_version: u16 = 11;
+/// Version 12 decodes the durable SQL setting catalog transition. Version 13
+/// decodes inert native row-policy definitions; RLS activation is separate.
+/// Version 14 decodes the durable row-policy publication/owner-ACK transition.
+/// Version 15 decodes the durable fenced FK generation publication transition.
+pub const current_version: u16 = 16;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.
@@ -40,6 +44,11 @@ pub const source_scope_version: u16 = 11;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;
 pub const system_catalog_version: u16 = 7;
+pub const sql_setting_catalog_version: u16 = 12;
+pub const sql_row_policy_catalog_version: u16 = 13;
+pub const sql_row_policy_publication_version: u16 = 14;
+pub const fk_generation_publication_version: u16 = 15;
+pub const fk_initial_create_version: u16 = 16;
 /// Minimum decoder capability required by the atomic create/drop wire format.
 /// Later, unrelated metadata features must not unnecessarily stop table DDL
 /// when a membership change temporarily includes a lower-capability peer.

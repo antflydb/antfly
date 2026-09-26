@@ -6844,6 +6844,33 @@ pub const MetadataAdminVoprSource = struct {
         const store = target.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         const group_id = target.cluster.metadata_group_id;
         const result = switch (input) {
+            .setting_snapshot => |scope| try store.sqlSettingSnapshotJson(alloc, group_id, scope),
+            .policy_snapshot => |request| try store.sqlPolicySnapshotJson(alloc, group_id, request.table_id, request.principal, request.database, request.roles),
+            .setting_mutate => return error.Forbidden,
+            // VOPR's public catalog façade does not own the private
+            // publication/coordination protocols. Keep these explicit so a
+            // newly added Call remains visible to exhaustive compilation.
+            .policy_install_snapshot,
+            .policy_publication_status,
+            .policy_publication_work,
+            .policy_publication_begin,
+            .policy_definition_mutate,
+            .policy_publication_mutate,
+            .fk_generation_publication_begin,
+            .fk_generation_publication_mutate,
+            .fk_generation_publication_status,
+            .fk_generation_publication_work,
+            .fk_generation_publication_decision,
+            .fk_generation_publication_source_decision,
+            .fk_initial_create_prepare,
+            .fk_initial_child_decision,
+            .fk_initial_create_begin,
+            .fk_initial_create_mutate,
+            .fk_initial_create_status,
+            .fk_generation_table_locked,
+            .fk_initial_create_work,
+            .fk_initial_parent_decision,
+            => return error.UnsupportedOperation,
             .write_validation_revision => try std.json.Stringify.valueAlloc(alloc, metadata_api.MetadataHead{
                 .metadata_group_id = group_id,
                 .metadata_incarnation = try target.metadataIncarnation(),

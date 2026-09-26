@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 65;
+pub const abi_version: u32 = 69;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -515,6 +515,8 @@ pub const MetadataProjectionKind = enum(u32) {
     verify_table_create_projection = 39,
     system_catalog = 41,
     backup_cohort = 63,
+    /// Abort-only validation of a proposed initial-FK Raft command.
+    fk_initial_create_preflight = 64,
     backup_cohort_progress = 43,
     backup_cohorts = 44,
     restore_staging_job = 45,
@@ -1046,6 +1048,7 @@ pub const OpenRequest = extern struct {
     /// Exact private metadata-authorized hidden owner bootstrap. Never set by
     /// ordinary public catalog opens; durable scope is checked before adoption.
     restore_bootstrap_json: BorrowedBytes = .{},
+    initial_child_bootstrap_json: BorrowedBytes = .{},
     restore_cancel_recovery: u8 = 0,
     restore_ha_replay: u8 = 0,
     /// Immutable native ownership domain; not inferred from the first row or
@@ -1054,6 +1057,9 @@ pub const OpenRequest = extern struct {
     /// This owner is being opened to apply an entry whose catalog descriptor
     /// may predate the configuration already persisted by this replica.
     historical_raft_apply: u8 = 0,
+    /// Optional result: the physical owner opened for exact topology control
+    /// while current-catalog index reconciliation remains fence-deferred.
+    owner_catalog_deferred_out: ?*u8 = null,
     _restore_reserved: [4]u8 = @splat(0),
     target_observer: TargetObserver = .{},
     transaction_recovery: TransactionRecoveryConfig = .{},
@@ -1063,6 +1069,11 @@ pub const OpenRequest = extern struct {
     initial_range_end: BorrowedBytes = .{},
     initial_range_control: ControlledJsonOperationRequest = .{},
     restore: RestoreAdmission = .{},
+    /// Immutable owner-local verifier for authenticated, statement-scoped
+    /// row-policy principal proofs. Absent for Lite and legacy runtimes, which
+    /// must reject active-policy reads and writes rather than assume a role.
+    row_policy_authority_secret: BorrowedBytes = .{},
+    row_policy_authority_issuer: BorrowedBytes = .{},
 };
 
 pub const JsonOperationRequest = extern struct {
@@ -1084,6 +1095,17 @@ pub const ReplicatedBatchAtRaftEntryRequest = extern struct {
     raft_index: u64 = 0,
 };
 
+/// Metadata-authorized hidden-child control on a native owner. This is a
+/// local operation receipt, never a data-Raft entry or source watermark.
+pub const NativeInitialChildControlRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    operation_term: u64 = 0,
+    operation_index: u64 = 0,
+};
+
 /// Complete offline HA-seed operations that must remain beside physical DB
 /// restore/validation code. Values are append-only because they are recorded
 /// in `FailureIdentity.operation` for cross-unit diagnostics.
@@ -1096,7 +1118,7 @@ pub const HASeedOperation = enum(u32) {
 /// Private owner discovery is physical metadata, not public catalog routing.
 pub const HiddenRestoreRequest = extern struct {
     version: u32 = abi_version,
-    operation: enum(u32) { read_bootstrap = 0, capture_snapshot = 1, capture_public_snapshot = 2 },
+    operation: enum(u32) { read_bootstrap = 0, capture_snapshot = 1, capture_public_snapshot = 2, read_initial_child = 3 },
     context: ?*anyopaque = null,
     path: BorrowedBytes = .{},
     table_name: BorrowedBytes = .{},
@@ -1870,6 +1892,12 @@ pub extern fn antfly_storage_owner_replicated_batch_json(
 pub extern fn antfly_storage_owner_replicated_batch_at_raft_entry_json(
     owner: ?*anyopaque,
     request: *const ReplicatedBatchAtRaftEntryRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_native_initial_child_control_json(
+    owner: ?*anyopaque,
+    request: *const NativeInitialChildControlRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 

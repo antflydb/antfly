@@ -333,6 +333,9 @@ pub const ClaimOwner = struct { parent_table: []const u8, parent_key: []const u8
 pub const Command = struct {
     address: Address,
     operation: union(enum) {
+        /// Exact pre-state guard for a conflict arbiter. null proves absence;
+        /// unlike check_owner this also fences schema/action/tuple state.
+        compare_claim: ?Claim,
         establish: Claim,
         check_owner: ClaimOwner,
         attach: Reference,
@@ -358,6 +361,11 @@ pub const Command = struct {
 pub fn commandAdmissionBytes(command: Command) !usize {
     var bytes: usize = 0;
     switch (command.operation) {
+        .compare_claim => |optional| if (optional) |claim| {
+            for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key, claim.target_tuple orelse "" }) |field| {
+                bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
+            }
+        },
         .establish => |claim| for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| {
             bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
         },

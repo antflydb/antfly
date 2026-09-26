@@ -103,6 +103,19 @@ pub const RequestDiagnostics = struct {
 };
 
 pub const RequestContext = struct {
+    /// Granted only after administrator authentication by a trusted native
+    /// ingress. Metadata HTTP never reconstructs this from request JSON.
+    setting_admin: bool = false,
+    /// Exact authenticated SQL credential principal; distinct from username
+    /// for API keys and derived only by trusted API/pgwire ingress.
+    setting_read_principal: ?[]const u8 = null,
+    /// Granted only by the authenticated internal metadata transport after
+    /// verifying a body-bound policy-install read grant. Never infer it from
+    /// a serialized catalog request or forwarded user identity.
+    row_policy_install_authority: bool = false,
+    /// Internal body-bound authorization for fenced FK schema publication.
+    /// Never accepted from public SQL or a client-provided catalog payload.
+    fk_generation_publication_authority: bool = false,
     /// Set only by the administrator-authorized relational recovery routes.
     relational_recovery: enum { none, repair, retry, retire } = .none,
     relational_retirement_target: ?[]const u8 = null,
@@ -123,6 +136,10 @@ pub const RequestContext = struct {
     /// admission (for example FK cascades). Adapters retain the admitted
     /// credential scopes; a username alone cannot reconstruct API-key rights.
     table_write_authorization: ?TableWriteAuthorization = null,
+    /// Borrowed authenticated ingress credential, never serialized or
+    /// reconstructed from `principal`. Only ApiHttpServer may interpret this
+    /// opaque capability when minting a table-scoped RLS write proof.
+    row_policy_credential: ?*const anyopaque = null,
     admission: ?*AdmissionReservation = null,
     /// Borrowed for the duration of the operation. This is deliberately
     /// request-scoped: std.Io tasks may resume on a different worker thread.

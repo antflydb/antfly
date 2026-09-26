@@ -77,6 +77,9 @@ pub const MetadataState = struct {
     projected_node_ids: []u64 = &.{},
     projected_store_node_ids: []u64 = &.{},
     projected_store_candidates: []CandidatePlacementInfo = &.{},
+    /// Exact hidden initial-FK groups from the durable provisioning cut. They
+    /// participate in placement without entering the public desired catalog.
+    initial_fk_owner_group_ids: []u64 = &.{},
     projected_store_topology_present: bool = false,
     committed_nodes: std.ArrayListUnmanaged(metadata_table_manager.NodeRecord) = .empty,
     committed_stores: std.ArrayListUnmanaged(metadata_table_manager.StoreRecord) = .empty,
@@ -102,6 +105,7 @@ pub const MetadataState = struct {
         if (self.placement_candidate_node_ids.len > 0) self.alloc.free(self.placement_candidate_node_ids);
         if (self.projected_node_ids.len > 0) self.alloc.free(self.projected_node_ids);
         if (self.projected_store_node_ids.len > 0) self.alloc.free(self.projected_store_node_ids);
+        if (self.initial_fk_owner_group_ids.len > 0) self.alloc.free(self.initial_fk_owner_group_ids);
         if (self.projected_store_candidates.len > 0) {
             for (self.projected_store_candidates) |candidate| {
                 self.alloc.free(candidate.role);
@@ -165,6 +169,14 @@ pub const MetadataState = struct {
         defer if (provisioning == null) service.freeProjectedTables(self.alloc, projected_tables);
         const projected_ranges = if (provisioning) |projection| projection.ranges else try service.listProjectedRanges(self.alloc);
         defer if (provisioning == null) service.freeProjectedRanges(self.alloc, projected_ranges);
+        const initial_fk_groups: []u64 = if (provisioning) |projection| blk: {
+            if (projection.initial_fk_owners.len == 0) break :blk &.{};
+            const ids = try self.alloc.alloc(u64, projection.initial_fk_owners.len);
+            for (projection.initial_fk_owners, ids) |owner, *id| id.* = owner.child_group_id;
+            break :blk ids;
+        } else &.{};
+        var initial_fk_groups_owned = true;
+        errdefer if (initial_fk_groups_owned and initial_fk_groups.len > 0) self.alloc.free(initial_fk_groups);
         const projected_nodes = try listProjectedNodes(self, service);
         defer freeProjectedNodes(self, service, projected_nodes);
         const projected_stores = try listProjectedStores(self, service);
@@ -175,6 +187,9 @@ pub const MetadataState = struct {
         defer service.freeProjectedMergeTransitions(self.alloc, merge_records);
 
         _ = try self.projected.replaceProjectedTopology(projected_tables, projected_ranges);
+        if (self.initial_fk_owner_group_ids.len > 0) self.alloc.free(self.initial_fk_owner_group_ids);
+        self.initial_fk_owner_group_ids = initial_fk_groups;
+        initial_fk_groups_owned = false;
         self.clearCommitted();
         self.clearCommittedNodes();
         self.clearCommittedStores();
@@ -294,6 +309,7 @@ pub const MetadataState = struct {
                 .placement_version_fences = placement_version_fences,
                 .tables = tables,
                 .ranges = ranges,
+                .initial_fk_owner_group_ids = self.initial_fk_owner_group_ids,
                 .stores = self.committed_stores.items,
                 .merged_group_statuses = merged_group_statuses,
                 .restore_progresses = restore_progresses,

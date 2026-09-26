@@ -32,6 +32,9 @@ const mappings = [_]Mapping{
     .{ .status = .catalog_already_exists, .err = error.CatalogAlreadyExists },
     .{ .status = .catalog_command_too_large, .err = error.CatalogCommandTooLarge },
     .{ .status = .catalog_generation_changed, .err = error.CatalogGenerationChanged },
+    .{ .status = .generation_publication_not_found, .err = error.GenerationPublicationNotFound },
+    .{ .status = .generation_publication_changed, .err = error.GenerationPublicationChanged },
+    .{ .status = .generation_retired, .err = error.GenerationRetired },
     .{ .status = .catalog_id_exhausted, .err = error.CatalogIdExhausted },
     .{ .status = .catalog_not_found, .err = error.CatalogNotFound },
     .{ .status = .catalog_projection_refresh_required, .err = error.CatalogProjectionRefreshRequired },
@@ -71,6 +74,7 @@ const mappings = [_]Mapping{
     .{ .status = .relational_expression_budget_exceeded, .err = error.RelationalExpressionBudgetExceeded },
     .{ .status = .relational_index_key_too_large, .err = error.RelationalIndexKeyTooLarge },
     .{ .status = .invalid_relational_expression_input, .err = error.InvalidRelationalExpressionInput },
+    .{ .status = .invalid_relational_row, .err = error.InvalidRelationalRow },
     .{ .status = .invalid_relational_generated_value, .err = error.InvalidRelationalGeneratedValue },
     .{ .status = .generated_column_rewrite_required, .err = error.GeneratedColumnRewriteRequired },
     .{ .status = .relational_index_not_ready, .err = error.RelationalIndexNotReady },
@@ -665,6 +669,16 @@ const mappings = [_]Mapping{
     .{ .status = .vector_store_requires_empty_table, .err = error.VectorStoreRequiresEmptyTable },
     .{ .status = .vector_store_requires_local_single_shard_table, .err = error.VectorStoreRequiresLocalSingleShardTable },
     .{ .status = .vector_store_requires_offline_command, .err = error.VectorStoreRequiresOfflineCommand },
+    .{ .status = .row_policy_authentication_required, .err = error.RowPolicyAuthenticationRequired },
+    .{ .status = .row_policy_authority_unavailable, .err = error.RowPolicyAuthorityUnavailable },
+    .{ .status = .row_policy_catalog_changed, .err = error.RowPolicyCatalogChanged },
+    .{ .status = .row_policy_readers_active, .err = error.RowPolicyReadersActive },
+    .{ .status = .row_policy_topology_unsupported, .err = error.RowPolicyTopologyUnsupported },
+    .{ .status = .row_policy_mutation_unsupported, .err = error.RowPolicyMutationUnsupported },
+    .{ .status = .row_policy_denied, .err = error.RowPolicyDenied },
+    .{ .status = .invalid_row_policy_receipt, .err = error.InvalidRowPolicyReceipt },
+    .{ .status = .invalid_row_policy_bundle, .err = error.InvalidRowPolicyBundle },
+    .{ .status = .row_policy_unsupported, .err = error.RowPolicyUnsupported },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {
@@ -904,11 +918,22 @@ pub fn validateForTest() !void {
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    // A stale FK attachment must remain a semantic rejection across the
+    // storage-owner ABI. Collapsing it to StorageKernelFailure can poison a
+    // replicated apply entry and stall every later proposal on that owner.
+    const retired = failureFromError(error.GenerationRetired, .storage_owner, abi.abi_version, 23);
+    try std.testing.expectEqual(abi.Status.generation_retired, retired.status);
+    try validateFailureEnvelope(retired.status, &retired, abi.abi_version);
+    try std.testing.expectError(error.GenerationRetired, statusToError(retired.status));
     // A newly created/rebuilt ANN index has no serving generation yet. This
     // expected state must survive both compiled query boundaries as a retry,
     // rather than becoming an unregistered StorageKernelFailure (HTTP 500).
     try std.testing.expectEqual(abi.Status.index_rebuilding, statusFromError(error.IndexRebuilding));
     try std.testing.expectError(error.IndexRebuilding, statusToError(.index_rebuilding));
+    // A fixed rewrite source row that violates the target layout must reach
+    // restore validation as its exact error, not generic kernel pressure.
+    try std.testing.expectEqual(abi.Status.invalid_relational_row, statusFromError(error.InvalidRelationalRow));
+    try std.testing.expectError(error.InvalidRelationalRow, statusToError(.invalid_relational_row));
     try validateForTest();
 }
 

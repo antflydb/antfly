@@ -81,6 +81,7 @@ pub const AddTestsResult = struct {
     antfly_test_step: *std.Build.Step,
     unit_test_step: *std.Build.Step,
     standalone_runtime_test_step: *std.Build.Step,
+    standalone_initial_fk_tests: *std.Build.Step.Compile,
     vopr_test_step: *std.Build.Step,
     integration_test_step: *std.Build.Step,
     chaos_test_step: *std.Build.Step,
@@ -184,6 +185,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_imports.configure(b, test_mod.*, true, true);
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
+    const initial_fk_admission_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[metadata_unit_baseline_mods.len - 1],
+        .filters = &.{ "initial self FK reserves one hidden child owner", "FK generation publication initial create reserves hidden identity", "FK parent lock permits only exact read-schema retirement", "initial partial support begin survives restart", "initial MATCH PARTIAL publication pins parent witness support", "initial FK root generation" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const initial_fk_admission_step = b.step("antfly-metadata-initial-fk-admission-test", "Run initial-FK preflight and stale-begin metadata fault regressions");
+    initial_fk_admission_step.dependOn(&addFilteredTestRunArtifact(b, initial_fk_admission_tests).step);
+    const initial_fk_placement_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[0],
+        .filters = &.{"hidden initial FK owner receives placement"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    initial_fk_admission_step.dependOn(&addFilteredTestRunArtifact(b, initial_fk_placement_tests).step);
 
     const store_observer_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[2],
@@ -197,7 +211,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_store_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "metadata.table storage extension", "relational integrity restore staging" },
+        .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes" },
     });
     const system_catalog_store_step = b.step("antfly-system-catalog-store-test", "Run catalog report persistence, snapshot, drain, and migration regressions");
     system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
@@ -435,7 +449,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, restore_owner_test_mod, true, true);
     const restore_owner_tests = b.addTest(.{
         .root_module = restore_owner_test_mod,
-        .filters = &.{ "restore owner verified decoder", "relational integrity portable decoder resumes bounded row pages across LSM reopen" },
+        .filters = &.{ "restore owner verified decoder", "restore decoder", "relational integrity portable decoder resumes bounded row pages across LSM reopen", "mapped restore admission" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-restore-owner-test", "Run authenticated source cache and replicated owner control integration").dependOn(&addFilteredTestRunArtifact(b, restore_owner_tests).step);
@@ -447,10 +461,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, relational_index_system_mod, true, true);
     const relational_index_system_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
-        .filters = &.{ "relational index system", "relational index records" },
+        .filters = &.{ "relational index system", "relational index records", "relational rows snapshot", "ordinal typed projection" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
+    const sql_pk_transform_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"SQL primary-key rewrite retains a present key across nullable-to-required row mapping"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-sql-primary-key-transform-test", "Run focused SQL primary-key native row-transform regression")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_pk_transform_tests).step);
     const api_restore_jobs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{
@@ -517,6 +538,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "export and import documents preserve timestamps",
             "portable backup round trips relational rows and schema metadata",
             "portable backup refuses retained retirement and topology authority without a catalog",
+            "portable accepted-generation proof requires a sealed v3 reader and canonical unique scope",
+            "portable accepted-generation proof page reads only canonical sealed decoder metadata",
             "portable restore validates historical rows with their public schema epoch",
             "portable archive accepts long history with a bounded decoded working set",
             "ordinal rows bind layout support projection checksum and canonical bytes",
@@ -894,6 +917,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "antfly client pkg compiles",
             "get index response timeout bounds the complete HTTP request",
             "list indexes response timeout bounds readiness preflight",
+            "SQL client preserves typed parameters receipts and forbids replay",
+            "SQL prepared client forbids replay and preserves exact owner identity",
         },
     });
     const run_antfly_client_pkg_tests = addFilteredTestRunArtifact(b, antfly_client_pkg_tests);
@@ -1521,8 +1546,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx schema rewrite authorizes incoming dependencies before source admission",
         "httpx schema rewrite accepted job atomically stores draft and preserves idempotent live schema",
         "httpx restore owner accepts bounded rewrite source chunks above legacy control limit",
+        "httpx hidden handoff receipt rejects public caller even in legacy internal mode",
+        "httpx FK source control rejects missing service token in legacy internal mode",
+        "hidden generation handoff receipt requires exact scoped read-index request",
         "httpx schema patch merges at the authority and accepts version zero ETag",
         "httpx relational row query mutation endpoints enforce exact versions and schema epochs",
+        "httpx SQL",
+        "api.sql_execution",
+        "api.sql_pgwire",
+        "SQL schema cache",
+        "SQL catalog",
+        "SQL policy DDL",
+        "api.row_policy_publication_coordinator.",
+        "api.row_policy_install.",
+        "api.relational_fk_generation_publication.",
+        "api http row policy signer",
+        "SQL native session",
+        "SQL session metadata",
+        "SQL session overlay",
+        "SQL JSON null",
+        "SQL staged",
+        "SQL retained native scan",
         "system catalog",
         "backup heartbeat ",
         "table storage creation intent survives",
@@ -1855,6 +1899,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_runtime_default_filters = [_][]const u8{
         "http host reserves service workers through its runtime and rolls back overcommit",
         "managed raft progress driver advances independently and joins on stop",
+        "managed raft progress driver wakes immediately when deferred apply owner opens",
         "managed raft progress driver publishes source failure",
         "managed raft progress driver reports a wedged round unhealthy",
         "managed raft progress driver ignores a completed observed generation",
@@ -4319,6 +4364,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone catalog remote apply outage preserves committed creation and retry authority",
             "standalone metadata replay refreshes colliding revisions and only publishes complete effects",
             "standalone metadata advertises a linearizable owned snapshot",
+            "standalone catalog journal preserves imported policy publication as fail closed",
+            "native standalone policy publication installs exact owner phases and resumes after restart",
             "standalone schema mutation supports atomic merge patch and version CAS",
             "standalone routing watch does not report absence after one probe",
             "standalone routing watch confirms absence before deadline and retries after expiry",
@@ -4341,15 +4388,43 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
         // This root intentionally links the complete standalone runtime and
-        // embedded inference ABI. With catalog and relational integration,
-        // macOS Debug codegen peaked at 13.17 GB; reserve scheduling headroom.
+        // embedded inference ABI. With native policy coordinator/owner paths,
+        // macOS Debug codegen peaked at 16.42 GB; reserve scheduling headroom.
         // This is a compile-memory scheduling claim, not a service limit.
         // Linux retains the measured aggregate default.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
     });
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
     lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
+    // Real hidden-owner publication crosses the storage-kernel C ABI. Link
+    // this one fixture separately rather than making every standalone
+    // inference/runtime unit test carry the storage owner artifact.
+    const standalone_initial_fk_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    standalone_runtime_imports.configure(b, standalone_initial_fk_test_mod, true, true);
+    standalone_runtime_imports.runtime.storage_boundary.configureProfile(standalone_initial_fk_test_mod, true, true, .all);
+    standalone_initial_fk_test_mod.addImport("antfly_openapi_specs", standalone_runtime_imports.runtime.embedded_openapi);
+    const usermgr_storage_initial_fk_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    usermgr_storage_initial_fk_test_mod.addImport("antfly_root", standalone_initial_fk_test_mod);
+    usermgr_storage_initial_fk_test_mod.addImport("antfly_platform", platform_mod);
+    standalone_initial_fk_test_mod.addImport("usermgr_storage", usermgr_storage_initial_fk_test_mod);
+    const standalone_initial_fk_tests = b.addTest(.{
+        .root_module = standalone_initial_fk_test_mod,
+        .filters = &.{
+            "standalone initial self FK private owners publish two ranges after restart",
+            "standalone canceled initial self FK retires exact private owners after restart",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
+    });
     // Keep the complete API worker fixture out of the inference-heavy runtime
     // object. Compile this narrow integration slice independently so adding
     // restore coverage does not inflate every standalone runtime test build.
@@ -4513,6 +4588,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     docstore_test_mod.addImport("antfly_pdf", pdf_mod);
     const docstore_unit_tests = b.addTest(.{
         .root_module = docstore_test_mod,
+        .filters = &.{ "storage.docstore.", "storage.transactions.", "storage.range_protection." },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_docstore_unit_tests = b.addRunArtifact(docstore_unit_tests);
@@ -5277,6 +5353,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const db_restore_identity_step = b.step("antfly-storage-db-restore-identity-test", "Run the focused run-backed identity restore regression");
     db_restore_identity_step.dependOn(&run_db_restore_identity_tests.step);
 
+    const db_handoff_reopen_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{"db empty-generation install receipt survives hidden to public owner reopen"},
+    });
+    const run_db_handoff_reopen_tests = addFilteredTestRunArtifact(b, db_handoff_reopen_tests);
+    b.step("antfly-storage-db-handoff-reopen-test", "Run hidden-to-public generation handoff receipt persistence regression")
+        .dependOn(&run_db_handoff_reopen_tests.step);
+
     // These focused regressions protect production paths introduced by this
     // branch. Keep them in the PR/base gate instead of defining orphan steps
     // that run only when invoked manually.
@@ -5466,6 +5550,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.graph_runtime.",
             "storage.db.graph_asset_state.",
             "storage.db.graph_edge_contender.",
+            "storage.db.graph_retirement_config.",
+            "storage.db.graph_retirement_seal.",
+            "storage.db.empty_generation_handoff.",
             "storage.db.graph_state_name.",
             "storage.db.lease.",
             "storage.db.merge_contract.",
@@ -5515,7 +5602,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.relational_integrity_range.",
             "storage.db.relational_integrity_activation.",
             "storage.db.relational_integrity_retirement.",
+            "storage.db.relational_integrity_generation_retirement.",
+            "storage.db.relational_integrity_generation_admission.",
+            "storage.db.relational_initial_child_publication.",
+            "storage.db.row_policy_gate.",
+            "storage.db.row_policy_bundle.",
             "storage.db.restore_staging.",
+            "storage.db.restore_staging_contract.",
+            "storage.db.restore_generation_admissions.",
             "storage.db.relational_integrity_topology.",
             "storage.db.relational_index_gc.",
             "storage.db.relational_row_cursor.",
@@ -5552,6 +5646,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.maintenance_signal.",
             "storage.projection_page_cache.",
             "storage.projection_read_trace.",
+            "storage.range_protection.",
+            "storage.relational_read_set.",
+            "storage.retained_read_registry.",
+            "storage.row_identity.",
+            "storage.statement_read_fence.",
+            "storage.typed_json.",
             "storage.vector_payload_store.",
             "storage.vector_wal_view.",
             "storage.backend_conformance_test.",
@@ -5596,6 +5696,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.source_pin_state.",
             "storage.source_snapshot.",
             "storage.restore_owner.",
+            "storage.restore_decoder_cache.",
             "storage.relational_index.",
             "storage.rowsource.",
             "storage.schema.",
@@ -6016,10 +6117,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
                 .path = b.path("pkg/antfly/src/test_runner.zig"),
                 .mode = .simple,
             },
-            // The consolidated service/HTTP lane reaches roughly 9.3 GiB on
-            // macOS Zig 0.16. This is compiler scheduling capacity, not an
-            // Antfly runtime budget; retain headroom for codegen variance.
-            .max_rss = 12 * 1024 * 1024 * 1024,
+            // Both consolidated metadata lanes now peak near 13.5 GiB with
+            // the full relational activation tests. Give Zig's scheduler a
+            // truthful per-compile bound with headroom; the heavy CI runner
+            // reserves 24 GiB and cannot safely run two such compiles at once.
+            .max_rss = 16 * 1024 * 1024 * 1024,
         });
     }
     const unit_metadata_compile_step = b.step(
@@ -6215,6 +6317,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .antfly_test_step = antfly_test_step,
         .unit_test_step = unit_test_step,
         .standalone_runtime_test_step = lib_standalone_runtime_test_step,
+        .standalone_initial_fk_tests = standalone_initial_fk_tests,
         .vopr_test_step = vopr_test_step,
         .integration_test_step = integration_test_step,
         .chaos_test_step = chaos_test_step,

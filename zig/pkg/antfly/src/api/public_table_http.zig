@@ -112,6 +112,7 @@ pub const TableApi = struct {
         GraphMetricMaterializationRejected,
         NotFound,
         Conflict,
+        IntegrityTopologyBusy,
         UniqueConstraintViolation,
         ForeignKeyParentMissing,
         ForeignKeyReferenced,
@@ -136,6 +137,10 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteQueryError = error{
+        RowPolicyAuthenticationRequired,
+        RowPolicyCatalogChanged,
+        RowPolicyUnsupported,
+        RowPolicyAuthorityUnavailable,
         InvalidQueryRequest,
         InvalidFilterQueryRequest,
         InvalidExclusionQueryRequest,
@@ -1604,7 +1609,20 @@ pub fn handleTableBatch(
 pub fn handleRelationalRowsMutation(alloc: std.mem.Allocator, table_name: []const u8, body: []const u8, api: TableApi) !OwnedResponse {
     resetLastBatchFailureName();
     last_ambiguous_batch_txn_id = null;
-    var req = @import("relational_rows.zig").parseMutation(alloc, body) catch |err| switch (err) {
+    var parsed = std.json.parseFromSlice(@import("antfly_metadata_openapi").types.RelationalRowMutationRequest, alloc, body, .{ .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid relational mutation request\"}"), .json = true },
+    };
+    defer parsed.deinit();
+    return handleTypedRelationalRowsMutation(alloc, table_name, parsed.value, api);
+}
+
+/// Native callers share the exact public ownership/coordinator/outcome path
+/// without serializing and reparsing a request envelope.
+pub fn handleTypedRelationalRowsMutation(alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_metadata_openapi").types.RelationalRowMutationRequest, api: TableApi) !OwnedResponse {
+    resetLastBatchFailureName();
+    last_ambiguous_batch_txn_id = null;
+    var req = @import("relational_rows.zig").prepareMutation(alloc, request) catch |err| switch (err) {
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid relational mutation request\"}"), .json = true },
         else => return err,
     };
@@ -1660,6 +1678,14 @@ fn executeRelationalLifecycle(alloc: std.mem.Allocator, table_name: []const u8, 
     return .{ .status = 202, .json = true, .body = try alloc.dupe(u8, "{\"status\":\"accepted\"}") };
 }
 
+/// Internal typed callers retain their request buffers for this synchronous
+/// call. In particular SQL predicate-only fences must not become deletes.
+pub fn handleNativeTableBatch(alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.BatchRequest, api: TableApi) !OwnedResponse {
+    resetLastBatchFailureName();
+    last_ambiguous_batch_txn_id = null;
+    return executeOwnedTableBatch(alloc, table_name, .{ .req = req, .writes = @constCast(req.writes), .deletes = @constCast(req.deletes) }, api);
+}
+
 fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batch_req: batch_api.OwnedBatchRequest, api: TableApi) !OwnedResponse {
     api.executeTableBatch(alloc, table_name, batch_req.req) catch |err| switch (err) {
         error.RelationalIndexKeyTooLarge => return .{ .status = 413, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"RelationalIndexKeyTooLarge\",\"message\":\"encoded relational index keys, including the document ID, must not exceed 1048576 bytes\"}") },
@@ -1678,6 +1704,12 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         },
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "batch transaction conflicted") },
+        error.IntegrityTopologyBusy => return .{
+            .status = 409,
+            .body = try alloc.dupe(u8, "{\"code\":\"integrity_topology_busy\",\"message\":\"table integrity topology is changing; retry this batch after publication\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced => return .{
             .status = 409,
             .json = true,
@@ -1796,6 +1828,10 @@ pub fn handleTableQueryRequest(
     };
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
         switch (err) {
+            error.RowPolicyAuthenticationRequired => return .{ .status = 403, .body = try alloc.dupe(u8, "row policy authentication required") },
+            error.RowPolicyCatalogChanged => return .{ .status = 409, .body = try alloc.dupe(u8, "row policy publication changed") },
+            error.RowPolicyUnsupported => return .{ .status = 409, .body = try alloc.dupe(u8, "row policy does not support this query") },
+            error.RowPolicyAuthorityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "row policy authority unavailable") },
             error.InvalidQueryRequest => {
                 if (db_mod.peekLastSortRejectionDiagnostic() != null) {
                     std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
@@ -2999,7 +3035,7 @@ fn unsupportedRestore(
     return error.InternalFailure;
 }
 
-test "relational mutation HTTP preserves conditional coordinator inputs" {
+test "SQL relational mutation HTTP and typed paths preserve conditional coordinator inputs" {
     const Backend = struct {
         called: bool = false,
         missing: bool = false,
@@ -3029,6 +3065,22 @@ test "relational mutation HTTP preserves conditional coordinator inputs" {
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), response.status);
     try std.testing.expect(backend.called);
+    backend.called = false;
+    var typed = try handleTypedRelationalRowsMutation(std.testing.allocator, "rows", .{
+        .schema_version = 8,
+        .mutations = &.{.{ .key = "a", .expected_version = "9007199254740993", .row = .{ .map = .empty } }},
+    }, api);
+    defer typed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 201), typed.status);
+    try std.testing.expect(backend.called);
+    backend.called = false;
+    var invalid_typed = try handleTypedRelationalRowsMutation(std.testing.allocator, "rows", .{
+        .schema_version = 8,
+        .mutations = &.{ .{ .key = "a", .expected_version = "0" }, .{ .key = "a", .expected_version = "0" } },
+    }, api);
+    defer invalid_typed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), invalid_typed.status);
+    try std.testing.expect(!backend.called);
     var invalid = try handleRelationalRowsMutation(std.testing.allocator, "rows", "{}", api);
     defer invalid.deinit(std.testing.allocator);
     try std.testing.expect(invalid.json);
@@ -3670,8 +3722,10 @@ test "public table batch handler maps write unavailable errors" {
         status: u16,
         body: []const u8,
         json: bool = false,
+        retry_after_seconds: ?u32 = null,
     }{
         .{ .err = error.WriteUnavailable, .status = 503, .body = "write unavailable" },
+        .{ .err = error.IntegrityTopologyBusy, .status = 409, .body = "{\"code\":\"integrity_topology_busy\",\"message\":\"table integrity topology is changing; retry this batch after publication\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{
             .err = error.OutcomeUnknown,
             .status = 409,
@@ -3695,6 +3749,7 @@ test "public table batch handler maps write unavailable errors" {
         try std.testing.expectEqual(tc.status, resp.status);
         try std.testing.expectEqualStrings(tc.body, resp.body);
         try std.testing.expectEqual(tc.json, resp.json);
+        try std.testing.expectEqual(tc.retry_after_seconds, resp.retry_after_seconds);
     }
 }
 

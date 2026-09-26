@@ -64,12 +64,27 @@ pub const TransactionReadItem = struct {
 };
 
 pub const TableCommitRequest = struct {
+    pub const ConflictGuards = struct {
+        generation_set: [32]u8,
+        commands: []const @import("../storage/db/relational_integrity_contract.zig").Command,
+        pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+            return @import("../storage/db/relational_integrity_json.zig").write(self, stream);
+        }
+    };
+    /// Server-authored arbiter observations survive statement merging,
+    /// savepoints, restart and final native dependency expansion.
+    conflict_guards: ?std.json.Parsed(ConflictGuards) = null,
+    range_guards: ?@import("range_read_guards.zig").Owned = null,
+    schema_version: ?u32 = null,
     table_name: []u8,
+    relational_schema_version: ?u32 = null,
     batch: batch_api.OwnedBatchRequest = .{},
     predicates: std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate) = .empty,
     txn_writes: []db_mod.types.TransactionWrite = &.{},
 
     pub fn deinit(self: *TableCommitRequest, alloc: std.mem.Allocator) void {
+        if (self.conflict_guards) |*guards| guards.deinit();
+        if (self.range_guards) |*guards| guards.deinit();
         alloc.free(self.table_name);
         if (self.txn_writes.len > 0) alloc.free(self.txn_writes);
         for (self.predicates.items) |predicate| alloc.free(@constCast(predicate.key));
@@ -81,19 +96,66 @@ pub const TableCommitRequest = struct {
     pub fn clone(self: TableCommitRequest, alloc: std.mem.Allocator) !TableCommitRequest {
         var out: TableCommitRequest = .{
             .table_name = try alloc.dupe(u8, self.table_name),
+            .schema_version = self.schema_version,
+            .relational_schema_version = self.relational_schema_version,
         };
         errdefer out.deinit(alloc);
         out.batch = try cloneBatchRequest(alloc, self.batch);
+        if (self.conflict_guards) |guards| try out.mergeConflictGuards(alloc, guards.value);
+        if (self.range_guards) |guards| try out.mergeRangeGuards(alloc, guards.value);
         try clonePredicatesInto(alloc, &out.predicates, self.predicates.items);
         return out;
     }
 
     pub fn mergeFrom(self: *TableCommitRequest, alloc: std.mem.Allocator, other: TableCommitRequest) !void {
+        if (other.range_guards) |guards| try self.mergeRangeGuards(alloc, guards.value);
+        if (other.conflict_guards) |guards| try self.mergeConflictGuards(alloc, guards.value);
+        if (self.schema_version != null and other.schema_version != null and self.schema_version != other.schema_version) return error.CatalogGenerationChanged;
+        if (self.schema_version == null) self.schema_version = other.schema_version;
+        if (self.relational_schema_version != null and other.relational_schema_version != null and self.relational_schema_version != other.relational_schema_version) return error.CatalogGenerationChanged;
+        if (self.relational_schema_version == null) self.relational_schema_version = other.relational_schema_version;
         try appendBatchWrites(alloc, &self.batch, other.batch.writes);
         try appendBatchDeletes(alloc, &self.batch, other.batch.deletes);
         try appendBatchTransforms(alloc, &self.batch, other.batch.transforms);
         try appendPredicates(alloc, &self.predicates, other.predicates.items);
         syncAndClear(self, alloc);
+    }
+
+    pub fn mergeConflictGuards(self: *TableCommitRequest, alloc: std.mem.Allocator, incoming: ConflictGuards) !void {
+        const native = @import("../storage/db/relational_integrity_contract.zig");
+        if (std.mem.allEqual(u8, &incoming.generation_set, 0)) return error.InvalidTransactionSessionRecord;
+        for (incoming.commands) |command| if (command.operation != .compare_claim) return error.InvalidTransactionSessionRecord;
+        const previous: []const native.Command = if (self.conflict_guards) |guards| blk: {
+            if (!std.mem.eql(u8, &guards.value.generation_set, &incoming.generation_set)) return error.CatalogGenerationChanged;
+            break :blk guards.value.commands;
+        } else &.{};
+        if (incoming.commands.len > native.max_commands or previous.len > native.max_commands) return error.TransactionTooLarge;
+        const combined = try alloc.alloc(native.Command, previous.len + incoming.commands.len);
+        defer alloc.free(combined);
+        var seen: std.AutoHashMapUnmanaged(native.Address, void) = .empty;
+        defer seen.deinit(alloc);
+        var count: usize = 0;
+        // Retain the first physical observation across statements. Later
+        // statements can observe this transaction's own staged claim changes;
+        // their statement validation must not replace the initial commit fence.
+        for ([_][]const native.Command{ previous, incoming.commands }) |commands| for (commands) |command| {
+            if ((try seen.getOrPut(alloc, command.address)).found_existing) continue;
+            if (count >= native.max_commands) return error.TransactionTooLarge;
+            combined[count] = command;
+            count += 1;
+        };
+        _ = try native.validateCommandAdmission(combined[0..count]);
+        const bytes = try std.json.Stringify.valueAlloc(alloc, ConflictGuards{ .generation_set = incoming.generation_set, .commands = combined[0..count] }, .{});
+        defer alloc.free(bytes);
+        const owned = try std.json.parseFromSlice(ConflictGuards, alloc, bytes, .{ .allocate = .alloc_always });
+        if (self.conflict_guards) |*guards| guards.deinit();
+        self.conflict_guards = owned;
+    }
+
+    pub fn mergeRangeGuards(self: *TableCommitRequest, alloc: std.mem.Allocator, incoming: []const @import("range_read_guards.zig").OwnerRangeProof) !void {
+        const merged = try @import("range_read_guards.zig").merge(alloc, if (self.range_guards) |guards| guards.value else &.{}, incoming);
+        if (self.range_guards) |*guards| guards.deinit();
+        self.range_guards = merged;
     }
 
     pub fn prepareWrites(self: *TableCommitRequest, alloc: std.mem.Allocator) !void {
@@ -103,6 +165,7 @@ pub const TableCommitRequest = struct {
             self.txn_writes[i] = .{
                 .key = write.key,
                 .value = write.value,
+                .json_null_fields = write.json_null_fields,
             };
         }
     }
@@ -115,6 +178,8 @@ pub const TableCommitRequest = struct {
 pub const CatalogBinding = struct { logical: []const u8, physical: []const u8 };
 
 pub const OwnedTransactionCommitRequest = struct {
+    constraint_timing: std.ArrayListUnmanaged(@import("../storage/relational_index.zig").ConstraintTiming) = .empty,
+
     // Server-authored identity bindings are persisted with staged operations.
     // Public JSON cannot supply them. Labels remain stable across renames.
     catalog_bindings: std.ArrayListUnmanaged(CatalogBinding) = .empty,
@@ -122,6 +187,16 @@ pub const OwnedTransactionCommitRequest = struct {
     read_set: []TransactionReadItem = &.{},
     tables: []TableCommitRequest = &.{},
     sync_level: db_mod.types.SyncLevel = .propose,
+
+    pub fn setConstraintTiming(self: *@This(), alloc: std.mem.Allocator, mode: @import("../storage/relational_index.zig").ConstraintTiming) !void {
+        if (mode.generation == null) self.constraint_timing.clearRetainingCapacity();
+        for (self.constraint_timing.items) |*previous| if (std.meta.eql(previous.generation, mode.generation)) {
+            previous.* = mode;
+            return;
+        };
+        if (self.constraint_timing.items.len >= 4096) return error.TransactionTooLarge;
+        try self.constraint_timing.append(alloc, mode);
+    }
 
     pub fn bind(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, logical: []const u8, physical: []const u8) !void {
         for (self.catalog_bindings.items) |binding| if (std.mem.eql(u8, binding.logical, logical)) {
@@ -138,12 +213,25 @@ pub const OwnedTransactionCommitRequest = struct {
         for (self.catalog_bindings.items) |binding| if (std.mem.eql(u8, binding.logical, logical)) return binding.physical;
         return logical;
     }
+    pub fn observeRanges(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, logical: []const u8, physical: []const u8, schema_version: u32, observations: []const @import("range_read_guards.zig").OwnerRangeProof) !void {
+        try self.bind(alloc, logical, physical);
+        for (self.tables) |*table| if (std.mem.eql(u8, self.physicalName(table.table_name), physical)) {
+            if (table.schema_version != null and table.schema_version != schema_version) return error.CatalogGenerationChanged;
+            try table.mergeRangeGuards(alloc, observations);
+            table.schema_version = schema_version;
+            return;
+        };
+        var guards = try @import("range_read_guards.zig").merge(alloc, &.{}, observations);
+        defer guards.deinit();
+        try appendTable(alloc, self, .{ .table_name = @constCast(logical), .schema_version = schema_version, .range_guards = guards });
+    }
     pub fn logicalName(self: OwnedTransactionCommitRequest, physical: []const u8) []const u8 {
         for (self.catalog_bindings.items) |binding| if (std.mem.eql(u8, binding.physical, physical)) return binding.logical;
         return physical;
     }
 
     pub fn deinit(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator) void {
+        self.constraint_timing.deinit(alloc);
         for (self.catalog_bindings.items) |binding| {
             alloc.free(binding.logical);
             alloc.free(binding.physical);
@@ -161,6 +249,7 @@ pub const OwnedTransactionCommitRequest = struct {
             .sync_level = self.sync_level,
         };
         errdefer out.deinit(alloc);
+        try out.constraint_timing.appendSlice(alloc, self.constraint_timing.items);
         for (self.catalog_bindings.items) |binding| try out.bind(alloc, binding.logical, binding.physical);
 
         out.read_set = try alloc.alloc(TransactionReadItem, self.read_set.len);
@@ -190,6 +279,7 @@ pub const OwnedTransactionCommitRequest = struct {
     }
 
     pub fn mergeFrom(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, other: *const OwnedTransactionCommitRequest) !void {
+        for (other.constraint_timing.items) |mode| try self.setConstraintTiming(alloc, mode);
         for (other.catalog_bindings.items) |binding| try self.bind(alloc, binding.logical, binding.physical);
         try appendReadSet(alloc, self, other.read_set);
         for (other.tables) |table| {
@@ -213,6 +303,11 @@ pub const OwnedTransactionCommitRequest = struct {
         for (self.tables, 0..) |*table, i| {
             out[i] = .{
                 .table_name = self.physicalName(table.table_name),
+                .schema_version = table.schema_version,
+                .relational_schema_version = table.relational_schema_version,
+                .relational_integrity_generation_set = if (table.conflict_guards) |guards| guards.value.generation_set else null,
+                .integrity_commands = if (table.conflict_guards) |guards| guards.value.commands else &.{},
+                .range_guards = if (table.range_guards) |guards| guards.value else &.{},
                 .writes = table.txn_writes,
                 .deletes = table.batch.deletes,
                 .transforms = table.batch.transforms,
@@ -220,6 +315,24 @@ pub const OwnedTransactionCommitRequest = struct {
             };
         }
         return out;
+    }
+
+    /// Rollback undoes staged mutations, not observations already exposed to
+    /// the client. Retain range dependencies across savepoint rollback so a
+    /// later write cannot evade serializable validation using an undone read.
+    pub fn retainRangeGuards(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, other: *const OwnedTransactionCommitRequest) !void {
+        for (other.tables) |table| if (table.range_guards) |guards| {
+            const physical = other.physicalName(table.table_name);
+            try self.bind(alloc, table.table_name, physical);
+            const existing = for (self.tables) |*entry| {
+                if (std.mem.eql(u8, self.physicalName(entry.table_name), physical)) break entry;
+            } else null;
+            if (existing) |entry| {
+                if (entry.schema_version != null and table.schema_version != null and entry.schema_version != table.schema_version) return error.CatalogGenerationChanged;
+                try entry.mergeRangeGuards(alloc, guards.value);
+                if (entry.schema_version == null) entry.schema_version = table.schema_version;
+            } else try appendTable(alloc, self, .{ .table_name = table.table_name, .schema_version = table.schema_version, .relational_schema_version = table.relational_schema_version, .range_guards = guards });
+        };
     }
 };
 
@@ -271,7 +384,112 @@ pub const CommitConflictKind = enum {
 
 pub const BeginRequest = struct {
     sync_level: db_mod.types.SyncLevel = .propose,
+    sql: ?SqlMetadata = null,
 };
+
+pub const SqlMetadata = struct {
+    database: []const u8,
+    namespace: []const u8,
+    isolation: @import("../sql/session.zig").Isolation,
+    mode: @import("../sql/session.zig").ReadMode,
+    failed: bool = false,
+
+    pub fn clone(self: SqlMetadata, alloc: std.mem.Allocator) !SqlMetadata {
+        const database = try alloc.dupe(u8, self.database);
+        errdefer alloc.free(database);
+        var out = self;
+        out.database = database;
+        out.namespace = try alloc.dupe(u8, self.namespace);
+        return out;
+    }
+
+    pub fn deinit(self: *SqlMetadata, alloc: std.mem.Allocator) void {
+        alloc.free(self.database);
+        alloc.free(self.namespace);
+        self.* = undefined;
+    }
+};
+
+const setting_catalog = @import("../sql/setting_catalog.zig");
+const SettingEntries = std.ArrayListUnmanaged(setting_catalog.OverlayEntry);
+
+fn deinitSettingEntries(alloc: std.mem.Allocator, entries: *SettingEntries) void {
+    for (entries.items) |entry| if (entry.value == .string) alloc.free(entry.value.string);
+    entries.deinit(alloc);
+    entries.* = .empty;
+}
+
+fn cloneSettingEntries(alloc: std.mem.Allocator, entries: []const setting_catalog.OverlayEntry) !SettingEntries {
+    var result: SettingEntries = .empty;
+    errdefer deinitSettingEntries(alloc, &result);
+    for (entries) |entry| try putSettingEntry(alloc, &result, entry);
+    return result;
+}
+
+fn putSettingEntry(alloc: std.mem.Allocator, entries: *SettingEntries, entry: setting_catalog.OverlayEntry) !void {
+    const max_entries = 128;
+    const max_value_bytes = 64 * 1024;
+    var old_bytes: usize = 0;
+    var found = false;
+    var total_bytes: usize = 0;
+    for (entries.items) |existing| {
+        if (existing.value == .string) total_bytes = std.math.add(usize, total_bytes, existing.value.string.len) catch return error.SettingLimitExceeded;
+        if (existing.identity.id == entry.identity.id) {
+            found = true;
+            if (existing.value == .string) old_bytes = existing.value.string.len;
+        }
+    }
+    const new_bytes: usize = if (entry.value == .string) entry.value.string.len else 0;
+    const prospective_bytes = std.math.add(usize, total_bytes - old_bytes, new_bytes) catch return error.SettingLimitExceeded;
+    if ((!found and entries.items.len >= max_entries) or prospective_bytes > max_value_bytes) return error.SettingLimitExceeded;
+    const value: setting_catalog.Value = switch (entry.value) {
+        .boolean => |v| .{ .boolean = v },
+        .integer => |v| .{ .integer = v },
+        .string => |v| .{ .string = try alloc.dupe(u8, v) },
+    };
+    for (entries.items) |*existing| if (existing.identity.id == entry.identity.id) {
+        if (existing.value == .string) alloc.free(existing.value.string);
+        existing.* = .{ .identity = entry.identity, .value = value };
+        return;
+    };
+    errdefer if (value == .string) alloc.free(value.string);
+    try entries.append(alloc, .{ .identity = entry.identity, .value = value });
+}
+
+fn removeSettingEntry(alloc: std.mem.Allocator, entries: *SettingEntries, id: u64) void {
+    for (entries.items, 0..) |entry, i| if (entry.identity.id == id) {
+        if (entry.value == .string) alloc.free(entry.value.string);
+        _ = entries.swapRemove(i);
+        return;
+    };
+}
+
+fn decodeSettingEntries(alloc: std.mem.Allocator, value: std.json.Value) !SettingEntries {
+    const array = switch (value) {
+        .array => |items| items,
+        else => return error.InvalidTransactionSessionRecord,
+    };
+    if (array.items.len > 128) return error.InvalidTransactionSessionRecord;
+    var result: SettingEntries = .empty;
+    errdefer deinitSettingEntries(alloc, &result);
+    for (array.items) |item| {
+        var parsed = std.json.parseFromValue(setting_catalog.OverlayEntry, alloc, item, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidTransactionSessionRecord,
+        };
+        defer parsed.deinit();
+        const entry = parsed.value;
+        if (entry.identity.id == 0 or entry.identity.generation == 0 or
+            (entry.value == .string and (entry.value.string.len > 4096 or !std.unicode.utf8ValidateSlice(entry.value.string))))
+            return error.InvalidTransactionSessionRecord;
+        for (result.items) |prior| if (prior.identity.id == entry.identity.id) return error.InvalidTransactionSessionRecord;
+        putSettingEntry(alloc, &result, entry) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidTransactionSessionRecord,
+        };
+    }
+    return result;
+}
 
 pub const StageReadRequest = struct {
     table_name: []u8,
@@ -666,27 +884,42 @@ pub const SavepointInfo = struct {
 
 pub const Savepoint = struct {
     id: u64,
+    name: ?[]u8 = null,
     snapshot: OwnedTransactionCommitRequest,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
+    setting_active: SettingEntries = .empty,
+    setting_committed: SettingEntries = .empty,
 
     pub fn deinit(self: *Savepoint, alloc: std.mem.Allocator) void {
+        if (self.name) |name| alloc.free(name);
         self.snapshot.deinit(alloc);
         deinitReadSnapshotMap(alloc, &self.read_snapshots);
+        deinitSettingEntries(alloc, &self.setting_active);
+        deinitSettingEntries(alloc, &self.setting_committed);
         self.* = undefined;
     }
 
     pub fn clone(self: Savepoint, alloc: std.mem.Allocator) !Savepoint {
+        const name = if (self.name) |name| try alloc.dupe(u8, name) else null;
+        const snapshot = self.snapshot.clone(alloc) catch |err| {
+            if (name) |value| alloc.free(value);
+            return err;
+        };
         var out: Savepoint = .{
             .id = self.id,
-            .snapshot = try self.snapshot.clone(alloc),
+            .name = name,
+            .snapshot = snapshot,
         };
-        errdefer out.snapshot.deinit(alloc);
+        errdefer out.deinit(alloc);
         out.read_snapshots = try cloneReadSnapshotMap(alloc, self.read_snapshots);
+        out.setting_active = try cloneSettingEntries(alloc, self.setting_active.items);
+        out.setting_committed = try cloneSettingEntries(alloc, self.setting_committed.items);
         return out;
     }
 };
 
 pub const Session = struct {
+    sql: ?SqlMetadata = null,
     txn_id: db_mod.types.TxnId,
     owner_node_id: u64,
     /// Stable authenticated subject that created this session. `null` is the
@@ -711,6 +944,8 @@ pub const Session = struct {
     /// Persisted before releasing the retained coordinator's topology fence.
     terminal_commit: ?TerminalCommit = null,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
+    setting_active: SettingEntries = .empty,
+    setting_committed: SettingEntries = .empty,
     next_savepoint_id: u64 = 1,
     savepoints: std.AutoHashMapUnmanaged(u64, Savepoint) = .empty,
 
@@ -723,11 +958,14 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session, alloc: std.mem.Allocator) void {
+        if (self.sql) |*metadata| metadata.deinit(alloc);
         if (self.principal) |principal| alloc.free(principal);
         if (self.staged) |*staged| staged.deinit(alloc);
         if (self.execution_plan) |bytes| alloc.free(bytes);
         if (self.terminal_commit) |*terminal| terminal.deinit(alloc);
         deinitReadSnapshotMap(alloc, &self.read_snapshots);
+        deinitSettingEntries(alloc, &self.setting_active);
+        deinitSettingEntries(alloc, &self.setting_committed);
         var it = self.savepoints.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.savepoints.deinit(alloc);
@@ -747,10 +985,13 @@ pub const Session = struct {
             .commit_execution_started = self.commit_execution_started,
         };
         errdefer out.deinit(alloc);
+        if (self.sql) |metadata| out.sql = try metadata.clone(alloc);
         if (self.staged) |staged| out.staged = try staged.clone(alloc);
         if (self.execution_plan) |bytes| out.execution_plan = try alloc.dupe(u8, bytes);
         if (self.terminal_commit) |terminal| out.terminal_commit = try terminal.clone(alloc);
         out.read_snapshots = try cloneReadSnapshotMap(alloc, self.read_snapshots);
+        out.setting_active = try cloneSettingEntries(alloc, self.setting_active.items);
+        out.setting_committed = try cloneSettingEntries(alloc, self.setting_committed.items);
         try out.savepoints.ensureUnusedCapacity(alloc, self.savepoints.count());
         var it = self.savepoints.iterator();
         while (it.next()) |entry| {
@@ -1480,6 +1721,7 @@ pub const SessionRegistry = struct {
         };
         var session_owned = true;
         errdefer if (session_owned) session.deinit(alloc);
+        if (req.sql) |metadata| session.sql = try metadata.clone(alloc);
         try self.initializeDurableSessionCount();
         self.mutex.lock();
         self.ensureSessionCapacityLocked() catch |err| {
@@ -1565,6 +1807,170 @@ pub const SessionRegistry = struct {
         return loaded.info();
     }
 
+    pub const SqlState = struct {
+        metadata: SqlMetadata,
+        setting_active: SettingEntries = .empty,
+        owner_node_id: u64,
+        execution_started: bool,
+        terminal: ?TerminalCommitStatus,
+        savepoints: usize,
+
+        pub fn deinit(self: *SqlState, alloc: std.mem.Allocator) void {
+            self.metadata.deinit(alloc);
+            deinitSettingEntries(alloc, &self.setting_active);
+        }
+    };
+
+    pub fn getSqlState(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SqlState {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        self.mutex.lock();
+        if (self.sessions.getPtr(txn_id)) |existing| {
+            defer self.mutex.unlock();
+            const metadata = existing.sql orelse return null;
+            var result: SqlState = .{ .metadata = try metadata.clone(alloc), .owner_node_id = existing.owner_node_id, .execution_started = existing.commit_execution_started, .terminal = if (existing.terminal_commit) |terminal| terminal.status else null, .savepoints = existing.savepoints.count() };
+            errdefer result.deinit(alloc);
+            result.setting_active = try cloneSettingEntries(alloc, existing.setting_active.items);
+            return result;
+        }
+        self.mutex.unlock();
+        const durable = self.durable orelse return null;
+        var loaded = (try durable.load(txn_id)) orelse return null;
+        defer loaded.deinit(durable.alloc);
+        const metadata = loaded.sql orelse return null;
+        var result: SqlState = .{ .metadata = try metadata.clone(alloc), .owner_node_id = loaded.owner_node_id, .execution_started = loaded.commit_execution_started, .terminal = if (loaded.terminal_commit) |terminal| terminal.status else null, .savepoints = loaded.savepoints.count() };
+        errdefer result.deinit(alloc);
+        result.setting_active = try cloneSettingEntries(alloc, loaded.setting_active.items);
+        return result;
+    }
+
+    /// Read-only SQL statements must not consume an obsolete cached session
+    /// after another node adopts its durable owner lease.
+    pub fn validateSqlLease(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, owner: u64) !void {
+        const store = self.lease_store orelse return;
+        var record = (try store.load(alloc, txn_id)) orelse return error.SessionLeaseLost;
+        defer lease_mod.deinitRecord(alloc, &record);
+        const expected = try ownerLeaseId(alloc, owner);
+        defer alloc.free(expected);
+        if (!std.mem.eql(u8, record.owner_id, expected) or record.expires_at_ms <= nextTxnTimestamp() / std.time.ns_per_ms) return error.SessionLeaseLost;
+    }
+
+    pub fn setSqlFailed(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, failed: bool) !void {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        if (candidate.commit_execution_started) return error.SqlTransactionOutcomeUnknown;
+        if (candidate.sql) |*metadata| metadata.failed = failed else return error.SqlTransactionNotActive;
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+    }
+
+    /// The registry is the HTTP setting owner: it rechecks the current
+    /// principal-scoped catalog before durably changing either overlay.
+    const SettingInput = union(enum) { typed: setting_catalog.Value, raw: []const u8 };
+
+    pub fn setSqlSetting(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: setting_catalog.Owner, name: []const u8, value: setting_catalog.Value, local: bool) !void {
+        return self.setSqlSettingInput(alloc, txn_id, principal, owner, name, .{ .typed = value }, local);
+    }
+
+    pub fn setSqlSettingRaw(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: setting_catalog.Owner, name: []const u8, raw: []const u8, local: bool) !void {
+        return self.setSqlSettingInput(alloc, txn_id, principal, owner, name, .{ .raw = raw }, local);
+    }
+
+    fn setSqlSettingInput(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: setting_catalog.Owner, name: []const u8, input: SettingInput, local: bool) !void {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        if (!principalsEqual(candidate.principal, principal)) return error.Forbidden;
+        const metadata = candidate.sql orelse return error.SqlTransactionNotActive;
+        if (metadata.failed) return error.SqlTransactionAborted;
+        if (candidate.commit_body_digest != null or candidate.commit_execution_started) return error.TransactionCommitSealed;
+        var view = try setting_catalog.View.capture(alloc, owner, .{ .principal = principal orelse "", .database = metadata.database }, candidate.setting_active.items);
+        defer view.deinit();
+        const definition = try view.writable(name);
+        const value = switch (input) {
+            .typed => |typed| typed,
+            .raw => |raw| try setting_catalog.parseValue(definition.kind, raw),
+        };
+        if (std.meta.activeTag(value) != definition.kind or (value == .string and (value.string.len > 4096 or !std.unicode.utf8ValidateSlice(value.string)))) return error.InvalidSettingValue;
+        const entry: setting_catalog.OverlayEntry = .{ .identity = definition.identity, .value = value };
+        try putSettingEntry(alloc, &candidate.setting_active, entry);
+        if (!local) try putSettingEntry(alloc, &candidate.setting_committed, entry);
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+    }
+
+    pub fn resetSqlSetting(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: setting_catalog.Owner, name: []const u8) !void {
+        return self.resetSqlSettingMode(alloc, txn_id, principal, owner, name, false);
+    }
+
+    pub fn resetLocalSqlSetting(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: setting_catalog.Owner, name: []const u8) !void {
+        return self.resetSqlSettingMode(alloc, txn_id, principal, owner, name, true);
+    }
+
+    fn resetSqlSettingMode(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: setting_catalog.Owner, name: []const u8, local: bool) !void {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        if (!principalsEqual(candidate.principal, principal)) return error.Forbidden;
+        const metadata = candidate.sql orelse return error.SqlTransactionNotActive;
+        if (metadata.failed) return error.SqlTransactionAborted;
+        if (candidate.commit_body_digest != null or candidate.commit_execution_started) return error.TransactionCommitSealed;
+        var view = try setting_catalog.View.capture(alloc, owner, .{ .principal = principal orelse "", .database = metadata.database }, candidate.setting_active.items);
+        defer view.deinit();
+        const definition = try view.writable(name);
+        removeSettingEntry(alloc, &candidate.setting_active, definition.identity.id);
+        if (!local) removeSettingEntry(alloc, &candidate.setting_committed, definition.identity.id);
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+    }
+
+    /// RESET ALL removes only this transaction's client-owned overlays. No
+    /// catalog read is needed: clearing stale identities is safe even when a
+    /// definition has changed, and the next statement captures fresh defaults.
+    pub fn resetAllSqlSettings(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8) !void {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        if (!principalsEqual(candidate.principal, principal)) return error.Forbidden;
+        const metadata = candidate.sql orelse return error.SqlTransactionNotActive;
+        if (metadata.failed) return error.SqlTransactionAborted;
+        if (candidate.commit_body_digest != null or candidate.commit_execution_started) return error.TransactionCommitSealed;
+        deinitSettingEntries(alloc, &candidate.setting_active);
+        deinitSettingEntries(alloc, &candidate.setting_committed);
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+    }
+
     pub const StageValidator = struct {
         ptr: *anyopaque,
         validate: *const fn (*anyopaque, std.mem.Allocator, ?*const OwnedTransactionCommitRequest, *OwnedTransactionCommitRequest, *const OwnedTransactionCommitRequest) anyerror!void,
@@ -1574,6 +1980,70 @@ pub const SessionRegistry = struct {
         return self.stageValidated(alloc, txn_id, req, null);
     }
 
+    pub fn stageSql(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, req: *const OwnedTransactionCommitRequest) !?SessionInfo {
+        return self.stageValidated(alloc, txn_id, req, .{ .ptr = self, .validate = normalizeSqlStage });
+    }
+
+    pub fn normalizeSqlStage(_: *anyopaque, alloc: std.mem.Allocator, previous: ?*const OwnedTransactionCommitRequest, merged: *OwnedTransactionCommitRequest, extra: *const OwnedTransactionCommitRequest) !void {
+        for (extra.tables) |incoming| {
+            const physical = extra.physicalName(incoming.table_name);
+            const target = for (merged.tables) |*table| {
+                if (std.mem.eql(u8, merged.physicalName(table.table_name), physical)) break table;
+            } else return error.InvalidTransactionCommitRequest;
+            var latest: std.StringArrayHashMapUnmanaged(?db_mod.types.BatchWrite) = .empty;
+            defer latest.deinit(alloc);
+            if (previous) |old| for (old.tables) |table| {
+                if (!std.mem.eql(u8, old.physicalName(table.table_name), physical)) continue;
+                if (table.batch.transforms.len != 0) return error.UnsupportedSqlExecution;
+                for (table.batch.writes) |write| try latest.put(alloc, write.key, write);
+                for (table.batch.deletes) |key| try latest.put(alloc, key, null);
+            };
+            if (incoming.batch.transforms.len != 0) return error.UnsupportedSqlExecution;
+            for (incoming.batch.writes) |write| try latest.put(alloc, write.key, write);
+            for (incoming.batch.deletes) |key| try latest.put(alloc, key, null);
+            var writes: std.ArrayList(db_mod.types.BatchWrite) = .empty;
+            defer writes.deinit(alloc);
+            var deletes: std.ArrayList([]const u8) = .empty;
+            defer deletes.deinit(alloc);
+            for (latest.keys(), latest.values()) |key, value| {
+                if (value) |write| try writes.append(alloc, write) else try deletes.append(alloc, key);
+            }
+            var replacement: batch_api.OwnedBatchRequest = .{};
+            errdefer replacement.deinit(alloc);
+            try appendBatchWrites(alloc, &replacement, writes.items);
+            try appendBatchDeletes(alloc, &replacement, deletes.items);
+            syncBatchReq(&replacement);
+            target.batch.deinit(alloc);
+            target.batch = replacement;
+            clearPreparedWrites(target, alloc);
+        }
+    }
+
+    /// Statement snapshot without sealing COMMIT. Callers serialize the SQL
+    /// statement through acquireCommitExecution before reading/staging it.
+    pub fn cloneSqlStaged(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !OwnedTransactionCommitRequest {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        self.mutex.lock();
+        const cached = self.sessions.get(txn_id);
+        self.mutex.unlock();
+        // The per-session stripe protects these owned slices while the map
+        // mutex remains free. Savepoint snapshots are not cloned for a SELECT.
+        var loaded: ?Session = null;
+        defer if (loaded) |*value| value.deinit(self.durable.?.alloc);
+        const current = cached orelse blk: {
+            const durable = self.durable orelse return error.SqlTransactionNotActive;
+            loaded = (try durable.load(txn_id)) orelse return error.SqlTransactionNotActive;
+            break :blk loaded.?;
+        };
+        const metadata = current.sql orelse return error.SqlTransactionNotActive;
+        if (metadata.failed) return error.SqlTransactionAborted;
+        if (current.commit_body_digest != null) return error.TransactionCommitSealed;
+        if (current.staged) |staged| return staged.clone(alloc);
+        return .{ .sync_level = current.sync_level };
+    }
+
     pub fn stageValidated(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, req: *const OwnedTransactionCommitRequest, validator: ?StageValidator) !?SessionInfo {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
@@ -1581,6 +2051,12 @@ pub const SessionRegistry = struct {
 
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
+        if (candidate.sql) |metadata| {
+            if (metadata.failed) return error.SqlTransactionAborted;
+            if (metadata.mode == .read_only) for (req.tables) |table| {
+                if (table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0) return error.SqlReadOnlyTransaction;
+            };
+        }
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         var previous = if (validator != null and candidate.staged != null) try candidate.staged.?.clone(alloc) else null;
         defer if (previous) |*value| value.deinit(alloc);
@@ -1660,6 +2136,12 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
+        if (candidate.sql) |metadata| {
+            if (metadata.failed) return error.SqlTransactionAborted;
+            if (metadata.mode == .read_only and extra_req != null) for (extra_req.?.tables) |table| {
+                if (table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0) return error.SqlReadOnlyTransaction;
+            };
+        }
         const body_digest = try commitBodyDigest(alloc, extra_req);
         if (candidate.commit_body_digest) |sealed_digest| {
             if (!std.mem.eql(u8, &sealed_digest, &body_digest)) return error.TransactionCommitRequestMismatch;
@@ -1685,6 +2167,7 @@ pub const SessionRegistry = struct {
         }
         if (out.tables.len == 0) {
             out.deinit(alloc);
+            candidate.deinit(alloc);
             return null;
         }
         if (candidate.staged) |*staged| staged.deinit(alloc);
@@ -2071,6 +2554,15 @@ pub const SessionRegistry = struct {
     }
 
     pub fn createSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SavepointInfo {
+        return self.createSavepointNamed(alloc, txn_id, null);
+    }
+
+    pub fn createNamedSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: []const u8) !?SavepointInfo {
+        if (name.len == 0 or name.len > 63) return error.InvalidSavepointName;
+        return self.createSavepointNamed(alloc, txn_id, name);
+    }
+
+    fn createSavepointNamed(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: ?[]const u8) !?SavepointInfo {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
@@ -2081,7 +2573,7 @@ pub const SessionRegistry = struct {
             if (candidate.savepoints.count() >= limit) return error.SavepointLimitExceeded;
         }
         const savepoint_id = candidate.next_savepoint_id;
-        candidate.next_savepoint_id += 1;
+        candidate.next_savepoint_id = std.math.add(u64, savepoint_id, 1) catch return error.SavepointLimitExceeded;
         const snapshot: OwnedTransactionCommitRequest = if (candidate.staged) |staged|
             try staged.clone(alloc)
         else
@@ -2092,7 +2584,10 @@ pub const SessionRegistry = struct {
         };
         var savepoint_inserted = false;
         errdefer if (!savepoint_inserted) new_savepoint.deinit(alloc);
+        new_savepoint.name = if (name) |value| try alloc.dupe(u8, value) else null;
         new_savepoint.read_snapshots = try cloneReadSnapshotMap(alloc, candidate.read_snapshots);
+        new_savepoint.setting_active = try cloneSettingEntries(alloc, candidate.setting_active.items);
+        new_savepoint.setting_committed = try cloneSettingEntries(alloc, candidate.setting_committed.items);
         try candidate.savepoints.put(alloc, savepoint_id, new_savepoint);
         savepoint_inserted = true;
         touchSession(&candidate);
@@ -2106,18 +2601,77 @@ pub const SessionRegistry = struct {
     }
 
     pub fn rollbackToSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, savepoint_id: u64) !?SavepointInfo {
+        return self.changeSavepoint(alloc, txn_id, .{ .id = savepoint_id }, false);
+    }
+
+    pub fn releaseSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, savepoint_id: u64) !?SavepointInfo {
+        return self.changeSavepoint(alloc, txn_id, .{ .id = savepoint_id }, true);
+    }
+
+    pub fn rollbackToNamedSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: []const u8) !?SavepointInfo {
+        return self.changeSavepoint(alloc, txn_id, .{ .name = name }, false);
+    }
+
+    pub fn releaseNamedSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: []const u8) !?SavepointInfo {
+        return self.changeSavepoint(alloc, txn_id, .{ .name = name }, true);
+    }
+
+    fn changeSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, target: union(enum) { id: u64, name: []const u8 }, release: bool) !?SavepointInfo {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
-        if (!candidate.savepoints.contains(savepoint_id)) return null;
+        const savepoint_id = switch (target) {
+            .id => |id| id,
+            .name => |name| blk: {
+                var newest: u64 = 0;
+                var points = candidate.savepoints.iterator();
+                while (points.next()) |point| if (point.value_ptr.name) |stored| {
+                    if (std.mem.eql(u8, name, stored)) newest = @max(newest, point.key_ptr.*);
+                };
+                break :blk newest;
+            },
+        };
+        if (!candidate.savepoints.contains(savepoint_id)) {
+            candidate.deinit(alloc);
+            return null;
+        }
         const savepoint = candidate.savepoints.getPtr(savepoint_id).?;
-        if (candidate.staged) |*staged| staged.deinit(alloc);
-        candidate.staged = try savepoint.snapshot.clone(alloc);
-        deinitReadSnapshotMap(alloc, &candidate.read_snapshots);
-        candidate.read_snapshots = try cloneReadSnapshotMap(alloc, savepoint.read_snapshots);
+        if (!release) {
+            var staged = try savepoint.snapshot.clone(alloc);
+            errdefer staged.deinit(alloc);
+            if (candidate.staged) |*old| try staged.retainRangeGuards(alloc, old);
+            if (candidate.staged) |*old| old.deinit(alloc);
+            candidate.staged = staged;
+            // Ownership moved into candidate, whose error path releases it.
+            staged = .{};
+            const read_snapshots = try cloneReadSnapshotMap(alloc, savepoint.read_snapshots);
+            deinitReadSnapshotMap(alloc, &candidate.read_snapshots);
+            candidate.read_snapshots = read_snapshots;
+            const active = try cloneSettingEntries(alloc, savepoint.setting_active.items);
+            const committed = cloneSettingEntries(alloc, savepoint.setting_committed.items) catch |err| {
+                var disposable = active;
+                deinitSettingEntries(alloc, &disposable);
+                return err;
+            };
+            deinitSettingEntries(alloc, &candidate.setting_active);
+            deinitSettingEntries(alloc, &candidate.setting_committed);
+            candidate.setting_active = active;
+            candidate.setting_committed = committed;
+            if (candidate.sql) |*metadata| metadata.failed = false;
+        }
+        // Numeric ids define nesting even when SQL names shadow older names.
+        // Gather ids before mutation so hash-map iteration cannot be invalidated.
+        var removed_ids = std.ArrayList(u64).empty;
+        defer removed_ids.deinit(alloc);
+        var points = candidate.savepoints.keyIterator();
+        while (points.next()) |id| if (id.* > savepoint_id or (release and id.* == savepoint_id)) try removed_ids.append(alloc, id.*);
+        for (removed_ids.items) |id| {
+            var removed = candidate.savepoints.fetchRemove(id).?.value;
+            removed.deinit(alloc);
+        }
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
         try self.persistLocked(candidate);
@@ -3065,6 +3619,12 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
     try out.append(alloc, '}');
     try out.appendSlice(alloc, ",\"sync_level\":");
     try appendJsonString(alloc, &out, syncLevelText(req.sync_level));
+    if (trusted and req.constraint_timing.items.len != 0) {
+        try out.appendSlice(alloc, ",\"constraint_timing\":");
+        const timing = try std.json.Stringify.valueAlloc(alloc, req.constraint_timing.items, .{});
+        defer alloc.free(timing);
+        try out.appendSlice(alloc, timing);
+    }
     if (trusted and req.catalog_bindings.items.len != 0) {
         try out.appendSlice(alloc, ",\"catalog_bindings\":");
         const bindings = try std.json.Stringify.valueAlloc(alloc, req.catalog_bindings.items, .{});
@@ -3072,9 +3632,72 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
         try out.appendSlice(alloc, bindings);
     }
     if (trusted) {
+        try out.appendSlice(alloc, ",\"json_null_fields\":{");
+        var first_null_table = true;
+        for (req.tables) |table| {
+            var first_null_write = true;
+            for (table.batch.writes) |write| if (write.json_null_fields.len != 0) {
+                if (first_null_write) {
+                    if (!first_null_table) try out.append(alloc, ',');
+                    first_null_table = false;
+                    try appendJsonString(alloc, &out, table.table_name);
+                    try out.appendSlice(alloc, ":{");
+                } else try out.append(alloc, ',');
+                first_null_write = false;
+                try appendJsonString(alloc, &out, write.key);
+                try out.append(alloc, ':');
+                const fields = try std.json.Stringify.valueAlloc(alloc, write.json_null_fields, .{});
+                defer alloc.free(fields);
+                try out.appendSlice(alloc, fields);
+            };
+            if (!first_null_write) try out.append(alloc, '}');
+        }
+        try out.append(alloc, '}');
+        try out.appendSlice(alloc, ",\"schema_versions\":{");
+        var first_epoch = true;
+        for (req.tables) |table| if (table.schema_version) |version| {
+            if (!first_epoch) try out.append(alloc, ',');
+            first_epoch = false;
+            try appendJsonString(alloc, &out, table.table_name);
+            try out.print(alloc, ":{d}", .{version});
+        };
+        try out.append(alloc, '}');
+        try out.appendSlice(alloc, ",\"relational_schema_versions\":{");
+        var first_schema = true;
+        for (req.tables) |table| if (table.relational_schema_version) |version| {
+            if (!first_schema) try out.append(alloc, ',');
+            first_schema = false;
+            try appendJsonString(alloc, &out, table.table_name);
+            try out.print(alloc, ":{d}", .{version});
+        };
+        try out.append(alloc, '}');
         // Private durable dependencies are distinct from the public read set.
         // Savepoints and recovery use this same encoding; public bodies cannot
         // supply these observations or receive their physical content digests.
+        try out.appendSlice(alloc, ",\"conflict_guards\":{");
+        var first_guard = true;
+        for (req.tables) |table| if (table.conflict_guards) |guards| {
+            if (!first_guard) try out.append(alloc, ',');
+            first_guard = false;
+            try appendJsonString(alloc, &out, table.table_name);
+            try out.append(alloc, ':');
+            const bytes = try std.json.Stringify.valueAlloc(alloc, guards.value, .{});
+            defer alloc.free(bytes);
+            try out.appendSlice(alloc, bytes);
+        };
+        try out.append(alloc, '}');
+        try out.appendSlice(alloc, ",\"range_guards\":{");
+        var first_range_guard = true;
+        for (req.tables) |table| if (table.range_guards) |guards| {
+            if (!first_range_guard) try out.append(alloc, ',');
+            first_range_guard = false;
+            try appendJsonString(alloc, &out, table.table_name);
+            try out.append(alloc, ':');
+            const bytes = try std.json.Stringify.valueAlloc(alloc, guards.value, .{});
+            defer alloc.free(bytes);
+            try out.appendSlice(alloc, bytes);
+        };
+        try out.append(alloc, '}');
         try out.appendSlice(alloc, ",\"observed_predicates\":{");
         for (req.tables, 0..) |table, i| {
             if (i != 0) try out.append(alloc, ',');
@@ -3260,6 +3883,32 @@ fn parseReadSet(alloc: std.mem.Allocator, value: std.json.Value) ![]TransactionR
 fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedTransactionCommitRequest {
     var request = try parseCommitValue(alloc, value);
     errdefer request.deinit(alloc);
+    if (value.object.get("constraint_timing")) |timing| {
+        if (timing != .array or timing.array.items.len > 4096) return error.InvalidTransactionSessionRecord;
+        var parsed = try std.json.parseFromValue([]const @import("../storage/relational_index.zig").ConstraintTiming, alloc, timing, .{});
+        defer parsed.deinit();
+        for (parsed.value) |mode| try request.setConstraintTiming(alloc, mode);
+    }
+    if (value.object.get("json_null_fields")) |tables| {
+        if (tables != .object) return error.InvalidTransactionSessionRecord;
+        var entries = tables.object.iterator();
+        while (entries.next()) |entry| {
+            const table = for (request.tables) |*table| {
+                if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
+            } else return error.InvalidTransactionSessionRecord;
+            if (entry.value_ptr.* != .object) return error.InvalidTransactionSessionRecord;
+            var rows = entry.value_ptr.object.iterator();
+            while (rows.next()) |row| {
+                const write = for (table.batch.writes) |*write| {
+                    if (std.mem.eql(u8, write.key, row.key_ptr.*)) break write;
+                } else return error.InvalidTransactionSessionRecord;
+                var parsed = try std.json.parseFromValue([]const []const u8, alloc, row.value_ptr.*, .{});
+                defer parsed.deinit();
+                if (parsed.value.len > 256) return error.InvalidTransactionSessionRecord;
+                write.json_null_fields = try cloneJsonNullFields(alloc, parsed.value);
+            }
+        }
+    }
     if (value.object.get("catalog_bindings")) |bindings| {
         if (bindings != .array) return error.InvalidTransactionSessionRecord;
         for (bindings.array.items) |binding| {
@@ -3268,6 +3917,60 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
             const physical = requireString(binding.object, "physical");
             if (logical.len == 0 or physical.len == 0) return error.InvalidTransactionSessionRecord;
             try request.bind(alloc, logical, physical);
+        }
+    }
+    if (value.object.get("schema_versions")) |versions| {
+        if (versions != .object) return error.InvalidTransactionSessionRecord;
+        var entries = versions.object.iterator();
+        while (entries.next()) |entry| {
+            const table = for (request.tables) |*table| {
+                if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
+            } else return error.InvalidTransactionSessionRecord;
+            const version: u64 = switch (entry.value_ptr.*) {
+                .integer => |number| try nonNegativeRecordInteger(number),
+                .number_string => |number| try recordNumber(number),
+                else => return error.InvalidTransactionSessionRecord,
+            };
+            table.schema_version = std.math.cast(u32, version) orelse return error.InvalidTransactionSessionRecord;
+        }
+    }
+    if (value.object.get("relational_schema_versions")) |versions| {
+        if (versions != .object) return error.InvalidTransactionSessionRecord;
+        var entries = versions.object.iterator();
+        while (entries.next()) |entry| {
+            const table = for (request.tables) |*table| {
+                if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
+            } else return error.InvalidTransactionSessionRecord;
+            const version: u64 = switch (entry.value_ptr.*) {
+                .integer => |number| try nonNegativeRecordInteger(number),
+                .number_string => |number| try recordNumber(number),
+                else => return error.InvalidTransactionSessionRecord,
+            };
+            table.relational_schema_version = std.math.cast(u32, version) orelse return error.InvalidTransactionSessionRecord;
+        }
+    }
+    if (value.object.get("conflict_guards")) |guards| {
+        if (guards != .object) return error.InvalidTransactionSessionRecord;
+        var entries = guards.object.iterator();
+        while (entries.next()) |entry| {
+            const table = for (request.tables) |*table| {
+                if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
+            } else return error.InvalidTransactionSessionRecord;
+            var parsed = try std.json.parseFromValue(TableCommitRequest.ConflictGuards, alloc, entry.value_ptr.*, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            try table.mergeConflictGuards(alloc, parsed.value);
+        }
+    }
+    if (value.object.get("range_guards")) |guards| {
+        if (guards != .object) return error.InvalidTransactionSessionRecord;
+        var entries = guards.object.iterator();
+        while (entries.next()) |entry| {
+            const table = for (request.tables) |*table| {
+                if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
+            } else return error.InvalidTransactionSessionRecord;
+            var parsed = try std.json.parseFromValue([]const @import("range_read_guards.zig").OwnerRangeProof, alloc, entry.value_ptr.*, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            try table.mergeRangeGuards(alloc, parsed.value);
         }
     }
     if (value.object.get("observed_predicates")) |observations| {
@@ -3771,6 +4474,34 @@ fn clearPreparedWrites(table: *TableCommitRequest, alloc: std.mem.Allocator) voi
     }
 }
 
+fn cloneJsonNullFields(alloc: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
+    if (fields.len == 0) return &.{};
+    const copy = try alloc.alloc([]const u8, fields.len);
+    var count: usize = 0;
+    errdefer {
+        for (copy[0..count]) |field| alloc.free(field);
+        alloc.free(copy);
+    }
+    for (fields, copy) |field, *out| {
+        out.* = try alloc.dupe(u8, field);
+        count += 1;
+    }
+    return copy;
+}
+
+fn freeJsonNullFields(alloc: std.mem.Allocator, fields: []const []const u8) void {
+    for (fields) |field| alloc.free(field);
+    if (fields.len != 0) alloc.free(fields);
+}
+
+fn cloneBatchWrite(alloc: std.mem.Allocator, write: db_mod.types.BatchWrite) !db_mod.types.BatchWrite {
+    const key = try alloc.dupe(u8, write.key);
+    errdefer alloc.free(key);
+    const value = try alloc.dupe(u8, write.value);
+    errdefer alloc.free(value);
+    return .{ .key = key, .value = value, .json_null_fields = try cloneJsonNullFields(alloc, write.json_null_fields) };
+}
+
 fn appendBatchWrites(alloc: std.mem.Allocator, batch: *batch_api.OwnedBatchRequest, writes: []const db_mod.types.BatchWrite) !void {
     if (writes.len == 0) return;
     const old_len = batch.writes.len;
@@ -3780,30 +4511,22 @@ fn appendBatchWrites(alloc: std.mem.Allocator, batch: *batch_api.OwnedBatchReque
         for (next[0..copied]) |write| {
             alloc.free(@constCast(write.key));
             alloc.free(@constCast(write.value));
+            freeJsonNullFields(alloc, write.json_null_fields);
         }
         alloc.free(next);
     }
     for (batch.writes) |write| {
-        const key = try alloc.dupe(u8, write.key);
-        errdefer alloc.free(key);
-        next[copied] = .{
-            .key = key,
-            .value = try alloc.dupe(u8, write.value),
-        };
+        next[copied] = try cloneBatchWrite(alloc, write);
         copied += 1;
     }
     for (writes) |write| {
-        const key = try alloc.dupe(u8, write.key);
-        errdefer alloc.free(key);
-        next[copied] = .{
-            .key = key,
-            .value = try alloc.dupe(u8, write.value),
-        };
+        next[copied] = try cloneBatchWrite(alloc, write);
         copied += 1;
     }
     for (batch.writes) |write| {
         alloc.free(@constCast(write.key));
         alloc.free(@constCast(write.value));
+        freeJsonNullFields(alloc, write.json_null_fields);
     }
     if (batch.writes.len > 0) alloc.free(batch.writes);
     batch.writes = next;
@@ -4193,6 +4916,12 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     } else {
         try out.appendSlice(alloc, "null");
     }
+    try out.appendSlice(alloc, ",\"sql\":");
+    if (session.sql) |metadata| {
+        const encoded = try std.json.Stringify.valueAlloc(alloc, metadata, .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    } else try out.appendSlice(alloc, "null");
     try out.appendSlice(alloc, ",\"begin_timestamp\":");
     try out.print(alloc, "{d}", .{session.begin_timestamp});
     try out.appendSlice(alloc, ",\"last_touched_timestamp\":");
@@ -4253,6 +4982,14 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         try appendReadSnapshotJson(alloc, &out, entry.value_ptr.*);
     }
     try out.append(alloc, ']');
+    try out.appendSlice(alloc, ",\"setting_active\":");
+    const active_settings = try std.json.Stringify.valueAlloc(alloc, session.setting_active.items, .{});
+    defer alloc.free(active_settings);
+    try out.appendSlice(alloc, active_settings);
+    try out.appendSlice(alloc, ",\"setting_committed\":");
+    const committed_settings = try std.json.Stringify.valueAlloc(alloc, session.setting_committed.items, .{});
+    defer alloc.free(committed_settings);
+    try out.appendSlice(alloc, committed_settings);
     try out.appendSlice(alloc, ",\"savepoints\":[");
     var it = session.savepoints.iterator();
     var first = true;
@@ -4261,6 +4998,8 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         first = false;
         try out.appendSlice(alloc, "{\"id\":");
         try out.print(alloc, "{d}", .{entry.key_ptr.*});
+        try out.appendSlice(alloc, ",\"name\":");
+        if (entry.value_ptr.name) |name| try appendJsonString(alloc, &out, name) else try out.appendSlice(alloc, "null");
         try out.appendSlice(alloc, ",\"snapshot\":");
         const encoded = try encodeCommitRequestMode(alloc, entry.value_ptr.snapshot, true);
         defer alloc.free(encoded);
@@ -4274,6 +5013,14 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
             try appendReadSnapshotJson(alloc, &out, snapshot_entry.value_ptr.*);
         }
         try out.append(alloc, ']');
+        try out.appendSlice(alloc, ",\"setting_active\":");
+        const point_active = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.setting_active.items, .{});
+        defer alloc.free(point_active);
+        try out.appendSlice(alloc, point_active);
+        try out.appendSlice(alloc, ",\"setting_committed\":");
+        const point_committed = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.setting_committed.items, .{});
+        defer alloc.free(point_committed);
+        try out.appendSlice(alloc, point_committed);
         try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, "]}");
@@ -4321,6 +5068,13 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
         },
     };
     errdefer session.deinit(alloc);
+    if (obj.get("sql")) |metadata| {
+        if (metadata != .null) {
+            const decoded = std.json.parseFromValue(SqlMetadata, alloc, metadata, .{}) catch return error.InvalidTransactionSessionRecord;
+            defer decoded.deinit();
+            session.sql = try decoded.value.clone(alloc);
+        }
+    }
     session.last_touched_timestamp = if (obj.get("last_touched_timestamp")) |value|
         switch (value) {
             .integer => |v| try nonNegativeRecordInteger(v),
@@ -4402,6 +5156,8 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
     if (obj.get("read_snapshots")) |snapshots_value| {
         try decodeReadSnapshotsInto(alloc, snapshots_value, &session.read_snapshots);
     }
+    if (obj.get("setting_active")) |value| session.setting_active = try decodeSettingEntries(alloc, value);
+    if (obj.get("setting_committed")) |value| session.setting_committed = try decodeSettingEntries(alloc, value);
     const savepoints_value = obj.get("savepoints") orelse return error.InvalidTransactionSessionRecord;
     const savepoints = switch (savepoints_value) {
         .array => |arr| arr,
@@ -4417,17 +5173,35 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             .number_string => |text| try recordNumber(text),
             else => return error.InvalidTransactionSessionRecord,
         };
+        if (session.savepoints.contains(id)) return error.InvalidTransactionSessionRecord;
         const snapshot = try parseStoredCommitValue(alloc, entry_obj.get("snapshot") orelse return error.InvalidTransactionSessionRecord);
+        var owned_snapshot = snapshot;
+        var transferred = false;
+        errdefer if (!transferred) owned_snapshot.deinit(alloc);
+        const name: ?[]u8 = if (entry_obj.get("name")) |value| switch (value) {
+            .null => null,
+            .string => |text| if (text.len > 0 and text.len <= 63) try alloc.dupe(u8, text) else return error.InvalidTransactionSessionRecord,
+            else => return error.InvalidTransactionSessionRecord,
+        } else null;
+        errdefer if (!transferred) if (name) |text| alloc.free(text);
         var read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty;
-        errdefer deinitReadSnapshotMap(alloc, &read_snapshots);
+        errdefer if (!transferred) deinitReadSnapshotMap(alloc, &read_snapshots);
         if (entry_obj.get("read_snapshots")) |read_snapshots_value| {
             try decodeReadSnapshotsInto(alloc, read_snapshots_value, &read_snapshots);
         }
+        var setting_active = if (entry_obj.get("setting_active")) |value| try decodeSettingEntries(alloc, value) else SettingEntries.empty;
+        errdefer if (!transferred) deinitSettingEntries(alloc, &setting_active);
+        var setting_committed = if (entry_obj.get("setting_committed")) |value| try decodeSettingEntries(alloc, value) else SettingEntries.empty;
+        errdefer if (!transferred) deinitSettingEntries(alloc, &setting_committed);
         try session.savepoints.put(alloc, id, .{
             .id = id,
+            .name = name,
             .snapshot = snapshot,
             .read_snapshots = read_snapshots,
+            .setting_active = setting_active,
+            .setting_committed = setting_committed,
         });
+        transferred = true;
     }
     return session;
 }
@@ -4635,6 +5409,156 @@ test "durable transaction sessions preserve and enforce principal bindings" {
     try std.testing.expectEqual(@as(usize, 1), anonymous_sessions.len);
 }
 
+test "durable session mutations publish only after persistence succeeds: HTTP SQL settings survive restart and savepoint rollback" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/api-sql-setting-sessions" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+    const Fixture = struct {
+        generation: u64 = 1,
+        const definitions = [_]setting_catalog.Definition{
+            .{ .identity = .{ .id = 1, .generation = 1 }, .name = "app.limit", .kind = .integer, .session_writable = true, .default = .{ .integer = 3 } },
+            .{ .identity = .{ .id = 2, .generation = 1 }, .name = "app.secret", .kind = .string, .policy_sensitive = true, .default = .{ .string = "hidden" } },
+        };
+        fn load(ptr: *anyopaque, allocator: std.mem.Allocator, scope: setting_catalog.Scope) !setting_catalog.RawSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, scope.principal, "alice") or !std.mem.eql(u8, scope.database, "main")) return error.Forbidden;
+            var values = definitions;
+            values[0].identity.generation = self.generation;
+            // The snapshot is borrowed only until View.capture returns.
+            return .{ .scope = scope, .epoch = self.generation, .definitions = try allocator.dupe(setting_catalog.Definition, &values) };
+        }
+    };
+    var fixture: Fixture = .{};
+    const owner: setting_catalog.Owner = .{ .ptr = &fixture, .load = Fixture.load };
+    var id: db_mod.types.TxnId = undefined;
+    {
+        var registry = SessionRegistry.init(&durable);
+        defer registry.deinit(alloc);
+        const begun = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice");
+        id = begun.txn_id;
+        try std.testing.expectError(error.Forbidden, registry.setSqlSetting(alloc, id, "bob", owner, "app.limit", .{ .integer = 5 }, false));
+        try std.testing.expectError(error.SettingWriteForbidden, registry.setSqlSetting(alloc, id, "alice", owner, "app.secret", .{ .string = "leak" }, false));
+        try registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 5 }, false);
+        const point = (try registry.createNamedSavepoint(alloc, id, "before_local")).?;
+        try registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 7 }, true);
+        durable.fail_writes_for_test = true;
+        try std.testing.expectError(error.InjectedSessionStoreFailure, registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 9 }, false));
+        durable.fail_writes_for_test = false;
+        var after_failure = (try registry.getSqlState(alloc, id)).?;
+        defer after_failure.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, 7), after_failure.setting_active.items[0].value.integer);
+        _ = try registry.rollbackToSavepoint(alloc, id, point.savepoint_id);
+    }
+    {
+        var registry = SessionRegistry.init(&durable);
+        defer registry.deinit(alloc);
+        var resumed = (try registry.getSqlState(alloc, id)).?;
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, 5), resumed.setting_active.items[0].value.integer);
+        var view = try setting_catalog.View.capture(alloc, owner, .{ .principal = "alice", .database = "main" }, resumed.setting_active.items);
+        defer view.deinit();
+        try std.testing.expectEqual(@as(i64, 5), (try view.resolve("app.limit")).value.integer);
+        try registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 8 }, false);
+        try registry.resetSqlSetting(alloc, id, "alice", owner, "app.limit");
+        var reset_state = (try registry.getSqlState(alloc, id)).?;
+        defer reset_state.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), reset_state.setting_active.items.len);
+        try registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 8 }, false);
+        const before_reset_all = (try registry.createNamedSavepoint(alloc, id, "before_reset_all")).?;
+        try std.testing.expectError(error.Forbidden, registry.resetAllSqlSettings(alloc, id, "bob"));
+        try registry.resetAllSqlSettings(alloc, id, "alice");
+        var cleared_at_savepoint = (try registry.getSqlState(alloc, id)).?;
+        defer cleared_at_savepoint.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), cleared_at_savepoint.setting_active.items.len);
+        var persisted_clear = (try durable.load(id)).?;
+        defer persisted_clear.deinit(durable.alloc);
+        try std.testing.expectEqual(@as(usize, 0), persisted_clear.setting_committed.items.len);
+        _ = try registry.rollbackToSavepoint(alloc, id, before_reset_all.savepoint_id);
+        durable.fail_writes_for_test = true;
+        try std.testing.expectError(error.InjectedSessionStoreFailure, registry.resetAllSqlSettings(alloc, id, "alice"));
+        durable.fail_writes_for_test = false;
+        var after_reset_failure = (try registry.getSqlState(alloc, id)).?;
+        defer after_reset_failure.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, 8), after_reset_failure.setting_active.items[0].value.integer);
+        fixture.generation = 2;
+        try std.testing.expectError(error.SettingCatalogChanged, setting_catalog.View.capture(alloc, owner, .{ .principal = "alice", .database = "main" }, resumed.setting_active.items));
+        try std.testing.expectError(error.SettingCatalogChanged, registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 9 }, false));
+        try std.testing.expectError(error.SettingCatalogChanged, registry.resetSqlSetting(alloc, id, "alice", owner, "app.limit"));
+        // Removing stale client overlays does not need a catalog round trip.
+        try registry.resetAllSqlSettings(alloc, id, "alice");
+    }
+    {
+        var registry = SessionRegistry.init(&durable);
+        defer registry.deinit(alloc);
+        var resumed = (try registry.getSqlState(alloc, id)).?;
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), resumed.setting_active.items.len);
+        var persisted_clear = (try durable.load(id)).?;
+        defer persisted_clear.deinit(durable.alloc);
+        try std.testing.expectEqual(@as(usize, 0), persisted_clear.setting_committed.items.len);
+        var view = try setting_catalog.View.capture(alloc, owner, .{ .principal = "alice", .database = "main" }, resumed.setting_active.items);
+        defer view.deinit();
+        try std.testing.expectEqual(@as(i64, 3), (try view.resolve("app.limit")).value.integer);
+    }
+}
+
+test "durable SQL LOCAL DEFAULT preserves committed setting across restart and savepoint" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/api-sql-local-default-sessions" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+    const Fixture = struct {
+        const definition: setting_catalog.Definition = .{ .identity = .{ .id = 1, .generation = 1 }, .name = "app.limit", .kind = .integer, .session_writable = true, .default = .{ .integer = 3 } };
+        fn load(_: *anyopaque, _: std.mem.Allocator, scope: setting_catalog.Scope) !setting_catalog.RawSnapshot {
+            return .{ .scope = scope, .epoch = 1, .definitions = &.{definition} };
+        }
+    };
+    var marker: u8 = 0;
+    const owner: setting_catalog.Owner = .{ .ptr = &marker, .load = Fixture.load };
+    var id: db_mod.types.TxnId = undefined;
+    var point_id: u64 = undefined;
+    {
+        var registry = SessionRegistry.init(&durable);
+        defer registry.deinit(alloc);
+        const begun = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice");
+        id = begun.txn_id;
+        try registry.setSqlSetting(alloc, id, "alice", owner, "app.limit", .{ .integer = 5 }, false);
+        point_id = (try registry.createNamedSavepoint(alloc, id, "before_default")).?.savepoint_id;
+        durable.fail_writes_for_test = true;
+        try std.testing.expectError(error.InjectedSessionStoreFailure, registry.resetLocalSqlSetting(alloc, id, "alice", owner, "app.limit"));
+        durable.fail_writes_for_test = false;
+        var before = (try registry.getSqlState(alloc, id)).?;
+        defer before.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, 5), before.setting_active.items[0].value.integer);
+        try registry.resetLocalSqlSetting(alloc, id, "alice", owner, "app.limit");
+        var state = (try registry.getSqlState(alloc, id)).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), state.setting_active.items.len);
+        var persisted = (try durable.load(id)).?;
+        defer persisted.deinit(durable.alloc);
+        try std.testing.expectEqual(@as(i64, 5), persisted.setting_committed.items[0].value.integer);
+    }
+    {
+        var registry = SessionRegistry.init(&durable);
+        defer registry.deinit(alloc);
+        var state = (try registry.getSqlState(alloc, id)).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), state.setting_active.items.len);
+        _ = try registry.rollbackToSavepoint(alloc, id, point_id);
+        var restored = (try registry.getSqlState(alloc, id)).?;
+        defer restored.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, 5), restored.setting_active.items[0].value.integer);
+        var persisted = (try durable.load(id)).?;
+        defer persisted.deinit(durable.alloc);
+        try std.testing.expectEqual(@as(i64, 5), persisted.setting_committed.items[0].value.integer);
+    }
+}
+
 test "durable session mutations publish only after persistence succeeds" {
     var backend = mem_backend.Backend.init(std.testing.allocator, .{});
     defer backend.close();
@@ -4774,7 +5698,7 @@ test "distributed txn sessions durably seal exact binary integrity plans before 
         .address = try @import("../storage/db/relational_integrity_contract.zig").Address.init(@splat(2), "\x00\xfftuple"),
         .operation = .{ .check_owner = .{ .parent_table = "docs", .parent_key = "\x00\xffa" } },
     }};
-    const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .relational_schema_version = 3, .relational_integrity_generation_set = @splat(0xff), .predicates = &.{.{ .key = "a", .expected_version = 7 }}, .integrity_commands = &commands }};
+    const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .relational_schema_version = 3, .relational_integrity_generation_set = @splat(0xff), .predicates = &.{.{ .key = "a", .expected_version = 7 }}, .integrity_commands = &commands, .row_policy_principal_proof = "signed-owner-admission", .row_policy_database = "default", .row_policy_admitted_at_seconds = 1_800_000_000 }};
     durable.fail_writes_for_test = true;
     try std.testing.expectError(error.InjectedSessionStoreFailure, writer.sealExecutionPlan(alloc, session.txn_id, &tables));
     try std.testing.expect((try writer.getExecutionPlan(alloc, session.txn_id)) == null);
@@ -4794,6 +5718,9 @@ test "distributed txn sessions durably seal exact binary integrity plans before 
     var decoded = try parseExecutionPlan(alloc, recovery.commit.execution_plan.?);
     defer decoded.deinit();
     try std.testing.expectEqual(@as(?u32, 3), decoded.value[0].relational_schema_version);
+    try std.testing.expectEqualStrings("signed-owner-admission", decoded.value[0].row_policy_principal_proof);
+    try std.testing.expectEqualStrings("default", decoded.value[0].row_policy_database);
+    try std.testing.expectEqual(@as(i64, 1_800_000_000), decoded.value[0].row_policy_admitted_at_seconds);
     try std.testing.expectEqual(@as(u64, 7), decoded.value[0].predicates[0].expected_version);
     try std.testing.expectEqualStrings("\x00\xffa", decoded.value[0].integrity_commands[0].operation.check_owner.parent_key);
     try std.testing.expectEqualSlices(u8, &commands[0].address.routing, &decoded.value[0].integrity_commands[0].address.routing);
@@ -5479,6 +6406,243 @@ test "transaction session registry reports status and cleans expired durable ses
     try std.testing.expect((try durable.load(session.txn_id)) == null);
 }
 
+test "distributed txn constraint timing stage rollback and durable reload are atomic" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/timing", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    var writer = SessionRegistry.init(&durable);
+    defer writer.deinit(alloc);
+    const session = try writer.begin(alloc, .{}, 21);
+    var deferred: OwnedTransactionCommitRequest = .{};
+    defer deferred.deinit(alloc);
+    try deferred.setConstraintTiming(alloc, .{ .deferred = true });
+    _ = try writer.stage(alloc, session.txn_id, &deferred);
+    const point = (try writer.createNamedSavepoint(alloc, session.txn_id, "deferred")).?;
+    var immediate: OwnedTransactionCommitRequest = .{};
+    defer immediate.deinit(alloc);
+    try immediate.setConstraintTiming(alloc, .{ .generation = @splat(4), .deferred = false });
+    const Reject = struct {
+        fn validate(_: *anyopaque, _: std.mem.Allocator, _: ?*const OwnedTransactionCommitRequest, _: *OwnedTransactionCommitRequest, _: *const OwnedTransactionCommitRequest) !void {
+            return error.UniqueConstraintViolation;
+        }
+    };
+    var context: u8 = 0;
+    try std.testing.expectError(error.UniqueConstraintViolation, writer.stageValidated(alloc, session.txn_id, &immediate, .{ .ptr = &context, .validate = Reject.validate }));
+    {
+        var pending = try writer.sessions.get(session.txn_id).?.staged.?.clone(alloc);
+        defer pending.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), pending.constraint_timing.items.len);
+        try std.testing.expect(pending.constraint_timing.items[0].deferred);
+    }
+    _ = try writer.stage(alloc, session.txn_id, &immediate);
+    _ = try writer.rollbackToSavepoint(alloc, session.txn_id, point.savepoint_id);
+    var recovered = (try durable.load(session.txn_id)).?;
+    defer recovered.deinit(alloc);
+    var pending = try recovered.staged.?.clone(alloc);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), pending.constraint_timing.items.len);
+    try std.testing.expect(pending.constraint_timing.items[0].deferred);
+    var public = try parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{},\"constraint_timing\":[{\"deferred\":true}]}");
+    defer public.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), public.constraint_timing.items.len);
+}
+
+test "transaction session named savepoints shadow release and roll back nested state" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const session = try registry.begin(alloc, .{}, 21);
+    const first = (try registry.createNamedSavepoint(alloc, session.txn_id, "point")).?;
+    _ = (try registry.createNamedSavepoint(alloc, session.txn_id, "nested")).?;
+    const shadow = (try registry.createNamedSavepoint(alloc, session.txn_id, "point")).?;
+    _ = (try registry.createNamedSavepoint(alloc, session.txn_id, "after")).?;
+    try std.testing.expectEqual(shadow.savepoint_id, (try registry.rollbackToNamedSavepoint(alloc, session.txn_id, "point")).?.savepoint_id);
+    try std.testing.expectEqual(@as(usize, 3), (try registry.getStatus(alloc, session.txn_id)).?.savepoint_count);
+    try std.testing.expect((try registry.releaseNamedSavepoint(alloc, session.txn_id, "after")) == null);
+    _ = (try registry.releaseNamedSavepoint(alloc, session.txn_id, "point")).?;
+    try std.testing.expectEqual(first.savepoint_id, (try registry.rollbackToNamedSavepoint(alloc, session.txn_id, "point")).?.savepoint_id);
+    try std.testing.expectEqual(@as(usize, 1), (try registry.getStatus(alloc, session.txn_id)).?.savepoint_count);
+    _ = (try registry.releaseNamedSavepoint(alloc, session.txn_id, "point")).?;
+    try std.testing.expectEqual(@as(usize, 0), (try registry.getStatus(alloc, session.txn_id)).?.savepoint_count);
+}
+
+test "durable SQL session rejects duplicate savepoint ids without double freeing overlays" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const info = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "app", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 9, "alice");
+    _ = (try registry.createNamedSavepoint(alloc, info.txn_id, "first")).?;
+    _ = (try registry.createNamedSavepoint(alloc, info.txn_id, "second")).?;
+    const bytes = try encodeSessionRecord(alloc, registry.sessions.get(info.txn_id).?);
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    const points = parsed.value.object.getPtr("savepoints").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), points.len);
+    try points[1].object.put(parsed.arena.allocator(), "id", points[0].object.get("id").?);
+    const invalid = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    defer alloc.free(invalid);
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, decodeSessionRecord(alloc, info.txn_id, invalid));
+}
+
+test "SQL session metadata and schema fences survive durable records" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const info = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "app", .namespace = "public", .isolation = .read_committed, .mode = .read_only } }, 9, "alice");
+    try registry.setSqlFailed(alloc, info.txn_id, true);
+    const session = registry.sessions.get(info.txn_id).?;
+    const bytes = try encodeSessionRecord(alloc, session);
+    defer alloc.free(bytes);
+    var decoded = try decodeSessionRecord(alloc, info.txn_id, bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings("app", decoded.sql.?.database);
+    try std.testing.expectEqual(@import("../sql/session.zig").Isolation.read_committed, decoded.sql.?.isolation);
+    try std.testing.expect(decoded.sql.?.failed);
+    var request: OwnedTransactionCommitRequest = .{};
+    defer request.deinit(alloc);
+    request.tables = try alloc.alloc(TableCommitRequest, 1);
+    request.tables[0] = .{ .table_name = try alloc.dupe(u8, "table"), .relational_schema_version = 7, .schema_version = 7 };
+    const stored = try encodeCommitRequestMode(alloc, request, true);
+    defer alloc.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    var restored = try parseStoredCommitValue(alloc, parsed.value);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(@as(?u32, 7), restored.tables[0].relational_schema_version);
+    try std.testing.expectEqual(@as(?u32, 7), restored.tables[0].schema_version);
+    const tables = try restored.distributedTables(alloc);
+    defer alloc.free(tables);
+    try std.testing.expectEqual(@as(?u32, 7), tables[0].relational_schema_version);
+    try std.testing.expectEqual(@as(?u32, 7), tables[0].schema_version);
+}
+
+test "distributed txn SQL range guards survive durability and savepoint rollback without restoring writes" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const ranges = @import("range_read_guards.zig");
+            const observation = ranges.OwnerRangeProof{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{ .group_id = 5, .range_id = 6, .identity_namespace = .{ .table_id = 3, .shard_id = 5, .range_id = 6 } } }, .proofs = &.{.{ .bucket = 98, .generation = std.math.maxInt(u64) }} };
+            const source_observation = ranges.OwnerRangeProof{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 4, .topology_epoch = 4, .route = .{ .group_id = 7, .range_id = 8, .identity_namespace = .{ .table_id = 4, .shard_id = 7, .range_id = 8 } } }, .proofs = &.{.{ .bucket = 99, .generation = 43 }} };
+            var registry = SessionRegistry.init(null);
+            defer registry.deinit(alloc);
+            const session = try registry.begin(alloc, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .serializable, .mode = .read_write } }, 1);
+            _ = try registry.createNamedSavepoint(alloc, session.txn_id, "before");
+            var request = try parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{\"v\":1}}},\"source\":{}}}");
+            defer request.deinit(alloc);
+            try request.bind(alloc, "docs", "physical:3");
+            try request.bind(alloc, "source", "physical:4");
+            request.tables[0].schema_version = 7;
+            request.tables[1].schema_version = 8;
+            try request.tables[0].mergeRangeGuards(alloc, &.{observation});
+            try request.tables[1].mergeRangeGuards(alloc, &.{source_observation});
+            _ = try registry.stage(alloc, session.txn_id, &request);
+            _ = try registry.rollbackToNamedSavepoint(alloc, session.txn_id, "before");
+            var restored = try registry.cloneSqlStaged(alloc, session.txn_id);
+            defer restored.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), restored.tables.len);
+            try std.testing.expectEqual(@as(usize, 0), restored.tables[0].batch.writes.len);
+            try std.testing.expectEqual(@as(usize, 0), restored.tables[1].batch.writes.len);
+            try std.testing.expectEqualStrings("physical:3", restored.physicalName("docs"));
+            try std.testing.expectEqualStrings("physical:4", restored.physicalName("source"));
+            try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), restored.tables[0].range_guards.?.value[0].proofs[0].generation);
+            try std.testing.expectEqual(@as(?u64, 43), restored.tables[1].range_guards.?.value[0].proofs[0].generation);
+            const encoded = try encodeCommitRequestMode(alloc, restored, true);
+            defer alloc.free(encoded);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{ .parse_numbers = false });
+            defer parsed.deinit();
+            var durable = try parseStoredCommitValue(alloc, parsed.value);
+            defer durable.deinit(alloc);
+            const routed = try durable.distributedTables(alloc);
+            defer alloc.free(routed);
+            try std.testing.expectEqual(@as(u64, 5), routed[0].range_guards[0].fence.route.group_id);
+            try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), routed[0].range_guards[0].proofs[0].generation);
+            try std.testing.expectEqual(@as(u64, 7), routed[1].range_guards[0].fence.route.group_id);
+            try std.testing.expectEqual(@as(u64, 8), routed[1].range_guards[0].fence.route.range_id);
+            try std.testing.expectEqual(@as(u64, 4), routed[1].range_guards[0].fence.route.identity_namespace.table_id);
+            try std.testing.expectEqual(@as(?u64, 43), routed[1].range_guards[0].proofs[0].generation);
+            const public = try encodeCommitRequestMode(alloc, durable, false);
+            defer alloc.free(public);
+            try std.testing.expect(std.mem.indexOf(u8, public, "range_guards") == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "distributed txn SQL conflict guards retain first native observation through clone and durable round trip" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const native = @import("../storage/db/relational_integrity_contract.zig");
+            const address = try native.Address.init(@splat(3), "\x00\xfftuple");
+            const first = [_]native.Command{.{ .address = address, .operation = .{ .compare_claim = null } }};
+            const later = [_]native.Command{.{ .address = address, .operation = .{ .compare_claim = .{ .tuple = "\x00\xfftuple", .parent_table = "table", .parent_key = "staged", .schema_version = 7 } } }};
+            var original: TableCommitRequest = .{ .table_name = try alloc.dupe(u8, "table"), .relational_schema_version = 7 };
+            defer original.deinit(alloc);
+            try original.mergeConflictGuards(alloc, .{ .generation_set = @splat(255), .commands = &first });
+            var request: OwnedTransactionCommitRequest = .{};
+            defer request.deinit(alloc);
+            const table = try original.clone(alloc);
+            request.tables = alloc.alloc(TableCommitRequest, 1) catch |err| {
+                var owned = table;
+                owned.deinit(alloc);
+                return err;
+            };
+            request.tables[0] = table;
+            try request.tables[0].mergeConflictGuards(alloc, .{ .generation_set = @splat(255), .commands = &later });
+            try std.testing.expectEqual(@as(usize, 1), request.tables[0].conflict_guards.?.value.commands.len);
+            try std.testing.expect(request.tables[0].conflict_guards.?.value.commands[0].operation.compare_claim == null);
+            const encoded = try encodeCommitRequestMode(alloc, request, true);
+            defer alloc.free(encoded);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{ .parse_numbers = false });
+            defer parsed.deinit();
+            var restored = try parseStoredCommitValue(alloc, parsed.value);
+            defer restored.deinit(alloc);
+            const tables = try restored.distributedTables(alloc);
+            defer alloc.free(tables);
+            try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(255))), &tables[0].relational_integrity_generation_set.?);
+            try std.testing.expectEqualDeep(address, tables[0].integrity_commands[0].address);
+            try std.testing.expect(tables[0].integrity_commands[0].operation.compare_claim == null);
+            var occupied: TableCommitRequest = .{ .table_name = try alloc.dupe(u8, "table") };
+            defer occupied.deinit(alloc);
+            try occupied.mergeConflictGuards(alloc, .{ .generation_set = @splat(255), .commands = &later });
+            var occupied_copy = try occupied.clone(alloc);
+            defer occupied_copy.deinit(alloc);
+            try std.testing.expectEqualStrings("\x00\xfftuple", occupied_copy.conflict_guards.?.value.commands[0].operation.compare_claim.?.tuple);
+            try std.testing.expectError(error.CatalogGenerationChanged, occupied.mergeConflictGuards(alloc, .{ .generation_set = @splat(1), .commands = &first }));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL staged statements coalesce writes deletes and retain first version" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const info = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 1, "alice");
+    var first = try parseCommitRequest(alloc, "{\"read_set\":[{\"table\":\"t\",\"key\":\"a\",\"version\":\"0\"}],\"tables\":{\"t\":{\"inserts\":{\"a\":{\"n\":1}}}}}");
+    defer first.deinit(alloc);
+    _ = try registry.stageSql(alloc, info.txn_id, &first);
+    _ = try registry.createNamedSavepoint(alloc, info.txn_id, "inserted");
+    var deletion = try parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{\"t\":{\"deletes\":[\"a\"]}}}");
+    defer deletion.deinit(alloc);
+    _ = try registry.stageSql(alloc, info.txn_id, &deletion);
+    var deleted = try registry.cloneSqlStaged(alloc, info.txn_id);
+    defer deleted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), deleted.tables[0].batch.writes.len);
+    try std.testing.expectEqual(@as(usize, 1), deleted.tables[0].batch.deletes.len);
+    _ = try registry.stageSql(alloc, info.txn_id, &first);
+    var restored = try registry.cloneSqlStaged(alloc, info.txn_id);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), restored.tables[0].batch.writes.len);
+    try std.testing.expectEqual(@as(usize, 0), restored.tables[0].batch.deletes.len);
+    try std.testing.expectEqual(@as(usize, 1), restored.tables[0].predicates.items.len);
+    try std.testing.expectEqual(@as(u64, 0), restored.tables[0].predicates.items[0].expected_version);
+}
+
 test "transaction session registry enforces savepoint limits and reports remaining capacity" {
     var registry = SessionRegistry.initWithOptions(null, null, null, 1, null, null);
     defer registry.deinit(std.testing.allocator);
@@ -5737,9 +6901,11 @@ test "distributed txn session preserves numeric tokens across staging savepoints
     const commit = "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":" ++ row ++ "}}}}";
     var staged = try parseCommitRequest(alloc, commit);
     defer staged.deinit(alloc);
+    try staged.setConstraintTiming(alloc, .{ .deferred = true });
+    try session.staged.?.setConstraintTiming(alloc, .{ .generation = @splat(7), .deferred = false });
     try std.testing.expectEqualStrings(row, staged.tables[0].batch.writes[0].value);
     try upsertReadSnapshot(alloc, &session.read_snapshots, .{ .table_name = "docs", .key = "a", .version = 44, .document_json = row });
-    try session.savepoints.put(alloc, 1, .{ .id = 1, .snapshot = try staged.clone(alloc), .read_snapshots = try cloneReadSnapshotMap(alloc, session.read_snapshots) });
+    try session.savepoints.put(alloc, 1, .{ .id = 1, .name = try alloc.dupe(u8, "before_update"), .snapshot = try staged.clone(alloc), .read_snapshots = try cloneReadSnapshotMap(alloc, session.read_snapshots) });
     const bytes = try encodeSessionRecord(alloc, session);
     defer alloc.free(bytes);
     var restored = try decodeSessionRecord(alloc, session.txn_id, bytes);
@@ -5749,6 +6915,10 @@ test "distributed txn session preserves numeric tokens across staging savepoints
     try std.testing.expectEqualStrings(row, restored.read_snapshots.values()[0].document_json.?);
     try std.testing.expectEqualStrings(row, restored.savepoints.get(1).?.snapshot.tables[0].batch.writes[0].value);
     try std.testing.expectEqualStrings(row, restored.savepoints.get(1).?.read_snapshots.values()[0].document_json.?);
+    try std.testing.expectEqualStrings("before_update", restored.savepoints.get(1).?.name.?);
+    try std.testing.expect(restored.savepoints.get(1).?.snapshot.constraint_timing.items[0].deferred);
+    try std.testing.expectEqualDeep(@as(?[16]u8, @splat(7)), restored.staged.?.constraint_timing.items[0].generation);
+    try std.testing.expect(!restored.staged.?.constraint_timing.items[0].deferred);
 }
 
 test "transaction catalog bindings persist privately and cannot be injected publicly" {
@@ -5778,6 +6948,29 @@ test "transaction catalog bindings persist privately and cannot be injected publ
 fn checkCatalogBoundRequestClone(alloc: std.mem.Allocator, request: OwnedTransactionCommitRequest) !void {
     var copied = try request.clone(alloc);
     defer copied.deinit(alloc);
+}
+
+test "SQL JSON null metadata survives stage clone savepoint persistence and recovery" {
+    const alloc = std.testing.allocator;
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"a":{"j":null}}}}}
+    );
+    defer request.deinit(alloc);
+    request.tables[0].batch.writes[0].json_null_fields = try cloneJsonNullFields(alloc, &.{"j"});
+    try std.testing.checkAllAllocationFailures(alloc, checkCatalogBoundRequestClone, .{request});
+    const stored = try encodeCommitRequestMode(alloc, request, true);
+    defer alloc.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    var restored = try parseStoredCommitValue(alloc, parsed.value);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqualStrings("j", restored.tables[0].batch.writes[0].json_null_fields[0]);
+    try restored.tables[0].prepareWrites(alloc);
+    try std.testing.expectEqualStrings("j", restored.tables[0].txn_writes[0].json_null_fields[0]);
+    // Public JSON cannot forge the private persisted typing envelope.
+    var public = try parseCommitRequest(alloc, stored);
+    defer public.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), public.tables[0].batch.writes[0].json_null_fields.len);
 }
 
 test "transaction catalog binding clone releases partial allocations" {

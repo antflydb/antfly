@@ -124,6 +124,14 @@ pub const MetadataHttpClient = struct {
     alloc: std.mem.Allocator,
     executor: http_common.RequestExecutor,
     internal_service: ?internal_service_auth.Config = null,
+    setting_authority_secret: ?[]const u8 = null,
+    setting_authority_issuer: ?[]const u8 = null,
+
+    pub fn withSettingAuthority(self: *MetadataHttpClient, secret: ?[]const u8, issuer: ?[]const u8) *MetadataHttpClient {
+        self.setting_authority_secret = secret;
+        self.setting_authority_issuer = issuer;
+        return self;
+    }
 
     pub fn init(alloc: std.mem.Allocator, executor: http_common.RequestExecutor) MetadataHttpClient {
         return .{
@@ -1035,7 +1043,7 @@ pub const MetadataHttpClient = struct {
     /// Read-only retries are safe. The response proves the metadata identity;
     /// callers need no preceding status/discovery round trip on the happy path.
     pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
-        if (input == .mutate) return error.InvalidCatalogMutation;
+        if (input == .mutate or input == .setting_mutate or input == .policy_definition_mutate or input == .policy_publication_mutate or input == .policy_publication_begin or input == .fk_generation_publication_begin or input == .fk_generation_publication_mutate or input == .fk_initial_create_begin or input == .fk_initial_create_mutate) return error.InvalidCatalogMutation;
         if (remaining_ms == 0) return error.Timeout;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
@@ -1044,17 +1052,40 @@ pub const MetadataHttpClient = struct {
         const uri = try join(self.alloc, base_uri, "/internal/v1/system-catalog");
         defer self.alloc.free(uri);
         var remaining_buf: [10]u8 = undefined;
+        const authority = @import("../system_catalog/setting_authority.zig");
+        const grant = if (input == .setting_snapshot or input == .policy_snapshot or input == .policy_install_snapshot or input == .policy_publication_status or input == .policy_publication_work or input == .fk_generation_publication_status or input == .fk_generation_publication_work or input == .fk_generation_publication_decision or input == .fk_generation_publication_source_decision or input == .fk_initial_create_prepare or input == .fk_initial_child_decision or input == .fk_initial_create_status or input == .fk_generation_table_locked or input == .fk_initial_create_work or input == .fk_initial_parent_decision) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .read, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
+        defer if (grant) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
             .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms}) },
             .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = "0" },
             .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = "false" },
+            .{ .name = authority.header_name, .value = grant orelse "" },
         };
         var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
         defer response.deinit(self.alloc);
         if (response.status != 200) return switch (response.status) {
-            400 => error.InvalidCatalogName,
+            400 => if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
+                input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
+                std.mem.eql(u8, response.body, "InvalidGenerationPublication"))
+                error.InvalidGenerationPublication
+            else
+                error.InvalidCatalogName,
             404 => error.CatalogNotFound,
-            409 => error.CatalogGenerationChanged,
+            409 => if (input == .policy_publication_status and std.mem.eql(u8, response.body, "RowPolicyCatalogChanged"))
+                error.RowPolicyCatalogChanged
+            else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
+                input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
+                std.mem.eql(u8, response.body, "GenerationPublicationNotFound"))
+                error.GenerationPublicationNotFound
+            else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
+                input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
+                std.mem.eql(u8, response.body, "GenerationPublicationChanged"))
+                error.GenerationPublicationChanged
+            else
+                error.CatalogGenerationChanged,
             413 => error.CatalogCommandTooLarge,
             426 => error.TableTopologyProtocolUpgradeRequired,
             503 => error.NotLeader,
@@ -1072,7 +1103,8 @@ pub const MetadataHttpClient = struct {
         };
     }
 
-    pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, forwarding: raft_mutation_forwarding.Context) ![]u8 {
+    pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
+        if ((input == .setting_mutate or input == .policy_definition_mutate or input == .policy_publication_mutate or input == .policy_publication_begin or input == .fk_generation_publication_begin or input == .fk_generation_publication_mutate or input == .fk_initial_create_begin or input == .fk_initial_create_mutate) != setting_admin) return error.Forbidden;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
         if (body.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
@@ -1080,10 +1112,14 @@ pub const MetadataHttpClient = struct {
         defer self.alloc.free(uri);
         var remaining_buf: [10]u8 = undefined;
         var forwards_buf: [3]u8 = undefined;
+        const authority = @import("../system_catalog/setting_authority.zig");
+        const grant = if (setting_admin) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .admin, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
+        defer if (grant) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
             .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{forwarding.remaining_ms}) },
             .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = try std.fmt.bufPrint(&forwards_buf, "{d}", .{forwarding.forwards_remaining}) },
             .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = if (forwarding.campaign_allowed) "true" else "false" },
+            .{ .name = authority.header_name, .value = grant orelse "" },
         };
         var delivery: http_common.RequestDeliveryTracker = .{};
         var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery }, self.internal_service) catch |err| {
@@ -4219,6 +4255,63 @@ test "system catalog direct read carries identity and deadline without a discove
     try std.testing.expectError(error.Timeout, client.readSystemCatalog("http://metadata.invalid", .snapshot, 0, null));
     try std.testing.expectError(error.InvalidCatalogMutation, client.readSystemCatalog("http://metadata.invalid", .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "denied" } } }, 25, null));
     try std.testing.expectEqual(@as(usize, 2), executor.calls);
+}
+
+test "system catalog policy publication status preserves absent stamp without reclassifying other conflicts" {
+    const alloc = std.testing.allocator;
+    const Executor = struct {
+        body: []const u8,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            return .{ .status = 409, .body = try a.dupe(u8, self.body) };
+        }
+    };
+    var executor = Executor{ .body = "RowPolicyCatalogChanged" };
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("policy-status-test-secret", "policy-status-test");
+    try std.testing.expectError(error.RowPolicyCatalogChanged, client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_status = 7 }, 25, null));
+    executor.body = "CatalogGenerationChanged";
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_status = 7 }, 25, null));
+    executor.body = "RowPolicyCatalogChanged";
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+}
+
+test "system catalog FK decision preserves absent publication for initial-parent fallback" {
+    const alloc = std.testing.allocator;
+    const Executor = struct {
+        body: []const u8,
+        status: u16 = 409,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            return .{ .status = self.status, .body = try a.dupe(u8, self.body) };
+        }
+    };
+    var executor = Executor{ .body = "GenerationPublicationNotFound" };
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("fk-decision-test-secret", "fk-decision-test");
+    const decision: system_catalog.Call = .{ .fk_generation_publication_decision = .{
+        .plan_id = .{1} ** 16,
+        .parent_table_id = 1,
+        .parent_group_id = 2,
+        .child_table_id = 3,
+        .child_table_name = "child",
+        .action = .stage,
+    } };
+    try std.testing.expectError(error.GenerationPublicationNotFound, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
+    executor.body = "GenerationPublicationChanged";
+    try std.testing.expectError(error.GenerationPublicationChanged, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
+    executor.body = "CatalogGenerationChanged";
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
+    executor.body = "GenerationPublicationChanged";
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    executor.body = "GenerationPublicationNotFound";
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    executor.status = 400;
+    executor.body = "InvalidGenerationPublication";
+    try std.testing.expectError(error.InvalidGenerationPublication, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
+    try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
 }
 
 test "metadata mutation topology avoids diagnostics and owns parsed roles across compatibility fallback" {

@@ -687,6 +687,8 @@ const Handle = struct {
     storage_owner_managed_config: local_write.OwnerManagedConfig = .{},
     storage_owner_target_observer: kernel_owner_abi.TargetObserver = .{},
     storage_owner_table_name: ?[]u8 = null,
+    row_policy_authority_secret: ?[]u8 = null,
+    row_policy_authority_issuer: ?[]u8 = null,
     storage_owner_group_id: u64 = 0,
     storage_owner_root_generation: u64 = 0,
     storage_owner_context: ?*StorageOwnerContext = null,
@@ -1640,6 +1642,11 @@ fn closeHandle(handle: *Handle) void {
     }
     if (handle.storage_owner_path) |path| handle.alloc.free(path);
     if (handle.storage_owner_table_name) |table_name| handle.alloc.free(table_name);
+    if (handle.row_policy_authority_secret) |secret| {
+        @memset(secret, 0);
+        handle.alloc.free(secret);
+    }
+    if (handle.row_policy_authority_issuer) |issuer| handle.alloc.free(issuer);
     handle.alloc.destroy(handle);
     if (storage_owner_context) |context| context.release();
 }
@@ -4447,6 +4454,19 @@ pub fn metadataApplyStoreProjection(
     const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
     const alloc = handle.alloc;
     return switch (request.kind) {
+        .fk_initial_create_preflight => blk: {
+            if (request.key.len == 0 or request.key.len > 2 * 1024 * 1024) break :blk .invalid_argument;
+            const result: antfly.capi_dependencies.metadata_storage_raft_apply_contract.InitialFkPreflight = result: {
+                handle.store.preflightFkInitialCreateCommand(request.group_id, request.key.slice()) catch |err| break :result switch (err) {
+                    error.GenerationPublicationChanged => .generation_changed,
+                    error.CatalogAlreadyExists => .catalog_exists,
+                    error.TableTransitionActive => .table_transition_active,
+                    else => break :blk storageOwnerStatusFromError(err),
+                };
+                break :result .ready;
+            };
+            break :blk metadataProjectionJson(alloc, out_json, result);
+        },
         .flush_ha_outbox => blk: {
             handle.store.flushHAOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
@@ -4650,6 +4670,78 @@ pub fn metadataApplyStoreProjection(
                     var value = handle.store.systemCatalogSnapshot(a, group_id) catch |err| break :blk storageOwnerStatusFromError(err);
                     defer value.deinit();
                     break :blk metadataProjectionJson(alloc, out_json, .{ .meta = value.meta, .value = value.value });
+                },
+                .sql_setting_snapshot => |input| {
+                    const value = handle.store.sqlSettingSnapshotJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_policy_snapshot => |input| {
+                    const value = handle.store.sqlPolicySnapshotJson(a, group_id, input.table_id, input.principal, input.database, input.roles) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_policy_install_snapshot => |input| {
+                    const value = handle.store.sqlPolicyInstallSnapshotJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_policy_publication_status => |input| {
+                    const value = handle.store.sqlPolicyPublicationStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_policy_publication_work => |input| {
+                    const value = handle.store.sqlPolicyPublicationWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_policy_begin_command => |input| {
+                    const value = handle.store.sqlPolicyBeginCommandJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .require_policy_index_mutation_allowed => |input| {
+                    handle.store.requirePolicyIndexMutationAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
+                .require_policy_topology_mutation_allowed => |input| {
+                    handle.store.requirePolicyTopologyMutationAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
+                .fk_generation_publication_status => |input| {
+                    const value = handle.store.fkGenerationPublicationStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .fk_generation_publication_work => |input| {
+                    const value = handle.store.fkGenerationPublicationWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .fk_generation_publication_decision => |input| {
+                    const value = handle.store.fkGenerationPublicationDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .fk_generation_publication_source_decision => |input| {
+                    const value = handle.store.fkGenerationPublicationSourceDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .fk_initial_create_prepare => |input| {
+                    const value = handle.store.fkInitialCreatePrepareJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .fk_initial_child_decision => |input| {
+                    const value = handle.store.fkInitialChildDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .fk_initial_create_status => |input| {
+                    const value = handle.store.fkInitialCreateStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .fk_generation_table_locked => |input| {
+                    const value = handle.store.fkGenerationTableLockedJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .fk_initial_create_work => |input| {
+                    const value = handle.store.fkInitialCreateWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .fk_initial_parent_decision => |input| {
+                    const value = handle.store.fkInitialParentDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
                 },
             }
         },
@@ -5959,7 +6051,9 @@ pub fn storageOwnerOpen(
     if (request.restore_cancel_recovery > 1 or request.restore_ha_replay > 1 or
         request.historical_raft_apply > 1 or
         (request.restore_cancel_recovery != 0 and request.restore_ha_replay != 0) or
-        ((request.restore_cancel_recovery != 0 or request.restore_ha_replay != 0) and request.restore_bootstrap_json.len == 0) or request.restore_bootstrap_json.len > 16 * 1024 * 1024) return .invalid_argument;
+        ((request.restore_cancel_recovery != 0 or request.restore_ha_replay != 0) and request.restore_bootstrap_json.len == 0) or request.restore_bootstrap_json.len > 16 * 1024 * 1024 or
+        request.initial_child_bootstrap_json.len > 4096 or
+        (request.initial_child_bootstrap_json.len != 0 and (request.restore_bootstrap_json.len != 0 or request.schema_json.len != 0 or request.indexes_json.len != 0))) return .invalid_argument;
     var restore_bootstrap: ?std.json.Parsed(antfly.capi_dependencies.storage_db_restore_staging_contract.OwnerBootstrap) = null;
     defer if (restore_bootstrap) |*parsed| parsed.deinit();
     if (request.restore_bootstrap_json.len != 0) {
@@ -5968,6 +6062,14 @@ pub fn storageOwnerOpen(
         bootstrap.validate() catch |err| return storageOwnerStatusFromError(err);
         const namespace = identity_namespace orelse return .invalid_argument;
         if (!namespace.eql(bootstrap.scope.target_namespace) or !std.mem.eql(u8, bootstrap.table_name, table_name) or !std.mem.eql(u8, bootstrap.schema_json, request.schema_json.slice()) or !std.mem.eql(u8, bootstrap.indexes_json, request.indexes_json.slice())) return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+    }
+    var initial_child_bootstrap: ?std.json.Parsed(antfly.capi_dependencies.storage_db_relational_initial_child_publication.Bootstrap) = null;
+    defer if (initial_child_bootstrap) |*parsed| parsed.deinit();
+    if (request.initial_child_bootstrap_json.len != 0) {
+        initial_child_bootstrap = std.json.parseFromSlice(antfly.capi_dependencies.storage_db_relational_initial_child_publication.Bootstrap, alloc, request.initial_child_bootstrap_json.slice(), .{ .ignore_unknown_fields = false }) catch |err| return storageOwnerStatusFromError(err);
+        initial_child_bootstrap.?.value.validate() catch |err| return storageOwnerStatusFromError(err);
+        const namespace = identity_namespace orelse return .invalid_argument;
+        if (!namespace.eql(initial_child_bootstrap.?.value.namespace)) return storageOwnerStatusFromError(error.InvalidInitialChildPublication);
     }
     var open_options = db_mod.OpenOptions{
         .online_source_authority = std.enums.fromInt(antfly.capi_dependencies.storage_source_authority.Kind, request.online_source_authority) orelse return .invalid_argument,
@@ -5978,12 +6080,14 @@ pub fn storageOwnerOpen(
             _ => return .invalid_argument,
         },
         .schema_before_index_load = prepared_schema,
+        .reject_stale_schema_before_index_load = request.historical_raft_apply == 0 and restore_bootstrap == null,
         .lsm_cache = if (owner_context) |context| &context.resources.lsm_cache else null,
         .hbc_cache = if (owner_context) |context| &context.resources.hbc_cache else null,
         .lsm_root_generation = request.lsm_root_generation,
         .resource_manager = if (owner_context) |context| &context.resources.resource_manager else null,
         .backend_runtime = if (owner_context) |context| context.backend_runtime.ptr() else null,
         .identity_namespace = identity_namespace,
+        .initial_child_bootstrap = if (initial_child_bootstrap) |value| value.value else null,
         .prefer_existing_identity_namespace = identity_namespace != null,
         .transaction_recovery = if (recovery) |value| value.dbConfig() else .{},
         .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() else null,
@@ -5995,8 +6099,8 @@ pub fn storageOwnerOpen(
         .index_backends = .{ .dense_native_migration_policy_source = if (runtime_hooks) |value| value.nativeMigrationPolicy() else null },
         .secret_store = if (owner_context) |context| context.secret_store else null,
         .remote_content = if (owner_context) |context| context.remoteContent() else null,
-        .start_optional_runtimes = restore_bootstrap == null,
-        .start_index_workers = restore_bootstrap == null,
+        .start_optional_runtimes = restore_bootstrap == null and initial_child_bootstrap == null,
+        .start_index_workers = restore_bootstrap == null and initial_child_bootstrap == null,
     };
     if (request.has_initial_range > 1 or request.initial_range_control.version != kernel_owner_abi.abi_version or request.initial_range_control.has_execution_deadline > 1) return .invalid_argument;
     if (request.has_initial_range != 0) {
@@ -6018,6 +6122,24 @@ pub fn storageOwnerOpen(
     defer if (!success) alloc.free(owned_path);
     const owned_table_name = alloc.dupe(u8, table_name) catch return .out_of_memory;
     defer if (!success) alloc.free(owned_table_name);
+    if ((request.row_policy_authority_secret.len != 0 and request.row_policy_authority_secret.ptr == null) or
+        (request.row_policy_authority_issuer.len != 0 and request.row_policy_authority_issuer.ptr == null) or
+        (request.row_policy_authority_secret.len == 0) != (request.row_policy_authority_issuer.len == 0) or
+        request.row_policy_authority_secret.len > 4096 or request.row_policy_authority_issuer.len > 256)
+        return .invalid_argument;
+    const owned_policy_secret = if (request.row_policy_authority_secret.len != 0)
+        alloc.dupe(u8, request.row_policy_authority_secret.slice()) catch return .out_of_memory
+    else
+        null;
+    defer if (!success) if (owned_policy_secret) |secret| {
+        @memset(secret, 0);
+        alloc.free(secret);
+    };
+    const owned_policy_issuer = if (request.row_policy_authority_issuer.len != 0)
+        alloc.dupe(u8, request.row_policy_authority_issuer.slice()) catch return .out_of_memory
+    else
+        null;
+    defer if (!success) if (owned_policy_issuer) |issuer| alloc.free(issuer);
     const handle = alloc.create(Handle) catch return .out_of_memory;
     defer if (!success) alloc.destroy(handle);
     handle.* = .{
@@ -6036,6 +6158,8 @@ pub fn storageOwnerOpen(
         },
         .storage_owner_path = owned_path,
         .storage_owner_table_name = owned_table_name,
+        .row_policy_authority_secret = owned_policy_secret,
+        .row_policy_authority_issuer = owned_policy_issuer,
         .storage_owner_group_id = request.group_id,
         .storage_owner_root_generation = request.lsm_root_generation,
         .storage_owner_context = owner_context,
@@ -6044,6 +6168,9 @@ pub fn storageOwnerOpen(
         .storage_owner_target_observer = request.target_observer,
     };
     defer if (!success) handle.db.close();
+    handle.db.row_policy_authority_secret = owned_policy_secret;
+    handle.db.row_policy_authority_issuer = owned_policy_issuer;
+    handle.db.row_policy_table_name = owned_table_name;
     if (runtime_hooks) |hooks| handle.db.setCoordinatedTtl(hooks.coordinatedTtlPort(), request.group_id);
     if (request.target_observer.notify != null) handle.db.setQueryVisibilityHook(.{
         .ptr = handle,
@@ -6055,25 +6182,30 @@ pub fn storageOwnerOpen(
     // after the DB occupies its final address, and drain them on failure.
     if (restore_bootstrap) |bootstrap| {
         local_write.configureRestoreOwnerDb(alloc, &handle.db, bootstrap.value, request.restore_cancel_recovery != 0, request.restore_ha_replay != 0) catch |err| return storageOwnerStatusFromError(err);
-    } else local_write.configureStorageKernelOwnerDbAtOpen(
-        alloc,
-        &handle.db,
-        table_name,
-        request.schema_json.slice(),
-        request.indexes_json.slice(),
-        if (owner_context) |context| context.backend_runtime.ptr() else null,
-        if (owner_context) |context| context.antflyProvider() else null,
-        if (owner_context) |context| context.secret_store else null,
-        if (owner_context) |context| context.remoteContent() else null,
-        &handle.storage_owner_managed_config,
-        request.historical_raft_apply != 0,
-    ) catch |err| return storageOwnerStatusFromError(err);
+    } else {
+        const deferred = local_write.configureStorageKernelOwnerDbAtOpen(
+            alloc,
+            &handle.db,
+            table_name,
+            request.schema_json.slice(),
+            request.indexes_json.slice(),
+            if (owner_context) |context| context.backend_runtime.ptr() else null,
+            if (owner_context) |context| context.antflyProvider() else null,
+            if (owner_context) |context| context.secret_store else null,
+            if (owner_context) |context| context.remoteContent() else null,
+            &handle.storage_owner_managed_config,
+            request.historical_raft_apply != 0,
+        ) catch |err| return storageOwnerStatusFromError(err);
+        if (request.owner_catalog_deferred_out) |out| out.* = @intFromBool(deferred);
+    }
     // DB.open returns by value. Only now is the compiled owner's DB at its
     // permanent address with configuration installed; use the same startup as
     // resident caches so relational builds, retirement and durable outboxes
     // make progress. Hidden restore owners must remain unpublished/quiescent.
     if (restore_bootstrap == null) {
-        handle.db.activateResolverReplayRuntimes() catch |err| return storageOwnerStatusFromError(err);
+        handle.db.activateResolverReplayRuntimes() catch |err| {
+            return storageOwnerStatusFromError(err);
+        };
         handle.db.startResidentBackgroundWorkersIfNeeded();
     }
     // Register as the last fallible step: on failure the defers above close
@@ -6089,6 +6221,17 @@ pub fn storageOwnerOpen(
 
 pub fn storageOwnerClose(owner: ?*anyopaque) callconv(.c) void {
     antfly_db_close(owner);
+}
+
+test "storage owner open rejects prior ABI before reading expanded request fields" {
+    var owner: ?*anyopaque = @ptrFromInt(1);
+    const old_request: kernel_owner_abi.OpenRequest = .{
+        .version = 68,
+        .path = .{ .ptr = @ptrFromInt(1), .len = 1 },
+        .owner_catalog_deferred_out = @ptrFromInt(1),
+    };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_abi, storageOwnerOpen(&old_request, &owner));
+    try std.testing.expect(owner == null);
 }
 
 pub fn storageOwnerConfigure(
@@ -6596,6 +6739,29 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
         .ptr = response.ptr,
         .len = @intCast(response.len),
     };
+    return .ok;
+}
+
+pub fn storageOwnerNativeInitialChildControlJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.NativeInitialChildControlRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.operation_term != 1 or request.operation_index < 1 or request.operation_index > 3) return .invalid_argument;
+    var owned = batch_api.parseInternalBatchRequest(handle.alloc, request.request_json.slice()) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer owned.deinit(handle.alloc);
+    handle.db.batchNativeInitialChildApply(owned.req, .{
+        .term = request.operation_term,
+        .index = request.operation_index,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = response.len };
     return .ok;
 }
 
@@ -7410,6 +7576,7 @@ fn batchStorageKernelJson(
     var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err|
         return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
+    if (owned.req.row_policy_publication != null) return .invalid_argument;
     if (owned.req.relational_index_maintenance) |command| if (command.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.PreparedGenerationChanged);
 
     if (committed_batch_effects_observer) |observer|
@@ -7440,6 +7607,7 @@ fn replicatedBatchStorageKernelJson(
     var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err|
         return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
+    if (owned.req.row_policy_publication != null) return .invalid_argument;
     if (owned.req.relational_index_maintenance) |command| if (command.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.PreparedGenerationChanged);
 
     local_write.applyStorageKernelReplicatedBatch(
@@ -7467,6 +7635,21 @@ fn replicatedBatchStorageKernelJsonAtRaftEntry(
     var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err|
         return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
+    if (owned.req.row_policy_publication) |publication| {
+        if (publication.table_id != handle.db.core.identity_namespace.table_id or publication.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        const bundle = owned.req.row_policy_install_bundle;
+        // Bound the private ABI payload before crossing into the storage owner;
+        // the owner independently checks the canonical bundle limit and shape.
+        if (bundle.len == 0 or bundle.len > 4 * 1024 * 1024) return .invalid_argument;
+        const receipt = handle.db.applyReplicatedRowPolicyPublication(bundle, publication, raft_entry) catch |err|
+            return storageOwnerStatusFromError(err);
+        var result = owned.result();
+        result.row_policy_receipt = receipt;
+        const response = batch_api.encodeBatchResponse(std.heap.c_allocator, result) catch |err|
+            return storageOwnerStatusFromError(err);
+        out_buf.* = .{ .ptr = response.ptr, .len = response.len };
+        return .ok;
+    }
     if (owned.req.relational_index_maintenance) |command| if (command.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.PreparedGenerationChanged);
 
     local_write.applyStorageKernelReplicatedBatchAtRaftEntry(
@@ -7545,6 +7728,172 @@ pub fn storageOwnerLookupJson(
     return .ok;
 }
 
+pub fn storageOwnerRelationalReadProvider(
+    owner: ?*anyopaque,
+    contract: *const antfly.capi_dependencies.runtime_native_abi.TypeContract,
+    output: *anyopaque,
+) callconv(.c) antfly.capi_dependencies.runtime_error_abi.Status {
+    const provider = antfly.capi_dependencies.relational_read_provider;
+    const errors = antfly.capi_dependencies.runtime_error_abi;
+    if (!contract.matches(.of(provider.Provider))) return errors.statusFromError(error.InvalidArgument);
+    _ = asHandle(owner) orelse return errors.statusFromError(error.InvalidArgument);
+    const out: *provider.Provider = @ptrCast(@alignCast(output));
+    // Provider callbacks resolve the registry id on every call. Returning the
+    // raw Handle here would fail that check and could outlive its generation.
+    out.* = .{ .ptr = owner.?, .vtable = &.{ .open = StorageRelationalRead.open, .try_fence = StorageRelationalRead.tryFence } };
+    return .ok;
+}
+
+const StorageRelationalRead = struct {
+    const View = antfly.capi_dependencies.relational_read_provider.View;
+    const Fence = antfly.capi_dependencies.statement_read_fence.Fence;
+    const Snapshot = antfly.capi_dependencies.statement_read_fence.Snapshot;
+
+    const Pinned = struct {
+        alloc: std.mem.Allocator,
+        db: *db_mod.DB,
+        read: db_mod.DB.RelationalStatementSnapshot,
+
+        fn open(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !View {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!opts.include_range_proofs) return error.SqlRangeTrackingRequired;
+            const query = opts.relational_query orelse return error.SqlStatementSnapshotRequired;
+            if (query.index != null or query.auto_index) return error.SqlStatementSnapshotRequired;
+            const session = try self.db.openRelationalReadSessionAtSnapshot(alloc, from, to, opts, &self.read);
+            return .{ .ptr = session, .vtable = &.{ .next = StorageRelationalRead.next, .close = StorageRelationalRead.close, .normalize = StorageRelationalRead.normalize, .range_proofs = StorageRelationalRead.rangeProofs } };
+        }
+
+        fn release(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.read.deinit();
+            self.alloc.destroy(self);
+        }
+    };
+
+    const Capture = struct {
+        alloc: std.mem.Allocator,
+        db: *db_mod.DB,
+        fence: db_mod.DB.StatementReadFence,
+        cancellation: @FieldType(db_mod.types.ScanOptions, "cancellation"),
+        deadline_ns: ?u64,
+
+        fn validate(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.cancellation) |token| try token.check();
+            if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        }
+        fn release(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.fence.release();
+            self.alloc.destroy(self);
+        }
+        fn open(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !View {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try validate(ptr);
+            const view = try StorageRelationalRead.openAny(self.db, alloc, from, to, opts);
+            errdefer view.deinit();
+            try validate(ptr);
+            return view;
+        }
+
+        fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !Snapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try validate(ptr);
+            const pinned = try alloc.create(Pinned);
+            errdefer alloc.destroy(pinned);
+            var read = try self.db.captureRelationalStatementSnapshot();
+            errdefer read.deinit();
+            pinned.* = .{ .alloc = alloc, .db = self.db, .read = read };
+            try validate(ptr);
+            return .{ .ptr = pinned, .vtable = &.{ .open = Pinned.open, .release = Pinned.release } };
+        }
+    };
+
+    fn tryFence(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, opts: db_mod.types.ScanOptions) !?Fence {
+        const handle = asHandle(ptr) orelse return error.InvalidArgument;
+        _ = storageOwnerTableName(handle, .fromSlice(table)) orelse return error.InvalidArgument;
+        if (opts.cancellation) |token| try token.check();
+        var fence = (try handle.db.tryStatementReadFence()) orelse return null;
+        errdefer fence.release();
+        const capture = try alloc.create(Capture);
+        errdefer alloc.destroy(capture);
+        capture.* = .{ .alloc = alloc, .db = &handle.db, .fence = fence, .cancellation = opts.cancellation, .deadline_ns = opts.execution_deadline_ns };
+        try Capture.validate(capture);
+        return .{ .ptr = capture, .vtable = &.{ .validate = Capture.validate, .open = Capture.open, .capture_snapshot = Capture.captureSnapshot, .release = Capture.release } };
+    }
+
+    fn open(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !View {
+        const handle = asHandle(ptr) orelse return error.InvalidArgument;
+        _ = storageOwnerTableName(handle, .fromSlice(table)) orelse return error.InvalidArgument;
+        try handle.prepareScanRequest(from, to, opts);
+        return openAny(&handle.db, alloc, from, to, opts);
+    }
+
+    fn openAny(db: *db_mod.DB, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !View {
+        var schema = db.core.acquireSchemaView();
+        defer if (schema) |*epoch| epoch.release();
+        if (schema == null or schema.?.storageMode() == .document) {
+            const session = try db.openDocumentReadSession(alloc, from, to, opts);
+            return .{ .ptr = session, .vtable = &.{ .next = nextDocument, .close = closeDocument, .normalize = normalizeDocument, .range_proofs = documentRangeProofs } };
+        }
+        const session = try db.openRelationalReadSession(alloc, from, to, opts);
+        return .{ .ptr = session, .vtable = &.{ .next = next, .close = close, .normalize = normalize, .range_proofs = rangeProofs } };
+    }
+
+    fn documentRangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]antfly.capi_dependencies.storage_range_protection.Proof {
+        const session: *db_mod.DB.DocumentReadSession = @ptrCast(@alignCast(ptr));
+        return session.rangeProofs(alloc);
+    }
+
+    fn rangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]antfly.capi_dependencies.storage_range_protection.Proof {
+        const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
+        return session.rangeProofs(alloc);
+    }
+
+    fn nextDocument(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !View.Page {
+        const session: *db_mod.DB.DocumentReadSession = @ptrCast(@alignCast(ptr));
+        return session.next(alloc, limit);
+    }
+
+    fn closeDocument(ptr: *anyopaque) void {
+        const session: *db_mod.DB.DocumentReadSession = @ptrCast(@alignCast(ptr));
+        session.deinit();
+    }
+
+    fn normalizeDocument(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const db_mod.types.BatchWrite) ![]db_mod.types.BatchWrite {
+        const session: *db_mod.DB.DocumentReadSession = @ptrCast(@alignCast(ptr));
+        return session.normalizeRows(alloc, writes);
+    }
+
+    fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !View.Page {
+        const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
+        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024 });
+        errdefer page.deinit();
+        const owned = page.arena.allocator();
+        const rows = try owned.alloc(View.Row, page.rows.len);
+        for (page.rows, rows) |row, *out| out.* = .{
+            .id = row.key,
+            .version = row.version,
+            .schema_version = session.reader.active.version(),
+            .value = row.typed orelse return error.InvalidResponse,
+            .sql_nulls = row.sql_nulls,
+            .expected_content_digest = row.expected_content_digest,
+        };
+        const after = if (page.more) try owned.dupe(u8, session.reader.after.items) else null;
+        return .{ .arena = page.arena, .rows = rows, .after = after };
+    }
+
+    fn close(ptr: *anyopaque) void {
+        const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
+        session.deinit();
+    }
+
+    fn normalize(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const db_mod.types.BatchWrite) ![]db_mod.types.BatchWrite {
+        const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
+        return session.normalizeRows(alloc, writes);
+    }
+};
+
 pub fn storageOwnerScanStream(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.ControlledJsonOperationRequest,
@@ -7560,7 +7909,7 @@ pub fn storageOwnerScanStream(
         table_reads_api.StorageKernelScanWireRequest,
         handle.alloc,
         request.request_json.slice(),
-        .{},
+        .{ .parse_numbers = false },
     ) catch return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
     defer parsed.deinit();
     var opts = parsed.value.options();
@@ -7569,7 +7918,7 @@ pub fn storageOwnerScanStream(
     if (opts.cancellation.?.isCancelled()) return storageOwnerQueryFailure(error.Canceled, .scan_stream, out_failure);
     if (opts.execution_deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return storageOwnerQueryFailure(error.DeadlineExceeded, .scan_stream, out_failure);
     handle.prepareScanRequest(parsed.value.from_key, parsed.value.to_key, opts) catch |err| return storageOwnerQueryFailure(err, .scan_stream, out_failure);
-    if (opts.relational_query_json.len != 0) {
+    if (opts.isRelational()) {
         // Readiness, schema and every typed row must validate before HTTP 200.
         // This is a single bounded owner snapshot, not independently paged reads.
         var result = handle.db.scan(handle.alloc, parsed.value.from_key, parsed.value.to_key, opts) catch |err| return storageOwnerQueryFailure(err, .scan_stream, out_failure);
@@ -7620,7 +7969,7 @@ pub fn storageOwnerScanNdjson(
         table_reads_api.StorageKernelScanWireRequest,
         handle.alloc,
         request.request_json.slice(),
-        .{},
+        .{ .parse_numbers = false },
     ) catch |err| return storageOwnerQueryFailure(err, .validate_request, out_failure);
     defer parsed.deinit();
     var opts = parsed.value.options();
@@ -11401,6 +11750,150 @@ fn searchPublicQueryJson(
     return .ok;
 }
 
+/// SQL over one explicitly named embedded table. No metadata catalog or remote
+/// coordinator is invented by this single-handle ABI. Output is always freed by
+/// antfly_buffer_free, including structured SQL diagnostics on failure.
+pub export fn antfly_db_sql_json(handle_ptr: ?*anyopaque, table_name: capi.Slice, request_json: capi.Slice, out_buf: *capi.Buffer) capi.ErrorCode {
+    out_buf.* = .{};
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (table_name.bytes().len == 0 or table_name.bytes().len > 1024 or request_json.bytes().len > 2 * 1024 * 1024) return .invalid_argument;
+    // Managed owners require Raft routing and credentials supplied by API SQL.
+    if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return .unsupported;
+    executeEmbeddedSql(handle, table_name.bytes(), request_json.bytes(), out_buf) catch |err| {
+        if (err == error.RowPolicyAuthenticationRequired) return .unsupported;
+        const diagnostic = antfly.capi_dependencies.sql_errors.describe(err);
+        if (out_buf.ptr == null) out_buf.* = stringifyJson(.{ .@"error" = diagnostic }) catch return .internal;
+        if (std.mem.eql(u8, diagnostic.code, "40003")) return .outcome_unknown;
+        if (std.mem.eql(u8, diagnostic.code, "0A000")) return .unsupported;
+        if (std.mem.eql(u8, diagnostic.code, "40001")) return .version_conflict;
+        if (std.mem.eql(u8, diagnostic.code, "XX000") or std.mem.eql(u8, diagnostic.code, "53200")) return .internal;
+        return .invalid_argument;
+    };
+    return .ok;
+}
+
+fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json: []const u8, out_buf: *capi.Buffer) !void {
+    // Lite has no authenticated principal capability. Hold a raw lease for
+    // the entire statement, including DDL paths that do not call row APIs,
+    // so policy activation cannot race an already-admitted SQL statement.
+    var row_policy_lease = try handle.db.row_policy_gate.enterRaw();
+    defer row_policy_lease.release();
+    const sql = @import("sql.zig");
+    const Budget = antfly.capi_dependencies.sql_memory_budget;
+    var preparation_budget = Budget{ .backing = handle.alloc, .limit = 8 * 1024 * 1024 };
+    const temporary = preparation_budget.allocator();
+    const Request = struct {
+        statement: []const u8,
+        parameters: []const std.json.Value = &.{},
+        limit: usize = 128,
+        session_id: ?[]const u8 = null,
+        database: ?[]const u8 = null,
+        namespace: ?[]const u8 = null,
+    };
+    var parsed = std.json.parseFromSlice(Request, temporary, request_json, .{ .allocate = .alloc_always }) catch |err| {
+        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlProgramLimitExceeded;
+        return error.InvalidSqlParameters;
+    };
+    defer parsed.deinit();
+    if (parsed.value.session_id != null or parsed.value.database != null or parsed.value.namespace != null) return error.UnsupportedSqlExecution;
+    var compiled = sql.compiler.compile(temporary, parsed.value.statement, .{}) catch |err| {
+        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlProgramLimitExceeded;
+        return err;
+    };
+    defer compiled.deinit();
+    // Reserve a bounded C-owned receipt before a write can commit. Neither
+    // response encoding nor the final ABI copy may erase a known commit when
+    // allocation fails afterwards. JSON trailing whitespace preserves the
+    // full allocation length for the caller's buffer-free contract.
+    var commit_receipt: ?[]u8 = switch (compiled.statement) {
+        .insert, .update, .delete => try std.heap.c_allocator.alloc(u8, 512),
+        else => null,
+    };
+    defer if (commit_receipt) |buffer| std.heap.c_allocator.free(buffer);
+    var adapter = sql.Adapter(antfly){ .db = &handle.db, .table_name = table_name, .read_only = handle.open_mode != .writer };
+    var result = sql.runtime.execute(handle.alloc, adapter.backend(), &compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit }) catch |err| {
+        if (err == error.SqlMutationOutcomeUnknown) if (adapter.outcome_transaction_id) |txn_id| {
+            out_buf.* = embeddedSqlUnknownReceipt(&commit_receipt, txn_id);
+        };
+        return err;
+    };
+    defer result.deinit();
+    var encoding_budget = Budget{ .backing = handle.alloc, .limit = 16 * 1024 * 1024 };
+    const bytes = std.json.Stringify.valueAlloc(encoding_budget.allocator(), result.output, .{}) catch |err| {
+        if (result.output.mutation_outcome != null) {
+            // Encoding failure after commit must never invite a mutation retry.
+            // Preserve the authoritative commit outcome in a bounded envelope.
+            out_buf.* = embeddedSqlCommitReceipt(&commit_receipt, result.output);
+            return;
+        }
+        if (err == error.OutOfMemory and encoding_budget.exhausted) return error.SqlProgramLimitExceeded;
+        return err;
+    };
+    defer encoding_budget.allocator().free(bytes);
+    out_buf.* = dupBytes(bytes) catch |err| {
+        if (result.output.mutation_outcome != null) {
+            out_buf.* = embeddedSqlCommitReceipt(&commit_receipt, result.output);
+            return;
+        }
+        return err;
+    };
+}
+
+fn embeddedSqlUnknownReceipt(reserved: *?[]u8, txn_id: db_mod.types.TxnId) capi.Buffer {
+    const buffer = reserved.*.?;
+    @memset(buffer, ' ');
+    const txn_hex = std.fmt.bytesToHex(txn_id, .lower);
+    _ = std.fmt.bufPrint(buffer, "{f}", .{std.json.fmt(.{
+        .transaction_id = @as([]const u8, &txn_hex),
+        .@"error" = .{ .code = "40003", .message = "The mutation outcome is unknown. Reconcile the native transaction receipt; do not replay the statement.", .retryable = false },
+    }, .{})}) catch unreachable;
+    reserved.* = null;
+    return .{ .ptr = buffer.ptr, .len = buffer.len };
+}
+
+fn embeddedSqlCommitReceipt(reserved: *?[]u8, output: antfly.capi_dependencies.sql_runtime.Output) capi.Buffer {
+    const buffer = reserved.*.?;
+    @memset(buffer, ' ');
+    // Only runtime-owned INSERT/UPDATE/DELETE tags and bounded enum/integer
+    // fields enter this envelope; 512 bytes exceeds their maximum encoding.
+    _ = std.fmt.bufPrint(buffer, "{f}", .{std.json.fmt(.{
+        .mutation_outcome = output.mutation_outcome.?,
+        .rows_affected = output.rows_affected,
+        .command_tag = output.command_tag,
+        .@"error" = .{ .code = "53200", .message = "The mutation committed but its full response could not be allocated.", .retryable = false },
+    }, .{})}) catch unreachable;
+    reserved.* = null;
+    return .{ .ptr = buffer.ptr, .len = buffer.len };
+}
+
+test "capi SQL reserved receipt preserves every known mutation outcome without allocation" {
+    inline for (std.meta.tags(antfly.capi_dependencies.sql_catalog.MutationOutcome)) |outcome| {
+        var reserved: ?[]u8 = try std.heap.c_allocator.alloc(u8, 512);
+        defer if (reserved) |buffer| std.heap.c_allocator.free(buffer);
+        const receipt = embeddedSqlCommitReceipt(&reserved, .{ .command_tag = "DELETE", .rows_affected = std.math.maxInt(u64), .mutation_outcome = outcome });
+        defer freeRawBuffer(receipt.ptr, receipt.len);
+        try std.testing.expect(reserved == null);
+        const decoded = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, receipt.ptr.?[0..receipt.len], .{ .parse_numbers = false });
+        defer decoded.deinit();
+        try std.testing.expectEqualStrings(@tagName(outcome), decoded.value.object.get("mutation_outcome").?.string);
+        try std.testing.expectEqualStrings("18446744073709551615", decoded.value.object.get("rows_affected").?.number_string);
+        try std.testing.expect(!decoded.value.object.get("error").?.object.get("retryable").?.bool);
+    }
+}
+
+test "capi SQL unknown commit receipt retains native transaction identity without allocation" {
+    var reserved: ?[]u8 = try std.heap.c_allocator.alloc(u8, 512);
+    defer if (reserved) |buffer| std.heap.c_allocator.free(buffer);
+    const receipt = embeddedSqlUnknownReceipt(&reserved, @splat(0xab));
+    defer freeRawBuffer(receipt.ptr, receipt.len);
+    try std.testing.expect(reserved == null);
+    const decoded = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, receipt.ptr.?[0..receipt.len], .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("abababababababababababababababab", decoded.value.object.get("transaction_id").?.string);
+    try std.testing.expectEqualStrings("40003", decoded.value.object.get("error").?.object.get("code").?.string);
+    try std.testing.expect(!decoded.value.object.get("error").?.object.get("retryable").?.bool);
+}
+
 pub export fn antfly_db_search_json(
     handle_ptr: ?*anyopaque,
     request_json: capi.Slice,
@@ -14282,6 +14775,392 @@ test "capi transaction lifecycle" {
     try std.testing.expectEqual(@as(u64, 2_000), commit_version);
 }
 
+test "Lite raw rows fail closed during row-policy owner transition" {
+    var test_tmp = try TestDirectory.init("capi-row-policy-gate");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, test_tmp.path(), "lite-policy-gate");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var handle_ptr: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
+    defer antfly_db_close(handle_ptr);
+
+    {
+        const guard = enterHandle(handle_ptr, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        try guard.handle.db.row_policy_gate.beginPreparing(.disabled);
+    }
+
+    var out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_batch_json(handle_ptr, .fromSlice("{\"inserts\":{\"a\":{\"x\":1}}}"), &out));
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_lookup_json(handle_ptr, .fromSlice("a"), &out));
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_get_raw(handle_ptr, .fromSlice("a"), &out));
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_scan_json(handle_ptr, .fromSlice("{}"), &out));
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT 1\"}"), &out));
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"CREATE TABLE blocked (id INT)\"}"), &out));
+    var timestamp: u64 = 0;
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_get_timestamp(handle_ptr, .fromSlice("a"), &timestamp));
+    try std.testing.expect(out.ptr == null);
+}
+
+test "capi SQL document mutations preserve undeclared fields and typed null semantics" {
+    var directory = try TestDirectory.init("capi-sql-document");
+    defer directory.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, directory.path(), "document");
+    defer alloc.free(path);
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle));
+    defer antfly_db_close(handle);
+    const schema =
+        \\{"version":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"j":{"default":{"annotated":true}}},"additionalProperties":true}}}}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle, .fromSlice(schema)));
+    var inserted: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .fromSlice("{\"inserts\":{\"a\":{\"n\":9007199254740993,\"extra\":true}}}"), &inserted));
+    defer freeRawBuffer(inserted.ptr, inserted.len);
+    var response: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT n FROM items WHERE _id='a'\"}"), &response));
+    defer freeRawBuffer(response.ptr, response.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.ptr.?[0..response.len], .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("9007199254740993", rows[0].array.items[0].string);
+    for ([_][]const u8{
+        "UPDATE items SET n=n+1, j='null' WHERE _id='a' RETURNING n,j",
+        "INSERT INTO items (_id,n,j) VALUES ('b',2,NULL) RETURNING n,j",
+        "INSERT INTO items (_id,n) VALUES ('c',2) RETURNING j",
+        "UPDATE items SET j=NULL WHERE _id='a' RETURNING j",
+    }) |statement| {
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement }, .{});
+        defer alloc.free(body);
+        var updated: capi.Buffer = .{};
+        const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice(body), &updated);
+        defer freeRawBuffer(updated.ptr, updated.len);
+        if (status != .ok) std.debug.print("document mutation error: {s}\n", .{updated.ptr.?[0..updated.len]});
+        try std.testing.expectEqual(capi.ErrorCode.ok, status);
+    }
+    var stored: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(handle, .fromSlice("a"), &stored));
+    defer freeRawBuffer(stored.ptr, stored.len);
+    const document = try std.json.parseFromSlice(std.json.Value, alloc, stored.ptr.?[0..stored.len], .{});
+    defer document.deinit();
+    try std.testing.expectEqual(@as(i64, 9007199254740994), document.value.object.get("n").?.integer);
+    try std.testing.expect(document.value.object.get("extra").?.bool);
+    try std.testing.expect(!document.value.object.contains("j"));
+    // JSON Schema defaults are annotations, not SQL column defaults. Both
+    // omitted JSON and explicit SQL NULL stay absent under native semantics.
+    for ([_][]const u8{ "b", "c" }) |key| {
+        var row: capi.Buffer = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(handle, .fromSlice(key), &row));
+        defer freeRawBuffer(row.ptr, row.len);
+        const value = try std.json.parseFromSlice(std.json.Value, alloc, row.ptr.?[0..row.len], .{});
+        defer value.deinit();
+        try std.testing.expect(!value.value.object.contains("j"));
+    }
+    var deleted: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"DELETE FROM items WHERE _id='a' RETURNING n\"}"), &deleted));
+    defer freeRawBuffer(deleted.ptr, deleted.len);
+}
+
+test "capi SQL document validation rejects an entire mutation before publication" {
+    var directory = try TestDirectory.init("capi-sql-document-validation");
+    defer directory.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, directory.path(), "document");
+    defer alloc.free(path);
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle));
+    defer antfly_db_close(handle);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle, .fromSlice(
+        \\{"version":1,"enforce_types":true,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","minimum":0}},"required":["n"],"additionalProperties":true}}}}
+    )));
+    var response: capi.Buffer = .{};
+    const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"INSERT INTO items (_id,n) VALUES ('valid',1),('invalid',-1) RETURNING n\"}"), &response);
+    defer freeRawBuffer(response.ptr, response.len);
+    try std.testing.expect(status != .ok);
+    var count: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT COUNT(*) FROM items\"}"), &count));
+    defer freeRawBuffer(count.ptr, count.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, count.ptr.?[0..count.len], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("0", parsed.value.object.get("rows").?.array.items[0].array.items[0].string);
+}
+
+test "capi SQL mutations fence exact primary bytes with unchanged TTL and schema epochs" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "document", "relational" }) |mode| {
+        var directory = try TestDirectory.init("capi-sql-digest-fence");
+        defer directory.cleanup();
+        var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer database.close();
+        const schema = try std.fmt.allocPrint(alloc,
+            \\{{"version":1,"storage_mode":"{s}","default_type":"row","ttl":{{"duration":"1s","field":"expires"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"n":{{"type":"integer"}},"expires":{{"type":"datetime"}}}},"additionalProperties":false}}}}}}}}
+        , .{mode});
+        defer alloc.free(schema);
+        try database.setSchemaJson(alloc, schema);
+        try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
+        var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "items" };
+        const backend = adapter.backend();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const table = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "items" }, .read_write);
+        const cursor = (try backend.vtable.open_scan.?(backend.ptr, alloc, table, .{ .fields = &.{"n"}, .include_primary_digest = true, .primary_key = "a", .limit = 1 })).?;
+        defer cursor.close(cursor.ptr);
+        const page = try cursor.next(cursor.ptr, alloc, 1);
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        const before = page.rows[0];
+        try std.testing.expect(before.expected_content_digest != null);
+        try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
+        try std.testing.expectEqual(before.version, try database.getTimestamp(alloc, "a"));
+        try std.testing.expectError(error.SqlWriteConflict, backend.vtable.mutate(backend.ptr, arena.allocator(), table, &.{.{ .key = "a", .expected_version = before.version, .expected_content_digest = before.expected_content_digest, .row = null }}));
+        try std.testing.expectError(error.PreparedGenerationChanged, database.batch(.{ .schema_version = 2, .deletes = &.{"a"} }));
+        const txn = try database.beginTransactionWithId(@splat(97), 1);
+        try std.testing.expectError(error.PreparedGenerationChanged, database.writeTransaction(txn, .{ .schema_version = 2, .deletes = &.{"a"} }));
+        try database.abortTransaction(txn, 2);
+        var retained = (try database.lookup(alloc, "a", .{})).?;
+        defer retained.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, retained.json, "\"n\":2") != null);
+    }
+}
+
+test "capi SQL local integrity coordinator enforces unique arbitration and self FK actions" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-integrity");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 501, .shard_id = 502 } });
+    defer database.close();
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    try database.setSchemaJson(alloc, schema);
+    var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const sql = @import("sql.zig");
+    for ([_]struct { statement: []const u8, count: u64 }{
+        .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('p',1,NULL),('c',2,1)", .count = 2 },
+        .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('skipped',1,NULL) ON CONFLICT (id) DO NOTHING RETURNING id", .count = 0 },
+        .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('skipped',1,NULL),('also_skipped',1,NULL) ON CONFLICT DO NOTHING RETURNING id", .count = 0 },
+        .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('new',1,NULL) ON CONFLICT (id) DO UPDATE SET id=3 RETURNING id", .count = 1 },
+    }) |case| {
+        var compiled = try sql.compiler.compile(alloc, case.statement, .{});
+        defer compiled.deinit();
+        var result = try sql.runtime.execute(alloc, adapter.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.count, result.output.rows_affected);
+    }
+    var child = (try database.lookup(alloc, "c", .{})).?;
+    defer child.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, child.json, "\"parent\":3") != null);
+    var removed = try sql.compiler.compile(alloc, "DELETE FROM rows WHERE _id='p'", .{});
+    defer removed.deinit();
+    var outcome = try sql.runtime.execute(alloc, adapter.backend(), &removed, &.{}, .{});
+    defer outcome.deinit();
+    try std.testing.expect(try database.lookup(alloc, "c", .{}) == null);
+    try std.testing.expect(try database.lookup(alloc, "p", .{}) == null);
+    try std.testing.expect(try database.lookup(alloc, "new", .{}) == null);
+    var orphan = try sql.compiler.compile(alloc, "INSERT INTO rows (_id,id,parent) VALUES ('orphan',4,999)", .{});
+    defer orphan.deinit();
+    try std.testing.expectError(error.ForeignKeyParentMissing, sql.runtime.execute(alloc, adapter.backend(), &orphan, &.{}, .{}));
+    try std.testing.expect(try database.lookup(alloc, "orphan", .{}) == null);
+    // An absent secondary claim is a commit predicate, not permission to
+    // overwrite whichever owner appears after conflict resolution.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const backend = adapter.backend();
+    const table = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "rows" }, .read_write);
+    const row = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"id\":4,\"parent\":null}", .{});
+    var mutation: antfly.capi_dependencies.sql_catalog.Mutation = .{ .key = "racer", .row = row, .expected_version = 0 };
+    const owners = try backend.vtable.resolve_conflict_owners.?(backend.ptr, arena.allocator(), table, &.{"id"}, &.{}, &.{}, &.{mutation});
+    try std.testing.expect(owners[0].key == null);
+    mutation.conflict_guard = owners[0].guard;
+    var winner = try sql.compiler.compile(alloc, "INSERT INTO rows (_id,id,parent) VALUES ('winner',4,NULL)", .{});
+    defer winner.deinit();
+    var won = try sql.runtime.execute(alloc, backend, &winner, &.{}, .{});
+    defer won.deinit();
+    try std.testing.expectError(error.PreparedReadSetChanged, backend.vtable.mutate(backend.ptr, arena.allocator(), table, &.{mutation}));
+    try std.testing.expect(try database.lookup(alloc, "racer", .{}) == null);
+}
+
+test "capi SQL native expression partial unique claims reject collisions and arbitrate targetless inserts" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-expression-unique");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 601, .shard_id = 602 } });
+    defer database.close();
+    try database.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"email_key","keys":[{"expression":{"op":"lower_ascii","args":[{"op":"column","column":"email"}]},"result_type":"string"}],"where":[{"column":"active","op":"eq","value":true}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"},"active":{"type":"boolean"}},"additionalProperties":false}}}}
+    );
+    var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const sql = @import("sql.zig");
+    for ([_]struct { statement: []const u8, count: u64 }{
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('a','Alice',TRUE)", .count = 1 },
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('skip','ALICE',TRUE) ON CONFLICT DO NOTHING", .count = 0 },
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('b','ALICE',FALSE) ON CONFLICT DO NOTHING", .count = 1 },
+        .{ .statement = "UPDATE rows SET active=FALSE WHERE _id='a'", .count = 1 },
+        .{ .statement = "UPDATE rows SET active=TRUE WHERE _id='b'", .count = 1 },
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('skip2','alice',TRUE),('c','Carol',TRUE),('skip3','CAROL',TRUE) ON CONFLICT DO NOTHING", .count = 1 },
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('skip4','ALICE',TRUE) ON CONFLICT (lower(email)) WHERE active=TRUE DO NOTHING", .count = 0 },
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('replace','ALICE',TRUE) ON CONFLICT ((lower(email))) WHERE active=TRUE DO UPDATE SET email='Bob'", .count = 1 },
+        .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('d','Alice',TRUE) ON CONFLICT (lower(email)) WHERE active=TRUE DO NOTHING", .count = 1 },
+    }) |case| {
+        var compiled = try sql.compiler.compile(alloc, case.statement, .{});
+        defer compiled.deinit();
+        var result = try sql.runtime.execute(alloc, adapter.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.count, result.output.rows_affected);
+    }
+    var collision = try sql.compiler.compile(alloc, "INSERT INTO rows (_id,email,active) VALUES ('collision','alice',TRUE)", .{});
+    defer collision.deinit();
+    try std.testing.expectError(error.UniqueConstraintViolation, sql.runtime.execute(alloc, adapter.backend(), &collision, &.{}, .{}));
+    try std.testing.expect(try database.lookup(alloc, "collision", .{}) == null);
+    try std.testing.expect(try database.lookup(alloc, "skip3", .{}) == null);
+    for ([_][]const u8{
+        "INSERT INTO rows (_id,email,active) VALUES ('wrong','ALICE',TRUE) ON CONFLICT (upper(email)) WHERE active=TRUE DO NOTHING",
+        "INSERT INTO rows (_id,email,active) VALUES ('wrong','ALICE',TRUE) ON CONFLICT (lower(email)) DO NOTHING",
+        "INSERT INTO rows (_id,email,active) VALUES ('wrong','ALICE',TRUE) ON CONFLICT (lower(email)) WHERE active=FALSE DO NOTHING",
+    }) |statement| {
+        var wrong = try sql.compiler.compile(alloc, statement, .{});
+        defer wrong.deinit();
+        try std.testing.expectError(error.ConflictArbiterNotFound, sql.runtime.execute(alloc, adapter.backend(), &wrong, &.{}, .{}));
+    }
+}
+
+test "capi SQL local integrity refuses partial ownership instead of inventing coverage" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-partial-integrity");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 503, .shard_id = 504 } });
+    defer database.close();
+    try database.updateRange(.{ .start = "a", .end = "z" });
+    try database.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const sql = @import("sql.zig");
+    var compiled = try sql.compiler.compile(alloc, "INSERT INTO rows (_id,id) VALUES ('k',1)", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.UnsupportedSqlExecution, sql.runtime.execute(alloc, adapter.backend(), &compiled, &.{}, .{}));
+    try std.testing.expect(try database.lookup(alloc, "k", .{}) == null);
+}
+
+test "capi SQL RETURNING uses native defaults generated values and versioned preimages" {
+    var directory = try TestDirectory.init("capi-sql-returning");
+    defer directory.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, directory.path(), "returning");
+    defer alloc.free(path);
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle));
+    defer antfly_db_close(handle);
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"b","expression":{"op":"literal","type":"integer","value":"2"}}],"generated_columns":[{"column":"total","expression":{"op":"add","args":[{"op":"column","column":"a"},{"op":"column","column":"b"}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"},"total":{"type":"integer"}},"required":["a","b","total"],"additionalProperties":false}}}}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle, .fromSlice(schema)));
+    for ([_]struct { statement: []const u8, expected: []const u8 }{
+        .{ .statement = "INSERT INTO items (_id,a) VALUES ('a',3) RETURNING total", .expected = "5" },
+        .{ .statement = "INSERT INTO items (_id,a) VALUES ('a',1) ON CONFLICT (_id) DO UPDATE SET a=excluded.a+items.a RETURNING total", .expected = "6" },
+        .{ .statement = "INSERT INTO items (_id,a) VALUES ('a',99) ON CONFLICT (_id) DO NOTHING RETURNING total", .expected = "empty" },
+        .{ .statement = "INSERT INTO items (_id,a) VALUES ('a',99) ON CONFLICT DO NOTHING RETURNING total", .expected = "empty" },
+        .{ .statement = "UPDATE items SET a=4 WHERE _id='a' RETURNING items.total", .expected = "6" },
+        .{ .statement = "DELETE FROM items WHERE _id='a' RETURNING total", .expected = "6" },
+    }) |case| {
+        const request = try std.json.Stringify.valueAlloc(alloc, .{ .statement = case.statement }, .{});
+        defer alloc.free(request);
+        var response: capi.Buffer = .{};
+        const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice(request), &response);
+        defer freeRawBuffer(response.ptr, response.len);
+        if (status != .ok) std.debug.print("SQL RETURNING native failure: {s}\n", .{response.ptr.?[0..response.len]});
+        try std.testing.expectEqual(capi.ErrorCode.ok, status);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.ptr.?[0..response.len], .{});
+        defer parsed.deinit();
+        const rows = parsed.value.object.get("rows").?.array.items;
+        if (std.mem.eql(u8, case.expected, "empty")) {
+            try std.testing.expectEqual(@as(usize, 0), rows.len);
+            try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("rows_affected").?.integer);
+            continue;
+        }
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqualStrings(case.expected, rows[0].array.items[0].string);
+    }
+    var generated: capi.Buffer = .{};
+    const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"INSERT INTO items (a) VALUES (3),(3) RETURNING _id,total\"}"), &generated);
+    defer freeRawBuffer(generated.ptr, generated.len);
+    try std.testing.expectEqual(capi.ErrorCode.ok, status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, generated.ptr.?[0..generated.len], .{});
+    defer parsed.deinit();
+    const generated_rows = parsed.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), generated_rows.len);
+    const first = generated_rows[0].array.items[0].string;
+    const second = generated_rows[1].array.items[0].string;
+    try std.testing.expectEqual(@as(usize, 32), first.len);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expectEqualStrings("5", generated_rows[0].array.items[1].string);
+}
+
+test "capi SQL uses native typed snapshots and atomic mutations" {
+    var test_tmp = try TestDirectory.init("capi-sql");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, test_tmp.path(), "sql");
+    defer alloc.free(path);
+    var handle_ptr: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
+    defer antfly_db_close(handle_ptr);
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"j":{"type":"json"}},"additionalProperties":false}}}}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle_ptr, .fromSlice(schema_json)));
+    const requests = [_][]const u8{
+        \\{"statement":"INSERT INTO items (_id,id) VALUES ('a',$1)","parameters":["9007199254740993"]}
+        ,
+        \\{"statement":"SELECT id FROM items WHERE _id='a'"}
+        ,
+        \\{"statement":"UPDATE items SET id=id+1 WHERE _id='a'"}
+        ,
+        \\{"statement":"SELECT id FROM items WHERE _id='a'"}
+        ,
+    };
+    for (requests, 0..) |request, index| {
+        var out: capi.Buffer = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice(request), &out));
+        defer freeRawBuffer(out.ptr, out.len);
+        if (index == 1) try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "9007199254740993") != null);
+        if (index == 3) try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "9007199254740994") != null);
+    }
+    var joined: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT l.id, r.id FROM items AS l JOIN items AS r ON l.id=r.id\"}"), &joined));
+    defer freeRawBuffer(joined.ptr, joined.len);
+    const joined_json = try std.json.parseFromSlice(std.json.Value, alloc, joined.ptr.?[0..joined.len], .{});
+    defer joined_json.deinit();
+    const joined_rows = joined_json.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), joined_rows.len);
+    try std.testing.expectEqualStrings("9007199254740994", joined_rows[0].array.items[0].string);
+    try std.testing.expectEqualStrings("9007199254740994", joined_rows[0].array.items[1].string);
+    var inserted_json_null: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"INSERT INTO items (_id,id,j) VALUES ('b',2,CAST('null' AS json))\"}"), &inserted_json_null));
+    defer freeRawBuffer(inserted_json_null.ptr, inserted_json_null.len);
+    var null_projection: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT j FROM items ORDER BY _id\"}"), &null_projection));
+    defer freeRawBuffer(null_projection.ptr, null_projection.len);
+    const projected = try std.json.parseFromSlice(std.json.Value, alloc, null_projection.ptr.?[0..null_projection.len], .{});
+    defer projected.deinit();
+    const projected_rows = projected.value.object.get("rows").?.array.items;
+    const projected_nulls = projected.value.object.get("sql_nulls").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), projected_rows.len);
+    try std.testing.expect(projected_rows[0].array.items[0] == .null);
+    try std.testing.expect(projected_rows[1].array.items[0] == .null);
+    try std.testing.expect(projected_nulls[0].array.items[0].bool);
+    try std.testing.expect(!projected_nulls[1].array.items[0].bool);
+    var rejected: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"BEGIN\"}"), &rejected));
+    defer freeRawBuffer(rejected.ptr, rejected.len);
+    try std.testing.expect(std.mem.indexOf(u8, rejected.ptr.?[0..rejected.len], "0A000") != null);
+}
+
 test "capi batch and lookup json" {
     var test_tmp = try TestDirectory.init("capi");
     defer test_tmp.cleanup();
@@ -16810,6 +17689,17 @@ pub fn storageOwnerRelationalTransitionRead(owner_ptr: ?*anyopaque, request: *co
 }
 
 fn hiddenRestoreJson(alloc: std.mem.Allocator, db: *db_mod.DB, request: *const kernel_owner_abi.HiddenRestoreRequest, out_result: *kernel_owner_abi.OwnedBytes) !void {
+    if (request.operation == .read_initial_child) {
+        const record = (try db.readInitialChildPublicationRecord()) orelse return;
+        // A cold hidden owner is opened read-only without a public table
+        // descriptor. Its core identity is not the authority for this path;
+        // the durable AICH namespace is, and the caller checks the complete
+        // bootstrap and terminal receipt before any retirement.
+        if (record.namespace.table_id != request.table_id) return error.InitialChildPublicationChanged;
+        const encoded = try std.json.Stringify.valueAlloc(alloc, record, .{});
+        out_result.* = .{ .ptr = encoded.ptr, .len = @intCast(encoded.len) };
+        return;
+    }
     if (db.core.identity_namespace.table_id != request.table_id) return error.RestoreStagingScopeChanged;
     if (request.operation == .capture_public_snapshot) return captureOwnerSeedSnapshot(alloc, db, request);
     var bootstrap = (try db.readRestoreStagingBootstrap(alloc)) orelse {
@@ -16830,6 +17720,7 @@ fn hiddenRestoreJson(alloc: std.mem.Allocator, db: *db_mod.DB, request: *const k
             try captureOwnerSeedSnapshot(alloc, db, request);
         },
         .capture_public_snapshot => unreachable,
+        .read_initial_child => unreachable,
     }
 }
 
@@ -16857,7 +17748,7 @@ pub fn storageOwnerHiddenRestoreJson(owner_ptr: ?*anyopaque, request: *const ker
         hiddenRestoreJson(handle.alloc, &handle.db, request, out_result) catch |err| return storageOwnerStatusFromError(err);
         return .ok;
     }
-    if (request.operation != .read_bootstrap or request.path.len == 0) return .invalid_argument;
+    if ((request.operation != .read_bootstrap and request.operation != .read_initial_child) or request.path.len == 0) return .invalid_argument;
     const context = asStorageOwnerContext(request.context) orelse return .invalid_argument;
     const alloc = context.alloc;
     const runtime = context.backend_runtime.ptr();

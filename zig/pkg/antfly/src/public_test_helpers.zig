@@ -16,6 +16,27 @@ const std = @import("std");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const serverless = @import("serverless/mod.zig");
 
+/// Sign the same HS256 trusted-principal wire token used by production HTTP
+/// authentication. Fixtures supply their own claims and remain explicit about
+/// the permissions granted to each request.
+pub fn encodeTrustedPrincipalToken(alloc: std.mem.Allocator, secret: []const u8, payload: []const u8) ![]u8 {
+    const header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    const header_encoded = try alloc.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(header.len));
+    defer alloc.free(header_encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(header_encoded, header);
+    const payload_encoded = try alloc.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(payload.len));
+    defer alloc.free(payload_encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(payload_encoded, payload);
+    const signing_input = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ header_encoded, payload_encoded });
+    defer alloc.free(signing_input);
+    var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(mac[0..], signing_input, secret);
+    const signature_encoded = try alloc.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(mac.len));
+    defer alloc.free(signature_encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(signature_encoded, mac[0..]);
+    return std.fmt.allocPrint(alloc, "{s}.{s}", .{ signing_input, signature_encoded });
+}
+
 pub fn expectSingleOpenapiTopHit(parsed: metadata_openapi.QueryResponses, doc_id: []const u8) !void {
     const responses = parsed.responses orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 1), responses.len);

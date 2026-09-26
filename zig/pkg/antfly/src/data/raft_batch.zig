@@ -43,6 +43,7 @@ pub const OwnedStorageOwnerDescriptor = struct {
         alloc.free(self.descriptor.schema_json);
         alloc.free(self.descriptor.indexes_json);
         alloc.free(self.descriptor.restore_bootstrap_json);
+        alloc.free(self.descriptor.initial_child_bootstrap_json);
         descriptor_contract.freeInitialRange(alloc, self.descriptor.initial_range);
         self.* = undefined;
     }
@@ -123,6 +124,8 @@ fn cloneStorageOwnerDescriptor(
     errdefer alloc.free(indexes_json);
     const restore_bootstrap_json = try alloc.dupe(u8, descriptor.restore_bootstrap_json);
     errdefer alloc.free(restore_bootstrap_json);
+    const initial_child_bootstrap_json = try alloc.dupe(u8, descriptor.initial_child_bootstrap_json);
+    errdefer alloc.free(initial_child_bootstrap_json);
     const initial_range = try descriptor_contract.cloneInitialRange(alloc, descriptor.initial_range);
     return .{ .descriptor = .{
         .lsm_root_generation = descriptor.lsm_root_generation,
@@ -131,6 +134,7 @@ fn cloneStorageOwnerDescriptor(
         .schema_json = schema_json,
         .indexes_json = indexes_json,
         .restore_bootstrap_json = restore_bootstrap_json,
+        .initial_child_bootstrap_json = initial_child_bootstrap_json,
         .initial_range = initial_range,
         .restore_cancel_recovery = descriptor.restore_cancel_recovery,
         .restore_ha_replay = descriptor.restore_ha_replay,
@@ -453,6 +457,7 @@ fn consumerTests() type {
                 .schema_json = "{\"fields\":{\"title\":{\"type\":\"string\"}}}",
                 .indexes_json = "{\"title\":{\"type\":\"full_text\"}}",
                 .restore_bootstrap_json = "{\"scope\":\"exact immutable owner proof\"}",
+                .initial_child_bootstrap_json = "{\"plan_id\":\"exact hidden child proof\"}",
                 .restore_cancel_recovery = true,
             };
             const encoded = try encodeWithStorageOwnerDescriptor(
@@ -472,6 +477,7 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings(descriptor.schema_json, actual.descriptor.schema_json);
             try std.testing.expectEqualStrings(descriptor.indexes_json, actual.descriptor.indexes_json);
             try std.testing.expectEqualStrings(descriptor.restore_bootstrap_json, actual.descriptor.restore_bootstrap_json);
+            try std.testing.expectEqualStrings(descriptor.initial_child_bootstrap_json, actual.descriptor.initial_child_bootstrap_json);
             try std.testing.expectEqual(descriptor.restore_cancel_recovery, actual.descriptor.restore_cancel_recovery);
         }
 

@@ -189,6 +189,45 @@ pub const LookupInput = struct {
     consistency: raft_mod.ReadConsistency = .read_index,
 };
 
+fn validateHandoffReceiptLookup(input: LookupInput, request: operation.RequestContext) Error!void {
+    const hidden_scoped = input.options.restore_staging_scope != null and input.options.restore_staging_plan_id != null and request.catalog_route_fence_json.len == 0;
+    const published_routed = input.options.restore_staging_scope == null and input.options.restore_staging_plan_id == null and request.catalog_route_fence_json.len != 0;
+    if (!std.mem.eql(u8, input.options.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
+        (!hidden_scoped and !published_routed) or
+        input.key.len != 0 or input.consistency != .read_index or
+        input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
+        input.options.relational_integrity_jobs_json.len != 0 or input.options.relational_index_status_json.len != 0 or
+        input.options.relational_activation_json.len != 0 or input.options.fields.len != 0)
+        return error.InvalidArgument;
+}
+
+test "hidden generation handoff receipt requires exact scoped read-index request" {
+    const input: LookupInput = .{ .group_id = 7, .table_name = "hidden", .key = "", .options = .{
+        .relational_topology_json = "{\"mode\":\"generation_handoff_install\"}",
+        .restore_staging_scope = @splat(1),
+        .restore_staging_plan_id = @splat(2),
+    } };
+    try validateHandoffReceiptLookup(input, .{});
+    var invalid = input;
+    invalid.options.restore_staging_scope = null;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.options.restore_staging_plan_id = null;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.options.relational_topology_json = "{\"mode\":\"generation_handoff_summary\"}";
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.consistency = .stale;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(input, .{ .catalog_route_fence_json = "{}" }));
+    invalid = input;
+    invalid.options.restore_staging_scope = null;
+    invalid.options.restore_staging_plan_id = null;
+    try validateHandoffReceiptLookup(invalid, .{ .catalog_route_fence_json = "{}" });
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+}
+
 pub const Operations = struct {
     reads: ?table_reads.TableReadSource,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter,
@@ -573,6 +612,11 @@ pub const Operations = struct {
             error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
+            // A fenced or cold-reopening owner can reject ordinary writer
+            // admission before proposal. Accepted-but-unconfirmed apply is
+            // separately OutcomeUnknown. This is retryable availability,
+            // not an internal defect or a proven conflict.
+            error.StorageReadTemporarilyUnavailable => return error.Unavailable,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,
             error.EnrichmentWaitCanceled => return error.EnrichmentWaitCanceled,
@@ -638,6 +682,10 @@ pub const Operations = struct {
 
     pub fn txnPrepare(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnPrepareRequest) Error!void {
         try ensurePreDecisionRequestActive(request);
+        if (input.req.range_guards.len != 0 and input.route_fence == null) return error.InvalidArgument;
+        if (input.route_fence) |fence| {
+            if (fence.route.group_id != group_id or fence.topology_epoch != input.topology_epoch) return error.TopologyChanged;
+        }
         const writes = self.writes orelse return error.NotFound;
         const supports_pre_decision_context =
             writes.vtable.txn_prepare_group_local_with_pre_decision_context != null;
@@ -660,6 +708,7 @@ pub const Operations = struct {
         }
         try ensurePreDecisionRequestActive(request);
         _ = (writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req, .{
+            .route_fence = input.route_fence,
             .deadline_ns = request.deadline_ns,
             .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
@@ -959,6 +1008,12 @@ pub const Operations = struct {
                 scoped.value.scope.validate() catch return error.InvalidArgument;
                 if (scoped.value.scope.fence.owner_group_id != input.group_id or input.consistency != .read_index or
                     input.key.len != 0 or input.options.restore_staging_scope != null) return error.InvalidArgument;
+            };
+            if (probe.value.mode) |mode| if (std.mem.eql(u8, mode, "generation_handoff_install")) {
+                // This private receipt is looked up after cutover, when the
+                // fresh hidden owner intentionally has no public route fence.
+                // Do not generalize the exception to other hidden reads.
+                try validateHandoffReceiptLookup(input, request);
             };
             if (probe.value.transition_id != null) {
                 if (input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or
@@ -1993,6 +2048,15 @@ fn consumerTests() type {
                 state.visibility_error = failure;
                 try std.testing.expectError(failure, operations.routedBatch(std.testing.allocator, request, 17, "documents", .{}, forwarding));
             }
+            state.visibility_error = error.StorageReadTemporarilyUnavailable;
+            try std.testing.expectError(error.Unavailable, operations.routedBatch(
+                std.testing.allocator,
+                request,
+                17,
+                "documents",
+                .{},
+                forwarding,
+            ));
         }
 
         test "typed internal query workers preserve identity generation validation" {

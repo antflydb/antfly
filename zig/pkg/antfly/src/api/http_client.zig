@@ -56,7 +56,7 @@ fn isUriUnreserved(ch: u8) bool {
         ch == '-' or ch == '.' or ch == '_' or ch == '~';
 }
 
-fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
+pub fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     for (value) |ch| {
@@ -765,6 +765,106 @@ pub const ApiHttpClient = struct {
             else => return error.UnexpectedHttpStatus,
         }
         const parsed = try std.json.parseFromSlice(@import("restore_owner.zig").Response, self.alloc, response.body, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    pub fn fetchRestoreParentActivation(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_parent_activation.zig").Request, input_context: @import("operation.zig").RequestContext) !@import("restore_parent_activation.zig").Response {
+        const context = try input_context.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group_id);
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, routes.Routes.restore_parent_activation_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > 4096) return error.InvalidRestoreStaging;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            400, 409 => return error.RestoreStagingScopeChanged,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.RestoreValidationPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        const parsed = try std.json.parseFromSlice(@import("restore_parent_activation.zig").Response, self.alloc, response.body, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    fn fetchFkGenerationControl(self: *ApiHttpClient, comptime Response: type, suffix: []const u8, base_uri: []const u8, group_id: u64, table_name: []const u8, request: anytype, input_context: @import("operation.zig").RequestContext) !Response {
+        const context = try input_context.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group_id);
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > 4096) return error.InvalidGenerationPublication;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            400, 409 => return error.GenerationAdmissionChanged,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.GenerationAdmissionPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        const parsed = try std.json.parseFromSlice(Response, self.alloc, response.body, .{});
+        defer parsed.deinit();
+        try parsed.value.validate(request);
+        return parsed.value;
+    }
+
+    pub fn fetchFkGenerationParent(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").Request, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").Receipt {
+        return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").Receipt, routes.Routes.fk_generation_parent_suffix, base_uri, group_id, table_name, request, context);
+    }
+
+    pub fn fetchFkGenerationSource(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").SourceRequest, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").SourceReceipt {
+        return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").SourceReceipt, routes.Routes.fk_generation_source_suffix, base_uri, group_id, table_name, request, context);
+    }
+
+    pub fn fetchFkInitialChild(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").InitialChildRequest, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").InitialChildReceipt {
+        return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").InitialChildReceipt, routes.Routes.fk_initial_child_suffix, base_uri, group_id, table_name, request, context);
+    }
+
+    pub fn fetchRowPolicyInstall(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("row_policy_install.zig").Request, input_context: @import("operation.zig").RequestContext) !@import("row_policy_install.zig").Response {
+        const context = try input_context.platformDeadline();
+        try context.ensureActive();
+        try @import("row_policy_install.zig").validate(request, group_id);
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, routes.Routes.row_policy_install_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > 4096) return error.InvalidRowPolicyPublication;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            400, 409 => return error.RowPolicyCatalogChanged,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.RowPolicyInstallationPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        const parsed = try std.json.parseFromSlice(@import("row_policy_install.zig").Response, self.alloc, response.body, .{});
         defer parsed.deinit();
         return parsed.value;
     }
@@ -2558,6 +2658,8 @@ pub const ApiHttpClient = struct {
                 if (forwarding == null or (outcome != null and
                     std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)))
                 {
+                    if (forwarding != null and std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), internal_batch_forwarding.admission_unavailable_body))
+                        return error.StorageReadTemporarilyUnavailable;
                     return error.LeaderUnavailable;
                 }
                 return error.RaftBatchWriteOutcomeUnknown;
@@ -5180,6 +5282,8 @@ fn consumerTests() type {
                 const Mode = enum {
                     unmarked_unavailable,
                     marked_not_proposed,
+                    marked_owner_unavailable,
+                    unmarked_owner_unavailable,
                     unmarked_timeout,
                     marked_timeout,
                     failure_before_send,
@@ -5214,6 +5318,16 @@ fn consumerTests() type {
                                 .value = internal_batch_forwarding.outcome_not_proposed_v1,
                             }},
                         ),
+                        .marked_owner_unavailable => try http_route_helpers.textResponseWithHeaders(
+                            alloc,
+                            503,
+                            internal_batch_forwarding.admission_unavailable_body,
+                            &.{.{
+                                .name = internal_batch_forwarding.outcome_header,
+                                .value = internal_batch_forwarding.outcome_not_proposed_v1,
+                            }},
+                        ),
+                        .unmarked_owner_unavailable => try http_route_helpers.textResponse(alloc, 503, internal_batch_forwarding.admission_unavailable_body),
                         .unmarked_timeout => try http_route_helpers.textResponse(alloc, 504, "request deadline exceeded"),
                         .marked_timeout => try http_route_helpers.textResponseWithHeaders(
                             alloc,
@@ -5268,6 +5382,12 @@ fn consumerTests() type {
 
             executor.mode = .marked_not_proposed;
             try std.testing.expectError(error.LeaderUnavailable, OutcomeExecutor.fetch(&client));
+
+            executor.mode = .marked_owner_unavailable;
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, OutcomeExecutor.fetch(&client));
+
+            executor.mode = .unmarked_owner_unavailable;
+            try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
 
             executor.mode = .unmarked_timeout;
             try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));

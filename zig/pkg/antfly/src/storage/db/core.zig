@@ -1330,6 +1330,26 @@ pub const DBCore = struct {
         table_schema: schema_mod.TableSchema,
         metadata_writes: []const docstore_mod.KVPair,
     ) !PreparedSchemaMetadata {
+        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false);
+    }
+
+    /// Only the private, metadata-authenticated child generation installer may
+    /// prepare a changed FK catalog. Ordinary schema publication remains
+    /// fail-closed until parent owners have durably accepted the successor.
+    pub fn prepareSchemaMetadataPublishedChild(
+        self: *DBCore,
+        table_schema: schema_mod.TableSchema,
+        metadata_writes: []const docstore_mod.KVPair,
+    ) !PreparedSchemaMetadata {
+        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, true);
+    }
+
+    fn prepareSchemaMetadataMode(
+        self: *DBCore,
+        table_schema: schema_mod.TableSchema,
+        metadata_writes: []const docstore_mod.KVPair,
+        published_child: bool,
+    ) !PreparedSchemaMetadata {
         try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, &.{});
         var prepared = try PreparedSchemaMetadata.init(self.alloc, table_schema, metadata_writes);
         errdefer prepared.deinit();
@@ -1391,6 +1411,26 @@ pub const DBCore = struct {
                 definitions,
                 checks_digest,
             );
+            // A metadata preflight is not an owner authorization. Independently
+            // reject a new/retired child FK generation at the atomic schema
+            // apply boundary until parent-owner acceptance is durably ACKed.
+            // Unrelated schema epochs preserve the canonical FK generation.
+            if (!published_child and prepared.base_schema_view != null and !prepared.same_version_layout_matches) {
+                var prior_catalog: ?integrity_catalog_mod.Catalog = if (previous_integrity) |bytes| try integrity_catalog_mod.decode(self.alloc, bytes) else null;
+                defer if (prior_catalog) |*value| value.deinit();
+                if (prior_catalog) |prior| {
+                    for (prior.bindings) |binding| {
+                        if (binding.retired or binding.definition.kind != .foreign_key) continue;
+                        const next = prepared.integrity_catalog.?.catalog.findGeneration(binding.generation) orelse return error.ForeignKeyGenerationPublicationRequired;
+                        if (next.retired) return error.ForeignKeyGenerationPublicationRequired;
+                    }
+                }
+                for (prepared.integrity_catalog.?.catalog.bindings) |binding| {
+                    if (binding.retired or binding.definition.kind != .foreign_key) continue;
+                    const prior = if (prior_catalog) |value| value.findGeneration(binding.generation) else null;
+                    if (prior == null or prior.?.retired) return error.ForeignKeyGenerationPublicationRequired;
+                }
+            }
             if (previous_integrity) |previous| {
                 var prior = try integrity_catalog_mod.decode(self.alloc, previous);
                 defer prior.deinit();
@@ -1400,6 +1440,11 @@ pub const DBCore = struct {
                     // Retaining a descriptor is necessary for recovery, but
                     // is not proof that cross-table dependents have retired.
                     if (next.retired) {
+                        // The private child publication already fenced every
+                        // source and activated the retired generation on all
+                        // parent owners. Other constraint kinds still need
+                        // their ordinary retirement proof.
+                        if (published_child and binding.definition.kind == .foreign_key) continue;
                         const proof = (try self.getStoreValue(self.alloc, @import("relational_integrity_retirement.zig").key)) orelse return error.ConstraintRetirementRequired;
                         defer self.alloc.free(proof);
                         const retirement = try @import("relational_integrity_retirement.zig").Progress.decode(proof);
@@ -1418,7 +1463,23 @@ pub const DBCore = struct {
         metadata_deletes: []const []const u8,
         reconciled_row_count: ?u64,
     ) !bool {
-        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false);
+        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false, null);
+    }
+
+    /// Commit the metadata-published child schema and lift its exact write
+    /// fence in one store transaction. The caller must first fetch the
+    /// immutable published decision from the metadata leader and verify its
+    /// schema/fence digest against this prepared candidate.
+    pub fn commitPreparedSchemaMetadataPublishedChild(
+        self: *DBCore,
+        prepared: *PreparedSchemaMetadata,
+        metadata_writes: []const docstore_mod.KVPair,
+        metadata_deletes: []const []const u8,
+        reconciled_row_count: ?u64,
+        source_fence: @import("relational_integrity_topology_contract.zig").Fence,
+    ) !bool {
+        if (source_fence.role != .child_generation_source and source_fence.role != .child_generation_dual) return error.InvalidIntegrityTopologyFence;
+        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false, source_fence);
     }
 
     /// Rehydrate an exact durable schema without inventing a mutation (or an HA
@@ -1428,7 +1489,7 @@ pub const DBCore = struct {
         prepared: *PreparedSchemaMetadata,
         metadata_writes: []const docstore_mod.KVPair,
     ) !bool {
-        _ = self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, true) catch |err| switch (err) {
+        _ = self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, true, null) catch |err| switch (err) {
             error.SchemaMetadataChanged => return false,
             else => return err,
         };
@@ -1442,6 +1503,7 @@ pub const DBCore = struct {
         metadata_deletes: []const []const u8,
         reconciled_row_count: ?u64,
         rehydrate_only: bool,
+        child_fence: ?@import("relational_integrity_topology_contract.zig").Fence,
     ) !bool {
         if (prepared.combined_writes.len != metadata_writes.len + 1)
             return error.InvalidSchemaUpdateRequest;
@@ -1510,9 +1572,11 @@ pub const DBCore = struct {
         @memcpy(prepared.combined_writes[0..metadata_writes.len], metadata_writes);
         prepared.combined_writes[metadata_writes.len] = .{ .key = table_catalog_mod.key, .value = &catalog_data };
         const Participants = struct {
+            core: *DBCore,
             prepared: *PreparedSchemaMetadata,
             row_count: u64,
             namespace: doc_identity.Namespace,
+            child_fence: ?@import("relational_integrity_topology_contract.zig").Fence,
 
             pub fn stage(participants: @This(), txn: anytype) !void {
                 // A retained source uses the immutable layouts/validator set
@@ -1526,9 +1590,27 @@ pub const DBCore = struct {
                     if (retention.active() and std.mem.eql(u8, &retention.namespace, &source_namespace))
                         return error.IntegrityTopologyBusy;
                 }
-                try @import("relational_integrity_topology.zig").requireUnfenced(txn);
+                const topology = @import("relational_integrity_topology.zig");
+                if (participants.child_fence) |expected| {
+                    var manager = try participants.core.initTxnManager();
+                    defer manager.deinit();
+                    try topology.requireDrained(txn, &manager, expected);
+                    try @import("relational_integrity_generation_admission.zig").requireDualInstallReady(txn, expected);
+                    if (expected.role == .child_generation_dual)
+                        try @import("relational_integrity_generation_admission.zig").requireDualCatalogMatch(
+                            participants.core.alloc,
+                            txn,
+                            expected.namespace.table_id,
+                            (participants.prepared.integrity_catalog orelse return error.IntegrityCatalogChanged).catalog,
+                        );
+                } else try topology.requireUnfenced(txn);
                 try @import("online_integrity_shadow.zig").requireCatalogMutable(txn);
                 try participants.stageChanges(txn);
+                if (participants.child_fence) |expected| {
+                    if (expected.role == .child_generation_dual)
+                        try txn.delete(@import("relational_integrity_generation_admission.zig").dual_acknowledged_fence_key);
+                    try topology.stageRelease(txn, expected);
+                }
             }
 
             pub fn stageChanges(participants: @This(), txn: anytype) !void {
@@ -1561,7 +1643,7 @@ pub const DBCore = struct {
                 }
             }
         };
-        const participants = Participants{ .prepared = prepared, .row_count = next_catalog.row_count, .namespace = self.identity_namespace };
+        const participants = Participants{ .core = self, .prepared = prepared, .row_count = next_catalog.row_count, .namespace = self.identity_namespace, .child_fence = child_fence };
         const unchanged = same_active_epoch and try schema_mod.encodedSchemaMetadataUnchanged(
             self.store,
             self.alloc,
@@ -1575,7 +1657,16 @@ pub const DBCore = struct {
         // The current resident epoch and index snapshot were fenced above and
         // already describe these exact bytes. Keep their identities stable so
         // reopening/configuring an owner does not invalidate prepared writes.
-        if (unchanged) return false;
+        if (unchanged) {
+            if (child_fence) |expected| {
+                var replay = try self.store.beginReadTxn();
+                defer replay.abort();
+                const topology = @import("relational_integrity_topology.zig");
+                const completed = (try topology.completed(&replay)) orelse return error.IntegrityTopologyFenceMissing;
+                if (!completed.eql(expected)) return error.IntegrityTopologyChanged;
+            }
+            return false;
+        }
         const changed = try schema_mod.saveEncodedSchemaWithMetadataAndStage(
             self.store,
             self.alloc,

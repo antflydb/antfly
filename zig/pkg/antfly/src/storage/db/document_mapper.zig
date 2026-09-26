@@ -332,7 +332,7 @@ pub const PreparedRelationalProjection = struct {
             const ordinal = layout.ordinalForName(schema.relational_columns, name) orelse return error.InvalidBatchRequest;
             if (schema.relational_columns[ordinal].required) try required.append(owned, @intCast(ordinal));
         }
-        const encoded = try buildRelationalRowValueFromParsedInternal(owned, owned, parsed, schema, layout, required.items);
+        const encoded = try buildRelationalRowValueFromParsedInternal(owned, owned, parsed, schema, layout, required.items, &.{});
         return .{ .arena = arena, .view = try relational_row_codec.ordinalRowViewTrusted(encoded.bytes, schema, layout) };
     }
 
@@ -416,6 +416,7 @@ pub const PreparedRelationalWrite = struct {
             physical_layout,
             null,
             false,
+            &.{},
         );
     }
 
@@ -430,7 +431,19 @@ pub const PreparedRelationalWrite = struct {
         table_schema: runtime_schema.TableSchema,
         physical_layout: *const relational_row_codec.PhysicalLayout,
     ) !PreparedRelationalWrite {
-        return try initWithAllocators(alloc, scratch, scratch, false, key, document_json, validator, table_schema, physical_layout, null, false);
+        return try initWithAllocators(alloc, scratch, scratch, false, key, document_json, validator, table_schema, physical_layout, null, false, &.{});
+    }
+
+    pub fn initTyped(alloc: Allocator, parse_alloc: Allocator, scratch: Allocator, retain_text_root: bool, key: []const u8, document_json: []const u8, validator: ?schema_api.CompiledTableValidator, table_schema: runtime_schema.TableSchema, physical_layout: *const relational_row_codec.PhysicalLayout, json_null_fields: []const []const u8, preserve: bool) !PreparedRelationalWrite {
+        return initWithAllocators(alloc, parse_alloc, scratch, retain_text_root, key, document_json, validator, table_schema, physical_layout, null, preserve, json_null_fields);
+    }
+
+    pub fn initTypedInSharedRegion(region: *PreparedRowRegion, scratch: Allocator, retain_text_root: bool, key: []const u8, document_json: []const u8, validator: ?schema_api.CompiledTableValidator, table_schema: runtime_schema.TableSchema, physical_layout: *const relational_row_codec.PhysicalLayout, json_null_fields: []const []const u8, preserve: bool) !PreparedRelationalWrite {
+        var prepared = try initTyped(region.arena.allocator(), if (retain_text_root) region.arena.allocator() else scratch, scratch, retain_text_root, key, document_json, validator, table_schema, physical_layout, json_null_fields, preserve);
+        region.retain();
+        prepared.owned_region = region;
+        if (retain_text_root) prepared.extracted.prepared_text_root = prepared.parsedValue();
+        return prepared;
     }
 
     /// Split transient parse ownership from retained row ownership. Batch
@@ -450,6 +463,7 @@ pub const PreparedRelationalWrite = struct {
         physical_layout: *const relational_row_codec.PhysicalLayout,
         durable_row: ?[]const u8,
         preserve_logical_values: bool,
+        json_null_fields: []const []const u8,
     ) !PreparedRelationalWrite {
         var intent_digest: ?document_content_hash.Digest = null;
         var parsed = if (durable_row) |bytes| blk: {
@@ -469,12 +483,34 @@ pub const PreparedRelationalWrite = struct {
             else => return error.InvalidBatchRequest,
         };
         errdefer parsed.deinit();
+        var effective_json_null_fields = std.ArrayListUnmanaged([]const u8).empty;
+        defer effective_json_null_fields.deinit(scratch);
+        if (json_null_fields.len != 0) {
+            if (durable_row != null or parsed.value != .object or json_null_fields.len > table_schema.relational_columns.len) return error.InvalidBatchRequest;
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen.deinit(scratch);
+            for (json_null_fields) |name| {
+                const ordinal = physical_layout.ordinalForName(table_schema.relational_columns, name) orelse return error.InvalidBatchRequest;
+                const column = table_schema.relational_columns[ordinal];
+                if (!column.is_json or column.json_kind != .any) return error.InvalidBatchRequest;
+                const datum = parsed.value.object.get(name) orelse return error.InvalidBatchRequest;
+                if (datum != .null or (try seen.getOrPut(scratch, name)).found_existing) return error.InvalidBatchRequest;
+                // Generated fields are output-only. Their expression result
+                // owns its null semantics, regardless of submitted metadata.
+                if (!preserve_logical_values) if (validator) |compiled| if (compiled.execution.expressions) |expressions| {
+                    if (expressions.generated_columns[ordinal]) continue;
+                };
+                try effective_json_null_fields.append(scratch, name);
+            }
+        }
         if (durable_row == null) if (validator) |compiled| {
             // Defaults and stored generated values cross the same immutable
             // schema boundary as CHECKs, extraction, indexes and logical hash.
             // Durable intents have already crossed it and must never evaluate
             // the current expression plan again during replay.
-            if (preserve_logical_values)
+            if (effective_json_null_fields.items.len != 0)
+                try compiled.prepareTypedValue(parsed.arena.allocator(), scratch, &parsed.value, effective_json_null_fields.items, preserve_logical_values)
+            else if (preserve_logical_values)
                 try compiled.validateValue(scratch, &parsed.value)
             else
                 try compiled.prepareValue(parsed.arena.allocator(), scratch, &parsed.value);
@@ -531,12 +567,14 @@ pub const PreparedRelationalWrite = struct {
                 .schema_columns = table_schema.relational_columns,
             };
         }
-        const prepared_row = try buildPreparedRelationalRowValueForSchemaFromParsedAlloc(
+        const prepared_row = try buildRelationalRowValueFromParsedInternal(
             alloc,
             scratch,
             parsed.value,
             table_schema,
             physical_layout,
+            physical_layout.required_ordinals,
+            effective_json_null_fields.items,
         );
         errdefer alloc.free(prepared_row.bytes);
         if (validator) |compiled| if (compiled.execution.expressions) |expressions| if (expressions.bindings.len != 0) {
@@ -627,7 +665,7 @@ pub const PreparedRelationalWrite = struct {
         physical_layout: *const relational_row_codec.PhysicalLayout,
         durable_row: ?[]const u8,
     ) !PreparedRelationalWrite {
-        return try initWithAllocators(alloc, alloc, alloc, false, key, document_json, validator, table_schema, physical_layout, durable_row, false);
+        return try initWithAllocators(alloc, alloc, alloc, false, key, document_json, validator, table_schema, physical_layout, durable_row, false, &.{});
     }
 
     /// A restore is not a new mutation: preserve missing values and verify
@@ -641,7 +679,7 @@ pub const PreparedRelationalWrite = struct {
         table_schema: runtime_schema.TableSchema,
         physical_layout: *const relational_row_codec.PhysicalLayout,
     ) !PreparedRelationalWrite {
-        return initWithAllocators(alloc, alloc, alloc, false, key, document_json, validator, table_schema, physical_layout, null, true);
+        return initWithAllocators(alloc, alloc, alloc, false, key, document_json, validator, table_schema, physical_layout, null, true, &.{});
     }
 
     pub fn initInSharedRegionPreserved(
@@ -654,7 +692,7 @@ pub const PreparedRelationalWrite = struct {
         table_schema: runtime_schema.TableSchema,
         physical_layout: *const relational_row_codec.PhysicalLayout,
     ) !PreparedRelationalWrite {
-        var prepared = try initWithAllocators(region.arena.allocator(), if (retain_text_root) region.arena.allocator() else scratch, scratch, retain_text_root, key, document_json, validator, table_schema, physical_layout, null, true);
+        var prepared = try initWithAllocators(region.arena.allocator(), if (retain_text_root) region.arena.allocator() else scratch, scratch, retain_text_root, key, document_json, validator, table_schema, physical_layout, null, true, &.{});
         region.retain();
         prepared.owned_region = region;
         if (retain_text_root) prepared.extracted.prepared_text_root = prepared.parsedValue();
@@ -684,6 +722,7 @@ pub const PreparedRelationalWrite = struct {
             physical_layout,
             durable_row,
             false,
+            &.{},
         );
         region.retain();
         prepared.owned_region = region;
@@ -4144,6 +4183,7 @@ fn buildPreparedRelationalRowValueForSchemaFromParsedAlloc(
         table_schema,
         physical_layout,
         physical_layout.required_ordinals,
+        &.{},
     );
 }
 
@@ -4154,6 +4194,7 @@ fn buildRelationalRowValueFromParsedInternal(
     table_schema: runtime_schema.TableSchema,
     physical_layout: *const relational_row_codec.PhysicalLayout,
     required_ordinals: []const u32,
+    json_null_fields: []const []const u8,
 ) !PreparedEncodedRow {
     if (root != .object) return error.InvalidBatchRequest;
     const columns = table_schema.relational_columns;
@@ -4177,10 +4218,11 @@ fn buildRelationalRowValueFromParsedInternal(
             ordinal: usize,
             column: runtime_schema.RelationalColumn,
             found: std.json.Value,
+            json_literal_null: bool,
             owned_buffers: *std.ArrayListUnmanaged([]u8),
         ) !relational_row_codec.Cell {
             const value_type = relationalValueType(column.column_type);
-            if (found == .null) {
+            if (found == .null and !json_literal_null) {
                 if (!column.allows_null) return error.InvalidBatchRequest;
                 return .{
                     .ordinal = @intCast(ordinal),
@@ -4237,6 +4279,9 @@ fn buildRelationalRowValueFromParsedInternal(
                 ordinal,
                 columns[ordinal],
                 found,
+                for (json_null_fields) |name| {
+                    if (std.mem.eql(u8, name, entry.key_ptr.*)) break true;
+                } else false,
                 &owned,
             ));
         }

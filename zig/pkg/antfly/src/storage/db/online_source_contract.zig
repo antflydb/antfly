@@ -164,10 +164,10 @@ pub fn validateRequest(req: anytype) !void {
     const command = req.online_source orelse return;
     try command.validate();
     if (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
-        req.relational_schema_version != null or req.relational_integrity_generation_set != null or req.timestamp_ns != 0 or
+        req.schema_version != null or req.relational_schema_version != null or req.relational_integrity_generation_set != null or req.timestamp_ns != 0 or
         req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.integrity.len != 0 or
         req.integrity_commands.len != 0 or req.predicates.len != 0 or req.transaction != null or
-        req.restore_staging != null or req.restore_staging_scope != null or req.restore_staging_plan_id != null or req.relational_topology != null or
+        req.restore_staging != null or req.restore_staging_scope != null or req.restore_staging_plan_id != null or req.relational_topology != null or req.relational_generation_gc != null or
         req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or
         req.relational_repair or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or
         req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null or req.merge_page != null or

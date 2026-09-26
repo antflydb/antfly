@@ -732,6 +732,26 @@ func (db *DB) StatsJSON() ([]byte, error) {
 	})
 }
 
+// SQLJSON executes SQL against the single embedded table named tableName.
+// The request uses statement, parameters and limit from the public SQL API.
+// The returned body is retained even on error so callers can inspect SQLSTATE;
+// sessions and catalog DDL require the server API, not a single database handle.
+func (db *DB) SQLJSON(tableName string, request []byte) ([]byte, error) {
+	handle, release, err := db.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	defer runtime.KeepAlive(db)
+	table, freeTable := makeCStringSlice([]byte(tableName))
+	defer freeTable()
+	input, freeInput := makeCStringSlice(request)
+	defer freeInput()
+	var out C.antfly_buffer
+	code := C.antfly_db_sql_json((*C.antfly_db)(handle), table, input, &out)
+	return takeBuffer(out), check(code)
+}
+
 // SearchJSON executes a JSON search request and returns the JSON result.
 func (db *DB) SearchJSON(request []byte) ([]byte, error) {
 	return db.withInputOutput(request, func(handle unsafe.Pointer, input C.antfly_slice, out *C.antfly_buffer) C.antfly_error_code {

@@ -22,6 +22,655 @@ const primary_mod = @import("../hot_standby/primary.zig");
 const time = @import("antfly_platform").time;
 const alloc = std.testing.allocator;
 
+test {
+    _ = @import("../relational_read_set.zig");
+    _ = @import("../retained_read_registry.zig");
+}
+
+test "relational index system statement fence never waits on partial prepared transactions" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("statement-fence");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    var first = (try db.tryStatementReadFence()).?;
+    defer first.release();
+    try std.testing.expect((try db.tryStatementReadFence()) == null);
+    first.release();
+    const transaction = try db.beginTransaction(1);
+    try db.writeIntents(transaction, &.{.{ .key = "pending", .value = "{\"n\":1}" }}, &.{});
+    try std.testing.expect((try db.tryStatementReadFence()) == null);
+    // A busy response releases both gates, allowing this participant (and a
+    // coordinator holding other participants) to finish its durable decision.
+    try std.testing.expect(db.core.snapshot_admission.lock.tryLockShared());
+    db.core.snapshot_admission.lock.unlockShared();
+    try std.testing.expect(db.core.snapshot_replay_admission.lock.tryLockShared());
+    db.core.snapshot_replay_admission.lock.unlockShared();
+    try db.abortTransaction(transaction, 2);
+    var after_resolution = (try db.tryStatementReadFence()).?;
+    defer after_resolution.release();
+}
+
+test "relational index system range activation rejects pending writers and captures empty snapshot guards" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("sql-range-activation");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const options: db_mod.types.ScanOptions = .{ .include_range_proofs = true, .relational_query = .{ .fields = &.{"_id"} } };
+    try std.testing.expectError(error.SqlRangeTrackingRequired, db.openDocumentReadSession(alloc, "a", "az", options));
+    const pending = try db.beginTransaction(1);
+    try db.writeIntents(pending, &.{.{ .key = "alpha", .value = "{}" }}, &.{});
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .activate_range_tracking = true }));
+    try db.abortTransaction(pending, 2);
+    try db.batch(.{ .activate_range_tracking = true });
+    const before = try db.openDocumentReadSession(alloc, "a", "az", options);
+    defer before.deinit();
+    const empty_proofs = try before.rangeProofs(alloc);
+    defer alloc.free(empty_proofs);
+    try std.testing.expectEqual(@as(usize, 1), empty_proofs.len);
+    try std.testing.expectEqual(null, empty_proofs[0].generation);
+    try db.batch(.{ .writes = &.{.{ .key = "alpha", .value = "{}" }} });
+    const after = try db.openDocumentReadSession(alloc, "a", "az", options);
+    defer after.deinit();
+    const changed = try after.rangeProofs(alloc);
+    defer alloc.free(changed);
+    try std.testing.expectEqual(@as(?u64, 1), changed[0].generation);
+    const pinned = try before.rangeProofs(alloc);
+    defer alloc.free(pinned);
+    try std.testing.expectEqual(null, pinned[0].generation);
+    const guarded = try db.beginTransaction(3);
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(guarded, .{ .range_guards = empty_proofs }));
+    try db.writeTransaction(guarded, .{ .range_guards = changed });
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .writes = &.{.{ .key = "another", .value = "{}" }} }));
+    try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .range_guards = changed }));
+    try db.abortTransaction(guarded, 4);
+    try db.batch(.{ .writes = &.{.{ .key = "another", .value = "{}" }} });
+    try db.batch(.{ .activate_range_tracking = true });
+}
+
+test "relational index system range activation and counters survive owner reopen" {
+    const protection = @import("../range_protection.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("sql-range-activation-reopen");
+    defer directory.cleanup();
+    {
+        var original = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+        defer original.close();
+        try original.batch(.{ .activate_range_tracking = true });
+        try original.batch(.{ .writes = &.{.{ .key = "alpha", .value = "{}" }} });
+    }
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try protection.isActive(&read));
+        try std.testing.expectEqual(@as(?u64, 1), try protection.generation(&read, protection.bucket("alpha")));
+    }
+    const options: db_mod.types.ScanOptions = .{ .include_range_proofs = true, .relational_query = .{ .fields = &.{"_id"} } };
+    const snapshot = try db.openDocumentReadSession(alloc, "a", "az", options);
+    defer snapshot.deinit();
+    const proofs = try snapshot.rangeProofs(alloc);
+    defer alloc.free(proofs);
+    try std.testing.expectEqual(@as(usize, 1), proofs.len);
+    try std.testing.expectEqual(@as(?u64, 1), proofs[0].generation);
+    try db.batch(.{ .writes = &.{.{ .key = "another", .value = "{}" }} });
+    const guarded = try db.beginTransaction(3);
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(guarded, .{ .range_guards = proofs }));
+    try db.abortTransaction(guarded, 4);
+}
+
+test "relational index system ordinary tuple replacement respects a prepared index span reader" {
+    const protection = @import("../range_protection.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("index-span-ordinary-conflict");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"label_idx","keys":[{"column":"label"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"label":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .activate_range_tracking = true });
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"label\":\"before\"}" }} });
+    _ = try readyIndex(&db, "label_idx");
+    const span = blk: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const entry = (try cursor.seekAtOrAfter(records.forward_namespace)) orelse return error.MissingRelationalIndexForwardKey;
+        if (!records.isForwardKey(entry.key)) return error.MissingRelationalIndexForwardKey;
+        break :blk (try protection.indexSpanDigest(entry.key)).?;
+    };
+    const counter = protection.indexCounterKey(span);
+    try std.testing.expectError(error.InvalidIntegrityOperation, db.batch(.{ .writes = &.{.{ .key = &counter, .value = "forged" }} }));
+    var counter_value: [8]u8 = undefined;
+    var initial_generation: u64 = undefined;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        initial_generation = (try protection.indexGeneration(&read, span)).?;
+        std.mem.writeInt(u64, &counter_value, initial_generation, .little);
+    }
+    const reader = try db.beginTransaction(2);
+    try db.writeIntents(reader, &.{}, &.{.{ .key = &counter, .expected_version = 0, .comparison = .exact_value, .expected_value = &counter_value }});
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"label\":\"after\"}" }} }));
+    const unchanged = (try db.get(alloc, "row")).?;
+    defer alloc.free(unchanged);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, unchanged, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("before", parsed.value.object.get("label").?.string);
+    try db.abortTransaction(reader, 3);
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"label\":\"after\"}" }} });
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(?u64, initial_generation + 1), try protection.indexGeneration(&read, span));
+}
+
+test "relational index system full-key reads guard exact READY tuple including misses" {
+    const protection = @import("../range_protection.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("index-exact-read-proof");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"label_idx","keys":[{"column":"label"}]},{"name":"label_tenant_idx","keys":[{"column":"label"},{"column":"tenant"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"label":{"type":"keyword"},"tenant":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .activate_range_tracking = true });
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"label\":\"before\"}" }} });
+    _ = try readyIndex(&db, "label_idx");
+    _ = try readyIndex(&db, "label_tenant_idx");
+    const options: db_mod.types.ScanOptions = .{
+        .include_range_proofs = true,
+        .relational_query_json = "{\"fields\":[\"label\"],\"index\":\"label_idx\",\"schema_version\":1,\"lower\":{\"values\":[\"after\"]},\"upper\":{\"values\":[\"after\"]}}",
+    };
+    const snapshot = try db.openRelationalReadSession(alloc, "", "", options);
+    defer snapshot.deinit();
+    const proofs = try snapshot.rangeProofs(alloc);
+    defer alloc.free(proofs);
+    try std.testing.expectEqual(@as(usize, 1), proofs.len);
+    try std.testing.expectEqual(protection.index_bucket_sentinel, proofs[0].bucket);
+    try std.testing.expectEqual(@as(?u64, null), proofs[0].generation);
+    const ranged = try db.openRelationalReadSession(alloc, "", "", .{
+        .include_range_proofs = true,
+        .relational_query_json = "{\"fields\":[\"label\"],\"index\":\"label_idx\",\"schema_version\":1,\"lower\":{\"values\":[\"after\"]}}",
+    });
+    defer ranged.deinit();
+    const conservative = try ranged.rangeProofs(alloc);
+    defer alloc.free(conservative);
+    try std.testing.expectEqual(@as(usize, protection.bucket_count), conservative.len);
+    try std.testing.expect(conservative[0].index == null);
+    const reader = try db.beginTransaction(2);
+    try db.writeTransaction(reader, .{ .range_guards = proofs });
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .writes = &.{.{ .key = "new", .value = "{\"label\":\"after\"}" }} }));
+    try db.abortTransaction(reader, 3);
+    try db.batch(.{ .writes = &.{.{ .key = "new", .value = "{\"label\":\"after\"}" }} });
+    const stale = try db.beginTransaction(4);
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(stale, .{ .range_guards = proofs }));
+    try db.abortTransaction(stale, 5);
+    const compound = try db.openRelationalReadSession(alloc, "", "", .{
+        .include_range_proofs = true,
+        .relational_query_json = "{\"fields\":[\"label\"],\"index\":\"label_tenant_idx\",\"schema_version\":1,\"lower\":{\"values\":[\"joint\",7]},\"upper\":{\"values\":[\"joint\",7]}}",
+    });
+    defer compound.deinit();
+    const compound_proofs = try compound.rangeProofs(alloc);
+    defer alloc.free(compound_proofs);
+    try std.testing.expectEqual(@as(usize, 1), compound_proofs.len);
+    try std.testing.expectEqual(protection.index_bucket_sentinel, compound_proofs[0].bucket);
+    const compound_reader = try db.beginTransaction(6);
+    try db.writeTransaction(compound_reader, .{ .range_guards = compound_proofs });
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .writes = &.{.{ .key = "composite", .value = "{\"label\":\"joint\",\"tenant\":7}" }} }));
+    try db.abortTransaction(compound_reader, 7);
+}
+
+test "relational index system exact tuple proof sees non-indexed row updates" {
+    const protection = @import("../range_protection.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("index-exact-row-update");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"label_idx","keys":[{"column":"label"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"label":{"type":"keyword"},"extra":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .activate_range_tracking = true });
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"label\":\"same\",\"extra\":\"before\"}" }} });
+    _ = try readyIndex(&db, "label_idx");
+    const snapshot = try db.openRelationalReadSession(alloc, "", "", .{
+        .include_range_proofs = true,
+        .relational_query_json = "{\"fields\":[\"label\",\"extra\"],\"index\":\"label_idx\",\"schema_version\":1,\"lower\":{\"values\":[\"same\"]},\"upper\":{\"values\":[\"same\"]}}",
+    });
+    defer snapshot.deinit();
+    const proofs = try snapshot.rangeProofs(alloc);
+    defer alloc.free(proofs);
+    try std.testing.expectEqual(@as(usize, 1), proofs.len);
+    try std.testing.expectEqual(protection.index_bucket_sentinel, proofs[0].bucket);
+    const prior = proofs[0].generation;
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"label\":\"same\",\"extra\":\"after\"}" }} });
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(?u64, prior.? + 1), try protection.indexGeneration(&read, proofs[0].index.?.digest));
+    const transaction = try db.beginTransaction(2);
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(transaction, .{ .range_guards = proofs }));
+    try db.abortTransaction(transaction, 3);
+    const current = try db.openRelationalReadSession(alloc, "", "", .{
+        .include_range_proofs = true,
+        .relational_query_json = "{\"fields\":[\"label\",\"extra\"],\"index\":\"label_idx\",\"schema_version\":1,\"lower\":{\"values\":[\"same\"]},\"upper\":{\"values\":[\"same\"]}}",
+    });
+    defer current.deinit();
+    const current_proofs = try current.rangeProofs(alloc);
+    defer alloc.free(current_proofs);
+    const writer = try db.beginTransaction(4);
+    try db.writeIntents(writer, &.{.{ .key = "row", .value = "{\"label\":\"same\",\"extra\":\"committed\"}" }}, &.{});
+    try db.commitTransaction(writer, 5);
+    const stale_transaction = try db.beginTransaction(6);
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(stale_transaction, .{ .range_guards = current_proofs }));
+    try db.abortTransaction(stale_transaction, 7);
+}
+
+test "relational index system prepared writer reserves prior and candidate tuples" {
+    const protection = @import("../range_protection.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("index-span-prepared-writer");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"label_idx","keys":[{"column":"label"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"label":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .activate_range_tracking = true });
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"label\":\"before\"}" }} });
+    _ = try readyIndex(&db, "label_idx");
+    const old_span = blk: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const entry = (try cursor.seekAtOrAfter(records.forward_namespace)) orelse return error.MissingRelationalIndexForwardKey;
+        break :blk (try protection.indexSpanDigest(entry.key)).?;
+    };
+    try db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"label\":\"after\"}" }} });
+    const new_span = blk: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(records.forward_namespace);
+        while (entry) |record| : (entry = try cursor.next()) {
+            if (!records.isForwardKey(record.key)) break;
+            const span = (try protection.indexSpanDigest(record.key)).?;
+            if (!std.mem.eql(u8, &span, &old_span)) break :blk span;
+        }
+        return error.MissingRelationalIndexForwardKey;
+    };
+    try db.batch(.{ .deletes = &.{"seed"} });
+    var old_value: [8]u8 = undefined;
+    var new_value: [8]u8 = undefined;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        std.mem.writeInt(u64, &old_value, (try protection.indexGeneration(&read, old_span)).?, .little);
+        std.mem.writeInt(u64, &new_value, (try protection.indexGeneration(&read, new_span)).?, .little);
+    }
+    const writer = try db.beginTransaction(2);
+    try db.writeIntents(writer, &.{.{ .key = "row", .value = "{\"label\":\"after\"}" }}, &.{});
+    db.close();
+    db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    const reader = try db.beginTransaction(3);
+    const old_counter = protection.indexCounterKey(old_span);
+    const new_counter = protection.indexCounterKey(new_span);
+    for ([_]@import("../transactions.zig").VersionPredicate{
+        .{ .key = &old_counter, .expected_version = 0, .comparison = .exact_value, .expected_value = &old_value },
+        .{ .key = &new_counter, .expected_version = 0, .comparison = .exact_value, .expected_value = &new_value },
+    }) |proof| try std.testing.expectError(error.IntentConflict, db.writeIntents(reader, &.{}, &.{proof}));
+    try db.abortTransaction(writer, 4);
+    try db.writeIntents(reader, &.{}, &.{.{ .key = &old_counter, .expected_version = 0, .comparison = .exact_value, .expected_value = &old_value }});
+    try db.abortTransaction(reader, 5);
+}
+
+test "relational index system ready publication waits for pre-generation transactions" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("index-span-ready-drain");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"label_idx","keys":[{"column":"label"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"label":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .activate_range_tracking = true });
+    const pending = try db.beginTransaction(1);
+    try db.writeIntents(pending, &.{.{ .key = "row", .value = "{\"label\":\"pending\"}" }}, &.{});
+    var deferred = false;
+    for (0..2048) |_| {
+        _ = db.runRelationalIndexMaintenancePass() catch |err| switch (err) {
+            error.IntentConflict => {
+                deferred = true;
+                break;
+            },
+            else => return err,
+        };
+    }
+    try std.testing.expect(deferred);
+    try std.testing.expectEqual(@import("relational_index_jobs.zig").State.building, (try db.relationalIndexBuildStatus("label_idx")).state);
+    try db.abortTransaction(pending, 2);
+    const idle = try db.beginTransaction(3);
+    for (0..2048) |_| {
+        if ((try db.relationalIndexBuildStatus("label_idx")).state == .ready) break;
+        try db.buildRelationalIndexStep("label_idx", .{});
+    }
+    try std.testing.expectEqual(@import("relational_index_jobs.zig").State.ready, (try db.relationalIndexBuildStatus("label_idx")).state);
+    try db.abortTransaction(idle, 4);
+}
+
+test "relational index system document SQL retains snapshot and projected null semantics" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("document-sql-snapshot");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"j":{}},"additionalProperties":true}}}}
+    );
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"n\":9007199254740993,\"j\":null}" },
+        .{ .key = "b", .value = "{\"n\":2}" },
+    } });
+    const session = try db.openDocumentReadSession(alloc, "", "", .{ .limit = 1, .relational_query = .{ .fields = &.{ "n", "j" }, .schema_version = 1 } });
+    defer session.deinit();
+    var first = try session.next(alloc, 1);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.rows.len);
+    try std.testing.expectEqualStrings("a", first.rows[0].id);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), first.rows[0].value.object.get("n").?.integer);
+    try std.testing.expect(!first.rows[0].sql_nulls.?[1]);
+    try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"n\":999,\"j\":{}}" }} });
+    var second = try session.next(alloc, 1);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), second.rows.len);
+    try std.testing.expectEqualStrings("b", second.rows[0].id);
+    try std.testing.expectEqual(@as(i64, 2), second.rows[0].value.object.get("n").?.integer);
+    try std.testing.expect(second.rows[0].sql_nulls.?[1]);
+}
+
+test "relational index system common-cut views release writers before scanning and survive later publication" {
+    var first_dir = try @import("../../common/test_directory.zig").TestDirectory.init("statement-cut-first");
+    defer first_dir.cleanup();
+    var second_dir = try @import("../../common/test_directory.zig").TestDirectory.init("statement-cut-second");
+    defer second_dir.cleanup();
+    var first = try db_mod.DB.open(alloc, first_dir.path(), .{ .start_optional_runtimes = false });
+    defer first.close();
+    var second = try db_mod.DB.open(alloc, second_dir.path(), .{ .start_optional_runtimes = false });
+    defer second.close();
+    const schema_json = try schema(1, false);
+    defer alloc.free(schema_json);
+    for ([_]*db_mod.DB{ &first, &second }) |db| {
+        try db.setSchemaJson(alloc, schema_json);
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"id\":1}" }} });
+    }
+    var first_fence = (try first.tryStatementReadFence()).?;
+    defer first_fence.release();
+    var second_fence = (try second.tryStatementReadFence()).?;
+    defer second_fence.release();
+    const opts: db_mod.types.ScanOptions = .{ .relational_query = .{ .fields = &.{"id"}, .schema_version = 1 } };
+    const first_view = try first.openRelationalReadSession(alloc, "", "", opts);
+    defer first_view.deinit();
+    const alias_view = try first.openRelationalReadSession(alloc, "", "", opts);
+    defer alias_view.deinit();
+    const second_view = try second.openRelationalReadSession(alloc, "", "", opts);
+    defer second_view.deinit();
+    second_fence.release();
+    first_fence.release();
+    for ([_]*db_mod.DB{ &first, &second }) |db| try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"id\":2}" }} });
+    for ([_]*db_mod.DB.RelationalReadSession{ first_view, alias_view, second_view }) |view| {
+        var page = try view.nextTypedPage(alloc, null, .{ .rows = 1 });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqual(@as(i64, 1), page.rows[0].typed.?.object.get("id").?.integer);
+    }
+}
+
+test "relational index system session normalization shares defaults generated values and immutable schema" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("sql-normalize");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const row_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"b","expression":{"op":"literal","type":"integer","value":"2"}}],"generated_columns":[{"column":"total","expression":{"op":"add","args":[{"op":"column","column":"a"},{"op":"column","column":"b"}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"},"total":{"type":"integer"}},"required":["a","b","total"],"additionalProperties":false}}}}
+    ;
+    try db.setSchemaJson(alloc, row_schema);
+    const session = try db.openRelationalReadSession(alloc, "", "", .{ .relational_query_json = "{\"fields\":[\"a\",\"b\",\"total\"],\"schema_version\":1}", .limit = 16 });
+    defer session.deinit();
+    const normalized = try session.normalizeRows(alloc, &.{.{ .key = "row", .value = "{\"a\":9007199254740993}" }});
+    defer {
+        for (normalized) |prepared_write| {
+            alloc.free(prepared_write.key);
+            alloc.free(prepared_write.value);
+        }
+        alloc.free(normalized);
+    }
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized[0].value, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("b").?.integer);
+    try std.testing.expectEqual(@as(i64, 9007199254740995), parsed.value.object.get("total").?.integer);
+    var empty = try session.nextTypedPage(alloc, null, .{});
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.rows.len);
+    // Native commit uses exactly the same preparation rules; supplied,
+    // server-normalized stored-generated values are revalidated consistently.
+    try db.batch(.{ .writes = normalized, .relational_schema_version = 1 });
+    var reader = try db.beginRelationalRows(alloc, .{ .fields = &.{"total"} });
+    defer reader.deinit();
+    var committed = try reader.nextTypedPage(alloc, null, .{});
+    defer committed.deinit();
+    try std.testing.expectEqual(@as(i64, 9007199254740995), committed.rows[0].typed.?.object.get("total").?.integer);
+    var changed = try std.json.parseFromSlice(std.json.Value, alloc, row_schema, .{});
+    defer changed.deinit();
+    changed.value.object.getPtr("version").?.* = .{ .integer = 2 };
+    changed.value.object.getPtr("column_defaults").?.array.items[0].object.getPtr("expression").?.object.getPtr("value").?.* = .{ .string = "7" };
+    const newer = try std.json.Stringify.valueAlloc(alloc, changed.value, .{});
+    defer alloc.free(newer);
+    try db.setSchemaJson(alloc, newer);
+    const pinned = try session.normalizeRows(alloc, &.{.{ .key = "later", .value = "{\"a\":1}" }});
+    defer {
+        for (pinned) |prepared_write| {
+            alloc.free(prepared_write.key);
+            alloc.free(prepared_write.value);
+        }
+        alloc.free(pinned);
+    }
+    var still_old = try std.json.parseFromSlice(std.json.Value, alloc, pinned[0].value, .{});
+    defer still_old.deinit();
+    try std.testing.expectEqual(@as(i64, 2), still_old.value.object.get("b").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), still_old.value.object.get("total").?.integer);
+}
+
+test "relational index system typed JSON null survives preparation normalization and transaction replay" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("typed-json-null");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"payload":{"type":"json"},"optional":{"type":["json","null"]}},"required":["payload"],"additionalProperties":false}}}}
+    );
+    const input_write = db_mod.types.BatchWrite{ .key = "a", .value = "{\"payload\":null,\"optional\":null}", .json_null_fields = &.{"payload"} };
+    const session = try db.openRelationalReadSession(alloc, "", "", .{ .relational_query_json = "{\"fields\":[\"payload\",\"optional\"],\"schema_version\":1}", .limit = 16 });
+    defer session.deinit();
+    const normalized = try session.normalizeRows(alloc, &.{input_write});
+    defer {
+        for (normalized) |item| {
+            alloc.free(item.key);
+            alloc.free(item.value);
+            for (item.json_null_fields) |name| alloc.free(name);
+            alloc.free(item.json_null_fields);
+        }
+        alloc.free(normalized);
+    }
+    try std.testing.expectEqualStrings("payload", normalized[0].json_null_fields[0]);
+    try db.batch(.{ .writes = normalized, .relational_schema_version = 1 });
+    var reader = try db.beginRelationalRows(alloc, .{ .fields = &.{ "payload", "optional" } });
+    defer reader.deinit();
+    var page = try reader.nextTypedPage(alloc, null, .{});
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, page.rows[0].sql_nulls.?);
+    const transaction = try db.beginTransaction(2);
+    try db.writeIntents(transaction, &.{.{ .key = "b", .value = input_write.value, .json_null_fields = input_write.json_null_fields }}, &.{});
+    try db.commitTransaction(transaction, 3);
+    var committed = try db.beginRelationalRows(alloc, .{ .fields = &.{ "payload", "optional" } });
+    defer committed.deinit();
+    var committed_page = try committed.nextTypedPage(alloc, null, .{});
+    defer committed_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), committed_page.rows.len);
+    for (committed_page.rows) |row| try std.testing.expectEqualSlices(bool, &.{ false, true }, row.sql_nulls.?);
+    try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{ .key = "bad", .value = input_write.value, .json_null_fields = &.{ "payload", "payload" } }} }));
+    try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{ .key = "bad", .value = input_write.value, .json_null_fields = &.{"missing"} }} }));
+}
+
+test "relational index system typed JSON null obeys composed JSON constraints" {
+    const schema_api = @import("../../schema/mod.zig");
+    for ([_]struct { constraint: []const u8, accepted: bool }{
+        .{ .constraint = "\"allOf\":[{\"type\":\"json\"}]", .accepted = true },
+        .{ .constraint = "\"allOf\":[{\"anyOf\":[{\"type\":\"json\"},{\"type\":\"integer\"}]}]", .accepted = true },
+        .{ .constraint = "\"anyOf\":[{\"type\":\"json\"},{\"type\":\"string\"}]", .accepted = true },
+        .{ .constraint = "\"oneOf\":[{\"type\":\"json\"},{\"type\":\"null\"}]", .accepted = false },
+        .{ .constraint = "\"not\":{\"type\":\"json\"}", .accepted = false },
+        .{ .constraint = "\"if\":{\"type\":\"json\"},\"then\":{\"enum\":[1]}", .accepted = false },
+        .{ .constraint = "\"if\":{\"type\":\"integer\"},\"else\":{\"const\":null}", .accepted = true },
+        .{ .constraint = "\"const\":null", .accepted = true },
+        .{ .constraint = "\"enum\":[1]", .accepted = false },
+    }) |case| {
+        const schema_json = try std.fmt.allocPrint(
+            alloc,
+            "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"payload\":{{\"type\":\"json\",{s}}}}}}}}}}}}}",
+            .{case.constraint},
+        );
+        defer alloc.free(schema_json);
+        var validator = try schema_api.CompiledTableValidator.init(alloc, schema_json);
+        defer validator.deinit(alloc);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"payload\":null}", .{});
+        defer parsed.deinit();
+        const result = validator.prepareTypedValue(parsed.arena.allocator(), alloc, &parsed.value, &.{"payload"}, false);
+        if (case.accepted) try result else try std.testing.expectError(error.InvalidBatchRequest, result);
+        const restored = @import("../../schema/table_schema_impl.zig").validateRelationalRestoreProperty(
+            alloc,
+            validator.schema,
+            0,
+            parsed.value.object.getPtr("payload").?,
+            &validator.execution,
+            true,
+        );
+        if (case.accepted) try restored else try std.testing.expectError(error.InvalidBatchRequest, restored);
+        // The same JSON representation without provenance denotes SQL NULL.
+        // Admitting literal JSON null must never weaken column nullability.
+        try std.testing.expectError(error.InvalidBatchRequest, validator.prepareValue(parsed.arena.allocator(), alloc, &parsed.value));
+    }
+}
+
+test "relational index system typed JSON null provenance is confined to named root datums" {
+    const schema_api = @import("../../schema/mod.zig");
+    var validator = try schema_api.CompiledTableValidator.init(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"payload":{"type":"json"},"other":{"type":"json"},"nested":{"type":"object","properties":{"child":{"type":"integer"}}}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(alloc);
+    for ([_][]const u8{
+        "{\"payload\":null,\"other\":null}",
+        "{\"payload\":null,\"nested\":{\"child\":null}}",
+        "null",
+    }) |input| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, input, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidBatchRequest, validator.prepareTypedValue(parsed.arena.allocator(), alloc, &parsed.value, &.{"payload"}, false));
+    }
+}
+
+test "relational index system automatic bounds use compiled collation identity" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("relational-auto-collation");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"a_ci","keys":[{"column":"label","collation":"ci"}]},{"name":"z_binary","keys":[{"column":"label"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"label":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .writes = &.{
+        .{ .key = "upper", .value = "{\"label\":\"Z\"}" },
+        .{ .key = "lower", .value = "{\"label\":\"a\"}" },
+    } });
+    _ = try readyIndex(&db, "a_ci");
+    _ = try readyIndex(&db, "z_binary");
+    var reader = try db.beginRelationalRows(alloc, .{ .auto_index = true, .fields = &.{"label"}, .conditions = &.{
+        .{ .column = "label", .op = .lt, .value = .{ .string = "a" }, .collation = "binary" },
+    } });
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("z_binary", reader.index.?.name);
+    var page = try reader.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqualStrings("upper", page.rows[0].key);
+}
+
+test "relational index system automatic ranges and snapshot costing bound scan work" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("relational-auto-range-cost");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"tenant_score","keys":[{"column":"tenant"},{"column":"score","direction":"desc"}],"include_columns":["bucket","payload"]},{"name":"bucket","keys":[{"column":"bucket"}],"include_columns":["tenant","score","payload"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"integer"},"score":{"type":"integer"},"bucket":{"type":"integer"},"payload":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const writes = try owned.alloc(db_mod.types.BatchWrite, 96);
+    for (writes, 0..) |*request, i| request.* = .{
+        .key = try std.fmt.allocPrint(owned, "row:{d:0>3}", .{i}),
+        .value = try std.json.Stringify.valueAlloc(owned, .{ .tenant = 1, .score = i, .bucket = @as(usize, @intFromBool(i == 15)), .payload = "value" }, .{}),
+    };
+    try db.batch(.{ .writes = writes });
+    _ = try readyIndex(&db, "tenant_score");
+    _ = try readyIndex(&db, "bucket");
+    const bounded = [_]rows.Condition{
+        .{ .column = "tenant", .op = .eq, .value = .{ .integer = 1 } },
+        .{ .column = "score", .op = .gte, .value = .{ .integer = 10 } },
+        .{ .column = "score", .op = .gt, .value = .{ .integer = 12 } },
+        .{ .column = "score", .op = .lte, .value = .{ .integer = 20 } },
+        .{ .column = "score", .op = .lt, .value = .{ .integer = 19 } },
+    };
+    {
+        var reader = try db.beginRelationalRows(alloc, .{ .auto_index = true, .fields = &.{"payload"}, .conditions = &bounded });
+        defer reader.deinit();
+        try std.testing.expectEqualStrings("tenant_score", reader.index.?.name);
+        try std.testing.expectEqual(@as(usize, 0), reader.planner_records);
+        var page = try reader.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 6), page.rows.len);
+        try std.testing.expectEqual(@as(usize, 6), page.records_examined);
+        try std.testing.expectEqualStrings("row:018", page.rows[0].key);
+        try std.testing.expectEqualStrings("row:013", page.rows[5].key);
+        try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+    }
+    {
+        const selective = bounded ++ [_]rows.Condition{.{ .column = "bucket", .op = .eq, .value = .{ .integer = 1 } }};
+        var reader = try db.beginRelationalRows(alloc, .{ .auto_index = true, .fields = &.{"payload"}, .conditions = &selective });
+        defer reader.deinit();
+        // Actual cardinality wins over the longer composite prefix.
+        try std.testing.expectEqualStrings("bucket", reader.index.?.name);
+        try std.testing.expectEqual(@as(usize, 2), reader.planner_candidates);
+        try std.testing.expectEqual(@as(usize, 7), reader.planner_records);
+        var page = try reader.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqualStrings("row:015", page.rows[0].key);
+        try std.testing.expectEqual(@as(usize, 1), page.records_examined);
+        try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+        std.debug.print("automatic index costing: 96 primary rows; planner={} records; selected={} records, primary_probes={}\n", .{ reader.planner_records, page.records_examined, page.primary_lookups });
+    }
+    {
+        // A range on the first ascending key needs no equality prefix.
+        var reader = try db.beginRelationalRows(alloc, .{ .auto_index = true, .fields = &.{"payload"}, .conditions = &.{
+            .{ .column = "bucket", .op = .gte, .value = .{ .integer = 1 } },
+            .{ .column = "bucket", .op = .lte, .value = .{ .integer = 1 } },
+        } });
+        defer reader.deinit();
+        try std.testing.expectEqualStrings("bucket", reader.index.?.name);
+        var page = try reader.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), page.records_examined);
+    }
+}
+
 fn mixedScanAllocations(test_alloc: std.mem.Allocator, db: *db_mod.DB) !void {
     var reader = try db.beginRelationalRows(test_alloc, .{ .fields = &.{"payload"} });
     defer reader.deinit();
@@ -848,6 +1497,29 @@ test "relational index system partial stronger query bounds preserve residual co
     // Query=>index admits a stronger range, but index=>query does NOT prove
     // its residual. Incorrectly sharing these two proofs would return 11 rows.
     _ = try readyIndex(&db, "scores");
+    {
+        var automatic = try db.beginRelationalRows(alloc, .{ .auto_index = true, .fields = &.{"id"}, .conditions = &.{
+            .{ .column = "id", .op = .eq, .value = .{ .integer = 15 } },
+            .{ .column = "score", .op = .gte, .value = .{ .integer = 12 } },
+            .{ .column = "score", .op = .lt, .value = .{ .integer = 18 } },
+        } });
+        defer automatic.deinit();
+        try std.testing.expectEqualStrings("scores", automatic.index.?.name);
+        var selected = try automatic.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(usize, 1), selected.rows.len);
+        try std.testing.expectEqualStrings("row:015", selected.rows[0].key);
+        try std.testing.expectEqual(@as(usize, 0), selected.primary_lookups);
+        var fallback = try db.beginRelationalRows(alloc, .{ .auto_index = true, .fields = &.{"id"}, .conditions = &.{
+            .{ .column = "id", .op = .eq, .value = .{ .integer = 5 } },
+        } });
+        defer fallback.deinit();
+        try std.testing.expect(fallback.index == null);
+        var primary_page = try fallback.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+        defer primary_page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), primary_page.rows.len);
+        try std.testing.expectEqualStrings("row:005", primary_page.rows[0].key);
+    }
     var reader = try db.beginRelationalRows(alloc, .{ .index = "scores", .fields = &.{"id"}, .conditions = &.{
         .{ .column = "score", .op = .gte, .value = .{ .integer = 12 } },
         .{ .column = "score", .op = .lt, .value = .{ .integer = 18 } },

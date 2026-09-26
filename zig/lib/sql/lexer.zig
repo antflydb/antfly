@@ -83,18 +83,24 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
 /// allocation-free diagnostics. A caller that receives `.tokens` owns them
 /// and must call `freeTokens`.
 pub fn tokenizeDiagnosticAlloc(alloc: std.mem.Allocator, sql: []const u8) !TokenizeResult {
+    return tokenizeBoundedDiagnosticAlloc(alloc, sql, std.math.maxInt(usize));
+}
+
+/// Enforces the token quota before allocating or decoding the next token.
+/// Whitespace/comments do not consume the quota, including trailing trivia.
+pub fn tokenizeBoundedDiagnosticAlloc(alloc: std.mem.Allocator, sql: []const u8, max_tokens: usize) !TokenizeResult {
     var diagnostic: LexDiagnostic = undefined;
-    const tokens = tokenizeImpl(alloc, sql, &diagnostic) catch |err| switch (err) {
+    const tokens = tokenizeImpl(alloc, sql, &diagnostic, max_tokens) catch |err| switch (err) {
         error.UnsupportedSqlShape => return .{ .diagnostic = diagnostic },
         else => return err,
     };
     return .{ .tokens = tokens };
 }
 
-fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagnostic) !std.ArrayListUnmanaged(Token) {
+fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagnostic, max_tokens: usize) !std.ArrayListUnmanaged(Token) {
     var tokens = std.ArrayListUnmanaged(Token).empty;
     errdefer freeTokens(alloc, &tokens);
-    const estimated_capacity = estimateTokenCapacity(sql);
+    const estimated_capacity = @min(max_tokens, estimateTokenCapacity(sql));
     if (estimated_capacity > 0) try tokens.ensureTotalCapacityPrecise(alloc, estimated_capacity);
 
     var i: usize = 0;
@@ -132,6 +138,7 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
             }
             continue;
         }
+        if (tokens.items.len >= max_tokens) return error.SqlTokenLimitExceeded;
         if (std.ascii.isAlphabetic(ch) or ch == '_' or ch >= 0x80) {
             const start = i;
             i += if (ch >= 0x80) try utf8SequenceWidthAt(sql, i, diagnostic) else 1;
@@ -417,6 +424,25 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
 fn estimateTokenCapacity(sql: []const u8) usize {
     if (sql.len == 0) return 0;
     return @min(eager_token_capacity_limit, @min(sql.len, sql.len / 4 + 8));
+}
+
+test "bounded lexer rejects before decoding excess token and allows trailing trivia" {
+    const allocator = std.testing.allocator;
+    var accepted = (try tokenizeBoundedDiagnosticAlloc(allocator, "select x -- trailing comment\n /* nested /* comment */ */", 2)).tokens;
+    defer freeTokens(allocator, &accepted);
+    try std.testing.expectEqual(@as(usize, 2), accepted.items.len);
+    // The excess token is an unterminated string; quota must win before scanning
+    // or allocating it, rather than performing work merely to reject afterward.
+    try std.testing.expectError(error.SqlTokenLimitExceeded, tokenizeBoundedDiagnosticAlloc(allocator, "select x 'unterminated", 2));
+    var empty_buffer: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&empty_buffer);
+    const empty = try tokenizeBoundedDiagnosticAlloc(fixed.allocator(), " -- no tokens", 0);
+    try std.testing.expectEqual(@as(usize, 0), empty.tokens.items.len);
+    try std.testing.expectError(error.SqlTokenLimitExceeded, tokenizeBoundedDiagnosticAlloc(fixed.allocator(), "select", 0));
+}
+
+test "bounded lexer releases owned tokens on quota failure" {
+    try std.testing.expectError(error.SqlTokenLimitExceeded, tokenizeBoundedDiagnosticAlloc(std.testing.allocator, "\"quoted\" 'string' excess", 2));
 }
 
 fn scanNumberEnd(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !usize {

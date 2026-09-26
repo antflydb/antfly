@@ -1394,6 +1394,316 @@ components:
       schema:
         type: string
   schemas:
+    SQLColumnType:
+      type: string
+      description: Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
+      enum: [string, integer, number, boolean, datetime, json, unknown]
+    SQLColumn:
+      type: object
+      additionalProperties: false
+      required: [name, type]
+      properties:
+        name:
+          type: string
+          description: Display label. Labels need not be unique; rows use matching ordinal positions.
+        type:
+          $ref: "#/components/schemas/SQLColumnType"
+    SQLPrepareRequest:
+      type: object
+      additionalProperties: false
+      required: [statement]
+      properties:
+        statement:
+          type: string
+          minLength: 1
+          maxLength: 65536
+        database:
+          type: string
+        namespace:
+          type: string
+        session_id:
+          type: string
+          pattern: '^[0-9a-fA-F]{32}$'
+          description: Optional durable SQL session. Preparation binds its authenticated scope and current setting catalog under the session lease; execution must supply the same session.
+    SQLPreparedExecutionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        parameters:
+          type: array
+          maxItems: 1024
+          items:
+            x-go-type: json.RawMessage
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 128
+        session_id:
+          type: string
+          pattern: '^[0-9a-fA-F]{32}$'
+          description: Optional durable transaction session. Required when the resource was prepared against a session; otherwise independent of the prepared resource lifetime.
+    SQLPreparedResponse:
+      type: object
+      additionalProperties: false
+      required: [prepared_id, expires_at_ms, owner_node_id, parameter_types, columns]
+      properties:
+        prepared_id:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+        expires_at_ms:
+          type: integer
+          format: int64
+        owner_node_id:
+          type: string
+          pattern: '^[0-9]{1,20}$'
+          maxLength: 20
+          description: Exact decimal API owner identifier, preserved by JavaScript clients.
+        parameter_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/SQLColumnType'
+        columns:
+          type: array
+          items:
+            $ref: '#/components/schemas/SQLColumn'
+    SqlSettingValue:
+      description: One typed setting value, matching the declared kind.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [boolean]
+          properties:
+            boolean: {type: boolean}
+        - type: object
+          additionalProperties: false
+          required: [integer]
+          properties:
+            integer: {type: integer, format: int64}
+        - type: object
+          additionalProperties: false
+          required: [string]
+          properties:
+            string: {type: string, maxLength: 4096}
+    SqlSettingDatabaseDefault:
+      type: object
+      additionalProperties: false
+      required: [database, value]
+      properties:
+        database: {type: string}
+        value: {$ref: '#/components/schemas/SqlSettingValue'}
+    SqlSettingRoleDefault:
+      type: object
+      additionalProperties: false
+      required: [principal, database, value]
+      properties:
+        principal: {type: string}
+        database: {type: string}
+        value: {$ref: '#/components/schemas/SqlSettingValue'}
+    SqlSettingPut:
+      type: object
+      additionalProperties: false
+      required: [name, kind, default]
+      properties:
+        name: {type: string, maxLength: 128}
+        kind: {type: string, enum: [boolean, integer, string]}
+        policy_sensitive: {type: boolean}
+        session_writable: {type: boolean}
+        default: {$ref: '#/components/schemas/SqlSettingValue'}
+        database_defaults:
+          type: array
+          maxItems: 256
+          items: {$ref: '#/components/schemas/SqlSettingDatabaseDefault'}
+        role_defaults:
+          type: array
+          maxItems: 1024
+          items: {$ref: '#/components/schemas/SqlSettingRoleDefault'}
+    SqlSettingMutationPut:
+      type: object
+      additionalProperties: false
+      required: [put]
+      properties:
+        put: {$ref: '#/components/schemas/SqlSettingPut'}
+    SqlSettingMutationDrop:
+      type: object
+      additionalProperties: false
+      required: [drop]
+      properties:
+        drop: {type: string, maxLength: 128}
+    SqlSettingMutationRequest:
+      description: Put a complete definition/default set or drop one by name.
+      oneOf:
+        - {$ref: '#/components/schemas/SqlSettingMutationPut'}
+        - {$ref: '#/components/schemas/SqlSettingMutationDrop'}
+    SQLRequest:
+      type: object
+      additionalProperties: false
+      required: [statement]
+      description: |
+        Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...),
+        never interpolated into SQL text. To preserve integer precision in
+        JavaScript clients, supply integers outside the exact JSON number range
+        as decimal strings; binding coerces parameters to the expected type.
+        The result limit is an admission bound, not an implicit SQL LIMIT:
+        statements whose results exceed it fail instead of silently truncating.
+        Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated
+        memory, and encoded results to a 16 MiB allocation budget.
+      properties:
+        statement:
+          type: string
+          minLength: 1
+          description: A single SQL statement.
+        parameters:
+          type: array
+          maxItems: 1024
+          description: Positional JSON parameter values, including null.
+          items:
+            x-go-type: json.RawMessage
+        database:
+          type: string
+          minLength: 1
+          description: Database used to resolve unqualified catalog names.
+        namespace:
+          type: string
+          minLength: 1
+          description: Namespace used to resolve unqualified table names.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 128
+          description: Maximum admitted result rows; does not change statement semantics.
+        session_id:
+          type: string
+          pattern: '^[0-9a-fA-F]{32}$'
+          description: Opaque SQL session identifier returned by a previous response.
+    SQLTransactionStatus:
+      type: string
+      enum: [idle, in_transaction, failed]
+      description: Authoritative native SQL session state after the statement. Failed sessions require ROLLBACK or ROLLBACK TO SAVEPOINT; uncertain commit outcomes must be reconciled by transaction_id, never replayed.
+    SQLMutationOutcome:
+      type: string
+      description: |
+        Durable mutation outcome. Every value confirms a commit and must not
+        cause the statement to be replayed. Pending or repair outcomes require
+        visibility convergence or operator action rather than another write.
+      enum: [committed, committed_pending, committed_repair_required, committed_graph_metric_materialization_rejected]
+    SQLResponse:
+      type: object
+      additionalProperties: false
+      required: [columns, rows, rows_affected, command_tag]
+      description: |
+        Ordinal result rows with corresponding logical column metadata. SQL NULL
+        is JSON null; sql_nulls distinguishes it from a JSON column containing
+        the JSON literal null. Integer-typed values are exact decimal strings; datetime
+        values are strings. Objects and arrays in JSON columns remain JSON.
+      properties:
+        columns:
+          type: array
+          items:
+            $ref: "#/components/schemas/SQLColumn"
+        rows:
+          type: array
+          maxItems: 4096
+          items:
+            type: array
+            items:
+              x-go-type: json.RawMessage
+        rows_affected:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of rows affected by a mutation, or zero for a read-only statement.
+        sql_nulls:
+          type: array
+          maxItems: 4096
+          description: |
+            Null flags aligned exactly with rows and their columns. True denotes
+            SQL NULL; false denotes a value, including the JSON literal null.
+            When omitted, null cells have the legacy SQL NULL interpretation.
+          items:
+            type: array
+            items:
+              type: boolean
+        command_tag:
+          type: string
+          description: SQL command completion tag.
+        mutation_outcome:
+          $ref: "#/components/schemas/SQLMutationOutcome"
+        ddl_receipt:
+          $ref: "#/components/schemas/SQLDDLReceipt"
+        transaction_id:
+          type: string
+          pattern: '^[0-9a-fA-F]{32}$'
+          description: Native transaction receipt for visibility or repair reconciliation; never replay a committed statement.
+        session_id:
+          type: string
+          description: Opaque SQL session identifier for subsequent requests.
+        transaction_status:
+          $ref: "#/components/schemas/SQLTransactionStatus"
+    SQLDDLReceiptState:
+      type: string
+      enum: [ready, pending, invalid, admission_unknown]
+    SQLDDLReceipt:
+      type: object
+      additionalProperties: false
+      required: [database, namespace, table, table_id, schema_version, state]
+      description: |
+        Durable DDL declaration receipt. admission_unknown means admission has
+        not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
+        Pending or invalid means the declaration
+        committed but validation has not established an active constraint. Do not
+        replay it. Inspect table constraint status using this immutable table
+        identity and schema generation; a later generation supersedes this receipt.
+      properties:
+        database:
+          type: string
+        namespace:
+          type: string
+        table:
+          type: string
+        table_id:
+          type: string
+        schema_version:
+          type: integer
+          format: int64
+          minimum: 0
+        state:
+          $ref: "#/components/schemas/SQLDDLReceiptState"
+        diagnostic:
+          type: string
+        restore_job_id:
+          type: string
+          description: Native staging job for an atomic schema rewrite or TRUNCATE generation barrier. table_id identifies the source generation. Poll the job; pending or admission_unknown is not completed DDL and must not be replayed.
+        idempotency_key:
+          type: string
+          description: Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL.
+    SQLDiagnostic:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          minLength: 5
+          maxLength: 5
+          description: Five-character SQLSTATE error code.
+        message:
+          type: string
+          description: Human-readable diagnostic with no sensitive parameter values.
+        position:
+          type: integer
+          minimum: 1
+          description: Optional one-based character position in the submitted SQL statement.
+        transaction_id:
+          type: string
+          pattern: '^[0-9a-fA-F]{32}$'
+          description: Native transaction receipt for reconciliation when a mutation outcome is unknown.
+        retryable:
+          type: boolean
+          description: False for SQLSTATE 40003; never replay a mutation whose outcome is unknown.
+        transaction_status:
+          $ref: "#/components/schemas/SQLTransactionStatus"
     DatabaseCatalogRecord:
       type: object
       required:
@@ -5548,6 +5858,11 @@ components:
         row:
           type: object
           additionalProperties: true
+        json_null_fields:
+          type: array
+          items:
+            type: string
+          description: Projected JSON columns containing the JSON literal null rather than SQL NULL. Other null-valued fields are SQL NULL.
         version:
           type: string
           pattern: '^[0-9]+$'
@@ -5573,6 +5888,12 @@ components:
         row:
           type: object
           additionalProperties: true
+        json_null_fields:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+          description: Names of JSON-typed columns whose row value is the JSON literal null rather than SQL NULL. Each name must identify a present null-valued JSON column; duplicates, unknown names, non-null values, and use with deletion are rejected.
 
     RelationalRowMutationRequest:
       type: object
@@ -6600,6 +6921,9 @@ components:
           maxLength: 19
           pattern: '^[1-9][0-9]{0,18}$'
           description: Opaque durable restore-job identifier. Clients must not parse it as a number.
+        idempotency_key:
+          type: string
+          description: Durable admission identity. Retain it with job_id when reconciling an uncertain schema rewrite; do not replay the DDL.
         attempt_id: { type: integer, format: int64 }
         scope: { type: string, enum: [table, cluster] }
         table_name: { type: string }
@@ -12310,6 +12634,235 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /sql/prepared:
+    post:
+      operationId: prepareSQL
+      summary: Create a durable prepared SQL resource
+      tags: [data_operations]
+      description: >
+        Binds SELECT, INSERT, UPDATE or DELETE without executing it. The immutable
+        resource belongs to the authenticated principal and API node, expires
+        after one hour, and survives transaction COMMIT and owner restart with
+        the same durable store and node identity. A session-bound resource is
+        executable only while its attached session remains active. Owner failover is not automatic;
+        execute and close must reach owner_node_id. Each durable store admits
+        at most 128 resources and 4 MiB of serialized prepared state. Expired
+        resources are reclaimed atomically during subsequent creation or close.
+        Execution authenticates and authorizes again and rejects changed catalog
+        identities or schemas. When session_id is supplied, preparation uses
+        the attached session's authenticated database, namespace and setting
+        overlay under its execution lease. The resource is bound to that session;
+        execution re-reads current values but rejects a changed setting catalog.
+        A native durable session store is required.
+      x-antfly-client-request-policy:
+        max_retries: 0
+        follow_redirects: false
+        cookies_enabled: false
+        max_response_size: 16777216
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SQLPrepareRequest'
+      responses:
+        '200':
+          description: Durable prepared resource
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLPreparedResponse'
+        default:
+          description: Preparation rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLDiagnostic'
+  /sql/prepared/{prepared_id}/execute:
+    parameters:
+      - name: prepared_id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+    post:
+      operationId: executePreparedSQL
+      summary: Execute a durable prepared SQL resource
+      tags: [data_operations]
+      description: >
+        Uses the stored statement, namespace and immutable binding identities.
+        Resource admission linearizes when its durable record is loaded; a later
+        close or expiry does not cancel that already admitted execution. Mutation
+        outcomes must be reconciled rather than replayed after ambiguous errors.
+      x-antfly-client-request-policy:
+        max_retries: 0
+        follow_redirects: false
+        cookies_enabled: false
+        max_response_size: 16777216
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SQLPreparedExecutionRequest'
+      responses:
+        '200':
+          description: SQL result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLResponse'
+        default:
+          description: Execution rejected or durable mutation outcome
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLDiagnostic'
+  /sql/prepared/{prepared_id}:
+    parameters:
+      - name: prepared_id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+    delete:
+      operationId: closePreparedSQL
+      summary: Release a durable prepared SQL resource
+      tags: [data_operations]
+      x-antfly-client-request-policy:
+        max_retries: 0
+        follow_redirects: false
+        cookies_enabled: false
+        max_response_size: 16777216
+      responses:
+        '200':
+          description: Resource released; already admitted executions may finish
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          description: Close rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLDiagnostic'
+  /settings:
+    post:
+      operationId: administerSqlSettings
+      summary: Publish or remove a durable SQL setting
+      tags: [cluster_management]
+      description: >
+        Cluster-administrator-only, revision-fenced publication of typed
+        setting definitions and global, database, and credential-role defaults.
+        SQL SET cannot change policy-sensitive settings. Observe an ambiguous
+        mutation before retrying.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SqlSettingMutationRequest'}
+      responses:
+        '200':
+          description: Setting catalog mutation committed
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+        '400': {description: Invalid setting definition or default}
+        '401': {description: Authentication required}
+        '403': {description: Cluster administrator permission required}
+        '409': {description: Catalog revision or setting generation changed}
+        '426': {description: Metadata peer upgrade required}
+        '503': {description: Mutation outcome unknown or metadata unavailable}
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /sql:
+    post:
+      summary: Execute a SQL statement
+      tags:
+        - data_operations
+      description: |
+        Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
+        subset through the current catalog and native row execution contracts.
+        Parameters are bound separately from statement text. Document, graph,
+        and lake SQL sources, DDL, and SQL sessions are not yet supported.
+        Reads inherit native owner-local consistency, not a global SQL
+        transaction snapshot. Statements requiring a retained multi-page
+        statement snapshot fail when that capability is unavailable.
+        Unsupported statement shapes fail explicitly; the server never
+        silently substitutes a different query or truncates the result.
+      operationId: executeSQL
+      x-antfly-client-request-policy:
+        max_retries: 0
+        follow_redirects: false
+        cookies_enabled: false
+        max_response_size: 16777216
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SQLRequest"
+      responses:
+        "200":
+          description: SQL statement result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SQLResponse"
+        "202":
+          description: DDL declaration durably admitted; constraint validation or native staging is pending. Do not replay.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SQLResponse"
+        "400":
+          description: Invalid statement, parameter, or result admission limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SQLDiagnostic"
+        "401":
+          description: Authentication required
+        "403":
+          description: Insufficient permission for the statement's catalog resources
+        "409":
+          description: Transaction or catalog conflict, committed DDL whose validation failed, or uncertain DDL admission with a recovery receipt. Do not replay uncertain DDL.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/SQLDiagnostic"
+                  - $ref: "#/components/schemas/SQLResponse"
+        "429":
+          description: Foreground query, write, or request-body admission is exhausted
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                minimum: 1
+        "501":
+          description: SQL statement shape is not supported
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SQLDiagnostic"
+        "503":
+          description: SQL backend execution capacity is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SQLDiagnostic"
+        "500":
+          description: Internal SQL execution failure
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SQLDiagnostic"
   /query:
     post:
       summary: Perform a global query

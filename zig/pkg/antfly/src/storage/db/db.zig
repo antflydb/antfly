@@ -229,6 +229,9 @@ test "standalone resource manager derives elastic storage cache envelopes" {
 }
 const schema_mod = @import("../schema.zig");
 const table_catalog_mod = @import("table_catalog.zig");
+const row_policy_gate_mod = @import("row_policy_gate.zig");
+const row_policy_bundle_mod = @import("row_policy_bundle.zig");
+const row_policy_authority_mod = @import("../../usermgr/row_policy_authority.zig");
 const schema_registry_mod = @import("schema_registry.zig");
 const relational_index_plans = @import("relational_index_plan.zig");
 const relational_index_records = @import("relational_index_records.zig");
@@ -310,6 +313,25 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
 };
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
+
+/// A backup can be admitted before a policy barrier and continue streaming
+/// after the barrier closes. Compose the caller's cancellation with the
+/// revocable raw-read lease so every portable block / native file checkpoint
+/// rejects late output without losing the original cancellation reason.
+const RowPolicyOutputCheckpoint = struct {
+    upstream: types.CancellationToken,
+    lease: *const row_policy_gate_mod.Gate.Lease,
+
+    fn token(self: *const @This()) types.CancellationToken {
+        return .{ .ptr = self, .check_fn = check };
+    }
+
+    fn check(ptr: *const anyopaque) anyerror!void {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        try self.upstream.check();
+        try self.lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    }
+};
 const default_visibility_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
 const public_schema_json_key = "\x00\x00__metadata__:schema_json";
 const index_catalog_key = "\x00\x00__metadata__:indexes";
@@ -367,6 +389,7 @@ fn durableHAOutboxKindFromKey(key: []const u8) !DurableHAOutboxKind {
         @intFromEnum(DurableHAOutboxKind.replay) => .replay,
         @intFromEnum(DurableHAOutboxKind.schema) => .schema,
         @intFromEnum(DurableHAOutboxKind.restore_batch) => .restore_batch,
+        @intFromEnum(DurableHAOutboxKind.row_policy) => .row_policy,
         else => error.InvalidHAOutbox,
     };
 }
@@ -603,6 +626,7 @@ pub const OpenOptions = struct {
     /// source projections. Do not open intentionally omitted index artifacts.
     primary_only_readonly: bool = false,
     initial_owner_range: ?range_state_mod.InitialOwnerRange = null,
+    initial_child_bootstrap: ?@import("relational_initial_child_publication.zig").Bootstrap = null,
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
     primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default },
@@ -632,6 +656,10 @@ pub const OpenOptions = struct {
     /// backfill could resume with the previously persisted (or schema-less)
     /// mapper before the provisioner got a chance to call `setSchema`.
     schema_before_index_load: ?SchemaBeforeIndexLoad = null,
+    /// An ordinary catalog-authoritative owner must retry when its pinned
+    /// schema predates the durable root. Historical Raft apply may retain the
+    /// newer schema while replaying an older entry's mutation.
+    reject_stale_schema_before_index_load: bool = false,
     identity_namespace: ?doc_identity.Namespace = null,
     /// Immutable authenticated deployment ownership, not selected by a source
     /// request. Decoders/library opens may leave this unset.
@@ -2898,7 +2926,9 @@ fn prepareRelationalRows(
             while (!ctx.failed.load(.acquire)) {
                 const index = ctx.next.fetchAdd(1, .monotonic);
                 if (index >= ctx.writes.len) return;
-                var prepared = (if (ctx.preserve_logical_values)
+                var prepared = (if (ctx.writes[index].json_null_fields.len != 0)
+                    mapper.PreparedRelationalWrite.initTypedInSharedRegion(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout, ctx.writes[index].json_null_fields, ctx.preserve_logical_values)
+                else if (ctx.preserve_logical_values)
                     mapper.PreparedRelationalWrite.initInSharedRegionPreserved(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout)
                 else
                     mapper.PreparedRelationalWrite.initInSharedRegionFromIntent(
@@ -3051,6 +3081,8 @@ fn prepareRelationalRows(
 }
 
 const BatchExecutionOptions = struct {
+    row_policy_principal: ?*const row_policy_authority_mod.Payload = null,
+    row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease = null,
     restore_staging: ?@import("restore_staging.zig").BatchAdmission = null,
     restore_artifacts: []const @import("restore_staging.zig").Artifact = &.{},
     restore_timestamps: ?*const std.StringHashMapUnmanaged(u64) = null,
@@ -3067,6 +3099,9 @@ const BatchExecutionOptions = struct {
     ha_applied_lsn_marker: ?u64 = null,
     online_source_applied_index: ?u64 = null,
     raft_applied_entry_marker: ?RaftAppliedEntryIdentity = null,
+    /// Metadata-authorized native hidden-child receipt identity. Never
+    /// writes the data-Raft watermark into a native source-authority root.
+    native_initial_child_entry: ?RaftAppliedEntryIdentity = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
     extra_store_deletes: []const []const u8 = &.{},
@@ -5225,11 +5260,27 @@ const GraphRestoreParseCache = struct {
 };
 
 pub const DB = struct {
+    row_policy_gate: row_policy_gate_mod.Gate = .{},
+    row_policy_bundle: ?row_policy_bundle_mod.Installed = null,
+    /// Borrowed from the opaque owner handle; Lite leaves these unset and
+    /// therefore cannot turn a raw local read into an authenticated one.
+    row_policy_authority_secret: ?[]const u8 = null,
+    row_policy_authority_issuer: ?[]const u8 = null,
+    /// Monolithic managed opens resolve the same process-owned verifier as
+    /// the compiled owner ABI. Opaque ABI opens may replace the borrowed view,
+    /// but these copies remain owned here until every DB worker has stopped.
+    owned_row_policy_authority_secret: ?[]u8 = null,
+    owned_row_policy_authority_issuer: ?[]u8 = null,
+    owned_row_policy_table_name: ?[]u8 = null,
+    row_policy_table_name: ?[]const u8 = null,
     rewrite_program_cache: @import("../rewrite_program_cache.zig").Cache = .{},
     rewrite_tail_cache: @import("../rewrite_tail_spool.zig").Cache = .{},
+    restore_decoder_cache: @import("../restore_decoder_cache.zig").Cache = .{},
     online_merge_reader: @import("online_merge_io.zig").Cache = .{},
     source_publication: @import("source_publication_job.zig").Job = .{},
     restore_staging_required: std.atomic.Value(bool) = .init(false),
+    initial_child_hidden: std.atomic.Value(bool) = .init(false),
+    initial_child_bootstrap: ?@import("relational_initial_child_publication.zig").Bootstrap = null,
     table_storage: table_storage_mod.Settings = .{},
     vector_migration_offline_candidate: bool = false,
     vector_migration_active: std.atomic.Value(bool) = .init(false),
@@ -5294,6 +5345,10 @@ pub const DB = struct {
     /// under apply before committing an outbox; only an apply-fenced empty scan
     /// may return it to false.
     durable_ha_outbox_maybe: std.atomic.Value(bool) = .init(true),
+    /// A committed policy publication cannot be followed by row mutations in
+    /// the HA tail until its metadata record has been appended. The ordinary
+    /// startup barrier also serves as this transient publication barrier.
+    row_policy_ha_outbox_pending: std.atomic.Value(bool) = .init(false),
     source_pin_gc_epoch: std.atomic.Value(u64) = .init(1),
     source_pin_gc_turn: std.atomic.Value(u64) = .init(0),
     source_pin_gc_next_ns: std.atomic.Value(u64) = .init(0),
@@ -5720,14 +5775,91 @@ pub const DB = struct {
 
     pub const RelationalRows = @import("relational_rows.zig");
 
-    pub fn beginRelationalRows(self: *DB, alloc: Allocator, request: RelationalRows.Request) !RelationalRows.Reader {
+    /// One owner-local immutable visibility cut for delayed SQL scans. The
+    /// caller must obtain it under a statement capture fence after read-index
+    /// admission. It deliberately cannot be serialized across owners.
+    pub const RelationalStatementSnapshot = struct {
+        row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null,
+        row_policy_phase: table_catalog_mod.RowPolicyPhase = .disabled,
+        row_policy_generation: u64 = 0,
+        row_policy_catalog_epoch: u64 = 0,
+        read: docstore_mod.DocStore.Txn,
+        schema_version: u32,
+
+        pub fn deinit(self: *@This()) void {
+            self.read.abort();
+            if (self.row_policy_lease) |*lease| lease.release();
+            self.* = undefined;
+        }
+    };
+
+    pub fn captureRelationalStatementSnapshot(self: *DB) !RelationalStatementSnapshot {
+        // Capturing a visibility cut does not expose row bytes. A protected
+        // statement captures only the owner policy epoch; each later scan
+        // must present an authenticated proof for that same epoch and retain
+        // its own bounded policy lease. An unprotected cut instead pins a raw
+        // lease so activation cannot overtake an in-flight statement.
+        try self.maybeFinalizePendingRowPolicyPublication();
+        const initial_phase = self.row_policy_gate.currentPhase();
+        var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = if (initial_phase == .disabled)
+            try self.row_policy_gate.enterRawRead()
+        else if (initial_phase == .active)
+            null
+        else
+            return error.RowPolicyAuthenticationRequired;
+        errdefer if (row_policy_lease) |*lease| lease.release();
+        const policy_generation = self.row_policy_gate.generation.load(.acquire);
+        const policy_epoch = self.row_policy_gate.catalog_epoch.load(.acquire);
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
         defer view.release();
+        if (view.storageMode() != .relational) return error.RelationalTableRequired;
+        var read = try self.core.store.beginReadTxn();
+        errdefer read.abort();
+        if (self.row_policy_gate.currentPhase() != initial_phase or
+            self.row_policy_gate.generation.load(.acquire) != policy_generation or
+            self.row_policy_gate.catalog_epoch.load(.acquire) != policy_epoch)
+            return error.RowPolicyCatalogChanged;
+        return .{
+            .row_policy_lease = row_policy_lease,
+            .row_policy_phase = initial_phase,
+            .row_policy_generation = policy_generation,
+            .row_policy_catalog_epoch = policy_epoch,
+            .read = read,
+            .schema_version = view.version(),
+        };
+    }
+
+    pub fn beginRelationalRows(self: *DB, alloc: Allocator, request: RelationalRows.Request) !RelationalRows.Reader {
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        errdefer row_policy_lease.release();
+        var reader = try self.beginRelationalRowsAtSnapshot(alloc, request, null);
+        reader.row_policy_lease = row_policy_lease;
+        return reader;
+    }
+
+    fn beginRelationalRowsAtSnapshot(self: *DB, alloc: Allocator, request: RelationalRows.Request, statement: ?*RelationalStatementSnapshot) !RelationalRows.Reader {
+        // A delayed scan may use only the primary path. READY index state and
+        // auto-index plans can change after the original visibility cut.
+        if (statement != null and (request.index != null or request.auto_index)) return error.SqlStatementSnapshotRequired;
+        try self.lockApplySharedForPortableRuntime();
+        var locked = true;
+        defer if (locked) self.core.unlockApplyShared();
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        if (statement) |cut| if (view.version() != cut.schema_version) return error.PreparedGenerationChanged;
         var indexes = self.core.relational_indexes.acquire();
         defer if (indexes) |*pinned| pinned.deinit();
-        return try RelationalRows.Reader.open(alloc, self.core.store, view, indexes, request, currentTimeNs());
+        const read_snapshot = if (statement) |cut| try cut.read.forkRead() else try self.core.store.beginReadTxn();
+        const authenticated = self.core.store.valuesAreAuthenticated();
+        const now = currentTimeNs();
+        self.core.unlockApplyShared();
+        locked = false;
+        // Immutable pins and the read transaction were captured together.
+        // Allocation, predicate compilation, readiness I/O and cardinality
+        // probes must not hold the global apply publication fence.
+        return try RelationalRows.Reader.openSnapshot(alloc, read_snapshot, authenticated, view, indexes, request, now);
     }
 
     pub fn relationalIndexBuildStatus(self: *DB, name: []const u8) !RelationalIndexBuildStatus {
@@ -5839,14 +5971,28 @@ pub const DB = struct {
     }
 
     fn ensureDurableHAStartupBarrier(self: *DB) !void {
-        if (!self.durable_ha_startup_barrier_pending.load(.acquire)) return;
+        if (!self.durable_ha_startup_barrier_pending.load(.acquire) and
+            !self.row_policy_ha_outbox_pending.load(.acquire)) return;
         const io = self.backend_runtime.io() orelse std.Options.debug_io;
         self.durable_ha_flush_mutex.lockUncancelable(io);
         defer self.durable_ha_flush_mutex.unlock(io);
-        if (!self.durable_ha_startup_barrier_pending.load(.acquire)) return;
-        while (self.durable_ha_outbox_maybe.load(.acquire))
-            try self.flushDurableHAOutboxesLocked();
-        self.durable_ha_startup_barrier_pending.store(false, .release);
+        if (!self.durable_ha_startup_barrier_pending.load(.acquire) and
+            !self.row_policy_ha_outbox_pending.load(.acquire)) return;
+        while (true) {
+            while (self.durable_ha_outbox_maybe.load(.acquire))
+                try self.flushDurableHAOutboxesLocked();
+            // Close the race with a policy commit that published its flag just
+            // after the final scan. The same apply fence orders that commit
+            // and the flag clear against subsequent row writers.
+            try self.lockApplyForPortableRuntime();
+            const empty = !self.durable_ha_outbox_maybe.load(.acquire);
+            if (empty) {
+                self.durable_ha_startup_barrier_pending.store(false, .release);
+                self.row_policy_ha_outbox_pending.store(false, .release);
+            }
+            self.core.unlockApply();
+            if (empty) return;
+        }
     }
 
     /// The caller owns `durable_ha_flush_mutex`. Recovery may overlap foreground
@@ -5920,9 +6066,9 @@ pub const DB = struct {
             const mirror = switch (kind) {
                 .batch, .restore_batch => self.ha_async_batch_mirror,
                 .replay => self.ha_async_effect_mirror,
-                .schema => self.ha_async_metadata_mirror,
+                .schema, .row_policy => self.ha_async_metadata_mirror,
             } orelse return error.HAMirrorUnavailable;
-            if (kind != .restore_batch and !haMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
+            if (kind != .restore_batch and kind != .row_policy and !haMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
             var ctx = self.batchContext();
             try recoverDurableHAOutboxContext(&ctx, mirror, outbox, kind);
             // The key names this exact mutation, so concurrent publishers cannot
@@ -6058,6 +6204,11 @@ pub const DB = struct {
     pub fn open(alloc: Allocator, path: []const u8, requested_opts: OpenOptions) !DB {
         return blk: {
             var opts = requested_opts;
+            if (opts.initial_child_bootstrap) |bootstrap| {
+                try bootstrap.validate();
+                if (opts.identity_namespace == null or !opts.identity_namespace.?.eql(bootstrap.namespace) or
+                    opts.schema_before_index_load != null) return error.InvalidInitialChildPublication;
+            }
             // Provider interfaces are move-only. Keep them in the mutable
             // options until a runtime has adopted them so partial opens have
             // exactly one cleanup owner.
@@ -6267,8 +6418,41 @@ pub const DB = struct {
             );
             core_owned = false;
             core_owner_initialized = true;
+            // Reject a stale catalog-authoritative descriptor as soon as the
+            // durable schema is known, before binding source authority or
+            // starting any owner-side maintenance. Historical Raft apply is
+            // allowed to replay against the newer on-disk schema instead.
+            if (opts.reject_stale_schema_before_index_load) {
+                if (opts.schema_before_index_load) |prepared_schema| {
+                    if (core_owner.schema) |durable_schema| {
+                        if (durable_schema.version > prepared_schema.runtime_schema.version)
+                            return error.SchemaVersionRegression;
+                    }
+                }
+            }
             core_owner.identity_visibility.summary = try doc_identity.visibilitySummaryFromStore(core_owner.store);
+            const policy_secret = if (opts.secret_store) |store|
+                try store.getOwned(alloc, "antfly.trusted_principal.secret")
+            else
+                null;
+            var policy_authority_owned = true;
+            errdefer if (policy_authority_owned) if (policy_secret) |value| {
+                @memset(value, 0);
+                alloc.free(value);
+            };
+            const policy_issuer = if (opts.secret_store) |store|
+                try store.getOwned(alloc, "antfly.trusted_principal.issuer")
+            else
+                null;
+            errdefer if (policy_authority_owned) if (policy_issuer) |value| alloc.free(value);
             var db = DB{
+                .row_policy_authority_secret = if (policy_secret != null and policy_issuer != null) policy_secret else null,
+                .row_policy_authority_issuer = if (policy_secret != null and policy_issuer != null) policy_issuer else null,
+                .owned_row_policy_authority_secret = policy_secret,
+                .owned_row_policy_authority_issuer = policy_issuer,
+                .initial_child_hidden = .init(opts.initial_child_bootstrap != null),
+                .initial_child_bootstrap = opts.initial_child_bootstrap,
+                .row_policy_gate = row_policy_gate_mod.Gate.init(core_owner.table_catalog),
                 .alloc = alloc,
                 .runtime_alloc = runtime_alloc,
                 .generation_read_lease = generation_read_lease,
@@ -6330,7 +6514,14 @@ pub const DB = struct {
             owned_resource_manager = null;
             owned_executor = null;
             generation_read_lease = null;
+            policy_authority_owned = false;
             errdefer db.deinitWrapperState(executor_ready);
+            if (db.core.table_catalog.row_policy_phase == .active) {
+                const schema = db.core.schema orelse return error.RowPolicyCatalogChanged;
+                db.row_policy_bundle = (try row_policy_bundle_mod.load(alloc, db.core.store, db.core.identity_namespace.table_id, schema)) orelse
+                    return error.RowPolicyAuthenticationRequired;
+                if (!db.row_policy_bundle.?.matchesCatalog(db.core.table_catalog)) return error.RowPolicyCatalogChanged;
+            }
             db.core.index_manager.setIo(db.backend_runtime.io());
             db.core.apply_mutex.io = db.backend_runtime.io();
             db.core.snapshot_admission.lock.io = db.backend_runtime.io();
@@ -6382,9 +6573,15 @@ pub const DB = struct {
                 // Keep that newer epoch; the older entry's native applied
                 // marker decides whether it still needs its data mutation.
                 if (db.core.schema != null and db.core.schema.?.version > prepared_schema.runtime_schema.version) {
+                    if (opts.reject_stale_schema_before_index_load) return error.SchemaVersionRegression;
                     std.log.debug("owner open retains newer durable schema path={s} durable_version={d} descriptor_version={d}", .{
                         path, db.core.schema.?.version, prepared_schema.runtime_schema.version,
                     });
+                } else if (try childGenerationSourcePinsSchema(db.core, prepared_schema.runtime_schema.version)) {
+                    // Parent ACKs precede the metadata child descriptor cut.
+                    // A cold owner may reopen in that interval, but the
+                    // descriptor cannot install an FK generation. Keep the
+                    // durable old schema until exact Raft install does so.
                 } else if (prepared_schema.public_schema_json) |public_json| {
                     const versioned_public_key = try public_table_schema.versionedSchemaKeyAlloc(alloc, prepared_schema.runtime_schema.version);
                     defer alloc.free(versioned_public_key);
@@ -6402,6 +6599,20 @@ pub const DB = struct {
                 var staging_status = value;
                 defer staging_status.deinit();
                 db.restore_staging_required.store(staging_status.value.phase != .published, .release);
+            }
+            {
+                var hidden_read = try db.core.store.beginReadTxn();
+                defer hidden_read.abort();
+                if (try @import("relational_initial_child_publication.zig").load(&hidden_read)) |hidden| {
+                    if (opts.initial_child_bootstrap) |bootstrap| if (!bootstrap.matches(hidden)) return error.InitialChildPublicationChanged;
+                    db.initial_child_hidden.store(hidden.phase != .released, .release);
+                }
+                // A cold old owner must not start graph workers or admit graph
+                // reads between reopening its index catalog and a resumed
+                // coordinator observing the durable cutover fence.
+                const graph_retirement = try @import("graph_retirement_seal.zig").status(&hidden_read);
+                if (graph_retirement.intent != null)
+                    db.core.index_manager.setGraphRetirementAdmissionAssumeCatalogLock(false);
             }
             const optional_runtimes_initialized = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and !ha_standby_role;
             const optional_runtime_workers_enabled = optional_runtimes_initialized and opts.start_optional_runtime_workers;
@@ -7147,6 +7358,7 @@ pub const DB = struct {
         if (self.closed) return;
         self.closed = true;
         self.source_publication.stop(self.backend_runtime.io() orelse std.Options.debug_io);
+        self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse std.Options.debug_io);
         self.online_merge_reader.retire(self.backend_runtime.io() orelse std.Options.debug_io, null);
         self.rewrite_program_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
         self.rewrite_tail_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
@@ -8197,6 +8409,8 @@ pub const DB = struct {
     }
 
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
+        if (self.row_policy_bundle) |*bundle| bundle.deinit();
+        self.row_policy_bundle = null;
         if (self.last_run_until_idle_no_progress) |*diagnostic| diagnostic.deinit(self.alloc);
         self.last_run_until_idle_no_progress = null;
         // Stop background workers before tearing down stores, runtimes, and
@@ -8343,6 +8557,12 @@ pub const DB = struct {
             manager.deinit(self.alloc);
             self.alloc.destroy(manager);
         }
+        if (self.owned_row_policy_authority_secret) |value| {
+            @memset(value, 0);
+            self.alloc.free(value);
+        }
+        if (self.owned_row_policy_authority_issuer) |value| self.alloc.free(value);
+        if (self.owned_row_policy_table_name) |value| self.alloc.free(value);
         self.* = undefined;
         self.closed = true;
     }
@@ -9487,7 +9707,7 @@ pub const DB = struct {
     /// allocation-light no-op before transforms or derived work execute.
     fn requiresDurableLifecycleHA(req: types.BatchRequest) bool {
         return req.online_source != null or req.restore_staging != null or req.restore_staging_scope != null or
-            req.relational_topology != null or req.split_transition != null or
+            req.relational_topology != null or req.relational_generation_gc != null or req.split_transition != null or
             req.split_checkpoint != null or req.split_replication != null or
             req.merge_checkpoint != null or req.merge_replication != null;
     }
@@ -9538,6 +9758,78 @@ pub const DB = struct {
             error.GraphMaintenanceInProgress => return error.RaftApplyWriterUnavailable,
             else => return err,
         };
+    }
+
+    /// A hidden initial child in native standalone has no data-Raft log. The
+    /// metadata decision names one immutable plan and owner, while the
+    /// hidden Record commits the operation receipt with the schema/phase.
+    /// Keep this distinct from the generic Raft path: native source roots
+    /// must never acquire a fabricated Raft applied-entry watermark.
+    pub fn batchNativeInitialChildApply(self: *DB, req: types.BatchRequest, receipt: RaftAppliedEntryIdentity) !void {
+        const command = req.relational_topology orelse return error.InvalidInitialChildPublication;
+        if (command.action != .provision_initial_child and command.action != .release_initial_child and command.action != .cancel_initial_child)
+            return error.InvalidInitialChildPublication;
+        if (receipt.term != 1 or receipt.index != switch (command.action) {
+            .provision_initial_child => @as(u64, 1),
+            .release_initial_child => @as(u64, 2),
+            .cancel_initial_child => @as(u64, 3),
+            else => unreachable,
+        }) return error.InvalidInitialChildPublication;
+        if (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0 or
+            req.integrity.len != 0 or req.integrity_commands.len != 0 or req.range_guards.len != 0 or
+            req.online_source != null or req.restore_staging != null or req.restore_staging_scope != null or
+            req.restore_staging_plan_id != null or req.relational_generation_gc != null or
+            req.relational_activation != null or req.relational_retirement != null or
+            req.relational_index_maintenance != null or req.row_policy_publication != null or
+            req.row_policy_install_bundle.len != 0 or req.row_policy_principal_proof.len != 0 or
+            req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0 or
+            req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or
+            req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null or
+            req.merge_page != null or req.merge_artifacts.len != 0 or req.transaction != null or
+            req.relational_repair or req.activate_range_tracking or req.reject_graph_transform_projections or
+            req.schema_version != null or req.relational_schema_version != null or
+            req.relational_integrity_generation_set != null or req.timestamp_ns != 0)
+            return error.InvalidInitialChildPublication;
+        const bootstrap = self.initial_child_bootstrap orelse return error.InvalidInitialChildPublication;
+        if (self.ha_async_batch_mirror != null or self.ha_async_metadata_mirror != null or
+            self.ha_async_effect_mirror != null or self.ha_write_gate != null or
+            openModeRequiresReadOnlyBackends(self.open_mode))
+            return error.InvalidInitialChildPublication;
+        if (!bootstrap.namespace.eql(command.fence.namespace) or
+            !std.mem.eql(u8, &bootstrap.catalog_digest, &command.fence.catalog_digest))
+            return error.InitialChildPublicationChanged;
+        switch (command.action) {
+            .provision_initial_child => {
+                const provision = command.initial_child_provision orelse return error.InvalidInitialChildPublication;
+                if (!std.mem.eql(u8, &bootstrap.plan_id, &provision.plan_id) or
+                    !std.mem.eql(u8, &bootstrap.plan_digest, &provision.plan_digest) or
+                    !std.mem.eql(u8, &bootstrap.schema_digest, &provision.schema_digest) or
+                    !std.mem.eql(u8, &bootstrap.public_schema_json_digest, &provision.public_schema_json_digest) or
+                    !std.mem.eql(u8, &bootstrap.catalog_digest, &provision.catalog_digest))
+                    return error.InitialChildPublicationChanged;
+            },
+            .release_initial_child, .cancel_initial_child => {
+                const control = command.initial_child_control orelse return error.InvalidInitialChildPublication;
+                if (!std.mem.eql(u8, &bootstrap.plan_id, &control.plan_id) or
+                    !std.mem.eql(u8, &bootstrap.plan_digest, &control.plan_digest) or
+                    bootstrap.schema_version != control.schema_version or
+                    !std.mem.eql(u8, &bootstrap.schema_digest, &control.schema_digest) or
+                    !std.mem.eql(u8, &bootstrap.public_schema_json_digest, &control.public_schema_json_digest) or
+                    !std.mem.eql(u8, &bootstrap.catalog_digest, &control.catalog_digest))
+                    return error.InitialChildPublicationChanged;
+            },
+            else => unreachable,
+        }
+        var authority = try self.core.store.beginReadTxn();
+        defer authority.abort();
+        _ = try @import("../source_authority.zig").require(&authority, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+        return self.batchInternal(req, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+            .native_initial_child_entry = receipt,
+        });
     }
 
     pub fn failNextRestoreProjectionApplyForTest() void {
@@ -9717,6 +10009,415 @@ pub const DB = struct {
         try self.core.store.putBatch(&.{marker}, &.{});
     }
 
+    /// Apply an exact metadata-read-index policy publication through the data
+    /// Raft log. The ingress must obtain `bundle_bytes` from the provisioned
+    /// metadata leader callback, never from a user request. The bundle,
+    /// fail-closed preparing catalog, pending receipt intent, and applied
+    /// marker commit atomically on every replica. Receipt publication is a
+    /// separate owner-local completion after old leases drain; no metadata ACK
+    /// is available until that completion is durable.
+    fn readRowPolicyReceiptLocked(self: *DB, expected: row_policy_bundle_mod.Receipt) !row_policy_bundle_mod.Receipt {
+        var key_buf: [128]u8 = undefined;
+        const key = try expected.key(&key_buf);
+        const bytes = self.core.store.get(self.alloc, key) catch return error.InvalidRowPolicyReceipt;
+        defer self.alloc.free(bytes);
+        const stored = try row_policy_bundle_mod.Receipt.decode(bytes);
+        if (!std.meta.eql(expected, stored)) return error.InvalidRowPolicyReceipt;
+        return stored;
+    }
+
+    fn readRowPolicyApplyResultLocked(self: *DB, expected: row_policy_bundle_mod.Receipt) !?row_policy_bundle_mod.Receipt {
+        const receipt = self.readRowPolicyReceiptLocked(expected) catch |err| switch (err) {
+            error.InvalidRowPolicyReceipt => null,
+            else => return err,
+        };
+        if (receipt) |stored| return stored;
+        const pending = (try self.pendingRowPolicyReceipt()) orelse return error.InvalidRowPolicyReceipt;
+        if (!std.meta.eql(pending, expected)) return error.RowPolicyCatalogChanged;
+        return null;
+    }
+
+    fn pendingRowPolicyReceipt(self: *DB) !?row_policy_bundle_mod.Receipt {
+        const bytes = self.core.store.get(self.alloc, row_policy_bundle_mod.pending_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(bytes);
+        return try row_policy_bundle_mod.Receipt.decode(bytes);
+    }
+
+    /// A data-Raft entry first commits a fail-closed preparing marker without
+    /// waiting in the apply queue. Only after local old-generation cursors and
+    /// schema leases drain may this replica commit the serving phase/receipt.
+    /// This is an owner-local monotone completion of an exact committed Raft
+    /// intent, not a new caller-selected policy program.
+    fn finalizePendingRowPolicyReceiptLocked(self: *DB, expected: row_policy_bundle_mod.Receipt) !row_policy_bundle_mod.Receipt {
+        const pending = (try self.pendingRowPolicyReceipt()) orelse return error.NotFound;
+        if (!std.meta.eql(pending, expected)) return error.RowPolicyCatalogChanged;
+        if (!self.row_policy_gate.quiesced()) return error.RowPolicyReadersActive;
+        var manager = try self.core.initTxnManager();
+        defer manager.deinit();
+        if (try manager.hasSchemaLeases()) return error.RowPolicyReadersActive;
+        const schema = self.core.schema orelse return error.RowPolicyCatalogChanged;
+        const bundle_bytes = try self.core.store.get(self.alloc, row_policy_bundle_mod.key);
+        defer self.alloc.free(bundle_bytes);
+        var installed = try row_policy_bundle_mod.Installed.init(self.alloc, bundle_bytes, self.core.identity_namespace.table_id, schema);
+        var installed_owned = true;
+        defer if (installed_owned) installed.deinit();
+        const publication = installed.parsed.value;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bundle_bytes, &digest, .{});
+        if (publication.table_id != expected.table_id or
+            publication.policy_generation != expected.generation or
+            publication.catalog_epoch != expected.catalog_epoch or
+            publication.phase != expected.phase or
+            !std.mem.eql(u8, &digest, &expected.bundle_digest)) return error.RowPolicyCatalogChanged;
+        const previous = self.core.table_catalog;
+        if (previous.row_policy_phase != .preparing or
+            previous.row_policy_generation != expected.generation or
+            previous.row_policy_catalog_epoch != expected.catalog_epoch or
+            previous.active_schema_version != publication.schema_version) return error.RowPolicyCatalogChanged;
+        var next = previous;
+        next.row_policy_phase = switch (publication.phase) {
+            .pending_install, .pending_disable, .serving_disable => .preparing,
+            .serving_install, .active => .active,
+            .disabled => .disabled,
+        };
+        next.generation +|= 1;
+        const catalog_bytes = next.encode();
+        const encoded_receipt = expected.encode();
+        var receipt_key_buf: [128]u8 = undefined;
+        const receipt_key = try expected.key(&receipt_key_buf);
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(receipt_key, &encoded_receipt);
+        try txn.put(table_catalog_mod.key, &catalog_bytes);
+        try txn.delete(row_policy_bundle_mod.pending_key);
+        try txn.commit();
+        self.core.table_catalog = next;
+        if (next.row_policy_phase != .preparing) {
+            if (self.row_policy_bundle) |*old| old.deinit();
+            self.row_policy_bundle = if (next.row_policy_phase == .active) installed else null;
+            if (next.row_policy_phase == .active) installed_owned = false;
+            try self.row_policy_gate.publishCommitted(next);
+        }
+        return expected;
+    }
+
+    /// Replicas need not be queried by the coordinator to become serve-ready.
+    /// The first subsequent local admission opportunistically completes a
+    /// committed pending phase; the disabled/active fast path is one atomic
+    /// load and never touches the store. Busy old leases simply leave the
+    /// owner preparing and the operation continues to fail closed.
+    fn maybeFinalizePendingRowPolicyPublication(self: *DB) !void {
+        if (self.row_policy_gate.currentPhase() != .preparing) return;
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        const pending = (try self.pendingRowPolicyReceipt()) orelse return;
+        _ = self.finalizePendingRowPolicyReceiptLocked(pending) catch |err| switch (err) {
+            error.RowPolicyReadersActive => return,
+            else => return err,
+        };
+    }
+
+    /// Private owner status query. A coordinator reads this only after the
+    /// data-Raft proposal has committed; it is never a substitute for the
+    /// metadata read-index bundle or an owner ACK. It exposes no user rows.
+    pub fn loadRowPolicyReceipt(self: *DB, generation: u64, phase: @import("../../system_catalog/policies.zig").Publication.Phase) !row_policy_bundle_mod.Receipt {
+        if (generation == 0) return error.InvalidRowPolicyReceipt;
+        var key_buf: [128]u8 = undefined;
+        const identity: row_policy_bundle_mod.Receipt = .{
+            .table_id = self.core.identity_namespace.table_id,
+            .generation = generation,
+            .catalog_epoch = 0,
+            .phase = phase,
+            .applied_term = 0,
+            .applied_index = 0,
+            .bundle_digest = @splat(0),
+            .descriptor_digest = @splat(0),
+        };
+        const key = try identity.key(&key_buf);
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        const bytes = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (bytes) |encoded| {
+            defer self.alloc.free(encoded);
+            const stored = try row_policy_bundle_mod.Receipt.decode(encoded);
+            if (stored.table_id != identity.table_id or stored.generation != generation or stored.phase != phase)
+                return error.InvalidRowPolicyReceipt;
+            return stored;
+        }
+        const pending = (try self.pendingRowPolicyReceipt()) orelse return error.NotFound;
+        if (pending.table_id != identity.table_id or pending.generation != generation or pending.phase != phase)
+            return error.NotFound;
+        return self.finalizePendingRowPolicyReceiptLocked(pending);
+    }
+
+    pub fn applyReplicatedRowPolicyPublication(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: RaftAppliedEntryIdentity) !?row_policy_bundle_mod.Receipt {
+        return self.applyRowPolicyPublicationInternal(bundle_bytes, request, identity, null);
+    }
+
+    fn finishRowPolicyHACommitLocked(self: *DB, payload: ?[]const u8, outbox_key: ?[]const u8, apply_held: *bool, ha_mutation: *?HAMutationBarrier.ExclusiveLease) !void {
+        const encoded = payload orelse return;
+        var ctx = self.batchContext();
+        var deferred = HADeferredCommitGates.begin(&ctx);
+        defer deferred.releaseTransition();
+        deferred.append(appendHAEncodedSchemaMetadataCommitLockedContext(&ctx, encoded) catch {
+            self.core.unlockApply();
+            apply_held.* = false;
+            if (ha_mutation.*) |*lease| lease.release();
+            ha_mutation.* = null;
+            return error.DurabilityOutcomeUnknown;
+        });
+        self.core.unlockApply();
+        apply_held.* = false;
+        if (ha_mutation.*) |*lease| lease.release();
+        ha_mutation.* = null;
+        deferred.waitForDurabilityAndAuthority(ctx.ha_write_gate) catch return error.DurabilityOutcomeUnknown;
+        self.clearDurableHAOutbox(outbox_key.?) catch |err| std.log.warn(
+            "row policy HA durability acknowledged but outbox cleanup is pending path={s} err={s}",
+            .{ self.core.path, @errorName(err) },
+        );
+    }
+
+    fn applyRowPolicyPublicationInternal(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: RaftAppliedEntryIdentity, ha_lsn: ?u64) !?row_policy_bundle_mod.Receipt {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (identity.term == 0 or identity.index == 0 or (ha_lsn != null and ha_lsn.? == 0)) return error.InvalidRowPolicyPublication;
+        if (ha_lsn == null and self.ha_async_metadata_mirror == null and
+            (self.ha_async_batch_mirror != null or self.ha_write_gate != null)) return error.HAMirrorUnavailable;
+        // The policy cut must be serialized with all in-flight primary writes,
+        // including writers that passed their fast outbox preflight already.
+        // Production HA mirrors share this capture barrier with every mutation.
+        if (ha_lsn == null) if (self.ha_async_metadata_mirror) |mirror|
+            if (mirror.mutation_barrier == null) return error.HAMirrorUnavailable;
+        var ha_mutation: ?HAMutationBarrier.ExclusiveLease = null;
+        defer if (ha_mutation) |*lease| lease.release();
+        if (ha_lsn == null) {
+            try self.enforceHAWriteGate();
+            try self.ensureDurableHAStartupBarrier();
+            try self.preflightHAMetadataSyncCommit();
+            if (self.ha_async_metadata_mirror) |mirror|
+                ha_mutation = mirror.mutation_barrier.?.acquireExclusive();
+        }
+        var schedule_ha_recovery_on_exit = false;
+        defer if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
+        const ha_payload = if (ha_lsn == null and self.ha_async_metadata_mirror != null)
+            try ha_effects_mod.encodeRowPolicyMetadataMutationAlloc(self.alloc, bundle_bytes, request, identity)
+        else
+            null;
+        defer if (ha_payload) |payload| self.alloc.free(payload);
+        const ha_outbox = if (ha_payload) |payload| blk: {
+            // This is a WAL search lower bound, not an LSN reservation.
+            // Recovery matches the exact payload and owner identity under the
+            // transition/log locks even if another publisher appended first.
+            const from_lsn = self.ha_async_metadata_mirror.?.primary.nextLsn();
+            const encoded = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, payload);
+            errdefer self.alloc.free(encoded);
+            const key = try durableHAOutboxKeyAlloc(self.alloc, .row_policy, from_lsn, self.core.root_generation, payload);
+            break :blk .{ .key = key, .value = encoded };
+        } else null;
+        defer if (ha_outbox) |outbox| {
+            self.alloc.free(outbox.key);
+            self.alloc.free(outbox.value);
+        };
+        const schema = self.core.schema orelse return error.RowPolicyCatalogChanged;
+        var installed = try row_policy_bundle_mod.Installed.init(self.alloc, bundle_bytes, self.core.identity_namespace.table_id, schema);
+        defer installed.deinit();
+        if (installed.parsed.value.table_id != request.table_id or
+            installed.parsed.value.policy_generation != request.expected_generation or
+            installed.parsed.value.catalog_epoch != request.expected_catalog_epoch or
+            installed.parsed.value.phase != request.expected_phase)
+            return error.RowPolicyCatalogChanged;
+        var bundle_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bundle_bytes, &bundle_digest, .{});
+        const expected_receipt: row_policy_bundle_mod.Receipt = .{
+            .table_id = request.table_id,
+            .generation = request.expected_generation,
+            .catalog_epoch = request.expected_catalog_epoch,
+            .phase = request.expected_phase,
+            .applied_term = identity.term,
+            .applied_index = identity.index,
+            .bundle_digest = bundle_digest,
+            .descriptor_digest = request.expected_descriptor_digest,
+        };
+        if (try self.raftEntryAlreadyApplied(identity)) {
+            lockApply(self);
+            const already = self.readRowPolicyApplyResultLocked(expected_receipt) catch |err| {
+                self.core.unlockApply();
+                return err;
+            };
+            self.core.unlockApply();
+            if (ha_lsn) |lsn| try self.markHAReplicationRecordApplied(lsn);
+            return already;
+        }
+        const phase = installed.parsed.value.phase;
+        const pending_phase = phase == .pending_install or phase == .pending_disable;
+        const stage_with_serving = pending_phase and self.row_policy_gate.currentPhase() == .active;
+        if (!stage_with_serving and pending_phase) {
+            if (self.row_policy_gate.currentPhase() != .preparing)
+                try self.row_policy_gate.beginPreparing(self.row_policy_gate.currentPhase());
+        } else if (!pending_phase and self.row_policy_gate.currentPhase() == .active and
+            (phase == .serving_install or phase == .serving_disable))
+        {
+            try self.row_policy_gate.beginPreparing(.active);
+        } else if (!stage_with_serving and self.row_policy_gate.currentPhase() != .preparing) {
+            // Metadata promotion is not an owner-local shortcut. Every owner
+            // must first have durably installed the pending generation.
+            return error.RowPolicyCatalogChanged;
+        }
+        try self.lockApplyForPortableRuntime();
+        var apply_held = true;
+        defer if (apply_held) self.core.unlockApply();
+        if (switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+            .already_applied => true,
+            .apply => false,
+        }) {
+            const already = try self.readRowPolicyApplyResultLocked(expected_receipt);
+            self.core.unlockApply();
+            apply_held = false;
+            if (ha_lsn) |lsn| try self.markHAReplicationRecordApplied(lsn);
+            return already;
+        }
+        if (try self.pendingRowPolicyReceipt()) |prior| {
+            // A lagging follower need not have received a coordinator receipt
+            // probe for the earlier phase. A later metadata-authorized Raft
+            // phase may supersede that fail-closed intent without admitting
+            // readers or claiming the earlier local ACK. The latest phase
+            // still waits for all old leases before it can serve.
+            const next_phase = installed.parsed.value.phase;
+            const follows = if (request.expected_generation > prior.generation)
+                next_phase == .pending_install or next_phase == .pending_disable
+            else if (request.expected_generation == prior.generation)
+                switch (prior.phase) {
+                    .pending_install => next_phase == .serving_install,
+                    .serving_install => next_phase == .active or next_phase == .pending_disable,
+                    .pending_disable => next_phase == .serving_disable,
+                    .serving_disable => next_phase == .disabled,
+                    .active, .disabled => false,
+                }
+            else
+                false;
+            if (!follows or prior.table_id != request.table_id or
+                !std.mem.eql(u8, &prior.descriptor_digest, &request.expected_descriptor_digest) or
+                identity.index <= prior.applied_index) return error.RowPolicyCatalogChanged;
+        }
+        const previous = self.core.table_catalog;
+        const publication = installed.parsed.value;
+        const current_range = self.core.byteRange();
+        const actual_descriptor_digest = try (@import("../../system_catalog/policies.zig").OwnerDescriptor{
+            .table_id = self.core.identity_namespace.table_id,
+            .group_id = request.owner_group_id,
+            .shard_id = self.core.identity_namespace.shard_id,
+            .range_id = self.core.identity_namespace.range_id,
+            .schema_version = publication.schema_version,
+            .schema_digest = publication.schema_digest,
+            .range_start = current_range.start,
+            .range_end = current_range.end,
+        }).digest();
+        if (!std.mem.eql(u8, &actual_descriptor_digest, &request.expected_descriptor_digest))
+            return error.RowPolicyCatalogChanged;
+        if (previous.storage_mode != .relational or previous.active_schema_version != publication.schema_version or
+            publication.policy_generation < previous.row_policy_generation or
+            (publication.policy_generation == previous.row_policy_generation and !stage_with_serving and
+                previous.row_policy_phase != .preparing)) return error.RowPolicyCatalogChanged;
+        var receipt_bytes: [raft_applied_entry_value_len]u8 = undefined;
+        const receipt = raftAppliedEntryWrite(identity, &receipt_bytes);
+        if (stage_with_serving) {
+            if (self.row_policy_gate.currentPhase() != .active or previous.row_policy_phase != .active or
+                publication.policy_generation <= previous.row_policy_generation or
+                (try self.pendingRowPolicyReceipt()) != null) return error.RowPolicyCatalogChanged;
+            const existing_candidate = self.core.store.get(self.alloc, row_policy_bundle_mod.candidate_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (existing_candidate) |value| self.alloc.free(value);
+            if (existing_candidate != null) return error.RowPolicyCatalogChanged;
+            const encoded_receipt = expected_receipt.encode();
+            var receipt_key_buf: [128]u8 = undefined;
+            const receipt_key = try expected_receipt.key(&receipt_key_buf);
+            var stage_txn = try self.core.store.beginWriteTxn();
+            errdefer stage_txn.abort();
+            try stage_txn.put(row_policy_bundle_mod.candidate_key, bundle_bytes);
+            try stage_txn.put(receipt_key, &encoded_receipt);
+            try stage_txn.put(receipt.key, receipt.value);
+            var ha_lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
+            if (ha_lsn) |lsn| {
+                const marker = haAppliedReplicationLsnWrite(lsn, &ha_lsn_buf);
+                try stage_txn.put(marker.key, marker.value);
+            }
+            if (ha_outbox) |outbox| try stage_txn.put(outbox.key, outbox.value);
+            if (ha_outbox != null) {
+                // Conservative on abort: the next admission performs an
+                // apply-fenced empty scan and clears both fast-negative flags.
+                self.durable_ha_outbox_maybe.store(true, .release);
+                self.row_policy_ha_outbox_pending.store(true, .release);
+            }
+            try stage_txn.commit();
+            if (ha_outbox != null) {
+                schedule_ha_recovery_on_exit = true;
+            }
+            try self.finishRowPolicyHACommitLocked(ha_payload, if (ha_outbox) |outbox| outbox.key else null, &apply_held, &ha_mutation);
+            return expected_receipt;
+        }
+        if (phase == .serving_install or phase == .serving_disable) {
+            const candidate = try self.core.store.get(self.alloc, row_policy_bundle_mod.candidate_key);
+            defer self.alloc.free(candidate);
+            var parsed_candidate = try row_policy_bundle_mod.Installed.init(self.alloc, candidate, self.core.identity_namespace.table_id, schema);
+            defer parsed_candidate.deinit();
+            if (parsed_candidate.parsed.value.table_id != publication.table_id or
+                parsed_candidate.parsed.value.policy_generation != publication.policy_generation or
+                parsed_candidate.parsed.value.catalog_epoch != publication.catalog_epoch or
+                !std.mem.eql(u8, &parsed_candidate.parsed.value.schema_digest, &publication.schema_digest) or
+                parsed_candidate.parsed.value.phase != (if (phase == .serving_install)
+                    @as(@import("../../system_catalog/policies.zig").Publication.Phase, .pending_install)
+                else
+                    .pending_disable))
+                return error.RowPolicyCatalogChanged;
+            const candidate_definitions = try std.json.Stringify.valueAlloc(self.alloc, .{ .records = parsed_candidate.parsed.value.records, .settings = parsed_candidate.parsed.value.settings }, .{});
+            defer self.alloc.free(candidate_definitions);
+            const serving_definitions = try std.json.Stringify.valueAlloc(self.alloc, .{ .records = publication.records, .settings = publication.settings }, .{});
+            defer self.alloc.free(serving_definitions);
+            if (!std.mem.eql(u8, candidate_definitions, serving_definitions)) return error.RowPolicyCatalogChanged;
+        }
+        var next = previous;
+        next.row_policy_generation = publication.policy_generation;
+        next.row_policy_catalog_epoch = publication.catalog_epoch;
+        next.row_policy_phase = .preparing;
+        next.generation +|= 1;
+        const catalog_bytes = next.encode();
+        const encoded_pending = expected_receipt.encode();
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(row_policy_bundle_mod.key, bundle_bytes);
+        if (pending_phase) try txn.put(row_policy_bundle_mod.candidate_key, bundle_bytes);
+        if (phase == .serving_install or phase == .serving_disable) try txn.delete(row_policy_bundle_mod.candidate_key);
+        try txn.put(row_policy_bundle_mod.pending_key, &encoded_pending);
+        try txn.put(table_catalog_mod.key, &catalog_bytes);
+        try txn.put(receipt.key, receipt.value);
+        var ha_lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
+        if (ha_lsn) |lsn| {
+            const marker = haAppliedReplicationLsnWrite(lsn, &ha_lsn_buf);
+            try txn.put(marker.key, marker.value);
+        }
+        if (ha_outbox) |outbox| try txn.put(outbox.key, outbox.value);
+        if (ha_outbox != null) {
+            self.durable_ha_outbox_maybe.store(true, .release);
+            self.row_policy_ha_outbox_pending.store(true, .release);
+        }
+        try txn.commit();
+        if (ha_outbox != null) {
+            schedule_ha_recovery_on_exit = true;
+        }
+        self.core.table_catalog = next;
+        // Keep the old immutable bundle alive for previously admitted bound
+        // readers. The receipt probe swaps it only after those leases drain.
+        try self.finishRowPolicyHACommitLocked(ha_payload, if (ha_outbox) |outbox| outbox.key else null, &apply_held, &ha_mutation);
+        return null;
+    }
+
     /// Removes group-local apply history when this document generation is
     /// materialized for a different Raft history (for example restore or the
     /// destination side of a split). The caller must hold structural ownership
@@ -9859,6 +10560,62 @@ pub const DB = struct {
         if (applied_lsn_marker) |lsn| try self.markHAReplicationRecordApplied(lsn);
     }
 
+    /// The HA journal carries the primary's authenticated child-source cut.
+    /// Apply the schema, accepted integrity catalog, source-fence release,
+    /// owner receipt and HA LSN in one standby transaction. Generic metadata
+    /// replay deliberately cannot publish a changed FK generation.
+    fn setPublishedChildSchemaReplicatedApplyWithMarker(self: *DB, table_schema: schema_mod.TableSchema, schema_json: []const u8, published: ha_effects_mod.PublishedChildSchema, lsn: u64) !void {
+        if (lsn == 0 or (published.fence.role != .child_generation_source and published.fence.role != .child_generation_dual) or
+            !published.fence.namespace.eql(self.core.identity_namespace) or
+            published.applied_term == 0 or published.applied_index == 0) return error.InvalidGenerationPublication;
+        var schema_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(schema_json, &schema_digest, .{});
+        if (!std.mem.eql(u8, &schema_digest, &published.schema_json_digest)) return error.InvalidGenerationPublication;
+        var prepared_recovery = if (self.transaction_recovery_identity_context != null)
+            try db_core.PreparedRecoveryRelationalState.init(self.runtime_alloc, if (table_schema.storage_mode == .relational) table_schema.relational_columns else null, table_schema.version)
+        else
+            null;
+        defer if (prepared_recovery) |*prepared| prepared.deinit();
+        const versioned_key = try public_table_schema.versionedSchemaKeyAlloc(self.alloc, table_schema.version);
+        defer self.alloc.free(versioned_key);
+        const admission = @import("relational_integrity_generation_admission.zig");
+        const receipt_digest = try admission.sourceInstallDigest(published.fence, published.before_schema_json_digest, published.schema_json_digest, published.before_catalog_digest, published.after_catalog_digest);
+        const receipt_bytes = (admission.AppliedReceipt{ .digest = receipt_digest, .term = published.applied_term, .index = published.applied_index }).encode();
+        var lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
+        const marker = haAppliedReplicationLsnWrite(lsn, &lsn_buf);
+        const writes = [_]docstore_mod.KVPair{
+            .{ .key = public_schema_json_key, .value = schema_json },
+            .{ .key = versioned_key, .value = schema_json },
+            .{ .key = admission.source_install_receipt_key, .value = &receipt_bytes },
+            marker,
+        };
+        var prepared = try self.core.prepareSchemaMetadataPublishedChild(table_schema, &writes);
+        defer prepared.deinit();
+        const after_catalog = (prepared.integrity_catalog orelse return error.IntegrityCatalogChanged).value;
+        var after_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(after_catalog, &after_digest, .{});
+        if (!std.mem.eql(u8, &after_digest, &published.after_catalog_digest)) return error.IntegrityCatalogChanged;
+        try self.lockApplyForPortableRuntime();
+        var apply_held = true;
+        errdefer if (apply_held) self.core.unlockApply();
+        const current_schema = (try self.core.getStoreValue(self.alloc, public_schema_json_key)) orelse return error.IntegrityCatalogChanged;
+        defer self.alloc.free(current_schema);
+        var before_schema_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(current_schema, &before_schema_digest, .{});
+        if (!std.mem.eql(u8, &before_schema_digest, &published.before_schema_json_digest)) return error.IntegrityCatalogChanged;
+        const current_catalog = (try self.core.getStoreValue(self.alloc, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
+        defer self.alloc.free(current_catalog);
+        var before_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(current_catalog, &before_digest, .{});
+        if (!std.mem.eql(u8, &before_digest, &published.before_catalog_digest)) return error.IntegrityCatalogChanged;
+        const row_count = try self.validateStorageModeCompatibilityLocked(table_schema);
+        _ = try self.core.commitPreparedSchemaMetadataPublishedChild(&prepared, &writes, &.{}, row_count, published.fence);
+        self.publishRelationalRuntimeModePrepared(if (prepared_recovery) |*recovery| recovery else null);
+        self.core.unlockApply();
+        apply_held = false;
+        self.reconcilePublishedSchemaIndexes(table_schema.version);
+    }
+
     pub fn applyHAReplicationRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!void {
         if (try self.haReplicationRecordAlreadyApplied(record)) {
             // Older records remain allocation-light no-ops. Only the current
@@ -9885,7 +10642,15 @@ pub const DB = struct {
             .batch_mutation => {
                 var decoded = try ha_effects_mod.decodeBatchMutationRequest(self.alloc, record);
                 defer decoded.deinit();
-                if (decoded.value.request.online_source != null) {
+                if (decoded.value.initial_child_raft_entry orelse decoded.value.graph_retirement_raft_entry orelse decoded.value.restore_generation_admission_raft_entry) |entry| {
+                    try self.batchInternal(decoded.value.request, null, .{
+                        .validate_range_ownership = false,
+                        .wait_for_sync_level = false,
+                        .bypass_ha_write_gate = true,
+                        .raft_applied_entry_marker = entry,
+                        .ha_applied_lsn_marker = record.lsn,
+                    });
+                } else if (decoded.value.request.online_source != null) {
                     var source_req = decoded.value.request;
                     source_req.sync_level = .write;
                     try self.batchInternal(source_req, null, .{
@@ -9898,9 +10663,24 @@ pub const DB = struct {
                 } else try self.batchReplicatedApplyWithMarker(decoded.value.request, record.lsn);
             },
             .metadata_mutation => {
-                var decoded = try ha_effects_mod.decodeSchemaMetadataMutation(self.alloc, record);
-                defer decoded.deinit();
-                try self.setSchemaReplicatedApplyWithMarker(decoded.schema, decoded.public_schema_json, record.lsn);
+                var metadata = try ha_effects_mod.decodeMetadataMutation(self.alloc, record);
+                defer metadata.deinit();
+                switch (metadata.value.kind) {
+                    .schema => {
+                        var decoded = try ha_effects_mod.decodeSchemaMetadataMutation(self.alloc, record);
+                        defer decoded.deinit();
+                        if (decoded.published_child) |published|
+                            try self.setPublishedChildSchemaReplicatedApplyWithMarker(decoded.schema, decoded.public_schema_json orelse return error.InvalidGenerationPublication, published, record.lsn)
+                        else
+                            try self.setSchemaReplicatedApplyWithMarker(decoded.schema, decoded.public_schema_json, record.lsn);
+                    },
+                    .row_policy => _ = try self.applyRowPolicyPublicationInternal(
+                        metadata.value.row_policy_bundle.?,
+                        metadata.value.row_policy_request.?,
+                        metadata.value.row_policy_raft_entry.?,
+                        record.lsn,
+                    ),
+                }
             },
             .derived_effect => {
                 _ = try self.applyHADerivedEffectRecord(record);
@@ -10118,6 +10898,64 @@ pub const DB = struct {
     /// the global serialization fence. The bound prevents catalog churn from
     /// turning one request into unbounded CPU/provider work.
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+        if (self.initial_child_hidden.load(.acquire) and
+            (req.relational_topology == null or
+                (req.relational_topology.?.action != .provision_initial_child and
+                    req.relational_topology.?.action != .release_initial_child and
+                    req.relational_topology.?.action != .cancel_initial_child)))
+            return error.InitialChildNotPublished;
+        // Publication has a dedicated deterministic Raft apply path; it must
+        // never be silently treated as an ordinary empty batch.
+        if (req.row_policy_publication != null or req.row_policy_install_bundle.len != 0)
+            return error.InvalidBatchRequest;
+        // Follower/recovery Raft replay applies an already-authorized log
+        // command. Every local direct mutation must retain an admission lease
+        // through commit so a policy activation cannot cross it.
+        var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
+        defer if (verified_principal) |*principal| principal.deinit();
+        var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null;
+        const trusted_replay = opts.raft_applied_entry_marker != null or opts.native_initial_child_entry != null or opts.ha_applied_lsn_marker != null;
+        if (!trusted_replay) try self.maybeFinalizePendingRowPolicyPublication();
+        if (req.row_policy_principal_proof.len != 0) {
+            if (req.row_policy_admitted_at_seconds <= 0 or req.row_policy_database.len == 0 or
+                req.row_policy_publication != null or req.relational_generation_gc != null or
+                req.online_source != null or req.restore_staging != null)
+                return error.RowPolicyAuthenticationRequired;
+            const now_seconds: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
+            verified_principal = try self.verifyRowPolicyPrincipal(self.alloc, req.row_policy_principal_proof, req.row_policy_database, .write, if (trusted_replay) req.row_policy_admitted_at_seconds else now_seconds);
+            row_policy_lease = if (trusted_replay)
+                try self.row_policy_gate.enterReplicatedPrincipal(&verified_principal.?.value)
+            else
+                try self.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, now_seconds);
+        } else if (req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0) {
+            return error.RowPolicyAuthenticationRequired;
+        } else if (!trusted_replay and req.relational_generation_gc == null and opts.transaction_resolution == null) {
+            row_policy_lease = try self.row_policy_gate.enterRaw();
+        } else if (self.row_policy_gate.currentPhase() != .disabled and
+            (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+                req.graph_writes.len != 0 or req.graph_deletes.len != 0) and
+            opts.transaction_resolution == null and req.relational_generation_gc == null)
+        {
+            return error.RowPolicyAuthenticationRequired;
+        }
+        defer if (row_policy_lease) |*lease| lease.release();
+        var policy_opts = opts;
+        if (verified_principal) |*principal| policy_opts.row_policy_principal = &principal.value;
+        if (row_policy_lease) |*lease| policy_opts.row_policy_lease = lease;
+        // A topology rewrite cannot inherit an active policy by copying row
+        // bytes: the new owner would lack an authenticated, descriptor-bound
+        // policy publication. Until coordinated bundle handoff exists, reject
+        // every replicated split/merge/restore lifecycle while a publication
+        // is preparing or active. This check also covers trusted Raft replay,
+        // which deliberately bypasses ordinary user-row admission.
+        if (self.row_policy_gate.currentPhase() != .disabled and
+            (req.online_source != null or req.restore_staging != null or
+                req.relational_topology != null or req.split_transition != null or
+                req.split_checkpoint != null or req.split_replication != null or
+                req.merge_source_transition != null or req.merge_checkpoint != null or
+                req.merge_replication != null or req.merge_page != null or
+                req.merge_artifacts.len != 0)) return error.RowPolicyTopologyUnsupported;
+        try @import("../range_protection.zig").validateRequest(req);
         try @import("merge_page_contract.zig").validateRequest(req);
         try @import("online_source_contract.zig").validateRequest(req);
         if (req.online_source != null) return self.applyOnlineSourceBatch(req, opts);
@@ -10142,22 +10980,40 @@ pub const DB = struct {
                     _ = finish;
                     return self.applyRestoreStagingControl(req, opts);
                 },
+                .install_generation_admissions => |install| {
+                    if (req.writes.len != 0 or req.deletes.len != 0) return error.InvalidRestoreStagingCommand;
+                    try install.validate();
+                    return self.applyRestoreStagingControl(req, opts);
+                },
                 .import_page, .rewrite_page => |page| {
                     if (req.writes.len +| req.deletes.len > 128 or page.timestamps.len != req.writes.len or page.next.len > 8 * 1024 * 1024) return error.InvalidRestoreStagingCommand;
-                    if (page.artifacts.len > 128 or (page.artifact_page and page.projection_page) or
-                        ((page.artifact_page or page.projection_page) and (control != .import_page or req.writes.len != 0 or req.deletes.len != 0)) or
-                        (!page.artifact_page and !page.projection_page and page.artifacts.len != 0)) return error.InvalidRestoreStagingCommand;
+                    if (page.artifacts.len > (if (page.source_generation_proof_page) @as(usize, 1024) else 128) or
+                        @as(u8, @intFromBool(page.artifact_page)) + @as(u8, @intFromBool(page.projection_page)) + @as(u8, @intFromBool(page.source_generation_proof_page)) > 1 or
+                        ((page.artifact_page or page.projection_page or page.source_generation_proof_page) and (control != .import_page or req.writes.len != 0 or req.deletes.len != 0)) or
+                        (!page.artifact_page and !page.projection_page and !page.source_generation_proof_page and page.artifacts.len != 0)) return error.InvalidRestoreStagingCommand;
                     var timestamps: std.StringHashMapUnmanaged(u64) = .empty;
                     defer timestamps.deinit(self.alloc);
                     var input_bytes: usize = 0;
                     var previous_artifact: ?[]const u8 = null;
                     for (page.artifacts) |artifact| {
-                        if (!(if (page.projection_page) isMergeArtifactKey(artifact.key) else isRestoreArtifactKey(artifact.key))) return error.InvalidRestoreStagingCommand;
+                        if (page.source_generation_proof_page) {
+                            const portable = @import("../portable_backup.zig");
+                            const accepted = @import("relational_integrity_generation_admission.zig");
+                            if (!std.mem.startsWith(u8, artifact.key, portable.source_generation_admission_prefix) or
+                                artifact.key.len != portable.source_generation_admission_prefix.len + 32) return error.InvalidRestoreStagingCommand;
+                            const decoded = accepted.Scope.decode(artifact.value) catch return error.InvalidRestoreStagingCommand;
+                            if (decoded.phase != .active) return error.InvalidRestoreStagingCommand;
+                            const key = try accepted.scopeKey(decoded.child_table_name, decoded.constraint_name);
+                            if (!std.mem.eql(u8, artifact.key[portable.source_generation_admission_prefix.len..], key[accepted.prefix.len..]))
+                                return error.InvalidRestoreStagingCommand;
+                        } else if (!(if (page.projection_page) isMergeArtifactKey(artifact.key) else isRestoreArtifactKey(artifact.key))) return error.InvalidRestoreStagingCommand;
                         if (previous_artifact) |previous| if (std.mem.order(u8, previous, artifact.key) != .lt) return error.InvalidRestoreStagingCommand;
                         previous_artifact = artifact.key;
-                        const owner = (try internal_keys.decodeDocumentComponentAlloc(self.alloc, artifact.key)) orelse return error.InvalidRestoreStagingCommand;
-                        defer self.alloc.free(owner);
-                        if (!self.core.byteRange().contains(owner)) return error.KeyOutOfRange;
+                        if (!page.source_generation_proof_page) {
+                            const owner = (try internal_keys.decodeDocumentComponentAlloc(self.alloc, artifact.key)) orelse return error.InvalidRestoreStagingCommand;
+                            defer self.alloc.free(owner);
+                            if (!self.core.byteRange().contains(owner)) return error.KeyOutOfRange;
+                        }
                         input_bytes = std.math.add(usize, input_bytes, artifact.key.len +| artifact.value.len) catch return error.TransactionTooLarge;
                         if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
                     }
@@ -10178,18 +11034,18 @@ pub const DB = struct {
                     }
                     var apply_req = req;
                     apply_req.restore_staging = null;
-                    apply_req.sync_level = if (page.artifact_page) .write else .full_index;
+                    apply_req.sync_level = if (page.artifact_page or page.source_generation_proof_page) .write else .full_index;
                     var apply_opts = opts;
-                    apply_opts.wait_for_sync_level = !page.artifact_page;
-                    apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects, .artifact_page = page.artifact_page, .projection_page = page.projection_page };
+                    apply_opts.wait_for_sync_level = !page.artifact_page and !page.source_generation_proof_page;
+                    apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects, .artifact_page = page.artifact_page, .projection_page = page.projection_page, .source_generation_proof_page = page.source_generation_proof_page };
                     apply_opts.restore_timestamps = &timestamps;
                     apply_opts.restore_ha_request = req;
                     apply_opts.restore_artifacts = page.artifacts;
-                    const extra = try self.alloc.alloc(docstore_mod.KVPair, opts.extra_store_writes.len + 1 + @intFromBool(page.artifacts.len != 0));
+                    const extra = try self.alloc.alloc(docstore_mod.KVPair, opts.extra_store_writes.len + 1 + @intFromBool(page.artifacts.len != 0 and !page.source_generation_proof_page));
                     defer self.alloc.free(extra);
                     @memcpy(extra[0..opts.extra_store_writes.len], opts.extra_store_writes);
                     extra[opts.extra_store_writes.len] = .{ .key = @import("restore_staging.zig").key, .value = page.next };
-                    if (page.artifacts.len != 0) {
+                    if (page.artifacts.len != 0 and !page.source_generation_proof_page) {
                         self.core.artifact_cleanup_maybe.store(true, .release);
                         extra[extra.len - 1] = .{ .key = internal_keys.artifact_presence_key[0..], .value = "1" };
                     }
@@ -10198,6 +11054,7 @@ pub const DB = struct {
                 },
             }
         }
+        if (req.relational_generation_gc != null) return self.applyGenerationGcBatch(req, opts);
         if (req.relational_topology != null or req.split_transition != null) {
             return self.applyRelationalTopologyBatch(req, opts);
         }
@@ -10237,6 +11094,8 @@ pub const DB = struct {
             apply_opts.restore_timestamps = &page_timestamps;
             apply_opts.preserve_logical_values = true;
         };
+        apply_opts.row_policy_principal = policy_opts.row_policy_principal;
+        apply_opts.row_policy_lease = policy_opts.row_policy_lease;
         self.batchInternalWithPreparationAllocator(apply_req, profile, apply_opts, &preparation.guard) catch |err|
             return preparation.mapError(err);
     }
@@ -10388,11 +11247,17 @@ pub const DB = struct {
         };
 
         const effective_req: types.BatchRequest = .{
+            .row_policy_principal_proof = req.row_policy_principal_proof,
+            .row_policy_database = req.row_policy_database,
+            .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+            .range_guards = req.range_guards,
             .restore_staging_scope = req.restore_staging_scope,
             .restore_staging_plan_id = req.restore_staging_plan_id,
+            .schema_version = req.schema_version,
             .relational_schema_version = req.relational_schema_version,
             .relational_integrity_generation_set = req.relational_integrity_generation_set,
             .relational_repair = req.relational_repair,
+            .activate_range_tracking = req.activate_range_tracking,
             .integrity = req.integrity,
             .integrity_commands = req.integrity_commands,
             .relational_activation = req.relational_activation,
@@ -10437,14 +11302,18 @@ pub const DB = struct {
             null;
         var request_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, request_schema_binding);
         defer if (request_schema_view) |*view| view.release();
+        if (req.schema_version) |version| {
+            const view = request_schema_view orelse return error.PreparedGenerationChanged;
+            if (view.version() != version) return error.PreparedGenerationChanged;
+        }
         // Only authenticated HA replay may supply final scoped metadata effects
         // without local participant intents. Scope, key kinds, owner range and
         // generation are revalidated below under the apply fence.
         const scoped_restore_ha_apply = opts.ha_applied_lsn_marker != null and effective_req.restore_staging_scope != null and opts.restore_staging == null;
         const live_ha_apply = opts.ha_applied_lsn_marker != null and effective_req.restore_staging_scope == null and opts.restore_staging == null;
         if (opts.transaction_resolution == null and !scoped_restore_ha_apply and !live_ha_apply) {
-            for (effective_ops.writes) |write| if (isProtectedIntegrityKey(write.key)) return error.InvalidIntegrityOperation;
-            for (effective_ops.deletes) |key| if (isProtectedIntegrityKey(key)) return error.InvalidIntegrityOperation;
+            for (effective_ops.writes) |write| if (isProtectedIntegrityKey(write.key) or isProtectedRangeWriteKey(write.key)) return error.InvalidIntegrityOperation;
+            for (effective_ops.deletes) |key| if (isProtectedIntegrityKey(key) or isProtectedRangeWriteKey(key)) return error.InvalidIntegrityOperation;
             if (hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
                 return error.ForeignKeyCoordinationRequired;
         }
@@ -10733,6 +11602,15 @@ pub const DB = struct {
         // A durable epoch survives active-schema publication, not replacement
         // of the entire database namespace with reused version/transaction IDs.
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+        // A document batch has no AROW preparation to perform this fence on
+        // its behalf. Check the pinned epoch again under exclusive admission.
+        if (self.initial_child_hidden.load(.acquire) and
+            (effective_req.relational_topology == null or
+                (effective_req.relational_topology.?.action != .provision_initial_child and
+                    effective_req.relational_topology.?.action != .release_initial_child and
+                    effective_req.relational_topology.?.action != .cancel_initial_child)))
+            return error.InitialChildNotPublished;
+        if (req.schema_version != null) try self.validatePreparedSchemaViewLocked(request_schema_view);
         if (!self.core.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
         if (live_ha_apply) {
             var integrity_read = try self.core.store.beginProbeTxn();
@@ -10989,6 +11867,7 @@ pub const DB = struct {
         else
             null;
         defer if (apply_schema_view) |*view| view.release();
+        if (relationalColumns(self) == null) for (effective_req.writes) |write| if (write.json_null_fields.len != 0) return error.InvalidBatchRequest;
         if (!use_preprepared_rows and relationalColumns(self) != null and apply_schema_view == null)
             return error.InvalidSchemaUpdateRequest;
         const batch_timestamp_ns = if (use_preprepared_rows)
@@ -10997,6 +11876,19 @@ pub const DB = struct {
             effective_req.timestamp_ns
         else
             preparation_timestamp_ns;
+
+        if (opts.row_policy_principal) |principal| {
+            const policy_schema_view = if (use_preprepared_rows)
+                request_schema_view orelse return error.RowPolicyCatalogChanged
+            else
+                apply_schema_view orelse return error.RowPolicyCatalogChanged;
+            try self.enforceRowPolicyMutationLocked(
+                policy_schema_view,
+                effective_req,
+                if (use_preprepared_rows) preprepared_rows else null,
+                principal,
+            );
+        }
 
         // Prepared transaction intents fence the ordinary single-group fast
         // path too. The key-oriented intent index keeps this O(touched keys)
@@ -11062,6 +11954,16 @@ pub const DB = struct {
         };
         var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer store_writes.deinit(self.alloc);
+        if (req.activate_range_tracking) {
+            const ranges = @import("../range_protection.zig");
+            try ranges.validateRequest(req);
+            var probe = try self.core.store.beginReadTxn();
+            defer probe.abort();
+            if (!try ranges.isActive(&probe)) {
+                if (try self.core.hasTopologySensitiveTransactions()) return error.IntentConflict;
+                try store_writes.append(self.alloc, .{ .key = ranges.activation_key, .value = ranges.activation_value });
+            }
+        }
         var owned_store_keys = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (owned_store_keys.items) |key| self.alloc.free(key);
@@ -11170,7 +12072,9 @@ pub const DB = struct {
                 preprepared_rows.?[i] = null;
                 break :blk prepared;
             } else if (apply_schema_view) |view|
-                if (opts.restore_staging != null or opts.preserve_logical_values)
+                if (write.json_null_fields.len != 0)
+                    try mapper.PreparedRelationalWrite.initTyped(self.alloc, self.alloc, self.alloc, false, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, opts.restore_staging != null or opts.preserve_logical_values)
+                else if (opts.restore_staging != null or opts.preserve_logical_values)
                     try mapper.PreparedRelationalWrite.initPreserved(self.alloc, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout())
                 else
                     try mapper.PreparedRelationalWrite.initFromIntent(
@@ -11889,6 +12793,7 @@ pub const DB = struct {
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.build_derived_ns, build_derived_start_ns);
 
         const store_write_start_ns = monotonicTimeNs();
+        if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         const store_batch_options: backend_types.BatchOptions = if (opts.store_batch_options.mode != .default)
             opts.store_batch_options
         else if (self.bulk_ingest_coalescer.active)
@@ -12097,6 +13002,19 @@ pub const DB = struct {
         try delete_keys.appendSlice(self.alloc, opts.extra_store_deletes);
         if (index_stage) |*stage| {
             const effects = try stage.seal();
+            if (opts.transaction_resolution == null and !live_ha_apply and !scoped_restore_ha_apply) {
+                var forward_keys = std.ArrayListUnmanaged([]const u8).empty;
+                defer forward_keys.deinit(self.alloc);
+                for (effects.writes) |effect| if (relational_index_records.isForwardKey(effect.key))
+                    try forward_keys.append(self.alloc, effect.key);
+                for (effects.deletes) |key| if (relational_index_records.isForwardKey(key))
+                    try forward_keys.append(self.alloc, key);
+                if (forward_keys.items.len != 0) {
+                    var manager = try self.core.initTxnManager();
+                    defer manager.deinit();
+                    try manager.checkIndexForwardWriteConflicts(forward_keys.items);
+                }
+            }
             try store_writes.appendSlice(self.alloc, effects.writes);
             try delete_keys.appendSlice(self.alloc, effects.deletes);
         }
@@ -12147,6 +13065,10 @@ pub const DB = struct {
             derived_executor_mod.BacklogAdmission{};
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_admission_ns, backlog_admission_start_ns);
         defer backlog_admission.cancel();
+        // Direct admissions may have spent time preparing derived effects.
+        // Recheck the original signed statement deadline at the irreversible
+        // primary commit boundary; Raft replay leases have no wall-time limit.
+        if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
             const outcome = try self.core.resolveTransactionIntentsWithExtraBatch(
                 resolution.txn_id,
@@ -13567,6 +14489,7 @@ pub const DB = struct {
     fn CoalescedKeyValueRequest(comptime T: type) type {
         return struct {
             const Entry = struct {
+                json_null_fields: []const []const u8 = &.{},
                 key: []const u8,
                 value: ?[]const u8 = null,
                 kind: enum { write, delete },
@@ -14123,6 +15046,7 @@ pub const DB = struct {
     fn setCoalescedEntryToBorrowedWrite(comptime T: type, entry: *CoalescedKeyValueRequest(T).Entry, write: T) void {
         entry.key = write.key;
         entry.value = write.value;
+        entry.json_null_fields = write.json_null_fields;
         entry.kind = .write;
         entry.owned_key = false;
         entry.owned_value = false;
@@ -14154,6 +15078,9 @@ pub const DB = struct {
         transforms: []const types.DocumentTransform,
         transform_snapshot: ?*const TransformReadSnapshot,
     ) !CoalescedKeyValueRequest(T) {
+        // SQL mutations lower to complete replacements. A document transform
+        // cannot retain the provenance of JSON null after reconstructing JSON.
+        if (transforms.len != 0) for (writes) |write| if (write.json_null_fields.len != 0) return error.UnsupportedTransformOperation;
         var result = CoalescedKeyValueRequest(T){};
         var order = std.ArrayListUnmanaged(CoalescedKeyValueRequest(T).Entry).empty;
         defer order.deinit(alloc);
@@ -14178,6 +15105,7 @@ pub const DB = struct {
                 try order.append(alloc, .{
                     .key = write.key,
                     .value = write.value,
+                    .json_null_fields = write.json_null_fields,
                     .kind = .write,
                 });
                 continue;
@@ -14344,6 +15272,7 @@ pub const DB = struct {
                     result.writes[write_index] = .{
                         .key = entry.key,
                         .value = entry.value.?,
+                        .json_null_fields = entry.json_null_fields,
                     };
                     write_index += 1;
                 },
@@ -14386,13 +15315,22 @@ pub const DB = struct {
     }
 
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
+        try self.maybeFinalizePendingRowPolicyPublication();
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
         var schema_view = self.core.acquireSchemaView();
         defer if (schema_view) |*view| view.release();
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
-        const raw = try self.core.getStoreValue(alloc, store_key) orelse return null;
+        const raw = try self.core.getStoreValue(alloc, store_key) orelse {
+            try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            return null;
+        };
         defer alloc.free(raw);
-        return try self.core.index_manager.materializeStoredValueWithPinnedSchemaAlloc(alloc, store_key, raw, schema_view);
+        const result = try self.core.index_manager.materializeStoredValueWithPinnedSchemaAlloc(alloc, store_key, raw, schema_view);
+        errdefer alloc.free(result);
+        try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        return result;
     }
 
     pub fn getGroupCreatedAtMillis(self: *DB, alloc: Allocator, group_id: u64) !?u64 {
@@ -14423,6 +15361,9 @@ pub const DB = struct {
     }
 
     pub fn getArtifact(self: *DB, alloc: Allocator, artifact_id: []const u8) !?types.ArtifactRecord {
+        try self.maybeFinalizePendingRowPolicyPublication();
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
         var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, artifact_id)) orelse return error.InvalidArgument;
         errdefer artifact_ref.deinit(alloc);
 
@@ -14432,8 +15373,11 @@ pub const DB = struct {
         const value = try self.core.getStoreValue(alloc, internal_key) orelse return null;
         errdefer alloc.free(value);
 
+        const id = try alloc.dupe(u8, artifact_id);
+        errdefer alloc.free(id);
+        try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return .{
-            .id = try alloc.dupe(u8, artifact_id),
+            .id = id,
             .value = value,
             .artifact_ref = artifact_ref,
         };
@@ -14444,11 +15388,15 @@ pub const DB = struct {
     /// storage metadata, while public lookup must never expose hierarchy
     /// revision fingerprints or coordinator envelopes.
     pub fn getPublicArtifact(self: *DB, alloc: Allocator, artifact_id: []const u8) !?types.ArtifactRecord {
+        try self.maybeFinalizePendingRowPolicyPublication();
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
         var artifact = (try self.getArtifact(alloc, artifact_id)) orelse return null;
         errdefer artifact.deinit(alloc);
         const public_value = try hierarchy_navigation.publicArtifactPayloadAlloc(alloc, artifact.value);
         alloc.free(artifact.value);
         artifact.value = public_value;
+        try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return artifact;
     }
 
@@ -14458,13 +15406,17 @@ pub const DB = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
     ) !?types.DocumentArtifactManifest {
+        try self.maybeFinalizePendingRowPolicyPublication();
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
 
         const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
         defer alloc.free(manifest_key);
         const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse return null;
-        errdefer alloc.free(manifest);
+        var manifest_owned = true;
+        errdefer if (manifest_owned) alloc.free(manifest);
 
         const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
         defer alloc.free(state_key);
@@ -14472,9 +15424,15 @@ pub const DB = struct {
             error.NotFound => null,
             else => return err,
         };
-        errdefer if (state) |value| alloc.free(value);
+        var state_owned = true;
+        errdefer if (state_owned) if (state) |value| alloc.free(value);
 
-        return try documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_name, manifest, state);
+        manifest_owned = false;
+        state_owned = false;
+        var result = try documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_name, manifest, state);
+        errdefer result.deinit(alloc);
+        try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        return result;
     }
 
     pub fn listDocumentArtifactManifests(
@@ -14482,6 +15440,9 @@ pub const DB = struct {
         alloc: Allocator,
         doc_key: []const u8,
     ) !types.DocumentArtifactManifestList {
+        try self.maybeFinalizePendingRowPolicyPublication();
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
 
@@ -14519,10 +15480,13 @@ pub const DB = struct {
             );
         }
 
-        return .{
+        var result: types.DocumentArtifactManifestList = .{
             .document_id = try alloc.dupe(u8, doc_key),
             .artifacts = try artifacts.toOwnedSlice(alloc),
         };
+        errdefer result.deinit(alloc);
+        try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        return result;
     }
 
     pub fn updateDocumentArtifactChildRangePlacement(
@@ -22934,19 +23898,28 @@ pub const DB = struct {
         var last_key: ?[]const u8 = null;
         var more = false;
         var bytes: usize = 0;
+        var scanned: usize = 0;
         const started = platform_time.monotonicNs();
         while (entry) |item| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, item.key, &prefix)) break;
-            if (references.items.len >= limit or (references.items.len != 0 and platform_time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) or item.value.len > 1024 * 1024 - bytes) {
-                if (references.items.len == 0) return error.IntegrityRecordTooLarge;
+            // Retired generations remain on disk until bounded GC, but they
+            // are no longer dependencies of the parent. Budget physical rows
+            // and advance the cursor even when a page contains only tombstoned
+            // references, or an old generation could make this read unbounded.
+            if (scanned >= limit or (scanned != 0 and platform_time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) or item.value.len > 1024 * 1024 - bytes) {
+                if (scanned == 0) return error.IntegrityRecordTooLarge;
                 more = true;
                 break;
             }
             if (self.backend_runtime.io()) |io| try io.checkCancel();
-            const copy = try owned.dupe(u8, item.value);
-            try references.append(owned, try integrity.Reference.decode(item.key, copy));
+            const reference = try integrity.Reference.decode(item.key, item.value);
+            if (!try @import("relational_integrity_generation_retirement.zig").isRetired(&read, reference)) {
+                const copy = try owned.dupe(u8, item.value);
+                try references.append(owned, try integrity.Reference.decode(item.key, copy));
+            }
             last_key = try owned.dupe(u8, item.key);
-            bytes += copy.len;
+            scanned += 1;
+            bytes += item.value.len;
         }
         const next: ?[]const u8 = if (more) next: {
             const raw = last_key orelse return error.InvalidIntegrityBudget;
@@ -22975,8 +23948,141 @@ pub const DB = struct {
         return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .address = address, .claim = claim, .references = references.items, .next = next }, .{}) };
     }
 
+    fn verifyRowPolicyPrincipal(self: *DB, alloc: Allocator, token: []const u8, database: []const u8, access: row_policy_authority_mod.Access, now_seconds: i64) !std.json.Parsed(row_policy_authority_mod.Payload) {
+        if (token.len == 0 or token.len > row_policy_authority_mod.maximum_token_bytes or database.len == 0)
+            return error.RowPolicyAuthenticationRequired;
+        return row_policy_authority_mod.verify(alloc, self.row_policy_authority_secret orelse return error.RowPolicyAuthorityUnavailable, self.row_policy_authority_issuer orelse return error.RowPolicyAuthorityUnavailable, .{
+            .table_id = self.core.identity_namespace.table_id,
+            .table = self.row_policy_table_name orelse return error.RowPolicyAuthorityUnavailable,
+            .database = database,
+            .policy_generation = self.row_policy_gate.generation.load(.acquire),
+            .catalog_epoch = self.row_policy_gate.catalog_epoch.load(.acquire),
+            .access = access,
+        }, now_seconds, token);
+    }
+
+    /// Called under the serialized apply lock, after transform coalescing and
+    /// optimistic schema validation but before any primary/index side effect.
+    /// A single read snapshot observes the old image for each affected key;
+    /// new images reuse the already prepared AROW bytes. Both sides are
+    /// evaluated on typed ordinals, not reconstructed JSON projections.
+    fn enforceRowPolicyMutationLocked(
+        self: *DB,
+        schema_view: schema_registry_mod.SchemaView,
+        req: types.BatchRequest,
+        prepared_rows: ?[]?mapper.PreparedRelationalWrite,
+        principal: *const row_policy_authority_mod.Payload,
+    ) !void {
+        if (principal.access != .write or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
+            req.merge_artifacts.len != 0 or req.online_source != null or req.restore_staging != null)
+            return error.RowPolicyAuthenticationRequired;
+        if (req.writes.len != 0 and (prepared_rows == null or prepared_rows.?.len != req.writes.len))
+            return error.RowPolicyMutationUnsupported;
+        const bundle = if (self.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
+        const schema = schema_view.tableSchema().*;
+        var insert_check = try bundle.captureEvaluation(self.alloc, schema, principal, .insert);
+        defer insert_check.deinit();
+        var update_old = try bundle.captureEvaluation(self.alloc, schema, principal, .update_old);
+        defer update_old.deinit();
+        var update_new = try bundle.captureEvaluation(self.alloc, schema, principal, .update_new);
+        defer update_new.deinit();
+        var delete_old = try bundle.captureEvaluation(self.alloc, schema, principal, .delete);
+        defer delete_old.deinit();
+        var probe = try self.core.store.beginProbeTxn();
+        defer probe.abort();
+        for (req.writes, 0..) |write, i| {
+            if (isMetadataKey(write.key)) return error.RowPolicyMutationUnsupported;
+            const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, write.key);
+            defer self.alloc.free(store_key);
+            const old_bytes: ?[]const u8 = probe.getLeased(store_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (old_bytes) |bytes| {
+                if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
+                const old = if (self.core.store.valuesAreAuthenticated())
+                    try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
+                else
+                    try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
+                if (!try update_old.permits(old)) return error.RowPolicyDenied;
+            }
+            const prepared = prepared_rows.?[i] orelse return error.RowPolicyMutationUnsupported;
+            const new = try relational_row_codec.ordinalRowViewTrusted(prepared.packed_row, schema, schema_view.physicalLayout());
+            if (!try (if (old_bytes != null) update_new else insert_check).permits(new))
+                return error.RowPolicyDenied;
+        }
+        for (req.deletes) |key| {
+            if (isMetadataKey(key)) return error.RowPolicyMutationUnsupported;
+            const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, key);
+            defer self.alloc.free(store_key);
+            const bytes = probe.getLeased(store_key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
+            const old = if (self.core.store.valuesAreAuthenticated())
+                try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
+            else
+                try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
+            if (!try delete_old.permits(old)) return error.RowPolicyDenied;
+        }
+    }
+
+    fn enforceRowPolicyIntentsLocked(self: *DB, schema_view: schema_registry_mod.SchemaView, intents: []const transactions_mod.WriteIntent, principal: *const row_policy_authority_mod.Payload) !void {
+        if (principal.access != .write) return error.RowPolicyAuthenticationRequired;
+        const bundle = if (self.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
+        const schema = schema_view.tableSchema().*;
+        var insert_check = try bundle.captureEvaluation(self.alloc, schema, principal, .insert);
+        defer insert_check.deinit();
+        var update_old = try bundle.captureEvaluation(self.alloc, schema, principal, .update_old);
+        defer update_old.deinit();
+        var update_new = try bundle.captureEvaluation(self.alloc, schema, principal, .update_new);
+        defer update_new.deinit();
+        var delete_old = try bundle.captureEvaluation(self.alloc, schema, principal, .delete);
+        defer delete_old.deinit();
+        var probe = try self.core.store.beginProbeTxn();
+        defer probe.abort();
+        for (intents) |intent| {
+            if (isMetadataKey(intent.key)) return error.RowPolicyMutationUnsupported;
+            const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, intent.key);
+            defer self.alloc.free(store_key);
+            const old_bytes: ?[]const u8 = probe.getLeased(store_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (old_bytes) |bytes| {
+                if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
+                const old = if (self.core.store.valuesAreAuthenticated())
+                    try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
+                else
+                    try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
+                if (!try (if (intent.value == null) delete_old else update_old).permits(old)) return error.RowPolicyDenied;
+            }
+            if (intent.value != null) {
+                const encoded = intent.prepared_row orelse return error.RowPolicyMutationUnsupported;
+                const new = try relational_row_codec.ordinalRowViewTrusted(encoded, schema, schema_view.physicalLayout());
+                if (!try (if (old_bytes == null) insert_check else update_new).permits(new)) return error.RowPolicyDenied;
+            }
+        }
+    }
+
     pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         try checkLookupOptionsActive(opts);
+        if (opts.row_policy_receipt) |request| {
+            // Only the provisioned cluster owner may answer coordinator
+            // receipt probes. Lite has no trusted policy authority and public
+            // lookup parsers never populate this private option.
+            if (self.row_policy_authority_secret == null or key.len != 0 or
+                opts.row_policy_principal_proof.len != 0 or opts.row_policy_database.len != 0)
+                return error.RowPolicyAuthenticationRequired;
+            const receipt = try self.loadRowPolicyReceipt(request.generation, request.phase);
+            return .{ .json = try std.json.Stringify.valueAlloc(alloc, receipt, .{}) };
+        }
+        try self.maybeFinalizePendingRowPolicyPublication();
+        if (self.initial_child_hidden.load(.acquire) and
+            opts.relational_topology_json.len == 0 and opts.relational_index_status_json.len == 0 and
+            !opts.relational_integrity_catalog)
+            return error.InitialChildNotPublished;
         if (self.restore_staging_required.load(.acquire) or opts.restore_staging_scope != null) {
             var staging_read = try self.core.store.beginProbeTxn();
             defer staging_read.abort();
@@ -22988,6 +24094,13 @@ pub const DB = struct {
         if (opts.relational_integrity_catalog) return self.lookupRelationalIntegrityCatalog(alloc);
         if (opts.relational_integrity_action) return self.lookupRelationalIntegrityAction(alloc, key);
         if (opts.relational_integrity_jobs_json.len != 0) return self.lookupRelationalIntegrityJobs(alloc, opts.relational_integrity_jobs_json);
+        var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
+        defer if (verified_principal) |*principal| principal.deinit();
+        var row_policy_lease = if (opts.row_policy_principal_proof.len != 0) bound: {
+            verified_principal = try self.verifyRowPolicyPrincipal(alloc, opts.row_policy_principal_proof, opts.row_policy_database, .read, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            break :bound try self.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        } else try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
         // Pin the schema once and keep the physical row intact through TTL and
         // projection. Relational rows carry their timestamp in the authenticated
         // AROW header, so a point read does not need a second store lookup.
@@ -23038,6 +24151,14 @@ pub const DB = struct {
                     row_schema.physicalLayout(),
                 );
         } else null;
+        if (verified_principal) |*principal| {
+            const row = ordinal_row orelse return error.RowPolicyCatalogChanged;
+            const bundle = if (self.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
+            var evaluation = try bundle.captureReadEvaluation(alloc, row.table_schema, &principal.value);
+            defer evaluation.deinit();
+            if (!try evaluation.permits(row)) return null;
+            try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        }
         if (!internal_keys.isInternalUserKey(key)) {
             const ttl_duration_ns = if (schema_view) |view| view.visibilityTtlDurationNs() else 0;
             if (ttl_duration_ns != 0) {
@@ -23093,6 +24214,7 @@ pub const DB = struct {
                 } else 0;
             }
         }
+        try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return .{ .json = stored, .version = version, .expected_content_digest = digest };
     }
 
@@ -23117,11 +24239,11 @@ pub const DB = struct {
             if (view.version() != progress.schema_version or !std.mem.eql(u8, &progress.generation_set, &activation.generationSet(bindings))) return error.ConstraintRetirementChanged;
             var fields = std.ArrayList([]const u8).empty;
             var selected = std.StringHashMapUnmanaged(void).empty;
-            if (public_schema.unique_constraints) |definitions| for (definitions.value) |definition| {
+            for (try public_schema.relationalUniqueDefinitions(owned)) |definition| {
                 const binding = bindings.find(.unique, definition.name) orelse return error.IntegrityCatalogChanged;
                 if (progress.phase != .unique or !progress.includes(binding.generation)) continue;
-                for (definition.columns) |column| if (!(try selected.getOrPut(owned, column)).found_existing) try fields.append(owned, column);
-            };
+                for (try @import("../../schema/relational_declarations.zig").uniqueFields(owned, view.tableSchema().*, view.physicalLayout(), definition)) |column| if (!(try selected.getOrPut(owned, column)).found_existing) try fields.append(owned, column);
+            }
             if (public_schema.foreign_keys) |definitions| for (definitions.value) |definition| {
                 const binding = bindings.find(.foreign_key, definition.name) orelse return error.IntegrityCatalogChanged;
                 if (progress.phase != .foreign_keys or !progress.includes(binding.generation)) continue;
@@ -23206,7 +24328,14 @@ pub const DB = struct {
             const foreign_count = if (public_schema.foreign_keys) |values| values.value.len else 0;
             const per_row = @max(@as(usize, 1), @max(unique_count, foreign_count));
             const declaration_limit = @max(@as(usize, 1), @import("relational_integrity.zig").max_commands / (2 * per_row));
-            var page = (try activation.Page.prepare(alloc, self.backend_runtime.io(), self.core, .{ .rows = @min(request.value.max_rows, declaration_limit), .output_bytes = 1024 * 1024 })) orelse return null;
+            // Activation pages commit through distributed 2PC. A bounded
+            // 100 ms source scan amortizes that commit without changing the
+            // reusable reader's caller-specified budget or its row/byte caps.
+            var page = (try activation.Page.prepare(alloc, self.backend_runtime.io(), self.core, .{
+                .rows = @min(request.value.max_rows, declaration_limit),
+                .output_bytes = 1024 * 1024,
+                .time_ns = 100 * std.time.ns_per_ms,
+            })) orelse return null;
             defer page.deinit();
             if (page.progress.schema_version != view.version()) return error.PreparedGenerationChanged;
             const Row = struct { key: []const u8, json: []const u8, version: u64, expected_content_digest: ?[32]u8 };
@@ -23271,8 +24400,13 @@ pub const DB = struct {
     }
 
     pub fn getTimestamp(self: *DB, alloc: Allocator, key: []const u8) !u64 {
+        try self.maybeFinalizePendingRowPolicyPublication();
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
         if (internal_keys.isInternalUserKey(key)) return 0;
-        return try self.core.readTimestamp(alloc, key);
+        const timestamp = try self.core.readTimestamp(alloc, key);
+        try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        return timestamp;
     }
 
     pub fn updateRange(self: *DB, byte_range: types.ByteRange) !void {
@@ -23845,6 +24979,7 @@ pub const DB = struct {
     }
 
     fn requireSupportedRelationalTopology(self: *DB) !void {
+        if (self.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyTopologyUnsupported;
         var view = self.core.acquireSchemaView();
         defer if (view) |*pinned| pinned.release();
         // Initial physical transfer understands routed integrity records, but
@@ -23916,6 +25051,8 @@ pub const DB = struct {
     }
 
     pub fn snapshot(self: *DB, id: []const u8) !u64 {
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         return try self.snapshotInternal(id, false, .none, null, null, false);
     }
 
@@ -23959,6 +25096,8 @@ pub const DB = struct {
     /// holding HA state/control traffic forever.
     /// The deadline is in this DB's BackendRuntime.monotonicClock domain.
     pub fn snapshotHASeed(self: *DB, id: []const u8, maintenance_deadline_ns: u64) !u64 {
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         return try self.snapshotInternal(id, false, .none, maintenance_deadline_ns, null, false);
     }
 
@@ -23969,12 +25108,16 @@ pub const DB = struct {
     }
 
     pub fn snapshotNativeWithCancellation(self: *DB, id: []const u8, cancellation: types.CancellationToken) !u64 {
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         return try self.snapshotInternal(id, true, cancellation, null, null, false);
     }
 
     /// Cohort capture verifies the exact durable owner fence and drained
     /// participant set under the same apply lock that pins the native root.
     pub fn snapshotRelationalCohort(self: *DB, id: []const u8, expected: @import("relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) !u64 {
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         if (expected.role != .backup_snapshot) return error.InvalidIntegrityTopologyFence;
         return try self.snapshotInternal(id, true, cancellation, null, expected, false);
     }
@@ -23982,6 +25125,8 @@ pub const DB = struct {
     /// Seal an exact common-cut owner generation durably. No corpus copy or
     /// hashing is performed while the write fence is held.
     pub fn sealBackupCohort(self: *DB, id: []const u8, expected: @import("relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) !@import("native_backup_seal.zig").Handle {
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         try validateSnapshotId(id);
         if (expected.role != .backup_snapshot or !expected.namespace.eql(self.core.identity_namespace)) return error.InvalidTopologyFence;
         const seal = @import("native_backup_seal.zig");
@@ -23995,6 +25140,10 @@ pub const DB = struct {
     }
 
     pub fn exportBackupCohort(self: *DB, handle: @import("native_backup_seal.zig").Handle, id: []const u8, cancellation: types.CancellationToken) !u64 {
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
+        const checkpoint: RowPolicyOutputCheckpoint = .{ .upstream = cancellation, .lease = &row_policy_lease };
+        const output_cancellation = checkpoint.token();
         if (!handle.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         try validateSnapshotId(id);
         try lockAtomicWithCancellation(&self.snapshot_publication_mutex, cancellation);
@@ -24013,13 +25162,18 @@ pub const DB = struct {
         try fs_paths.createDirPathPortable(io, parent);
         const target = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ parent, id });
         defer self.alloc.free(target);
-        if (try snapshotPathExists(io, target)) return seal.exportedBytes(self.alloc, io, target, handle);
+        if (try snapshotPathExists(io, target)) {
+            const bytes = try seal.exportedBytes(self.alloc, io, target, handle);
+            try output_cancellation.check();
+            return bytes;
+        }
         const staging = try createSnapshotStagingRoot(self.alloc, io, parent, id);
         defer self.alloc.free(staging);
         var published = false;
         defer if (!published) std.Io.Dir.cwd().deleteTree(io, staging) catch {};
-        const total = try seal.exportTo(self.alloc, io, root, handle, staging, cancellation);
+        const total = try seal.exportTo(self.alloc, io, root, handle, staging, output_cancellation);
         try seal.recordExport(self.alloc, io, staging, handle, total);
+        try output_cancellation.check();
         try publishSnapshotStaging(io, parent, staging, target);
         published = true;
         return total;
@@ -24028,6 +25182,15 @@ pub const DB = struct {
     /// Portable logical rows from the identical immutable cut used by native
     /// cohorts. The live root may already have resumed writes at this point.
     pub fn exportBackupCohortPortable(self: *DB, handle: @import("native_backup_seal.zig").Handle, writer: *std.Io.Writer, options: portable_backup.ExportOptions, cancellation: types.CancellationToken) !void {
+        if (options.source_generation_summary_output) |summary| summary.output.* = null;
+        errdefer if (options.source_generation_summary_output) |summary| if (summary.output.*) |entries| {
+            portable_backup.freeSourceGenerationAdmissionSummary(summary.alloc, entries);
+            summary.output.* = null;
+        };
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
+        const checkpoint: RowPolicyOutputCheckpoint = .{ .upstream = cancellation, .lease = &row_policy_lease };
+        const output_cancellation = checkpoint.token();
         if (options.source_certificate) |certificate| certificate.output.* = null;
         errdefer if (options.source_certificate) |certificate| {
             certificate.output.* = null;
@@ -24054,7 +25217,7 @@ pub const DB = struct {
             if (stat.inode != file.inode or stat.size != file.size or stat.mtime.toNanoseconds() != file.mtime_ns) return error.BackupSealSourceChanged;
         }
         var export_options = options;
-        export_options.cancellation = cancellation;
+        export_options.cancellation = output_cancellation;
         export_options.cohort = .{ .seal = handle, .namespace = handle.fence.namespace };
         if (std.mem.eql(u8, opened.parsed.value.primary.artifact_format, "antfly-lsm-checkpoint")) {
             const primary = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ root, db_core.primary_lsm_checkpoint_directory_name });
@@ -24078,7 +25241,7 @@ pub const DB = struct {
             _ = try db_core.importStoreSnapshotWithIo(self.alloc, io, &store, root, cancellation);
             try portable_backup.exportPortableToWriterWithOptions(self.alloc, &store, writer, export_options);
         } else return error.UnsupportedBackupFormat;
-        try cancellation.check();
+        try output_cancellation.check();
     }
 
     /// Tombstone before unlink: retries after a crash finish bounded inventory
@@ -26338,6 +27501,9 @@ pub const DB = struct {
     }
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         var schedule_ha_recovery_on_exit = false;
         defer if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
         var prepared_recovery = if (self.transaction_recovery_identity_context != null)
@@ -26383,6 +27549,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         try self.enforceVectorMigrationConfigurationGate();
         const reconciled_row_count = try self.validateStorageModeCompatibilityLocked(table_schema);
         if (durable_ha_schema_outbox_key != null) self.durable_ha_outbox_maybe.store(true, .release);
@@ -26624,6 +27791,393 @@ pub const DB = struct {
     }
 
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        return self.setSchemaJsonMode(alloc, schema_json, null);
+    }
+
+    pub const PublishedChildSchema = struct {
+        fence: @import("relational_integrity_topology_contract.zig").Fence,
+        before_schema_json_digest: [32]u8,
+        schema_json_digest: [32]u8,
+        before_catalog_digest: [32]u8,
+        after_catalog_digest: [32]u8,
+        raft_entry: RaftAppliedEntryIdentity,
+    };
+
+    pub const InitialHiddenChild = struct {
+        fence: @import("relational_integrity_topology_contract.zig").Fence,
+        child_table_name: []const u8,
+        plan_id: [16]u8,
+        plan_digest: [32]u8,
+        schema_digest: [32]u8,
+        public_schema_json_digest: [32]u8,
+        catalog_digest: [32]u8,
+        raft_entry: RaftAppliedEntryIdentity,
+        native: bool = false,
+    };
+
+    /// Fresh, unroutable FK child owners receive their candidate schema only
+    /// after a durable metadata decision. The hidden record and schema share
+    /// one write; Raft owners also persist the Raft marker, while native
+    /// owners use the record itself as their exact durable operation receipt.
+    pub fn provisionInitialHiddenChild(self: *DB, schema_json: []const u8, input: InitialHiddenChild, ha_lsn: ?u64, ha_payload: ?[]const u8) !void {
+        const hidden = @import("relational_initial_child_publication.zig");
+        if (self.initial_child_bootstrap) |bootstrap| {
+            if (!std.mem.eql(u8, &bootstrap.plan_id, &input.plan_id) or
+                !std.mem.eql(u8, &bootstrap.plan_digest, &input.plan_digest) or
+                !bootstrap.namespace.eql(input.fence.namespace) or
+                !std.mem.eql(u8, &bootstrap.schema_digest, &input.schema_digest) or
+                !std.mem.eql(u8, &bootstrap.public_schema_json_digest, &input.public_schema_json_digest) or
+                !std.mem.eql(u8, &bootstrap.catalog_digest, &input.catalog_digest)) return error.InitialChildPublicationChanged;
+        }
+        if (input.fence.role != .child_generation_source or
+            !input.fence.namespace.eql(self.core.identity_namespace) or
+            input.child_table_name.len == 0 or input.child_table_name.len > 256 or
+            !std.unicode.utf8ValidateSlice(input.child_table_name) or
+            std.mem.allEqual(u8, &input.plan_id, 0) or std.mem.allEqual(u8, &input.plan_digest, 0) or
+            (ha_lsn != null and ha_payload != null))
+            return error.InvalidInitialChildPublication;
+        const replay = if (input.native)
+            try self.core.getStoreValue(self.alloc, hidden.key)
+        else if (try self.raftEntryAlreadyApplied(input.raft_entry))
+            (try self.core.getStoreValue(self.alloc, hidden.key)) orelse return error.InitialChildPublicationChanged
+        else
+            null;
+        if (replay) |raw| {
+            defer self.alloc.free(raw);
+            const prior = try hidden.Record.decode(raw);
+            if (!std.mem.eql(u8, &prior.plan_id, &input.plan_id) or
+                !std.mem.eql(u8, &prior.plan_digest, &input.plan_digest) or
+                !prior.namespace.eql(input.fence.namespace) or
+                !std.mem.eql(u8, &prior.schema_digest, &input.schema_digest) or
+                !std.mem.eql(u8, &prior.public_schema_json_digest, &input.public_schema_json_digest) or
+                !std.mem.eql(u8, &prior.catalog_digest, &input.catalog_digest) or
+                prior.provision_term != input.raft_entry.term or prior.provision_index != input.raft_entry.index)
+                return error.InitialChildPublicationChanged;
+            if (ha_lsn) |lsn| try self.markHAReplicationRecordApplied(lsn);
+            return;
+        }
+        var public_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(schema_json, &public_digest, .{});
+        if (!std.mem.eql(u8, &public_digest, &input.public_schema_json_digest)) return error.InvalidInitialChildPublication;
+        var parsed = try public_table_schema.parseValidatedTableSchema(self.alloc, schema_json);
+        defer parsed.deinit(self.alloc);
+        if (parsed.storage_mode != .relational) return error.InvalidInitialChildPublication;
+        const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(self.alloc, parsed);
+        defer schema_mod.freeSchema(self.alloc, runtime_schema);
+        const versioned_key = try public_table_schema.versionedSchemaKeyAlloc(self.alloc, runtime_schema.version);
+        defer self.alloc.free(versioned_key);
+        const schema_writes = [_]docstore_mod.KVPair{
+            .{ .key = public_schema_json_key, .value = schema_json },
+            .{ .key = versioned_key, .value = schema_json },
+        };
+        var candidate = try self.core.prepareSchemaMetadataPublishedChild(runtime_schema, &schema_writes);
+        defer candidate.deinit();
+        const aic = candidate.integrity_catalog orelse return error.IntegrityCatalogChanged;
+        var catalog_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(aic.value, &catalog_digest, .{});
+        if (!std.mem.eql(u8, &catalog_digest, &input.catalog_digest) or
+            !std.mem.eql(u8, &aic.catalog.schema_digest, &input.schema_digest)) return error.IntegrityCatalogChanged;
+        const record: hidden.Record = .{
+            .phase = .hidden,
+            .plan_id = input.plan_id,
+            .plan_digest = input.plan_digest,
+            .namespace = input.fence.namespace,
+            .schema_version = runtime_schema.version,
+            .row_count = 0,
+            .schema_digest = input.schema_digest,
+            .public_schema_json_digest = input.public_schema_json_digest,
+            .catalog_digest = input.catalog_digest,
+            .provision_term = input.raft_entry.term,
+            .provision_index = input.raft_entry.index,
+        };
+        const encoded_record = try record.encode();
+        var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+        const marker = raftAppliedEntryWrite(input.raft_entry, &marker_buf);
+        // Self-referential parents share these hidden child owners. Install
+        // their accepted generation scopes in the same durable transaction as
+        // the initial schema and hidden gate, before any release can route a
+        // row. External-parent scopes use the separate parent protocol.
+        const admission = @import("relational_integrity_generation_admission.zig");
+        const fks = try parsed.relationalForeignKeyDefinitions(self.alloc);
+        defer if (fks.len > 0) self.alloc.free(fks);
+        var self_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer self_arena.deinit();
+        const self_alloc = self_arena.allocator();
+        var writes = try self.alloc.alloc(docstore_mod.KVPair, 6 + fks.len);
+        defer self.alloc.free(writes);
+        var write_count: usize = if (input.native) 3 else 4;
+        writes[0] = schema_writes[0];
+        writes[1] = schema_writes[1];
+        writes[2] = .{ .key = hidden.key, .value = &encoded_record };
+        if (!input.native) writes[3] = marker;
+        for (fks) |fk| {
+            if (!std.mem.eql(u8, fk.parent_table, input.child_table_name)) continue;
+            const binding = aic.catalog.find(.foreign_key, fk.name) orelse return error.IntegrityCatalogChanged;
+            const scope_key = try admission.scopeKey(input.child_table_name, fk.name);
+            const key = try self_alloc.dupe(u8, &scope_key);
+            const scope: admission.Scope = .{
+                .child_table_id = input.fence.namespace.table_id,
+                .child_table_name = input.child_table_name,
+                .constraint_name = fk.name,
+                .revision = 1,
+                .phase = .active,
+                .active_generation = binding.generation,
+                .plan_id = input.plan_id,
+                .decision_digest = input.plan_digest,
+            };
+            writes[write_count] = .{ .key = key, .value = try scope.encode(self_alloc) };
+            write_count += 1;
+        }
+        var ha_lsn_buffer: [ha_applied_lsn_value_len]u8 = undefined;
+        if (ha_lsn) |lsn| {
+            writes[write_count] = haAppliedReplicationLsnWrite(lsn, &ha_lsn_buffer);
+            write_count += 1;
+        }
+        const ha_outbox = if (ha_payload) |payload| blk: {
+            const mirror = self.ha_async_batch_mirror orelse return error.HAMirrorUnavailable;
+            const from_lsn = mirror.primary.nextLsn();
+            const encoded = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, payload);
+            const key = try durableHAOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, payload);
+            break :blk .{ .key = key, .value = encoded };
+        } else null;
+        defer if (ha_outbox) |outbox| {
+            self.alloc.free(outbox.key);
+            self.alloc.free(outbox.value);
+        };
+        if (ha_outbox) |outbox| {
+            writes[write_count] = .{ .key = outbox.key, .value = outbox.value };
+            write_count += 1;
+        }
+        var prepared = try self.core.prepareSchemaMetadataPublishedChild(runtime_schema, writes[0..write_count]);
+        defer prepared.deinit();
+        var prepared_recovery = if (self.transaction_recovery_identity_context != null)
+            try db_core.PreparedRecoveryRelationalState.init(self.runtime_alloc, runtime_schema.relational_columns, runtime_schema.version)
+        else
+            null;
+        defer if (prepared_recovery) |*state| state.deinit();
+        var mutation = self.core.snapshot_admission.acquireMutation();
+        defer mutation.release();
+        try self.lockApplyForPortableRuntime();
+        var apply_held = true;
+        errdefer if (apply_held) self.core.unlockApply();
+        if (!input.native) switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), input.raft_entry)) {
+            .already_applied => {
+                self.core.unlockApply();
+                apply_held = false;
+                return;
+            },
+            .apply => {},
+        };
+        if (try self.core.getStoreValue(self.alloc, public_schema_json_key)) |prior_schema| {
+            self.alloc.free(prior_schema);
+            return error.InitialChildPublicationChanged;
+        }
+        if (try self.core.getStoreValue(self.alloc, @import("relational_integrity_catalog.zig").key)) |prior_catalog| {
+            self.alloc.free(prior_catalog);
+            return error.InitialChildPublicationChanged;
+        }
+        if (try self.core.getStoreValue(self.alloc, hidden.key)) |prior_hidden| {
+            defer self.alloc.free(prior_hidden);
+            if (!input.native) return error.InitialChildPublicationChanged;
+            // A second local supervisor may have won the commit after our
+            // optimistic replay probe. The hidden record is the native
+            // operation receipt; acknowledge only its exact immutable plan
+            // and provision ordinal while still under the apply lock.
+            const prior = try hidden.Record.decode(prior_hidden);
+            if (!std.mem.eql(u8, &prior.plan_id, &input.plan_id) or
+                !std.mem.eql(u8, &prior.plan_digest, &input.plan_digest) or
+                !prior.namespace.eql(input.fence.namespace) or
+                !std.mem.eql(u8, &prior.schema_digest, &input.schema_digest) or
+                !std.mem.eql(u8, &prior.public_schema_json_digest, &input.public_schema_json_digest) or
+                !std.mem.eql(u8, &prior.catalog_digest, &input.catalog_digest) or
+                prior.provision_term != input.raft_entry.term or prior.provision_index != input.raft_entry.index)
+                return error.InitialChildPublicationChanged;
+            self.core.unlockApply();
+            apply_held = false;
+            return;
+        }
+        const row_count = try self.validateStorageModeCompatibilityLocked(runtime_schema);
+        if (row_count != null and row_count.? != 0) return error.InitialChildPublicationChanged;
+        _ = try self.core.commitPreparedSchemaMetadata(&prepared, writes[0..write_count], &.{}, row_count);
+        if (ha_outbox != null) self.durable_ha_outbox_maybe.store(true, .release);
+        self.initial_child_hidden.store(true, .release);
+        self.publishRelationalRuntimeModePrepared(if (prepared_recovery) |*state| state else null);
+        self.core.unlockApply();
+        apply_held = false;
+        self.reconcilePublishedSchemaIndexes(runtime_schema.version);
+    }
+
+    fn applyInitialChildPhase(self: *DB, fence: @import("relational_integrity_topology_contract.zig").Fence, control: @import("relational_integrity_topology_contract.zig").InitialChildControl, phase: @import("relational_initial_child_publication.zig").Phase, entry: RaftAppliedEntryIdentity, native: bool, ha_lsn: ?u64, ha_payload: ?[]const u8) !void {
+        const hidden = @import("relational_initial_child_publication.zig");
+        if (fence.role != .child_generation_source or !fence.namespace.eql(self.core.identity_namespace) or
+            std.mem.allEqual(u8, &control.plan_id, 0) or std.mem.allEqual(u8, &control.plan_digest, 0) or
+            !std.mem.eql(u8, &control.catalog_digest, &fence.catalog_digest) or
+            phase == .hidden or (ha_lsn != null and ha_payload != null)) return error.InvalidInitialChildPublication;
+        const replay = if (native)
+            try self.core.getStoreValue(self.alloc, hidden.key)
+        else if (try self.raftEntryAlreadyApplied(entry))
+            (try self.core.getStoreValue(self.alloc, hidden.key)) orelse return error.InitialChildPublicationChanged
+        else
+            null;
+        if (replay) |raw| {
+            defer self.alloc.free(raw);
+            const prior = try hidden.Record.decode(raw);
+            if (!std.mem.eql(u8, &prior.plan_id, &control.plan_id) or
+                !std.mem.eql(u8, &prior.plan_digest, &control.plan_digest) or
+                !prior.namespace.eql(fence.namespace) or prior.schema_version != control.schema_version or
+                !std.mem.eql(u8, &prior.schema_digest, &control.schema_digest) or
+                !std.mem.eql(u8, &prior.public_schema_json_digest, &control.public_schema_json_digest) or
+                !std.mem.eql(u8, &prior.catalog_digest, &control.catalog_digest))
+                return error.InitialChildPublicationChanged;
+            if (prior.phase == phase) {
+                if (prior.phase_term != entry.term or prior.phase_index != entry.index) return error.InitialChildPublicationChanged;
+                if (ha_lsn) |lsn| try self.markHAReplicationRecordApplied(lsn);
+                return;
+            }
+            if (!native or prior.phase != .hidden) return error.InitialChildPublicationChanged;
+        }
+        var mutation = self.core.snapshot_admission.acquireMutation();
+        defer mutation.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (!native) switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry)) {
+            .already_applied => return,
+            .apply => {},
+        };
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        const before = try hidden.load(&txn);
+        if (before == null and phase == .canceled) {
+            const canceled: hidden.Record = .{
+                .phase = .canceled,
+                .plan_id = control.plan_id,
+                .plan_digest = control.plan_digest,
+                .namespace = fence.namespace,
+                .schema_version = control.schema_version,
+                .row_count = 0,
+                .schema_digest = control.schema_digest,
+                .public_schema_json_digest = control.public_schema_json_digest,
+                .catalog_digest = control.catalog_digest,
+                .provision_term = 0,
+                .provision_index = 0,
+                .phase_term = entry.term,
+                .phase_index = entry.index,
+            };
+            _ = try hidden.stageUnprovisionedCancel(&txn, canceled);
+            if (!native) {
+                var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+                const marker = raftAppliedEntryWrite(entry, &marker_buf);
+                try txn.put(marker.key, marker.value);
+            }
+            if (ha_lsn) |lsn| {
+                var lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
+                const lsn_marker = haAppliedReplicationLsnWrite(lsn, &lsn_buf);
+                try txn.put(lsn_marker.key, lsn_marker.value);
+            }
+            try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+            try txn.commit();
+            self.initial_child_hidden.store(true, .release);
+            return;
+        }
+        const current = before orelse return error.InitialChildPublicationMissing;
+        if (!current.namespace.eql(fence.namespace) or
+            !std.mem.eql(u8, &current.catalog_digest, &fence.catalog_digest) or
+            !std.mem.eql(u8, &current.plan_id, &control.plan_id) or
+            !std.mem.eql(u8, &current.plan_digest, &control.plan_digest) or
+            current.schema_version != control.schema_version or
+            !std.mem.eql(u8, &current.schema_digest, &control.schema_digest) or
+            !std.mem.eql(u8, &current.public_schema_json_digest, &control.public_schema_json_digest)) return error.InitialChildPublicationChanged;
+        if (native and current.phase == phase) {
+            if (current.phase_term != entry.term or current.phase_index != entry.index) return error.InitialChildPublicationChanged;
+            return;
+        }
+        if (native and current.phase != .hidden) return error.InitialChildPublicationChanged;
+        if (current.provision_term == 0) {
+            if (phase != .canceled) return error.InitialChildPublicationChanged;
+            if (!native) {
+                var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+                const marker = raftAppliedEntryWrite(entry, &marker_buf);
+                try txn.put(marker.key, marker.value);
+            }
+            if (ha_lsn) |lsn| {
+                var lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
+                const lsn_marker = haAppliedReplicationLsnWrite(lsn, &lsn_buf);
+                try txn.put(lsn_marker.key, lsn_marker.value);
+            }
+            try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+            try txn.commit();
+            return;
+        }
+        const stored_catalog = txn.get(@import("relational_integrity_catalog.zig").key) catch return error.IntegrityCatalogChanged;
+        var catalog_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(stored_catalog, &catalog_digest, .{});
+        if (!std.mem.eql(u8, &catalog_digest, &current.catalog_digest)) return error.IntegrityCatalogChanged;
+        const stored_schema = txn.get(public_schema_json_key) catch return error.IntegrityCatalogChanged;
+        var schema_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(stored_schema, &schema_digest, .{});
+        if (!std.mem.eql(u8, &schema_digest, &current.public_schema_json_digest)) return error.IntegrityCatalogChanged;
+        if (phase == .released) {
+            var parsed_schema = try public_table_schema.parseValidatedTableSchema(self.alloc, stored_schema);
+            defer parsed_schema.deinit(self.alloc);
+            var parsed_catalog = try @import("relational_integrity_catalog.zig").decode(self.alloc, stored_catalog);
+            defer parsed_catalog.deinit();
+            const fks = try parsed_schema.relationalForeignKeyDefinitions(self.alloc);
+            defer if (fks.len > 0) self.alloc.free(fks);
+            for (fks) |fk| {
+                // Physical table identity is hash-derived by metadata. Match
+                // the hidden child without relying on a public route, then
+                // require its own accepted parent generation to be durable.
+                if (!std.mem.startsWith(u8, fk.parent_table, "table:")) continue;
+                const physical_id = std.hash.Wyhash.hash(0x54424c45, fk.parent_table);
+                if ((if (physical_id == 0) @as(u64, 1) else physical_id) != current.namespace.table_id) continue;
+                const scope = (try @import("relational_integrity_generation_admission.zig").load(&txn, fk.parent_table, fk.name)) orelse return error.InitialChildPublicationChanged;
+                const binding = parsed_catalog.find(.foreign_key, fk.name) orelse return error.IntegrityCatalogChanged;
+                if (scope.phase != .active or scope.active_generation == null or
+                    !std.mem.eql(u8, &scope.active_generation.?, &binding.generation) or
+                    !std.mem.eql(u8, &scope.plan_id, &current.plan_id) or
+                    !std.mem.eql(u8, &scope.decision_digest, &current.plan_digest))
+                    return error.InitialChildPublicationChanged;
+            }
+        }
+        const table_raw = txn.get(@import("table_catalog.zig").key) catch return error.InitialChildPublicationChanged;
+        if ((try @import("table_catalog.zig").Catalog.decode(table_raw)).row_count != 0) return error.InitialChildPublicationChanged;
+        _ = try hidden.stagePhase(&txn, current, phase, entry.term, entry.index);
+        if (!native) {
+            var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+            const marker = raftAppliedEntryWrite(entry, &marker_buf);
+            try txn.put(marker.key, marker.value);
+        }
+        if (ha_lsn) |lsn| {
+            var lsn_buf: [ha_applied_lsn_value_len]u8 = undefined;
+            const lsn_marker = haAppliedReplicationLsnWrite(lsn, &lsn_buf);
+            try txn.put(lsn_marker.key, lsn_marker.value);
+        }
+        try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+        try txn.commit();
+        if (phase == .released) self.initial_child_hidden.store(false, .release);
+    }
+
+    /// Called only by the private child-owner publication control after its
+    /// direct metadata read-index decision. The schema, integrity catalog,
+    /// Raft marker and source-fence release commit atomically.
+    pub fn installPublishedChildSchema(self: *DB, alloc: Allocator, schema_json: []const u8, publication: PublishedChildSchema) !void {
+        if ((publication.fence.role != .child_generation_source and publication.fence.role != .child_generation_dual) or
+            !publication.fence.namespace.eql(self.core.identity_namespace)) return error.InvalidIntegrityTopologyFence;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(schema_json, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &publication.schema_json_digest)) return error.InvalidGenerationPublication;
+        // The exact Raft entry may be replayed after the accepted catalog has
+        // already advanced. Check its durable marker before re-preparing the
+        // old→new catalog comparison; the apply-locked check below still
+        // closes the race with another entry.
+        if (try self.raftEntryAlreadyApplied(publication.raft_entry)) return;
+        return self.setSchemaJsonMode(alloc, schema_json, publication);
+    }
+
+    fn setSchemaJsonMode(self: *DB, alloc: Allocator, schema_json: []const u8, publication: ?PublishedChildSchema) !void {
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         var schedule_ha_recovery_on_exit = false;
         defer if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
         _ = alloc;
@@ -26646,11 +28200,28 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.ensureDurableHAStartupBarrier();
         try self.preflightHAMetadataSyncCommit();
-        const durable_ha_schema_payload = if (self.ha_async_metadata_mirror) |mirror|
-            if (haMirrorRequiresDurableOutbox(mirror)) try ha_effects_mod.encodeSchemaMetadataMutationAlloc(self.alloc, runtime_schema, schema_json) else null
+        const ha_schema_payload = if (self.ha_async_metadata_mirror) |mirror|
+            if (publication) |published|
+                try ha_effects_mod.encodePublishedChildSchemaMetadataMutationAlloc(self.alloc, runtime_schema, schema_json, .{
+                    .fence = published.fence,
+                    .before_schema_json_digest = published.before_schema_json_digest,
+                    .schema_json_digest = published.schema_json_digest,
+                    .before_catalog_digest = published.before_catalog_digest,
+                    .after_catalog_digest = published.after_catalog_digest,
+                    .applied_term = published.raft_entry.term,
+                    .applied_index = published.raft_entry.index,
+                })
+            else if (haMirrorRequiresDurableOutbox(mirror))
+                try ha_effects_mod.encodeSchemaMetadataMutationAlloc(self.alloc, runtime_schema, schema_json)
+            else
+                null
         else
             null;
-        defer if (durable_ha_schema_payload) |payload| self.alloc.free(payload);
+        defer if (ha_schema_payload) |payload| self.alloc.free(payload);
+        const durable_ha_schema_payload = if (self.ha_async_metadata_mirror) |mirror|
+            if (haMirrorRequiresDurableOutbox(mirror)) ha_schema_payload else null
+        else
+            null;
         const durable_ha_schema_lsn = if (durable_ha_schema_payload != null)
             self.ha_async_metadata_mirror.?.primary.nextLsn()
         else
@@ -26667,7 +28238,7 @@ pub const DB = struct {
         defer if (durable_ha_schema_outbox_key) |key| self.alloc.free(key);
         const versioned_public_key = try public_table_schema.versionedSchemaKeyAlloc(self.alloc, runtime_schema.version);
         defer self.alloc.free(versioned_public_key);
-        var schema_metadata_writes: [3]docstore_mod.KVPair = undefined;
+        var schema_metadata_writes: [5]docstore_mod.KVPair = undefined;
         var schema_metadata_write_count: usize = 2;
         schema_metadata_writes[0] = .{ .key = public_schema_json_key, .value = schema_json };
         schema_metadata_writes[1] = .{ .key = versioned_public_key, .value = schema_json };
@@ -26675,22 +28246,68 @@ pub const DB = struct {
             schema_metadata_writes[2] = .{ .key = durable_ha_schema_outbox_key.?, .value = outbox };
             schema_metadata_write_count = 3;
         }
-        var prepared_schema = try self.core.prepareSchemaMetadata(
-            runtime_schema,
-            schema_metadata_writes[0..schema_metadata_write_count],
-        );
+        var raft_marker_buffer: [raft_applied_entry_value_len]u8 = undefined;
+        var source_receipt_buffer: [48]u8 = undefined;
+        if (publication) |published| {
+            const marker = raftAppliedEntryWrite(published.raft_entry, &raft_marker_buffer);
+            schema_metadata_writes[schema_metadata_write_count] = marker;
+            schema_metadata_write_count += 1;
+            const admission = @import("relational_integrity_generation_admission.zig");
+            const digest = try admission.sourceInstallDigest(published.fence, published.before_schema_json_digest, published.schema_json_digest, published.before_catalog_digest, published.after_catalog_digest);
+            source_receipt_buffer = (admission.AppliedReceipt{ .digest = digest, .term = published.raft_entry.term, .index = published.raft_entry.index }).encode();
+            schema_metadata_writes[schema_metadata_write_count] = .{ .key = admission.source_install_receipt_key, .value = &source_receipt_buffer };
+            schema_metadata_write_count += 1;
+        }
+        var prepared_schema = if (publication != null)
+            try self.core.prepareSchemaMetadataPublishedChild(runtime_schema, schema_metadata_writes[0..schema_metadata_write_count])
+        else
+            try self.core.prepareSchemaMetadata(runtime_schema, schema_metadata_writes[0..schema_metadata_write_count]);
         defer prepared_schema.deinit();
+        if (publication) |published| {
+            const current_catalog = (try self.core.getStoreValue(self.alloc, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
+            defer self.alloc.free(current_catalog);
+            var before_digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(current_catalog, &before_digest, .{});
+            var after_digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash((prepared_schema.integrity_catalog orelse return error.IntegrityCatalogChanged).value, &after_digest, .{});
+            if (!std.mem.eql(u8, &before_digest, &published.before_catalog_digest) or
+                !std.mem.eql(u8, &after_digest, &published.after_catalog_digest)) return error.IntegrityCatalogChanged;
+        }
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
+        if (publication) |published| switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), published.raft_entry)) {
+            .already_applied => {
+                self.core.unlockApply();
+                apply_held = false;
+                return;
+            },
+            .apply => {},
+        };
+        if (publication) |published| {
+            const existing_schema = (try self.core.getStoreValue(self.alloc, public_schema_json_key)) orelse return error.IntegrityCatalogChanged;
+            defer self.alloc.free(existing_schema);
+            var before_schema_digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(existing_schema, &before_schema_digest, .{});
+            if (!std.mem.eql(u8, &before_schema_digest, &published.before_schema_json_digest)) return error.IntegrityCatalogChanged;
+        }
         const reconciled_row_count = try self.validateStorageModeCompatibilityLocked(runtime_schema);
         if (durable_ha_schema_outbox_key != null) self.durable_ha_outbox_maybe.store(true, .release);
-        _ = try self.core.commitPreparedSchemaMetadata(
-            &prepared_schema,
-            schema_metadata_writes[0..schema_metadata_write_count],
-            &.{},
-            reconciled_row_count,
-        );
+        _ = if (publication) |published|
+            try self.core.commitPreparedSchemaMetadataPublishedChild(
+                &prepared_schema,
+                schema_metadata_writes[0..schema_metadata_write_count],
+                &.{},
+                reconciled_row_count,
+                published.fence,
+            )
+        else
+            try self.core.commitPreparedSchemaMetadata(
+                &prepared_schema,
+                schema_metadata_writes[0..schema_metadata_write_count],
+                &.{},
+                reconciled_row_count,
+            );
         schedule_ha_recovery_on_exit = durable_ha_schema_outbox_key != null;
         self.publishRelationalRuntimeModePrepared(if (prepared_recovery) |*prepared| prepared else null);
 
@@ -26698,7 +28315,7 @@ pub const DB = struct {
         var deferred_ha_gates = HADeferredCommitGates.begin(&ctx);
         defer deferred_ha_gates.releaseTransition();
         var post_commit_error: ?anyerror = null;
-        if (durable_ha_schema_payload) |payload|
+        if (ha_schema_payload) |payload|
             deferred_ha_gates.append(appendHAEncodedSchemaMetadataCommitLockedContext(&ctx, payload) catch |err| blk: {
                 post_commit_error = err;
                 break :blk null;
@@ -26778,11 +28395,14 @@ pub const DB = struct {
         created_at_ns: u64,
         participants: []const []const u8,
     ) !transactions_mod.TxnId {
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (self.restore_staging_required.load(.acquire)) {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
@@ -26822,11 +28442,14 @@ pub const DB = struct {
     }
 
     pub fn beginTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) !transactions_mod.TxnId {
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (self.restore_staging_required.load(.acquire) or scope != null) {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
@@ -26858,6 +28481,7 @@ pub const DB = struct {
     pub fn beginReplicatedTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: RaftAppliedEntryIdentity, scope: ?[32]u8) !transactions_mod.TxnId {
         lockApply(self);
         defer self.core.unlockApply();
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
             .already_applied => return txn_id,
             .apply => {},
@@ -26929,7 +28553,7 @@ pub const DB = struct {
         var view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (view) |*pinned| pinned.release();
         for (intents) |intent| {
-            if (isProtectedIntegrityKey(intent.key)) return error.InvalidIntegrityOperation;
+            if (isProtectedIntegrityKey(intent.key) or isProtectedRangeWriteKey(intent.key)) return error.InvalidIntegrityOperation;
             if (hasCoordinatedConstraints(view) and !isMetadataKey(intent.key)) return error.ForeignKeyCoordinationRequired;
         }
         for (predicates) |predicate| if (isProtectedIntegrityKey(predicate.key)) return error.InvalidIntegrityOperation;
@@ -26937,6 +28561,7 @@ pub const DB = struct {
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(view);
         {
@@ -26948,13 +28573,17 @@ pub const DB = struct {
             try @import("relational_integrity_topology.zig").admitPrepare(&topology_read, &topology_manager, preparation_alloc, txn_id);
         }
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
+        const index_spans = try self.collectIndexSpanReservations(preparation_alloc, prepared_intents, view);
+        defer if (index_spans.len != 0) preparation_alloc.free(index_spans);
         try self.core.writeIntentsExtraBatch(txn_id, prepared_intents, predicates, .{
             .preparation_allocator = preparation_alloc,
             .schema_binding = .{ .version = if (view) |pinned| pinned.version() else null },
+            .index_span_digests = index_spans,
         });
     }
 
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
@@ -26978,13 +28607,36 @@ pub const DB = struct {
         req: types.TransactionIntentRequest,
         raft_entry: ?RaftAppliedEntryIdentity,
     ) !void {
+        if (raft_entry == null) try self.maybeFinalizePendingRowPolicyPublication();
+        var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
+        defer if (verified_principal) |*principal| principal.deinit();
+        var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null;
+        if (req.row_policy_principal_proof.len != 0) {
+            if (req.row_policy_database.len == 0 or req.row_policy_admitted_at_seconds <= 0 or
+                req.restore_staging_scope != null) return error.RowPolicyAuthenticationRequired;
+            const now_seconds: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
+            verified_principal = try self.verifyRowPolicyPrincipal(self.alloc, req.row_policy_principal_proof, req.row_policy_database, .write, if (raft_entry != null) req.row_policy_admitted_at_seconds else now_seconds);
+            row_policy_lease = if (raft_entry != null)
+                try self.row_policy_gate.enterReplicatedPrincipal(&verified_principal.?.value)
+            else
+                try self.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, now_seconds);
+        } else if (req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0) {
+            return error.RowPolicyAuthenticationRequired;
+        } else if (raft_entry == null) {
+            row_policy_lease = try self.row_policy_gate.enterRaw();
+        } else if (self.row_policy_gate.currentPhase() != .disabled and
+            (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0))
+        {
+            return error.RowPolicyAuthenticationRequired;
+        }
+        defer if (row_policy_lease) |*lease| lease.release();
         var preparation: RequestPreparationContext = undefined;
         preparation.init(self);
         defer preparation.deinit();
         const max_prepared_retries = 2;
         var retries: usize = 0;
         while (true) {
-            self.writeTransactionInternalOnce(txn_id, req, raft_entry, preparation.guard.allocator()) catch |err| switch (err) {
+            self.writeTransactionInternalOnce(txn_id, req, raft_entry, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
@@ -27002,6 +28654,8 @@ pub const DB = struct {
         req: types.TransactionIntentRequest,
         raft_entry: ?RaftAppliedEntryIdentity,
         preparation_alloc: Allocator,
+        row_policy_principal: ?*const row_policy_authority_mod.Payload,
+        row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
     ) !void {
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
@@ -27044,14 +28698,15 @@ pub const DB = struct {
         defer predicates.deinit(preparation_alloc);
 
         for (effective_ops.writes) |write| {
-            if (isProtectedIntegrityKey(write.key)) return error.InvalidIntegrityOperation;
+            if (isProtectedIntegrityKey(write.key) or isProtectedRangeWriteKey(write.key)) return error.InvalidIntegrityOperation;
             try intents.append(preparation_alloc, .{
                 .key = write.key,
                 .value = write.value,
+                .json_null_fields = write.json_null_fields,
             });
         }
         for (effective_ops.deletes) |key| {
-            if (isProtectedIntegrityKey(key)) return error.InvalidIntegrityOperation;
+            if (isProtectedIntegrityKey(key) or isProtectedRangeWriteKey(key)) return error.InvalidIntegrityOperation;
             try intents.append(preparation_alloc, .{
                 .key = key,
                 .value = null,
@@ -27066,6 +28721,37 @@ pub const DB = struct {
             });
         }
 
+        // These internal observations address this exact owner's metadata,
+        // never document keyspace. The coordinator routes them by owner fence.
+        const tracking = @import("../range_protection.zig");
+        if (req.range_guards.len > @import("../../api/range_read_guards.zig").max_proofs) return error.TransactionTooLarge;
+        const range_keys = try preparation_alloc.alloc([tracking.counter_prefix.len + 2]u8, req.range_guards.len);
+        defer preparation_alloc.free(range_keys);
+        const index_range_keys = try preparation_alloc.alloc([tracking.index_counter_prefix.len + tracking.index_span_digest_bytes]u8, req.range_guards.len);
+        defer preparation_alloc.free(index_range_keys);
+        const range_values = try preparation_alloc.alloc([8]u8, req.range_guards.len);
+        defer preparation_alloc.free(range_values);
+        var observed_buckets = std.StaticBitSet(tracking.bucket_count).initEmpty();
+        for (req.range_guards, 0..) |guard, i| {
+            tracking.validateProof(guard) catch return error.InvalidBatchRequest;
+            const key: []const u8 = if (guard.index) |span| blk: {
+                index_range_keys[i] = tracking.indexCounterKey(span.digest);
+                break :blk &index_range_keys[i];
+            } else blk: {
+                if (observed_buckets.isSet(guard.bucket)) return error.InvalidBatchRequest;
+                observed_buckets.set(guard.bucket);
+                range_keys[i] = tracking.counterKey(guard.bucket);
+                break :blk &range_keys[i];
+            };
+            if (guard.generation) |generation| std.mem.writeInt(u64, &range_values[i], generation, .little);
+            try predicates.append(preparation_alloc, .{
+                .key = key,
+                .expected_version = 0,
+                .comparison = .exact_value,
+                .expected_value = if (guard.generation != null) &range_values[i] else null,
+            });
+        }
+
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer identity_upsert_keys.deinit(preparation_alloc);
         for (intents.items) |intent| {
@@ -27076,6 +28762,10 @@ pub const DB = struct {
         const binding = try self.core.transactionSchemaBinding(preparation_alloc, txn_id);
         var prepared_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (prepared_schema_view) |*view| view.release();
+        if (req.schema_version) |version| {
+            const view = prepared_schema_view orelse return error.PreparedGenerationChanged;
+            if (view.version() != version) return error.PreparedGenerationChanged;
+        }
         if ((hasCoordinatedConstraints(prepared_schema_view) or req.relational_repair) and
             (req.relational_schema_version == null or req.relational_integrity_generation_set == null) and
             (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0)) return error.ForeignKeyCoordinationRequired;
@@ -27083,6 +28773,55 @@ pub const DB = struct {
             const view = prepared_schema_view orelse return error.InvalidRelationalRowsRequest;
             if (view.storageMode() != .relational) return error.InvalidRelationalRowsRequest;
             if (view.version() != version) return error.PreparedGenerationChanged;
+        }
+        // Exact index-span proofs remain valid only while the observed READY
+        // generation is the current catalog generation. Fence all three
+        // pieces of that state in the same prepare as the span counter.
+        var range_metadata_buffers: std.ArrayList([]u8) = .empty;
+        defer {
+            for (range_metadata_buffers.items) |bytes| preparation_alloc.free(bytes);
+            range_metadata_buffers.deinit(preparation_alloc);
+        }
+        const CaptureMetadata = struct {
+            fn add(alloc: Allocator, buffers: *std.ArrayList([]u8), output: *std.ArrayListUnmanaged(transactions_mod.VersionPredicate), read: anytype, key: []const u8) !void {
+                try buffers.ensureUnusedCapacity(alloc, 2);
+                const owned_key = try alloc.dupe(u8, key);
+                buffers.appendAssumeCapacity(owned_key);
+                const raw = read.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                const value = if (raw) |bytes| try alloc.dupe(u8, bytes) else null;
+                if (value) |bytes| buffers.appendAssumeCapacity(bytes);
+                try output.append(alloc, .{ .key = owned_key, .comparison = .exact_value, .expected_value = value });
+            }
+        };
+        var guarded_indexes: std.AutoHashMapUnmanaged([tracking.index_id_bytes]u8, void) = .empty;
+        defer guarded_indexes.deinit(preparation_alloc);
+        var index_plan: ?@import("relational_index_catalog.zig").WriteSnapshot = null;
+        defer if (index_plan) |*plan| plan.deinit();
+        var index_read: ?docstore_mod.DocStore.Txn = null;
+        defer if (index_read) |*read| read.abort();
+        for (req.range_guards) |guard| {
+            const span = guard.index orelse continue;
+            const seen = try guarded_indexes.getOrPut(preparation_alloc, span.id);
+            if (seen.found_existing) continue;
+            if (index_plan == null) {
+                index_plan = self.core.relational_indexes.acquire() orelse return error.PreparedGenerationChanged;
+                index_read = try self.core.store.beginProbeTxn();
+                const head_raw = try index_read.?.get(@import("relational_index_catalog.zig").head_key);
+                if (!(try @import("relational_index_catalog.zig").Head.decode(head_raw)).eql(index_plan.?.head)) return error.PreparedGenerationChanged;
+                try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, @import("relational_index_catalog.zig").head_key);
+            }
+            const index = for (index_plan.?.plan.boundIndexes()) |candidate| {
+                const candidate_id = candidate.id().encode();
+                if (std.mem.eql(u8, &candidate_id, &span.id)) break candidate;
+            } else return error.PreparedGenerationChanged;
+            if ((try relational_index_jobs.status(&index_read.?, index)).state != .ready) return error.RelationalIndexNotReady;
+            const progress_key = relational_index_jobs.progressKey(index.id());
+            const control_key = @import("relational_index_maintenance_contract.zig").controlKey(index.id());
+            try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, &progress_key);
+            try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, &control_key);
         }
         defer freePreparedIntentRows(preparation_alloc, intents.items);
         try self.prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view);
@@ -27115,8 +28854,13 @@ pub const DB = struct {
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
+        if (row_policy_principal) |principal| {
+            const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
+            try self.enforceRowPolicyIntentsLocked(view, intents.items, principal);
+        }
         const integrity_mod = @import("relational_integrity.zig");
         const activation_mod = @import("relational_integrity_activation.zig");
         var repair_checkpoint: ?[]const u8 = null;
@@ -27227,6 +28971,9 @@ pub const DB = struct {
         }
         try self.validateTransformReadSnapshot(transform_snapshot);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
+        const index_spans = try self.collectIndexSpanReservations(preparation_alloc, intents.items, prepared_schema_view);
+        defer if (index_spans.len != 0) preparation_alloc.free(index_spans);
+        if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         if (raft_entry) |identity| {
             switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(preparation_alloc, self.core.store), identity)) {
                 .already_applied => return,
@@ -27238,12 +28985,13 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc },
+                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
+                .index_span_digests = index_spans,
             });
         }
     }
@@ -27258,15 +29006,42 @@ pub const DB = struct {
 
     fn isProtectedIntegrityKey(key: []const u8) bool {
         if (@import("relational_index_catalog.zig").Controller.isReservedMetadataKey(key)) return true;
+        const generation_admission = @import("relational_integrity_generation_admission.zig");
         return std.mem.eql(u8, key, @import("restore_staging.zig").key) or std.mem.eql(u8, key, @import("restore_staging.zig").bootstrap_key) or @import("relational_integrity.zig").isKey(key) or std.mem.eql(u8, key, @import("relational_integrity_catalog.zig").key) or
             std.mem.eql(u8, key, @import("relational_integrity_activation.zig").key) or
             std.mem.eql(u8, key, @import("relational_integrity_topology.zig").fence_key) or
             std.mem.eql(u8, key, @import("relational_integrity_topology.zig").receipt_key) or
             std.mem.startsWith(u8, key, @import("relational_integrity_topology.zig").abort_prefix) or
             std.mem.eql(u8, key, @import("relational_integrity_retirement.zig").key) or
+            std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").key) or
+            std.mem.startsWith(u8, key, @import("relational_integrity_generation_retirement.zig").active_prefix) or
+            std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").gc_progress_key) or
+            std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").activation_receipt_key) or
+            std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").completed_pending_key) or
+            std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").acknowledged_receipt_key) or
+            std.mem.startsWith(u8, key, generation_admission.prefix) or
+            std.mem.eql(u8, key, generation_admission.staged_receipt_key) or
+            std.mem.eql(u8, key, generation_admission.activation_receipt_key) or
+            std.mem.eql(u8, key, generation_admission.acknowledged_receipt_key) or
+            std.mem.eql(u8, key, generation_admission.dual_acknowledged_fence_key) or
+            std.mem.eql(u8, key, generation_admission.dual_canceled_fence_key) or
+            std.mem.eql(u8, key, generation_admission.cancel_receipt_key) or
+            std.mem.eql(u8, key, generation_admission.source_cancel_receipt_key) or
+            std.mem.eql(u8, key, generation_admission.source_fence_receipt_key) or
+            std.mem.eql(u8, key, generation_admission.source_install_receipt_key) or
+            std.mem.eql(u8, key, @import("relational_initial_child_publication.zig").key) or
             std.mem.eql(u8, key, @import("relational_integrity_handoff.zig").manifest_key) or
             std.mem.eql(u8, key, @import("relational_integrity_handoff.zig").progress_key) or
             std.mem.eql(u8, key, @import("relational_integrity_handoff.zig").prune_key);
+    }
+
+    fn isProtectedRangeWriteKey(key: []const u8) bool {
+        const protection = @import("../range_protection.zig");
+        return std.mem.eql(u8, key, protection.activation_key) or
+            std.mem.startsWith(u8, key, protection.counter_prefix) or
+            std.mem.startsWith(u8, key, protection.writer_prefix) or
+            std.mem.startsWith(u8, key, protection.index_counter_prefix) or
+            std.mem.startsWith(u8, key, protection.index_writer_prefix);
     }
 
     fn hasCoordinatedConstraints(view: ?schema_registry_mod.SchemaView) bool {
@@ -27292,14 +29067,87 @@ pub const DB = struct {
         };
     }
 
+    /// Called under apply after row preparation. Prior reverse companions are
+    /// the authoritative old tuples, including retired generations; the pinned
+    /// plan produces candidate tuples from canonical AROW without reparsing JSON.
+    /// Reserve both sides before publishing a primary intent so an empty index
+    /// equality read cannot pass between prepare and index-effect commit.
+    fn collectIndexSpanReservations(
+        self: *DB,
+        alloc: Allocator,
+        intents: []const transactions_mod.WriteIntent,
+        schema_view: ?schema_registry_mod.SchemaView,
+    ) ![]const [@import("../range_protection.zig").index_span_digest_bytes]u8 {
+        const protection = @import("../range_protection.zig");
+        const view = schema_view orelse return &.{};
+        if (view.storageMode() != .relational) return &.{};
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        if (!try protection.isActive(&read)) return &.{};
+        var plan_snapshot = self.core.relational_indexes.acquire();
+        defer if (plan_snapshot) |*pinned_plan| pinned_plan.deinit();
+        if (plan_snapshot) |pinned_plan| if (pinned_plan.plan.schemaView().epoch != view.epoch) return error.PreparedGenerationChanged;
+        var index_keys: ?relational_index_plans.Batch = if (plan_snapshot) |pinned_plan| relational_index_plans.Batch.init(alloc, pinned_plan.plan) else null;
+        defer if (index_keys) |*keys| keys.deinit();
+        var seen = std.AutoHashMapUnmanaged([protection.index_span_digest_bytes]u8, void).empty;
+        defer seen.deinit(alloc);
+        var spans = std.ArrayListUnmanaged([protection.index_span_digest_bytes]u8).empty;
+        errdefer spans.deinit(alloc);
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var prefix = std.ArrayList(u8).empty;
+        defer prefix.deinit(alloc);
+        var inspected: usize = 0;
+        for (intents) |intent| {
+            if (isMetadataKey(intent.key)) continue;
+            prefix.clearRetainingCapacity();
+            try internal_keys.appendDocumentPrefix(&prefix, alloc, intent.key);
+            try prefix.append(alloc, internal_keys.relational_index_reverse_kind);
+            var entry = try cursor.seekAtOrAfter(prefix.items);
+            while (entry) |record| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, record.key, prefix.items)) break;
+                inspected = std.math.add(usize, inspected, 1) catch return error.TransactionTooLarge;
+                if (inspected > transactions_mod.max_read_guards_per_transaction) return error.TransactionTooLarge;
+                const reverse = try relational_index_records.parseReverseKey(record.key);
+                const tuple = try relational_index_records.reverseTuple(record.key, record.value);
+                const digest = try protection.indexTupleSpanDigest(reverse.id.encode(), tuple);
+                if (!(try seen.getOrPut(alloc, digest)).found_existing) {
+                    if (spans.items.len == transactions_mod.max_read_guards_per_transaction) return error.TransactionTooLarge;
+                    try spans.append(alloc, digest);
+                }
+            }
+            if (intent.prepared_row) |encoded_row| if (index_keys) |*keys| {
+                keys.reset();
+                const row = try relational_row_codec.ordinalRowViewTrusted(encoded_row, view.tableSchema().*, view.physicalLayout());
+                const position = try keys.append(row);
+                for (keys.view.boundIndexes(), 0..) |index, i| {
+                    const candidate = try keys.key(position, i);
+                    if (!candidate.member) continue;
+                    const digest = try protection.indexTupleSpanDigest(index.id().encode(), candidate.bytes);
+                    if (!(try seen.getOrPut(alloc, digest)).found_existing) {
+                        if (spans.items.len == transactions_mod.max_read_guards_per_transaction) return error.TransactionTooLarge;
+                        try spans.append(alloc, digest);
+                    }
+                }
+            };
+        }
+        return try spans.toOwnedSlice(alloc);
+    }
+
     fn prepareTransactionRows(
         self: *DB,
         alloc: Allocator,
         intents: []transactions_mod.WriteIntent,
         schema_view: ?schema_registry_mod.SchemaView,
     ) !void {
-        const view = schema_view orelse return;
-        if (view.storageMode() != .relational) return;
+        const view = schema_view orelse {
+            for (intents) |intent| if (intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
+            return;
+        };
+        if (view.storageMode() != .relational) {
+            for (intents) |intent| if (intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
+            return;
+        }
         const Context = struct {
             alloc: Allocator,
             intents: []transactions_mod.WriteIntent,
@@ -27313,7 +29161,7 @@ pub const DB = struct {
             fn prepare(ctx: *@This(), scratch: Allocator, intent: *transactions_mod.WriteIntent) !void {
                 if (isMetadataKey(intent.key)) return;
                 const value = intent.value orelse return;
-                var row = try mapper.PreparedRelationalWrite.initWithTransientParse(ctx.alloc, scratch, intent.key, value, ctx.view.validator(), ctx.view.tableSchema().*, ctx.view.physicalLayout());
+                var row = try mapper.PreparedRelationalWrite.initTyped(ctx.alloc, scratch, scratch, false, intent.key, value, ctx.view.validator(), ctx.view.tableSchema().*, ctx.view.physicalLayout(), intent.json_null_fields, false);
                 defer row.deinit(ctx.alloc);
                 try row.finalizeMetadata(0);
                 var specials = std.json.ObjectMap.empty;
@@ -27324,6 +29172,7 @@ pub const DB = struct {
                 const sidecar = try std.json.Stringify.valueAlloc(ctx.alloc, std.json.Value{ .object = specials }, .{});
                 intent.prepared_row = row.takePackedRow();
                 intent.value = sidecar;
+                intent.json_null_fields = &.{};
             }
 
             fn run(ctx: *@This()) void {
@@ -27389,6 +29238,10 @@ pub const DB = struct {
         sync_level: types.SyncLevel,
         visibility_cancellation: types.CancellationToken,
     ) !void {
+        // Resolution applies only a previously prepared durable decision.
+        // Policy publication fences on outstanding schema/transaction leases,
+        // so a preparing policy must not deadlock the very resolution needed
+        // to drain those leases. User-visible writes are checked at prepare.
         try self.resolveTransactionIntentsInternal(
             txn_id,
             status,
@@ -27618,7 +29471,7 @@ pub const DB = struct {
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
-            mode: enum { identity, status, completed, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
+            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, graph_retirement, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
             scope: ?@import("online_source_contract.zig").Scope = null,
         }, alloc, request_json, .{});
         defer request.deinit();
@@ -27664,6 +29517,115 @@ pub const DB = struct {
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
                 try @import("relational_integrity_json.zig").write(try @import("relational_integrity_topology.zig").completed(&read), &stream);
+            },
+            .parent_activation => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                const retirement = @import("relational_integrity_generation_retirement.zig");
+                const value = try retirement.ownerStatus(alloc, &read);
+                defer if (value) |status| alloc.free(status.entries);
+                try @import("relational_integrity_json.zig").write(value, &stream);
+            },
+            .generation_publication => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                const value = try @import("relational_integrity_generation_admission.zig").ownerStatus(&read);
+                try @import("relational_integrity_json.zig").write(value, &stream);
+            },
+            .generation_handoff_summary => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                // This status scans bounded live scopes and streams the
+                // historical retirement digest. Probe transactions cannot
+                // open physical cursors; pin one coherent read snapshot.
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                var value = try @import("empty_generation_handoff.zig").summaryAlloc(alloc, &read, self.core.identity_namespace);
+                defer value.deinit(alloc);
+                try @import("relational_integrity_json.zig").write(value, &stream);
+            },
+            .generation_handoff_seal => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                try @import("relational_integrity_json.zig").write(try @import("empty_generation_handoff.zig").sealStatus(&read, self.core.identity_namespace), &stream);
+            },
+            .generation_handoff_install => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                try @import("relational_integrity_json.zig").write(try @import("empty_generation_handoff.zig").loadInstallReceipt(&read), &stream);
+            },
+            .graph_retirement => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                try @import("relational_integrity_json.zig").write(try @import("graph_retirement_seal.zig").status(&read), &stream);
+            },
+            .initial_child_publication => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                const value = try @import("relational_initial_child_publication.zig").load(&read);
+                try @import("relational_integrity_json.zig").write(value, &stream);
+            },
+            .initial_child_preflight => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                const table_raw = read.get(@import("table_catalog.zig").key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                const row_count: u64 = if (table_raw) |raw| (try @import("table_catalog.zig").Catalog.decode(raw)).row_count else 0;
+                const existing_schema = read.get(public_schema_json_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                const existing_catalog = read.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                try @import("relational_integrity_json.zig").write(.{
+                    .namespace = self.core.identity_namespace,
+                    .row_count = row_count,
+                    .has_schema = existing_schema != null,
+                    .has_catalog = existing_catalog != null,
+                    .hidden = try @import("relational_initial_child_publication.zig").load(&read),
+                }, &stream);
+            },
+            .public_schema => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                const value = read.get(public_schema_json_key) catch return error.IntegrityCatalogChanged;
+                try stream.write(std.json.Value{ .string = value });
+            },
+            .generation_gc => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                // GC preparation scans a bounded key range. Probe transactions
+                // support point reads only and cannot open the required cursor.
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                if (try @import("relational_integrity_topology.zig").current(&read) != null) {
+                    try @import("relational_integrity_json.zig").write(@as(?@import("relational_integrity_generation_retirement.zig").GcCommand, null), &stream);
+                } else {
+                    var page = try @import("relational_integrity_generation_retirement.zig").prepareGcPage(alloc, &read, 64, 512 * 1024);
+                    defer if (page) |*owned_page| owned_page.deinit();
+                    const value: ?@import("relational_integrity_generation_retirement.zig").GcCommand = if (page) |*owned_page| owned_page.command(0, self.core.identity_namespace) else null;
+                    try @import("relational_integrity_json.zig").write(value, &stream);
+                }
             },
             .handoff_progress => {
                 self.core.lockApplyShared();
@@ -27734,6 +29696,50 @@ pub const DB = struct {
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
         return .{ .fence = fence, .drained = !try manager.hasTopologySensitiveTransactions() };
+    }
+
+    fn childGenerationSourceFence(core: *db_core.DBCore) !bool {
+        var read = try core.store.beginProbeTxn();
+        defer read.abort();
+        const fence = (try @import("relational_integrity_topology.zig").current(&read)) orelse return false;
+        if (fence.role != .child_generation_source and fence.role != .child_generation_dual) return false;
+        _ = core.schema orelse return error.IntegrityCatalogChanged;
+        if (!fence.namespace.eql(core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        const encoded_catalog = read.get(@import("relational_integrity_catalog.zig").key) catch return error.IntegrityCatalogChanged;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(encoded_catalog, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &fence.catalog_digest)) return error.IntegrityCatalogChanged;
+        return true;
+    }
+
+    fn childGenerationSourcePinsSchema(core: *db_core.DBCore, candidate_version: u32) !bool {
+        if (!try childGenerationSourceFence(core)) return false;
+        const durable = core.schema orelse return error.IntegrityCatalogChanged;
+        if (candidate_version <= durable.version) return false;
+        if (candidate_version != (std.math.add(u32, durable.version, 1) catch return error.GenerationAdmissionChanged))
+            return error.GenerationAdmissionChanged;
+        return true;
+    }
+
+    /// The metadata successor is visible before its exact Raft schema install.
+    /// Callers configuring a reopened owner must retain its old schema and
+    /// indexes while the verified child-source fence remains active.
+    pub fn childGenerationSourcePinsSchemaJson(self: *DB, schema_json: []const u8) !bool {
+        var parsed = try public_table_schema.parseValidatedTableSchema(self.alloc, schema_json);
+        defer parsed.deinit(self.alloc);
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        return childGenerationSourcePinsSchema(self.core, parsed.version);
+    }
+
+    /// A cold current-catalog owner may reopen after the exact child schema
+    /// install but before parent ACK removes the dual/source fence. During that
+    /// interval its durable index catalog is authoritative; metadata-driven
+    /// add/remove/repair is a mutation and must wait for fence release.
+    pub fn childGenerationSourceDefersOwnerCatalog(self: *DB) !bool {
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        return childGenerationSourceFence(self.core);
     }
 
     /// The allocator belongs to one bounded transfer request/arena. All slices
@@ -27991,19 +29997,18 @@ pub const DB = struct {
         return try @import("merge_tail_reader.zig").Session.open(self, scope, after_sequence);
     }
 
-    fn applyRelationalTopologyBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
-        if (req.relational_index_maintenance != null) return error.InvalidBatchRequest;
-        if (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+    fn applyGenerationGcBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
+        try req.relational_generation_gc.?.validate();
+        if (req.relational_topology != null or req.row_policy_publication != null or req.online_source != null or req.restore_staging != null or
+            req.restore_staging_scope != null or req.restore_staging_plan_id != null or req.merge_page != null or
+            req.transaction != null or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
             req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.integrity.len != 0 or
-            req.integrity_commands.len != 0 or req.predicates.len != 0 or req.transaction != null or
-            req.restore_staging != null or req.restore_staging_scope != null or
-            req.relational_activation != null or req.relational_retirement != null or
-            req.relational_repair or req.split_checkpoint != null or req.split_replication != null or
-            req.merge_checkpoint != null or req.merge_replication != null or
-            req.merge_source_transition != null or req.merge_artifacts.len != 0) return error.InvalidBatchRequest;
-        if (req.relational_topology != null and req.split_transition != null) return error.InvalidBatchRequest;
-        if (req.relational_topology) |command| if (command.fence.role == .backup_snapshot and (command.action != .begin and command.action != .release and command.action != .cancel)) return error.InvalidBatchRequest;
-        if (req.split_transition) |transition| if (transition.kind != .finalize) return error.InvalidBatchRequest;
+            req.integrity_commands.len != 0 or req.predicates.len != 0 or req.relational_activation != null or
+            req.relational_retirement != null or req.relational_index_maintenance != null or req.relational_repair or
+            req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or
+            req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null or
+            req.merge_artifacts.len != 0 or req.range_guards.len != 0 or req.activate_range_tracking or
+            req.schema_version != null or req.relational_schema_version != null or req.relational_integrity_generation_set != null) return error.InvalidBatchRequest;
         var mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
         defer if (mutation) |*lease| lease.release();
         if (!opts.bypass_ha_write_gate) {
@@ -28014,6 +30019,159 @@ pub const DB = struct {
         }
         const payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
             try ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
+        else
+            null;
+        defer if (payload) |bytes| self.alloc.free(bytes);
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (opts.raft_applied_entry_marker) |entry| switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry)) {
+            .already_applied => return,
+            .apply => {},
+        };
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        if (req.relational_generation_gc.?.owner_group_id == 0 or !req.relational_generation_gc.?.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        // A page prepared at read-index can lose a race to a new reference,
+        // activation or topology fence before its Raft entry applies. Such an
+        // admitted entry must still advance the applied marker on every
+        // replica; the next bounded sweep will reprepare from durable state.
+        if (try @import("relational_integrity_topology.zig").current(&txn) == null) {
+            @import("relational_integrity_generation_retirement.zig").applyGcPage(&txn, req.relational_generation_gc.?) catch |err| switch (err) {
+                error.GenerationRetirementChanged => {},
+                else => return err,
+            };
+        }
+        if (opts.raft_applied_entry_marker) |entry| {
+            var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+            const marker = raftAppliedEntryWrite(entry, &marker_buf);
+            try txn.put(marker.key, marker.value);
+        }
+        if (opts.ha_applied_lsn_marker) |lsn| {
+            var marker_buf: [ha_applied_lsn_value_len]u8 = undefined;
+            const marker = haAppliedReplicationLsnWrite(lsn, &marker_buf);
+            try txn.put(marker.key, marker.value);
+        }
+        try self.stageRestoreStagingHAOutbox(&txn, payload);
+        try txn.commit();
+        if (payload != null) try self.flushDurableHAOutboxes();
+    }
+
+    fn applyRelationalTopologyBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
+        if (req.relational_index_maintenance != null) return error.InvalidBatchRequest;
+        const hidden_handoff_install = if (req.relational_topology) |control| control.action == .install_generation_handoff else false;
+        if (hidden_handoff_install) {
+            const control = req.relational_topology.?;
+            const install = control.generation_handoff_install orelse return error.InvalidBatchRequest;
+            var expected_plan_id: [16]u8 = undefined;
+            std.mem.writeInt(u64, expected_plan_id[0..8], control.fence.transition_id, .little);
+            std.mem.writeInt(u64, expected_plan_id[8..16], control.fence.attempt, .little);
+            if (req.restore_staging_scope == null or req.restore_staging_plan_id == null or
+                !std.mem.eql(u8, &req.restore_staging_scope.?, &install.scope) or
+                !std.mem.eql(u8, &req.restore_staging_plan_id.?, &expected_plan_id)) return error.InvalidBatchRequest;
+        } else if (req.restore_staging_scope != null or req.restore_staging_plan_id != null) return error.InvalidBatchRequest;
+        if (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.integrity.len != 0 or
+            req.integrity_commands.len != 0 or req.predicates.len != 0 or req.transaction != null or
+            req.restore_staging != null or
+            req.relational_activation != null or req.relational_retirement != null or
+            req.relational_repair or req.split_checkpoint != null or req.split_replication != null or
+            req.merge_checkpoint != null or req.merge_replication != null or
+            req.merge_source_transition != null or req.merge_artifacts.len != 0) return error.InvalidBatchRequest;
+        if (req.relational_topology != null and req.split_transition != null) return error.InvalidBatchRequest;
+        if (req.relational_topology) |command| if (command.fence.role == .backup_snapshot and (command.action != .begin and command.action != .release and command.action != .cancel)) return error.InvalidBatchRequest;
+        if (req.relational_topology) |command| if ((command.action == .seal_graph_retirement and command.graph_retirement == null) or
+            (command.graph_retirement != null and command.action != .begin and command.action != .seal_graph_retirement)) return error.InvalidBatchRequest;
+        if (req.split_transition) |transition| if (transition.kind != .finalize) return error.InvalidBatchRequest;
+        if (req.relational_topology) |command| if (command.action == .install_child_schema) {
+            if ((command.fence.role != .child_generation_source and command.fence.role != .child_generation_dual) or command.child_schema_install == null or
+                command.transfer != null or command.parent_retirement != null or command.parent_activation != null or
+                command.child_generations != null) return error.InvalidBatchRequest;
+            const install = command.child_schema_install.?;
+            const entry = opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest;
+            return self.installPublishedChildSchema(self.alloc, install.schema_json, .{
+                .fence = command.fence,
+                .before_schema_json_digest = install.before_schema_json_digest,
+                .schema_json_digest = install.schema_json_digest,
+                .before_catalog_digest = install.before_catalog_digest,
+                .after_catalog_digest = install.after_catalog_digest,
+                .raft_entry = entry,
+            });
+        };
+        if (req.relational_topology) |command| if (command.action == .provision_initial_child) {
+            if (command.initial_child_provision == null or command.initial_child_control != null or
+                command.child_schema_install != null or command.transfer != null or command.parent_retirement != null or
+                command.parent_activation != null or command.child_generations != null) return error.InvalidBatchRequest;
+            const provision = command.initial_child_provision.?;
+            const entry = opts.raft_applied_entry_marker orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
+            var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
+            defer if (ha_mutation) |*lease| lease.release();
+            if (!opts.bypass_ha_write_gate) {
+                if (self.ha_async_metadata_mirror != null and self.ha_async_batch_mirror == null) return error.HAMirrorUnavailable;
+                try self.enforceHAWriteGate();
+                try self.ensureDurableHAStartupBarrier();
+                try self.flushDurableHAOutboxes();
+                try self.preflightHABatchSyncCommit();
+            }
+            const payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
+                try ha_effects_mod.encodeInitialChildMutationRequestAlloc(self.alloc, req, entry)
+            else
+                null;
+            defer if (payload) |bytes| self.alloc.free(bytes);
+            try self.provisionInitialHiddenChild(provision.schema_json, .{
+                .fence = command.fence,
+                .child_table_name = provision.child_table_name,
+                .plan_id = provision.plan_id,
+                .plan_digest = provision.plan_digest,
+                .schema_digest = provision.schema_digest,
+                .public_schema_json_digest = provision.public_schema_json_digest,
+                .catalog_digest = provision.catalog_digest,
+                .raft_entry = entry,
+                .native = opts.native_initial_child_entry != null,
+            }, opts.ha_applied_lsn_marker, payload);
+            if (payload != null) try self.flushDurableHAOutboxes();
+            return;
+        };
+        if (req.relational_topology) |command| if (command.action == .release_initial_child or command.action == .cancel_initial_child) {
+            if (command.initial_child_control == null or command.initial_child_provision != null or
+                command.child_schema_install != null or command.transfer != null or command.parent_retirement != null or
+                command.parent_activation != null or command.child_generations != null) return error.InvalidBatchRequest;
+            const entry = opts.raft_applied_entry_marker orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
+            var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
+            defer if (ha_mutation) |*lease| lease.release();
+            if (!opts.bypass_ha_write_gate) {
+                if (self.ha_async_metadata_mirror != null and self.ha_async_batch_mirror == null) return error.HAMirrorUnavailable;
+                try self.enforceHAWriteGate();
+                try self.ensureDurableHAStartupBarrier();
+                try self.flushDurableHAOutboxes();
+                try self.preflightHABatchSyncCommit();
+            }
+            const payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
+                try ha_effects_mod.encodeInitialChildMutationRequestAlloc(self.alloc, req, entry)
+            else
+                null;
+            defer if (payload) |bytes| self.alloc.free(bytes);
+            try self.applyInitialChildPhase(command.fence, command.initial_child_control.?, if (command.action == .release_initial_child) .released else .canceled, entry, opts.native_initial_child_entry != null, opts.ha_applied_lsn_marker, payload);
+            if (payload != null) try self.flushDurableHAOutboxes();
+            return;
+        };
+        var mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
+        defer if (mutation) |*lease| lease.release();
+        if (!opts.bypass_ha_write_gate) {
+            try self.enforceHAWriteGate();
+            try self.ensureDurableHAStartupBarrier();
+            try self.flushDurableHAOutboxes();
+            try self.preflightHABatchSyncCommit();
+        }
+        const payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
+            if (req.relational_topology) |command|
+                if (command.action == .seal_graph_retirement)
+                    try ha_effects_mod.encodeGraphRetirementSealMutationRequestAlloc(self.alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest)
+                else
+                    try ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
+            else
+                try ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
         else
             null;
         defer if (payload) |bytes| self.alloc.free(bytes);
@@ -28044,6 +30202,12 @@ pub const DB = struct {
             .already_applied => return,
             .apply => {},
         };
+        const graph_catalog_lock_required = command.graph_retirement != null or
+            (command.fence.role == .rewrite_source and (command.action == .cancel or command.action == .abort_transition));
+        if (graph_catalog_lock_required and !self.core.index_manager.catalog_mutex.tryLockExclusive()) return error.StorageBusy;
+        defer if (graph_catalog_lock_required) self.core.index_manager.catalog_mutex.unlockExclusive();
+        var close_graph_after_commit = false;
+        var open_graph_after_commit = false;
         if (!command.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
@@ -28055,9 +30219,24 @@ pub const DB = struct {
             try txn.put(&internal_keys.identity_namespace_key, &namespace_bytes);
         }
         const topology = @import("relational_integrity_topology.zig");
-        if ((command.action == .transfer) != (command.transfer != null)) return error.InvalidBatchRequest;
+        if ((command.action == .transfer) != (command.transfer != null) or
+            (command.action == .seal_graph_retirement and command.graph_retirement == null) or
+            (command.graph_retirement != null and command.action != .begin and command.action != .seal_graph_retirement) or
+            (command.generation_handoff != null and command.action != .begin) or
+            ((command.action == .seal_generation_handoff) != (command.generation_handoff_seal != null)) or
+            ((command.action == .install_generation_handoff) != (command.generation_handoff_install != null)) or
+            (command.action == .stage_parent_retirement) != (command.parent_retirement != null) or
+            ((command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement) != (command.parent_activation != null)) or
+            ((command.action == .stage_child_generation or command.action == .activate_child_generation or command.action == .acknowledge_child_generation or
+                (command.action == .cancel and (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_dual))) != (command.child_generations != null))) return error.InvalidBatchRequest;
+        if (command.child_schema_install != null) return error.InvalidBatchRequest;
         switch (command.action) {
             .begin => {
+                if (command.graph_retirement) |scope| {
+                    if (!scope.fence.eql(command.fence)) return error.InvalidBatchRequest;
+                    const loaded = (try self.core.index_manager.graphRetirementConfigDigestAssumeCatalogLock(self.alloc)) orelse return error.InvalidBatchRequest;
+                    if (!std.mem.eql(u8, &loaded, &scope.graph_config_digest)) return error.InvalidBatchRequest;
+                }
                 if (try topology.current(&txn) == null) {
                     if (command.fence.role == .split_destination) {
                         const previous_manifest = txn.get(@import("relational_integrity_handoff.zig").manifest_key) catch |err| switch (err) {
@@ -28092,9 +30271,59 @@ pub const DB = struct {
                         if (try manager.hasTopologySensitiveTransactions()) return error.IntegrityTopologyBusy;
                     }
                 }
-                try topology.stageBegin(&txn, command.fence);
+                try topology.stageBeginWithHandoff(&txn, command.fence, command.generation_handoff);
+                if (command.graph_retirement) |scope| {
+                    try @import("graph_retirement_seal.zig").stageBegin(&txn, scope);
+                    close_graph_after_commit = true;
+                }
+                if (command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual)
+                    try @import("relational_integrity_generation_admission.zig").stageSourceFencedReceipt(&txn, command.fence, if (raft_entry) |entry| entry.term else 0, if (raft_entry) |entry| entry.index else 0);
+            },
+            .seal_graph_retirement => {
+                const scope = command.graph_retirement.?;
+                if (!scope.fence.eql(command.fence)) return error.InvalidBatchRequest;
+                if (!self.core.index_manager.graphRetirementPinsDrainedAssumeCatalogLock()) return error.StorageBusy;
+                const loaded = (try self.core.index_manager.graphRetirementConfigDigestAssumeCatalogLock(self.alloc)) orelse return error.InvalidBatchRequest;
+                if (!std.mem.eql(u8, &loaded, &scope.graph_config_digest)) return error.InvalidBatchRequest;
+                const entry = raft_entry orelse return error.InvalidBatchRequest;
+                _ = try @import("graph_retirement_seal.zig").stageSeal(&txn, scope, entry.term, entry.index);
+            },
+            .seal_generation_handoff => {
+                const entry = raft_entry orelse return error.InvalidBatchRequest;
+                try @import("empty_generation_handoff.zig").stageSeal(&txn, command.fence, command.generation_handoff_seal.?, entry.term, entry.index);
+            },
+            .install_generation_handoff => {
+                if (command.fence.role != .rewrite_destination) return error.InvalidGenerationHandoff;
+                const entry = raft_entry orelse return error.InvalidBatchRequest;
+                const install = command.generation_handoff_install.?;
+                const contract = @import("restore_staging_contract.zig");
+                const logical = try @import("empty_generation_handoff.zig").installReceiptDigest(install);
+                var expected_plan_id: [16]u8 = undefined;
+                std.mem.writeInt(u64, expected_plan_id[0..8], command.fence.transition_id, .little);
+                std.mem.writeInt(u64, expected_plan_id[8..16], command.fence.attempt, .little);
+                const bootstrap_raw = txn.get(contract.bootstrap_key) catch return error.RestoreStagingScopeChanged;
+                var bootstrap = try contract.OwnerBootstrap.decode(self.alloc, bootstrap_raw);
+                defer bootstrap.deinit();
+                const binding = bootstrap.value.empty_generation_handoff orelse return error.GenerationHandoffIntentMissing;
+                const raw_progress = txn.get(contract.key) catch return error.RestoreStagingScopeChanged;
+                var progress = try contract.Progress.decode(self.alloc, raw_progress);
+                defer progress.deinit();
+                if (!bootstrap.value.scope.empty_generation or
+                    !bootstrap.value.scope.target_namespace.eql(command.fence.namespace) or
+                    !std.mem.eql(u8, &bootstrap.value.scope.plan_id, &expected_plan_id) or
+                    !std.mem.eql(u8, &bootstrap.value.scope.digest(), &install.scope) or
+                    !std.mem.eql(u8, &progress.value.scope.digest(), &install.scope) or
+                    progress.value.phase != .validated or
+                    !std.mem.eql(u8, &binding.source_summary_digest, &install.source_summary_digest) or
+                    !std.mem.eql(u8, &binding.retired_digest, &install.retired_digest) or
+                    binding.retired_count != install.retired_count or
+                    !std.mem.eql(u8, &binding.expected_install_receipt_digest, &logical))
+                    return error.RestoreStagingScopeChanged;
+                _ = try @import("empty_generation_handoff.zig").stageInstall(self.alloc, &txn, install, bootstrap.value.scope.plan_id, entry.term, entry.index);
             },
             .release => {
+                if (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual or command.fence.role == .truncate_parent)
+                    return error.GenerationAdmissionActivationRequired;
                 if ((command.fence.role == .split_destination or command.fence.role == .merge_destination) and try topology.current(&txn) != null) {
                     var progress = try @import("relational_integrity_handoff.zig").loadProgress(self.alloc, &txn);
                     defer progress.deinit();
@@ -28123,7 +30352,27 @@ pub const DB = struct {
                 // off-range records must be drained by rollback/prune before
                 // admission resumes; generic cancellation is not that proof.
                 if (command.fence.role == .merge_source or command.fence.role == .merge_destination) return error.InvalidBatchRequest;
+                // A child-source fence protects the old FK generation while
+                // parent owners transition. Only a metadata-authenticated
+                // abort decision may lift it; generic cancellation could
+                // admit a delayed old-generation attach after activation.
+                if (command.fence.role == .child_generation_source) return error.GenerationAdmissionActivationRequired;
+                if (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_dual) {
+                    const admission = @import("relational_integrity_generation_admission.zig");
+                    const transitions = command.child_generations.?;
+                    try admission.validateTransitions(transitions);
+                    for (transitions) |transition| try admission.cancelTransition(self.alloc, &txn, transition);
+                    try admission.stageCanceledReceipt(&txn, command.fence, transitions, if (raft_entry) |entry| entry.term else 0, if (raft_entry) |entry| entry.index else 0);
+                }
+                if (command.fence.role == .child_generation_dual)
+                    try txn.delete(@import("relational_integrity_generation_admission.zig").dual_acknowledged_fence_key);
                 try topology.stageCancel(&txn, command.fence);
+                if (command.fence.role == .child_generation_dual) {
+                    const encoded_fence = try command.fence.encode();
+                    try txn.put(@import("relational_integrity_generation_admission.zig").dual_canceled_fence_key, &encoded_fence);
+                }
+                if (command.fence.role == .rewrite_source)
+                    open_graph_after_commit = try @import("graph_retirement_seal.zig").stageCancel(&txn, command.fence);
             },
             .abort_transition => {
                 if (command.fence.role == .merge_destination and try topology.current(&txn) != null) {
@@ -28153,6 +30402,8 @@ pub const DB = struct {
                     }
                 }
                 try topology.stageAbortTransition(&txn, command.fence);
+                if (command.fence.role == .rewrite_source)
+                    open_graph_after_commit = try @import("graph_retirement_seal.zig").stageCancel(&txn, command.fence);
             },
             .transfer => {
                 var manager = try self.core.initTxnManager();
@@ -28160,6 +30411,100 @@ pub const DB = struct {
                 try topology.requireDrained(&txn, &manager, command.fence);
                 try @import("relational_integrity_handoff.zig").apply(self.alloc, &txn, command.fence, command.transfer.?);
             },
+            .stage_parent_retirement => {
+                var manager = try self.core.initTxnManager();
+                defer manager.deinit();
+                const stage = command.parent_retirement.?;
+                try @import("relational_integrity_generation_retirement.zig").stagePending(self.alloc, &txn, &manager, command.fence, stage.plan_digest, stage.entries);
+            },
+            .activate_parent_retirement => {
+                const retirement = @import("relational_integrity_generation_retirement.zig");
+                const activation = command.parent_activation.?;
+                if (command.fence.role != .truncate_parent or std.mem.allEqual(u8, &activation.plan_id, 0) or
+                    !std.mem.eql(u8, &activation.publication_digest, &retirement.publicationDigest(activation.plan_id, activation.plan_digest)))
+                    return error.InvalidGenerationRetirement;
+                if (try topology.current(&txn)) |actual| {
+                    if (!actual.eql(command.fence)) return error.IntegrityTopologyChanged;
+                    if (!try retirement.completedActivation(&txn, command.fence, activation.plan_digest, activation.publication_digest)) {
+                        if (try retirement.completedPending(&txn)) |prior| {
+                            if (prior.fence.eql(command.fence)) return error.GenerationRetirementChanged;
+                        }
+                        var manager = try self.core.initTxnManager();
+                        defer manager.deinit();
+                        try topology.requireDrained(&txn, &manager, command.fence);
+                        try retirement.stageVerifiedActivation(self.alloc, &txn, command.fence, activation.plan_id, activation.plan_digest, activation.publication_digest);
+                    }
+                } else {
+                    const completed = (try topology.completed(&txn)) orelse return error.IntegrityTopologyFenceMissing;
+                    if (!completed.eql(command.fence) or !try retirement.completedActivation(&txn, command.fence, activation.plan_digest, activation.publication_digest))
+                        return error.GenerationRetirementChanged;
+                }
+            },
+            .acknowledge_parent_retirement => {
+                const retirement = @import("relational_integrity_generation_retirement.zig");
+                const activation = command.parent_activation.?;
+                if (command.fence.role != .truncate_parent or std.mem.allEqual(u8, &activation.plan_id, 0) or
+                    !std.mem.eql(u8, &activation.publication_digest, &retirement.publicationDigest(activation.plan_id, activation.plan_digest)))
+                    return error.InvalidGenerationRetirement;
+                try retirement.stageAcknowledgement(&txn, command.fence, activation.plan_digest, activation.publication_digest);
+            },
+            .stage_child_generation => {
+                if (command.fence.role != .child_generation_parent and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
+                var manager = try self.core.initTxnManager();
+                defer manager.deinit();
+                try topology.requireDrained(&txn, &manager, command.fence);
+                const admission = @import("relational_integrity_generation_admission.zig");
+                const transitions = command.child_generations.?;
+                try admission.validateTransitions(transitions);
+                for (transitions) |transition| try admission.stageTransition(self.alloc, &txn, transition);
+                try admission.stageStagedReceipt(&txn, command.fence, transitions, if (raft_entry) |entry| entry.term else 0, if (raft_entry) |entry| entry.index else 0);
+            },
+            .activate_child_generation => {
+                if (command.fence.role != .child_generation_parent and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
+                const admission = @import("relational_integrity_generation_admission.zig");
+                const transitions = command.child_generations.?;
+                try admission.validateTransitions(transitions);
+                if (try topology.current(&txn)) |actual| {
+                    if (!actual.eql(command.fence)) return error.IntegrityTopologyChanged;
+                    var manager = try self.core.initTxnManager();
+                    defer manager.deinit();
+                    try topology.requireDrained(&txn, &manager, command.fence);
+                    for (transitions) |transition| try admission.activateTransition(self.alloc, &txn, transition);
+                    try @import("relational_integrity_generation_retirement.zig").stageChildGenerationRetirements(self.alloc, &txn, command.fence, transitions);
+                    try admission.stageCompletion(&txn, command.fence, transitions, if (raft_entry) |entry| entry.term else 0, if (raft_entry) |entry| entry.index else 0);
+                    // The same fence still protects the old child schema. A
+                    // dual-role owner releases it only with the published
+                    // schema/catalog install, never at parent activation.
+                    if (command.fence.role != .child_generation_dual) try topology.stageRelease(&txn, command.fence);
+                } else {
+                    if (command.fence.role == .child_generation_dual) return error.IntegrityTopologyFenceMissing;
+                    const completed = (try topology.completed(&txn)) orelse return error.IntegrityTopologyFenceMissing;
+                    const expected = try admission.completionReceipt(command.fence, transitions);
+                    const stored = txn.get(admission.activation_receipt_key) catch return error.GenerationAdmissionChanged;
+                    const applied = try admission.AppliedReceipt.decode(stored);
+                    if (!completed.eql(command.fence) or !std.mem.eql(u8, &applied.digest, &expected)) return error.GenerationAdmissionChanged;
+                }
+            },
+            .acknowledge_child_generation => {
+                if (command.fence.role != .child_generation_parent and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
+                try @import("relational_integrity_generation_admission.zig").stageAcknowledgement(&txn, command.fence, command.child_generations.?, if (raft_entry) |entry| entry.term else 0, if (raft_entry) |entry| entry.index else 0);
+            },
+            .cancel_child_generation_source => {
+                if (command.fence.role != .child_generation_source and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
+                // The private owner route must independently read the durable
+                // metadata canceling decision before proposing this command.
+                // The source has no accepted-generation state to undo; the
+                // exact fence receipt consumes its admission epoch forever.
+                if (command.fence.role == .child_generation_dual) {
+                    try @import("relational_integrity_generation_admission.zig").requireDualParentCanceled(&txn, command.fence);
+                    try txn.delete(@import("relational_integrity_generation_admission.zig").dual_acknowledged_fence_key);
+                    try txn.delete(@import("relational_integrity_generation_admission.zig").dual_canceled_fence_key);
+                }
+                try topology.stageCancel(&txn, command.fence);
+                try @import("relational_integrity_generation_admission.zig").stageCanceledReceipt(&txn, command.fence, null, if (raft_entry) |entry| entry.term else 0, if (raft_entry) |entry| entry.index else 0);
+            },
+            .install_child_schema => unreachable, // Handled before generic topology transaction.
+            .provision_initial_child, .release_initial_child, .cancel_initial_child => unreachable, // Handled before generic topology transaction.
             .prune => try @import("relational_integrity_handoff.zig").prune(self.alloc, &txn, command.fence, self.core.byteRange()),
         }
         if (raft_entry) |entry| {
@@ -28174,6 +30519,8 @@ pub const DB = struct {
         }
         try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
         try txn.commit();
+        if (close_graph_after_commit) self.core.index_manager.setGraphRetirementAdmissionAssumeCatalogLock(false);
+        if (open_graph_after_commit) self.core.index_manager.setGraphRetirementAdmissionAssumeCatalogLock(true);
     }
 
     pub fn markTransactionParticipantResolved(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
@@ -28288,10 +30635,16 @@ pub const DB = struct {
         edge_type: []const u8,
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
         if (key.len == 0) return try alloc.alloc(graph_mod.Edge, 0);
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        return try self.core.graphGetEdges(alloc, index_name, key, edge_type, direction);
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        const edges = try self.core.graphGetEdges(alloc, index_name, key, edge_type, direction);
+        errdefer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        return edges;
     }
 
     pub fn traverseEdges(
@@ -28301,10 +30654,16 @@ pub const DB = struct {
         start_key: []const u8,
         rules: traversal_mod.TraversalRules,
     ) ![]traversal_mod.TraversalResult {
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
         if (start_key.len == 0) return try alloc.alloc(traversal_mod.TraversalResult, 0);
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        return try self.core.graphTraverseEdges(alloc, index_name, start_key, rules);
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        const results = try self.core.graphTraverseEdges(alloc, index_name, start_key, rules);
+        errdefer traversal_mod.freeOwnedResults(alloc, results);
+        try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        return results;
     }
 
     pub fn getNeighbors(
@@ -28340,9 +30699,12 @@ pub const DB = struct {
         min_weight: ?f64,
         max_weight: ?f64,
     ) !?paths_mod.Path {
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         if (source.len == 0 or target.len == 0) return null;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (try self.findAlgebraicShortestPath(alloc, index_name, source, target, edge_types, direction, weight_mode, max_depth, min_weight, max_weight)) |path| {
             return path;
         }
@@ -28377,6 +30739,8 @@ pub const DB = struct {
         min_weight: ?f64,
         max_weight: ?f64,
     ) ![]paths_mod.Path {
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         if (source.len == 0 or target.len == 0 or k == 0) return try alloc.alloc(paths_mod.Path, 0);
         if (k == 1) {
             if (try self.findShortestPath(alloc, index_name, source, target, edge_types, direction, weight_mode, max_depth, min_weight, max_weight)) |path| {
@@ -28388,6 +30752,7 @@ pub const DB = struct {
         }
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.graphFindKShortestPaths(
             alloc,
             index_name,
@@ -28505,13 +30870,16 @@ pub const DB = struct {
         max_results: u32,
         return_aliases: []const []const u8,
     ) ![]graph_pattern_mod.PatternMatch {
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         var work_budget = graph_pattern_mod.WorkBudget.init(
             graph_pattern_mod.default_max_explored_nodes,
             graph_pattern_mod.default_max_explored_edges,
         );
-        return try self.matchPatternWithNodeAdmission(
+        const matches = try self.matchPatternWithNodeAdmission(
             alloc,
             index_name,
             start_keys,
@@ -28525,6 +30893,9 @@ pub const DB = struct {
             &work_budget,
             .{},
         );
+        errdefer graph_pattern_mod.freeMatches(alloc, matches);
+        try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        return matches;
     }
 
     fn matchPatternWithNodeAdmission(
@@ -28707,8 +31078,11 @@ pub const DB = struct {
         graph_queries: []const types.NamedGraphQuery,
         input_sets: []const types.NamedGraphInputSet,
     ) ![]types.GraphSearchResult {
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (req.identity_read_generation == null) {
             for (input_sets) |input_set| {
                 if (input_set.hit_ids.len > 0) return error.UnsupportedQueryRequest;
@@ -29154,6 +31528,9 @@ pub const DB = struct {
     }
 
     fn addIndexWithAdmission(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode) !?u128 {
+        if (self.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyUnsupported;
+        var row_policy_lease = self.row_policy_gate.enterRaw() catch return error.RowPolicyUnsupported;
+        defer row_policy_lease.release();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
@@ -30145,6 +32522,8 @@ pub const DB = struct {
         text_query: types.TextQuery,
         options: types.TextKernelSearchOptions,
     ) !types.TextKernelResult {
+        var row_policy_lease = try self.row_policy_gate.enterUnsupportedSearch();
+        defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
@@ -30608,6 +32987,9 @@ pub const DB = struct {
     }
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
+        if (self.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyUnsupported;
+        var row_policy_lease = self.row_policy_gate.enterRaw() catch return error.RowPolicyUnsupported;
+        defer row_policy_lease.release();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
@@ -32029,6 +34411,10 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         while (true) {
             lockApply(self);
+            if (!self.core.index_manager.graphRetirementAdmissionOpen()) {
+                self.core.unlockApply();
+                return error.IntegrityTopologyBusy;
+            }
             const more = self.core.index_manager.runGraphOwnershipCleanupStep() catch |err| {
                 self.core.unlockApply();
                 return err;
@@ -32046,6 +34432,7 @@ pub const DB = struct {
         }
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return switch (self.graph_metric_idle_maintenance) {
             .legacy => try self.core.index_manager.runGraphMetricMaintenance(),
             .planned, .auto => unreachable,
@@ -32094,6 +34481,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedMaintenance(options);
     }
 
@@ -32182,6 +34570,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.enableGraphMetric(metric_name);
         var status = try entry.index.runGraphMetric(metric_name);
@@ -32195,6 +34584,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.enableGraphMetric(metric_name);
         var status = try entry.index.runGraphMetric(metric_name);
@@ -32218,6 +34608,7 @@ pub const DB = struct {
         const owned_status = blk: {
             lockApply(self);
             defer self.core.unlockApply();
+            if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
             const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
             var current = try entry.index.graphMetricStatus(metric_name);
             defer current.deinit(entry.index.alloc);
@@ -32253,6 +34644,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.deleteGraphMetricMaterialization(metric_name);
         var status = try entry.index.graphMetricStatus(metric_name);
@@ -32266,6 +34658,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         var status = try entry.index.pauseGraphMetricMaintenance(metric_name);
         defer status.deinit(entry.index.alloc);
@@ -32276,6 +34669,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         var status = try entry.index.resumeGraphMetricMaintenance(metric_name);
         defer status.deinit(entry.index.alloc);
@@ -32292,6 +34686,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         var status = try self.core.index_manager.ensureGraphMetricPlannedBuild(index_name, metric_name, target_generation);
         defer status.deinit(self.core.index_manager.alloc);
         return try cloneGraphMetricStatusFromGraph(alloc, status);
@@ -32301,6 +34696,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedWorkerPageStep(index_name, metric_name, worker_id);
     }
 
@@ -32308,6 +34704,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedWorkerPageStepAt(index_name, metric_name, worker_id, now_ms);
     }
 
@@ -32315,6 +34712,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedCoordinatorStep(index_name, metric_name);
     }
 
@@ -32322,6 +34720,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedCoordinatorStepAt(index_name, metric_name, now_ms);
     }
 
@@ -32329,6 +34728,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         var status = try self.core.index_manager.failGraphMetricPlannedBuild(index_name, metric_name, err);
         defer status.deinit(self.core.index_manager.alloc);
         return try cloneGraphMetricStatusFromGraph(alloc, status);
@@ -32338,6 +34738,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         var status = try self.core.index_manager.runGraphMetricPlannedDrain(index_name, metric_name, target_generation, options);
         defer status.deinit(self.core.index_manager.alloc);
         return try cloneGraphMetricStatusFromGraph(alloc, status);
@@ -36787,6 +39188,7 @@ pub const DB = struct {
         schema_replacement: schema_registry_mod.Registry.PreparedReplacement,
         relational_indexes: ?@import("relational_index_catalog.zig").WriteSnapshot,
         table_catalog: table_catalog_mod.Catalog,
+        row_policy_lease: row_policy_gate_mod.Gate.Lease,
         recovery: ?db_core.PreparedRecoveryRelationalState,
         target_identity: doc_identity.Namespace,
 
@@ -36795,6 +39197,7 @@ pub const DB = struct {
             self.schema_replacement.deinit();
             if (self.schema) |schema| schema_mod.freeSchema(self.alloc, schema);
             if (self.recovery) |*recovery| recovery.deinit();
+            self.row_policy_lease.release();
             self.* = undefined;
         }
     };
@@ -36811,6 +39214,8 @@ pub const DB = struct {
         source_store: *docstore_mod.DocStore,
         target_identity: doc_identity.Namespace,
     ) !PreparedPortableRuntimeMetadata {
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        errdefer row_policy_lease.release();
         const identity_summary = try doc_identity.visibilitySummaryFromStore(source_store);
         const restored_schema = try schema_mod.loadSchema(source_store, self.alloc);
         var restored_schema_owned = true;
@@ -36845,6 +39250,12 @@ pub const DB = struct {
         // registry when a row first references them. This keeps publication
         // latency and resident memory independent of schema-history length.
         const restored_catalog = try db_core.loadTableCatalogForSchema(self.alloc, source_store, restored_schema);
+        // Portable publication replaces the owner catalog without replaying
+        // policy commands. Until the staged image carries a verified compiled
+        // policy epoch and an authenticated principal binding, importing an
+        // active policy (or replacing one) would create an unguarded window.
+        if (restored_catalog.row_policy_phase != .disabled or self.row_policy_gate.currentPhase() != .disabled)
+            return error.RowPolicyAuthenticationRequired;
         var prepared_recovery = if (self.transaction_recovery_identity_context != null)
             try db_core.PreparedRecoveryRelationalState.init(
                 self.runtime_alloc,
@@ -36863,6 +39274,7 @@ pub const DB = struct {
             .schema_replacement = schema_replacement,
             .relational_indexes = restored_indexes,
             .table_catalog = restored_catalog,
+            .row_policy_lease = row_policy_lease,
             .recovery = prepared_recovery,
             .target_identity = target_identity,
         };
@@ -36973,11 +39385,19 @@ pub const DB = struct {
         return try staging.Progress.decode(alloc, raw);
     }
 
+    pub fn restoreGenerationAdmissionReceipt(self: *DB) !?@import("restore_staging_contract.zig").GenerationAdmissionReceipt {
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return @import("restore_generation_admissions.zig").loadReceipt(&read);
+    }
+
     /// Private provisioners call this before cache adoption, after installing
     /// the durable reservation. Initial empty schema/index admission must not
     /// emit an HA mutation before its owner authorization exists.
     pub fn attachRestoreStagingHAMirror(self: *DB, mirror: ?HAAsyncEffectMirror) !void {
         if (!self.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
+        if (mirror != null and self.core.table_catalog.row_policy_phase != .disabled)
+            return error.RowPolicyUnsupported;
         self.ha_async_batch_mirror = mirror;
         self.ha_async_effect_mirror = mirror;
         self.ha_async_metadata_mirror = mirror;
@@ -37238,8 +39658,18 @@ pub const DB = struct {
         return null;
     }
 
-    fn encodeRestoreStagingHAPayload(self: *DB, req: types.BatchRequest) ![]u8 {
+    /// A cold, read-only physical proof for canceled initial FK retirement.
+    /// This does not consult or synthesize a public catalog route.
+    pub fn readInitialChildPublicationRecord(self: *DB) !?@import("relational_initial_child_publication.zig").Record {
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return @import("relational_initial_child_publication.zig").load(&txn);
+    }
+
+    fn encodeRestoreStagingHAPayload(self: *DB, req: types.BatchRequest, raft_entry: ?RaftAppliedEntryIdentity) ![]u8 {
         const staging = @import("restore_staging.zig");
+        if (req.restore_staging.? == .install_generation_admissions)
+            return ha_effects_mod.encodeRestoreGenerationAdmissionMutationRequestAlloc(self.alloc, req, raft_entry orelse return error.InvalidRestoreStagingCommand);
         if (req.restore_staging.? == .begin) {
             const stored = try self.core.getStoreValue(self.alloc, staging.bootstrap_key);
             defer if (stored) |bytes| self.alloc.free(bytes);
@@ -37271,6 +39701,61 @@ pub const DB = struct {
         if (!ready) return error.RestoreProjectionCatchUpPending;
     }
 
+    fn installRestoreGenerationAdmissionsWithMarker(
+        self: *DB,
+        alloc: Allocator,
+        command: @import("restore_staging_contract.zig").InstallGenerationAdmissions,
+        marker: ?RaftAppliedEntryIdentity,
+        ha_lsn: ?u64,
+        ha_payload: ?[]const u8,
+    ) !@import("restore_staging_contract.zig").GenerationAdmissionReceipt {
+        const contract = @import("restore_staging_contract.zig");
+        const entry = marker orelse return error.InvalidRestoreStagingCommand;
+        const expected = try contract.admissionReceiptDigest(command);
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var txn = try self.core.store.beginWriteTxn();
+        var txn_open = true;
+        defer if (txn_open) txn.abort();
+        const bootstrap_bytes = txn.get(contract.bootstrap_key) catch |err| switch (err) {
+            error.NotFound => return error.RestoreStagingScopeChanged,
+            else => return err,
+        };
+        var bootstrap = try contract.OwnerBootstrap.decode(alloc, bootstrap_bytes);
+        defer bootstrap.deinit();
+        const binding = bootstrap.value.generation_admission orelse return error.RestoreSourceProofMissing;
+        const source_proof_digest = bootstrap.value.source_generation_proof_digest orelse return error.RestoreSourceProofMissing;
+        if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &command.scope) or
+            !std.mem.eql(u8, &source_proof_digest, &binding.source_summary_digest) or
+            !std.mem.eql(u8, &binding.source_summary_digest, &command.source_summary_digest) or
+            !std.mem.eql(u8, &binding.expected_receipt_digest, &expected))
+            return error.RestoreStagingScopeChanged;
+        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(alloc, self.core.store), entry)) {
+            .already_applied => {
+                const receipt = (try @import("restore_generation_admissions.zig").loadReceipt(&txn)) orelse
+                    return error.RestoreSourceProofMissing;
+                if (!std.mem.eql(u8, &receipt.logical_digest, &expected) or
+                    !std.mem.eql(u8, &receipt.scope, &command.scope)) return error.RestoreStagingScopeChanged;
+                return receipt;
+            },
+            .apply => {},
+        }
+        const receipt = try @import("restore_generation_admissions.zig").stageInstall(alloc, &txn, command, entry.term, entry.index);
+        var marker_bytes: [raft_applied_entry_value_len]u8 = undefined;
+        const applied = raftAppliedEntryWrite(entry, &marker_bytes);
+        try txn.put(applied.key, applied.value);
+        if (ha_lsn) |lsn| {
+            var lsn_bytes: [ha_applied_lsn_value_len]u8 = undefined;
+            const replicated = haAppliedReplicationLsnWrite(lsn, &lsn_bytes);
+            try txn.put(replicated.key, replicated.value);
+        }
+        try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+        try txn.commit();
+        txn_open = false;
+        try self.core.store.sync(true);
+        return receipt;
+    }
+
     /// Control payload and owner marker are committed together. Every HA mode
     /// retains a local append obligation; remote acknowledgement still follows
     /// the configured policy. Retrying an applied Raft entry drains this record.
@@ -37294,13 +39779,14 @@ pub const DB = struct {
             try self.preflightHABatchSyncCommit();
         }
         const payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
-            try self.encodeRestoreStagingHAPayload(req)
+            try self.encodeRestoreStagingHAPayload(req, opts.raft_applied_entry_marker)
         else
             null;
         defer if (payload) |bytes| self.alloc.free(bytes);
         switch (req.restore_staging.?) {
             .begin => |scope| try self.beginRestoreStagingWithMarker(self.alloc, scope, opts.raft_applied_entry_marker, opts.ha_applied_lsn_marker, payload),
             .finish => |finish| _ = try self.finishRestoreStagingWithMarker(self.alloc, finish.scope, finish.phase, opts.raft_applied_entry_marker, opts.ha_applied_lsn_marker, payload),
+            .install_generation_admissions => |install| _ = try self.installRestoreGenerationAdmissionsWithMarker(self.alloc, install, opts.raft_applied_entry_marker, opts.ha_applied_lsn_marker, payload),
             .import_page, .rewrite_page => unreachable,
         }
         if (payload != null) try self.flushDurableHAOutboxes();
@@ -37467,11 +39953,45 @@ pub const DB = struct {
             }
         }
         if (self.core.table_catalog.row_count != 0) return error.RestoreStagingTargetNotEmpty;
+        if (scope.empty_generation) {
+            if ((scope.graph_retirement_digest != null) != self.core.index_manager.hasGraphIndexes()) return error.RestoreStagingScopeChanged;
+            if (scope.graph_retirement_digest != null) for (self.core.index_manager.graph_indexes.items) |*entry| {
+                try entry.index.requirePristineEmptyGeneration();
+            };
+            if (scope.graph_retirement_digest != null) {
+                // Source-owned graph edge/state/contender rows live in the
+                // primary store, outside the graph index's private stores.
+                // An empty row count cannot prove these orphan artifacts
+                // absent. The new owner normally has no user-key band, so
+                // this is one bounded early-exit cursor walk at admission.
+                var graph_cursor = try txn.openPhysicalCursorAdapter();
+                defer graph_cursor.close();
+                var entry = try graph_cursor.seekAtOrAfter(&.{internal_keys.replay_namespace});
+                while (entry) |record| {
+                    if (record.key.len == 0 or record.key[0] != internal_keys.replay_namespace or
+                        (record.key.len > 1 and record.key[1] == 0xff)) break;
+                    if (internal_keys.isGraphEdgeArtifactKey(record.key) or
+                        internal_keys.isGraphAssetStateKey(record.key) or
+                        internal_keys.isGraphEdgeContenderKey(record.key)) return error.RestoreStagingTargetNotEmpty;
+                    entry = try graph_cursor.next();
+                }
+                const global_prefix = [_]u8{ internal_keys.replay_namespace, 0xff, internal_keys.graph_global_edge_contender_kind };
+                if (try graph_cursor.seekAtOrAfter(&global_prefix)) |record| if (std.mem.startsWith(u8, record.key, &global_prefix)) return error.RestoreStagingTargetNotEmpty;
+            }
+            // These global secondary records lie outside document identity's
+            // user-key proof. A fresh generation must not inherit claims or
+            // ordered-index entries even if a corrupt counter says zero.
+            var cursor = try txn.openPhysicalCursorAdapter();
+            defer cursor.close();
+            for ([_][]const u8{ @import("relational_integrity_contract.zig").namespace, @import("relational_index_records.zig").forward_namespace, @import("relational_index_records.zig").ownership_namespace }) |prefix| {
+                if (try cursor.seekAtOrAfter(prefix)) |entry| if (std.mem.startsWith(u8, entry.key, prefix)) return error.RestoreStagingTargetNotEmpty;
+            }
+        }
         const schema_bytes = try schema_mod.serializeSchema(alloc, self.core.schema orelse .{});
         defer alloc.free(schema_bytes);
         if (!std.mem.eql(u8, &staging.digest(schema_bytes), &scope.target_schema_digest)) return error.RestoreStagingScopeChanged;
         var initial_identity_summary: ?doc_identity.VisibilitySummary = null;
-        if (scope.preserve_artifacts) {
+        if (scope.preserve_artifacts or scope.empty_generation) {
             // Native cache pages precede primary rows. Bind a proven-pristine
             // identity root and exact zero cardinality before those artifacts
             // make an absent visibility summary ambiguous. Keep these facts
@@ -37496,7 +40016,18 @@ pub const DB = struct {
                 try txn.put(@import("relational_integrity_activation.zig").key, coverage);
             }
         }
-        const initial = try (staging.Progress{ .scope = scope, .rewrite = if (scope.rewrite) |rewrite| .{ .sequence = rewrite.retained_start } else null }).encode(alloc);
+        const bootstrap_raw = txn.get(staging.bootstrap_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        var source_proofs_required = false;
+        if (bootstrap_raw) |bytes| {
+            var bootstrap = try staging.OwnerBootstrap.decode(alloc, bytes);
+            defer bootstrap.deinit();
+            if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &scope.digest())) return error.RestoreStagingScopeChanged;
+            source_proofs_required = bootstrap.value.source_generation_proof_digest != null;
+        }
+        const initial = try (staging.Progress{ .scope = scope, .phase = if (scope.empty_generation) .imported else .importing, .source_generation_proofs_complete = !source_proofs_required, .rewrite = if (scope.rewrite) |rewrite| .{ .sequence = rewrite.retained_start } else null }).encode(alloc);
         defer alloc.free(initial);
         try txn.put(staging.key, initial);
         try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
@@ -37529,7 +40060,7 @@ pub const DB = struct {
     }
 
     pub fn prepareRestoreStagingPage(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken) !@import("restore_staging.zig").PreparedPage {
-        if (scope.rewrite != null) return error.InvalidRestoreStagingCommand;
+        if (scope.rewrite != null or scope.empty_generation) return error.InvalidRestoreStagingCommand;
         return self.prepareRestoreStagingPageInternal(alloc, scope, source, max_rows, cancellation, null);
     }
 
@@ -37553,6 +40084,34 @@ pub const DB = struct {
         if (next.phase == .canceled) return error.RestoreStagingCanceled;
         if (next.phase == .reserved) return error.RestoreStagingInProgress;
         if (next.phase != .importing) return .{ .arena = arena, .phase = next.phase, .batch = null };
+        if (!next.source_generation_proofs_complete) {
+            const portable = @import("../portable_backup.zig");
+            var bootstrap = (try self.readRestoreStagingBootstrap(alloc)) orelse return error.RestoreSourceProofMissing;
+            defer bootstrap.deinit();
+            const expected_digest = bootstrap.value.source_generation_proof_digest orelse return error.RestoreSourceProofMissing;
+            if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &scope.digest())) return error.RestoreStagingScopeChanged;
+            var source_read = try source.core.store.beginReadTxn();
+            defer source_read.abort();
+            var proofs = try portable.sourceGenerationAdmissionProofPageAlloc(alloc, &source_read, scope.source_namespace);
+            defer proofs.deinit();
+            if (!std.mem.eql(u8, &expected_digest, &try portable.sourceGenerationAdmissionSummaryDigest(scope.source_namespace, proofs.entries)))
+                return error.RestoreSourceProofMissing;
+            const artifacts = try owned.alloc(staging.Artifact, proofs.artifacts.len);
+            for (proofs.artifacts, artifacts) |proof, *artifact| artifact.* = .{
+                .key = try owned.dupe(u8, proof.key),
+                .value = try owned.dupe(u8, proof.value),
+            };
+            next.source_generation_proofs_complete = true;
+            const encoded_progress = try next.encode(owned);
+            return .{ .arena = arena, .phase = next.phase, .batch = .{ .sync_level = .write, .restore_staging = .{ .import_page = .{
+                .expected = staging.digest(raw),
+                .next = encoded_progress,
+                .scope = scope.digest(),
+                .timestamps = &.{},
+                .source_generation_proof_page = true,
+                .artifacts = artifacts,
+            } } } };
+        }
         if (next.rewrite) |rewrite| if (rewrite.snapshot_complete) return .{ .arena = arena, .phase = next.phase, .batch = null };
         if (scope.preserve_artifacts and (!next.artifacts_complete or next.rows_complete)) {
             // Import immutable generated inputs before primary rows. Normal
@@ -37584,7 +40143,12 @@ pub const DB = struct {
             var artifacts: std.ArrayList(staging.Artifact) = .empty;
             var artifact_bytes: usize = 0;
             var examined_artifacts: usize = 0;
-            const artifact_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_ms;
+            // Artifact and projection passes only scan the immutable source;
+            // they often emit no writes. Give a bounded cursor turn enough
+            // time to amortize reopening the decoder and committing its
+            // continuation, while retaining per-record cancellation and the
+            // 1024-record/128-artifact/16 MiB page ceilings below.
+            const artifact_deadline = monotonicTimeNs() +| 100 * std.time.ns_per_ms;
             while (artifact_entry) |row| : (artifact_entry = try artifacts_cursor.next()) {
                 _ = record_arena.reset(.retain_capacity);
                 const scratch = record_arena.allocator();
@@ -37697,14 +40261,24 @@ pub const DB = struct {
         defer if (historical) |*view| view.release();
         var bytes: usize = 0;
         var examined: usize = 0;
-        const deadline = monotonicTimeNs() +| 5 * std.time.ns_per_ms;
+        const row_started = monotonicTimeNs();
+        const row_soft_deadline = row_started +| 5 * std.time.ns_per_ms;
+        const row_hard_deadline = row_started +| 100 * std.time.ns_per_ms;
         while (entry) |row| : (entry = try cursor.next()) {
             if (cancellation.isCancelled()) return error.Canceled;
             if (row.key.len == 0 or row.key[0] != internal_keys.user_namespace) {
                 entry = null;
                 break;
             }
-            if (writes.items.len == max_rows or examined == 1024 or (examined != 0 and monotonicTimeNs() >= deadline)) break;
+            if (writes.items.len == max_rows or examined == 1024) break;
+            if (examined != 0) {
+                const now = monotonicTimeNs();
+                // Restore pages pay a durable apply and index update each
+                // time. Amortize those costs over at least 32 ordinary rows
+                // when possible, but keep the 100 ms hard slice, row/byte/
+                // examined-record ceilings and per-record cancellation.
+                if (now >= row_hard_deadline or (writes.items.len >= 32 and now >= row_soft_deadline)) break;
+            }
             const document_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(owned, row.key)) orelse {
                 continuation_buffer.clearRetainingCapacity();
                 try continuation_buffer.appendSlice(alloc, row.key);
@@ -37836,6 +40410,19 @@ pub const DB = struct {
             return next.receipt();
         }
         if (phase == .validated) {
+            const bootstrap_raw = txn.get(staging.bootstrap_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (bootstrap_raw) |bytes| {
+                var bootstrap = try staging.OwnerBootstrap.decode(alloc, bytes);
+                defer bootstrap.deinit();
+                if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &scope)) return error.RestoreStagingScopeChanged;
+                if (bootstrap.value.source_generation_proof_digest) |expected_digest| {
+                    if (!next.source_generation_proofs_complete) return error.RestoreSourceProofMissing;
+                    try @import("restore_generation_admissions.zig").verifyImportedProofSummary(alloc, &txn, next.scope.source_namespace, expected_digest);
+                }
+            }
             if (self.core.acquireSchemaView()) |active| {
                 var view = active;
                 defer view.release();
@@ -39419,6 +42006,7 @@ pub const DB = struct {
     }
 
     pub fn scan(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !types.ScanResult {
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         const Collector = struct {
             alloc: Allocator,
             include_documents: bool,
@@ -39440,6 +42028,11 @@ pub const DB = struct {
                 errdefer collector.alloc.free(hash_id);
                 const row_cursor = if (entry.relational_cursor) |value| try collector.alloc.dupe(u8, value) else null;
                 errdefer if (row_cursor) |value| collector.alloc.free(value);
+                const json_null_fields = try types.cloneJsonNullFields(collector.alloc, entry.json_null_fields);
+                errdefer {
+                    for (json_null_fields) |field| collector.alloc.free(field);
+                    collector.alloc.free(json_null_fields);
+                }
                 if (collector.include_documents) {
                     const document_id = try collector.alloc.dupe(u8, entry.id);
                     errdefer collector.alloc.free(document_id);
@@ -39453,6 +42046,7 @@ pub const DB = struct {
                     .content_hash = entry.content_hash,
                     .relational_schema_version = entry.relational_schema_version,
                     .relational_cursor = row_cursor,
+                    .json_null_fields = json_null_fields,
                 });
             }
         };
@@ -39472,31 +42066,203 @@ pub const DB = struct {
         return .{ .hashes = hashes, .documents = documents };
     }
 
-    fn scanRelationalRowsVisit(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) !void {
-        if (opts.relational_query_json.len > 1024 * 1024 or opts.limit > 4096) return error.InvalidRelationalRowsRequest;
-        const Input = struct {
-            fields: []const []const u8,
-            index: ?[]const u8 = null,
-            after: ?[]const u8 = null,
-            lower: ?struct { values: []const std.json.Value, inclusive: bool = true } = null,
-            upper: ?struct { values: []const std.json.Value, inclusive: bool = true } = null,
-            conditions: []const struct {
-                column: []const u8,
-                op: @import("../relational_index.zig").RelationalCheckOp,
-                value: ?std.json.Value = null,
-                collation: ?[]const u8 = null,
-            } = &.{},
-            schema_version: ?u32 = null,
+    pub const StatementReadFence = struct {
+        primary: snapshot_admission_mod.SnapshotAdmission.CaptureLease,
+        replay: snapshot_admission_mod.SnapshotAdmission.CaptureLease,
+
+        pub fn release(fence: *StatementReadFence) void {
+            fence.replay.release();
+            fence.primary.release();
+        }
+    };
+
+    /// A short capture fence, not a transaction-long writer lock. The caller
+    /// captures every participating owner, pins their read views, then releases
+    /// every fence before reading rows. A busy participant requires releasing
+    /// ALL earlier fences before retrying: a prepared transaction may need one
+    /// of those owners to finish resolution. Never drain it under this fence.
+    pub fn tryStatementReadFence(self: *DB) !?StatementReadFence {
+        var primary = self.core.snapshot_admission.tryAcquireCapture() orelse return null;
+        errdefer primary.release();
+        var replay = self.core.snapshot_replay_admission.tryAcquireCapture() orelse {
+            primary.release();
+            return null;
         };
-        var parsed = std.json.parseFromSlice(Input, alloc, opts.relational_query_json, .{ .allocate = .alloc_always, .parse_numbers = false, .ignore_unknown_fields = true }) catch |err| switch (err) {
+        errdefer replay.release();
+        try self.ensurePrimaryOnlySnapshot();
+        var manager = try self.core.initTxnManager();
+        if (try manager.hasUnresolvedWriteIntents()) {
+            replay.release();
+            primary.release();
+            return null;
+        }
+        return .{ .primary = primary, .replay = replay };
+    }
+
+    /// Owns a retained schema/store snapshot and its authorization predicate.
+    /// The DB owner and request cancellation source must outlive this session;
+    /// no query, projection, bound or filter bytes are borrowed from the caller.
+    pub const RelationalReadSession = struct {
+        row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null,
+        range_proofs: ?[]@import("../range_protection.zig").Proof = null,
+        alloc: Allocator,
+        reader: RelationalRows.Reader = undefined,
+        filter_context: ?*anyopaque = null,
+        destroy_filter: ?*const fn (Allocator, *anyopaque) void = null,
+        cancellation: @FieldType(types.ScanOptions, "cancellation"),
+        deadline_ns: ?u64,
+
+        pub fn deinit(session: *RelationalReadSession) void {
+            if (session.range_proofs) |proofs| session.alloc.free(proofs);
+            session.reader.deinit();
+            if (session.filter_context) |filter| session.destroy_filter.?(session.alloc, filter);
+            if (session.row_policy_lease) |*lease| lease.release();
+            const owner = session.alloc;
+            owner.destroy(session);
+        }
+
+        pub fn checkpoint(session: *const RelationalReadSession) !void {
+            if (session.cancellation) |cancellation| try cancellation.check();
+            if (session.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            if (session.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        }
+        pub fn rangeProofs(session: *RelationalReadSession, alloc: Allocator) ![]@import("../range_protection.zig").Proof {
+            try session.checkpoint();
+            return alloc.dupe(@import("../range_protection.zig").Proof, session.range_proofs orelse return error.SqlRangeTrackingRequired);
+        }
+
+        pub fn nextTypedPage(session: *RelationalReadSession, alloc: Allocator, io: ?std.Io, budget: RelationalRows.Budget) !RelationalRows.Page {
+            try session.checkpoint();
+            var page = try session.reader.nextTypedPage(alloc, io, budget);
+            errdefer page.deinit();
+            try session.checkpoint();
+            return page;
+        }
+
+        /// Prepare logical rows under this reader's immutable schema epoch,
+        /// without publishing primary rows, index effects or transaction state.
+        /// SQL staging uses the same defaults/generated/CHECK pipeline as commit.
+        /// Each returned key/value and the outer slice belong to alloc.
+        pub fn normalizeRows(session: *RelationalReadSession, alloc: Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
+            if (writes.len > 4096) return error.InvalidArgument;
+            try session.checkpoint();
+            const view = session.reader.active;
+            const normalized = try alloc.alloc(types.BatchWrite, writes.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (normalized[0..initialized]) |write| {
+                    alloc.free(write.key);
+                    alloc.free(write.value);
+                    for (write.json_null_fields) |name| alloc.free(name);
+                    if (write.json_null_fields.len != 0) alloc.free(write.json_null_fields);
+                }
+                alloc.free(normalized);
+            }
+            var output_bytes: usize = 0;
+            for (writes, normalized) |write, *out| {
+                try session.checkpoint();
+                var prepared = try mapper.PreparedRelationalWrite.initTyped(alloc, alloc, alloc, false, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, false);
+                defer prepared.deinit(alloc);
+                try prepared.requireLogicalRoot();
+                const value = try std.json.Stringify.valueAlloc(alloc, prepared.parsedValue(), .{});
+                errdefer alloc.free(value);
+                output_bytes = std.math.add(usize, output_bytes, value.len +| write.key.len) catch return error.RelationalRowResultTooLarge;
+                if (output_bytes > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
+                const key = try alloc.dupe(u8, write.key);
+                errdefer alloc.free(key);
+                // Generated values can replace a submitted literal JSON null
+                // with SQL NULL. Return provenance from the prepared authority.
+                const typed = try prepared.typedView(view.tableSchema().*, view.physicalLayout());
+                var null_names = std.ArrayListUnmanaged([]const u8).empty;
+                defer null_names.deinit(alloc);
+                for (write.json_null_fields) |name| {
+                    const ordinal = typed.ordinalForName(name) orelse return error.InvalidBatchRequest;
+                    const cell = (try typed.findCell(ordinal)) orelse continue;
+                    if (!cell.is_null) try null_names.append(alloc, name);
+                }
+                const nulls = try types.cloneJsonNullFields(alloc, null_names.items);
+                out.* = .{ .key = key, .value = value, .json_null_fields = nulls };
+                initialized += 1;
+            }
+            try session.checkpoint();
+            return normalized;
+        }
+    };
+
+    pub const DocumentReadSession = @import("document_rows.zig").Session;
+
+    pub fn openDocumentReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*DocumentReadSession {
+        try self.maybeFinalizePendingRowPolicyPublication();
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        errdefer row_policy_lease.release();
+        try self.lockApplySharedForPortableRuntime();
+        var locked = true;
+        defer if (locked) self.core.unlockApplyShared();
+        var schema = self.core.acquireSchemaView();
+        defer if (schema) |*view| view.release();
+        const borrowed = self.core.byteRange();
+        const start = try alloc.dupe(u8, borrowed.start);
+        defer alloc.free(start);
+        const end = try alloc.dupe(u8, borrowed.end);
+        defer alloc.free(end);
+        const txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        const now = currentTimeNs();
+        self.core.unlockApplyShared();
+        locked = false;
+        const session = try DocumentReadSession.openSnapshot(alloc, self.core.store, txn, schema, .{ .start = start, .end = end }, from_key, to_key, opts, now);
+        session.row_policy_lease = row_policy_lease;
+        return session;
+    }
+
+    pub fn openRelationalReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*RelationalReadSession {
+        return self.openRelationalReadSessionAtSnapshot(alloc, from_key, to_key, opts, null);
+    }
+
+    pub fn openRelationalReadSessionAtSnapshot(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*RelationalStatementSnapshot) !*RelationalReadSession {
+        try self.maybeFinalizePendingRowPolicyPublication();
+        var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
+        defer if (verified_principal) |*proof| proof.deinit();
+        var row_policy_lease = if (opts.row_policy_principal_proof.len != 0) bound: {
+            if (opts.row_policy_principal_proof.len > row_policy_authority_mod.maximum_token_bytes or
+                opts.row_policy_database.len == 0) return error.RowPolicyAuthenticationRequired;
+            if (statement) |cut| if (cut.row_policy_phase != .active) return error.RowPolicyCatalogChanged;
+            const secret = self.row_policy_authority_secret orelse return error.RowPolicyAuthorityUnavailable;
+            const issuer = self.row_policy_authority_issuer orelse return error.RowPolicyAuthorityUnavailable;
+            const table = self.row_policy_table_name orelse return error.RowPolicyAuthorityUnavailable;
+            const now_seconds: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
+            verified_principal = try row_policy_authority_mod.verify(alloc, secret, issuer, .{
+                .table_id = self.core.identity_namespace.table_id,
+                .table = table,
+                .database = opts.row_policy_database,
+                .policy_generation = self.row_policy_gate.generation.load(.acquire),
+                .catalog_epoch = self.row_policy_gate.catalog_epoch.load(.acquire),
+            }, now_seconds, opts.row_policy_principal_proof);
+            if (statement) |cut| if (cut.row_policy_generation != verified_principal.?.value.policy_generation or
+                cut.row_policy_catalog_epoch != verified_principal.?.value.catalog_epoch) return error.RowPolicyCatalogChanged;
+            break :bound try self.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, now_seconds);
+        } else if (statement) |pinned_statement| blk: {
+            if (pinned_statement.row_policy_phase != .disabled) return error.RowPolicyAuthenticationRequired;
+            const lease = if (pinned_statement.row_policy_lease) |*active| active else return error.RowPolicyAuthenticationRequired;
+            break :blk lease.clone();
+        } else try self.row_policy_gate.enterRawRead();
+        errdefer row_policy_lease.release();
+        if (opts.relational_query_json.len > 1024 * 1024 or opts.limit > 4096) return error.InvalidRelationalRowsRequest;
+        const session = try alloc.create(RelationalReadSession);
+        errdefer alloc.destroy(session);
+        session.* = .{ .alloc = alloc, .cancellation = opts.cancellation, .deadline_ns = opts.execution_deadline_ns };
+        try session.checkpoint();
+        const Input = types.RelationalRowQuery;
+        var parsed_json: ?std.json.Parsed(Input) = if (opts.relational_query == null) std.json.parseFromSlice(Input, alloc, opts.relational_query_json, .{ .allocate = .alloc_always, .parse_numbers = false, .ignore_unknown_fields = true }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidRelationalRowsRequest,
-        };
-        defer parsed.deinit();
+        } else null;
+        defer if (parsed_json) |*owned| owned.deinit();
+        const parsed = .{ .value = opts.relational_query orelse parsed_json.?.value };
         if (parsed.value.conditions.len > 256 or parsed.value.fields.len > 256) return error.InvalidRelationalRowsRequest;
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
         defer view.release();
         if (view.storageMode() != .relational) return error.RelationalTableRequired;
+        if (opts.include_range_proofs and view.tableSchema().ttl_duration_ns != 0) return error.UnsupportedSqlExecution;
         if (parsed.value.schema_version) |version| if (version != view.version()) return error.PreparedGenerationChanged;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -39535,22 +42301,32 @@ pub const DB = struct {
         }
         const Filter = struct {
             alloc: Allocator,
-            source: db_query_graph.PreparedPatternFilter,
+            source: ?db_query_graph.PreparedPatternFilter = null,
+            policy: ?*row_policy_bundle_mod.ReadEvaluation = null,
             bound: ?db_query_graph.PreparedOrdinalPatternFilter = null,
             version: ?u32 = null,
 
             fn deinit(filter: *@This()) void {
                 if (filter.bound) |*bound| bound.deinit();
-                filter.source.deinit();
+                if (filter.source) |*source| source.deinit();
+                if (filter.policy) |policy| policy.deinit();
+            }
+
+            fn destroy(owner: Allocator, raw: *anyopaque) void {
+                const filter: *@This() = @ptrCast(@alignCast(raw));
+                filter.deinit();
+                owner.destroy(filter);
             }
 
             fn matches(raw: *anyopaque, temporary: Allocator, key: []const u8, row: relational_row_codec.OrdinalRowView) !bool {
                 const filter: *@This() = @ptrCast(@alignCast(raw));
+                if (filter.policy) |policy| if (!try policy.permits(row)) return false;
+                const source = if (filter.source) |*active| active else return true;
                 if (filter.version == null or filter.version.? != row.table_schema.version) {
                     if (filter.bound) |*bound| bound.deinit();
                     filter.bound = null;
                     filter.version = null;
-                    filter.bound = try db_query_graph.PreparedOrdinalPatternFilter.init(filter.alloc, &filter.source, row.table_schema, row.layout);
+                    filter.bound = try db_query_graph.PreparedOrdinalPatternFilter.init(filter.alloc, source, row.table_schema, row.layout);
                     filter.version = row.table_schema.version;
                 }
                 if (try filter.bound.?.matches(temporary, key, row)) |matched| return matched;
@@ -39559,13 +42335,27 @@ pub const DB = struct {
                 // projection or silently omit the security predicate.
                 const json = try row.reconstructValueAlloc(temporary);
                 defer temporary.free(json);
-                return try filter.source.matchesStored(temporary, key, json);
+                return try source.matchesStored(temporary, key, json);
             }
         };
-        var filter = if (opts.filter_query_json.len != 0) Filter{ .alloc = alloc, .source = try db_query_graph.PreparedPatternFilter.init(alloc, opts.filter_query_json) } else null;
-        defer if (filter) |*active| active.deinit();
-        var reader = try self.beginRelationalRows(alloc, .{
+        const filter: ?*Filter = if (opts.filter_query_json.len != 0 or verified_principal != null) blk: {
+            const active = try alloc.create(Filter);
+            errdefer alloc.destroy(active);
+            active.* = .{ .alloc = alloc };
+            errdefer active.deinit();
+            if (opts.filter_query_json.len != 0)
+                active.source = try db_query_graph.PreparedPatternFilter.init(alloc, opts.filter_query_json);
+            if (verified_principal) |*proof| {
+                const bundle = if (self.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
+                active.policy = try bundle.captureReadEvaluation(alloc, view.tableSchema().*, &proof.value);
+            }
+            break :blk active;
+        } else null;
+        errdefer if (filter) |active| Filter.destroy(alloc, active);
+        session.reader = try self.beginRelationalRowsAtSnapshot(alloc, .{
             .index = parsed.value.index,
+            .auto_index = parsed.value.auto_index,
+            .include_primary_digest = opts.include_content_hashes,
             .include_cursor = parsed.value.index != null,
             .after = parsed.value.after,
             .lower = lower,
@@ -39575,19 +42365,50 @@ pub const DB = struct {
             .primary_lower = if (from_key.len != 0) .{ .key = from_key, .inclusive = opts.inclusive_from } else null,
             .primary_upper = if (to_key.len != 0) .{ .key = to_key, .inclusive = !opts.exclusive_to } else null,
             .expected_schema_version = parsed.value.schema_version orelse view.version(),
-            .row_filter = if (filter) |*active| .{ .context = active, .matches = Filter.matches } else null,
-        });
-        defer reader.deinit();
+            .row_filter = if (filter) |active| .{ .context = active, .matches = Filter.matches } else null,
+        }, statement);
+        session.filter_context = filter;
+        session.destroy_filter = Filter.destroy;
+        errdefer session.reader.deinit();
+        if (opts.include_range_proofs) {
+            const tracking = @import("../range_protection.zig");
+            if (session.reader.index) |index| {
+                const prefix = try @import("relational_index_records.zig").forwardPrefix(index.id());
+                const next = if (parsed.value.after == null and lower != null and upper != null and
+                    lower.?.inclusive and upper.?.inclusive and
+                    lower.?.values.len == index.tuple.keys.len and upper.?.values.len == index.tuple.keys.len and
+                    std.mem.startsWith(u8, session.reader.lower, &prefix) and session.reader.lower.len > prefix.len)
+                    try internal_keys.nextPrefixAlloc(scratch, session.reader.lower)
+                else
+                    null;
+                if (next) |exclusive_end| {
+                    if (std.mem.eql(u8, exclusive_end, session.reader.upper)) {
+                        session.range_proofs = try tracking.captureIndex(alloc, &session.reader.read, index.id().encode(), session.reader.lower[prefix.len..]);
+                    }
+                }
+            }
+            if (session.range_proofs == null) session.range_proofs = try tracking.capture(alloc, &session.reader.read, from_key, to_key);
+        }
+        session.row_policy_lease = row_policy_lease;
+        return session;
+    }
+
+    fn scanRelationalRowsVisit(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) !void {
+        const session = try self.openRelationalReadSession(alloc, from_key, to_key, opts);
+        defer session.deinit();
+        const reader = &session.reader;
         const limit = if (opts.limit == 0) @as(u32, 128) else opts.limit;
         var delivered: usize = 0;
         var remaining_bytes: usize = 16 * 1024 * 1024;
         while (delivered < limit) {
+            try session.checkpoint();
             if (opts.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Canceled;
             if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
             if (remaining_bytes == 0) return error.RelationalRowResultTooLarge;
             var page = try reader.nextPage(alloc, self.backend_runtime.io(), .{ .rows = @min(128, limit - delivered), .output_bytes = remaining_bytes });
             defer page.deinit();
             for (page.rows) |row| {
+                try session.checkpoint();
                 if (opts.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Canceled;
                 try visitor.visit(visitor.context, .{
                     .id = row.key,
@@ -39595,6 +42416,7 @@ pub const DB = struct {
                     .content_hash = if (opts.include_content_hashes) row.semantic_hash else null,
                     .relational_schema_version = reader.active.version(),
                     .relational_cursor = row.cursor,
+                    .json_null_fields = row.json_null_fields,
                     .document_json = if (opts.include_documents) row.json else null,
                 });
                 delivered += 1;
@@ -39616,7 +42438,10 @@ pub const DB = struct {
         opts: types.ScanOptions,
         visitor: types.ScanVisitor,
     ) !void {
-        if (opts.relational_query_json.len != 0) return self.scanRelationalRowsVisit(alloc, from_key, to_key, opts, visitor);
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (opts.isRelational()) return self.scanRelationalRowsVisit(alloc, from_key, to_key, opts, visitor);
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         const projection_plan = db_query_projection.buildLookupFieldSelectionPlan(.{
             .fields = opts.fields,
             .include_all_fields = opts.include_all_fields,
@@ -40019,6 +42844,9 @@ pub const DB = struct {
     /// with multiple dense lanes intentionally leave it unset rather than
     /// publishing an ambiguous aggregate.
     pub fn searchWithDenseProfile(self: *DB, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        var row_policy_lease = try self.row_policy_gate.enterUnsupportedSearch();
+        defer row_policy_lease.release();
         try self.enforcePortableRuntimeGate();
         if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
         defer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
@@ -40060,6 +42888,7 @@ pub const DB = struct {
     /// wait for another apply barrier while this lease excludes writers.
     pub const QueryReadLease = struct {
         db: *DB,
+        row_policy_lease: row_policy_gate_mod.Gate.Lease,
 
         pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
             const db = self.db;
@@ -40080,18 +42909,22 @@ pub const DB = struct {
             const db = self.db;
             db.core.unlockApplyShared();
             if (db.async_context.resource_manager) |manager| manager.finishForegroundQuery();
+            self.row_policy_lease.release();
             self.* = undefined;
         }
     };
 
     pub fn beginQueryReadLease(self: *DB) !QueryReadLease {
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        var row_policy_lease = try self.row_policy_gate.enterUnsupportedSearch();
+        errdefer row_policy_lease.release();
         if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
         errdefer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
         try self.enforcePortableRuntimeGate();
         lockApplyShared(self);
         errdefer self.core.unlockApplyShared();
         try self.enforcePortableRuntimeGate();
-        return .{ .db = self };
+        return .{ .db = self, .row_policy_lease = row_policy_lease };
     }
 
     pub fn searchWithExecutionContext(
@@ -40109,6 +42942,9 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !SearchWithCapturedRequestResult {
+        if (self.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        var row_policy_lease = try self.row_policy_gate.enterUnsupportedSearch();
+        defer row_policy_lease.release();
         if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
         defer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
         // Keep degraded requests out of catalog/apply lock queues. Revalidate
@@ -40178,6 +43014,9 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
+        if ((req.query == .graph or req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.graph_metric_rerank != null or req.graph_query_transport != null) and
+            !self.core.index_manager.graphRetirementAdmissionOpen())
+            return error.IntegrityTopologyBusy;
         // Validate canonical collapse-and-expand work before executing the
         // primary selection query. This protects direct storage callers and
         // internal worker envelopes in addition to the public API boundary.
@@ -41127,6 +43966,8 @@ pub const DB = struct {
     }
 
     pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        var row_policy_lease = try self.row_policy_gate.enterUnsupportedSearch();
+        defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectSearchRequestTextStats(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{
@@ -41165,6 +44006,8 @@ pub const DB = struct {
         max_work: u32,
         exec_ctx: types.ExecutionContext,
     ) !planning_stats_mod.PlanningStatsSummary {
+        var row_policy_lease = try self.row_policy_gate.enterUnsupportedSearch();
+        defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try self.collectPlanningStatsLocked(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), max_work, exec_ctx);
@@ -41213,6 +44056,8 @@ pub const DB = struct {
     }
 
     pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        var row_policy_lease = try self.row_policy_gate.enterUnsupportedSearch();
+        defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
@@ -41227,6 +44072,8 @@ pub const DB = struct {
         alloc: Allocator,
         requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
     ) ![]const aggregations_mod.DistributedBackgroundTextStats {
+        var row_policy_lease = try self.row_policy_gate.enterUnsupportedSearch();
+        defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
@@ -41842,6 +44689,8 @@ pub const DB = struct {
         req: types.SearchRequest,
         dense: types.DenseKnnQuery,
     ) !ProfiledDenseSearchWithCapturedRequestResult {
+        var row_policy_lease = try self.row_policy_gate.enterUnsupportedSearch();
+        defer row_policy_lease.release();
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         try self.enforcePortableRuntimeGate();
         if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
@@ -42791,7 +45640,12 @@ pub const DB = struct {
     }
 
     fn publishedDenseRequestEligible(req: types.SearchRequest) bool {
-        if (req.graph_queries.len != 0) return false;
+        // Graph execution must hold apply-shared from the retirement-gate
+        // check through the entire read. The published-dense lease only pins
+        // dense catalog entries and cannot fence a concurrent graph seal.
+        if (req.query == .graph or req.graph_queries.len != 0 or
+            req.graph_metric_queries.len != 0 or req.graph_metric_rerank != null or
+            req.graph_query_transport != null) return false;
         if (req.full_text != null or req.sparse != null) return false;
         if (req.full_text_queries.len != 0 or req.dense_queries.len != 0 or req.sparse_queries.len != 0) return false;
         if (req.merge_config != null) return false;
@@ -43173,6 +46027,7 @@ pub const DB = struct {
     ) ![]types.SearchHit {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
 
         const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
         var admission = try self.filterGraphKeysWithOrdinalsAlloc(
@@ -43217,8 +46072,11 @@ pub const DB = struct {
         expected: index_manager_mod.IndexManager.CoverageIdentity,
         identity_read_generation: ?u64,
     ) ![]bool {
+        var row_policy_lease = try self.row_policy_gate.enterRaw();
+        defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         // Validate under the same apply lease as the reverse snapshot. A
         // out-of-lease check can race index replacement and certify an
         // old index's negative answers under the new incarnation's cache key.
@@ -55595,6 +58453,13 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     if (index_stage) |*stage| {
         const effects = try stage.seal();
+        var forward_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer forward_keys.deinit(ctx.alloc);
+        for (effects.writes) |effect| if (relational_index_records.isForwardKey(effect.key))
+            try forward_keys.append(ctx.alloc, effect.key);
+        for (effects.deletes) |key| if (relational_index_records.isForwardKey(key))
+            try forward_keys.append(ctx.alloc, key);
+        try manager.checkIndexForwardWriteConflicts(forward_keys.items);
         try store_writes.appendSlice(ctx.alloc, effects.writes);
         try delete_keys.appendSlice(ctx.alloc, effects.deletes);
     }
@@ -55951,12 +58816,13 @@ const DurableHAOutboxKind = enum {
     replay,
     schema,
     restore_batch,
+    row_policy,
 
     fn recordKind(self: @This()) ha_replication_record_mod.RecordKind {
         return switch (self) {
             .batch, .restore_batch => .batch_mutation,
             .replay => .derived_effect,
-            .schema => .metadata_mutation,
+            .schema, .row_policy => .metadata_mutation,
         };
     }
 };
@@ -55996,7 +58862,7 @@ fn recoverDurableHAOutboxContext(
                 .shard_id = ctx.identity_namespace.shard_id,
                 .table_id = ctx.identity_namespace.table_id,
             }),
-            .schema => ha_effects_mod.appendEncodedSchemaMetadataMutation(mirror.primary, outbox.payload, .{
+            .schema, .row_policy => ha_effects_mod.appendEncodedSchemaMetadataMutation(mirror.primary, outbox.payload, .{
                 .shard_id = ctx.identity_namespace.shard_id,
                 .table_id = ctx.identity_namespace.table_id,
             }),
@@ -56004,7 +58870,7 @@ fn recoverDurableHAOutboxContext(
             switch (kind) {
                 .batch, .restore_batch => noteHAMirrorFailure(mirror, "batch mutation recovery", err),
                 .replay => noteHAMirrorFailure(mirror, "derived effect recovery", err),
-                .schema => noteHAMirrorFailure(mirror, "metadata mutation recovery", err),
+                .schema, .row_policy => noteHAMirrorFailure(mirror, "metadata mutation recovery", err),
             }
             return err;
         };
@@ -74456,6 +77322,54 @@ test "relational rows snapshot projects exact composite ranges through writes DD
         if ((try db.relationalIndexBuildStatus("tenant_id")).state == .ready) break;
         _ = try db.buildRelationalIndexStep("tenant_id", .{});
     }
+    {
+        // Native SQL scans hand the storage reader typed conjunctions and let
+        // it choose a READY index. The two equality predicates must bind the
+        // compound key, including its descending suffix, without widening the
+        // read to a primary-table scan or exposing an index name to callers.
+        const PlanningAllocator = struct {
+            db: *DB,
+            blocked: bool = false,
+            allocations: usize = 0,
+
+            fn allocate(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.allocations += 1;
+                if (self.db.core.tryLockApplyExclusive()) self.db.core.unlockApplyExclusive() else self.blocked = true;
+                return std.testing.allocator.rawAlloc(len, alignment, ret);
+            }
+            fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+                return false;
+            }
+            fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+                return null;
+            }
+            fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+                std.testing.allocator.rawFree(memory, alignment, ret);
+            }
+            fn allocator(self: *@This()) Allocator {
+                return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+            }
+        };
+        var planning: PlanningAllocator = .{ .db = &db };
+        var automatic = try db.beginRelationalRows(planning.allocator(), .{
+            .auto_index = true,
+            .fields = &.{"id"},
+            .conditions = &.{
+                .{ .column = "tenant", .op = .eq, .value = .{ .integer = 1 } },
+                .{ .column = "id", .op = .eq, .value = .{ .integer = 9007199254740993 } },
+            },
+        });
+        defer automatic.deinit();
+        try std.testing.expect(planning.allocations != 0);
+        try std.testing.expect(!planning.blocked);
+        try std.testing.expectEqualStrings("tenant_id", automatic.index.?.name);
+        var page = try automatic.nextPage(alloc, null, .{});
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqualStrings("b", page.rows[0].key);
+        try std.testing.expectEqualStrings("{\"id\":9007199254740993}", page.rows[0].json);
+    }
     var wrong = request;
     wrong.lower = .{ .values = &.{.{ .number = 1 }} };
     try std.testing.expectError(error.InvalidRelationalIndexBound, db.beginRelationalRows(alloc, wrong));
@@ -74545,6 +77459,34 @@ test "relational rows snapshot projects exact composite ranges through writes DD
         });
         defer excluded.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 0), excluded.hashes.len);
+        // Session owns compiled query/filter bytes and keeps the original
+        // snapshot even after caller buffers and live row values change.
+        const query_copy = try alloc.dupe(u8, query);
+        defer alloc.free(query_copy);
+        const filter_copy = try alloc.dupe(u8, "{\"doc_id\":[\"b\"]}");
+        defer alloc.free(filter_copy);
+        var cancel = std.atomic.Value(bool).init(false);
+        const session = try db.openRelationalReadSession(alloc, "", "", .{
+            .relational_query_json = query_copy,
+            .filter_query_json = filter_copy,
+            .limit = 16,
+            .cancellation = types.CancellationToken.fromAtomic(&cancel),
+        });
+        defer session.deinit();
+        @memset(query_copy, 'x');
+        @memset(filter_copy, 'x');
+        try db.batch(.{ .timestamp_ns = 300, .writes = &.{.{ .key = "b", .value = "{\"tenant\":1,\"id\":2}" }} });
+        var typed = try session.nextTypedPage(alloc, null, .{});
+        defer typed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), typed.rows.len);
+        try std.testing.expectEqualStrings("b", typed.rows[0].key);
+        try std.testing.expectEqual(@as(i64, 1), typed.rows[0].typed.?.object.get("id").?.integer);
+        cancel.store(true, .release);
+        try std.testing.expectError(error.Canceled, session.nextTypedPage(alloc, null, .{}));
+        try std.testing.expectError(error.DeadlineExceeded, db.openRelationalReadSession(alloc, "", "", .{
+            .relational_query_json = query,
+            .execution_deadline_ns = 0,
+        }));
     }
 }
 
@@ -78682,6 +81624,236 @@ test "relational columnar bounded compaction splits empty ranges and resumes can
     try std.testing.expectEqual(@as(usize, 1), inserted.documents.len);
     try std.testing.expectEqualStrings("{\"n\":42}", inserted.documents[0].json);
     try std.testing.expect(try db.rebuildRelationalColumns());
+}
+
+test "row-policy backup checkpoint revokes a pre-policy export before its next block" {
+    var gate = row_policy_gate_mod.Gate.init(.{
+        .mode_initialized = true,
+        .storage_mode = .relational,
+        .active_schema_version = 1,
+    });
+    var lease = try gate.enterRawRead();
+    defer lease.release();
+    const checkpoint: RowPolicyOutputCheckpoint = .{ .upstream = .none, .lease = &lease };
+    try checkpoint.token().check();
+    try gate.beginPreparing(.disabled);
+    try std.testing.expectError(error.RowPolicyCatalogChanged, checkpoint.token().check());
+}
+
+test "row-policy Raft apply persists fail-closed intent and finalizes after restart" {
+    const alloc = std.testing.allocator;
+    var test_tmp = try TestDirectory.init("row-policy-pending");
+    defer test_tmp.cleanup();
+    const path = std.mem.span(test_tmp.path().ptr);
+    const namespace: DocIdentityNamespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
+    const options: OpenOptions = .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false };
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    var bundle_bytes: []u8 = undefined;
+    var request: @import("../../system_catalog/policies.zig").InstallRequest = undefined;
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_json);
+        const schema = db.core.schema.?;
+        const schema_bytes = try schema_mod.serializeSchema(alloc, schema);
+        defer alloc.free(schema_bytes);
+        var schema_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(schema_bytes, &schema_digest, .{});
+        const policy: @import("../../system_catalog/policies.zig").Record = .{
+            .id = 1,
+            .generation = 1,
+            .table_id = namespace.table_id,
+            .schema_version = schema.version,
+            .schema_digest = schema_digest,
+            .name = "visible",
+            .commands = .{ .select = true },
+            .roles = &.{"PUBLIC"},
+            .using = .{ .instructions = &.{
+                .{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } },
+            }, .root = 0 },
+        };
+        bundle_bytes = try std.json.Stringify.valueAlloc(alloc, @import("../../system_catalog/policies.zig").InstallSnapshot{
+            .table_id = namespace.table_id,
+            .schema_version = schema.version,
+            .schema_digest = schema_digest,
+            .policy_generation = 1,
+            .catalog_epoch = 2,
+            .phase = .pending_install,
+            .records = &.{policy},
+            .settings = &.{},
+        }, .{});
+        const range = db.core.byteRange();
+        request = .{
+            .table_id = namespace.table_id,
+            .expected_generation = 1,
+            .expected_catalog_epoch = 2,
+            .expected_phase = .pending_install,
+            .owner_group_id = 17,
+            .expected_descriptor_digest = try (@import("../../system_catalog/policies.zig").OwnerDescriptor{
+                .table_id = namespace.table_id,
+                .group_id = 17,
+                .shard_id = namespace.shard_id,
+                .range_id = namespace.range_id,
+                .schema_version = schema.version,
+                .schema_digest = schema_digest,
+                .range_start = range.start,
+                .range_end = range.end,
+            }).digest(),
+        };
+        var old_reader = try db.row_policy_gate.enterRaw();
+        const delayed_scan = try db.openRelationalReadSession(alloc, "", "", .{ .relational_query = .{ .fields = &.{"id"} } });
+        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(bundle_bytes, request, .{ .term = 3, .index = 11 })) == null);
+        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, db.core.table_catalog.row_policy_phase);
+        try std.testing.expectError(error.RowPolicyAuthenticationRequired, db.row_policy_gate.enterRaw());
+        try std.testing.expectError(error.RowPolicyCatalogChanged, delayed_scan.nextTypedPage(alloc, null, .{}));
+        try std.testing.expectError(error.RowPolicyReadersActive, db.loadRowPolicyReceipt(1, .pending_install));
+        delayed_scan.deinit();
+        old_reader.release();
+        // The applied marker is already durable; reopening must retain the
+        // preparing barrier and complete only from the committed intent.
+    }
+    defer alloc.free(bundle_bytes);
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, db.row_policy_gate.currentPhase());
+        try std.testing.expectError(error.RowPolicyAuthenticationRequired, db.row_policy_gate.enterRaw());
+        const receipt = try db.loadRowPolicyReceipt(1, .pending_install);
+        try std.testing.expectEqual(@as(u64, 3), receipt.applied_term);
+        try std.testing.expectEqual(@as(u64, 11), receipt.applied_index);
+        try std.testing.expectEqualDeep(receipt, (try db.applyReplicatedRowPolicyPublication(bundle_bytes, request, .{ .term = 3, .index = 11 })).?);
+        var parsed = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, bundle_bytes, .{});
+        defer parsed.deinit();
+        parsed.value.phase = .serving_install;
+        const serving_bytes = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        defer alloc.free(serving_bytes);
+        request.expected_phase = .serving_install;
+        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(serving_bytes, request, .{ .term = 3, .index = 12 })) == null);
+        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, db.row_policy_gate.currentPhase());
+        const serving_receipt = try db.loadRowPolicyReceipt(1, .serving_install);
+        try std.testing.expectEqual(@as(u64, 12), serving_receipt.applied_index);
+        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, db.row_policy_gate.currentPhase());
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, row_policy_bundle_mod.pending_key));
+    }
+    {
+        var reopened = try DB.open(alloc, path, options);
+        defer reopened.close();
+        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, reopened.row_policy_gate.currentPhase());
+        try std.testing.expect(reopened.row_policy_bundle != null);
+        try std.testing.expectError(error.RowPolicyAuthenticationRequired, reopened.row_policy_gate.enterRaw());
+    }
+    {
+        // A serving policy must survive a primary reopen with the ordered
+        // batch and metadata mirrors attached; raw callers remain denied.
+        var log_tmp = try TestDirectory.init("row-policy-ha-log");
+        defer log_tmp.cleanup();
+        var slots_tmp = try TestDirectory.init("row-policy-ha-slots");
+        defer slots_tmp.cleanup();
+        var primary = try ha_primary_mod.Primary.open(alloc, std.mem.span(log_tmp.path().ptr), std.mem.span(slots_tmp.path().ptr), .{
+            .cluster_id = 1,
+            .shard_id = namespace.shard_id,
+            .table_id = namespace.table_id,
+            .timeline_id = 1,
+            .epoch = 1,
+        }, .{});
+        defer primary.close();
+        var mirrored_options = options;
+        mirrored_options.ha_async_batch_mirror = .{ .primary = &primary };
+        mirrored_options.ha_async_metadata_mirror = .{ .primary = &primary };
+        var mirrored = try DB.open(alloc, path, mirrored_options);
+        defer mirrored.close();
+        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, mirrored.row_policy_gate.currentPhase());
+        try std.testing.expectError(error.RowPolicyAuthenticationRequired, mirrored.row_policy_gate.enterRaw());
+    }
+    var follower_tmp = try TestDirectory.init("row-policy-follower");
+    defer follower_tmp.cleanup();
+    var follower = try DB.open(alloc, std.mem.span(follower_tmp.path().ptr), options);
+    defer follower.close();
+    try follower.setSchemaJson(alloc, schema_json);
+    var pending_request = request;
+    pending_request.expected_phase = .pending_install;
+    var follower_reader = try follower.row_policy_gate.enterRaw();
+    try std.testing.expect((try follower.applyReplicatedRowPolicyPublication(bundle_bytes, pending_request, .{ .term = 3, .index = 11 })) == null);
+    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, follower.row_policy_gate.currentPhase());
+    var follower_bundle = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, bundle_bytes, .{});
+    defer follower_bundle.deinit();
+    follower_bundle.value.phase = .serving_install;
+    const follower_serving_bytes = try std.json.Stringify.valueAlloc(alloc, follower_bundle.value, .{});
+    defer alloc.free(follower_serving_bytes);
+    pending_request.expected_phase = .serving_install;
+    try std.testing.expect((try follower.applyReplicatedRowPolicyPublication(follower_serving_bytes, pending_request, .{ .term = 3, .index = 12 })) == null);
+    // No receipt probe ran for pending_install on this follower. Catch-up
+    // must advance the committed fail-closed intent rather than stall Raft.
+    try std.testing.expectError(error.NotFound, follower.loadRowPolicyReceipt(1, .pending_install));
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, follower.get(alloc, "row:unseen"));
+    try std.testing.expectError(error.RowPolicyReadersActive, follower.loadRowPolicyReceipt(1, .serving_install));
+    follower_reader.release();
+    const follower_receipt = try follower.loadRowPolicyReceipt(1, .serving_install);
+    try std.testing.expectEqual(@as(u64, 12), follower_receipt.applied_index);
+    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, follower.row_policy_gate.currentPhase());
+
+    var next_bundle = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, bundle_bytes, .{});
+    defer next_bundle.deinit();
+    next_bundle.value.policy_generation = 2;
+    next_bundle.value.catalog_epoch = 3;
+    next_bundle.value.phase = .pending_disable;
+    const candidate_bytes = try std.json.Stringify.valueAlloc(alloc, next_bundle.value, .{});
+    defer alloc.free(candidate_bytes);
+    var candidate_request = request;
+    candidate_request.expected_generation = 2;
+    candidate_request.expected_catalog_epoch = 3;
+    candidate_request.expected_phase = .pending_disable;
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        const candidate_receipt = (try db.applyReplicatedRowPolicyPublication(candidate_bytes, candidate_request, .{ .term = 3, .index = 13 })).?;
+        try std.testing.expectEqual(@as(u64, 13), candidate_receipt.applied_index);
+        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, db.row_policy_gate.currentPhase());
+        try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_policy_generation);
+        try std.testing.expect(db.row_policy_bundle != null);
+    }
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        // A staged candidate does not replace the serving policy on restart.
+        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, db.row_policy_gate.currentPhase());
+        try std.testing.expectEqual(@as(u64, 1), db.row_policy_bundle.?.parsed.value.policy_generation);
+        const old_principal: row_policy_authority_mod.Payload = .{
+            .principal = "alice",
+            .roles = &.{},
+            .auth_revision = 1,
+            .table_id = namespace.table_id,
+            .table = "table:7",
+            .database = "main",
+            .policy_generation = 1,
+            .catalog_epoch = 2,
+            .access = .read,
+            .expires = 130,
+        };
+        var old_reader = try db.row_policy_gate.enterVerifiedPrincipal(&old_principal, 100);
+        try old_reader.checkAt(100);
+        next_bundle.value.phase = .serving_disable;
+        const serving_bytes = try std.json.Stringify.valueAlloc(alloc, next_bundle.value, .{});
+        defer alloc.free(serving_bytes);
+        candidate_request.expected_phase = .serving_disable;
+        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(serving_bytes, candidate_request, .{ .term = 3, .index = 14 })) == null);
+        try std.testing.expectError(error.RowPolicyCatalogChanged, old_reader.checkAt(100));
+        try std.testing.expectError(error.RowPolicyReadersActive, db.loadRowPolicyReceipt(2, .serving_disable));
+        old_reader.release();
+        _ = try db.loadRowPolicyReceipt(2, .serving_disable);
+        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, db.row_policy_gate.currentPhase());
+        next_bundle.value.phase = .disabled;
+        const disabled_bytes = try std.json.Stringify.valueAlloc(alloc, next_bundle.value, .{});
+        defer alloc.free(disabled_bytes);
+        candidate_request.expected_phase = .disabled;
+        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(disabled_bytes, candidate_request, .{ .term = 3, .index = 15 })) == null);
+        _ = try db.loadRowPolicyReceipt(2, .disabled);
+        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.disabled, db.row_policy_gate.currentPhase());
+        var raw = try db.row_policy_gate.enterRawRead();
+        raw.release();
+    }
 }
 
 test "db relational mode stores authoritative packed rows across reopen scan and delete" {
@@ -85247,6 +88419,168 @@ test "db direct graph writes record graph artifacts in the replay stream instead
 
     try std.testing.expectEqual(@as(usize, 1), journal_record.record.changed_artifact_keys.len);
     try std.testing.expect(internal_keys.isGraphEdgeArtifactKey(journal_record.record.changed_artifact_keys[0]));
+}
+
+test "graph rerank read pins apply across retirement seal admission" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("graph-retirement-read-pin");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+
+    var request: types.SearchRequest = .{ .dense = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } };
+    try std.testing.expect(DB.publishedDenseRequestEligible(request));
+    request.graph_metric_rerank = .{ .index_name = "links", .metric_name = "rank" };
+    try std.testing.expect(!DB.publishedDenseRequestEligible(request));
+    {
+        const access = db.beginDenseSearchAccess(request);
+        defer db.endDenseSearchAccess(access);
+        try std.testing.expectEqual(DB.DenseSearchAccess.apply_shared, access);
+        // The Raft seal takes apply-exclusive before closing the graph gate;
+        // it cannot cross this in-flight graph read after its gate check.
+        try std.testing.expect(!db.core.tryLockApplyExclusive());
+    }
+    try std.testing.expect(db.core.tryLockApplyExclusive());
+    db.core.unlockApply();
+
+    request.graph_metric_rerank = null;
+    request.graph_metric_queries = &.{.{ .name = "metric", .query = .{ .index_name = "links", .metric_name = "rank" } }};
+    try std.testing.expect(!DB.publishedDenseRequestEligible(request));
+    request.graph_metric_queries = &.{};
+    const anchor: u8 = 0;
+    request.graph_query_transport = .{ .dialect = .canonical, .operations_json = "{}", .admitted_operations_ptr = &anchor, .admitted_operations_len = 0 };
+    try std.testing.expect(!DB.publishedDenseRequestEligible(request));
+}
+
+test "storage.hot_standby graph retirement seal replays exact Raft receipt and rejects missing marker" {
+    const alloc = std.testing.allocator;
+    const ha_effects = @import("../hot_standby/effects.zig");
+    const seal = @import("graph_retirement_seal.zig");
+    var path_tmp = try TestDirectory.init("graph-retirement-ha-replay");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const namespace: doc_identity.Namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 };
+    var db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false });
+    var db_open = true;
+    defer if (db_open) db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":0,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 1 });
+    const graph_digest = (try db.core.index_manager.graphRetirementConfigDigest(alloc)) orelse return error.TestUnexpectedResult;
+    const catalog = try db.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+    defer alloc.free(catalog);
+    var catalog_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(catalog, &catalog_digest, .{});
+    const scope: seal.Scope = .{
+        .fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .admission_epoch = 1, .peer_group_id = 401, .owner_group_id = 301, .namespace = namespace, .catalog_digest = catalog_digest },
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .target_table_id = 10,
+        .graph_config_digest = graph_digest,
+    };
+    const begin_req: types.BatchRequest = .{ .relational_topology = .{ .action = .begin, .fence = scope.fence, .graph_retirement = scope } };
+    const begin_payload = try ha_effects.encodeBatchMutationRequestAlloc(alloc, begin_req);
+    defer alloc.free(begin_payload);
+    var record: ha_replication_record_mod.RecordView = .{
+        .kind = .batch_mutation,
+        .payload_codec = .json,
+        .cluster_id = 1,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .table_id = namespace.table_id,
+        .shard_id = namespace.shard_id,
+        .payload = begin_payload,
+    };
+    try db.applyHAReplicationRecord(record);
+    try std.testing.expect(!db.core.index_manager.graphRetirementAdmissionOpen());
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.findKShortestPaths(alloc, "links", "a", "b", 2, &.{}, .out, .min_hops, 4, null, null));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.matchPattern(alloc, "links", &.{"a"}, &.{}, 1, &.{}));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.search(alloc, .{
+        .graph_metric_queries = &.{.{ .name = "metric", .query = .{ .index_name = "links", .metric_name = "rank" } }},
+    }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.search(alloc, .{
+        .graph_metric_rerank = .{ .index_name = "links", .metric_name = "rank" },
+    }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.batch(.{
+        .graph_writes = &.{.{ .index_name = "links", .source = "a", .target = "b", .edge_type = "related", .weight = 1.0 }},
+    }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.runGraphMetricMaintenanceForIdle());
+    // The begin intent alone must rehydrate the closed gate before optional
+    // graph runtimes start. No seal receipt exists yet, so restart cannot
+    // accidentally treat the owner as either unguarded or completed.
+    db.close();
+    db_open = false;
+    db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false });
+    db_open = true;
+    try std.testing.expect(!db.core.index_manager.graphRetirementAdmissionOpen());
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const status = try seal.status(&read);
+        try std.testing.expect(status.intent.?.eql(scope));
+        try std.testing.expect(status.receipt == null);
+    }
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.search(alloc, .{
+        .graph_metric_rerank = .{ .index_name = "links", .metric_name = "rank" },
+    }));
+    const seal_req: types.BatchRequest = .{ .relational_topology = .{ .action = .seal_graph_retirement, .fence = scope.fence, .graph_retirement = scope } };
+    try std.testing.expectError(error.InvalidBatchRequest, db.applyRelationalTopologyControlWithHA(
+        .{ .action = .seal_graph_retirement, .fence = scope.fence },
+        .{ .term = 5, .index = 8 },
+        null,
+        null,
+    ));
+    const missing_marker = try std.json.Stringify.valueAlloc(alloc, ha_effects.BatchMutationPayload{ .schema_version = 9, .request = seal_req }, .{});
+    defer alloc.free(missing_marker);
+    record.lsn = 2;
+    record.previous_lsn = 1;
+    record.payload = missing_marker;
+    try std.testing.expectError(error.InvalidGraphRetirementSeal, db.applyHAReplicationRecord(record));
+    const invalid_marker = try std.json.Stringify.valueAlloc(alloc, ha_effects.BatchMutationPayload{ .schema_version = 9, .request = seal_req, .graph_retirement_raft_entry = .{ .term = 0, .index = 8 } }, .{});
+    defer alloc.free(invalid_marker);
+    record.payload = invalid_marker;
+    try std.testing.expectError(error.InvalidGraphRetirementSeal, db.applyHAReplicationRecord(record));
+    const sealed_payload = try ha_effects.encodeGraphRetirementSealMutationRequestAlloc(alloc, seal_req, .{ .term = 5, .index = 8 });
+    defer alloc.free(sealed_payload);
+    record.payload = sealed_payload;
+    db.core.index_manager.graph_metric_schedule_pins.store(1, .release);
+    try std.testing.expectError(error.StorageBusy, db.applyHAReplicationRecord(record));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try seal.status(&read)).receipt == null);
+    }
+    db.core.index_manager.graph_metric_schedule_pins.store(0, .release);
+    try db.applyHAReplicationRecord(record);
+    try db.applyHAReplicationRecord(record);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const status = try seal.status(&read);
+        try std.testing.expect(status.intent.?.eql(scope));
+        try std.testing.expectEqual(@as(u64, 5), status.receipt.?.applied_term);
+        try std.testing.expectEqual(@as(u64, 8), status.receipt.?.applied_index);
+        try std.testing.expectEqualDeep(try scope.sealDigest(), status.receipt.?.digest);
+    }
+    try std.testing.expect(!db.core.index_manager.graphRetirementAdmissionOpen());
+    db.close();
+    db_open = false;
+    db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false });
+    db_open = true;
+    try std.testing.expect(!db.core.index_manager.graphRetirementAdmissionOpen());
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const status = try seal.status(&read);
+        try std.testing.expect(status.intent.?.eql(scope));
+        try std.testing.expectEqualDeep(try scope.sealDigest(), status.receipt.?.digest);
+    }
 }
 
 test "db _edges writes record graph artifacts in the replay stream instead of graph payload replay" {
@@ -107137,6 +110471,142 @@ test "storage.hot_standby db mirrors and applies schema metadata mutation record
     try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
 }
 
+test "storage.hot_standby row policy metadata publication replays with its exact Raft cut" {
+    const alloc = std.testing.allocator;
+    var primary_tmp = try TestDirectory.init("ha-policy-primary");
+    defer primary_tmp.cleanup();
+    var replica_tmp = try TestDirectory.init("ha-policy-replica");
+    defer replica_tmp.cleanup();
+    var log_tmp = try TestDirectory.init("ha-policy-log");
+    defer log_tmp.cleanup();
+    var slots_tmp = try TestDirectory.init("ha-policy-slots");
+    defer slots_tmp.cleanup();
+    const identity = ha_standby_mod.Identity{ .cluster_id = 421, .shard_id = 8, .table_id = 7, .timeline_id = 1, .epoch = 1 };
+    var primary = try ha_primary_mod.Primary.open(alloc, std.mem.span(log_tmp.path().ptr), std.mem.span(slots_tmp.path().ptr), identity, .{});
+    defer primary.close();
+    var mutation_barrier = HAMutationBarrier{};
+    const namespace: DocIdentityNamespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
+    var owner = try DB.open(alloc, std.mem.span(primary_tmp.path().ptr), .{
+        .identity_namespace = namespace,
+        .ha_async_batch_mirror = .{ .primary = &primary, .mutation_barrier = &mutation_barrier },
+        .ha_async_metadata_mirror = .{ .primary = &primary, .mutation_barrier = &mutation_barrier },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    var owner_open = true;
+    defer if (owner_open) owner.close();
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    try owner.setSchemaJson(alloc, schema_json);
+    var replica = try DB.open(alloc, std.mem.span(replica_tmp.path().ptr), .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false });
+    defer replica.close();
+    var schema_entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer schema_entry.deinit(alloc);
+    try replica.applyHAReplicationRecord(schema_entry.record);
+    try owner.batch(.{ .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"a\"}" }} });
+    var row_entry = (try primary.log.entryAt(alloc, 2)) orelse return error.TestExpectedEqual;
+    defer row_entry.deinit(alloc);
+    try std.testing.expectEqual(ha_replication_record_mod.RecordKind.batch_mutation, row_entry.record.kind);
+    try replica.applyHAReplicationRecord(row_entry.record);
+    const schema_bytes = try schema_mod.serializeSchema(alloc, owner.core.schema.?);
+    defer alloc.free(schema_bytes);
+    var schema_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema_bytes, &schema_digest, .{});
+    const policy: @import("../../system_catalog/policies.zig").Record = .{
+        .id = 1,
+        .generation = 1,
+        .table_id = 7,
+        .schema_version = 1,
+        .schema_digest = schema_digest,
+        .name = "visible",
+        .commands = .{ .select = true },
+        .roles = &.{"PUBLIC"},
+        .using = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } }}, .root = 0 },
+    };
+    const bundle = try std.json.Stringify.valueAlloc(alloc, @import("../../system_catalog/policies.zig").InstallSnapshot{
+        .table_id = 7,
+        .schema_version = 1,
+        .schema_digest = schema_digest,
+        .policy_generation = 1,
+        .catalog_epoch = 2,
+        .phase = .pending_install,
+        .records = &.{policy},
+        .settings = &.{},
+    }, .{});
+    defer alloc.free(bundle);
+    const range = owner.core.byteRange();
+    var request: @import("../../system_catalog/policies.zig").InstallRequest = .{
+        .table_id = 7,
+        .expected_generation = 1,
+        .expected_catalog_epoch = 2,
+        .expected_phase = .pending_install,
+        .owner_group_id = 17,
+        .expected_descriptor_digest = try (@import("../../system_catalog/policies.zig").OwnerDescriptor{
+            .table_id = 7,
+            .group_id = 17,
+            .shard_id = 8,
+            .range_id = 9,
+            .schema_version = 1,
+            .schema_digest = schema_digest,
+            .range_start = range.start,
+            .range_end = range.end,
+        }).digest(),
+    };
+    try std.testing.expect((try owner.applyReplicatedRowPolicyPublication(bundle, request, .{ .term = 3, .index = 11 })) == null);
+    try std.testing.expectEqual(@as(u64, 3), primary.lastLsn());
+    var policy_entry = (try primary.log.entryAt(alloc, 3)) orelse return error.TestExpectedEqual;
+    defer policy_entry.deinit(alloc);
+    try std.testing.expectEqual(ha_replication_record_mod.RecordKind.metadata_mutation, policy_entry.record.kind);
+    try replica.applyHAReplicationRecord(policy_entry.record);
+    try replica.applyHAReplicationRecord(policy_entry.record);
+    try std.testing.expectEqual(@as(u64, 3), try replica.haAppliedReplicationLsn());
+    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, replica.row_policy_gate.currentPhase());
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, replica.get(alloc, "unseen"));
+    const receipt = try replica.loadRowPolicyReceipt(1, .pending_install);
+    try std.testing.expectEqual(@as(u64, 11), receipt.applied_index);
+    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, replica.row_policy_gate.currentPhase());
+
+    var serving = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, bundle, .{});
+    defer serving.deinit();
+    serving.value.phase = .serving_install;
+    const serving_bundle = try std.json.Stringify.valueAlloc(alloc, serving.value, .{});
+    defer alloc.free(serving_bundle);
+    request.expected_phase = .serving_install;
+    try std.testing.expect((try owner.applyReplicatedRowPolicyPublication(serving_bundle, request, .{ .term = 3, .index = 12 })) == null);
+    _ = try owner.loadRowPolicyReceipt(1, .serving_install);
+    try std.testing.expectEqual(@as(u64, 4), primary.lastLsn());
+    var serving_entry = (try primary.log.entryAt(alloc, 4)) orelse return error.TestExpectedEqual;
+    defer serving_entry.deinit(alloc);
+    try replica.applyHAReplicationRecord(serving_entry.record);
+    _ = try replica.loadRowPolicyReceipt(1, .serving_install);
+    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, replica.row_policy_gate.currentPhase());
+    try std.testing.expectEqual(@as(u64, 4), try replica.haAppliedReplicationLsn());
+
+    // Simulate a crash after the exact policy WAL append but before local
+    // outbox deletion. Reopen must reconcile, not duplicate, that record.
+    const from_lsn = serving_entry.record.lsn;
+    const outbox_bytes = try encodeDurableHAOutboxAlloc(alloc, from_lsn, serving_entry.record.payload);
+    defer alloc.free(outbox_bytes);
+    const outbox_key = try durableHAOutboxKeyAlloc(alloc, .row_policy, from_lsn, owner.core.root_generation, serving_entry.record.payload);
+    defer alloc.free(outbox_key);
+    try owner.core.store.put(outbox_key, outbox_bytes);
+    owner.close();
+    owner_open = false;
+    var reopened = try DB.open(alloc, std.mem.span(primary_tmp.path().ptr), .{
+        .identity_namespace = namespace,
+        .ha_async_batch_mirror = .{ .primary = &primary, .mutation_barrier = &mutation_barrier },
+        .ha_async_metadata_mirror = .{ .primary = &primary, .mutation_barrier = &mutation_barrier },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer reopened.close();
+    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, reopened.row_policy_gate.currentPhase());
+    try reopened.ensureDurableHAStartupBarrier();
+    try std.testing.expectEqual(@as(u64, 4), primary.lastLsn());
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, outbox_key));
+}
+
 test "storage.hot_standby db applies batch mutation records through replication session callback" {
     const alloc = std.testing.allocator;
 
@@ -126350,6 +129820,122 @@ test "db owner open does not downgrade a newer durable schema for Raft catch-up"
     try std.testing.expectEqualStrings(newer_json, public_json);
 }
 
+test "db owner reopen pins old child schema until exact generation install" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-child-generation-owner-reopen");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const namespace: doc_identity.Namespace = .{ .table_id = 17, .shard_id = 19, .range_id = 19 };
+    const old_json =
+        \\{"version":0,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const next_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parent","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var parsed_next = try public_table_schema.parseValidatedTableSchema(alloc, next_json);
+    defer parsed_next.deinit(alloc);
+    const next_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_next);
+    defer schema_mod.freeSchema(alloc, next_schema);
+    var fence: @import("relational_integrity_topology.zig").Fence = undefined;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc, old_json);
+        const catalog = try db.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+        defer alloc.free(catalog);
+        var catalog_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(catalog, &catalog_digest, .{});
+        fence = .{
+            .transition_id = 1,
+            .attempt = 1,
+            .peer_group_id = 19,
+            .owner_group_id = 19,
+            .role = .child_generation_source,
+            .namespace = namespace,
+            .catalog_digest = catalog_digest,
+        };
+        try db.batch(.{ .relational_topology = .{ .action = .begin, .fence = fence } });
+        try std.testing.expect(try db.childGenerationSourcePinsSchemaJson(next_json));
+        try std.testing.expect(try db.childGenerationSourceDefersOwnerCatalog());
+    }
+    var after_catalog_digest: [32]u8 = undefined;
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .identity_namespace = namespace,
+            .start_optional_runtimes = false,
+            .schema_before_index_load = .{ .runtime_schema = next_schema, .public_schema_json = next_json },
+        });
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u32, 0), reopened.core.schema.?.version);
+        try std.testing.expect(try reopened.childGenerationSourcePinsSchemaJson(next_json));
+        const public_json = try reopened.core.store.get(alloc, public_schema_json_key);
+        defer alloc.free(public_json);
+        try std.testing.expectEqualStrings(old_json, public_json);
+        const old_catalog = try reopened.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+        defer alloc.free(old_catalog);
+        var before_catalog_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(old_catalog, &before_catalog_digest, .{});
+        var prepared = try reopened.core.prepareSchemaMetadataPublishedChild(next_schema, &.{.{ .key = public_schema_json_key, .value = next_json }});
+        defer prepared.deinit();
+        std.crypto.hash.Blake3.hash(prepared.integrity_catalog.?.value, &after_catalog_digest, .{});
+        var old_json_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(old_json, &old_json_digest, .{});
+        var next_json_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(next_json, &next_json_digest, .{});
+        const install: DB.PublishedChildSchema = .{
+            .fence = fence,
+            .before_schema_json_digest = old_json_digest,
+            .schema_json_digest = next_json_digest,
+            .before_catalog_digest = before_catalog_digest,
+            .after_catalog_digest = after_catalog_digest,
+            .raft_entry = .{ .term = 1, .index = 1 },
+        };
+        try reopened.installPublishedChildSchema(alloc, next_json, install);
+        try reopened.installPublishedChildSchema(alloc, next_json, install);
+        try std.testing.expectEqual(@as(u32, 1), reopened.core.schema.?.version);
+        try std.testing.expect((try reopened.relationalTopologyStatus()).fence == null);
+        try std.testing.expect(!(try reopened.childGenerationSourceDefersOwnerCatalog()));
+    }
+    var installed = try DB.open(alloc, std.mem.span(path), .{
+        .identity_namespace = namespace,
+        .start_optional_runtimes = false,
+        .schema_before_index_load = .{ .runtime_schema = next_schema, .public_schema_json = next_json },
+    });
+    defer installed.close();
+    try std.testing.expectEqual(@as(u32, 1), installed.core.schema.?.version);
+    try std.testing.expect(!(try installed.childGenerationSourcePinsSchemaJson(next_json)));
+    const installed_public = try installed.core.store.get(alloc, public_schema_json_key);
+    defer alloc.free(installed_public);
+    try std.testing.expectEqualStrings(next_json, installed_public);
+    const installed_catalog = try installed.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+    defer alloc.free(installed_catalog);
+    var installed_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(installed_catalog, &installed_digest, .{});
+    try std.testing.expectEqual(after_catalog_digest, installed_digest);
+    const receipt_bytes = try installed.core.store.get(alloc, @import("relational_integrity_generation_admission.zig").source_install_receipt_key);
+    defer alloc.free(receipt_bytes);
+    const receipt = try @import("relational_integrity_generation_admission.zig").AppliedReceipt.decode(receipt_bytes);
+    try std.testing.expectEqual(@as(u64, 1), receipt.term);
+    try std.testing.expectEqual(@as(u64, 1), receipt.index);
+    // A later DROP publication fences the already-installed v1 layout. The
+    // schema pin is intentionally false for an equal version, but cold owner
+    // index reconciliation must still wait for this dual-role fence.
+    const dual_fence: @import("relational_integrity_topology.zig").Fence = .{
+        .admission_epoch = 2,
+        .transition_id = 2,
+        .attempt = 1,
+        .peer_group_id = 19,
+        .owner_group_id = 19,
+        .role = .child_generation_dual,
+        .namespace = namespace,
+        .catalog_digest = installed_digest,
+    };
+    try installed.batch(.{ .relational_topology = .{ .action = .begin, .fence = dual_fence } });
+    try std.testing.expect(!(try installed.childGenerationSourcePinsSchemaJson(next_json)));
+    try std.testing.expect(try installed.childGenerationSourceDefersOwnerCatalog());
+}
+
 test "db provisioning schema is persisted before configured full text indexes open" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
@@ -140530,4 +144116,79 @@ test "source vector migration converts legacy ANN generations in both modes" {
         defer result.deinit();
         try std.testing.expectEqualStrings("a", result.hits[0].id);
     }
+}
+
+test "db empty-generation install receipt survives hidden to public owner reopen" {
+    const alloc = std.testing.allocator;
+    const staging = @import("restore_staging_contract.zig");
+    const handoff = @import("empty_generation_handoff.zig");
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/handoff-public-reopen", .{tmp.sub_path});
+    defer alloc.free(path);
+    const namespace: doc_identity.Namespace = .{ .table_id = 201, .shard_id = 202, .range_id = 202 };
+    const hidden_options: OpenOptions = .{
+        .identity_namespace = namespace,
+        .primary_backend = .{ .lsm = .{} },
+        .schema_before_index_load = .{ .runtime_schema = runtime_schema, .public_schema_json = schema_json },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    };
+    const scope: staging.Scope = .{
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .source_artifact_digest = @splat(0),
+        .source_namespace = .{ .table_id = 101, .shard_id = 102, .range_id = 102 },
+        .target_namespace = namespace,
+        .target_schema_digest = @splat(3),
+        .empty_generation = true,
+    };
+    const install: handoff.Install = .{
+        .scope = scope.digest(),
+        .source_summary_digest = @splat(4),
+        .retired_digest = @splat(5),
+        .retired_count = 0,
+        .mappings = &.{},
+    };
+    {
+        var hidden = try DB.open(alloc, path, hidden_options);
+        defer hidden.close();
+        try hidden.reserveRestoreStagingScoped(alloc, scope);
+        const imported = try (staging.Progress{ .scope = scope, .phase = .imported, .rows_complete = true, .artifacts_complete = true }).encode(alloc);
+        defer alloc.free(imported);
+        try hidden.core.store.put(staging.key, imported);
+        _ = try hidden.finishRestoreStaging(alloc, scope.digest(), .validated);
+        var txn = try hidden.core.store.beginWriteTxn();
+        var txn_open = true;
+        defer if (txn_open) txn.abort();
+        const applied = try handoff.stageInstall(alloc, &txn, install, scope.plan_id, 7, 11);
+        try txn.commit();
+        txn_open = false;
+        try std.testing.expectEqual(@as(u64, 11), applied.applied_index);
+        _ = try hidden.finishRestoreStaging(alloc, scope.digest(), .published);
+        var read = try hidden.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 11), (try handoff.loadInstallReceipt(&read)).?.applied_index);
+    }
+    var published_options = hidden_options;
+    published_options.reject_stale_schema_before_index_load = true;
+    published_options.prefer_existing_identity_namespace = true;
+    published_options.start_optional_runtimes = true;
+    var published = try DB.open(alloc, path, published_options);
+    defer published.close();
+    var read = try published.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u64, 11), (try handoff.loadInstallReceipt(&read)).?.applied_index);
+    var response = (try published.lookup(alloc, "", .{ .relational_topology_json = "{\"mode\":\"generation_handoff_install\"}" })) orelse return error.GenerationHandoffInstallMissing;
+    defer response.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(?staging.GenerationAdmissionReceipt, alloc, response.json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 11), (parsed.value orelse return error.GenerationHandoffInstallMissing).applied_index);
 }

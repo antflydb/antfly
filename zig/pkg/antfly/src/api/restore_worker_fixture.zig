@@ -22,6 +22,7 @@ const tables = @import("../metadata/table_manager.zig");
 const stages = @import("../metadata/restore_staging.zig");
 const cohort = @import("../metadata/backup_cohort.zig");
 const db = @import("../storage/db/mod.zig");
+const portable_backup = @import("../storage/portable_backup.zig");
 const native = @import("../storage/db/restore_staging.zig");
 const owner_api = @import("restore_owner.zig");
 const catalog_mod = @import("restore_catalog.zig");
@@ -52,6 +53,27 @@ const Fixture = struct {
     sequence: u8 = 0,
     private_catalog: ?*catalog_mod.Catalog = null,
     imports: usize = 0,
+    import_elapsed_ns: u64 = 0,
+    import_max_ns: u64 = 0,
+    import_apply_elapsed_ns: u64 = 0,
+    import_apply_max_ns: u64 = 0,
+    materialization_calls: usize = 0,
+    materialization_elapsed_ns: u64 = 0,
+    materialization_max_ns: u64 = 0,
+    import_row_page_bins: [6]usize = @splat(0),
+    import_page_kinds: [4]usize = @splat(0),
+    imported_artifacts: usize = 0,
+    validation_owner_calls: usize = 0,
+    validation_owner_elapsed_ns: u64 = 0,
+    validation_owner_max_ns: u64 = 0,
+    activation_pages: usize = 0,
+    activation_rows: usize = 0,
+    activation_row_bins: [5]usize = @splat(0),
+    status_owner_calls: usize = 0,
+    status_owner_elapsed_ns: u64 = 0,
+    status_owner_max_ns: u64 = 0,
+    validation_timings: catalog_mod.ValidationPort.ValidationTimings = .{},
+    source_operations: usize = 0,
     validations: usize = 0,
     publications: usize = 0,
     target_paths: [3][]const u8 = undefined,
@@ -71,8 +93,23 @@ const Fixture = struct {
     tail_injected: bool = false,
     facts_alloc: ?std.mem.Allocator = null,
 
+    fn printValidationTimings(self: *@This()) void {
+        const t = &self.validation_timings;
+        std.debug.print("restore validation session prepare_calls={d} step_calls={d} prepare_progress_ms={d} prepare_snapshot_ms={d} prepare_projection_ms={d} prepare_bind_ms={d} step_progress_ms={d} step_validate_ms={d}\n", .{
+            t.prepare_calls.load(.acquire),
+            t.step_calls.load(.acquire),
+            t.prepare_progress_ns.load(.acquire) / std.time.ns_per_ms,
+            t.prepare_snapshot_ns.load(.acquire) / std.time.ns_per_ms,
+            t.prepare_projection_ns.load(.acquire) / std.time.ns_per_ms,
+            t.prepare_bind_ns.load(.acquire) / std.time.ns_per_ms,
+            t.step_progress_ns.load(.acquire) / std.time.ns_per_ms,
+            t.step_validate_ns.load(.acquire) / std.time.ns_per_ms,
+        });
+    }
+
     fn sourceIo(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, name: []const u8, request: @import("online_merge_io.zig").contract.Request, context: operation.RequestContext) ![]u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.source_operations += 1;
         const i = try index(name);
         const original = self.donors[i];
         try std.testing.expectEqual(@as(u64, 20) + i, group);
@@ -115,7 +152,8 @@ const Fixture = struct {
         self.target_open[i] = true;
         try self.dbs[i].setSchemaJson(self.alloc, target.table.schema_json);
         try self.dbs[i].reserveRestoreStagingScoped(self.alloc, scope);
-        try self.dbs[i].installRestoreStagingBootstrap(self.alloc, .{ .scope = scope, .table_name = target.table.name, .schema_json = target.table.schema_json, .read_schema_json = target.table.read_schema_json, .indexes_json = target.table.indexes_json, .byte_range = .{ .start = "", .end = "" } });
+        const handoff = try stages.mappedEmptyGenerationHandoffForGroup(self.alloc, job.value.plan, job.value.plan_digest, target.ranges[0].group_id);
+        try self.dbs[i].installRestoreStagingBootstrap(self.alloc, .{ .scope = scope, .table_name = target.table.name, .schema_json = target.table.schema_json, .read_schema_json = target.table.read_schema_json, .indexes_json = target.table.indexes_json, .byte_range = .{ .start = "", .end = "" }, .generation_admission = try stages.expectedGenerationAdmissionReceiptForGroup(self.alloc, job.value.plan, job.value.plan_digest, target.ranges[0].group_id), .source_generation_proof_digest = try stages.sourceGenerationProofDigestForGroup(job.value.plan, target.ranges[0].group_id), .empty_generation_handoff = if (handoff) |mapped| .{ .source_summary_digest = mapped.command.source_summary_digest, .retired_digest = mapped.command.retired_digest, .retired_count = mapped.command.retired_count, .expected_install_receipt_digest = mapped.expected_receipt_digest } else null });
         _ = try @import("../metadata/table_provisioner.zig").reconcileDbIndexesWithOptions(self.alloc, self.dbs[i], target.table.indexes_json, .{ .restore_build_only = true });
     }
 
@@ -189,7 +227,21 @@ const Fixture = struct {
             self.fixture.indices[self.index] += 1;
             var mutation = request;
             mutation.restore_staging_scope = self.fixture.scopes[self.index].digest();
+            const is_import_page = if (request.restore_staging) |command| command == .import_page else false;
+            const apply_started_ns = if (is_import_page) @import("antfly_platform").time.monotonicNs() else 0;
             if (self.fixture.non_raft) try self.fixture.dbs[self.index].batchWithVisibilityCancellation(mutation, context.cancellation) else try self.fixture.dbs[self.index].batchRaftReplicatedApply(mutation, .{ .index = self.fixture.indices[self.index], .term = 1 });
+            if (is_import_page) {
+                const elapsed_ns = @import("antfly_platform").time.monotonicNs() - apply_started_ns;
+                self.fixture.import_apply_elapsed_ns +|= elapsed_ns;
+                self.fixture.import_apply_max_ns = @max(self.fixture.import_apply_max_ns, elapsed_ns);
+                const page = request.restore_staging.?.import_page;
+                const kind: usize = if (page.source_generation_proof_page) 0 else if (page.artifact_page) 1 else if (page.projection_page) 2 else 3;
+                self.fixture.import_page_kinds[kind] += 1;
+                self.fixture.imported_artifacts += page.artifacts.len;
+                const row_count = request.writes.len;
+                const bin: usize = if (row_count == 0) 0 else if (row_count == 1) 1 else if (row_count <= 3) 2 else if (row_count <= 7) 3 else if (row_count <= 15) 4 else 5;
+                self.fixture.import_row_page_bins[bin] += 1;
+            }
         }
     };
     fn owner(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, group: u64, request: owner_api.Request, context: operation.RequestContext) !owner_api.Response {
@@ -198,11 +250,14 @@ const Fixture = struct {
         const i = try index(name);
         if (self.rewrite_mode) try self.provisionRewrite(i, request.scope);
         try std.testing.expectEqual(self.scopes[i].target_namespace.shard_id, group);
-        const source = self.source;
-        const progress = (try source.getRestoreStagingProgress(alloc, request.scope.plan_id, context)).?;
-        if (request.action == .publish) try std.testing.expectEqual(stages.State.published, progress.state);
+        // Only publication and validation assert the metadata phase. A
+        // linearizable progress read on every begin/import page adds a
+        // fixture-only metadata round trip absent from the production owner.
+        if (request.action == .publish or request.action == .validate) {
+            const progress = (try self.source.getRestoreStagingProgress(alloc, request.scope.plan_id, context)).?;
+            try std.testing.expectEqual(if (request.action == .publish) stages.State.published else stages.State.validating, progress.state);
+        }
         if (request.action == .validate) {
-            try std.testing.expectEqual(stages.State.validating, progress.state);
             for (self.dbs[0..self.owner_count]) |target| {
                 var state = (try target.restoreStagingStatus(alloc)).?;
                 defer state.deinit();
@@ -216,20 +271,46 @@ const Fixture = struct {
             break :blk before.value.phase == .reserved;
         };
         var apply: Apply = .{ .fixture = self, .index = i };
+        const owner_started_ns = @import("antfly_platform").time.monotonicNs();
+        const applied_before = self.import_page_kinds[0] + self.import_page_kinds[1] + self.import_page_kinds[2] + self.import_page_kinds[3];
         const result = try @import("../storage/restore_owner.zig").executeResident(alloc, self.dbs[i], .{ .io = std.testing.io, .runtime = self.runtime, .location_options = .{ .filesystem_io = std.testing.io, .node_config = self.node_config }, .cache_path = self.cache_paths[i], .proposer = .{ .ptr = &apply, .propose = Apply.propose } }, request, context);
         if (self.rewrite_mode and !self.tail_injected and result.rewrite != null and result.rewrite.?.snapshot_complete) {
             self.tail_injected = true;
             _ = try sourceBatch(self, alloc, "parent", .{ .timestamp_ns = 987, .writes = &.{ .{ .key = "row", .value = "{\"id\":1,\"x\":7}" }, .{ .key = "new", .value = "{\"id\":2,\"x\":9}" } }, .deletes = &.{"removed"} });
         }
-        if (request.action == .import_page) self.imports += 1;
+        if (request.action == .import_page) {
+            self.imports += 1;
+            const elapsed_ns = @import("antfly_platform").time.monotonicNs() - owner_started_ns;
+            self.import_elapsed_ns +|= elapsed_ns;
+            self.import_max_ns = @max(self.import_max_ns, elapsed_ns);
+            const applied_after = self.import_page_kinds[0] + self.import_page_kinds[1] + self.import_page_kinds[2] + self.import_page_kinds[3];
+            if (applied_after == applied_before) {
+                self.materialization_calls += 1;
+                self.materialization_elapsed_ns +|= elapsed_ns;
+                self.materialization_max_ns = @max(self.materialization_max_ns, elapsed_ns);
+            }
+        }
+        if (request.action == .validate or request.action == .install_generation_admissions) {
+            self.validation_owner_calls += 1;
+            const elapsed_ns = @import("antfly_platform").time.monotonicNs() - owner_started_ns;
+            self.validation_owner_elapsed_ns +|= elapsed_ns;
+            self.validation_owner_max_ns = @max(self.validation_owner_max_ns, elapsed_ns);
+        }
+        if (request.action == .status) {
+            self.status_owner_calls += 1;
+            const elapsed_ns = @import("antfly_platform").time.monotonicNs() - owner_started_ns;
+            self.status_owner_elapsed_ns +|= elapsed_ns;
+            self.status_owner_max_ns = @max(self.status_owner_max_ns, elapsed_ns);
+        }
         if (request.action == .publish) self.publications += 1;
         // Fault the durable admission transition, whether it came from an
         // explicit begin or the first idempotent snapshot import. Binding the
         // fault to the RPC spelling silently misses implicit admissions.
-        const fault_bit: u8 = if (reserved and result.phase == .importing) 1 else switch (request.action) {
+        const fault_bit: u8 = if (reserved and (result.phase == .importing or (request.scope.empty_generation and result.phase == .imported))) 1 else switch (request.action) {
             .begin => 0,
             .import_page => if (result.rows != 0 or result.phase == .imported) 2 else 0,
             .validate => if (result.phase == .validated) 4 else 0,
+            .install_generation_admissions => 0,
             .publish => 8,
             .cancel => 16,
             .status => 0,
@@ -258,6 +339,17 @@ const Fixture = struct {
         var scoped = opts;
         scoped.restore_staging_scope = try self.private_catalog.?.source().restoreScopeForGroup(name, self.scopes[i].target_namespace.shard_id);
         const row = (try self.dbs[i].lookup(alloc, key, scoped)) orelse return null;
+        if (self.validation_timings.prepare_calls.load(.monotonic) != 0 and
+            std.mem.indexOf(u8, opts.relational_activation_json, "\"mode\":\"page\"") != null)
+        {
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row.json, .{});
+            defer parsed.deinit();
+            const count = parsed.value.object.get("rows").?.array.items.len;
+            self.activation_pages += 1;
+            self.activation_rows += count;
+            const bucket: usize = if (count == 0) 0 else if (count < 5) 1 else if (count < 16) 2 else if (count < 64) 3 else 4;
+            self.activation_row_bins[bucket] += 1;
+        }
         return .{ .json = row.json, .version = try self.dbs[i].getTimestamp(alloc, key) };
     }
     fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db.types.ScanOptions, _: read_gate.ReadConsistency) !?reads.ScanResponse {
@@ -359,12 +451,13 @@ const RewritePersistence = struct {
 /// reopen targets; acknowledged writes after the source cut must still appear.
 pub fn runRewrite(comptime Driver: type) !void {
     for ([_]bool{ false, true }) |non_raft| {
-        try runRewriteWithFailure(Driver, false, non_raft);
-        try runRewriteWithFailure(Driver, true, non_raft);
+        try runRewriteWithFailure(Driver, false, non_raft, false);
+        try runRewriteWithFailure(Driver, true, non_raft, false);
+        try runRewriteWithFailure(Driver, false, non_raft, true);
     }
 }
 
-fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bool) !void {
+fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bool, empty_generation: bool) !void {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -443,8 +536,52 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
         fixture.cache_paths[i] = try std.fmt.allocPrint(a, "{s}/decoder-{d}", .{ root, i });
     }
     try svc.runRound();
-    const plan = try @import("relational_rewrite_admission.zig").build(a, plan_id, &records, &ranges, "parent", proposed, &fixture);
-    _ = try server.restore_job_store.start(a, .{ .scope = .cluster, .source_kind = .schema_rewrite, .backup_id = "rewrite", .location = "metadata://rewrite", .connection = "internal", .restore_mode = "overwrite", .idempotency_namespace = "rewrite-worker", .idempotency_key = "one", .table_names = &.{ "parent", "child", "docs" }, .destination_authorization_principal = @import("stored_destination_authorization.zig").auth_disabled_principal, .rewrite_plan_json = try std.json.Stringify.valueAlloc(a, plan, .{}) });
+    var plan = try @import("relational_rewrite_admission.zig").build(a, plan_id, &records, &ranges, "parent", proposed, &fixture);
+    if (empty_generation) {
+        const targets = try a.dupe(stages.Target, plan.targets);
+        for (targets) |*target| {
+            target.empty_generation = true;
+            target.rewrite = null;
+            target.rewrite_sources = &.{};
+            target.source_artifacts = &.{};
+            target.table.schema_json = target.replace.?.table.schema_json;
+            target.table.read_schema_json = target.replace.?.table.read_schema_json;
+            target.table.indexes_json = target.replace.?.table.indexes_json;
+            // An empty-generation rewrite must carry a preview of the real
+            // source owner's accepted generations and retirement history.
+            // The coordinator will compare this preview again after fencing.
+            const old = target.replace.?;
+            const handoffs = try a.alloc(stages.GenerationHandoffRange, old.ranges.len);
+            for (old.ranges, target.ranges, handoffs) |source_range, destination_range, *handoff| {
+                const donor = fixture.donors[try Fixture.index(old.table.name)];
+                var read = try donor.core.store.beginReadTxn();
+                defer read.abort();
+                const source_namespace = donor.core.identity_namespace;
+                const summary = try @import("../storage/db/empty_generation_handoff.zig").summaryAlloc(a, &read, source_namespace);
+                if (!summary.namespace.eql(source_namespace) or summary.intent != null or summary.seal != null) return error.TableGenerationChanged;
+                handoff.* = .{
+                    .source_group_id = source_range.group_id,
+                    .target_group_id = destination_range.group_id,
+                    .source_namespace = summary.namespace,
+                    .admissions = summary.admissions,
+                    .admissions_digest = summary.admissions_digest,
+                    .retired_digest = summary.retired_digest,
+                    .retired_count = summary.retired_count,
+                };
+            }
+            target.generation_handoffs = handoffs;
+            target.graph_retirement_digest = try stages.graphRetirementDigest(a, old.table.table_id, target.table.table_id, target.table.indexes_json);
+        }
+        try stages.prepareEmptyGenerationHandoffMappingsAlloc(a, targets);
+        try stages.prepareTargetProjectionsAlloc(a, targets);
+        plan.targets = targets;
+        plan.preparing_sources = false;
+        plan.cohort_digest = @splat(7);
+        try plan.validate(a);
+    }
+    const plan_json = try std.json.Stringify.valueAlloc(a, plan, .{});
+    const source_operations_before_execution = fixture.source_operations;
+    _ = try server.restore_job_store.start(a, .{ .scope = .cluster, .source_kind = if (empty_generation) .empty_generation else .schema_rewrite, .backup_id = "rewrite", .location = "metadata://rewrite", .connection = "internal", .restore_mode = "overwrite", .idempotency_namespace = "rewrite-worker", .idempotency_key = "one", .table_names = &.{ "parent", "child", "docs" }, .destination_authorization_principal = @import("stored_destination_authorization.zig").auth_disabled_principal, .rewrite_plan_json = if (empty_generation) null else plan_json, .generation_plan_json = if (empty_generation) plan_json else null });
     for (0..600) |_| {
         try Driver.work(&server, job_id);
         const bytes = (try server.restore_job_store.load(a, job_id)).?;
@@ -470,7 +607,7 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
         std.debug.print("rewrite worker stalled: {s}\n", .{(try server.restore_job_store.load(a, job_id)).?});
         return error.RewriteWorkerDidNotComplete;
     }
-    try std.testing.expect(fixture.tail_injected);
+    try std.testing.expectEqual(!empty_generation, fixture.tail_injected);
     if (non_raft) {
         for (fixture.donors) |donor| try std.testing.expect((try donor.raftAppliedEntry()) == null);
         for (fixture.dbs, fixture.target_open) |target, opened| if (opened) try std.testing.expect((try target.raftAppliedEntry()) == null);
@@ -494,6 +631,18 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
         return;
     }
     for (published.tables) |record| try std.testing.expect(record.table_id >= 13);
+    if (empty_generation) {
+        try std.testing.expectEqual(@as(usize, 0), fixture.imports);
+        try std.testing.expectEqual(source_operations_before_execution, fixture.source_operations);
+        for (fixture.dbs, fixture.donors, 0..) |target, original, i| {
+            try std.testing.expect((try target.lookup(alloc, "row", .{})) == null);
+            try std.testing.expectEqual(@as(u64, 0), target.core.table_catalog.row_count);
+            const retained = (try original.lookup(alloc, "row", .{})).?;
+            alloc.free(retained.json);
+            try std.testing.expect(fixture.faults_seen[i] & 13 == 13);
+        }
+        return;
+    }
     for (fixture.dbs, 0..) |target, i| {
         const row = (try target.lookup(alloc, "row", .{})).?;
         defer alloc.free(row.json);
@@ -521,7 +670,7 @@ pub fn runWithPersistence(comptime Driver: type, invalid_child: bool, override: 
     return runWithPolicy(Driver, invalid_child, override, persistence, .{});
 }
 
-pub const Policy = struct { failover_safe: bool = false, guard: ?http.RestoreExecutionGuard = null, gate: ?db.HAWriteGate = null, mirror: ?db.HAAsyncEffectMirror = null, term: u64 = 1, portable: bool = false, restart_after_commit: bool = false, table_restore: bool = false, migration: bool = false, generated: bool = false, remote_owner: bool = false, benchmark_rows: usize = 1 };
+pub const Policy = struct { failover_safe: bool = false, guard: ?http.RestoreExecutionGuard = null, gate: ?db.HAWriteGate = null, mirror: ?db.HAAsyncEffectMirror = null, term: u64 = 1, portable: bool = false, restart_after_commit: bool = false, table_restore: bool = false, migration: bool = false, generated: bool = false, remote_owner: bool = false, benchmark_rows: usize = 1, benchmark_deadline_ms: u32 = 30_000 };
 
 fn generatedSchema(alloc: std.mem.Allocator, input: []const u8, default_base: []const u8) ![]const u8 {
     var schema = try std.json.parseFromSlice(std.json.Value, alloc, input, .{});
@@ -547,6 +696,91 @@ fn generatedSchema(alloc: std.mem.Allocator, input: []const u8, default_base: []
     , .{});
     try schema.value.object.put(a, "relational_indexes", indexes.value);
     return std.json.Stringify.valueAlloc(alloc, schema.value, .{});
+}
+
+/// Materialize the source snapshot after an accepted child-generation
+/// publication. Direct schema mutation is correctly forbidden for an existing
+/// external FK child; the backup fixture must exercise the same fenced owner
+/// install that a metadata publication drives. The invalid-child variant is
+/// intentionally a malformed source backup for restore validation.
+fn publishSourceChildSchema(alloc: std.mem.Allocator, parent: *db.DB, source: *db.DB, schema_json: []const u8, namespace: @import("../storage/db/doc_identity.zig").Namespace) !void {
+    const public_schema = @import("../schema/mod.zig");
+    const topology = @import("../storage/db/relational_integrity_topology.zig");
+    const catalog = @import("../storage/db/relational_integrity_catalog.zig");
+    const before_schema = (try source.getSchemaJson(alloc)) orelse return error.MissingSourceSchema;
+    defer alloc.free(before_schema);
+    const before_catalog = try source.core.store.get(alloc, catalog.key);
+    defer alloc.free(before_catalog);
+    var before_catalog_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(before_catalog, &before_catalog_digest, .{});
+    var parsed = try public_schema.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime_schema = try public_schema.deriveRuntimeTableSchema(alloc, parsed);
+    defer @import("../storage/schema.zig").freeSchema(alloc, runtime_schema);
+    var prepared = try source.core.prepareSchemaMetadataPublishedChild(runtime_schema, &.{.{ .key = "\x00\x00__metadata__:schema_json", .value = schema_json }});
+    defer prepared.deinit();
+    const generation = (prepared.integrity_catalog.?.catalog.find(.foreign_key, "parent_fk") orelse return error.IntegrityCatalogChanged).generation;
+    var after_catalog_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(prepared.integrity_catalog.?.value, &after_catalog_digest, .{});
+    var before_schema_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(before_schema, &before_schema_digest, .{});
+    var schema_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema_json, &schema_digest, .{});
+    const identity = try source.relationalTopologyIdentity();
+    const fence: topology.Fence = .{
+        .role = .child_generation_source,
+        .transition_id = 699,
+        .attempt = 1,
+        .admission_epoch = identity.next_epoch,
+        .peer_group_id = namespace.shard_id,
+        .owner_group_id = namespace.shard_id,
+        .namespace = namespace,
+        .catalog_digest = before_catalog_digest,
+    };
+    try source.applyRelationalTopologyControl(.{ .action = .begin, .fence = fence }, null);
+    const parent_identity = try parent.relationalTopologyIdentity();
+    const parent_fence: topology.Fence = .{
+        .role = .child_generation_parent,
+        .transition_id = fence.transition_id,
+        .attempt = fence.attempt,
+        .admission_epoch = parent_identity.next_epoch,
+        .peer_group_id = namespace.shard_id,
+        .owner_group_id = parent.core.identity_namespace.shard_id,
+        .namespace = parent.core.identity_namespace,
+        .catalog_digest = parent_identity.catalog_digest,
+    };
+    const transition: @import("../storage/db/relational_integrity_generation_admission.zig").Transition = .{
+        .child_table_id = namespace.table_id,
+        .child_table_name = "child",
+        .constraint_name = "parent_fk",
+        .expected_generation = null,
+        .next_generation = generation,
+        .plan_id = @splat(6),
+        .decision_digest = @splat(7),
+    };
+    try parent.applyRelationalTopologyControl(.{ .action = .begin, .fence = parent_fence }, null);
+    try parent.applyRelationalTopologyControl(.{ .action = .stage_child_generation, .fence = parent_fence, .child_generations = &.{transition} }, null);
+    try parent.applyRelationalTopologyControl(.{ .action = .activate_child_generation, .fence = parent_fence, .child_generations = &.{transition} }, null);
+    try source.installPublishedChildSchema(alloc, schema_json, .{
+        .fence = fence,
+        .before_schema_json_digest = before_schema_digest,
+        .schema_json_digest = schema_digest,
+        .before_catalog_digest = before_catalog_digest,
+        .after_catalog_digest = after_catalog_digest,
+        .raft_entry = .{ .term = 1, .index = 1 },
+    });
+    try parent.applyRelationalTopologyControl(.{ .action = .acknowledge_child_generation, .fence = parent_fence, .child_generations = &.{transition} }, null);
+    {
+        var read = try parent.core.store.beginReadTxn();
+        defer read.abort();
+        const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
+        const accepted = (try admission.load(&read, transition.child_table_name, transition.constraint_name)) orelse return error.MissingParentGeneration;
+        try std.testing.expectEqual(admission.Phase.active, accepted.phase);
+        try std.testing.expectEqual(namespace.table_id, accepted.child_table_id);
+        try std.testing.expectEqual(generation, accepted.active_generation.?);
+    }
+    try std.testing.expect((try parent.relationalTopologyStatus()).fence == null);
+    try std.testing.expect((try source.relationalTopologyStatus()).fence == null);
 }
 pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http.StatusSource, persistence: ?restore_jobs.ReplicatedPersistence, policy: Policy) !void {
     const alloc = std.testing.allocator;
@@ -579,7 +813,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     var node_config = try Driver.nodeConfig(alloc);
     defer node_config.deinit();
     fixture.node_config = &node_config;
-    var server = http.ApiHttpServer.init(alloc, .{ .backend_runtime = &api_runtime, .node_config = &node_config, .restore_owner = .{ .ptr = &fixture, .execute_fn = if (policy.remote_owner) Fixture.remoteOwner else Fixture.owner }, .restore_validation = .{ .status = source, .factory = .{ .ptr = &fixture, .bind = Fixture.bind } }, .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = Fixture.localStatus, .group_leader_node_id = Fixture.leader, .node_base_uri = Fixture.uri } } }, source, null, null);
+    var server = http.ApiHttpServer.init(alloc, .{ .backend_runtime = &api_runtime, .node_config = &node_config, .restore_owner = .{ .ptr = &fixture, .execute_fn = if (policy.remote_owner) Fixture.remoteOwner else Fixture.owner }, .restore_validation = .{ .status = source, .factory = .{ .ptr = &fixture, .bind = Fixture.bind }, .timings = if (policy.benchmark_rows > 1) &fixture.validation_timings else null }, .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = Fixture.localStatus, .group_leader_node_id = Fixture.leader, .node_base_uri = Fixture.uri } } }, source, null, null);
     defer server.deinit();
     var owner_server = http.ApiHttpServer.init(alloc, .{ .backend_runtime = &api_runtime, .node_config = &node_config, .restore_owner = .{ .ptr = &fixture, .execute_fn = Fixture.owner } }, source, null, null);
     owner_server.cfg.internal_service_secret = "restore-worker-test-secret-0123456789";
@@ -622,11 +856,18 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     var owners: [3]cohort.Owner = undefined;
     var proofs: [3]cohort.TableProof = undefined;
     var seals: [3]cohort.SealReceipt = undefined;
-    for ([_][]const u8{ "parent", "child", "docs" }, 0..) |name, i| {
+    var originals: [3]db.DB = undefined;
+    var originals_open: usize = 0;
+    defer for (originals[0..originals_open]) |*original| original.close();
+    var namespaces: [3]@import("../storage/db/doc_identity.zig").Namespace = undefined;
+    var schemas: [3][]const u8 = undefined;
+    for ([_][]const u8{ "parent", "child", "docs" }, 0..) |_, i| {
         const namespace: @import("../storage/db/doc_identity.zig").Namespace = .{ .table_id = 10 + i, .shard_id = 20 + i, .range_id = 20 + i };
         const path = try std.fmt.allocPrint(a, "{s}/source-{d}", .{ root, i });
-        var original = try db.DB.open(alloc, path, .{ .backend_runtime = &runtime, .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
-        defer original.close();
+        originals[i] = try db.DB.open(alloc, path, .{ .backend_runtime = &runtime, .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
+        originals_open += 1;
+        const original = &originals[i];
+        namespaces[i] = namespace;
         try original.setSchemaJson(alloc, if (i == 2) (if (policy.migration) previous_doc_schema else "{}") else if (policy.generated) try generatedSchema(a, plain_schema, "0") else plain_schema);
         const input = try a.alloc(db.types.BatchWrite, policy.benchmark_rows);
         for (input, 0..) |*row, ordinal| row.* = .{ .key = if (ordinal == 0) "row" else try std.fmt.allocPrint(a, "row-{d:0>8}", .{ordinal}), .value = if (policy.migration and i == 2) "{\"id\":1,\"name\":\"Old Mapping\"}" else try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{ordinal + (if (invalid_child and i == 1) @as(usize, 2) else 1)}) };
@@ -640,7 +881,25 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
             else => if (policy.migration) active_doc_schema else "{}",
         };
         const schema = if (policy.generated and i < 2) try generatedSchema(a, base_schema, "7") else base_schema;
-        try original.setSchemaJson(alloc, schema);
+        schemas[i] = schema;
+        if (i != 1) try original.setSchemaJson(alloc, schema);
+    }
+    if (policy.table_restore) {
+        // This request intentionally selects only the parent table. A source
+        // parent with an accepted external child generation would require a
+        // dependency-complete multi-table restore, so keep this one-table
+        // fixture independent instead of bypassing Plan validation.
+        schemas[1] = if (policy.generated) try generatedSchema(a, plain_schema, "0") else plain_schema;
+    } else {
+        // The child source is published only after its parent owner durably
+        // accepts the exact FK generation. Snapshot seals then see one
+        // coherent source cohort, including the parent admission record.
+        try publishSourceChildSchema(alloc, &originals[0], &originals[1], schemas[1], namespaces[1]);
+    }
+    for ([_][]const u8{ "parent", "child", "docs" }, 0..) |name, i| {
+        const original = &originals[i];
+        const namespace = namespaces[i];
+        const schema = schemas[i];
         const identity = try original.relationalTopologyIdentity();
         const fence: @import("../storage/db/relational_integrity_topology.zig").Fence = .{ .transition_id = 700, .attempt = 1, .owner_group_id = namespace.shard_id, .peer_group_id = namespace.shard_id, .admission_epoch = identity.next_epoch, .role = .backup_snapshot, .namespace = namespace, .catalog_digest = identity.catalog_digest };
         try original.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
@@ -649,19 +908,24 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         const format: backups.BackupFormat = if (policy.portable) .portable else .native;
         const relative = if (policy.portable) try std.fmt.allocPrint(a, "source-{d}.afb", .{i}) else try std.fmt.allocPrint(a, "source-{d}.snapshots/snapshot", .{i});
         const artifact_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, relative });
+        var source_summary: ?[]portable_backup.SourceGenerationAdmissionSummaryEntry = null;
         if (policy.portable) {
             var file = try std.Io.Dir.cwd().createFile(std.testing.io, artifact_path, .{});
             defer file.close(std.testing.io);
             var buffer: [65536]u8 = undefined;
             var writer = file.writer(std.testing.io, &buffer);
-            try original.exportBackupCohortPortable(seal, &writer.interface, .{}, .none);
+            try original.exportBackupCohortPortable(seal, &writer.interface, .{ .source_generation_summary_output = .{ .alloc = a, .output = &source_summary } }, .none);
             try writer.end();
             try file.sync(std.testing.io);
         } else _ = try original.exportBackupCohort(seal, "snapshot", .none);
         const integrity = try backups.artifactIntegrityAlloc(a, std.testing.io, format, artifact_path);
         const inventory = if (!policy.portable) try backups.nativeGenerationManifestIntegrityAllocWithCancellation(a, std.testing.io, artifact_path, .none) else null;
+        // This descriptor came from the same pinned read transaction as the
+        // AFB blocks, even though the live source resumed after its seal.
+        const accepted_summary: []const portable_backup.SourceGenerationAdmissionSummaryEntry = if (policy.portable) source_summary orelse return error.BackupIntegrityFailure else &.{};
+        const accepted_digest: ?[32]u8 = if (policy.portable) try portable_backup.sourceGenerationAdmissionSummaryDigest(namespace, accepted_summary) else null;
         const table: tables.TableRecord = .{ .table_id = namespace.table_id, .name = name, .schema_json = schema, .read_schema_json = if (policy.migration and i == 2) previous_doc_schema else "", .indexes_json = if (policy.migration and i == 2) "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}" else "{}" };
-        manifests[i] = try backups.createManifest(a, "daily", format, &table, &.{.{ .group_id = namespace.shard_id, .range_id = namespace.range_id, .doc_identity_shard_id = namespace.shard_id, .doc_identity_range_id = namespace.range_id, .start_key = "", .snapshot_path = relative, .artifact_size_bytes = integrity.size_bytes, .artifact_sha256 = integrity.sha256, .native_manifest_size_bytes = if (inventory) |v| v.size_bytes else 0, .native_manifest_sha256 = if (inventory) |v| v.sha256 else "" }});
+        manifests[i] = try backups.createManifest(a, "daily", format, &table, &.{.{ .group_id = namespace.shard_id, .range_id = namespace.range_id, .doc_identity_shard_id = namespace.shard_id, .doc_identity_range_id = namespace.range_id, .start_key = "", .snapshot_path = relative, .artifact_size_bytes = integrity.size_bytes, .artifact_sha256 = integrity.sha256, .native_manifest_size_bytes = if (inventory) |v| v.size_bytes else 0, .native_manifest_sha256 = if (inventory) |v| v.sha256 else "", .accepted_generation_summary = accepted_summary, .accepted_generation_summary_digest = accepted_digest }});
         owners[i] = .{ .table_name = name, .range_start = "", .range_end = "", .fence = fence, .artifact_id = "snapshot", .capture_node_id = 1 };
         proofs[i] = .{ .table_id = namespace.table_id, .name = name, .definition = @splat(1), .manifest_definition = cohort.manifestDefinition(name, table.description, schema, table.read_schema_json, table.indexes_json, table.replication_sources_json) };
         seals[i] = .{ .handle = seal, .source_node_id = 1 };
@@ -702,7 +966,8 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         opened += 1;
         try database.setSchemaJson(alloc, target.table.schema_json);
         try database.reserveRestoreStagingScoped(alloc, scope);
-        try database.installRestoreStagingBootstrap(alloc, .{ .scope = scope, .table_name = target.table.name, .schema_json = target.table.schema_json, .read_schema_json = target.table.read_schema_json, .indexes_json = target.table.indexes_json, .byte_range = .{ .start = "", .end = "" } });
+        const handoff = try stages.mappedEmptyGenerationHandoffForGroup(alloc, job.value.plan, job.value.plan_digest, target.ranges[0].group_id);
+        try database.installRestoreStagingBootstrap(alloc, .{ .scope = scope, .table_name = target.table.name, .schema_json = target.table.schema_json, .read_schema_json = target.table.read_schema_json, .indexes_json = target.table.indexes_json, .byte_range = .{ .start = "", .end = "" }, .generation_admission = try stages.expectedGenerationAdmissionReceiptForGroup(alloc, job.value.plan, job.value.plan_digest, target.ranges[0].group_id), .source_generation_proof_digest = try stages.sourceGenerationProofDigestForGroup(job.value.plan, target.ranges[0].group_id), .empty_generation_handoff = if (handoff) |mapped| .{ .source_summary_digest = mapped.command.source_summary_digest, .retired_digest = mapped.command.retired_digest, .retired_count = mapped.command.retired_count, .expected_install_receipt_digest = mapped.expected_receipt_digest } else null });
         _ = try @import("../metadata/table_provisioner.zig").reconcileDbIndexesWithOptions(alloc, database, target.table.indexes_json, .{ .restore_build_only = true });
         // Match production provisioning: initialization is local and hidden;
         // only the authorized owner generation may start emitting HA effects.
@@ -713,7 +978,11 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     source.freeAdminSnapshot(&hidden);
     _ = try server.restore_job_store.retryRunning(a, worker.value, "RestoreStagingYield", 0);
     const started_ns = @import("antfly_platform").time.monotonicNs();
-    for (0..(if (policy.restart_after_commit) @as(usize, 6000) else 120)) |_| {
+    // The large-row fixture measures a real multi-owner import, whose page
+    // count depends on storage throughput. Bound elapsed time rather than
+    // assuming it must finish in the tiny 120-tick functional-test budget.
+    const work_ticks: usize = if (policy.restart_after_commit or policy.benchmark_rows > 1) 6000 else 120;
+    for (0..work_ticks) |_| {
         try Driver.work(&server, worker.value.job_id);
         // A routing/authentication setup error is not a simulated owner retry.
         // Fail promptly with the first bounded HTTP diagnostic above instead
@@ -724,6 +993,14 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         const state = try std.json.parseFromSlice(restore_jobs.JobState, a, bytes, .{});
         if (state.value.phase == .succeeded) {
             try std.testing.expect(!invalid_child);
+            if (policy.portable and !policy.table_restore) {
+                var parent_progress = (try fixture.dbs[0].restoreStagingStatus(a)) orelse return error.RestoreSourceProofMissing;
+                defer parent_progress.deinit();
+                // The proof-only page must commit before validation and
+                // activation; a successful job alone would not prove it was
+                // durably imported into the hidden parent owner.
+                try std.testing.expect(parent_progress.value.source_generation_proofs_complete);
+            }
             const result = try std.json.parseFromSlice(std.json.Value, a, state.value.result_json orelse return error.MissingRestoreResult, .{});
             if (policy.table_restore) {
                 try std.testing.expectEqualStrings("triggered", result.value.object.get("restore").?.string);
@@ -740,6 +1017,53 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
             try std.testing.expectEqual(restore_jobs.StagingResolution.canceled, state.value.staging_resolution);
             try std.testing.expectEqualStrings("ConstraintActivationFailed", state.value.staging_failure);
             break;
+        }
+        if (policy.benchmark_rows > 1 and @import("antfly_platform").time.monotonicNs() - started_ns > @as(u64, policy.benchmark_deadline_ms) * std.time.ns_per_ms) {
+            const live_staging_bytes = (try source.getRestoreStaging(a, plan_id, .{})) orelse return error.RestoreStagingScopeChanged;
+            var live_staging = try std.json.parseFromSlice(stages.Job, a, live_staging_bytes, .{});
+            defer live_staging.deinit();
+            std.debug.print("restore benchmark exceeded 30s: rows={d} owner_phase={d} owner_cursor={d} validation_phase={d} validation_owner={d} staging_state={s} staging_completed_owners={d} imports={d} owner_calls={d} import_elapsed_ms={d} max_import_ms={d} apply_elapsed_ms={d} max_apply_ms={d} row_pages={any} page_kinds={any} artifacts={d} validation_calls={d} validation_ms={d} max_validation_ms={d} status_calls={d} status_ms={d} max_status_ms={d} phase={s} error={s}\n", .{
+                policy.benchmark_rows * fixture.owner_count,
+                state.value.staging_owner_phase,
+                state.value.staging_owner_cursor,
+                state.value.staging_validation_phase,
+                state.value.staging_validation_owner,
+                @tagName(live_staging.value.state),
+                live_staging.value.completed_owners,
+                fixture.imports,
+                fixture.owner_calls,
+                fixture.import_elapsed_ns / std.time.ns_per_ms,
+                fixture.import_max_ns / std.time.ns_per_ms,
+                fixture.import_apply_elapsed_ns / std.time.ns_per_ms,
+                fixture.import_apply_max_ns / std.time.ns_per_ms,
+                fixture.import_row_page_bins,
+                fixture.import_page_kinds,
+                fixture.imported_artifacts,
+                fixture.validation_owner_calls,
+                fixture.validation_owner_elapsed_ns / std.time.ns_per_ms,
+                fixture.validation_owner_max_ns / std.time.ns_per_ms,
+                fixture.status_owner_calls,
+                fixture.status_owner_elapsed_ns / std.time.ns_per_ms,
+                fixture.status_owner_max_ns / std.time.ns_per_ms,
+                @tagName(state.value.phase),
+                state.value.last_error orelse "none",
+            });
+            fixture.printValidationTimings();
+            std.debug.print("restore activation pages={d} rows={d} row_bins={any}\n", .{ fixture.activation_pages, fixture.activation_rows, fixture.activation_row_bins });
+            std.debug.print("restore source materialization calls={d} elapsed_ms={d} max_ms={d}\n", .{ fixture.materialization_calls, fixture.materialization_elapsed_ns / std.time.ns_per_ms, fixture.materialization_max_ns / std.time.ns_per_ms });
+            for (fixture.dbs[0..fixture.owner_count], 0..) |target, owner_index| {
+                var owner_progress = (try target.restoreStagingStatus(a)) orelse continue;
+                defer owner_progress.deinit();
+                std.debug.print("restore benchmark owner={d} phase={s} rows={d} artifacts_complete={} rows_complete={} proof_complete={}\n", .{
+                    owner_index,
+                    @tagName(owner_progress.value.phase),
+                    owner_progress.value.rows,
+                    owner_progress.value.artifacts_complete,
+                    owner_progress.value.rows_complete,
+                    owner_progress.value.source_generation_proofs_complete,
+                });
+            }
+            return error.RestoreBenchmarkDeadlineExceeded;
         }
         try std.testing.io.sleep(.fromMilliseconds(12), .awake);
     } else {
@@ -763,6 +1087,9 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
             artifact_bytes += shard.artifact_size_bytes;
         };
         std.debug.print("restore benchmark format={s} rows={d} artifact_bytes={d} owner_import_calls={d} validation_calls={d} integrity_transactions={d} elapsed_ms={d}\n", .{ if (policy.portable) "portable" else "native", policy.benchmark_rows * fixture.owner_count, artifact_bytes, fixture.imports, fixture.validations, fixture.sequence, (@import("antfly_platform").time.monotonicNs() - started_ns) / std.time.ns_per_ms });
+        fixture.printValidationTimings();
+        std.debug.print("restore activation pages={d} rows={d} row_bins={any}\n", .{ fixture.activation_pages, fixture.activation_rows, fixture.activation_row_bins });
+        std.debug.print("restore source materialization calls={d} elapsed_ms={d} max_ms={d}\n", .{ fixture.materialization_calls, fixture.materialization_elapsed_ns / std.time.ns_per_ms, fixture.materialization_max_ns / std.time.ns_per_ms });
     }
     defer source.freeAdminSnapshot(&published);
     if (policy.remote_owner) try std.testing.expect(fixture.remote_calls > fixture.owner_count);

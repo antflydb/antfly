@@ -22,6 +22,11 @@ const metadata_incarnation = @import("../incarnation.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 const topology_protocol = @import("../topology_protocol.zig");
 
+/// Result of an aborting owner-side initial-FK admission transaction. Keep
+/// expected CAS conflicts out of generic storage error statuses so the
+/// storage-free control process can return a definite non-admission result.
+pub const InitialFkPreflight = enum { ready, generation_changed, catalog_exists, table_transition_active };
+
 pub const AppliedMetadataCheckpoint = struct {
     commit_index: u64,
     input_kind: enum(u8) { committed_entries = 0, snapshot = 1 },
@@ -95,6 +100,10 @@ pub const StandaloneCatalogUpdate = struct {
     remove_ranges: []const u64 = &.{},
     auxiliary_json: ?[]const u8 = null,
     import_catalog: ?@import("../../system_catalog/domain.zig").State = null,
+    /// Applied in the same local transaction as the standalone revision and
+    /// mirrored outbox. Mutually exclusive with an ordinary logical delta.
+    setting_command: ?@import("../../system_catalog/settings.zig").Command = null,
+    policy_command: ?@import("../../system_catalog/policies.zig").Command = null,
     logical: ?struct {
         previous_revision: u64,
         delta: @import("../../system_catalog/domain.zig").Delta,
@@ -247,4 +256,22 @@ pub const CatalogProjectionRequest = union(enum) {
     report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
     report_baseline_fragment_admission: @import("../store_report_baseline.zig").Request,
     catalog_snapshot: void,
+    sql_setting_snapshot: @import("../../system_catalog/settings.zig").Scope,
+    sql_policy_snapshot: struct { table_id: u64, principal: []const u8, database: []const u8, roles: []const []const u8 },
+    sql_policy_install_snapshot: @import("../../system_catalog/policies.zig").InstallRequest,
+    sql_policy_publication_status: u64,
+    sql_policy_publication_work: u64,
+    sql_policy_begin_command: @import("../../system_catalog/policies.zig").BeginRequest,
+    require_policy_index_mutation_allowed: u64,
+    require_policy_topology_mutation_allowed: u64,
+    fk_generation_publication_status: u64,
+    fk_generation_publication_work: u64,
+    fk_generation_publication_decision: @import("../fk_generation_publication.zig").DecisionRequest,
+    fk_generation_publication_source_decision: @import("../fk_generation_publication.zig").SourceDecisionRequest,
+    fk_initial_create_prepare: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest,
+    fk_initial_child_decision: @import("../fk_generation_publication.zig").InitialChildDecisionRequest,
+    fk_initial_create_status: u64,
+    fk_generation_table_locked: u64,
+    fk_initial_create_work: u64,
+    fk_initial_parent_decision: @import("../fk_generation_publication.zig").DecisionRequest,
 };

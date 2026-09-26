@@ -64,12 +64,34 @@ pub const TableSchema = struct {
     pub fn relationalUniqueDefinitions(self: TableSchema, alloc: std.mem.Allocator) ![]const relational_native.UniqueConstraint {
         const declarations = self.unique_constraints orelse return &.{};
         const definitions = try alloc.alloc(relational_native.UniqueConstraint, declarations.value.len);
-        for (declarations.value, definitions) |declaration, *definition| definition.* = .{
-            .name = declaration.name,
-            .columns = declaration.columns,
-            .nulls_not_distinct = declaration.nulls_not_distinct orelse false,
-            .validation_state = .unvalidated,
-        };
+        for (declarations.value, definitions) |declaration, *definition| {
+            const wire_keys: []const relational_wire.RelationalIndexKey = declaration.keys orelse &.{};
+            const keys = try alloc.alloc(relational_native.RelationalIndexKey, wire_keys.len);
+            for (wire_keys, keys) |wire, *key| key.* = .{
+                .column = wire.column orelse "",
+                .expression_json = if (wire.expression) |expression| try std.json.Stringify.valueAlloc(alloc, expression, .{ .emit_null_optional_fields = false }) else null,
+                .result_type = if (wire.result_type) |kind| nativeEnum(storage_schema.RelationalColumnType, kind) else null,
+                .collation = wire.collation,
+            };
+            const conditions: []const relational_wire.RelationalIndexPredicate = declaration.where orelse &.{};
+            const where = try alloc.alloc(relational_native.UniquePredicate, conditions.len);
+            for (conditions, where) |condition, *target| target.* = .{
+                .field = condition.column,
+                .op = nativeEnum(relational_native.RelationalCheckOp, condition.op),
+                .value_json = if (condition.value) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
+                .collation = condition.collation,
+            };
+            definition.* = .{
+                .name = declaration.name,
+                .columns = declaration.columns orelse &.{},
+                .keys = keys,
+                .where = where,
+                .nulls_not_distinct = declaration.nulls_not_distinct orelse false,
+                .deferrable = declaration.deferrable orelse false,
+                .timing = nativeEnum(relational_native.ForeignKeyTiming, declaration.timing orelse .immediate),
+                .validation_state = .unvalidated,
+            };
+        }
         return definitions;
     }
 
@@ -543,6 +565,7 @@ pub const CompiledValidationPlan = struct {
 
 const RuntimeValidationContext = struct {
     alloc: std.mem.Allocator,
+    json_null_values: []const *const std.json.Value = &.{},
     compiled: ?*const CompiledValidationPlan = null,
     /// The table boundary validates declared root members once. The recursive
     /// root call defers their value checks but preserves unknown-member rules
@@ -893,8 +916,10 @@ pub fn validateRelationalRestoreProperty(
     property_index: usize,
     value: *const std.json.Value,
     compiled: *const CompiledValidationPlan,
+    json_literal_null: bool,
 ) !void {
-    var context = RuntimeValidationContext{ .alloc = alloc, .compiled = compiled, .require_physical_encoding = true };
+    const pointers = [_]*const std.json.Value{value};
+    var context = RuntimeValidationContext{ .alloc = alloc, .compiled = compiled, .require_physical_encoding = true, .json_null_values = if (json_literal_null) &pointers else &.{} };
     defer context.deinit();
     try validateDocumentFieldValueWithContext(&context, schema.document_schemas[0].properties[property_index], value, schema.enforce_types);
 }
@@ -906,7 +931,7 @@ pub fn validateDocumentValueWithPlan(
     physical_fields: []const PhysicalFieldValidation,
     compiled: ?*const CompiledValidationPlan,
 ) !void {
-    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true);
+    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{});
 }
 
 /// The only boundary that skips verification owns both expression evaluation
@@ -920,7 +945,22 @@ pub fn prepareDocumentValueWithPlan(
     compiled: *const CompiledValidationPlan,
 ) !void {
     if (compiled.expressions) |expressions| try expressions.applyJson(owned_alloc, value);
-    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false);
+    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{});
+}
+
+/// Typed null metadata is schema-checked by the row preparer before entering
+/// this boundary. Pointer identity scopes the exception to the exact root
+/// datums; nested nulls and unrelated SQL NULLs retain ordinary validation.
+pub fn prepareTypedDocumentValueWithPlan(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool) !void {
+    if (value.* != .object) return error.InvalidBatchRequest;
+    if (!preserve) if (compiled.expressions) |expressions| try expressions.applyJson(owned_alloc, value);
+    const pointers = try scratch.alloc(*const std.json.Value, json_null_fields.len);
+    defer scratch.free(pointers);
+    for (json_null_fields, pointers) |name, *pointer| {
+        pointer.* = value.object.getPtr(name) orelse return error.InvalidBatchRequest;
+        if (pointer.*.* != .null) return error.InvalidBatchRequest;
+    }
+    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, preserve, pointers);
 }
 
 fn validateDocumentValueInternal(
@@ -930,6 +970,7 @@ fn validateDocumentValueInternal(
     physical_fields: []const PhysicalFieldValidation,
     compiled: ?*const CompiledValidationPlan,
     verify_generated: bool,
+    json_null_values: []const *const std.json.Value,
 ) !void {
     if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0 and physical_fields.len == 0) return;
 
@@ -948,6 +989,7 @@ fn validateDocumentValueInternal(
     };
     var validation_context = RuntimeValidationContext{
         .alloc = alloc,
+        .json_null_values = json_null_values,
         .compiled = compiled,
         .require_physical_encoding = schema.storage_mode == .relational,
     };
@@ -2446,8 +2488,14 @@ fn parseRelationalDeclarations(comptime T: type, alloc: std.mem.Allocator, value
     for (parsed.value, 0..) |item, i| {
         if (item.name.len == 0 or item.name.len > 256 or !std.unicode.utf8ValidateSlice(item.name)) return error.InvalidSchemaUpdateRequest;
         for (parsed.value[0..i]) |prior| if (std.mem.eql(u8, prior.name, item.name)) return error.InvalidSchemaUpdateRequest;
-        const columns = if (T == relational_wire.RelationalUniqueConstraint) item.columns else item.child_columns;
-        try validateConstraintColumns(columns);
+        const columns = if (T == relational_wire.RelationalUniqueConstraint) item.columns orelse &.{} else item.child_columns;
+        if (T == relational_wire.RelationalUniqueConstraint) {
+            if (item.timing == .deferred and !(item.deferrable orelse false)) return error.InvalidSchemaUpdateRequest;
+            if ((item.columns != null) == (item.keys != null)) return error.InvalidSchemaUpdateRequest;
+            if (item.keys) |keys| {
+                if (keys.len == 0 or keys.len > 32) return error.InvalidSchemaUpdateRequest;
+            } else try validateConstraintColumns(columns);
+        } else try validateConstraintColumns(columns);
         if (T == relational_wire.RelationalForeignKeyConstraint) {
             if (item.parent_table.len == 0 or !std.unicode.utf8ValidateSlice(item.parent_table) or item.parent_columns.len != columns.len)
                 return error.InvalidSchemaUpdateRequest;
@@ -2559,8 +2607,25 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
     if (schema.document_schemas.len != 1) return error.InvalidSchemaUpdateRequest;
 
     const document_schema = schema.document_schemas[0];
+    var primary_count: usize = 0;
     if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| {
-        for (constraint.columns) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
+        if ((constraint.columns != null) == (constraint.keys != null)) return error.InvalidSchemaUpdateRequest;
+        for (constraint.columns orelse &.{}) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
+        if (constraint.primary orelse false) {
+            primary_count += 1;
+            if (primary_count > 1 or constraint.columns == null or constraint.columns.?.len == 0 or constraint.keys != null or constraint.where != null or (constraint.deferrable orelse false) or constraint.timing != .immediate)
+                return error.InvalidSchemaUpdateRequest;
+            for (constraint.columns.?) |column| {
+                const property = findDocumentProperty(document_schema.properties, column) orelse return error.InvalidSchemaUpdateRequest;
+                if (property.allows_null) return error.InvalidSchemaUpdateRequest;
+                var required = false;
+                for (document_schema.required_fields) |name| if (std.mem.eql(u8, name, column)) {
+                    required = true;
+                    break;
+                };
+                if (!required) return error.InvalidSchemaUpdateRequest;
+            }
+        }
         if (schema.checks) |checks| for (checks.value) |check| if (std.mem.eql(u8, check.name, constraint.name)) return error.InvalidSchemaUpdateRequest;
     };
     if (schema.foreign_keys) |constraints| for (constraints.value) |constraint| {
@@ -2631,6 +2696,20 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
         if (!isRelationalStorageProperty(property) or !relationalPhysicalConstraintsAreExact(property)) {
             return error.InvalidSchemaUpdateRequest;
         }
+    }
+}
+
+test "relational primary keys cannot defer enforcement" {
+    const alloc = std.testing.allocator;
+    const prefix = "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"nullable\":false}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"unique_constraints\":[";
+    for ([_][]const u8{
+        "{\"name\":\"pk\",\"columns\":[\"id\"],\"primary\":true,\"deferrable\":true,\"timing\":\"deferred\"}",
+        "{\"name\":\"pk\",\"columns\":[\"id\"],\"primary\":true,\"deferrable\":true,\"timing\":\"immediate\"}",
+        "{\"name\":\"pk\",\"columns\":[],\"primary\":true}",
+    }) |constraint| {
+        const json = try std.fmt.allocPrint(alloc, "{s}{s}]}}", .{ prefix, constraint });
+        defer alloc.free(json);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc, json));
     }
 }
 
@@ -4056,7 +4135,15 @@ fn validateDocumentFieldValueWithContext(
         }
     }
 
-    if (value.* == .null) return validateNullValueWithContext(context, property, value, enforce_types);
+    if (value.* == .null) {
+        for (context.json_null_values) |literal| if (literal == value) {
+            // Only SQL nullability is bypassed. JSON Schema enum/const and
+            // composition still constrain a literal JSON-null datum.
+            if (!documentPropertyAllowsNullInternal(property, true)) return error.InvalidBatchRequest;
+            return;
+        };
+        return validateNullValueWithContext(context, property, value, enforce_types);
+    }
 
     if ((property.antfly_index orelse true)) {
         if (property.antfly_field) |mapping| try validateMappedFieldValue(mapping, value.*);
@@ -4489,21 +4576,26 @@ fn losslessJsonNumberTextToF64(text: []const u8) ?f64 {
 }
 
 pub fn documentPropertyAllowsNull(property: DocumentProperty) bool {
+    return documentPropertyAllowsNullInternal(property, false);
+}
+
+fn documentPropertyAllowsNullInternal(property: DocumentProperty, json_literal_null: bool) bool {
     // JSON Schema keywords at the same schema location are conjunctive. Work
     // out whether the literal null satisfies each applicable keyword instead
     // of returning as soon as one composition happens to admit it.
     if (property.field_type) |field_type| {
-        if (!property.allows_null and !std.mem.eql(u8, field_type, "null")) return false;
+        if (!property.allows_null and !std.mem.eql(u8, field_type, "null") and
+            !(json_literal_null and std.mem.eql(u8, field_type, "json"))) return false;
     }
 
     for (property.all_of) |variant| {
-        if (!documentPropertyAllowsNull(variant)) return false;
+        if (!documentPropertyAllowsNullInternal(variant, json_literal_null)) return false;
     }
 
     if (property.any_of.len > 0) {
         var matches = false;
         for (property.any_of) |variant| {
-            if (documentPropertyAllowsNull(variant)) {
+            if (documentPropertyAllowsNullInternal(variant, json_literal_null)) {
                 matches = true;
                 break;
             }
@@ -4514,22 +4606,22 @@ pub fn documentPropertyAllowsNull(property: DocumentProperty) bool {
     if (property.one_of.len > 0) {
         var matches: usize = 0;
         for (property.one_of) |variant| {
-            if (documentPropertyAllowsNull(variant)) matches += 1;
+            if (documentPropertyAllowsNullInternal(variant, json_literal_null)) matches += 1;
         }
         if (matches != 1) return false;
     }
 
     if (property.not_schema) |not_schema| {
-        if (documentPropertyAllowsNull(not_schema.*)) return false;
+        if (documentPropertyAllowsNullInternal(not_schema.*, json_literal_null)) return false;
     }
 
     if (property.if_schema) |if_schema| {
-        if (documentPropertyAllowsNull(if_schema.*)) {
+        if (documentPropertyAllowsNullInternal(if_schema.*, json_literal_null)) {
             if (property.then_schema) |then_schema| {
-                if (!documentPropertyAllowsNull(then_schema.*)) return false;
+                if (!documentPropertyAllowsNullInternal(then_schema.*, json_literal_null)) return false;
             }
         } else if (property.else_schema) |else_schema| {
-            if (!documentPropertyAllowsNull(else_schema.*)) return false;
+            if (!documentPropertyAllowsNullInternal(else_schema.*, json_literal_null)) return false;
         }
     }
 

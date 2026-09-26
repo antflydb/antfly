@@ -79,16 +79,16 @@ mcp-schema-fragments-check:
 	$(SCRIPTS_PY) ../scripts/generate_mcp_schema_fragments.py --check
 
 snowball-generate:
-	$(ZIG) build regen-snowball
+	$(ZIG) build regen-snowball $(ZIG_BUILD_FLAGS)
 
 snowball-check:
-	$(ZIG) build check-snowball
+	$(ZIG) build check-snowball $(ZIG_BUILD_FLAGS)
 
 sql-grammar-generate:
-	$(ZIG) build regen-sql-grammar
+	$(ZIG) build regen-sql-grammar $(ZIG_BUILD_FLAGS)
 
 sql-grammar-check:
-	$(ZIG) build sql-grammar-generated-check
+	$(ZIG) build sql-grammar-generated-check $(ZIG_BUILD_FLAGS)
 
 cabi-header-generate:
 	$(SCRIPTS_PY) ../scripts/packaging/sync_cabi_header.py

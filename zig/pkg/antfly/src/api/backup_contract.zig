@@ -147,6 +147,8 @@ pub fn tableDefinitionDigest(
     return hasher.finalResult();
 }
 
+pub const SourceGenerationAdmissionSummaryEntry = @import("../storage/portable_backup.zig").SourceGenerationAdmissionSummaryEntry;
+
 pub const ShardSnapshot = struct {
     group_id: u64,
     /// Logical range identity is distinct from the physical Raft group after
@@ -165,6 +167,10 @@ pub const ShardSnapshot = struct {
     /// only when the authoritative inventory itself is unchanged.
     native_manifest_size_bytes: u64 = 0,
     native_manifest_sha256: []const u8 = "",
+    /// Exact sealed source-owner evidence for this physical range. Different
+    /// parent ranges can have different accepted scopes and revisions.
+    accepted_generation_summary: []const SourceGenerationAdmissionSummaryEntry = &.{},
+    accepted_generation_summary_digest: ?[32]u8 = null,
 
     pub fn deinit(self: ShardSnapshot, alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.start_key));
@@ -172,10 +178,16 @@ pub const ShardSnapshot = struct {
         alloc.free(@constCast(self.snapshot_path));
         if (self.artifact_sha256.len > 0) alloc.free(@constCast(self.artifact_sha256));
         if (self.native_manifest_sha256.len > 0) alloc.free(@constCast(self.native_manifest_sha256));
+        for (self.accepted_generation_summary) |entry| {
+            alloc.free(@constCast(entry.child_table_name));
+            alloc.free(@constCast(entry.constraint_name));
+        }
+        if (self.accepted_generation_summary.len != 0) alloc.free(@constCast(self.accepted_generation_summary));
     }
 };
 
 pub const TableBackupManifest = struct {
+    pub const AcceptedGeneration = SourceGenerationAdmissionSummaryEntry;
     format_version: u32 = format_version,
     format: BackupFormat,
     artifact_integrity_mode: ArtifactIntegrityMode = .declared,

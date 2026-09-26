@@ -599,6 +599,36 @@ pub const DeleteSecretPathParams = struct {
     key: []const u8,
 };
 
+/// Parse the JSON request body for administerSqlSettings.
+pub fn parseAdministerSqlSettingsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SqlSettingMutationRequest) {
+    return std.json.parseFromSlice(types.SqlSettingMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for executeSQL.
+pub fn parseExecuteSQLBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLRequest) {
+    return std.json.parseFromSlice(types.SQLRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for prepareSQL.
+pub fn parsePrepareSQLBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLPrepareRequest) {
+    return std.json.parseFromSlice(types.SQLPrepareRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Release a durable prepared SQL resource
+pub const ClosePreparedSQLPathParams = struct {
+    prepared_id: []const u8,
+};
+
+/// Execute a durable prepared SQL resource
+pub const ExecutePreparedSQLPathParams = struct {
+    prepared_id: []const u8,
+};
+
+/// Parse the JSON request body for executePreparedSQL.
+pub fn parseExecutePreparedSQLBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLPreparedExecutionRequest) {
+    return std.json.parseFromSlice(types.SQLPreparedExecutionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 pub const ListTablesParams = struct {
     /// Filter tables by name prefix (e.g., "prod_")
     prefix: ?[]const u8 = null,
@@ -1284,6 +1314,11 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/settings", .operation_id = "administerSqlSettings", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/sql", .operation_id = "executeSQL", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/sql/prepared", .operation_id = "prepareSQL", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/sql/prepared/{prepared_id}", .operation_id = "closePreparedSQL", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/sql/prepared/{prepared_id}/execute", .operation_id = "executePreparedSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/status", .operation_id = "getStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables", .operation_id = "listTables", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}", .operation_id = "getTable", .request_body = .none, .streaming_response = false },
@@ -1426,6 +1461,11 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "listSecrets")) @compileError("ServerRouter: Impl missing required method 'listSecrets'");
         if (!@hasDecl(Impl, "putSecret")) @compileError("ServerRouter: Impl missing required method 'putSecret'");
         if (!@hasDecl(Impl, "deleteSecret")) @compileError("ServerRouter: Impl missing required method 'deleteSecret'");
+        if (!@hasDecl(Impl, "administerSqlSettings")) @compileError("ServerRouter: Impl missing required method 'administerSqlSettings'");
+        if (!@hasDecl(Impl, "executeSQL")) @compileError("ServerRouter: Impl missing required method 'executeSQL'");
+        if (!@hasDecl(Impl, "prepareSQL")) @compileError("ServerRouter: Impl missing required method 'prepareSQL'");
+        if (!@hasDecl(Impl, "closePreparedSQL")) @compileError("ServerRouter: Impl missing required method 'closePreparedSQL'");
+        if (!@hasDecl(Impl, "executePreparedSQL")) @compileError("ServerRouter: Impl missing required method 'executePreparedSQL'");
         if (!@hasDecl(Impl, "getStatus")) @compileError("ServerRouter: Impl missing required method 'getStatus'");
         if (!@hasDecl(Impl, "listTables")) @compileError("ServerRouter: Impl missing required method 'listTables'");
         if (!@hasDecl(Impl, "getTable")) @compileError("ServerRouter: Impl missing required method 'getTable'");
@@ -1566,6 +1606,11 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/secrets", httpx.Handler.bind(self.impl, listSecrets));
             try server.put("/secrets/:key", httpx.Handler.bind(self.impl, putSecret));
             try server.delete("/secrets/:key", httpx.Handler.bind(self.impl, deleteSecret));
+            try server.post("/settings", httpx.Handler.bind(self.impl, administerSqlSettings));
+            try server.post("/sql", httpx.Handler.bind(self.impl, executeSQL));
+            try server.post("/sql/prepared", httpx.Handler.bind(self.impl, prepareSQL));
+            try server.delete("/sql/prepared/:prepared_id", httpx.Handler.bind(self.impl, closePreparedSQL));
+            try server.post("/sql/prepared/:prepared_id/execute", httpx.Handler.bind(self.impl, executePreparedSQL));
             try server.get("/status", httpx.Handler.bind(self.impl, getStatus));
             try server.get("/tables", httpx.Handler.bind(self.impl, listTables));
             try server.get("/tables/:tableName", httpx.Handler.bind(self.impl, getTable));
@@ -2146,6 +2191,38 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn deleteSecret(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             return impl.deleteSecret(ctx, key);
+        }
+
+        /// Publish or remove a durable SQL setting
+        /// POST /settings
+        fn administerSqlSettings(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.administerSqlSettings(ctx);
+        }
+
+        /// Execute a SQL statement
+        /// POST /sql
+        fn executeSQL(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.executeSQL(ctx);
+        }
+
+        /// Create a durable prepared SQL resource
+        /// POST /sql/prepared
+        fn prepareSQL(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.prepareSQL(ctx);
+        }
+
+        /// Release a durable prepared SQL resource
+        /// DELETE /sql/prepared/{prepared_id}
+        fn closePreparedSQL(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const prepared_id = ctx.param("prepared_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: prepared_id" });
+            return impl.closePreparedSQL(ctx, prepared_id);
+        }
+
+        /// Execute a durable prepared SQL resource
+        /// POST /sql/prepared/{prepared_id}/execute
+        fn executePreparedSQL(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const prepared_id = ctx.param("prepared_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: prepared_id" });
+            return impl.executePreparedSQL(ctx, prepared_id);
         }
 
         /// Get cluster status
@@ -2731,6 +2808,11 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
+//   fn administerSqlSettings(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn executeSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn prepareSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn closePreparedSQL(self: *Impl, ctx: *httpx.Context, prepared_id: []const u8) !httpx.Response
+//   fn executePreparedSQL(self: *Impl, ctx: *httpx.Context, prepared_id: []const u8) !httpx.Response
 //   fn getStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listTables(self: *Impl, ctx: *httpx.Context, params: ListTablesParams) !httpx.Response
 //   fn getTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

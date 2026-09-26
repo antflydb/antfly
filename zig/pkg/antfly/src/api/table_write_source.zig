@@ -76,8 +76,12 @@ pub const TableWriteSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    /// Transaction-ID commits enforce owner-routed range guards atomically
+    /// with primary writes, including read-only guard participants.
+    supports_sql_range_guards: bool = false,
 
     pub const VTable = struct {
+        activate_range_tracking: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("operation.zig").RequestContext) anyerror!void = null,
         txn_status_group_local_with_request: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -627,6 +631,11 @@ pub const TableWriteSource = struct {
             stamp: metadata_api.CatalogMutationStamp,
         ) anyerror!?void = null,
     };
+
+    pub fn activateRangeTracking(self: TableWriteSource, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
+        const callback = self.vtable.activate_range_tracking orelse return error.SqlRangeTrackingRequired;
+        return BoundaryAbi.call("activate_range_tracking", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, context });
+    }
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn batch(
@@ -1046,6 +1055,8 @@ pub const TableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
         context: distributed_txn.PreDecisionContext,
     ) !?void {
+        if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
+        if (context.route_fence != null and self.vtable.txn_prepare_group_local_with_pre_decision_context == null) return error.CatalogRouteFenceUnsupported;
         const fn_ptr = self.vtable.txn_prepare_group_local_with_pre_decision_context orelse
             return try self.txnPrepareGroupLocal(alloc, group_id, table_name, txn_id, topology_epoch, req);
         return try BoundaryAbi.call("txn_prepare_group_local_with_pre_decision_context", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, topology_epoch, req, context });

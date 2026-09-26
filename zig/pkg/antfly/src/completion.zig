@@ -76,6 +76,7 @@ pub const commands = [_]Command{
     .{ .name = "index", .description = "Manage indexes", .route = .cli, .subcommands = &index_subcommands },
     .{ .name = "artifact", .description = "Manage generated artifacts", .route = .cli, .subcommands = &artifact_subcommands },
     .{ .name = "query", .description = "Query table data", .route = .cli },
+    .{ .name = "sql", .description = "Execute a typed SQL statement", .route = .cli },
     .{ .name = "lookup", .description = "Look up a document by key", .route = .cli },
     .{ .name = "load", .description = "Bulk-load NDJSON data", .route = .cli },
     .{ .name = "insert", .description = "Insert a document", .route = .cli },

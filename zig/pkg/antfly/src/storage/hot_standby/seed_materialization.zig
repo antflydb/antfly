@@ -164,6 +164,12 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
     }
     const native_owners = try @import("restore_owner_registry.zig").expand(alloc, parsed.value.native_restore_tables, parsed.value.native_restore_owners);
     defer alloc.free(native_owners);
+    var initial_arena = std.heap.ArenaAllocator.init(alloc);
+    defer initial_arena.deinit();
+    const initial_owners = if (parsed.value.private_provisioning) |projection|
+        try @import("../../data/private_provisioning.zig").validateInitial(initial_arena.allocator(), parsed.value.catalog.tables, parsed.value.catalog.ranges, projection)
+    else
+        &.{};
     for (native_owners) |owner| try @import("restore_owner_registry.zig").record(alloc, io, metadata_root, owner);
     if (parsed.value.restore_terminals) |artifact| {
         const terminal_path = try std.fs.path.join(alloc, &.{ request.raw_generation_root, artifact.path });
@@ -210,6 +216,39 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
             .shard_id = replica.identity_shard_id,
             .range_id = replica.identity_range_id,
         });
+        try verifyReplicaRowPolicy(alloc, staged.path(), replica, parsed.value.catalog.policy_install_snapshots);
+        for (initial_owners) |owner| {
+            if (owner.range.group_id != replica.group_id) continue;
+            const hidden = @import("../db/relational_initial_child_publication.zig");
+            const descriptor = owner.descriptor;
+            const expected: hidden.Bootstrap = .{
+                .plan_id = descriptor.plan_id,
+                .plan_digest = descriptor.plan_digest,
+                .namespace = descriptor.namespace,
+                .schema_version = descriptor.schema_version,
+                .schema_digest = descriptor.schema_digest,
+                .public_schema_json_digest = descriptor.public_schema_json_digest,
+                .catalog_digest = descriptor.catalog_digest,
+            };
+            var verified = try db_mod.DB.open(alloc, staged.path(), .{
+                .open_mode = .query_readonly,
+                .primary_only_readonly = true,
+                .identity_namespace = descriptor.namespace,
+                .initial_child_bootstrap = expected,
+                .start_index_workers = false,
+                .start_optional_runtimes = false,
+            });
+            defer verified.close();
+            var probe = try verified.core.store.beginReadTxn();
+            defer probe.abort();
+            if (try hidden.load(&probe)) |record| {
+                if (!expected.matches(record) or record.row_count != 0) return error.SeedReplicaIdentityMismatch;
+            } else {
+                const hidden_catalog = probe.get(@import("../db/relational_integrity_catalog.zig").key) catch null;
+                const schema_json = probe.get("\x00\x00__metadata__:schema_json") catch null;
+                if (hidden_catalog != null or schema_json != null) return error.SeedReplicaIdentityMismatch;
+            }
+        }
         var native_ha_owner = false;
         for (native_owners) |owner| {
             if (owner.scope.target_namespace.shard_id != replica.group_id) continue;
@@ -410,8 +449,71 @@ pub fn validateRuntimeIdentity(
             .start_index_workers = false,
             .start_optional_runtimes = false,
         });
-        db.close();
+        defer db.close();
+        try verifyOpenedReplicaRowPolicy(alloc, &db, replica.identity_table_id, topology.value.catalog.policy_install_snapshots);
     }
+}
+
+/// A metadata seed is not sufficient if the physical owner carries a stale
+/// policy generation. Validate the exact immutable installed program before
+/// publishing a staged generation and again before promotion/reopen.
+fn verifyReplicaRowPolicy(
+    alloc: Allocator,
+    db_path: []const u8,
+    replica: ReplicaSnapshot,
+    programs: []const @import("../../system_catalog/policies.zig").InstallSnapshot,
+) !void {
+    var db = try db_mod.DB.open(alloc, db_path, .{
+        .open_mode = .query_readonly,
+        .primary_only_readonly = true,
+        .identity_namespace = .{
+            .table_id = replica.identity_table_id,
+            .shard_id = replica.identity_shard_id,
+            .range_id = replica.identity_range_id,
+        },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer db.close();
+    try verifyOpenedReplicaRowPolicy(alloc, &db, replica.identity_table_id, programs);
+}
+
+fn verifyOpenedReplicaRowPolicy(
+    alloc: Allocator,
+    db: *db_mod.DB,
+    table_id: u64,
+    programs: []const @import("../../system_catalog/policies.zig").InstallSnapshot,
+) !void {
+    var expected: ?*const @import("../../system_catalog/policies.zig").InstallSnapshot = null;
+    for (programs) |*program| if (program.table_id == table_id) {
+        if (expected != null) return error.SeedMetadataTopologyMismatch;
+        expected = program;
+    };
+    if (expected) |program| {
+        if (db.core.table_catalog.row_policy_phase != .active) return error.SeedReplicaPolicyMismatch;
+        const installed = if (db.row_policy_bundle) |*bundle| bundle else return error.SeedReplicaPolicyMismatch;
+        if (!(try policyInstallSnapshotsEqual(alloc, installed.parsed.value, program.*))) return error.SeedReplicaPolicyMismatch;
+    } else if (db.core.table_catalog.row_policy_phase != .disabled) {
+        return error.SeedReplicaPolicyMismatch;
+    }
+}
+
+fn policyInstallSnapshotsEqual(
+    alloc: Allocator,
+    actual: @import("../../system_catalog/policies.zig").InstallSnapshot,
+    expected: @import("../../system_catalog/policies.zig").InstallSnapshot,
+) !bool {
+    // Metadata promotes `.serving_install` to `.active` after every owner has
+    // ACKed; no extra owner Raft entry rewrites the immutable installed bytes.
+    // Normalize only that publication phase, never the program or epoch.
+    var normalized = actual;
+    if (normalized.phase == .serving_install and expected.phase == .active)
+        normalized.phase = .active;
+    const actual_json = try std.json.Stringify.valueAlloc(alloc, normalized, .{});
+    defer alloc.free(actual_json);
+    const expected_json = try std.json.Stringify.valueAlloc(alloc, expected, .{});
+    defer alloc.free(expected_json);
+    return std.mem.eql(u8, actual_json, expected_json);
 }
 
 fn verifyStandaloneMetadataTopology(alloc: Allocator, store: *@import("../../metadata/storage/raft_apply_store.zig").RaftApplyStore, topology: Topology) !void {
@@ -428,6 +530,21 @@ fn verifyStandaloneMetadataTopology(alloc: Allocator, store: *@import("../../met
     defer actual_catalog.deinit();
     const expected_catalog = topology.catalog.system_catalog orelse catalog.State{};
     if (actual_catalog.value.revision != expected_catalog.revision or actual_catalog.value.next_id != expected_catalog.next_id) return error.SeedMetadataTopologyMismatch;
+    // The active program may differ from mutable policy drafts. Verify its
+    // immutable metadata snapshot survived materialization before any owner
+    // can be made routable by the promoted seed.
+    const exported_bytes = store.exportSystemCatalog(scratch, group_id) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.SeedMetadataTopologyMismatch,
+    };
+    const exported = try std.json.parseFromSliceLeaky(@import("../../system_catalog/projection.zig").Export, scratch, exported_bytes, .{ .allocate = .alloc_always });
+    const expected_programs = topology.catalog.policy_install_snapshots;
+    if (exported.policy_install_snapshots.len != expected_programs.len) return error.SeedMetadataTopologyMismatch;
+    for (exported.policy_install_snapshots, expected_programs) |actual_program, expected_program| {
+        const actual_json = try std.json.Stringify.valueAlloc(scratch, actual_program, .{});
+        const expected_json = try std.json.Stringify.valueAlloc(scratch, expected_program, .{});
+        if (!std.mem.eql(u8, actual_json, expected_json)) return error.SeedMetadataTopologyMismatch;
+    }
     var expected_state = try catalog.MutableState.clone(scratch, expected_catalog);
     defer expected_state.deinit();
     var actual_state = try catalog.MutableState.clone(scratch, actual_catalog.value);
@@ -704,6 +821,150 @@ fn pathExists(io: std.Io, path: []const u8) !bool {
         else => return err,
     };
     return true;
+}
+
+test "storage.ha physical owner policy snapshot must equal metadata seed program" {
+    const policies = @import("../../system_catalog/policies.zig");
+    const base: policies.InstallSnapshot = .{
+        .table_id = 7,
+        .schema_version = 1,
+        .schema_digest = @splat(3),
+        .policy_generation = 4,
+        .catalog_epoch = 9,
+        .phase = .active,
+        .records = &.{},
+        .settings = &.{},
+    };
+    try std.testing.expect(try policyInstallSnapshotsEqual(std.testing.allocator, base, base));
+    var serving = base;
+    serving.phase = .serving_install;
+    try std.testing.expect(try policyInstallSnapshotsEqual(std.testing.allocator, serving, base));
+    var stale = base;
+    stale.catalog_epoch = 8;
+    try std.testing.expect(!(try policyInstallSnapshotsEqual(std.testing.allocator, stale, base)));
+    stale = base;
+    stale.phase = .pending_install;
+    try std.testing.expect(!(try policyInstallSnapshotsEqual(std.testing.allocator, stale, base)));
+}
+
+test "storage.ha staged owner rejects metadata policy missing from its physical catalog" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io_impl.io(), ".", alloc);
+    defer alloc.free(root);
+    const db_path = try std.fs.path.join(alloc, &.{ root, "table-db" });
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer db.close();
+    try verifyOpenedReplicaRowPolicy(alloc, &db, 7, &.{});
+    const program: @import("../../system_catalog/policies.zig").InstallSnapshot = .{
+        .table_id = 7,
+        .schema_version = 1,
+        .schema_digest = @splat(3),
+        .policy_generation = 1,
+        .catalog_epoch = 2,
+        .phase = .active,
+        .records = &.{},
+        .settings = &.{},
+    };
+    try std.testing.expectError(error.SeedReplicaPolicyMismatch, verifyOpenedReplicaRowPolicy(alloc, &db, 7, &.{program}));
+}
+
+test "storage.ha protected owner seed accepts serving program and rejects stale promotion program" {
+    const alloc = std.testing.allocator;
+    const policies = @import("../../system_catalog/policies.zig");
+    const schema_mod = @import("../schema.zig");
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io_impl.io(), ".", alloc);
+    defer alloc.free(root);
+    const db_path = try std.fs.path.join(alloc, &.{ root, "table-db" });
+    defer alloc.free(db_path);
+    const namespace: @import("../db/doc_identity_namespace.zig").Namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    var active_program: policies.InstallSnapshot = undefined;
+    var records: [1]policies.Record = undefined;
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_json);
+        const schema_bytes = try schema_mod.serializeSchema(alloc, db.core.schema.?);
+        defer alloc.free(schema_bytes);
+        var schema_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(schema_bytes, &schema_digest, .{});
+        records[0] = .{
+            .id = 1,
+            .generation = 1,
+            .table_id = 7,
+            .schema_version = 1,
+            .schema_digest = schema_digest,
+            .name = "visible",
+            .commands = .{ .select = true },
+            .roles = &.{"PUBLIC"},
+            .using = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } }}, .root = 0 },
+        };
+        const pending: policies.InstallSnapshot = .{
+            .table_id = 7,
+            .schema_version = 1,
+            .schema_digest = schema_digest,
+            .policy_generation = 1,
+            .catalog_epoch = 2,
+            .phase = .pending_install,
+            .records = &records,
+            .settings = &.{},
+        };
+        const pending_bytes = try std.json.Stringify.valueAlloc(alloc, pending, .{});
+        defer alloc.free(pending_bytes);
+        const range = db.core.byteRange();
+        var request: policies.InstallRequest = .{
+            .table_id = 7,
+            .expected_generation = 1,
+            .expected_catalog_epoch = 2,
+            .expected_phase = .pending_install,
+            .owner_group_id = 17,
+            .expected_descriptor_digest = try (policies.OwnerDescriptor{
+                .table_id = 7,
+                .group_id = 17,
+                .shard_id = 8,
+                .range_id = 9,
+                .schema_version = 1,
+                .schema_digest = schema_digest,
+                .range_start = range.start,
+                .range_end = range.end,
+            }).digest(),
+        };
+        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(pending_bytes, request, .{ .term = 3, .index = 11 })) == null);
+        _ = try db.loadRowPolicyReceipt(1, .pending_install);
+        var serving = pending;
+        serving.phase = .serving_install;
+        const serving_bytes = try std.json.Stringify.valueAlloc(alloc, serving, .{});
+        defer alloc.free(serving_bytes);
+        request.expected_phase = .serving_install;
+        try std.testing.expect((try db.applyReplicatedRowPolicyPublication(serving_bytes, request, .{ .term = 3, .index = 12 })) == null);
+        _ = try db.loadRowPolicyReceipt(1, .serving_install);
+        active_program = pending;
+        active_program.phase = .active;
+        try verifyOpenedReplicaRowPolicy(alloc, &db, 7, &.{active_program});
+        var stale = active_program;
+        stale.catalog_epoch = 3;
+        try std.testing.expectError(error.SeedReplicaPolicyMismatch, verifyOpenedReplicaRowPolicy(alloc, &db, 7, &.{stale}));
+    }
+    const replica: ReplicaSnapshot = .{ .group_id = 8, .table_id = 7, .table_name = "policy", .snapshot_path = "unused", .logical_sha256 = "unused", .identity_table_id = 7, .identity_shard_id = 8, .identity_range_id = 9 };
+    try verifyReplicaRowPolicy(alloc, db_path, replica, &.{active_program});
+    var stale = active_program;
+    stale.policy_generation = 2;
+    try std.testing.expectError(error.SeedReplicaPolicyMismatch, verifyReplicaRowPolicy(alloc, db_path, replica, &.{stale}));
 }
 
 test "storage.ha system catalog seed versions require complete logical identities" {

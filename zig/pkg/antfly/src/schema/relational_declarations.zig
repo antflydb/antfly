@@ -33,12 +33,47 @@ pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSche
     errdefer alloc.free(definitions);
     var initialized: usize = 0;
     errdefer for (definitions[0..initialized]) |definition| alloc.free(definition.payload);
+    var layout: ?@import("../storage/db/algebraic/relational_row_codec.zig").PhysicalLayout = null;
+    defer if (layout) |*value| value.deinit();
     for (uniques, definitions[0..uniques.len]) |unique, *definition| {
-        definition.* = try definitionAlloc(alloc, .unique, unique.name, .{
-            .domain = "antfly unique declaration v2 null witnesses",
+        if (unique.timing == .deferred and !unique.deferrable) return error.InvalidSchemaUpdateRequest;
+        if (unique.keys.len == 0 and unique.where.len == 0 and !unique.deferrable) {
+            definition.* = try definitionAlloc(alloc, .unique, unique.name, .{
+                .domain = "antfly unique declaration v2 null witnesses",
+                .name = unique.name,
+                .columns = unique.columns,
+                .column_types = try columnTypes(arena, runtime, unique.columns),
+                .nulls_not_distinct = unique.nulls_not_distinct,
+            });
+            initialized += 1;
+            continue;
+        }
+        if (layout == null) layout = try @import("../storage/db/algebraic/relational_row_codec.zig").PhysicalLayout.init(arena, runtime);
+        const keys = if (unique.keys.len != 0) unique.keys else blk: {
+            const values = try arena.alloc(@import("../storage/relational_index.zig").RelationalIndexKey, unique.columns.len);
+            for (unique.columns, values) |column, *key| key.* = .{ .column = column };
+            break :blk values;
+        };
+        var tuple = try @import("../storage/db/relational_index_keys.zig").TuplePlan.init(arena, runtime, &layout.?, keys);
+        defer tuple.deinit();
+        var predicate = if (unique.where.len != 0) try @import("../storage/db/relational_index_predicate.zig").Plan.init(arena, runtime, &layout.?, unique.where) else null;
+        defer if (predicate) |*plan| plan.deinit();
+        // Preserve generations of existing plain-column declarations. New
+        // shapes use compiled identities, including referenced types and the
+        // normalized predicate, rather than JSON spelling or column ordinals.
+        definition.* = if (unique.deferrable) try definitionAlloc(alloc, .unique, unique.name, .{
+            .domain = "antfly unique declaration v4 constraint timing",
             .name = unique.name,
-            .columns = unique.columns,
-            .column_types = try columnTypes(arena, runtime, unique.columns),
+            .tuple = tuple.fingerprint,
+            .predicate = if (predicate) |plan| plan.identity else @as([32]u8, @splat(0)),
+            .nulls_not_distinct = unique.nulls_not_distinct,
+            .deferrable = unique.deferrable,
+            .timing = @tagName(unique.timing),
+        }) else try definitionAlloc(alloc, .unique, unique.name, .{
+            .domain = "antfly unique declaration v3 typed keys and membership",
+            .name = unique.name,
+            .tuple = tuple.fingerprint,
+            .predicate = if (predicate) |plan| plan.identity else @as([32]u8, @splat(0)),
             .nulls_not_distinct = unique.nulls_not_distinct,
         });
         initialized += 1;
@@ -74,6 +109,25 @@ pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSche
 pub fn freeDefinitions(alloc: std.mem.Allocator, definitions: []const catalog.Definition) void {
     for (definitions) |definition| alloc.free(definition.payload);
     alloc.free(definitions);
+}
+
+/// Source projection shared by activation, retirement and the coordinator.
+/// Expression operands and membership predicates are integrity dependencies.
+pub fn uniqueFields(alloc: std.mem.Allocator, runtime: native.TableSchema, layout: *const @import("../storage/db/algebraic/relational_row_codec.zig").PhysicalLayout, unique: @import("../storage/relational_index.zig").UniqueConstraint) ![]const []const u8 {
+    var fields: std.ArrayList([]const u8) = .empty;
+    errdefer fields.deinit(alloc);
+    try fields.appendSlice(alloc, unique.columns);
+    if (unique.keys.len != 0) {
+        var tuple = try @import("../storage/db/relational_index_keys.zig").TuplePlan.init(alloc, runtime, layout, unique.keys);
+        defer tuple.deinit();
+        for (tuple.keys) |key| {
+            if (key.expression) |expression| {
+                for (expression.plan.dependencies) |ordinal| try fields.append(alloc, runtime.relational_columns[ordinal].name);
+            } else try fields.append(alloc, runtime.relational_columns[key.ordinal].name);
+        }
+    }
+    for (unique.where) |condition| try fields.append(alloc, condition.field);
+    return fields.toOwnedSlice(alloc);
 }
 
 fn columnTypes(alloc: std.mem.Allocator, runtime: native.TableSchema, names: []const []const u8) ![]const []const u8 {
@@ -121,4 +175,15 @@ test "relational declarations own arrays and fingerprint logical identity" {
     const ttl_definitions = try definitionFingerprints(alloc, parsed, runtime);
     defer freeDefinitions(alloc, ttl_definitions);
     try std.testing.expectEqualSlices(u8, &first[0].fingerprint, &ttl_definitions[0].fingerprint);
+    @constCast(parsed.unique_constraints.?.value)[0].deferrable = true;
+    const deferrable = try definitionFingerprints(alloc, parsed, runtime);
+    defer freeDefinitions(alloc, deferrable);
+    try std.testing.expect(!std.mem.eql(u8, &first[0].fingerprint, &deferrable[0].fingerprint));
+    @constCast(parsed.unique_constraints.?.value)[0].timing = .deferred;
+    const deferred = try definitionFingerprints(alloc, parsed, runtime);
+    defer freeDefinitions(alloc, deferred);
+    try std.testing.expect(!std.mem.eql(u8, &deferrable[0].fingerprint, &deferred[0].fingerprint));
+    const moved = try definitionFingerprints(alloc, parsed, reordered);
+    defer freeDefinitions(alloc, moved);
+    try std.testing.expectEqualSlices(u8, &deferred[0].fingerprint, &moved[0].fingerprint);
 }

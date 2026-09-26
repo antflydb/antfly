@@ -226,7 +226,7 @@ components:
     RelationalUniqueConstraint:
       type: object
       additionalProperties: false
-      required: [name, columns]
+      required: [name]
       description: |
         A named, ordered composite unique key. Validation status is maintained
         by the server. TTL expiry uses the distributed integrity coordinator.
@@ -236,6 +236,9 @@ components:
           type: string
           minLength: 1
           maxLength: 256
+        primary:
+          type: boolean
+          description: SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable.
         columns:
           type: array
           minItems: 1
@@ -243,9 +246,27 @@ components:
           items:
             type: string
             minLength: 1
+        keys:
+          type: array
+          minItems: 1
+          maxItems: 32
+          description: Typed native unique keys. Specify either columns or keys.
+          items:
+            $ref: '#/components/schemas/RelationalIndexKey'
+        where:
+          type: array
+          maxItems: 256
+          description: Conjunction restricting uniqueness to matching rows.
+          items:
+            $ref: '#/components/schemas/RelationalIndexPredicate'
         nulls_not_distinct:
           type: boolean
           description: When true, NULL components compare equal for uniqueness.
+        deferrable:
+          type: boolean
+          description: Permit uniqueness checks at transaction commit. Never eligible as an ON CONFLICT arbiter or a referenced foreign key target.
+        timing:
+          $ref: "#/components/schemas/ForeignKeyTiming"
 
     RelationalForeignKeyConstraint:
       type: object

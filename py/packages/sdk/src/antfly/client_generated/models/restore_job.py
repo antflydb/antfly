@@ -35,6 +35,8 @@ class RestoreJob:
             completion checkpoint is durable.
         created_at_ms (int):
         updated_at_ms (int):
+        idempotency_key (str | Unset): Durable admission identity. Retain it with job_id when reconciling an uncertain
+            schema rewrite; do not replay the DDL.
         table_name (str | Unset):
         total_table_count (int | Unset): Requested table count when known before execution.
         result (RestoreJobResult | Unset): Bounded terminal result. A committed result with durability pending means
@@ -61,6 +63,7 @@ class RestoreJob:
     completed_table_count: int
     created_at_ms: int
     updated_at_ms: int
+    idempotency_key: str | Unset = UNSET
     table_name: str | Unset = UNSET
     total_table_count: int | Unset = UNSET
     result: RestoreJobResult | Unset = UNSET
@@ -91,6 +94,8 @@ class RestoreJob:
 
         updated_at_ms = self.updated_at_ms
 
+        idempotency_key = self.idempotency_key
+
         table_name = self.table_name
 
         total_table_count = self.total_table_count
@@ -120,6 +125,8 @@ class RestoreJob:
                 "updated_at_ms": updated_at_ms,
             }
         )
+        if idempotency_key is not UNSET:
+            field_dict["idempotency_key"] = idempotency_key
         if table_name is not UNSET:
             field_dict["table_name"] = table_name
         if total_table_count is not UNSET:
@@ -160,6 +167,8 @@ class RestoreJob:
 
         updated_at_ms = d.pop("updated_at_ms")
 
+        idempotency_key = d.pop("idempotency_key", UNSET)
+
         table_name = d.pop("table_name", UNSET)
 
         total_table_count = d.pop("total_table_count", UNSET)
@@ -187,6 +196,7 @@ class RestoreJob:
             completed_table_count=completed_table_count,
             created_at_ms=created_at_ms,
             updated_at_ms=updated_at_ms,
+            idempotency_key=idempotency_key,
             table_name=table_name,
             total_table_count=total_table_count,
             result=result,

@@ -55,6 +55,8 @@ pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionComm
         // for read-only dependencies and across subsequent statements.
         var entry = [_]sessions.TableCommitRequest{.{
             .table_name = @constCast(label),
+            .relational_schema_version = update.relational_schema_version,
+            .schema_version = update.schema_version,
             .batch = .{ .writes = writes, .deletes = @constCast(update.deletes) },
             .predicates = .{ .items = @constCast(update.predicates), .capacity = update.predicates.len },
         }};
@@ -86,7 +88,7 @@ pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const ses
     defer before.deinit(alloc);
     const staged = try before.distributedTables(alloc);
     defer alloc.free(staged);
-    var prepared = try integrity.prepareSessionStatement(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context);
+    var prepared = try integrity.prepareSessionStatementWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context, candidate.constraint_timing.items);
     defer prepared.deinit();
     try server.authorizeAndBindIntegrityMutations(alloc, context, prepared.tables, candidate);
     try server.validateCommitTablesAgainstSchema(context, prepared.tables);

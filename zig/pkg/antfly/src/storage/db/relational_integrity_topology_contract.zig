@@ -33,7 +33,128 @@ pub const receipt_key = "\x00\x00__metadata__:relational_integrity_topology_rece
 
 pub const abort_prefix = "\x00\x00__metadata__:relational_integrity_topology_aborted:";
 
-pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5, rewrite_source = 6 };
+pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5, rewrite_source = 6, truncate_parent = 7, child_generation_parent = 8, child_generation_source = 9, child_generation_dual = 10, rewrite_destination = 11 };
+
+pub const ParentRetirementEntry = struct {
+    child_table_id: u64,
+    child_table_name: []const u8,
+    constraint_name: []const u8,
+    generation: integrity.Generation,
+    next_generation: integrity.Generation,
+};
+
+pub const ParentRetirementStage = struct {
+    plan_digest: integrity.Digest,
+    entries: []const ParentRetirementEntry,
+};
+
+pub const ParentActivation = struct {
+    plan_id: [16]u8,
+    plan_digest: integrity.Digest,
+    publication_digest: integrity.Digest,
+};
+
+pub const ChildSchemaInstall = struct {
+    schema_json: []const u8,
+    before_schema_json_digest: integrity.Digest,
+    schema_json_digest: integrity.Digest,
+    before_catalog_digest: integrity.Digest,
+    after_catalog_digest: integrity.Digest,
+
+    pub fn nativeJsonProjection(self: ChildSchemaInstall) struct {
+        schema_json: std.json.Value,
+        before_schema_json_digest: integrity.Digest,
+        schema_json_digest: integrity.Digest,
+        before_catalog_digest: integrity.Digest,
+        after_catalog_digest: integrity.Digest,
+    } {
+        return .{
+            .schema_json = .{ .string = self.schema_json },
+            .before_schema_json_digest = self.before_schema_json_digest,
+            .schema_json_digest = self.schema_json_digest,
+            .before_catalog_digest = self.before_catalog_digest,
+            .after_catalog_digest = self.after_catalog_digest,
+        };
+    }
+};
+
+pub const InitialChildProvision = struct {
+    schema_json: []const u8,
+    child_table_name: []const u8,
+    plan_id: [16]u8,
+    plan_digest: integrity.Digest,
+    schema_digest: integrity.Digest,
+    public_schema_json_digest: integrity.Digest,
+    catalog_digest: integrity.Digest,
+
+    pub fn nativeJsonProjection(self: InitialChildProvision) struct {
+        schema_json: std.json.Value,
+        child_table_name: []const u8,
+        plan_id: [16]u8,
+        plan_digest: integrity.Digest,
+        schema_digest: integrity.Digest,
+        public_schema_json_digest: integrity.Digest,
+        catalog_digest: integrity.Digest,
+    } {
+        return .{
+            .schema_json = .{ .string = self.schema_json },
+            .child_table_name = self.child_table_name,
+            .plan_id = self.plan_id,
+            .plan_digest = self.plan_digest,
+            .schema_digest = self.schema_digest,
+            .public_schema_json_digest = self.public_schema_json_digest,
+            .catalog_digest = self.catalog_digest,
+        };
+    }
+};
+
+pub const InitialChildControl = struct {
+    plan_id: [16]u8,
+    plan_digest: integrity.Digest,
+    schema_version: u32,
+    schema_digest: integrity.Digest,
+    public_schema_json_digest: integrity.Digest,
+    catalog_digest: integrity.Digest,
+};
+
+/// An empty-generation rewrite may retire a parent only after the source has
+/// durably fenced the exact metadata plan. This is not a transfer of generic
+/// split/merge authority.
+pub const GenerationHandoffIntent = struct {
+    plan_id: [16]u8,
+    plan_digest: integrity.Digest,
+};
+
+pub const GenerationHandoffSeal = struct {
+    plan_digest: integrity.Digest,
+    admissions_digest: integrity.Digest,
+    retired_digest: integrity.Digest,
+    retired_count: u64,
+};
+
+pub const GenerationHandoffInstall = struct {
+    scope: integrity.Digest,
+    source_summary_digest: integrity.Digest,
+    retired_digest: integrity.Digest,
+    retired_count: u64,
+    mappings: []const @import("restore_staging_contract.zig").GenerationAdmissionMapping,
+
+    pub fn validate(self: @This()) !void {
+        if (std.mem.allEqual(u8, &self.scope, 0) or std.mem.allEqual(u8, &self.source_summary_digest, 0) or
+            std.mem.allEqual(u8, &self.retired_digest, 0) or self.mappings.len > 1024)
+            return error.InvalidGenerationHandoff;
+        for (self.mappings, 0..) |mapping, index| {
+            try mapping.validate();
+            if (mapping.source_generation == null or mapping.target_generation == null) return error.InvalidGenerationHandoff;
+            if (index != 0) {
+                const previous = self.mappings[index - 1];
+                const order = std.mem.order(u8, previous.source_child_table_name, mapping.source_child_table_name);
+                if (order == .gt or (order == .eq and std.mem.order(u8, previous.constraint_name, mapping.constraint_name) != .lt))
+                    return error.InvalidGenerationHandoff;
+            }
+        }
+    }
+};
 
 pub const Fence = struct {
     admission_epoch: u64 = 1,
@@ -97,8 +218,20 @@ pub const Fence = struct {
 
 pub const Command = struct {
     fence: Fence,
-    action: enum { begin, release, cancel, abort_transition, transfer, prune },
+    action: enum { begin, seal_graph_retirement, seal_generation_handoff, install_generation_handoff, release, cancel, abort_transition, transfer, prune, stage_parent_retirement, activate_parent_retirement, acknowledge_parent_retirement, stage_child_generation, activate_child_generation, acknowledge_child_generation, cancel_child_generation_source, install_child_schema, provision_initial_child, release_initial_child, cancel_initial_child },
     transfer: ?@import("relational_integrity_handoff_contract.zig").Command = null,
+    parent_retirement: ?ParentRetirementStage = null,
+    parent_activation: ?ParentActivation = null,
+    child_generations: ?[]const @import("relational_integrity_generation_admission.zig").Transition = null,
+    child_schema_install: ?ChildSchemaInstall = null,
+    initial_child_provision: ?InitialChildProvision = null,
+    initial_child_control: ?InitialChildControl = null,
+    /// Present on graph TRUNCATE begin and seal only. Other rewrite-source
+    /// operations retain their existing graph-independent topology contract.
+    graph_retirement: ?@import("graph_retirement_seal.zig").Scope = null,
+    generation_handoff: ?GenerationHandoffIntent = null,
+    generation_handoff_seal: ?GenerationHandoffSeal = null,
+    generation_handoff_install: ?GenerationHandoffInstall = null,
     pub fn jsonStringify(self: Command, jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("relational_integrity_json.zig").write(self, jw);
     }

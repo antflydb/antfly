@@ -91,7 +91,23 @@ test "public sync level text accepts full_index and rejects removed aknn alias" 
 pub const BatchWrite = struct {
     key: []const u8,
     value: []const u8,
+    /// Top-level JSON-typed fields whose null datum is JSON null, not SQL NULL.
+    /// Validated against the pinned relational schema before preparation.
+    json_null_fields: []const []const u8 = &.{},
 };
+
+pub fn cloneJsonNullFields(alloc: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
+    if (fields.len == 0) return &.{};
+    const copy = try alloc.alloc([]const u8, fields.len);
+    errdefer alloc.free(copy);
+    var initialized: usize = 0;
+    errdefer for (copy[0..initialized]) |name| alloc.free(name);
+    for (fields, copy) |name, *out| {
+        out.* = try alloc.dupe(u8, name);
+        initialized += 1;
+    }
+    return copy;
+}
 
 pub const TransformOpType = enum {
     set,
@@ -306,6 +322,23 @@ pub const TransactionMutation = union(enum) {
 };
 
 pub const BatchRequest = struct {
+    /// Trusted ingress attaches a signed write principal and the admission
+    /// instant after authenticating the live request. Replicas verify against
+    /// that committed instant so delayed Raft replay is deterministic.
+    /// Public batch JSON never accepts these fields.
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    row_policy_admitted_at_seconds: i64 = 0,
+    /// Exact metadata read-index snapshot fetched and validated by the owner
+    /// leader before proposal. Followers consume these committed bytes locally;
+    /// they must never perform metadata IO from deterministic Raft apply.
+    row_policy_install_bundle: []const u8 = "",
+    range_guards: []const @import("../range_protection.zig").Proof = &.{},
+    /// Internal replicated capability activation. Never accepted by public JSON.
+    activate_range_tracking: bool = false,
+    /// Internal schema epoch fence shared by document and relational writes.
+    /// Never accepted from public batch JSON.
+    schema_version: ?u32 = null,
     /// Private, replicated source-retention lifecycle. Never accepted by public JSON.
     online_source: ?@import("online_source_contract.zig").Command = null,
     /// Private replicated hidden-owner lifecycle; public JSON cannot set it.
@@ -315,6 +348,12 @@ pub const BatchRequest = struct {
     restore_staging_plan_id: ?[16]u8 = null,
     /// Authenticated owner lifecycle control; never populated by public JSON.
     relational_topology: ?@import("relational_integrity_topology_contract.zig").Command = null,
+    /// Bounded, exact-CAS inverse-reference cleanup after generation retirement.
+    /// Only the current owner leader may propose this private Raft command.
+    relational_generation_gc: ?@import("relational_integrity_generation_retirement.zig").GcCommand = null,
+    /// Metadata-authorized policy generation identifier. The Raft payload
+    /// never contains caller-supplied policy expressions or role claims.
+    row_policy_publication: ?@import("../../system_catalog/policies.zig").InstallRequest = null,
     relational_schema_version: ?u32 = null,
     /// Internal coordinator evidence; never populated from public request JSON.
     relational_integrity_generation_set: ?[32]u8 = null,
@@ -1319,6 +1358,14 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    /// Private metadata-coordinator probe. Public HTTP lookup parsing must
+    /// never populate this field; it exposes no row data.
+    row_policy_receipt: ?struct {
+        generation: u64,
+        phase: @import("../../system_catalog/policies.zig").Publication.Phase,
+    } = null,
     /// Private optimistic observation: captures version and SHA256 of the
     /// exact primary bytes from one snapshot, regardless of JSON projection.
     include_primary_digest: bool = false,
@@ -1331,6 +1378,16 @@ pub const LookupOptions = struct {
     relational_activation_json: []const u8 = "",
     relational_index_status_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
+    /// Local FK source-control capability. Never parsed from HTTP or encoded
+    /// on the lookup wire; only the authenticated owner receiver sets it.
+    fk_generation_source_control: bool = false,
+    /// Set only by the local read wrapper after its strict Raft read-index
+    /// barrier, before entering structural read admission. Not on any wire.
+    fk_generation_source_read_index_certified: bool = false,
+    /// The published handoff receipt's read-index was completed by the local
+    /// read wrapper before it entered structural admission. This proof is
+    /// never parsed or serialized on either HTTP or storage-kernel wires.
+    generation_handoff_install_read_index_certified: bool = false,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     /// Internal, absolute monotonic deadline used by routed lookups. It is not
@@ -1399,10 +1456,42 @@ pub const ColumnarScanStats = struct {
     primary_rows_read: u64 = 0,
 };
 
+/// Borrowed typed request for native callers. Encoded only at an archive or
+/// network boundary; fields and JSON operands must outlive the synchronous scan.
+pub const RelationalRowQuery = struct {
+    pub const Bound = struct { values: []const std.json.Value, inclusive: bool = true };
+    pub const Condition = struct {
+        column: []const u8,
+        op: @import("../relational_index.zig").RelationalCheckOp,
+        value: ?std.json.Value = null,
+        collation: ?[]const u8 = null,
+    };
+    fields: []const []const u8,
+    index: ?[]const u8 = null,
+    /// Let the storage reader choose a READY covering/key index from the
+    /// pinned catalog snapshot. This is deliberately a hint: no usable index
+    /// is a correct primary-key fallback.
+    auto_index: bool = false,
+    after: ?[]const u8 = null,
+    lower: ?Bound = null,
+    upper: ?Bound = null,
+    conditions: []const Condition = &.{},
+    schema_version: ?u32 = null,
+};
+
 pub const ScanOptions = struct {
+    /// Retain the full document only for a version-fenced SQL mutation.
+    sql_document_preimage: bool = false,
+    /// Collect durable logical range guards only for explicitly guarded SQL.
+    include_range_proofs: bool = false,
+    relational_query: ?RelationalRowQuery = null,
     /// Schema-bound typed row query carried by the routed scan transport. It
     /// is never interpreted as a search DSL or permitted to replace RLS filters.
     relational_query_json: []const u8 = "",
+    /// Opaque authenticated principal proof for one policy epoch. External
+    /// callers cannot assert roles directly; the native owner verifies it.
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
     /// Internal differential-testing and benchmark baseline; never serialized.
     disable_columnar_scan: bool = false,
     /// Internal request-local decoded payload reuse budget. Includes retained
@@ -1427,6 +1516,10 @@ pub const ScanOptions = struct {
     /// scan lifetime.
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+
+    pub fn isRelational(self: ScanOptions) bool {
+        return self.relational_query != null or self.relational_query_json.len != 0;
+    }
 };
 
 pub const ScanDocument = struct {
@@ -1446,10 +1539,13 @@ pub const ScanHash = struct {
     content_hash: ?DocumentContentHash = null,
     relational_schema_version: ?u32 = null,
     relational_cursor: ?[]u8 = null,
+    json_null_fields: []const []const u8 = &.{},
 
     pub fn deinit(self: *ScanHash, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.relational_cursor) |cursor| alloc.free(cursor);
+        for (self.json_null_fields) |field| alloc.free(field);
+        alloc.free(self.json_null_fields);
         self.* = undefined;
     }
 };
@@ -1462,6 +1558,7 @@ pub const ScanVisitEntry = struct {
     content_hash: ?DocumentContentHash = null,
     relational_schema_version: ?u32 = null,
     relational_cursor: ?[]const u8 = null,
+    json_null_fields: []const []const u8 = &.{},
     document_json: ?[]const u8 = null,
 };
 
@@ -1557,6 +1654,7 @@ pub const GraphPath = paths_mod.Path;
 pub const TransactionWrite = struct {
     key: []const u8,
     value: []const u8,
+    json_null_fields: []const []const u8 = &.{},
 };
 
 pub const TransactionVersionPredicate = struct {
@@ -1574,6 +1672,11 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    row_policy_admitted_at_seconds: i64 = 0,
+    range_guards: []const @import("../range_protection.zig").Proof = &.{},
+    schema_version: ?u32 = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,

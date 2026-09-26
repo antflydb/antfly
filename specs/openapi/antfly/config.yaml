@@ -102,6 +102,30 @@ components:
           type: string
           minLength: 1
           description: Literal path to an externally managed secret file. Never written by the API.
+    PgwireConfig:
+      type: object
+      description: Optional PostgreSQL wire listener. Requires authentication. Transactions remain unsupported. Remote bindings require externally protected transport.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+        bind_host:
+          type: string
+          default: "127.0.0.1"
+        bind_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 5432
+        max_connections:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 32
+        externally_protected_transport:
+          type: boolean
+          default: false
+          description: Acknowledges that a TLS proxy or authenticated private transport protects a non-loopback listener. Does not enable native TLS.
     Config:
       type: object
       properties:
@@ -126,6 +150,8 @@ components:
           $ref: "#/components/schemas/GraphExecutionConfig"
         mcp:
           $ref: "#/components/schemas/McpConfig"
+        pgwire:
+          $ref: "#/components/schemas/PgwireConfig"
         backup:
           $ref: "#/components/schemas/BackupConfig"
         secrets:

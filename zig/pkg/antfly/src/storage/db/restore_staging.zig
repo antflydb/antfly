@@ -43,6 +43,92 @@ pub const Scope = @import("restore_staging_contract.zig").Scope;
 pub const Progress = @import("restore_staging_contract.zig").Progress;
 
 pub const digest = @import("restore_staging_contract.zig").digest;
+
+test "restore empty generation proves pristine owner and rejects source import" {
+    for ([_][]const u8{ "{}", "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}" }) |definition| {
+        const db = @import("db.zig");
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/empty-owner", .{tmp.sub_path});
+        defer alloc.free(path);
+        const options: db.OpenOptions = .{ .identity_namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+        var target = try db.DB.open(alloc, path, options);
+        defer target.close();
+        try target.setSchemaJson(alloc, definition);
+        const schema = try @import("../schema.zig").serializeSchema(alloc, target.core.schema orelse .{});
+        defer alloc.free(schema);
+        const scope: Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(0), .source_namespace = .{ .table_id = 4, .shard_id = 5, .range_id = 5 }, .target_namespace = options.identity_namespace.?, .target_schema_digest = digest(schema), .empty_generation = true };
+        try target.reserveRestoreStagingScoped(alloc, scope);
+        const count_key = &@import("../internal_keys.zig").range_document_count_key;
+        var count: [8]u8 = undefined;
+        std.mem.writeInt(u64, &count, 1, .little);
+        try target.core.store.putBatch(&.{.{ .key = count_key, .value = &count }}, &.{});
+        try std.testing.expectError(error.RestoreStagingTargetNotEmpty, target.beginRestoreStaging(alloc, scope));
+        {
+            var state = (try target.restoreStagingStatus(alloc)).?;
+            defer state.deinit();
+            try std.testing.expectEqual(Phase.reserved, state.value.phase);
+        }
+        try target.core.store.putBatch(&.{}, &.{count_key});
+        const orphan = @import("relational_index_records.zig").forward_namespace ++ "orphan";
+        try target.core.store.putBatch(&.{.{ .key = orphan, .value = "" }}, &.{});
+        try std.testing.expectError(error.RestoreStagingTargetNotEmpty, target.beginRestoreStaging(alloc, scope));
+        try target.core.store.putBatch(&.{}, &.{orphan});
+        try target.beginRestoreStaging(alloc, scope);
+        try target.beginRestoreStaging(alloc, scope);
+        {
+            var state = (try target.restoreStagingStatus(alloc)).?;
+            defer state.deinit();
+            try std.testing.expectEqual(Phase.imported, state.value.phase);
+            try std.testing.expectEqual(@as(u64, 0), state.value.rows);
+            try std.testing.expectEqual(@as(u64, 0), (try identity.visibilitySummaryFromStore(target.core.store)).?.live_ordinals);
+        }
+        try std.testing.expectError(error.InvalidRestoreStagingCommand, target.prepareRestoreStagingPage(alloc, scope, &target, 128, .none));
+        _ = try target.finishRestoreStaging(alloc, scope.digest(), .validated);
+        _ = try target.finishRestoreStaging(alloc, scope.digest(), .published);
+    }
+}
+
+test "restore graph empty generation rejects physical artifacts before staging" {
+    const db = @import("db.zig");
+    const alloc = std.testing.allocator;
+    for ([_]enum { clean, edge, primary_artifact }{ .clean, .edge, .primary_artifact }) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-empty-owner", .{tmp.sub_path});
+        defer alloc.free(path);
+        const namespace: identity.Namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 };
+        var target = try db.DB.open(alloc, path, .{ .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+        defer target.close();
+        try target.setSchemaJson(alloc, "{}");
+        try target.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}" });
+        const schema = try @import("../schema.zig").serializeSchema(alloc, target.core.schema orelse .{});
+        defer alloc.free(schema);
+        const scope: Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(0), .source_namespace = .{ .table_id = 4, .shard_id = 5, .range_id = 5 }, .target_namespace = namespace, .target_schema_digest = digest(schema), .empty_generation = true, .graph_retirement_digest = @splat(7) };
+        try target.reserveRestoreStagingScoped(alloc, scope);
+        if (case == .edge) try target.core.index_manager.graphIndex("links").?.index.batchApply(&.{.{ .source = "a", .target = "b", .edge_type = "link" }}, &.{});
+        if (case == .primary_artifact) {
+            const keys = @import("../internal_keys.zig");
+            var state = std.ArrayListUnmanaged(u8).empty;
+            defer state.deinit(alloc);
+            try keys.appendDocumentPrefix(&state, alloc, "orphan");
+            try state.append(alloc, keys.graph_asset_state_kind);
+            try keys.appendEncodedComponent(&state, alloc, "links");
+            try keys.appendEncodedComponent(&state, alloc, "source");
+            try target.core.store.putBatch(&.{.{ .key = state.items, .value = "orphan" }}, &.{});
+        }
+        if (case != .clean) {
+            try std.testing.expectError(error.RestoreStagingTargetNotEmpty, target.beginRestoreStaging(alloc, scope));
+        } else {
+            try target.beginRestoreStaging(alloc, scope);
+            var state = (try target.restoreStagingStatus(alloc)).?;
+            defer state.deinit();
+            try std.testing.expectEqual(Phase.imported, state.value.phase);
+        }
+    }
+}
+
 pub fn optional(txn: anytype) !?[]const u8 {
     return txn.get(key) catch |err| switch (err) {
         error.NotFound => null,
@@ -77,12 +163,13 @@ pub fn requireMutableScope(alloc: Allocator, txn: anytype, expected: ?Digest) !v
 }
 
 /// Internal PreparedRow import admission, consumed under the DB apply fence.
-pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest, rewrite: bool = false, source_effects: u32 = 0, artifact_page: bool = false, projection_page: bool = false };
+pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest, rewrite: bool = false, source_effects: u32 = 0, artifact_page: bool = false, projection_page: bool = false, source_generation_proof_page: bool = false };
 pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission, row_count: usize, delete_count: usize) !void {
     const raw = (try optional(txn)) orelse return error.RestoreStagingScopeChanged;
     if (!std.mem.eql(u8, &digest(raw), &admission.expected)) return error.RestoreStagingProgressChanged;
     var before = try Progress.decode(alloc, raw);
     defer before.deinit();
+    if (before.value.scope.empty_generation) return error.InvalidRestoreStagingCommand;
     var after = Progress.decode(alloc, admission.next) catch |err| {
         if (err == error.OutOfMemory) return err;
         return error.InvalidRestoreStagingCommand;
@@ -93,6 +180,26 @@ pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission,
         after.value.rows != std.math.add(u64, before.value.rows, row_count +| delete_count) catch return error.InvalidRestoreStagingCommand)
         return error.InvalidRestoreStagingCommand;
     if (admission.rewrite != (before.value.scope.rewrite != null)) return error.InvalidRestoreStagingCommand;
+    if (admission.source_generation_proof_page) {
+        if (admission.rewrite or admission.artifact_page or admission.projection_page or
+            before.value.source_generation_proofs_complete or !after.value.source_generation_proofs_complete or
+            before.value.phase != .importing or after.value.phase != .importing or
+            row_count != 0 or delete_count != 0 or admission.source_effects != 0 or
+            before.value.rows != 0 or before.value.cursor.len != 0 or before.value.artifact_cursor.len != 0 or
+            before.value.projection_cursor.len != 0 or before.value.artifacts_complete or before.value.rows_complete or
+            before.value.rows != after.value.rows or
+            !std.mem.eql(u8, before.value.cursor, after.value.cursor) or
+            !std.mem.eql(u8, before.value.artifact_cursor, after.value.artifact_cursor) or
+            !std.mem.eql(u8, before.value.projection_cursor, after.value.projection_cursor) or
+            before.value.artifacts_complete != after.value.artifacts_complete or
+            before.value.rows_complete != after.value.rows_complete or
+            !std.mem.eql(u8, &before.value.logical_digest, &after.value.logical_digest) or
+            !std.meta.eql(before.value.rewrite, after.value.rewrite)) return error.InvalidRestoreStagingCommand;
+        return;
+    }
+    if (!before.value.source_generation_proofs_complete) return error.InvalidRestoreStagingCommand;
+    if (before.value.source_generation_proofs_complete != after.value.source_generation_proofs_complete)
+        return error.InvalidRestoreStagingCommand;
     if (admission.projection_page) {
         if (admission.artifact_page or admission.rewrite or !before.value.scope.preserve_artifacts or !before.value.artifacts_complete or
             !before.value.rows_complete or !after.value.rows_complete or !after.value.artifacts_complete or

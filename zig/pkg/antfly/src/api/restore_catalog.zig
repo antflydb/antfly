@@ -164,9 +164,35 @@ pub const ValidationCursor = struct {
 /// queue or a public query route. Templates are lightweight hosted sources.
 pub const ValidationPort = struct {
     status: @import("http_server.zig").StatusSource,
+    /// Optional caller-owned benchmark probe. Normal restore paths leave it
+    /// null and pay no clock-read or atomic-update cost.
+    timings: ?*ValidationTimings = null,
     /// Internal embedding boundary. Implementations borrow the exact private
     /// catalog for the session lifetime and must not fall back to live names.
     factory: ?SourceFactory = null,
+
+    pub const ValidationTimings = struct {
+        prepare_calls: std.atomic.Value(u64) = .init(0),
+        step_calls: std.atomic.Value(u64) = .init(0),
+        prepare_progress_ns: std.atomic.Value(u64) = .init(0),
+        prepare_snapshot_ns: std.atomic.Value(u64) = .init(0),
+        prepare_projection_ns: std.atomic.Value(u64) = .init(0),
+        prepare_bind_ns: std.atomic.Value(u64) = .init(0),
+        step_progress_ns: std.atomic.Value(u64) = .init(0),
+        step_validate_ns: std.atomic.Value(u64) = .init(0),
+
+        fn add(self: *@This(), comptime field: []const u8, elapsed_ns: u64) void {
+            _ = @field(self.*, field).fetchAdd(elapsed_ns, .monotonic);
+        }
+    };
+
+    fn timingStart(self: @This()) u64 {
+        return if (self.timings != null) @import("antfly_platform").time.monotonicNs() else 0;
+    }
+
+    fn timingRecord(self: @This(), comptime field: []const u8, started_ns: u64) void {
+        if (self.timings) |timings| timings.add(field, @import("antfly_platform").time.monotonicNs() - started_ns);
+    }
 
     pub const SourcePair = struct {
         reader: @import("table_read_source.zig").TableReadSource,
@@ -248,16 +274,22 @@ pub const ValidationPort = struct {
     /// slice. Authority is checked independently before every page.
     pub fn prepare(self: @This(), alloc: std.mem.Allocator, job: @import("../metadata/restore_staging.zig").Job, request: @import("operation.zig").RequestContext) !*ValidationSession {
         try request.ensureActive();
+        if (self.timings) |timings| _ = timings.prepare_calls.fetchAdd(1, .monotonic);
         const staging = @import("../metadata/restore_staging.zig");
+        var started_ns = self.timingStart();
         const current = (try self.status.getRestoreStagingProgress(alloc, job.plan.id, request)) orelse return error.RestoreStagingScopeChanged;
+        self.timingRecord("prepare_progress_ns", started_ns);
         if (current.state != .importing and current.state != .validating) return error.RestoreStagingScopeChanged;
+        started_ns = self.timingStart();
         var live = (try self.status.linearizableSnapshot(request)) orelse return error.CatalogRoutingUnavailable;
+        self.timingRecord("prepare_snapshot_ns", started_ns);
         errdefer self.status.freeAdminSnapshot(&live);
         const session = try alloc.create(ValidationSession);
         errdefer alloc.destroy(session);
         session.* = .{ .alloc = alloc, .port = self, .arena = std.heap.ArenaAllocator.init(alloc), .live = live, .catalog = undefined, .request = request };
         errdefer session.arena.deinit();
         const owned = session.arena.allocator();
+        started_ns = self.timingStart();
         // Own the plan bytes; the driver's next metadata update may replace its
         // previous Job even while this slice retains the routing projection.
         const plan_bytes = try std.json.Stringify.valueAlloc(owned, job.plan, .{});
@@ -280,8 +312,11 @@ pub const ValidationPort = struct {
         snapshot.tables = private_tables.items;
         snapshot.ranges = private_ranges.items;
         session.catalog = try Catalog.init(alloc, snapshot, owners.items, .{ .ptr = session, .verify = ValidationSession.verify });
+        self.timingRecord("prepare_projection_ns", started_ns);
         const factory = self.factory orelse return error.RestoreValidationPending;
+        started_ns = self.timingStart();
         session.bound = try factory.bindSources(&session.catalog);
+        self.timingRecord("prepare_bind_ns", started_ns);
         return session;
     }
 };
@@ -311,9 +346,15 @@ pub const ValidationSession = struct {
     pub fn step(self: *@This(), alloc: std.mem.Allocator, cursor: *ValidationCursor, request: @import("operation.zig").RequestContext) !bool {
         try request.ensureActive();
         self.request = request;
+        if (self.port.timings) |timings| _ = timings.step_calls.fetchAdd(1, .monotonic);
+        var started_ns = self.port.timingStart();
         const current = (try self.port.status.getRestoreStagingProgress(alloc, self.catalog.plan_id, request)) orelse return error.RestoreStagingScopeChanged;
+        self.port.timingRecord("step_progress_ns", started_ns);
         if (current.state != .importing and current.state != .validating) return error.RestoreStagingScopeChanged;
-        return validateSlice(alloc, &self.catalog, self.bound.reader, self.bound.writer, cursor);
+        started_ns = self.port.timingStart();
+        const done = try validateSlice(alloc, &self.catalog, self.bound.reader, self.bound.writer, cursor);
+        self.port.timingRecord("step_validate_ns", started_ns);
+        return done;
     }
 };
 

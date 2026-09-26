@@ -49,6 +49,202 @@ const batch_target_bytes: usize = 4 * 1024 * 1024;
 const portable_metadata_prefix = "\x00\x00__metadata__:";
 const resolution_public_id_prefix = "af1:resolution:";
 const schema_version_prefix = "\x00\x00__metadata__:schema_v";
+/// Source-side accepted child FK scopes are backup evidence, never target
+/// admission authority. Restore remaps them to new table/generation identities
+/// only after the whole sealed cohort validates.
+pub const source_generation_admission_prefix = "\x00\x00__metadata__:portable_source_generation_admission:";
+pub const max_source_generation_admissions: usize = 1024;
+
+pub const SourceGenerationAdmissionSummaryEntry = struct {
+    child_table_id: u64,
+    child_table_name: []const u8,
+    constraint_name: []const u8,
+    active_generation: ?@import("db/relational_integrity_contract.zig").Generation,
+    /// Binds the backup manifest to the complete durable source scope,
+    /// including its revision and original publication decision.
+    source_scope_digest: [32]u8,
+};
+
+pub fn freeSourceGenerationAdmissionSummary(alloc: Allocator, entries: []SourceGenerationAdmissionSummaryEntry) void {
+    for (entries) |entry| {
+        alloc.free(entry.child_table_name);
+        alloc.free(entry.constraint_name);
+    }
+    alloc.free(entries);
+}
+
+/// Must receive the exporter's pinned read transaction. A live-root read
+/// after sealing can observe later accepted generations and produce a
+/// manifest summary that does not describe the immutable AFB source. The
+/// returned descriptors are sorted by logical child/constraint.
+fn sourceGenerationAdmissionSummaryTxnAlloc(alloc: Allocator, read: *DocStore.Txn, proof: CohortProof) ![]SourceGenerationAdmissionSummaryEntry {
+    _ = try proof.encode();
+    const admission = @import("db/relational_integrity_generation_admission.zig");
+    const topology = @import("db/relational_integrity_topology.zig");
+    const namespace = try doc_identity.loadNamespaceTxn(read) orelse return error.BackupIntegrityFailure;
+    if (!namespace.eql(proof.namespace)) return error.BackupIntegrityFailure;
+    const raw_fence = try read.get(topology.fence_key);
+    const fence = try topology.Fence.decode(raw_fence);
+    if (!fence.eql(proof.seal.fence)) return error.BackupIntegrityFailure;
+    var entries: std.ArrayListUnmanaged(SourceGenerationAdmissionSummaryEntry) = .empty;
+    errdefer {
+        for (entries.items) |entry| {
+            alloc.free(entry.child_table_name);
+            alloc.free(entry.constraint_name);
+        }
+        entries.deinit(alloc);
+    }
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var item = try cursor.seekAtOrAfter(admission.prefix);
+    while (item) |record| : (item = try cursor.next()) {
+        if (!std.mem.startsWith(u8, record.key, admission.prefix)) break;
+        if (entries.items.len >= max_source_generation_admissions) return error.TooManySourceGenerationAdmissions;
+        if (record.key.len != admission.prefix.len + 32) return error.InvalidGenerationAdmission;
+        const scope = try admission.Scope.decode(record.value);
+        if (scope.phase != .active or !std.mem.eql(u8, record.key, &try admission.scopeKey(scope.child_table_name, scope.constraint_name)))
+            return error.InvalidGenerationAdmission;
+        const canonical = try scope.encode(alloc);
+        defer alloc.free(canonical);
+        if (!std.mem.eql(u8, record.value, canonical)) return error.InvalidGenerationAdmission;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(record.value, &digest, .{});
+        const child_name = try alloc.dupe(u8, scope.child_table_name);
+        errdefer alloc.free(child_name);
+        const constraint_name = try alloc.dupe(u8, scope.constraint_name);
+        errdefer alloc.free(constraint_name);
+        try entries.append(alloc, .{
+            .child_table_id = scope.child_table_id,
+            .child_table_name = child_name,
+            .constraint_name = constraint_name,
+            .active_generation = scope.active_generation,
+            .source_scope_digest = digest,
+        });
+    }
+    std.mem.sort(SourceGenerationAdmissionSummaryEntry, entries.items, {}, struct {
+        fn less(_: void, lhs: SourceGenerationAdmissionSummaryEntry, rhs: SourceGenerationAdmissionSummaryEntry) bool {
+            const order = std.mem.order(u8, lhs.child_table_name, rhs.child_table_name);
+            return order == .lt or (order == .eq and std.mem.order(u8, lhs.constraint_name, rhs.constraint_name) == .lt);
+        }
+    }.less);
+    return try entries.toOwnedSlice(alloc);
+}
+
+pub fn sourceGenerationAdmissionSummaryDigest(namespace: doc_identity.Namespace, entries: []const SourceGenerationAdmissionSummaryEntry) ![32]u8 {
+    if (entries.len > max_source_generation_admissions) return error.TooManySourceGenerationAdmissions;
+    if (namespace.table_id == 0) return error.InvalidGenerationAdmission;
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("antfly portable source generation admission summary v1");
+    var number: [8]u8 = undefined;
+    inline for (.{ namespace.table_id, namespace.shard_id, namespace.range_id }) |part| {
+        std.mem.writeInt(u64, &number, part, .little);
+        hash.update(&number);
+    }
+    std.mem.writeInt(u64, &number, @intCast(entries.len), .little);
+    hash.update(&number);
+    for (entries, 0..) |entry, i| {
+        if (entry.child_table_id == 0 or entry.child_table_name.len == 0 or entry.constraint_name.len == 0 or
+            entry.child_table_name.len > 256 or entry.constraint_name.len > 256 or
+            (i != 0 and std.mem.order(u8, entries[i - 1].child_table_name, entry.child_table_name) != .lt and
+                !(std.mem.eql(u8, entries[i - 1].child_table_name, entry.child_table_name) and
+                    std.mem.order(u8, entries[i - 1].constraint_name, entry.constraint_name) == .lt)))
+            return error.InvalidGenerationAdmission;
+        std.mem.writeInt(u64, &number, entry.child_table_id, .little);
+        hash.update(&number);
+        std.mem.writeInt(u64, &number, entry.child_table_name.len, .little);
+        hash.update(&number);
+        hash.update(entry.child_table_name);
+        std.mem.writeInt(u64, &number, entry.constraint_name.len, .little);
+        hash.update(&number);
+        hash.update(entry.constraint_name);
+        hash.update(if (entry.active_generation) |generation| &generation else &([_]u8{0} ** 16));
+        hash.update(&entry.source_scope_digest);
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+/// Bounded proof-only records from an already validated, pinned portable
+/// decoder. The artifact order follows the physical keyspace; descriptors are
+/// independently sorted by logical child/constraint for manifest comparison.
+pub const SourceGenerationAdmissionProofPage = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: []SourceGenerationAdmissionSummaryEntry,
+    artifacts: []backup_codec.KeyValueEntry,
+
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn sourceGenerationAdmissionProofPageAlloc(alloc: Allocator, read: *DocStore.Txn, namespace: doc_identity.Namespace) !SourceGenerationAdmissionProofPage {
+    const admission = @import("db/relational_integrity_generation_admission.zig");
+    const topology = @import("db/relational_integrity_topology.zig");
+    const stored_namespace = try doc_identity.loadNamespaceTxn(read) orelse return error.RestoreSourceProofMissing;
+    if (!stored_namespace.eql(namespace)) return error.RestoreSourceProofMissing;
+    const cohort_bytes = read.get(cohort_proof_key) catch |err| switch (err) {
+        error.NotFound => return error.RestoreSourceProofMissing,
+        else => return err,
+    };
+    if (cohort_bytes.len != 168 or std.mem.allEqual(u8, cohort_bytes[136..168], 0))
+        return error.RestoreSourceProofMissing;
+    const fence = topology.Fence.decode(cohort_bytes[0..136]) catch return error.RestoreSourceProofMissing;
+    if (fence.role != .backup_snapshot or !fence.namespace.eql(namespace))
+        return error.RestoreSourceProofMissing;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    var entries: std.ArrayListUnmanaged(SourceGenerationAdmissionSummaryEntry) = .empty;
+    var artifacts: std.ArrayListUnmanaged(backup_codec.KeyValueEntry) = .empty;
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var item = try cursor.seekAtOrAfter(source_generation_admission_prefix);
+    while (item) |record| : (item = try cursor.next()) {
+        if (!std.mem.startsWith(u8, record.key, source_generation_admission_prefix)) break;
+        if (entries.items.len >= max_source_generation_admissions or
+            record.key.len != source_generation_admission_prefix.len + 32)
+            return error.RestoreSourceProofMissing;
+        const scope = admission.Scope.decode(record.value) catch return error.RestoreSourceProofMissing;
+        const raw_key = try admission.scopeKey(scope.child_table_name, scope.constraint_name);
+        const canonical_value = try scope.encode(owned);
+        if (scope.phase != .active or
+            !std.mem.eql(u8, record.key[source_generation_admission_prefix.len..], raw_key[admission.prefix.len..]) or
+            !std.mem.eql(u8, record.value, canonical_value))
+            return error.RestoreSourceProofMissing;
+        var scope_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(record.value, &scope_digest, .{});
+        try entries.append(owned, .{
+            .child_table_id = scope.child_table_id,
+            .child_table_name = try owned.dupe(u8, scope.child_table_name),
+            .constraint_name = try owned.dupe(u8, scope.constraint_name),
+            .active_generation = scope.active_generation,
+            .source_scope_digest = scope_digest,
+        });
+        try artifacts.append(owned, .{
+            .key = try owned.dupe(u8, record.key),
+            .value = canonical_value,
+        });
+    }
+    std.mem.sort(SourceGenerationAdmissionSummaryEntry, entries.items, {}, struct {
+        fn less(_: void, lhs: SourceGenerationAdmissionSummaryEntry, rhs: SourceGenerationAdmissionSummaryEntry) bool {
+            const order = std.mem.order(u8, lhs.child_table_name, rhs.child_table_name);
+            return order == .lt or (order == .eq and std.mem.order(u8, lhs.constraint_name, rhs.constraint_name) == .lt);
+        }
+    }.less);
+    // Also rejects duplicate logical keys, including a corrupted decoder
+    // whose physical keys differ despite naming the same scope.
+    _ = sourceGenerationAdmissionSummaryDigest(namespace, entries.items) catch return error.RestoreSourceProofMissing;
+    const owned_entries = try entries.toOwnedSlice(owned);
+    const owned_artifacts = try artifacts.toOwnedSlice(owned);
+    return .{
+        .arena = arena,
+        .entries = owned_entries,
+        .artifacts = owned_artifacts,
+    };
+}
 
 const ResolutionArtifactRef = struct {
     doc_key: []u8,
@@ -107,6 +303,7 @@ const PortableOutput = struct {
     bytes_written: u64 = 0,
     bundle_offset: u64 = 0,
     stats: ?*ExportStats = null,
+    source_generation_admission_count: u32 = 0,
 
     source_certificate: ?*source_snapshot.Builder = null,
 
@@ -276,6 +473,12 @@ pub const ExportOptions = struct {
     /// Only export a verified immutable native cohort seal, never a live root.
     /// The proof travels with logical rows; routed enforcement keys do not.
     cohort: ?CohortProof = null,
+    /// Returned only after a complete export, from the exact pinned read
+    /// transaction that supplied the AFB blocks. The caller owns the slice.
+    source_generation_summary_output: ?struct {
+        alloc: Allocator,
+        output: *?[]SourceGenerationAdmissionSummaryEntry,
+    } = null,
     source_copy: ?SourceCopyProof = null,
     cancellation: @import("../common/cancellation.zig").CancellationToken = .none,
     stats: ?*ExportStats = null,
@@ -298,7 +501,9 @@ pub fn exportPortableToWriterWithOptions(
     options: ExportOptions,
 ) !void {
     var certificate_builder: ?source_snapshot.Builder = null;
+    if (options.source_generation_summary_output) |output| output.output.* = null;
     if (options.source_copy != null and (options.cohort != null or options.source_certificate == null)) return error.InvalidBackupRequest;
+    if (options.source_generation_summary_output != null and options.cohort == null) return error.InvalidBackupRequest;
     if (options.source_certificate) |certificate| {
         certificate.output.* = null;
         certificate_builder = try source_snapshot.Builder.init(certificate.cut);
@@ -320,6 +525,11 @@ pub fn exportPortableToWriterWithOptions(
     };
     var scan = try store.beginReadTxn();
     defer scan.abort();
+    const source_summary: ?[]SourceGenerationAdmissionSummaryEntry = if (options.source_generation_summary_output) |output|
+        try sourceGenerationAdmissionSummaryTxnAlloc(output.alloc, &scan, options.cohort.?)
+    else
+        null;
+    errdefer if (source_summary) |entries| freeSourceGenerationAdmissionSummary(options.source_generation_summary_output.?.alloc, entries);
     if (options.source_certificate) |certificate| {
         const namespace = try doc_identity.loadNamespaceTxn(&scan) orelse return error.IdentityNamespaceMismatch;
         if (!namespace.eql(certificate.cut.namespace)) return error.IdentityNamespaceMismatch;
@@ -416,7 +626,13 @@ pub fn exportPortableToWriterWithOptions(
         .mode = snapshot_mode,
         .parent_manifest_sha256 = parent_manifest_sha256,
         .created_at_unix_ns = options.created_at_unix_ns,
-        .compatibility = .{ .storage_engine = "logical" },
+        .compatibility = .{
+            .min_afb_reader = if (inventory_out.source_generation_admission_count != 0)
+                backup_bundle.source_generation_admission_reader_version
+            else
+                backup_bundle.base_afb_reader_version,
+            .storage_engine = "logical",
+        },
         .objects = descriptors,
         .blobs = blob_descriptors,
     });
@@ -456,6 +672,7 @@ pub fn exportPortableToWriterWithOptions(
         } },
         .bundle_offset = backup_codec.header_size + backup_codec.block_envelope_overhead + manifest.len,
         .stats = options.stats,
+        .source_generation_admission_count = if (options.spool != null) inventory_out.source_generation_admission_count else 0,
     };
     if (options.spool) |spool| {
         var spool_reader = backup_codec.FileReader.init(spool.io, spool.file, inventory_out.bytes_written);
@@ -468,6 +685,8 @@ pub fn exportPortableToWriterWithOptions(
         _ = try spool_reader.verifiedFingerprint();
     } else {
         try exportPortableSnapshot(alloc, &scan, &bundle_out, options.cohort, options.source_copy);
+        if (bundle_out.source_generation_admission_count != inventory_out.source_generation_admission_count)
+            return error.NonDeterministicBackupCapture;
     }
     if (next_ordinal != objects.items.len) return error.NonDeterministicBackupCapture;
     const footer_payload = try backup_bundle.encodeFooterIndexAlloc(alloc, footer.items);
@@ -481,6 +700,7 @@ pub fn exportPortableToWriterWithOptions(
     try sink_writer.writeAll(&trailer);
     try options.cancellation.check();
     if (options.source_certificate) |certificate| certificate.output.* = try certificate_builder.?.finish();
+    if (options.source_generation_summary_output) |output| output.output.* = source_summary;
 }
 
 /// Skip entire nonportable namespaces, not individual derived payloads. Keep
@@ -575,6 +795,37 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
         else => return err,
     };
     if (retirement != null) return error.CoordinatedConstraintPortableBackupUnsupported;
+    const generation_retirement = scan.get(@import("db/relational_integrity_generation_retirement.zig").key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (generation_retirement != null) return error.CoordinatedConstraintPortableBackupUnsupported;
+    const generation_gc = @import("db/relational_integrity_generation_retirement.zig");
+    const gc_progress = scan.get(generation_gc.gc_progress_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (gc_progress != null) return error.CoordinatedConstraintPortableBackupUnsupported;
+    inline for (.{ generation_gc.activation_receipt_key, generation_gc.completed_pending_key, generation_gc.acknowledged_receipt_key }) |authority_key| {
+        const authority = scan.get(authority_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (authority != null) return error.CoordinatedConstraintPortableBackupUnsupported;
+    }
+    // Replicated GC may remove physical tombstones, but the permanent
+    // accepted-generation scope still denies delayed old-generation attaches.
+    // Portable backup cannot silently discard either authority.
+    var retired_cursor = try scan.openCursor();
+    defer retired_cursor.close();
+    if (try retired_cursor.seekAtOrAfter(generation_gc.active_prefix)) |entry| {
+        if (std.mem.startsWith(u8, entry.key, generation_gc.active_prefix)) return error.CoordinatedConstraintPortableBackupUnsupported;
+    }
+    const admitted_prefix = @import("db/relational_integrity_generation_admission.zig").prefix;
+    if (try retired_cursor.seekAtOrAfter(admitted_prefix)) |entry| {
+        if (std.mem.startsWith(u8, entry.key, admitted_prefix) and cohort == null)
+            return error.CoordinatedConstraintPortableBackupUnsupported;
+    }
     const topology_fence = scan.get(@import("db/relational_integrity_topology.zig").fence_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
@@ -729,6 +980,48 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
         try out.writeBlock(.metadata_batch, payload);
     }
 
+    // A sealed dependency-complete cohort may carry parent acceptance proof,
+    // but it must not import the source's physical admission key verbatim: the
+    // destination allocates new child IDs and constraint generations. Emit
+    // canonical proof-only metadata, checked again by the v3 reader, for the
+    // distributed activation barrier to remap after all rows validate.
+    if (cohort != null) {
+        const admission = @import("db/relational_integrity_generation_admission.zig");
+        var proofs: std.ArrayListUnmanaged(backup_codec.KeyValueEntry) = .empty;
+        defer deinitKeyValueBatch(alloc, &proofs);
+        var proof_bytes: usize = 0;
+        var accepted = try retired_cursor.seekAtOrAfter(admission.prefix);
+        while (accepted) |item| : (accepted = try retired_cursor.next()) {
+            if (!std.mem.startsWith(u8, item.key, admission.prefix)) break;
+            try out.cancellation.check();
+            if (out.source_generation_admission_count >= max_source_generation_admissions)
+                return error.TooManySourceGenerationAdmissions;
+            if (item.key.len != admission.prefix.len + 32) return error.InvalidGenerationAdmission;
+            const scope = try admission.Scope.decode(item.value);
+            if (scope.phase != .active or !std.mem.eql(u8, item.key, &try admission.scopeKey(scope.child_table_name, scope.constraint_name)))
+                return error.InvalidGenerationAdmission;
+            const canonical = try scope.encode(alloc);
+            defer alloc.free(canonical);
+            if (!std.mem.eql(u8, item.value, canonical)) return error.InvalidGenerationAdmission;
+            const proof_key = try alloc.alloc(u8, source_generation_admission_prefix.len + 32);
+            var pending = true;
+            errdefer if (pending) alloc.free(proof_key);
+            @memcpy(proof_key[0..source_generation_admission_prefix.len], source_generation_admission_prefix);
+            @memcpy(proof_key[source_generation_admission_prefix.len..], item.key[admission.prefix.len..]);
+            const proof_value = try alloc.dupe(u8, item.value);
+            errdefer if (pending) alloc.free(proof_value);
+            try proofs.append(alloc, .{ .key = proof_key, .value = proof_value });
+            pending = false;
+            proof_bytes += proof_key.len + item.value.len;
+            out.source_generation_admission_count = std.math.add(u32, out.source_generation_admission_count, 1) catch return error.BackupManifestTooLarge;
+            if (proof_bytes >= batch_target_bytes) {
+                try flushMetadataBatch(alloc, out, &proofs);
+                proof_bytes = 0;
+            }
+        }
+        if (proofs.items.len != 0) try flushMetadataBatch(alloc, out, &proofs);
+    }
+
     // Head precedes its one active immutable blob in the manifest, regardless
     // of store key order. Retired blobs are not runtime definitions and must
     // not make backup memory/size grow with catalog churn.
@@ -753,7 +1046,8 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     while (scan_entry) |kv| : (scan_entry = try cursor.next()) {
         try out.cancellation.check();
         if (!std.mem.startsWith(u8, kv.key, portable_metadata_prefix)) break;
-        if (!isPortableMetadataKey(kv.key) or std.mem.eql(u8, kv.key, cohort_proof_key) or std.mem.eql(u8, kv.key, source_copy_proof_key)) continue;
+        if (!isPortableMetadataKey(kv.key) or std.mem.eql(u8, kv.key, cohort_proof_key) or std.mem.eql(u8, kv.key, source_copy_proof_key) or
+            std.mem.startsWith(u8, kv.key, source_generation_admission_prefix)) continue;
         if (std.mem.eql(u8, kv.key, relational_index_catalog.head_key) or
             std.mem.startsWith(u8, kv.key, relational_index_catalog.blob_prefix)) continue;
         if (std.mem.startsWith(u8, kv.key, schema_version_prefix)) {
@@ -1270,6 +1564,7 @@ fn deinitKeyValueBatch(alloc: Allocator, batch: *std.ArrayListUnmanaged(backup_c
 
 pub fn isPortableMetadataKey(key: []const u8) bool {
     return std.mem.eql(u8, key, cohort_proof_key) or std.mem.eql(u8, key, source_copy_proof_key) or
+        std.mem.startsWith(u8, key, source_generation_admission_prefix) or
         std.mem.eql(u8, key, source_integrity_key) or std.mem.eql(u8, key, source_integrity_catalog_key) or std.mem.eql(u8, key, source_integrity_activation_key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:schema") or
         std.mem.eql(u8, key, relational_index_catalog.head_key) or
@@ -1923,6 +2218,7 @@ pub const cohort_import_checkpoint_key = "\x00\x00__metadata__:portable_cohort_i
 const CohortImportCheckpoint = struct {
     scope: [32]u8,
     proof_digest: [32]u8,
+    min_afb_reader: u32 = backup_bundle.base_afb_reader_version,
     object_count: u32 = 0,
     footer_offset: u64 = 0,
     ordinal: u32 = 0,
@@ -1977,7 +2273,7 @@ const StagedImportProof = union(enum) {
 };
 
 fn loadCohortArchive(alloc: Allocator, store: *DocStore, proof: StagedImportProof, state: CohortImportCheckpoint) !PortableArchiveValidation {
-    var archive: PortableArchiveValidation = .{ .format_version = 2, .cohort = if (proof == .cohort) proof.cohort else null, .source_copy = if (proof == .source_copy) proof.source_copy else null, .staging_store = store, .snapshot_alloc = alloc, .durable_schemas = true, .document_row_count = state.rows, .saw_document_block = state.saw_rows, .saw_relational_rows = state.saw_relational, .saw_document_rows = state.saw_document };
+    var archive: PortableArchiveValidation = .{ .format_version = 2, .min_afb_reader = state.min_afb_reader, .cohort = if (proof == .cohort) proof.cohort else null, .source_copy = if (proof == .source_copy) proof.source_copy else null, .staging_store = store, .snapshot_alloc = alloc, .durable_schemas = true, .document_row_count = state.rows, .saw_document_block = state.saw_rows, .saw_relational_rows = state.saw_relational, .saw_document_rows = state.saw_document };
     errdefer archive.deinit(alloc);
     if (state.source_integrity_last_key.len > archive.source_integrity_last_key.len) return error.InvalidRestoreSourceCheckpoint;
     @memcpy(archive.source_integrity_last_key[0..state.source_integrity_last_key.len], state.source_integrity_last_key);
@@ -2102,6 +2398,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
         try reader.ensureIndex(alloc);
         var locators: std.ArrayListUnmanaged(KVPair) = .empty;
         const manifest = reader.manifest.?.value;
+        state.min_afb_reader = manifest.compatibility.min_afb_reader;
         for (manifest.objects, 0..) |object, ordinal| {
             try cancellation.check();
             const index = backup_bundle.blobIndex(manifest.blobs, object.sha256) orelse return error.InvalidBackupManifest;
@@ -2604,6 +2901,7 @@ fn validateAndImportPortableStagingAfterHeader(
             var manifest = try backup_bundle.parseManifest(alloc, block.payload);
             defer manifest.deinit();
             if (manifest.value.representation != .portable) return error.BackupArtifactFormatMismatch;
+            archive.min_afb_reader = manifest.value.compatibility.min_afb_reader;
             saw_bundle_manifest = true;
         }
         if (block.block_type == .metadata_batch and archive.saw_document_block)
@@ -2739,6 +3037,7 @@ fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportO
             var manifest = try backup_bundle.parseManifest(alloc, block.payload);
             defer manifest.deinit();
             if (manifest.value.representation != .portable) return error.BackupArtifactFormatMismatch;
+            archive.min_afb_reader = manifest.value.compatibility.min_afb_reader;
             saw_bundle_manifest = true;
         }
         if (header.format_version == backup_codec.format_version and
@@ -2770,6 +3069,7 @@ const ArchiveSchemaLayout = struct {
 
 const PortableArchiveValidation = struct {
     format_version: u32,
+    min_afb_reader: u32 = backup_bundle.base_afb_reader_version,
     cohort: ?CohortProof = null,
     saw_cohort: bool = false,
     source_copy: ?SourceCopyProof = null,
@@ -2779,6 +3079,7 @@ const PortableArchiveValidation = struct {
     source_integrity_activation: bool = false,
     source_integrity_last_key: [@import("db/relational_integrity_contract.zig").key_len + 32]u8 = undefined,
     source_integrity_last_key_len: usize = 0,
+    source_generation_admissions: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
     durable_schemas: bool = false,
     schema_cache_bytes: usize = default_schema_cache_bytes,
     spool: ?SchemaSpool = null,
@@ -2960,6 +3261,7 @@ const PortableArchiveValidation = struct {
     }
 
     fn deinit(self: *PortableArchiveValidation, alloc: Allocator) void {
+        self.source_generation_admissions.deinit(alloc);
         if (self.source_integrity_catalog) |*catalog| catalog.deinit();
         if (self.index_projection) |*projection| projection.deinit(alloc);
         if (self.relational_index_plan) |*plan| plan.release();
@@ -3641,7 +3943,8 @@ fn validatePortableDocumentEntryAgainstArchive(
             else => return error.InvalidBackupRequest,
         };
         defer logical.deinit(alloc);
-        validator.validateValue(alloc, &logical.root) catch |err| switch (err) {
+        const typed_row = try relational_row_codec.ordinalRowViewTrusted(entry.value, layout.schema.*, layout.physical);
+        validator.validateTypedStoredRoot(alloc, &logical.root, typed_row) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidBackupRequest,
         };
@@ -3720,6 +4023,23 @@ fn validateMetadataEntries(
             const expected = archive.cohort orelse return error.CoordinatedConstraintPortableBackupUnsupported;
             if (archive.saw_cohort or !std.mem.eql(u8, entry.value, &try expected.encode())) return error.BackupIntegrityFailure;
             archive.saw_cohort = true;
+        } else if (std.mem.startsWith(u8, entry.key, source_generation_admission_prefix)) {
+            if (archive.min_afb_reader < backup_bundle.source_generation_admission_reader_version or
+                archive.cohort == null or !archive.saw_cohort or
+                entry.key.len != source_generation_admission_prefix.len + 32)
+                return error.CoordinatedConstraintPortableBackupUnsupported;
+            const admission = @import("db/relational_integrity_generation_admission.zig");
+            const scope = admission.Scope.decode(entry.value) catch return error.InvalidMetadataBatch;
+            if (scope.phase != .active) return error.InvalidMetadataBatch;
+            const canonical = scope.encode(alloc) catch return error.InvalidMetadataBatch;
+            defer alloc.free(canonical);
+            if (!std.mem.eql(u8, entry.value, canonical)) return error.InvalidMetadataBatch;
+            const raw_key = try admission.scopeKey(scope.child_table_name, scope.constraint_name);
+            if (!std.mem.eql(u8, entry.key[source_generation_admission_prefix.len..], raw_key[admission.prefix.len..]))
+                return error.InvalidMetadataBatch;
+            if (archive.source_generation_admissions.count() >= 1024 or
+                (try archive.source_generation_admissions.getOrPut(alloc, raw_key[admission.prefix.len..].*)).found_existing)
+                return error.InvalidMetadataBatch;
         } else if (std.mem.eql(u8, entry.key, relational_index_catalog.head_key)) {
             if (archive.format_version < 2) return error.InvalidMetadataBatch;
             if (archive.relational_index_head != null) return error.InvalidMetadataBatch;
@@ -4818,12 +5138,165 @@ test "portable backup refuses retained retirement and topology authority without
     defer store.close();
     var output: ArrayList(u8) = .empty;
     defer output.deinit(alloc);
-    inline for (.{ @import("db/relational_integrity_retirement.zig").key, @import("db/relational_integrity_topology.zig").fence_key }) |key| {
+    inline for (.{ @import("db/relational_integrity_retirement.zig").key, @import("db/relational_integrity_generation_retirement.zig").key, @import("db/relational_integrity_generation_retirement.zig").gc_progress_key, @import("db/relational_integrity_topology.zig").fence_key }) |key| {
         try store.put(key, "retained authority");
         try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, exportPortable(alloc, &store, &output));
         try std.testing.expectEqual(@as(usize, 0), output.items.len);
         try store.delete(key);
     }
+    const active_key = @import("db/relational_integrity_generation_retirement.zig").activeKey(@splat(7));
+    try store.put(&active_key, "retained authority");
+    try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, exportPortable(alloc, &store, &output));
+    try std.testing.expectEqual(@as(usize, 0), output.items.len);
+    try store.delete(&active_key);
+    const admission_key = try @import("db/relational_integrity_generation_admission.zig").scopeKey("children", "fk");
+    try store.put(&admission_key, "retained authority");
+    try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, exportPortable(alloc, &store, &output));
+    try std.testing.expectEqual(@as(usize, 0), output.items.len);
+}
+
+test "portable accepted-generation proof requires a sealed v3 reader and canonical unique scope" {
+    const alloc = std.testing.allocator;
+    const admission = @import("db/relational_integrity_generation_admission.zig");
+    const namespace: doc_identity.Namespace = .{ .table_id = 10, .shard_id = 20, .range_id = 20 };
+    const proof: CohortProof = .{
+        .seal = .{ .fence = .{
+            .transition_id = 7,
+            .attempt = 1,
+            .peer_group_id = 20,
+            .owner_group_id = 20,
+            .role = .backup_snapshot,
+            .namespace = namespace,
+            .catalog_digest = @splat(3),
+        }, .digest = @splat(4) },
+        .namespace = namespace,
+    };
+    const scope: admission.Scope = .{
+        .child_table_id = 11,
+        .child_table_name = "children",
+        .constraint_name = "parent_fk",
+        .revision = 1,
+        .phase = .active,
+        .active_generation = [_]u8{5} ** 16,
+        .plan_id = @splat(6),
+        .decision_digest = @splat(7),
+    };
+    const value = try scope.encode(alloc);
+    defer alloc.free(value);
+    const raw_key = try admission.scopeKey(scope.child_table_name, scope.constraint_name);
+    var proof_key: [source_generation_admission_prefix.len + 32]u8 = undefined;
+    @memcpy(proof_key[0..source_generation_admission_prefix.len], source_generation_admission_prefix);
+    @memcpy(proof_key[source_generation_admission_prefix.len..], raw_key[admission.prefix.len..]);
+    const entry: backup_codec.KeyValueEntry = .{ .key = &proof_key, .value = value };
+
+    var legacy: PortableArchiveValidation = .{
+        .format_version = backup_codec.format_version,
+        .min_afb_reader = backup_bundle.base_afb_reader_version,
+        .cohort = proof,
+        .saw_cohort = true,
+    };
+    defer legacy.deinit(alloc);
+    try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, validateMetadataEntries(alloc, &.{entry}, &legacy));
+
+    var unsealed: PortableArchiveValidation = .{
+        .format_version = backup_codec.format_version,
+        .min_afb_reader = backup_bundle.source_generation_admission_reader_version,
+    };
+    defer unsealed.deinit(alloc);
+    try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, validateMetadataEntries(alloc, &.{entry}, &unsealed));
+
+    var archive: PortableArchiveValidation = .{
+        .format_version = backup_codec.format_version,
+        .min_afb_reader = backup_bundle.source_generation_admission_reader_version,
+        .cohort = proof,
+        .saw_cohort = true,
+    };
+    defer archive.deinit(alloc);
+    try validateMetadataEntries(alloc, &.{entry}, &archive);
+    try std.testing.expectEqual(@as(usize, 1), archive.source_generation_admissions.count());
+    try std.testing.expectError(error.InvalidMetadataBatch, validateMetadataEntries(alloc, &.{entry}, &archive));
+
+    var tampered_key = proof_key;
+    tampered_key[tampered_key.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidMetadataBatch, validateMetadataEntries(alloc, &.{.{ .key = &tampered_key, .value = value }}, &archive));
+    const tampered_value = try alloc.dupe(u8, value);
+    defer alloc.free(tampered_value);
+    tampered_value[tampered_value.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidMetadataBatch, validateMetadataEntries(alloc, &.{.{ .key = &proof_key, .value = tampered_value }}, &archive));
+}
+
+test "portable accepted-generation proof page reads only canonical sealed decoder metadata" {
+    const alloc = std.testing.allocator;
+    const empty_summary_digest = try sourceGenerationAdmissionSummaryDigest(.{ .table_id = 10, .shard_id = 20, .range_id = 20 }, &.{});
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(alloc, &tmp);
+    defer store.close();
+    const namespace: doc_identity.Namespace = .{ .table_id = 10, .shard_id = 20, .range_id = 20 };
+    try doc_identity.writeNamespaceToStore(&store, namespace);
+    const proof: CohortProof = .{
+        .seal = .{ .fence = .{
+            .transition_id = 7,
+            .attempt = 1,
+            .peer_group_id = 20,
+            .owner_group_id = 20,
+            .role = .backup_snapshot,
+            .namespace = namespace,
+            .catalog_digest = @splat(3),
+        }, .digest = @splat(4) },
+        .namespace = namespace,
+    };
+    const proof_bytes = try proof.encode();
+    try store.put(cohort_proof_key, &proof_bytes);
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        var empty = try sourceGenerationAdmissionProofPageAlloc(alloc, &read, namespace);
+        defer empty.deinit();
+        try std.testing.expectEqual(@as(usize, 0), empty.entries.len);
+        try std.testing.expectEqual(@as(usize, 0), empty.artifacts.len);
+    }
+
+    const admission = @import("db/relational_integrity_generation_admission.zig");
+    const scope: admission.Scope = .{
+        .child_table_id = 11,
+        .child_table_name = "children",
+        .constraint_name = "parent_fk",
+        .revision = 1,
+        .phase = .active,
+        .active_generation = [_]u8{5} ** 16,
+        .plan_id = @splat(6),
+        .decision_digest = @splat(7),
+    };
+    const value = try scope.encode(alloc);
+    defer alloc.free(value);
+    const raw_key = try admission.scopeKey(scope.child_table_name, scope.constraint_name);
+    var proof_key: [source_generation_admission_prefix.len + 32]u8 = undefined;
+    @memcpy(proof_key[0..source_generation_admission_prefix.len], source_generation_admission_prefix);
+    @memcpy(proof_key[source_generation_admission_prefix.len..], raw_key[admission.prefix.len..]);
+    try store.put(&proof_key, value);
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        var page = try sourceGenerationAdmissionProofPageAlloc(alloc, &read, namespace);
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.entries.len);
+        try std.testing.expectEqual(@as(usize, 1), page.artifacts.len);
+        try std.testing.expectEqualStrings("children", page.entries[0].child_table_name);
+        try std.testing.expectEqualSlices(u8, &proof_key, page.artifacts[0].key);
+        try std.testing.expectEqualSlices(u8, value, page.artifacts[0].value);
+        // An archive advertised with an authenticated empty range summary
+        // cannot smuggle a valid but unexpected proof-only scope into cutover.
+        try std.testing.expectError(error.RestoreSourceProofMissing, @import("db/restore_generation_admissions.zig").verifyImportedProofSummary(alloc, &read, namespace, empty_summary_digest));
+        try std.testing.expectError(error.RestoreSourceProofMissing, sourceGenerationAdmissionProofPageAlloc(alloc, &read, .{ .table_id = 10, .shard_id = 21, .range_id = 21 }));
+    }
+    const corrupted = try alloc.dupe(u8, value);
+    defer alloc.free(corrupted);
+    corrupted[corrupted.len - 1] ^= 1;
+    try store.put(&proof_key, corrupted);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectError(error.RestoreSourceProofMissing, sourceGenerationAdmissionProofPageAlloc(alloc, &read, namespace));
 }
 
 test "complete database image rejects a public document schema without runtime schema" {

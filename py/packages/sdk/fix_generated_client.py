@@ -22,6 +22,10 @@ REQUIRED_BODY = re.compile(
 )
 NDJSON_HEADER = 'headers["Content-Type"] = "application/x-ndjson"'
 RELATIONAL_QUERY = Path("api/data_operations/query_relational_rows.py")
+SQL_OPERATIONS = [
+    Path(f"api/data_operations/{operation}.py")
+    for operation in ("execute_sql", "prepare_sql", "execute_prepared_sql", "close_prepared_sql")
+]
 NDJSON_RESPONSE = "response_200 = cast(str, response.content)"
 
 
@@ -45,6 +49,27 @@ def fix_generated_client(root: Path) -> None:
     if source.count(NDJSON_RESPONSE) != 1:
         raise RuntimeError(f"unexpected generated shape in {RELATIONAL_QUERY}: NDJSON response")
     updates[path] = source.replace(NDJSON_RESPONSE, "response_200 = response.text")
+
+    # Keep raw generated SQL entry points bounded as well. Match exactly once
+    # per sync/async call and fail generation if upstream changes this shape.
+    for operation in SQL_OPERATIONS:
+        path = root / operation
+        source = path.read_text(encoding="utf-8")
+        for original, replacement in (
+            (
+                "from ...client import",
+                "from ....sql_transport import sql_request, sql_request_async\nfrom ...client import",
+            ),
+            ("response = client.get_httpx_client().request(", "response = sql_request(client.get_httpx_client(),"),
+            (
+                "response = await client.get_async_httpx_client().request(",
+                "response = await sql_request_async(client.get_async_httpx_client(),",
+            ),
+        ):
+            if source.count(original) != 1:
+                raise RuntimeError(f"unexpected generated shape in {operation}: {original}")
+            source = source.replace(original, replacement)
+        updates[path] = source
 
     for path, source in updates.items():
         path.write_text(source, encoding="utf-8")

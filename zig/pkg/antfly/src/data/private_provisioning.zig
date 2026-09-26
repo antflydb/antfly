@@ -17,31 +17,96 @@
 const std = @import("std");
 const staging = @import("../metadata/restore_staging.zig");
 const tables = @import("../metadata/table_manager.zig");
-pub const Owner = struct { plan_id: [16]u8, plan_digest: [32]u8, table: tables.TableRecord, range: tables.RangeRecord, scope: @import("../storage/db/restore_staging_contract.zig").Scope, cancel_recovery: bool = false };
+pub const Owner = struct {
+    plan_id: [16]u8,
+    plan_digest: [32]u8,
+    table: tables.TableRecord,
+    range: tables.RangeRecord,
+    scope: @import("../storage/db/restore_staging_contract.zig").Scope,
+    empty_generation_handoff: ?@import("../storage/db/restore_staging_contract.zig").EmptyGenerationHandoffExpectation = null,
+    cancel_recovery: bool = false,
+};
+pub const InitialOwner = struct {
+    descriptor: staging.ProvisioningProjection.InitialFkOwner,
+    table: tables.TableRecord,
+    range: tables.RangeRecord,
+};
+
+pub fn validateInitial(alloc: std.mem.Allocator, public_tables: []const tables.TableRecord, public_ranges: []const tables.RangeRecord, projection: staging.ProvisioningProjection) ![]InitialOwner {
+    var owners = std.ArrayListUnmanaged(InitialOwner).empty;
+    errdefer owners.deinit(alloc);
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(alloc);
+    for (projection.initial_fk_owners) |descriptor| {
+        if (std.mem.allEqual(u8, &descriptor.plan_id, 0) or std.mem.allEqual(u8, &descriptor.plan_digest, 0) or
+            std.mem.allEqual(u8, &descriptor.schema_digest, 0) or std.mem.allEqual(u8, &descriptor.catalog_digest, 0) or
+            std.mem.allEqual(u8, &descriptor.public_schema_json_digest, 0) or descriptor.child_table_id == 0 or
+            descriptor.child_group_id == 0 or descriptor.namespace.table_id != descriptor.child_table_id)
+            return error.InvalidGenerationPublication;
+        const table = for (projection.tables) |candidate| {
+            if (candidate.table_id == descriptor.child_table_id) break candidate;
+        } else return error.InvalidGenerationPublication;
+        const range = for (projection.ranges) |candidate| {
+            if (candidate.group_id == descriptor.child_group_id) break candidate;
+        } else return error.InvalidGenerationPublication;
+        if (range.table_id != table.table_id or
+            descriptor.namespace.shard_id != tables.rangeDocIdentityShardId(range) or
+            descriptor.namespace.range_id != tables.rangeDocIdentityRangeId(range)) return error.InvalidGenerationPublication;
+        for (public_tables) |published| if (published.table_id == table.table_id) return error.InvalidGenerationPublication;
+        for (public_ranges) |published| if (published.group_id == range.group_id) return error.InvalidGenerationPublication;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(table.schema_json, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &descriptor.public_schema_json_digest)) return error.InvalidGenerationPublication;
+        var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, table.schema_json);
+        defer parsed.deinit(alloc);
+        if (parsed.version != descriptor.schema_version or parsed.storage_mode != .relational) return error.InvalidGenerationPublication;
+        var compiled = try @import("../metadata/fk_generation_publication.zig").compileCatalog(alloc, parsed, table.table_id, null);
+        defer compiled.deinit();
+        std.crypto.hash.Blake3.hash(compiled.value, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &descriptor.catalog_digest) or
+            !std.mem.eql(u8, &compiled.catalog.schema_digest, &descriptor.schema_digest)) return error.InvalidGenerationPublication;
+        const entry = try seen.getOrPut(alloc, descriptor.child_group_id);
+        if (entry.found_existing) return error.InvalidGenerationPublication;
+        try owners.append(alloc, .{ .descriptor = descriptor, .table = table, .range = range });
+    }
+    return owners.toOwnedSlice(alloc);
+}
 
 pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRecord, public_ranges: []const tables.RangeRecord, projection: staging.ProvisioningProjection) ![]Owner {
+    const initial_owners = try validateInitial(alloc, public_tables, public_ranges, projection);
+    defer alloc.free(initial_owners);
     if (projection.jobs_json.len > staging.max_active_attempts) return error.InvalidRestoreStaging;
     var owners = std.ArrayListUnmanaged(Owner).empty;
+    errdefer owners.deinit(alloc);
     var seen_groups: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen_groups.deinit(alloc);
     for (projection.jobs_json) |bytes| {
         if (bytes.len > staging.max_encoded_bytes) return error.InvalidRestoreStaging;
-        const parsed = try std.json.parseFromSlice(staging.Job, alloc, bytes, .{ .allocate = .alloc_always });
+        var parsed = try std.json.parseFromSlice(staging.Job, alloc, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
         try parsed.value.plan.validate(alloc);
         if (!std.mem.eql(u8, &parsed.value.plan_digest, &(try parsed.value.plan.digest(alloc)))) return error.InvalidRestoreStaging;
         switch (parsed.value.state) {
-            .importing, .validating, .cutover, .canceling => {},
+            .importing, .validating, .cutover, .activating, .canceling => {},
             .published, .canceled, .preparing_sources => return error.InvalidRestoreStaging,
         }
         if (parsed.value.revision == 0) return error.InvalidRestoreStaging;
         var new_owners: usize = 0;
         var old_owners: usize = 0;
+        var parent_owners: usize = 0;
         for (parsed.value.plan.targets) |target| {
             new_owners += target.ranges.len;
             if (target.replace) |old| old_owners += old.ranges.len;
         }
+        for (parsed.value.plan.external_fk_parents) |parent| parent_owners += parent.ranges.len;
+        // The metadata progress counter is reused for each phase: parent
+        // fences precede old-owner cutover, then activation counts parents
+        // alone. Match that state machine even though only hidden target
+        // owners are projected into this private routing view.
         const maximum = switch (parsed.value.state) {
-            .cutover => old_owners,
-            .canceling => new_owners + old_owners,
+            .cutover => old_owners + parent_owners,
+            .activating => parent_owners,
+            .canceling => new_owners + old_owners + parent_owners,
             else => new_owners,
         };
         if (parsed.value.completed_owners > maximum) return error.InvalidRestoreStaging;
@@ -56,8 +121,9 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
             const actual = maybe_actual orelse continue;
             for (public_tables) |published| if (published.table_id == target.table.table_id) return error.InvalidRestoreStaging;
             if (!tables.tableDefinitionsEqual(expected, actual)) return error.InvalidRestoreStaging;
-            for (target.ranges) |range| {
+            for (target.ranges, 0..) |range, range_index| {
                 var expected_range = try tables.cloneRange(alloc, range);
+                defer tables.freeRange(alloc, expected_range);
                 try tables.clearOwnedRangeRestoreIntent(alloc, &expected_range);
                 expected_range.completed_restore_fingerprint = tables.empty_restore_completion_fingerprint;
                 const maybe_range: ?tables.RangeRecord = for (projection.ranges) |candidate| {
@@ -70,11 +136,42 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
                 if (inserted.found_existing) return error.InvalidRestoreStaging;
                 const scope = try staging.ownerScope(alloc, parsed.value.plan, parsed.value.plan_digest, target, range);
                 try scope.validate();
-                try owners.append(alloc, .{ .plan_id = parsed.value.plan.id, .plan_digest = parsed.value.plan_digest, .table = actual, .range = actual_range, .scope = scope, .cancel_recovery = parsed.value.state == .canceling });
+                // The validated plan aligns each old/new range and its
+                // handoff by ordinal. Avoid rescanning every target for each
+                // projected owner on the hot metadata snapshot path.
+                const handoff = if (scope.empty_generation) handoff: {
+                    if (range_index >= target.generation_handoffs.len) return error.InvalidRestoreStaging;
+                    const pinned = target.generation_handoffs[range_index];
+                    if (pinned.target_group_id != range.group_id) return error.InvalidRestoreStaging;
+                    const command: @import("../storage/db/relational_integrity_topology_contract.zig").GenerationHandoffInstall = .{
+                        .scope = scope.digest(),
+                        .source_summary_digest = pinned.admissions_digest,
+                        .retired_digest = pinned.retired_digest,
+                        .retired_count = pinned.retired_count,
+                        .mappings = pinned.mappings,
+                    };
+                    break :handoff @import("../storage/db/restore_staging_contract.zig").EmptyGenerationHandoffExpectation{
+                        .source_summary_digest = command.source_summary_digest,
+                        .retired_digest = command.retired_digest,
+                        .retired_count = command.retired_count,
+                        .expected_install_receipt_digest = try @import("../storage/db/empty_generation_handoff.zig").installReceiptDigest(command),
+                    };
+                } else null;
+                try owners.append(alloc, .{
+                    .plan_id = parsed.value.plan.id,
+                    .plan_digest = parsed.value.plan_digest,
+                    .table = actual,
+                    .range = actual_range,
+                    .scope = scope,
+                    .empty_generation_handoff = handoff,
+                    .cancel_recovery = parsed.value.state == .canceling,
+                });
             }
         }
     }
+    for (initial_owners) |owner| if (seen_groups.contains(owner.range.group_id)) return error.InvalidGenerationPublication;
     var seen_tables: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen_tables.deinit(alloc);
     for (projection.tables) |table| {
         const entry = try seen_tables.getOrPut(alloc, table.table_id);
         if (entry.found_existing) return error.InvalidRestoreStaging;
@@ -86,10 +183,15 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
         } else {
             for (owners.items) |owner| {
                 if (owner.table.table_id == table.table_id) break;
-            } else return error.InvalidRestoreStaging;
+            } else {
+                for (initial_owners) |owner| {
+                    if (owner.table.table_id == table.table_id) break;
+                } else return error.InvalidRestoreStaging;
+            }
         }
     }
     var projected_groups: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer projected_groups.deinit(alloc);
     for (projection.ranges) |range| {
         const entry = try projected_groups.getOrPut(alloc, range.group_id);
         if (entry.found_existing) return error.InvalidRestoreStaging;
@@ -98,7 +200,11 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
         } else null;
         if (published) |expected| {
             if (!tables.rangeRecordsEqual(expected, range)) return error.MetadataSnapshotHeadMismatch;
-        } else if (!seen_groups.contains(range.group_id)) return error.InvalidRestoreStaging;
+        } else if (!seen_groups.contains(range.group_id)) {
+            for (initial_owners) |owner| {
+                if (owner.range.group_id == range.group_id) break;
+            } else return error.InvalidRestoreStaging;
+        }
     }
     return owners.toOwnedSlice(alloc);
 }
@@ -127,7 +233,45 @@ pub fn unpublishedProjection(alloc: std.mem.Allocator, public_tables: []const ta
             }
         }
     }
-    return .{ .tables = try hidden_tables.toOwnedSlice(alloc), .ranges = try hidden_ranges.toOwnedSlice(alloc), .jobs_json = projection.jobs_json };
+    return .{ .tables = try hidden_tables.toOwnedSlice(alloc), .ranges = try hidden_ranges.toOwnedSlice(alloc), .jobs_json = projection.jobs_json, .initial_fk_owners = projection.initial_fk_owners };
+}
+
+test "initial FK private owner is exact, unpublished, and supports schema epoch zero" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const schema_json = "{\"version\":0,\"storage_mode\":\"relational\"}";
+    var schema_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema_json, &schema_digest, .{});
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    var compiled = try @import("../metadata/fk_generation_publication.zig").compileCatalog(alloc, parsed, 7, null);
+    defer compiled.deinit();
+    var catalog_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(compiled.value, &catalog_digest, .{});
+    var table_values = [_]tables.TableRecord{.{ .table_id = 7, .name = "hidden_fk", .schema_json = schema_json }};
+    var range_values = [_]tables.RangeRecord{.{ .table_id = 7, .group_id = 9, .range_id = 9, .doc_identity_shard_id = 9, .doc_identity_range_id = 9, .start_key = "" }};
+    var descriptors = [_]staging.ProvisioningProjection.InitialFkOwner{.{
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .child_table_id = 7,
+        .child_group_id = 9,
+        .namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 9 },
+        .schema_version = 0,
+        .schema_digest = compiled.catalog.schema_digest,
+        .public_schema_json_digest = schema_digest,
+        .catalog_digest = catalog_digest,
+    }};
+    const projection: staging.ProvisioningProjection = .{
+        .tables = &table_values,
+        .ranges = &range_values,
+        .initial_fk_owners = &descriptors,
+    };
+    const owners = try validateInitial(alloc, &.{}, &.{}, projection);
+    try std.testing.expectEqual(@as(usize, 1), owners.len);
+    try std.testing.expectEqual(@as(usize, 0), (try validate(alloc, &.{}, &.{}, projection)).len);
+    descriptors[0].namespace.range_id = 10;
+    try std.testing.expectError(error.InvalidGenerationPublication, validateInitial(alloc, &.{}, &.{}, projection));
 }
 
 test "private provisioning validates immutable hidden owners and rejects forged descriptors" {

@@ -10,6 +10,54 @@ const reads = @import("table_read_source.zig");
 const operation = @import("operation.zig");
 const native = @import("../storage/db/relational_index_status_contract.zig");
 
+/// Initial FK publication accepts a parent-owner stage (or self-parent child
+/// release) only after the exact schema-bound witness index is ready in that
+/// owner's read-index snapshot. A stale or failed index is a retryable wait,
+/// never a partially enforced public FK.
+pub fn requireInitialFkSupportReady(status: native.Status, table_id: u64, schema_version: u32, start: []const u8, end: []const u8, comparison: [32]u8) !void {
+    if (status.table_id != table_id or status.schema_version != schema_version or
+        status.generation == 0 or status.state != .ready or status.failure != .none or
+        !std.mem.eql(u8, &status.comparison, &comparison) or
+        !std.mem.eql(u8, status.range_start, start) or
+        !std.mem.eql(u8, status.range_end, end))
+        return error.GenerationAdmissionPending;
+}
+
+test "relational index status initial FK owner readiness rejects building and stale witnesses before publication" {
+    const comparison: [32]u8 = @splat(7);
+    var status: native.Status = .{
+        .table_id = 51,
+        .schema_version = 3,
+        .generation = 9,
+        .slot = 0,
+        .catalog = @splat(2),
+        .comparison = comparison,
+        .owner = @splat(4),
+        .range_start = "a",
+        .range_end = "z",
+        .state = .building,
+        .rows_scanned = 1,
+        .failure = .none,
+        .progress_digest = @splat(5),
+        .maintenance_epoch = 0,
+        .last_maintenance_request = @splat(0),
+    };
+    try std.testing.expectError(error.GenerationAdmissionPending, requireInitialFkSupportReady(status, 51, 3, "a", "z", comparison));
+    status.state = .ready;
+    try requireInitialFkSupportReady(status, 51, 3, "a", "z", comparison);
+    status.generation = 0;
+    try std.testing.expectError(error.GenerationAdmissionPending, requireInitialFkSupportReady(status, 51, 3, "a", "z", comparison));
+    status.generation = 9;
+    status.comparison = @splat(8);
+    try std.testing.expectError(error.GenerationAdmissionPending, requireInitialFkSupportReady(status, 51, 3, "a", "z", comparison));
+    status.comparison = comparison;
+    status.failure = .invalid_row;
+    try std.testing.expectError(error.GenerationAdmissionPending, requireInitialFkSupportReady(status, 51, 3, "a", "z", comparison));
+    status.failure = .none;
+    try std.testing.expectError(error.GenerationAdmissionPending, requireInitialFkSupportReady(status, 51, 4, "a", "z", comparison));
+    try std.testing.expectError(error.GenerationAdmissionPending, requireInitialFkSupportReady(status, 51, 3, "a", "zz", comparison));
+}
+
 pub fn expectedComparison(alloc: std.mem.Allocator, parsed: @import("../schema/mod.zig").ParsedTableSchema, name: []const u8) ![32]u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();

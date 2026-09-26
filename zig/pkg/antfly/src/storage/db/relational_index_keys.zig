@@ -202,6 +202,20 @@ pub const TuplePlan = struct {
         self.* = undefined;
     }
 
+    /// Uniqueness inference ignores presentation order and sort direction,
+    /// while retaining the exact typed expression/collation identity.
+    pub fn sameEqualityKey(self: TuplePlan, left_index: usize, other: TuplePlan, right_index: usize) bool {
+        const left = self.keys[left_index];
+        const right = other.keys[right_index];
+        if (left.column_type != right.column_type or left.fold_ascii != right.fold_ascii) return false;
+        if (left.expression) |expression| {
+            const rhs = right.expression orelse return false;
+            return std.mem.eql(u8, &expression.fingerprint, &rhs.fingerprint);
+        }
+        if (right.expression != null) return false;
+        return std.mem.eql(u8, self.columns[left.ordinal].name, other.columns[right.ordinal].name);
+    }
+
     /// Bind this logical key to another immutable source layout for cold scans
     /// and restoration. Resolve names once per source epoch, never per row.
     /// Absent or differently typed source columns require an explicit migration;

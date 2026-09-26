@@ -92,6 +92,16 @@ const OpaqueApiHttpServer = struct {
             @panic("API kernel allocation failed");
     }
 
+    pub fn initWithProcessRequestAllocatorFallible(
+        owner_alloc: std.mem.Allocator,
+        cfg: server_mod.ApiHttpServerConfig,
+        source: server_mod.StatusSource,
+        read_source: ?table_reads.TableReadSource,
+        write_source: ?table_writes.TableWriteSource,
+    ) !OpaqueApiHttpServer {
+        return createOpaqueServer(owner_alloc, cfg, source, read_source, write_source, false);
+    }
+
     pub fn deinit(self: *OpaqueApiHttpServer) void {
         const boundary_allocator = self.boundary_allocator;
         const allocator = boundary_allocator.allocator;
@@ -423,13 +433,20 @@ const OpaqueHttpxHandler = struct {
             };
             try self.runtime_routes.append(alloc, route);
             errdefer _ = self.runtime_routes.pop();
-            try server.routeWithData(switch (entry.method) {
+            const method: httpx.Method = switch (entry.method) {
                 .get => .GET,
                 .post => .POST,
                 .put => .PUT,
                 .delete => .DELETE,
                 .patch => .PATCH,
-            }, path, runtimeApiHttpHandler, route);
+            };
+            if (method == .POST) {
+                if (@import("http_routes.zig").publicPostBodyLimit(path)) |limit| {
+                    try server.routeWithDataAndBodyLimit(method, path, runtimeApiHttpHandler, route, limit);
+                    continue;
+                }
+            }
+            try server.routeWithData(method, path, runtimeApiHttpHandler, route);
         }
     }
 

@@ -438,6 +438,7 @@ pub const DocStore = struct {
     });
 
     pub const Txn = struct {
+        range_mutation: @import("range_protection.zig").Mutation = .{},
         retained: retained_effects.Capture = .{},
         mutation_capture: ?*@import("txn_mutation_capture.zig").Capture = null,
         payload_session: ?*artifact_payload.Session = null,
@@ -452,6 +453,29 @@ pub const DocStore = struct {
         columns_invalidated: bool = false,
         columnar_mutation: ?internal_keys.ColumnarMutationToken = null,
         columnar_owner: ?*DocStore = null,
+
+        /// Fork an immutable runtime read at the same visibility cut. Each
+        /// fork has independent cursor scratch while the erased backend pins
+        /// the original snapshot until its last child closes. Callers must
+        /// serialize use of the payload session, which is shared for the
+        /// lifetime of this read family. LMDB does not provide this contract.
+        pub fn forkRead(self: *Txn) !Txn {
+            if (self.raw != null or self.write != null or self.probe != null or self.current_scan != null)
+                return error.ReadSnapshotForkUnsupported;
+            const parent = if (self.read) |*read| read else return error.ReadSnapshotForkUnsupported;
+            const owner = self.portable_import_reader_owner orelse return error.ReadSnapshotForkUnsupported;
+            try owner.acquirePortableImportReader();
+            errdefer owner.releasePortableImportReader();
+            var fork = try parent.forkRead();
+            errdefer fork.abort();
+            if (self.payload_session) |session| session.retain();
+            return .{
+                .alloc = self.alloc,
+                .read = fork,
+                .payload_session = self.payload_session,
+                .portable_import_reader_owner = owner,
+            };
+        }
 
         pub const CursorAdapter = backend_erased.Cursor;
         pub const ReadAdapter = backend_adapter.ReadTxn(Txn, CursorAdapter, .{
@@ -673,6 +697,7 @@ pub const DocStore = struct {
         }
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
+            try self.range_mutation.touch(self, key);
             try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), if (self.columnar_owner) |owner| &owner.retained_effects_cache else null);
             if (self.mutation_capture) |capture| try capture.touch(key);
             try self.markColumnarDirty(key, value);
@@ -689,6 +714,7 @@ pub const DocStore = struct {
         }
 
         pub fn delete(self: *Txn, key: []const u8) !void {
+            try self.range_mutation.touch(self, key);
             try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), if (self.columnar_owner) |owner| &owner.retained_effects_cache else null);
             if (self.mutation_capture) |capture| try capture.touch(key);
             try self.markColumnarDirty(key, null);
@@ -765,6 +791,7 @@ pub const DocStore = struct {
     };
 
     pub const Batch = struct {
+        range_mutation: @import("range_protection.zig").Mutation = .{},
         retained: retained_effects.Capture = .{},
         columnar_owner: ?*DocStore = null,
         payload_session: ?*artifact_payload.Session = null,
@@ -777,6 +804,7 @@ pub const DocStore = struct {
         runtime: ?backend_erased.Batch = null,
 
         pub const BatchTxn = struct {
+            range_mutation: *@import("range_protection.zig").Mutation,
             retained: *retained_effects.Capture,
             retained_cache: ?*std.atomic.Value(u8) = null,
             payload_session: ?*artifact_payload.Session = null,
@@ -837,6 +865,7 @@ pub const DocStore = struct {
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) !void {
+                try self.range_mutation.touch(self, key);
                 try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, value);
                 try self.invalidateColumns(key);
@@ -852,6 +881,10 @@ pub const DocStore = struct {
             }
 
             pub fn appendPut(self: @This(), key: []const u8, value: []const u8) !void {
+                // Active tracking requires point updates for bucket counters.
+                // Restore bulk writers publish into a fresh identity; they may
+                // defer activation until their unordered import is complete.
+                try self.range_mutation.touch(self, key);
                 try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
                 if (self.unordered_bulk_append_puts and internal_keys.isRelationalRowKey(key)) {
                     // Keep auxiliary records in the bulk arena too. A regular
@@ -874,6 +907,7 @@ pub const DocStore = struct {
             }
 
             pub fn delete(self: @This(), key: []const u8) !void {
+                try self.range_mutation.touch(self, key);
                 try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, null);
                 try self.invalidateColumns(key);
@@ -986,6 +1020,7 @@ pub const DocStore = struct {
 
         pub fn asTxn(self: *Batch) BatchTxn {
             return .{
+                .range_mutation = &self.range_mutation,
                 .retained = &self.retained,
                 .retained_cache = if (self.columnar_owner) |owner| &owner.retained_effects_cache else null,
                 .payload_session = self.payload_session,
@@ -2546,6 +2581,31 @@ pub const DocStore = struct {
         checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
         callback: ScanWithContextCallback,
     ) !void {
+        return self.scanRowKindReadTxnWithContext(txn, lower, upper, internal_keys.relational_row_kind, ctx, checkpoint, callback);
+    }
+
+    pub fn scanDocumentRowsReadTxnWithContext(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        ctx: ?*anyopaque,
+        checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
+        callback: ScanWithContextCallback,
+    ) !void {
+        return self.scanRowKindReadTxnWithContext(txn, lower, upper, internal_keys.primary_kind, ctx, checkpoint, callback);
+    }
+
+    fn scanRowKindReadTxnWithContext(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        row_kind: u8,
+        ctx: ?*anyopaque,
+        checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
+        callback: ScanWithContextCallback,
+    ) !void {
         var cursor = try txn.openCursor();
         defer cursor.close();
         const end = if (upper.len != 0) upper else &[_]u8{internal_keys.user_namespace + 1};
@@ -2561,7 +2621,7 @@ pub const DocStore = struct {
             const term = internal_keys.findComponentTerminator(item.key, 1) orelse return error.InvalidInternalUserKey;
             candidate.clearRetainingCapacity();
             try candidate.appendSlice(self.alloc, item.key[0 .. term + 2]);
-            try candidate.append(self.alloc, internal_keys.relational_row_kind);
+            try candidate.append(self.alloc, row_kind);
             if (try checkpoint(ctx, candidate.items) == .stop) return;
             var current = item;
             if (std.mem.order(u8, current.key, candidate.items) == .lt) {
@@ -3137,6 +3197,95 @@ test "docstore retained row effects bound admission and abort oversized atomic w
         try std.testing.expectError(error.RetainedEffectsFull, retained_effects.admit(&txn, @splat(1), 2, @splat(2), retained_effects.max_frame_bytes));
         try txn.put(key, "ordinary write can still use admitted space");
         try std.testing.expectError(error.RetainedEffectsMixedControl, retained_effects.acknowledge(&txn, @splat(1), 1, @splat(1), 0, 1));
+    }
+}
+
+test "docstore range tracking native LSM common prefix batch benchmark" {
+    const range_protection = @import("range_protection.zig");
+    const alloc = std.testing.allocator;
+    var keys: [32][]u8 = undefined;
+    var writes: [32]KVPair = undefined;
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(key);
+    for (&keys, &writes, 0..) |*key, *write, i| {
+        var raw: [32]u8 = undefined;
+        key.* = try internal_keys.documentKeyAlloc(alloc, try std.fmt.bufPrint(&raw, "doc:{d}", .{i}));
+        initialized += 1;
+        write.* = .{ .key = key.*, .value = "{\"value\":123,\"category\":\"bounded shared-prefix benchmark\"}" };
+    }
+    inline for (.{ false, true }) |active| {
+        var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 4096 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        if (active) try store.put(range_protection.activation_key, range_protection.activation_value);
+        const started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        for (0..100) |_| try store.putBatch(&writes, &.{});
+        const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - started;
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(?u64, if (active) 100 else null), try range_protection.generation(&read, range_protection.bucket("doc:0")));
+        std.debug.print("native LSM range tracking active={any} batches=100 rows_per_batch=32 elapsed_ns={d}\n", .{ active, elapsed });
+    }
+}
+
+test "docstore range tracking survives native LSM reopen and rejects generation overflow atomically" {
+    const range_protection = @import("range_protection.zig");
+    const index_records = @import("db/relational_index_records.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const key = try internal_keys.documentKeyAlloc(alloc, "doc:one");
+    defer alloc.free(key);
+    const id = range_protection.bucket("doc:one");
+    var component: std.ArrayList(u8) = .empty;
+    defer component.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&component, alloc, "doc:one");
+    var forward: std.ArrayList(u8) = .empty;
+    defer forward.deinit(alloc);
+    const forward_prefix = try index_records.forwardPrefix(.{ .generation = 7, .slot = 2 });
+    try forward.appendSlice(alloc, &forward_prefix);
+    try forward.appendSlice(alloc, &.{ 0x80, 'x', 0, 0 });
+    try forward.appendSlice(alloc, component.items[1..]);
+    var footer: [4]u8 = undefined;
+    std.mem.writeInt(u32, &footer, @intCast(component.items.len - 1), .big);
+    try forward.appendSlice(alloc, &footer);
+    const span = (try range_protection.indexSpanDigest(forward.items)).?;
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 4096 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.put(range_protection.activation_key, range_protection.activation_value);
+        try store.put(key, "before restart");
+        try store.put(forward.items, "");
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 4096 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.put(key, "after restart");
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(?u64, 2), try range_protection.generation(&read, id));
+        try std.testing.expectEqual(@as(?u64, 1), try range_protection.indexGeneration(&read, span));
+        const counter_key = range_protection.counterKey(id);
+        const index_counter_key = range_protection.indexCounterKey(span);
+        var exhausted: [8]u8 = undefined;
+        std.mem.writeInt(u64, &exhausted, std.math.maxInt(u64), .little);
+        try store.put(&counter_key, &exhausted);
+        try store.put(&index_counter_key, &exhausted);
+        try std.testing.expectError(error.RangeTrackingGenerationExhausted, store.put(key, "must never publish"));
+        try std.testing.expectError(error.RangeTrackingGenerationExhausted, store.put(forward.items, "must never publish"));
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        try std.testing.expectEqualStrings("after restart", try current.get(key));
+        try std.testing.expectEqualStrings("", try current.get(forward.items));
+        try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), try range_protection.generation(&current, id));
+        try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), try range_protection.indexGeneration(&current, span));
     }
 }
 

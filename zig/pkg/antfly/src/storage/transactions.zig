@@ -27,6 +27,7 @@ const backend_scan = @import("backend_scan.zig");
 const docstore = @import("docstore.zig");
 const DocStore = docstore.DocStore;
 const internal_keys = @import("internal_keys.zig");
+const range_protection = @import("range_protection.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
@@ -76,7 +77,7 @@ const read_guards_prefix = "\x00\x00__txn_read_guards__:";
 const read_members_prefix = "\x00\x00__txn_read_members__:";
 const read_admission_prefix = "\x00\x00__txn_read_admission__:";
 const read_guard_count_key = "\x00\x00__txn_read_guard_count";
-const max_read_guards_per_transaction = 65_536;
+pub const max_read_guards_per_transaction = 65_536;
 // Durable epoch leases. A prepare vote and its schema identity are one atomic
 // mutation; resolution retires both. Historical immutable schemas remain
 // usable after a new active epoch is published and after participant restart.
@@ -102,6 +103,9 @@ pub const TxnStatus = enum(u8) {
 pub const WriteIntent = struct {
     key: []const u8,
     value: ?[]const u8, // null for deletes
+    /// Borrowed logical typing metadata; must be consumed by canonical AROW
+    /// preparation before the journal boundary, never silently discarded.
+    json_null_fields: []const []const u8 = &.{},
     /// Schema-bound canonical AROW produced before voting prepared. The API
     /// sidecar retains only API-only special fields needed by commit effects.
     prepared_row: ?[]const u8 = null,
@@ -131,8 +135,9 @@ pub const IntentValue = struct {
 /// exact-number DOM, and per-row commit metadata. Limits apply to the entire
 /// transaction, including repeated prepares; replacing a key releases credits.
 pub fn intentAdmissionBytes(intent: WriteIntent) !u64 {
-    const payload: u64 = (if (intent.value) |value| value.len else 0) +
+    var payload: u64 = (if (intent.value) |value| value.len else 0) +
         (if (intent.prepared_row) |row| row.len else 0);
+    for (intent.json_null_fields) |field| payload = std.math.add(u64, payload, field.len + @sizeOf([]const u8)) catch return error.TransactionTooLarge;
     const bytes = std.math.mul(u64, payload, 64) catch return error.TransactionTooLarge;
     const keys = std.math.mul(u64, intent.key.len, 16) catch return error.TransactionTooLarge;
     return std.math.add(u64, bytes, std.math.add(u64, keys, 4096) catch return error.TransactionTooLarge) catch error.TransactionTooLarge;
@@ -143,11 +148,21 @@ pub fn intentAdmissionBytes(intent: WriteIntent) !u64 {
 /// Document numbers retain their exact source spelling. Only special-field
 /// stripping serializes JSON; count its exact output with a bounded writer.
 fn isRawMetadataIntentKey(key: []const u8) bool {
-    return std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or
+    return range_protection.counterBucket(key) != null or
+        range_protection.indexCounterDigest(key) != null or
+        std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_activation") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_retirement") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_generation_retirement") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:restore_staging_owner") or
         @import("db/relational_index_maintenance_contract.zig").isControlKey(key);
+}
+
+fn isRawMetadataPredicateKey(key: []const u8) bool {
+    return isRawMetadataIntentKey(key) or
+        std.mem.eql(u8, key, @import("db/relational_index_catalog.zig").head_key) or
+        (key.len == @import("db/relational_index_jobs.zig").progress_prefix.len + range_protection.index_id_bytes and
+            std.mem.startsWith(u8, key, @import("db/relational_index_jobs.zig").progress_prefix));
 }
 
 fn retainedIntentBytes(alloc: Allocator, intent: WriteIntent) !u64 {
@@ -328,6 +343,9 @@ pub const MutationExtraBatch = struct {
     /// DB callers supply the replicated catalog policy, never local capacity.
     max_intent_admission_bytes: u64 = 0,
     preparation_allocator: ?Allocator = null,
+    /// Exact old/new index tuple spans derived under the pinned index plan.
+    /// Each prepared primary writer reserves its spans before publication.
+    index_span_digests: []const [range_protection.index_span_digest_bytes]u8 = &.{},
 };
 
 pub const SchemaBinding = struct {
@@ -639,6 +657,8 @@ pub const TxnManager = struct {
         predicates: []const VersionPredicate,
         extra_batch: MutationExtraBatch,
     ) !void {
+        if (extra_batch.index_span_digests.len > max_read_guards_per_transaction) return error.TransactionTooLarge;
+        for (intents) |intent| if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
 
@@ -674,6 +694,7 @@ pub const TxnManager = struct {
             self.traceWriteIntentFails(txn_id, intents, "IntentConflict");
             return err;
         };
+        try self.checkIndexSpanGuardConflicts(extra_batch.index_span_digests, txn_id);
 
         const previous_admission = try self.loadIntentAdmission(self.alloc, txn_id);
         var admission = previous_admission orelse IntentAdmission{};
@@ -756,7 +777,34 @@ pub const TxnManager = struct {
             try pending_costs.put(self.alloc, intent.key, .{ .bytes = cost, .retained = retained });
             try last_intents.put(self.alloc, intent.key, index);
         }
-        const read_admission = try self.stageReadGuards(txn_id, predicates, &last_intents, &write_keys, &write_vals, &writes);
+        var range_reservations = std.ArrayListUnmanaged(VersionPredicate).empty;
+        defer range_reservations.deinit(self.alloc);
+        try range_reservations.appendSlice(self.alloc, predicates);
+        var writer_keys: [range_protection.bucket_count][range_protection.writer_prefix.len + 2]u8 = undefined;
+        var writer_buckets: std.StaticBitSet(range_protection.bucket_count) = .initEmpty();
+        const index_writer_keys = try self.alloc.alloc([range_protection.index_writer_prefix.len + range_protection.index_span_digest_bytes]u8, extra_batch.index_span_digests.len);
+        defer self.alloc.free(index_writer_keys);
+        {
+            var probe = try self.store.beginProbe();
+            defer probe.abort();
+            const tracking_active = try range_protection.isActive(&probe);
+            if (!tracking_active and extra_batch.index_span_digests.len != 0) return error.SqlRangeTrackingRequired;
+            if (tracking_active) {
+                for (intents) |intent| {
+                    if (std.mem.startsWith(u8, intent.key, "\x00\x00")) continue;
+                    const id = range_protection.bucket(intent.key);
+                    if (writer_buckets.isSet(id)) continue;
+                    writer_buckets.set(id);
+                    writer_keys[id] = range_protection.writerKey(id);
+                    try range_reservations.append(self.alloc, .{ .key = &writer_keys[id], .expected_version = 0, .comparison = .exact_value, .expected_value = null });
+                }
+                for (extra_batch.index_span_digests, 0..) |digest, i| {
+                    index_writer_keys[i] = range_protection.indexWriterKey(digest);
+                    try range_reservations.append(self.alloc, .{ .key = &index_writer_keys[i], .expected_version = 0, .comparison = .exact_value, .expected_value = null });
+                }
+            }
+        }
+        const read_admission = try self.stageReadGuards(txn_id, range_reservations.items, &last_intents, &write_keys, &write_vals, &writes);
         const total_bytes = std.math.add(u64, admission.bytes, read_admission.next.bytes) catch return error.TransactionTooLarge;
         const previous_bytes = std.math.add(u64, if (previous_admission) |previous| previous.bytes else 0, read_admission.previous.bytes) catch return error.InvalidTxnRecord;
         if (extra_batch.max_intent_admission_bytes != 0 and total_bytes > extra_batch.max_intent_admission_bytes and
@@ -1335,6 +1383,15 @@ pub const TxnManager = struct {
         return (try self.listTransactionsPage(alloc, null, std.math.maxInt(usize))).items;
     }
 
+    /// Index READY publication needs to drain outstanding row intents, not
+    /// idle/read-only sessions or already resolved HA outboxes. Admission and
+    /// publication are serialized by the DB apply fence.
+    pub fn hasPendingIntents(self: *TxnManager) !bool {
+        var read = try self.store.beginRead();
+        defer read.abort();
+        return readHasPrefix(&read, intents_prefix);
+    }
+
     /// Returns whether a topology transition would strand transaction state.
     /// This stays allocation-free and uses a single backend read snapshot:
     /// transitions are cold-path operations, but retained terminal decisions
@@ -1379,6 +1436,16 @@ pub const TxnManager = struct {
             entry = try cursor.next();
         }
         return false;
+    }
+
+    /// Constant-work uncertainty check for coordinated statement snapshots.
+    /// The caller must hold primary AND replay mutation admission while using
+    /// this result. A prepared participant may otherwise resolve immediately
+    /// after the check, yielding different sides of one distributed commit.
+    pub fn hasUnresolvedWriteIntents(self: *TxnManager) !bool {
+        var read = try self.store.beginRead();
+        defer read.abort();
+        return readHasPrefix(&read, intents_prefix);
     }
 
     pub fn listTransactionsPage(
@@ -1728,7 +1795,29 @@ pub const TxnManager = struct {
                     }
                 },
                 .exact_value => {
-                    if (!isRawMetadataIntentKey(pred.key)) return error.InvalidArgument;
+                    if (!isRawMetadataPredicateKey(pred.key)) return error.InvalidArgument;
+                    if (range_protection.counterBucket(pred.key)) |id| {
+                        var probe = try self.store.beginProbe();
+                        defer probe.abort();
+                        if (!try range_protection.isActive(&probe)) return error.SqlRangeTrackingRequired;
+                        var read = try self.store.beginCurrentScan();
+                        defer read.abort();
+                        var cursor = try read.openCursor();
+                        defer cursor.close();
+                        const writer_key = range_protection.writerKey(id);
+                        try self.checkReadGuardCursor(&cursor, &writer_key, exclude_txn);
+                    }
+                    if (range_protection.indexCounterDigest(pred.key)) |digest| {
+                        var probe = try self.store.beginProbe();
+                        defer probe.abort();
+                        if (!try range_protection.isActive(&probe)) return error.SqlRangeTrackingRequired;
+                        var read = try self.store.beginCurrentScan();
+                        defer read.abort();
+                        var cursor = try read.openCursor();
+                        defer cursor.close();
+                        const writer_key = range_protection.indexWriterKey(digest);
+                        try self.checkReadGuardCursor(&cursor, &writer_key, exclude_txn);
+                    }
                     const current = self.getAlloc(self.alloc, pred.key) catch |err| switch (err) {
                         error.NotFound => null,
                         else => return err,
@@ -1761,7 +1850,16 @@ pub const TxnManager = struct {
             defer scan.abort();
             var cursor = try scan.openCursor();
             defer cursor.close();
-            for (intents) |intent| try self.checkReadGuardCursor(&cursor, intent.key, exclude_txn);
+            var buckets: std.StaticBitSet(range_protection.bucket_count) = .initEmpty();
+            for (intents) |intent| {
+                try self.checkReadGuardCursor(&cursor, intent.key, exclude_txn);
+                if (std.mem.startsWith(u8, intent.key, "\x00\x00")) continue;
+                const id = range_protection.bucket(intent.key);
+                if (buckets.isSet(id)) continue;
+                buckets.set(id);
+                const counter = range_protection.counterKey(id);
+                try self.checkReadGuardCursor(&cursor, &counter, exclude_txn);
+            }
         }
     }
 
@@ -1835,7 +1933,51 @@ pub const TxnManager = struct {
             defer scan.abort();
             var cursor = try scan.openCursor();
             defer cursor.close();
-            for (user_keys) |key| try self.checkReadGuardCursor(&cursor, key, null);
+            var buckets: std.StaticBitSet(range_protection.bucket_count) = .initEmpty();
+            for (user_keys) |key| {
+                try self.checkReadGuardCursor(&cursor, key, null);
+                if (std.mem.startsWith(u8, key, "\x00\x00")) continue;
+                const id = range_protection.bucket(key);
+                if (buckets.isSet(id)) continue;
+                buckets.set(id);
+                const counter = range_protection.counterKey(id);
+                try self.checkReadGuardCursor(&cursor, &counter, null);
+            }
+        }
+    }
+
+    /// Forward-index effects are computed under the DB apply fence after the
+    /// final row image is known. Check their exact tuple spans before the same
+    /// atomic batch publishes the primary and index records.
+    pub fn checkIndexForwardWriteConflicts(self: *TxnManager, physical_keys: []const []const u8) !void {
+        if (physical_keys.len == 0 or try self.readGuardCount() == 0) return;
+        var scan = try self.store.beginCurrentScan();
+        defer scan.abort();
+        var cursor = try scan.openCursor();
+        defer cursor.close();
+        var seen = std.AutoHashMapUnmanaged([range_protection.index_span_digest_bytes]u8, void).empty;
+        defer seen.deinit(self.alloc);
+        for (physical_keys) |key| {
+            const digest = (try range_protection.indexSpanDigest(key)) orelse continue;
+            if ((try seen.getOrPut(self.alloc, digest)).found_existing) continue;
+            const counter = range_protection.indexCounterKey(digest);
+            try self.checkReadGuardCursor(&cursor, &counter, null);
+        }
+    }
+
+    fn checkIndexSpanGuardConflicts(
+        self: *TxnManager,
+        digests: []const [range_protection.index_span_digest_bytes]u8,
+        exclude_txn: ?TxnId,
+    ) !void {
+        if (digests.len == 0 or try self.readGuardCount() == 0) return;
+        var scan = try self.store.beginCurrentScan();
+        defer scan.abort();
+        var cursor = try scan.openCursor();
+        defer cursor.close();
+        for (digests) |digest| {
+            const counter = range_protection.indexCounterKey(digest);
+            try self.checkReadGuardCursor(&cursor, &counter, exclude_txn);
         }
     }
 
@@ -2931,6 +3073,7 @@ test "retained transaction byte bounds count exact physical rows without parsing
     for ([_][]const u8{
         "\x00\x00__metadata__:relational_integrity_activation",
         "\x00\x00__metadata__:relational_integrity_retirement",
+        "\x00\x00__metadata__:relational_integrity_generation_retirement",
         "\x00\x00__metadata__:restore_staging_owner",
     }) |key| try std.testing.expectEqual(@as(u64, 0), try retainedIntentBytes(fixed.allocator(), .{ .key = key, .value = "binary\x00\\_edges" }));
 }
@@ -3022,6 +3165,21 @@ test "transaction intent admission releases failed allocations before voting" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "transaction journal refuses to lose unprepared JSON null typing" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var mgr = try TxnManager.init(alloc, &runtime);
+    defer mgr.deinit();
+    const txn: TxnId = .{32} ** 16;
+    try mgr.initTransaction(txn, 100);
+    try std.testing.expectError(error.PreparedIntentRequiresMaterialization, mgr.writeIntents(txn, &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }}, &.{}));
+    // Once the native AROW exists, its bitmap is the durable authority.
+    try mgr.writeIntents(txn, &.{.{ .key = "row", .value = "{}", .json_null_fields = &.{"j"}, .prepared_row = "physical" }}, &.{});
 }
 
 test "transaction abort retires large intents without loading their payloads" {
@@ -3554,6 +3712,171 @@ test "transaction shared read guards fence writes and survive restart until reso
         try manager.resolveIntents(first, .committed, 701);
         try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
     }
+}
+
+test "transaction activated range guards fence pending writers without serializing disjoint writes" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    try store.put(range_protection.activation_key, range_protection.activation_value);
+    const first: TxnId = @splat(91);
+    const second: TxnId = @splat(92);
+    const reader: TxnId = @splat(93);
+    try manager.initTransaction(first, 1);
+    try manager.initTransaction(second, 1);
+    try manager.initTransaction(reader, 1);
+    const key = range_protection.counterKey(range_protection.bucket("alpha"));
+    const predicate: VersionPredicate = .{ .key = &key, .expected_version = 0, .comparison = .exact_value, .expected_value = null };
+    try manager.writeIntents(first, &.{.{ .key = "alpha", .value = "1" }}, &.{});
+    // Same bucket, different keys: both writers prepare concurrently.
+    try manager.writeIntents(second, &.{.{ .key = "another", .value = "2" }}, &.{});
+    try std.testing.expectError(error.IntentConflict, manager.writeIntents(reader, &.{}, &.{predicate}));
+    try manager.resolveIntents(first, .aborted, 2);
+    try std.testing.expectError(error.IntentConflict, manager.writeIntents(reader, &.{}, &.{predicate}));
+    try manager.resolveIntents(second, .aborted, 2);
+    try manager.writeIntents(reader, &.{}, &.{predicate});
+    try std.testing.expectError(error.IntentConflict, manager.checkOrdinaryWriteConflict("absent-phantom"));
+    try manager.checkOrdinaryWriteConflict("different-bucket");
+    try manager.resolveIntents(reader, .aborted, 3);
+    try manager.checkOrdinaryWriteConflict("absent-phantom");
+    try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
+}
+
+test "transaction index span guards fence pending and later writers without blocking disjoint tuples" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    try store.put(range_protection.activation_key, range_protection.activation_value);
+    const writer: TxnId = @splat(101);
+    const reader: TxnId = @splat(102);
+    const unrelated: TxnId = @splat(103);
+    const later_writer: TxnId = @splat(104);
+    try manager.initTransaction(writer, 1);
+    try manager.initTransaction(reader, 1);
+    try manager.initTransaction(unrelated, 1);
+    try manager.initTransaction(later_writer, 1);
+    var component: std.ArrayList(u8) = .empty;
+    defer component.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&component, alloc, "primary");
+    var forward: std.ArrayList(u8) = .empty;
+    defer forward.deinit(alloc);
+    const forward_prefix = try @import("db/relational_index_records.zig").forwardPrefix(.{ .generation = 7, .slot = 2 });
+    try forward.appendSlice(alloc, &forward_prefix);
+    try forward.appendSlice(alloc, &.{ 0x80, 'x', 0, 0 });
+    try forward.appendSlice(alloc, component.items[1..]);
+    var footer: [4]u8 = undefined;
+    std.mem.writeInt(u32, &footer, @intCast(component.items.len - 1), .big);
+    try forward.appendSlice(alloc, &footer);
+    const span = (try range_protection.indexSpanDigest(forward.items)).?;
+    const other_span: [range_protection.index_span_digest_bytes]u8 = @splat(8);
+    const counter = range_protection.indexCounterKey(span);
+    const proof: VersionPredicate = .{ .key = &counter, .expected_version = 0, .comparison = .exact_value, .expected_value = null };
+    try manager.writeIntentsExtraBatch(writer, &.{.{ .key = "primary", .value = "{}" }}, &.{}, .{ .index_span_digests = &.{span} });
+    try std.testing.expectError(error.IntentConflict, manager.writeIntents(reader, &.{}, &.{proof}));
+    try manager.resolveIntents(writer, .aborted, 2);
+    try manager.writeIntents(reader, &.{}, &.{proof});
+    try std.testing.expectError(error.IntentConflict, manager.checkIndexForwardWriteConflicts(&.{forward.items}));
+    try std.testing.expectError(error.IntentConflict, manager.writeIntentsExtraBatch(later_writer, &.{.{ .key = "another", .value = "{}" }}, &.{}, .{ .index_span_digests = &.{span} }));
+    try manager.writeIntentsExtraBatch(unrelated, &.{.{ .key = "another", .value = "{}" }}, &.{}, .{ .index_span_digests = &.{other_span} });
+    try manager.resolveIntents(reader, .aborted, 3);
+    try manager.checkIndexForwardWriteConflicts(&.{forward.items});
+    try manager.resolveIntents(unrelated, .aborted, 3);
+    try manager.resolveIntents(later_writer, .aborted, 3);
+    try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
+}
+
+test "transaction activated range reader and writer reservations recover across LSM restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const writer: TxnId = @splat(94);
+    const reader: TxnId = @splat(95);
+    const key = range_protection.counterKey(range_protection.bucket("alpha"));
+    const predicate: VersionPredicate = .{ .key = &key, .expected_version = 0, .comparison = .exact_value, .expected_value = null };
+    for (0..3) |phase| {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        switch (phase) {
+            0 => {
+                try store.put(range_protection.activation_key, range_protection.activation_value);
+                try manager.initTransaction(writer, 1);
+                try manager.initTransaction(reader, 1);
+                try manager.writeIntents(writer, &.{.{ .key = "alpha", .value = "pending" }}, &.{});
+            },
+            1 => {
+                try std.testing.expectError(error.IntentConflict, manager.writeIntents(reader, &.{}, &.{predicate}));
+                try manager.resolveIntents(writer, .aborted, 2);
+                try manager.writeIntents(reader, &.{}, &.{predicate});
+            },
+            2 => {
+                try std.testing.expectError(error.IntentConflict, manager.checkOrdinaryWriteConflict("another phantom"));
+                try std.testing.expect(try manager.hasTopologySensitiveTransactions());
+                try manager.resolveIntents(reader, .aborted, 3);
+                try manager.checkOrdinaryWriteConflict("another phantom");
+                try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
+            },
+            else => unreachable,
+        }
+    }
+}
+
+test "transaction range generations are atomic snapshot bound and coalesced per bucket" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const a = try internal_keys.documentKeyAlloc(alloc, "alpha");
+    defer alloc.free(a);
+    const b = try internal_keys.documentKeyAlloc(alloc, "another");
+    defer alloc.free(b);
+    const id = range_protection.bucket("alpha");
+    try store.put(a, "1");
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(null, try range_protection.generation(&read, id));
+        try std.testing.expectError(error.SqlRangeTrackingRequired, range_protection.capture(alloc, &read, "", ""));
+    }
+    try store.put(range_protection.activation_key, range_protection.activation_value);
+    {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(a, "2");
+        try batch.put(b, "3");
+        try batch.commit();
+    }
+    var pinned = try store.beginReadTxn();
+    defer pinned.abort();
+    try std.testing.expectEqual(@as(?u64, 1), try range_protection.generation(&pinned, id));
+    {
+        var batch = try store.beginWriteBatch();
+        defer batch.abort();
+        try batch.put(a, "aborted");
+    }
+    try store.delete(a);
+    var current = try store.beginReadTxn();
+    defer current.abort();
+    try std.testing.expectEqual(@as(?u64, 1), try range_protection.generation(&pinned, id));
+    try std.testing.expectEqual(@as(?u64, 2), try range_protection.generation(&current, id));
+    const proofs = try range_protection.capture(alloc, &current, "alpha", "azure");
+    defer alloc.free(proofs);
+    try std.testing.expectEqual(@as(usize, 1), proofs.len);
+    try std.testing.expectEqual(@as(?u64, 2), proofs[0].generation);
 }
 
 test "transaction read guards protect absence and reject write skew" {

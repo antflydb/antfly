@@ -482,6 +482,18 @@ fn replaceTableDefinitionStampedWithReceipt(
         !std.mem.eql(u8, replacement.name, expected.name))
         return error.InvalidTableDefinitionReplacement;
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    if (!std.mem.eql(u8, expected.schema_json, replacement.schema_json) or
+        !std.mem.eql(u8, expected.read_schema_json, replacement.read_schema_json) or
+        !std.mem.eql(u8, expected.indexes_json, replacement.indexes_json))
+    {
+        // Policy bytecode binds the typed-row layout. Reject uncoupled
+        // relational index/schema DDL before proposing a metadata mutation;
+        // apply repeats the guard at its authoritative table-record writer.
+        if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+            try service.ensureLinearizableRead();
+            try store.requirePolicyIndexMutationAllowed(service.metadata_group_id, expected.table_id);
+        }
+    }
     const baseline_fence = try store.getTableTransitionFence(
         service.metadata_group_id,
         expected.table_id,
@@ -1781,6 +1793,8 @@ pub const MetadataServiceConfig = struct {
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
+    setting_authority_secret: ?[]const u8 = null,
+    setting_authority_issuer: ?[]const u8 = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     reallocation_protocol_peers: []const ReallocationProtocolPeer = &.{},
 };
@@ -2823,6 +2837,33 @@ pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.Transition
     };
 }
 
+fn preflightRowPolicyTopologyCommand(service: anytype, command: metadata_storage.TransitionCommand) !void {
+    const table_id: ?u64 = switch (command) {
+        .upsert_range => |range| range.table_id,
+        .admit_split_transition => |admission| admission.record.table_contract.table_id,
+        .upsert_split_transition => |record| record.table_contract.table_id,
+        .upsert_merge_transition => |record| record.table_contract.table_id,
+        .admit_online_merge => |admission| admission.next.scope.fence.namespace.table_id,
+        .compare_and_set_online_merge => |update| update.expected.scope.fence.namespace.table_id,
+        else => null,
+    };
+    if (table_id) |id| {
+        const store = service.projectedStore() orelse return error.MissingMetadataStore;
+        try store.requirePolicyTopologyMutationAllowed(service.metadata_group_id, id);
+    }
+    if (command == .remove_range or command == .complete_restore_range) {
+        const store = service.projectedStore() orelse return error.MissingMetadataStore;
+        const range_group_id = switch (command) {
+            .remove_range => |record| record.group_id,
+            .complete_restore_range => |record| record.group_id,
+            else => unreachable,
+        };
+        const range = try store.getRange(service.alloc, service.metadata_group_id, range_group_id);
+        defer if (range) |value| metadata_table_manager.freeRange(service.alloc, value);
+        if (range) |value| try store.requirePolicyTopologyMutationAllowed(service.metadata_group_id, value.table_id);
+    }
+}
+
 /// Call before acquiring a catalog lock. Remote membership probes belong at
 /// workflow admission; the final proposal path below only consumes a proof.
 pub fn ensureCoordinatedDecoderWithContext(service: anytype, command: metadata_storage.TransitionCommand, request: api_operation.RequestContext) !void {
@@ -2833,6 +2874,9 @@ pub fn ensureCoordinatedDecoderWithContext(service: anytype, command: metadata_s
 }
 
 fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metadata_storage.TransitionCommand) !?TableTopologyProtocolReadiness {
+    if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+        for (commands) |command| try preflightRowPolicyTopologyCommand(service, command);
+    }
     for (commands) |command| if (transitionRequiresCoordinatedDecoder(command)) {
         if (comptime !@hasDecl(@TypeOf(service.*), "cachedCoordinatedDecoderReadiness"))
             return error.TableTopologyProtocolUpgradeRequired;
@@ -3779,7 +3823,7 @@ test "catalog projection capability counts cover every enum tag and last-owner r
 
 test "catalog projection store lease includes relational rollout capability" {
     const alloc = std.testing.allocator;
-    const record = try metadata_table_manager.cloneStore(alloc, .{ .store_id = 1, .node_id = 1, .relational_topology_protocol_version = 1 });
+    const record = try metadata_table_manager.cloneStore(alloc, .{ .store_id = 1, .node_id = 1, .relational_topology_protocol_version = metadata_table_manager.relational_topology_protocol_version });
     const lease = StoreProjectionLease.create(alloc, record, null, false, false) catch |err| {
         metadata_table_manager.freeStore(alloc, record);
         return err;
@@ -7517,6 +7561,8 @@ pub const MetadataHttpService = struct {
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
+    setting_authority_secret: ?[]const u8 = null,
+    setting_authority_issuer: ?[]const u8 = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -7580,6 +7626,8 @@ pub const MetadataHttpService = struct {
             .secret_store = cfg.secret_store,
             .internal_service_secret = cfg.internal_service_secret,
             .internal_service_issuer = cfg.internal_service_issuer,
+            .setting_authority_secret = cfg.setting_authority_secret,
+            .setting_authority_issuer = cfg.setting_authority_issuer,
             .destination_authorizer = cfg.destination_authorizer,
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
@@ -9582,6 +9630,7 @@ pub const MetadataHttpService = struct {
             self.internal_service_secret,
             self.internal_service_issuer,
         );
+        _ = client.withSettingAuthority(self.setting_authority_secret, self.setting_authority_issuer);
         return client;
     }
 
@@ -12165,8 +12214,10 @@ test "relational topology admission rejects lifecycle proposals before encoding 
 
 test "relational topology admission requires metadata decoder capability beyond framed status" {
     try std.testing.expectEqual(@as(u16, 11), metadata_topology_protocol.source_scope_version);
-    try std.testing.expectEqual(metadata_topology_protocol.current_version, metadata_topology_protocol.coordinated_lifecycle_version);
-    try std.testing.expectEqual(metadata_topology_protocol.current_version, metadata_topology_protocol.relational_integrity_topology_version);
+    // The latest metadata protocol can advance independently of the minimum
+    // decoder version required by coordinated relational lifecycle entries.
+    try std.testing.expect(metadata_topology_protocol.current_version >= metadata_topology_protocol.coordinated_lifecycle_version);
+    try std.testing.expectEqual(metadata_topology_protocol.coordinated_lifecycle_version, metadata_topology_protocol.relational_integrity_topology_version);
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var status: MetadataStatus = .{ .metadata_group_id = 42, .metadata_incarnation = incarnation, .metadata_raft_local_node_id = 7, .metrics = .{}, .table_topology_protocol_version = 6, .runtime_status_record_version = metadata_runtime_status_protocol.current_record_version };
     try std.testing.expect(runtimeStatusProtocolCompatible(status, 42, 7, incarnation, metadata_runtime_status_protocol.current_record_version));

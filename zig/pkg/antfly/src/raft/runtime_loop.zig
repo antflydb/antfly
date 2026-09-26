@@ -74,6 +74,8 @@ pub const ManagedProgressDriver = struct {
     future: ?std.Io.Future(void) = null,
     state: State = .initialized,
     stop_event: std.Io.Event = .unset,
+    wake_event: std.Io.Event = .unset,
+    wake_generation: std.atomic.Value(u64) = .init(0),
     failure_event: std.Io.Event = .unset,
     failed: std.atomic.Value(bool) = .init(false),
     /// Even generations are idle; odd generations identify one active round.
@@ -169,6 +171,7 @@ pub const ManagedProgressDriver = struct {
     pub fn stop(self: *ManagedProgressDriver) void {
         if (self.state != .running) return;
         self.stop_event.set(self.io);
+        self.wake_event.set(self.io);
         if (self.future) |*future| future.await(self.schedulingIo());
         self.future = null;
         if (self.progress_io) |*owned| owned.deinit();
@@ -181,8 +184,17 @@ pub const ManagedProgressDriver = struct {
         self.* = undefined;
     }
 
+    /// A deferred apply owner became available. Coalesce wakeups while the
+    /// driver is busy, and retain a generation so a wake cannot be lost in
+    /// the gap between the progress round and its timed wait.
+    pub fn requestWake(self: *ManagedProgressDriver) void {
+        _ = self.wake_generation.fetchAdd(1, .release);
+        self.wake_event.set(self.io);
+    }
+
     fn run(self: *ManagedProgressDriver) void {
         while (!self.stop_event.isSet()) {
+            const observed_wake = self.wake_generation.load(.acquire);
             const started_ns = platform_time.monotonicNs();
             self.round_started_ns.store(started_ns, .release);
             _ = self.round_generation.fetchAdd(1, .acq_rel);
@@ -194,7 +206,9 @@ pub const ManagedProgressDriver = struct {
             _ = self.round_generation.fetchAdd(1, .release);
             const elapsed_ns = completed_ns -| started_ns;
             if (elapsed_ns < self.interval_ns) {
-                self.stop_event.waitTimeout(self.io, .{
+                self.wake_event.reset();
+                if (self.stop_event.isSet() or self.wake_generation.load(.acquire) != observed_wake) continue;
+                self.wake_event.waitTimeout(self.io, .{
                     .duration = .{
                         .raw = std.Io.Duration.fromNanoseconds(self.interval_ns - elapsed_ns),
                         .clock = .awake,
@@ -498,6 +512,35 @@ test "managed raft progress driver advances independently and joins on stop" {
     try io_impl.io().sleep(.fromMilliseconds(5), .awake);
     try std.testing.expectEqual(stopped_count, counter.count.load(.acquire));
     try std.testing.expectError(error.AlreadyStarted, driver.start());
+}
+
+test "managed raft progress driver wakes immediately when deferred apply owner opens" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const Counter = struct {
+        count: std.atomic.Value(u64) = .init(0),
+        fn runOnce(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.count.fetchAdd(1, .release);
+        }
+    };
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var counter = Counter{};
+    var driver = ManagedProgressDriver.init(io, .{ .ptr = &counter, .run_once = Counter.runOnce }, std.time.ns_per_hour);
+    defer driver.deinit();
+    try driver.start();
+    const deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+    while (counter.count.load(.acquire) == 0) {
+        if (platform_time.monotonicNs() >= deadline) return error.TestProgressDidNotStart;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    driver.requestWake();
+    while (counter.count.load(.acquire) < 2) {
+        if (platform_time.monotonicNs() >= deadline) return error.TestOwnerWakeDidNotAdvanceProgress;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try driver.checkFailure();
 }
 
 test "managed raft progress driver publishes source failure" {
