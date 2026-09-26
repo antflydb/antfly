@@ -239,11 +239,9 @@ Backend status:
 
 - **CPU and Metal:** use the generic ModernBERT path with segment attention
   (below). Its linears already run on resident weight slots.
-- **Packed decision head on Metal:** question-type embeddings are gathered on
-  the device, and marker and anchor rows are gathered and scored there. Only
-  the scorer logits (for the action head's confidence statistics) and the
-  action logits are read back, instead of the whole `[rows, dim]` hidden
-  state. CPU scores on the host.
+- **Packed decision head:** question-type embeddings are gathered on the
+  backend from `[type_emb; 0]`. Scoring reads the hidden state back and
+  scores on the host on every backend (see the open issue below).
 - **Fused Metal kernels:** the resident Laya kernels (`ops/laya_metal.zig`)
   are not used for packed rows (see roadmap step 1c).
 - **CUDA:** does not select the Laya profile for packed configs, just as it
@@ -755,12 +753,12 @@ How the numbers got here, all on the same machine and checkpoint:
   Metal and 740 ms on CPU. Removing the trunk's zero query rows brought it to
   66 ms and 331 ms.
 
-**Device scoring for packed rows (2026-09-25).** Scoring on the device
-instead of reading the hidden state back is exact and saves 2–4% at 16–64
-questions (for example 12 sentences, 64 questions: 406.8 → 399.5 ms packed,
-363.1 → 355.2 ms cached; 1 sentence, 64 questions: 259.6 → 249.9 ms), and
-nothing measurable below. The packed Metal path is now bound by encoder GPU
-work that the fused resident kernels would compute the same way. So routing
+**Device scoring for packed rows (2026-09-25, reverted).** Scoring on the
+device instead of reading the hidden state back saved 2–4% at 16–64
+questions (for example 12 sentences, 64 questions: 406.8 → 399.5 ms packed)
+and nothing measurable below. It was reverted after it raced on Metal (see
+open issues). Either way, the packed Metal path is bound by encoder GPU work
+that the fused resident kernels would compute the same way, so routing
 packed rows through them (step 1c) is not expected to pay off on Metal.
 
 The full raw output of every run is in
@@ -913,7 +911,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 | 0. Qualify packed accuracy | fine-tune | question mode: single-seed parity on typed-decisions (0.574 vs 0.572), but the recipe varies 0.37–0.57 by seed, so parity needs several seeds of each layout. Candidate mode: Banking77 0.819 mean over two seeds (0.828, 0.810) with soft CE (RLCD diverges at 77 options) | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
 | 1a. State cache across rows and requests | no | done (CPU and Metal) | Exact against the full row and the oracle; follow-up questions skip trunk projections and feed-forward work |
 | 1b. Segment attention | no | done (CPU and Metal); multi-row batching done (CPU and Metal, question and candidate modes) | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call: exact against running each row alone, isolated by construction; not yet composed with the trunk cache |
-| 1c. Metal and CUDA packed kernels | no | Metal: packed decisions scored on the device (2–4%); fused kernels not pursued (encoder GPU work dominates). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |
+| 1c. Metal and CUDA packed kernels | no | Metal: fused kernels not pursued (encoder GPU work dominates; device scoring gave 2–4% and was reverted after a race). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |
 | 1d. Weight quantization (q8_0) | no | done (CPU and Metal); pays off on Metal; CPU kernel fixed (dequant+SGEMM, no triple-kept prepared copies) but not yet re-measured on ReleaseFast | Labels identical and probabilities within 2e-2 of dense on the fixture; on the released model, 36% less Metal memory at the same accuracy. CPU: re-measure throughput and footprint after the 2026-09-26 kernel fix |
 | 2a. Long-context teacher (Qwen3.8-27B) | labels only | not started | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
 | 2b. Two-stage choice for many options | same fine-tune | not started | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. Measured on Banking77 |
@@ -927,6 +925,16 @@ layers make their attention cost comparable to the decoder's. The decoder only
 pulls ahead well beyond 32k, where Laya's encoder was not pretrained anyway.
 
 Other open items:
+
+- **Metal race in device-side scoring:** gathering marker and anchor rows,
+  running the scorer and concatenating action features on the device
+  (reverted in 41b198338a) made `laya packed pipeline batches many small
+  states into fewer session calls` fail in 3 of 24 Metal runs with a
+  probability error up to 0.059, with no other GPU work. Host scoring passed
+  20 of 20. The failing sequence (row gather by host indices, linears,
+  readback, second gather, last-dimension concat with a host tensor) likely
+  exposes an ordering bug in one of those Metal primitives that other models
+  could hit too.
 
 - **Very many options:** candidate branches cannot compare options before the
   softmax (step 2b).
