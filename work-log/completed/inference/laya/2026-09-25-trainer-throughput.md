@@ -196,3 +196,57 @@ RLCD CE per 200 steps: 3.612, 3.996, 5.002, 4.37, 4.345, 4.34, 4.346, 4.337
 RLCD at a quarter of the learning rate 3.373, 3.124, 3.352, 2.617, 3.748,
 2.975 (grad norms 979-3,348); soft CE 3.851, 2.786, 2.392, 2.524, 2.126,
 2.291 (grad norms 93-291).
+
+## Long states: fused segment training attention (step 2c, 2026-09-25)
+
+Added a fused training-attention op, `fused_segment_training_attention_v1`
+(and its hand-written backward), next to the existing
+`fused_deberta_training_attention_v1`/`fused_boundary_training_attention_v1`
+in `ml/src/graph/node.zig`. It generalizes Laya's global, sliding-window
+local, and tree-packed layers under one contract: `ranges` (up to three
+ancestor-segment extents per query, `laya_tree` style) plus a graph-time
+`window`, instead of a materialized `[batch*heads, S, S]` additive bias.
+
+Kernel: `lib/linalg/src/attention.zig`
+(`segmentTrainingAttentionForwardHost`/`BackwardHost`), beside
+`segmentAttentionHost`. Forward tiles `BLOCK_Q`x`BLOCK_KV` with an online
+softmax and saves only per-query `(row_max, row_sum)`. Backward recomputes
+the forward (for `O` and the delta term) and makes one more tiled sweep that
+recomputes `P` per tile for `dQ`/`dK`/`dV` -- no `[tokens, tokens]` tensor in
+either sweep. Dropout is a seeded counter mix keyed by `(batch, head, query,
+key)`, replayed identically in both sweeps.
+
+Wired end to end: `node.zig` (attrs/opcodes) -> `builder.zig`
+(`segmentTrainingAttentionV1`) -> `autodiff.zig` (VJP emits the backward op
+and lets the existing `concat` VJP split the packed gradient into dQ/dK/dV)
+-> `ops/segment_training_attention.zig` (control decode, admission) ->
+`ops/native_compute.zig` (CPU dispatch) -> `graph/interpreter.zig`. CPU only:
+the `ComputeBackend` vtable slots are unset on Metal, so
+`finetune/laya/job.zig` only sets `use_fused_attention` when
+`backend == .cpu`; a Metal job keeps the original dense-bias graph and its
+`batch*L^2*heads <= 64M` bound unchanged. `finetune/laya/graph.zig` gained
+`buildWithAttention`/`fusedAttention`, and `training.zig`'s `inputs` now
+builds the one `segment_control` runtime tensor (from `Example.position`/
+`packed_row` via `laya_tree.ranges`) instead of the three dense bias tensors
+when fused attention is selected. `graph.validate` drops the quadratic
+admission bound in that case and checks `seq_len <= 8192` instead
+(ModernBERT's pretraining length, already `laya.max_len`'s ceiling).
+
+Tests added: `lib/linalg/src/attention.zig` (forward vs. dense masked
+softmax for global/local-window/tree-segment ranges; backward vs. finite
+differences, with and without dropout), `ops/segment_training_attention.zig`
+(admission, control decoding), `ml/src/graph/segment_training_attention_test.zig`
+(VJP wiring, mirroring `deberta_training_attention_test.zig`), and
+`finetune/laya/fused_attention_test.zig` (the real training graph, through
+`training.inputs` and the CPU backend, comparing the fused and dense builds'
+logits on an unpacked example and a synthetic tree-packed row with identical
+random weights). `finetune/laya/job.zig`'s admission tests gained a case
+showing the fused path admits a batch the dense bound rejects.
+
+Open: no Metal (or CUDA) kernel -- Metal training stays on the dense path,
+so it does not yet benefit from the 8k bound. The long-state smoke test
+(2k/4k/8k synthetic states, tens of fine-tune steps, step time and peak
+memory under the gpu lock) is specified in LAYA.md but blocked on this
+machine's shared build lock during this session (nine agents, one lock);
+see LAYA.md's Long states section for the recipe. A real long-state
+fine-tune on teacher-labelled data depends on step 2a (not this track).

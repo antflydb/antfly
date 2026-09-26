@@ -103,6 +103,9 @@ const Cache = struct {
     config: modern.Config,
     dropout: f32,
     freeze_layers: u32 = 0,
+    /// See `training.Program.initFrozenFused`: CPU-only today. Set from
+    /// `Config.backend == .cpu` so Metal jobs keep the dense-bias graph.
+    use_fused_attention: bool = false,
     frozen: []const training.Frozen = &.{},
     program: ?training.Program = null,
     last: architecture.Layout = .{ .batch = 0, .sequence = 0, .options = 0, .questions = 0 },
@@ -111,7 +114,7 @@ const Cache = struct {
         if (self.program == null or !std.meta.eql(l, self.last)) {
             if (self.program) |*p| p.deinit();
             self.program = null;
-            self.program = try training.Program.initFrozen(self.allocator, self.config, l, self.dropout, self.freeze_layers);
+            self.program = try training.Program.initFrozenFused(self.allocator, self.config, l, self.dropout, self.freeze_layers, self.use_fused_attention);
             self.last = l;
         }
         self.program.?.frozen = self.frozen;
@@ -261,7 +264,7 @@ fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.jso
 
 // A shuffled batch can combine the longest sequence with any other record.
 // Admit a conservative bound for the entire split before backend allocation.
-fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32) !void {
+fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32, use_fused_attention: bool) !void {
     var layout = architecture.Layout{ .batch = @intCast(@min(batch_size, examples.len)), .sequence = 0, .options = 0, .questions = 0 };
     var questions: u32 = 0;
     for (examples) |e| {
@@ -272,7 +275,7 @@ fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_s
         for (e.ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidLayaTrainingToken;
     }
     layout.questions = @min(questions * layout.batch, 512);
-    try architecture.validate(cfg, layout, dropout);
+    try architecture.validate(cfg, layout, dropout, use_fused_attention);
 }
 
 const Cursor = struct {
@@ -370,10 +373,14 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
         try data.disjoint(a, train, calib);
         try data.disjoint(a, eval, calib);
     }
-    try admitExamples(encoder, train.examples, c.batch_size, c.head_dropout);
-    try admitExamples(encoder, eval.examples, 1, c.head_dropout);
-    if (calibration) |calib| try admitExamples(encoder, calib.examples, 1, c.head_dropout);
-    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = c.freeze_layers };
+    // Flash-style segment attention (roadmap step 2c) has no device kernel
+    // yet; only the CPU backend uses it, which is also where it matters most
+    // (Metal's dense path already runs the fused resident kernels below ~2k).
+    const use_fused_attention = c.backend == .cpu;
+    try admitExamples(encoder, train.examples, c.batch_size, c.head_dropout, use_fused_attention);
+    try admitExamples(encoder, eval.examples, 1, c.head_dropout, use_fused_attention);
+    if (calibration) |calib| try admitExamples(encoder, calib.examples, 1, c.head_dropout, use_fused_attention);
+    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = c.freeze_layers, .use_fused_attention = use_fused_attention };
     defer cache.deinit();
     // Release the raw source snapshot before optimizer initialization/restore.
     // Only owned trainable values, frozen values, and export metadata survive.
@@ -560,12 +567,23 @@ test "laya admission checks late long sequences and token vocabulary before trai
     const short = training.Example{ .ids = ids[0..2], .markers = &.{ 0, 1 }, .kind = .noul, .target = &.{ 1, 0 } };
     var long = short;
     long.ids = &ids;
-    try admitExamples(cfg, &.{ short, short }, 2, 0);
-    try admitExamples(cfg, &.{long}, 1, 0);
-    try std.testing.expectError(error.LayaTrainingAttentionLimitExceeded, admitExamples(cfg, &.{ short, short, long }, 2, 0));
+    try admitExamples(cfg, &.{ short, short }, 2, 0, false);
+    try admitExamples(cfg, &.{long}, 1, 0, false);
+    try std.testing.expectError(error.LayaTrainingAttentionLimitExceeded, admitExamples(cfg, &.{ short, short, long }, 2, 0, false));
     var invalid = short;
     invalid.ids = &.{ 0, cfg.vocab_size };
-    try std.testing.expectError(error.InvalidLayaTrainingToken, admitExamples(cfg, &.{ short, invalid }, 1, 0));
+    try std.testing.expectError(error.InvalidLayaTrainingToken, admitExamples(cfg, &.{ short, invalid }, 1, 0, false));
+}
+
+test "laya admission drops the quadratic bound when fused segment attention is selected" {
+    const cfg = modern.Config{ .laya = .{ .max_len = 2048 }, .checkpoint_layout = .huggingface_fused_qkv_no_bias, .rope_interleaved = false };
+    const ids = [_]i64{0} ** 2048;
+    const short = training.Example{ .ids = ids[0..2], .markers = &.{ 0, 1 }, .kind = .noul, .target = &.{ 1, 0 } };
+    var long = short;
+    long.ids = &ids;
+    // Same three-row batch the dense path above rejects: fused admission is
+    // O(batch*heads*seq*visible_keys), not O(batch*heads*seq^2).
+    try admitExamples(cfg, &.{ short, short, long }, 2, 0, true);
 }
 
 test "laya training rejects malformed encoder metadata instead of defaulting" {

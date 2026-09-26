@@ -84,7 +84,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     var trainer = try train.controller.Trainer.init(a, cb, parameters, .{ .execution = execution, .limits = .{ .max_state_bytes = 16 * 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0.000025 } }, .{ .schedule = .{ .constant = 0.0001 } } } });
     defer trainer.deinit();
     var prng = std.Random.DefaultPrng.init(715);
-    const runtime = try train.inputs(scratch, cb, &program.graph, program.built, config, examples, prng.random(), false);
+    const runtime = try train.inputs(scratch, cb, &program.graph, program.built, config, examples, prng.random(), false, false);
     defer for (runtime) |input| cb.free(input.value);
     var binding = try trainer.bind(&program.graph, null);
     defer binding.deinit();

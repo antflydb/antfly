@@ -119,6 +119,8 @@ test {
     _ = @import("finetune/laya/objective.zig");
     _ = @import("finetune/laya/training_test.zig");
     _ = @import("finetune/laya/training_packed_test.zig");
+    _ = @import("finetune/laya/fused_attention_test.zig");
+    _ = @import("ops/segment_training_attention.zig");
     _ = @import("finetune/laya/data.zig");
     _ = @import("finetune/laya/job.zig");
     _ = @import("finetune/laya/evaluate.zig");

@@ -42,6 +42,7 @@ pub const elementwise_loss_math = @import("elementwise_loss_math.zig");
 pub const consistency_loss_math = @import("consistency_loss_math.zig");
 pub const listwise_loss_math = @import("listwise_loss_math.zig");
 pub const deberta_training_attention = @import("deberta_training_attention.zig");
+pub const segment_training_attention = @import("segment_training_attention.zig");
 
 pub const UnaryConsumeOp = enum {
     gelu,
@@ -2267,6 +2268,12 @@ pub const ComputeBackend = struct {
         /// must not fall back to the inference attention mask or host execution.
         debertaTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
         debertaTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, dO: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+        /// CPU only today (no device kernel): the encoder's global and
+        /// local-window layers and packed rows' tree segments all lower to
+        /// this. `null` means the training graph must fall back to the
+        /// dense-bias attention path (see `finetune/laya/graph.zig`).
+        segmentTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+        segmentTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
 
         /// Optional destructive softmax over the last dimension. When this
         /// returns a tensor, the backend may have reused `input`'s storage, so
@@ -4072,6 +4079,26 @@ pub const ComputeBackend = struct {
         try self.checkExecutionControl();
         const op = self.vtable.debertaTrainingAttentionBackwardV1 orelse return error.DebertaTrainingAttentionProfileUnavailable;
         const output = try op(self.ptr, qkv, relative, control_i32, dO, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn segmentTrainingAttentionV1(self: *const ComputeBackend, qkv: CT, control_i32: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.segmentTrainingAttentionV1 orelse return error.SegmentTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, control_i32, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn segmentTrainingAttentionBackwardV1(self: *const ComputeBackend, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.segmentTrainingAttentionBackwardV1 orelse return error.SegmentTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, control_i32, dO, attrs, self.execution_control);
         errdefer self.free(output);
         try self.checkExecutionControl();
         return output;

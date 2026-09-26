@@ -23,6 +23,11 @@ pub const Inputs = struct {
     local_bias: Id, // encoder_bias plus the logical sliding window
     head_bias: Id, // [B*head_heads,S,S], padding and tree visibility
     rope: [2][2]Id, // [global, local][cos, sin], each [N*heads, head_dim/2]
+    /// Physical i32 control for `fusedAttention` (replay limbs, logical
+    /// positions, `laya_tree`-style ranges); see
+    /// `SegmentTrainingAttentionAttrs`. Declared unconditionally like the
+    /// three bias inputs above; unused (and unfed) unless `use_fused_attention`.
+    segment_control: Id,
 };
 pub const Dropout = struct { node: Id, probability: f32 };
 pub const Built = struct {
@@ -93,6 +98,26 @@ fn attention(b: *B, built: *Built, q: Id, k: Id, v: Id, bias: Id, l: Layout, h: 
     return b.reshape(try b.transpose(shaped, &.{ 0, 2, 1, 3 }), Shape.init(.f32, &.{ l.batch * l.sequence, h * d }));
 }
 
+/// Flash-style attention (roadmap step 2c): `q`/`k`/`v` are already
+/// token-major `[batch*sequence, h*d]` (their natural shape straight out of
+/// `rope`/`sliceLastDim` -- no `heads()` transpose needed, unlike `attention`
+/// above), so no `[L, L]` bias or probability tensor is ever built. `window`
+/// and `dropout_probability` are graph-time attributes; visibility (global,
+/// local, or tree-packed) lives in `control` (`Inputs.segment_control`).
+fn fusedAttention(b: *B, control: Id, q: Id, k: Id, v: Id, l: Layout, h: u32, d: u32, window: u32, dropout_stream_id: u64, dropout_probability: f32) !Id {
+    const qkv = try b.concat(try b.concat(q, k, 0), v, 0);
+    const attrs = ml.SegmentTrainingAttentionAttrs{
+        .batch = l.batch,
+        .seq_len = l.sequence,
+        .num_heads = h,
+        .head_dim = d,
+        .window = window,
+        .dropout_probability = dropout_probability,
+        .dropout_stream_id = dropout_stream_id,
+    };
+    return b.segmentTrainingAttentionV1(qkv, control, attrs);
+}
+
 /// Split-half RoPE tables for `positions` (one logical position per token),
 /// laid out `[tokens * heads, d/2]` to match `rope`.
 pub fn ropeTables(a: std.mem.Allocator, positions: []const i64, h: u32, d: u32, theta: f32) ![2][]f32 {
@@ -123,7 +148,7 @@ fn rope(b: *B, x: Id, tables: [2]Id, l: Layout, h: u32, d: u32) !Id {
     return b.reshape(try b.concat(first, second, 1), Shape.init(.f32, &.{ l.batch * l.sequence, h * d }));
 }
 
-pub fn validate(cfg: modern.Config, l: Layout, head_dropout: f32) !void {
+pub fn validate(cfg: modern.Config, l: Layout, head_dropout: f32, use_fused_attention: bool) !void {
     const lc = cfg.laya orelse return error.InvalidLayaConfig;
     if (cfg.checkpoint_layout != .huggingface_fused_qkv_no_bias or cfg.rope_interleaved or
         cfg.hidden_size < 64 or cfg.hidden_size > 4096 or cfg.hidden_size % 64 != 0 or cfg.num_attention_heads == 0 or
@@ -136,13 +161,28 @@ pub fn validate(cfg: modern.Config, l: Layout, head_dropout: f32) !void {
         l.questions < l.batch or l.questions > 512 or (!lc.packing.enabled() and l.questions != l.batch) or
         l.options < 2 or l.options > lc.maxOptions() or !std.math.isFinite(head_dropout) or head_dropout < 0 or head_dropout >= 1)
         return error.InvalidLayaTrainingLayout;
-    // Bound the materialized reference attention before allocating constants.
-    if (@as(u64, l.batch) * l.sequence * l.sequence * @max(cfg.num_attention_heads, cfg.hidden_size / 64) > 64 * 1024 * 1024)
+    if (use_fused_attention) {
+        // Flash-style segment attention (roadmap step 2c) never materializes
+        // a `[L, L]` tensor; memory is O(batch*heads*seq*head_dim), so the
+        // only remaining bound is the config's own `max_len`/`max_packed_len`
+        // cap above (already checked) and ModernBERT's 8192 pretraining length.
+        if (l.sequence > 8192) return error.LayaTrainingAttentionLimitExceeded;
+    } else if (@as(u64, l.batch) * l.sequence * l.sequence * @max(cfg.num_attention_heads, cfg.hidden_size / 64) > 64 * 1024 * 1024) {
+        // Bound the materialized reference attention before allocating constants.
         return error.LayaTrainingAttentionLimitExceeded;
+    }
 }
 
 pub fn build(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32) !Built {
-    try validate(cfg, l, head_dropout);
+    return buildWithAttention(b, cfg, l, head_dropout, false);
+}
+
+/// `use_fused_attention` selects `fusedAttention` (CPU-only today; see
+/// `ops.ComputeBackend.segmentTrainingAttentionV1`) over the dense
+/// materialized-bias `attention` for every encoder and head-layer call,
+/// removing the `batch*L^2*heads` admission bound above 8k logical tokens.
+pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32, use_fused_attention: bool) !Built {
+    try validate(cfg, l, head_dropout, use_fused_attention);
     const lc = cfg.laya.?;
     const h = cfg.hidden_size;
     const n = l.batch * l.sequence;
@@ -157,6 +197,7 @@ pub fn build(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32) !Built {
         .encoder_bias = try b.parameter("__laya_encoder_bias", Shape.init(.f32, &.{ l.batch * nh, l.sequence, l.sequence })),
         .local_bias = try b.parameter("__laya_local_bias", Shape.init(.f32, &.{ l.batch * nh, l.sequence, l.sequence })),
         .head_bias = try b.parameter("__laya_head_bias", Shape.init(.f32, &.{ l.batch * hh, l.sequence, l.sequence })),
+        .segment_control = try b.parameter("__laya_segment_control", Shape.init(.i32, &.{6 + n + n * 6})),
         .rope = .{
             .{ try b.parameter("__laya_rope_global_cos", table), try b.parameter("__laya_rope_global_sin", table) },
             .{ try b.parameter("__laya_rope_local_cos", table), try b.parameter("__laya_rope_local_sin", table) },
@@ -178,7 +219,10 @@ pub fn build(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32) !Built {
         const q = try rope(b, try b.sliceLastDim(qkv, 0, h), tables, l, nh, h / nh);
         const k = try rope(b, try b.sliceLastDim(qkv, h, h * 2), tables, l, nh, h / nh);
         const v = try b.sliceLastDim(qkv, h * 2, h * 3);
-        const attn = try attention(b, &result, q, k, v, if (global) result.inputs.encoder_bias else result.inputs.local_bias, l, nh, h / nh, 0);
+        const attn = if (use_fused_attention)
+            try fusedAttention(b, result.inputs.segment_control, q, k, v, l, nh, h / nh, if (global) std.math.maxInt(u32) else cfg.local_attention_window / 2, @as(u64, layer), 0)
+        else
+            try attention(b, &result, q, k, v, if (global) result.inputs.encoder_bias else result.inputs.local_bias, l, nh, h / nh, 0);
         x = try b.add(x, try linear(b, attn, try std.fmt.bufPrint(&names, "{s}.attn.Wo", .{prefix}), n, h, h, false));
         const normed = try norm(b, x, try std.fmt.bufPrint(&names, "{s}.mlp_norm", .{prefix}), h, cfg.layer_norm_eps, false);
         const up = try linear(b, normed, try std.fmt.bufPrint(&names, "{s}.mlp.Wi", .{prefix}), n, h, cfg.intermediate_size * 2, false);
@@ -200,7 +244,10 @@ pub fn build(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32) !Built {
         const bias = try param(b, prefix, "self_attn.in_proj_bias", &.{h * 3});
         const qkv_fused = try b.linear(n1, w, bias, n, h, h * 3);
         const qkv = b.graph.node(qkv_fused).vjp_alternate;
-        const attn = try attention(b, &result, try b.sliceLastDim(qkv, 0, h), try b.sliceLastDim(qkv, h, h * 2), try b.sliceLastDim(qkv, h * 2, h * 3), result.inputs.head_bias, l, hh, 64, head_dropout);
+        const attn = if (use_fused_attention)
+            try fusedAttention(b, result.inputs.segment_control, try b.sliceLastDim(qkv, 0, h), try b.sliceLastDim(qkv, h, h * 2), try b.sliceLastDim(qkv, h * 2, h * 3), l, hh, 64, std.math.maxInt(u32), 1_000_000 + @as(u64, layer), head_dropout)
+        else
+            try attention(b, &result, try b.sliceLastDim(qkv, 0, h), try b.sliceLastDim(qkv, h, h * 2), try b.sliceLastDim(qkv, h * 2, h * 3), result.inputs.head_bias, l, hh, 64, head_dropout);
         const proj = try linear(b, attn, try std.fmt.bufPrint(&names, "{s}.self_attn.out_proj", .{prefix}), n, h, h, true);
         x = try b.add(x, try drop(b, &result, proj, head_dropout));
         const n2 = try norm(b, x, try std.fmt.bufPrint(&names, "{s}.norm2", .{prefix}), h, 1e-5, true);
