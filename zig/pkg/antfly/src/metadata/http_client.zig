@@ -1064,7 +1064,13 @@ pub const MetadataHttpClient = struct {
         var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
         defer response.deinit(self.alloc);
         if (response.status != 200) return switch (response.status) {
-            400 => error.InvalidCatalogName,
+            400 => if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
+                input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
+                std.mem.eql(u8, response.body, "InvalidGenerationPublication"))
+                error.InvalidGenerationPublication
+            else
+                error.InvalidCatalogName,
             404 => error.CatalogNotFound,
             409 => if (input == .policy_publication_status and std.mem.eql(u8, response.body, "RowPolicyCatalogChanged"))
                 error.RowPolicyCatalogChanged
@@ -1073,6 +1079,11 @@ pub const MetadataHttpClient = struct {
                 input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
                 std.mem.eql(u8, response.body, "GenerationPublicationNotFound"))
                 error.GenerationPublicationNotFound
+            else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
+                input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
+                std.mem.eql(u8, response.body, "GenerationPublicationChanged"))
+                error.GenerationPublicationChanged
             else
                 error.CatalogGenerationChanged,
             413 => error.CatalogCommandTooLarge,
@@ -4270,10 +4281,11 @@ test "system catalog FK decision preserves absent publication for initial-parent
     const alloc = std.testing.allocator;
     const Executor = struct {
         body: []const u8,
+        status: u16 = 409,
         fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
-            return .{ .status = 409, .body = try a.dupe(u8, self.body) };
+            return .{ .status = self.status, .body = try a.dupe(u8, self.body) };
         }
     };
     var executor = Executor{ .body = "GenerationPublicationNotFound" };
@@ -4289,9 +4301,17 @@ test "system catalog FK decision preserves absent publication for initial-parent
     } };
     try std.testing.expectError(error.GenerationPublicationNotFound, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
     executor.body = "GenerationPublicationChanged";
+    try std.testing.expectError(error.GenerationPublicationChanged, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
+    executor.body = "CatalogGenerationChanged";
     try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
+    executor.body = "GenerationPublicationChanged";
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
     executor.body = "GenerationPublicationNotFound";
     try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    executor.status = 400;
+    executor.body = "InvalidGenerationPublication";
+    try std.testing.expectError(error.InvalidGenerationPublication, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
+    try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
 }
 
 test "metadata mutation topology avoids diagnostics and owns parsed roles across compatibility fallback" {

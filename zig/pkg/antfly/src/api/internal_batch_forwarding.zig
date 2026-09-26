@@ -35,6 +35,10 @@ pub const forwards_remaining_header = "X-Antfly-Raft-Batch-Forwards-Remaining";
 pub const campaign_allowed_header = "X-Antfly-Raft-Batch-Campaign-Allowed";
 pub const outcome_header = "X-Antfly-Raft-Batch-Outcome";
 pub const outcome_not_proposed_v1 = "not-proposed-v1";
+/// Exact internal rejection: the destination was reachable, but validation,
+/// catalog, topology, or storage could not admit this write before proposal.
+/// This is not evidence that its Raft leader route is unreachable.
+pub const admission_unavailable_body = "routed raft batch admission unavailable";
 pub const outcome_unknown_v1 = "unknown-v1";
 pub const outcome_committed_visibility_pending_v1 = "committed-visibility-pending-v1";
 pub const outcome_committed_repair_required_v1 = "committed-repair-required-v1";

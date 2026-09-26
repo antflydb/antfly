@@ -390,6 +390,10 @@ const DataRaftBatchRoute = struct {
     required_local_term: ?u64 = null,
     allow_remote_forward: bool = true,
     discovery: DataRaftMutationDiscovery,
+    /// Local-only provenance. A forwarded target may follow an exact Raft
+    /// leader, but must not choose another blind placement and bounce the
+    /// write back to its sender. Other cache-only callers may still rotate.
+    received_forwarded_request: bool = false,
     campaign_allowed: bool = true,
     forwards_remaining: u8 = data_raft_batch_initial_forwards,
     cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation = null,
@@ -407,6 +411,7 @@ const DataRaftBatchRoute = struct {
 const DataRaftBatchForwardState = struct {
     allow_remote_forward: bool,
     discovery: DataRaftMutationDiscovery,
+    received_forwarded_request: bool = false,
     forwards_remaining: u8,
     local_status_missing: bool,
     local_status_is_voter: bool,
@@ -11247,6 +11252,7 @@ pub const DataServer = struct {
             .{
                 .admission_deadline_ns = received_at +| remaining,
                 .discovery = .cached,
+                .received_forwarded_request = true,
                 .campaign_allowed = forwarding.campaign_allowed,
                 .forwards_remaining = forwarding.forwards_remaining,
                 .cancellation = if (cancellation_token.ptr != null) &cancellation else null,
@@ -12275,6 +12281,7 @@ pub const DataServer = struct {
             if (shouldForwardRaftBatchToPlacementReplica(.{
                 .allow_remote_forward = route.allow_remote_forward,
                 .discovery = route.discovery,
+                .received_forwarded_request = route.received_forwarded_request,
                 .forwards_remaining = route.forwards_remaining,
                 .local_status_missing = local_status_missing,
                 .local_status_is_voter = local_status_is_voter,
@@ -12400,6 +12407,13 @@ pub const DataServer = struct {
                     }
                 }
             }
+
+            // A forwarded request has no per-origin visited set. If this node
+            // cannot route to its exact Raft-reported leader, reject before
+            // sending another blind placement hop. The origin retains its
+            // candidate cursor and can safely choose the next placement only
+            // after receiving this known not-proposed rejection.
+            if (route.received_forwarded_request) return error.LeaderUnavailable;
 
             const now_ns = self.dataRaftMonotonicNs();
             if (route.discovery.mayRefreshCatalog() and leader_node_id == null and now_ns -| last_metadata_sync_ns >= data_raft_metadata_resync_interval_ns) {
@@ -12625,6 +12639,7 @@ pub const DataServer = struct {
 
     fn shouldForwardRaftBatchToPlacementReplica(state: DataRaftBatchForwardState) bool {
         if (!state.allow_remote_forward or state.forwards_remaining == 0) return false;
+        if (state.received_forwarded_request) return false;
         if (state.leader_node_id != null and !state.known_leader_unreachable) return false;
         if (state.known_leader_unreachable) return true;
         // A status-missing caller is not a hosted replica and may use one
@@ -25512,7 +25527,7 @@ const RemoteMetadataSource = struct {
                 ));
                 const read = client.readSystemCatalog(self.base_uris[index], input, attempt_ms, &cancellation) catch |err| {
                     switch (err) {
-                        error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.GenerationPublicationNotFound, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
+                        error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.GenerationPublicationNotFound, error.GenerationPublicationChanged, error.InvalidGenerationPublication, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
                         else => {
                             if (!antfly.metadata.authority.isRetryableError(err) and
                                 !isRetryableControlPlaneTransportError(err) and err != error.RemoteUnavailable)
@@ -42678,6 +42693,11 @@ fn consumerTests() type {
             // a node that does not host the destination group.
             state.discovery = .cached;
             try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(state));
+            // Split replication is cache-only but originates locally; only a
+            // previously forwarded request is forbidden a second blind hop.
+            state.received_forwarded_request = true;
+            try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(state));
+            state.received_forwarded_request = false;
 
             state.discovery = .catalog;
             state.local_status_missing = false;
@@ -42703,7 +42723,16 @@ fn consumerTests() type {
             state.discovery = .cached;
             state.known_leader_unreachable = true;
             try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(state));
+            state.received_forwarded_request = true;
+            try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(state));
+            state.received_forwarded_request = false;
             state.known_leader_unreachable = false;
+
+            // Three placements: a forwarded node 102 cannot bounce blindly
+            // back to origin 101, while the origin retains its previous target
+            // and rotates from a safe rejection at 102 to leader 103.
+            try std.testing.expectEqual(@as(?u64, 102), DataServer.remoteRaftBatchPlacementNode(7001, 101, null, &intents, true, null));
+            try std.testing.expectEqual(@as(?u64, 103), DataServer.remoteRaftBatchPlacementNode(7001, 101, null, &intents, true, 102));
 
             try std.testing.expectEqual(
                 @as(u64, 125 * std.time.ns_per_ms),
@@ -43115,9 +43144,15 @@ fn implementationTests() type {
                     if (self.mode == .private_changed and head == 1) return error.MetadataSnapshotHeadMismatch;
                     return head;
                 }
-                fn freePublic(self: *@This(), _: *u64) void { self.freed_public += 1; }
-                fn freePrivate(self: *@This(), _: *?u64) void { self.freed_private += 1; }
-                fn invalidate(self: *@This()) void { self.invalidations += 1; }
+                fn freePublic(self: *@This(), _: *u64) void {
+                    self.freed_public += 1;
+                }
+                fn freePrivate(self: *@This(), _: *?u64) void {
+                    self.freed_private += 1;
+                }
+                fn invalidate(self: *@This()) void {
+                    self.invalidations += 1;
+                }
             };
             for ([_]Fake{ .{ .mode = .private_changed }, .{ .mode = .head_changed } }) |initial| {
                 var fake = initial;

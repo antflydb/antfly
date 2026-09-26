@@ -1335,6 +1335,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-internal-routed-batch-test", "Run exact private batch routing and rollback authority regressions").dependOn(&api_internal_routed_batch_tests.run(b).step);
+    const api_internal_batch_outcome_tests = @import("linked_tests.zig").add(b, .{
+        .name = "api-internal-batch-outcome-tests",
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{"api http client requires explicit not-proposed marker and tracks delivery phase"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-internal-batch-outcome-test", "Run forwarded batch outcome and admission classification regressions")
+        .dependOn(&api_internal_batch_outcome_tests.run(b).step);
+    const api_aborted_prepare_unavailability_tests = b.addTest(.{
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{"distributed txn coordinator aborts only participants that may have begun"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-aborted-prepare-unavailability-test", "Run durable-abort retryability classification regression")
+        .dependOn(&addFilteredTestRunArtifact(b, api_aborted_prepare_unavailability_tests).step);
     const api_derived_coverage_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_derived_coverage_test_root.zig"),
         .target = target,

@@ -3560,7 +3560,7 @@ pub const AntflyApiHandler = struct {
             },
             error.Unavailable => blk: {
                 try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
-                break :blk textResponse(ctx, 503, "routed raft batch unavailable");
+                break :blk textResponse(ctx, 503, internal_batch_forwarding.admission_unavailable_body);
             },
             error.NotFound => textResponse(ctx, 404, "not found"),
             error.Canceled, error.DeadlineExceeded => blk: {
@@ -4281,7 +4281,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(500);
                 return ctx.text("transaction outcome is unknown; do not retry this stateless request because it may already have committed; use a transaction session for retryable commits");
             },
-            error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
+            error.AbortDecisionNotDurable, error.TransactionBeginFailed, error.TransactionPrepareAbortedUnavailable => {
                 _ = ctx.status(503);
                 return ctx.text("transaction coordinator is temporarily unavailable");
             },
@@ -5127,7 +5127,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(503);
                 return ctx.text("transaction outcome is unknown; retry this transaction id");
             },
-            error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
+            error.AbortDecisionNotDurable, error.TransactionBeginFailed, error.TransactionPrepareAbortedUnavailable => {
                 _ = ctx.status(503);
                 return ctx.text("transaction coordinator is temporarily unavailable");
             },

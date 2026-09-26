@@ -822,6 +822,19 @@ are proved):
    post-cutover enforcement or removal, and no stale-generation attachment or
    reference visibility after restart before the public guard is removed.
 
+The three-voter self-FK leadership-transfer diagnostic has not cleared that
+gate: ADD advanced, but a subsequent DROP repeatedly stalled at parent
+`stage`. A forwarded write also exposed a placement bounce, now bounded by
+allowing a forwarded receiver to follow only an exact Raft leader; the origin
+owns blind placement retries. Internal admission responses distinguish a
+known pre-proposal 503 from an unknown write outcome, and a distributed
+prepare admission failure is exposed as retryable only after a durable abort.
+These changes have focused regressions, not a passing mounted DROP proof.
+The diagnostic requires a direct-leader 409 at the active fence and checks
+authoritative absence of distinct probe keys after publication. The public
+self-FK guard remains enabled while the parent-stage failure and replica
+failover matrix are unresolved.
+
 Initial MATCH PARTIAL support-index installation now reserves the parent
 descriptor, hidden child identity, locks, and durable work in one metadata
 transaction. The hosted path now seals parent support, places a private child

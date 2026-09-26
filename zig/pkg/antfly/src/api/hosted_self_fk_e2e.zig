@@ -631,6 +631,21 @@ fn drivePublicationWithLostReplies(
     base: []const u8,
     stop_after_ack: bool,
 ) !bool {
+    return drivePublicationWithLostRepliesDiagnostic(alloc, io, metadata, table_id, transport, headers, base, stop_after_ack, null, null);
+}
+
+fn drivePublicationWithLostRepliesDiagnostic(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    metadata: *metadata_runtime.Server,
+    table_id: u64,
+    transport: http.RequestExecutor,
+    headers: []const http.RequestHeader,
+    base: []const u8,
+    stop_after_ack: bool,
+    leader_base: ?[]const u8,
+    probe_unproven: ?*bool,
+) !bool {
     const server = metadata.server.owned_public_http_server orelse return error.PublicationSupervisorUnavailable;
     const driver = http_server.ApiHttpServer.FkGenerationPublicationTestDriver;
     driver.forgetVolatileCursor(server);
@@ -652,7 +667,40 @@ fn drivePublicationWithLostReplies(
             // The dual-role owner has durably fenced the old generation, but
             // metadata has not published the successor. A concurrent write
             // must not slip through either the child or parent role.
-            var fenced_write = try batchOnce(alloc, transport, headers, base, "{\"inserts\":{\"during-fence\":{\"id\":99}},\"sync_level\":\"full_text\"}");
+            if (leader_base) |leader| {
+                const started = platform.time.monotonicNs();
+                const leader_write = batchOnce(alloc, transport, headers, leader, "{\"inserts\":{\"during-fence-leader-probe\":{\"id\":98}},\"sync_level\":\"full_text\"}") catch |err| {
+                    std.debug.print("self-FK leader fenced probe elapsed_ms={d} err={s}\n", .{ (platform.time.monotonicNs() -| started) / std.time.ns_per_ms, @errorName(err) });
+                    if (probe_unproven) |unproven| unproven.* = true;
+                    fenced_write_checked = true;
+                    continue;
+                };
+                var response = leader_write;
+                defer response.deinit(alloc);
+                if (response.status != 409)
+                    std.debug.print("self-FK leader fenced probe elapsed_ms={d} status={d}\n", .{ (platform.time.monotonicNs() -| started) / std.time.ns_per_ms, response.status });
+                if (response.status == 503) {
+                    // A retryable refusal does not prove the fence. Do not
+                    // replay this possibly delivered key or probe another
+                    // writer; finish publication and prove absence first.
+                    if (probe_unproven) |unproven| unproven.* = true;
+                    fenced_write_checked = true;
+                    continue;
+                }
+                try std.testing.expectEqual(@as(u16, 409), response.status);
+            }
+            const started = platform.time.monotonicNs();
+            const follower_body = if (leader_base == null)
+                "{\"inserts\":{\"during-fence\":{\"id\":99}},\"sync_level\":\"full_text\"}"
+            else
+                "{\"inserts\":{\"during-fence-follower-probe\":{\"id\":97}},\"sync_level\":\"full_text\"}";
+            var fenced_write = batchOnce(alloc, transport, headers, base, follower_body) catch |err| {
+                if (leader_base == null) return err;
+                std.debug.print("self-FK follower fenced probe elapsed_ms={d} err={s}\n", .{ (platform.time.monotonicNs() -| started) / std.time.ns_per_ms, @errorName(err) });
+                if (probe_unproven) |unproven| unproven.* = true;
+                fenced_write_checked = true;
+                continue;
+            };
             defer fenced_write.deinit(alloc);
             // A transferred leader may have to reopen a fence-deferred owner.
             // 503 is retryable, not a proof that no proposal occurred. The
@@ -945,7 +993,15 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
     try std.testing.expectEqual(@as(u16, 202), drop.status);
     if (leader_transfer) {
         const child_group = try publicationChildGroup(alloc, &metadata, table_id);
-        const stopped_at_ack = drivePublicationWithLostReplies(alloc, io, &metadata, table_id, transport, &headers, base, true) catch |err| {
+        const leader_id = try awaitThreeVoters(io, &data, .{ peers[0].?, peers[1].? }, child_group);
+        const leader_server: *data_runtime.DataServer = if (leader_id == 9) &data else if (leader_id == 10) &peers[0].?.server else if (leader_id == 11) &peers[1].?.server else return error.OwnerLeaderUnknown;
+        const follower_server: *data_runtime.DataServer = if (leader_id != 9) &data else &peers[0].?.server;
+        const leader_base = try leader_server.baseUri(alloc);
+        defer alloc.free(leader_base);
+        const follower_base = try follower_server.baseUri(alloc);
+        defer alloc.free(follower_base);
+        var probe_unproven = false;
+        const stopped_at_ack = drivePublicationWithLostRepliesDiagnostic(alloc, io, &metadata, table_id, transport, &headers, follower_base, true, leader_base, &probe_unproven) catch |err| {
             const physical = tableGroup(alloc, &metadata, table_id) catch return err;
             defer alloc.free(physical.name);
             printDropParentFailureState(alloc, &metadata, &data, .{ peers[0].?, peers[1].? }, physical.name, child_group);
@@ -957,6 +1013,20 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
         try transferOwnerLeadership(io, &data, .{ peers[0].?, peers[1].? }, child_group);
         try std.testing.expectEqualDeep(acknowledged, try publicationPosition(alloc, &metadata, table_id));
         try std.testing.expect(try drivePublicationWithLostReplies(alloc, io, &metadata, table_id, transport, &headers, base, false));
+        const physical = try tableGroup(alloc, &metadata, table_id);
+        defer alloc.free(physical.name);
+        const api = metadata.server.owned_public_http_server orelse return error.PublicationSupervisorUnavailable;
+        const reads = api.table_reads orelse return error.OwnerReadNotReady;
+        for ([_][]const u8{ "during-fence-leader-probe", "during-fence-follower-probe" }) |key| {
+            var visible = try reads.lookup(alloc, physical.name, key, .{
+                .execution_deadline_ns = platform.time.monotonicNs() +| 5 * std.time.ns_per_s,
+            }, .read_index);
+            if (visible) |*response| {
+                response.deinit(alloc);
+                return error.FencedWriteCommitted;
+            }
+        }
+        if (probe_unproven) return error.FencedWriteProbeUnproven;
     } else if (lost_replies) try std.testing.expect(try drivePublicationWithLostReplies(alloc, io, &metadata, table_id, transport, &headers, base, false)) else try awaitPublication(alloc, io, &metadata, table_id);
     if (paused_data_fk_server) |server| {
         http_server.ApiHttpServer.FkGenerationPublicationTestDriver.resumeBackground(server);

@@ -2658,6 +2658,8 @@ pub const ApiHttpClient = struct {
                 if (forwarding == null or (outcome != null and
                     std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)))
                 {
+                    if (forwarding != null and std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), internal_batch_forwarding.admission_unavailable_body))
+                        return error.StorageReadTemporarilyUnavailable;
                     return error.LeaderUnavailable;
                 }
                 return error.RaftBatchWriteOutcomeUnknown;
@@ -5280,6 +5282,8 @@ fn consumerTests() type {
                 const Mode = enum {
                     unmarked_unavailable,
                     marked_not_proposed,
+                    marked_owner_unavailable,
+                    unmarked_owner_unavailable,
                     unmarked_timeout,
                     marked_timeout,
                     failure_before_send,
@@ -5314,6 +5318,16 @@ fn consumerTests() type {
                                 .value = internal_batch_forwarding.outcome_not_proposed_v1,
                             }},
                         ),
+                        .marked_owner_unavailable => try http_route_helpers.textResponseWithHeaders(
+                            alloc,
+                            503,
+                            internal_batch_forwarding.admission_unavailable_body,
+                            &.{.{
+                                .name = internal_batch_forwarding.outcome_header,
+                                .value = internal_batch_forwarding.outcome_not_proposed_v1,
+                            }},
+                        ),
+                        .unmarked_owner_unavailable => try http_route_helpers.textResponse(alloc, 503, internal_batch_forwarding.admission_unavailable_body),
                         .unmarked_timeout => try http_route_helpers.textResponse(alloc, 504, "request deadline exceeded"),
                         .marked_timeout => try http_route_helpers.textResponseWithHeaders(
                             alloc,
@@ -5368,6 +5382,12 @@ fn consumerTests() type {
 
             executor.mode = .marked_not_proposed;
             try std.testing.expectError(error.LeaderUnavailable, OutcomeExecutor.fetch(&client));
+
+            executor.mode = .marked_owner_unavailable;
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, OutcomeExecutor.fetch(&client));
+
+            executor.mode = .unmarked_owner_unavailable;
+            try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
 
             executor.mode = .unmarked_timeout;
             try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));

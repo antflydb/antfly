@@ -13285,6 +13285,7 @@ pub const ApiHttpServer = struct {
             error.EnrichmentWorkerFailed => return error.CommittedRepairRequired,
             error.AbortDecisionNotDurable,
             error.TransactionBeginFailed,
+            error.TransactionPrepareAbortedUnavailable,
             error.PortableImportPublicationInProgress,
             error.PortableImportRecoveryRequired,
             error.PortableRuntimeActivationPending,
