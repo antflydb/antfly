@@ -9326,6 +9326,22 @@ const prepared_q3_k_panel_values_bytes = 256 * prepared_q3_k_panel_nr;
 const prepared_q3_k_panel_block_bytes = prepared_q3_k_panel_values_offset + prepared_q3_k_panel_values_bytes;
 
 pub fn prepareNativeQuantizedStorage(storage: *QuantizedStorage) !void {
+    // Preparation only adds missing immutable layouts. Stage those additions
+    // until every allocation succeeds: an existing gather may still borrow
+    // the raw storage, and cache accounting must not miss a partial result.
+    var staged = storage.*;
+    errdefer for (staged.prepared.entries, storage.prepared.entries) |current, previous| {
+        if (previous) |existing| {
+            std.debug.assert(current != null and current.?.bytes.ptr == existing.bytes.ptr);
+        } else if (current) |added| {
+            storage.allocator.free(added.bytes);
+        }
+    };
+    try prepareNativeQuantizedStorageInPlace(&staged);
+    storage.prepared = staged.prepared;
+}
+
+fn prepareNativeQuantizedStorageInPlace(storage: *QuantizedStorage) !void {
     const known = switch (storage.tensor_type) {
         .known => |value| value,
         else => return,
@@ -47232,6 +47248,64 @@ test "native Qwen3 quantized-only weight handle preserves shape and lookup witho
     for ([_]usize{ 1, 0 }, 0..) |source_row, output_row| {
         try quant_codec.dequantizeRow(.{ .known = .Q8_0 }, raw, 32, source_row, &expected);
         try std.testing.expectEqualSlices(f32, &expected, getData(result)[output_row * 32 ..][0..32]);
+    }
+}
+
+test "native gather matrix preparation failure preserves cache accounting and existing layouts" {
+    const allocator = std.testing.allocator;
+    const dense = [_]f32{1} ** 128;
+    const raw = try quant_codec.quantizeQ8_0FromF32(allocator, &dense);
+    defer allocator.free(raw);
+    const shape = [_]i64{ 4, 32 };
+    const initial_shape = [_]i64{ 2, 64 };
+    var expected_row: [32]f32 = undefined;
+    try quant_codec.dequantizeRow(.{ .known = .Q8_0 }, raw, 32, 0, &expected_row);
+    for ([_]bool{ false, true }) |existing_rows| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{});
+        var storage = QuantizedStorage{
+            .tensor_type = .{ .known = .Q8_0 },
+            .raw_bytes = raw,
+            .shape = &initial_shape,
+            .raw_owned = false,
+            .allocator = failing.allocator(),
+        };
+        defer storage.prepared.deinit(failing.allocator());
+        // Two rows produce row blocks but no four-row panel. Preserve those
+        // already published blocks when a later panel allocation fails.
+        if (existing_rows) try prepareNativeQuantizedStorage(&storage);
+        storage.shape = &shape;
+        const original_rows = storage.preparedBytes(.row_major_blocks);
+        const original_bytes = quantizedStorageBudgetBytes(&storage);
+        var store = WeightStore{
+            .allocator = allocator,
+            .resident_weights = .{},
+            .lazy_weights = .{},
+            .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 4096 }),
+        };
+        defer deinitPrefetchQueue(&store);
+        try store.tier_cache.?.reserve(.host, original_bytes);
+        var compute = NativeCompute.init(allocator, &store, null);
+        defer compute.deinit();
+        var tracked_bytes = original_bytes;
+        failing.fail_index = failing.alloc_index + @as(usize, if (existing_rows) 0 else 1);
+        try std.testing.expectError(error.OutOfMemory, ensurePreparedKBlock(&compute, &storage, &tracked_bytes));
+        try std.testing.expectEqual(original_bytes, quantizedStorageBudgetBytes(&storage));
+        try std.testing.expectEqual(original_bytes, tracked_bytes);
+        try std.testing.expectEqual(original_bytes, store.tier_cache.?.host_bytes);
+        try std.testing.expect(storage.preparedBytes(.panel4) == null);
+        if (original_rows) |rows| {
+            try std.testing.expectEqual(rows.ptr, storage.preparedBytes(.row_major_blocks).?.ptr);
+        } else {
+            try std.testing.expect(storage.preparedBytes(.row_major_blocks) == null);
+        }
+        failing.fail_index = std.math.maxInt(usize);
+        try ensurePreparedKBlock(&compute, &storage, &tracked_bytes);
+        try std.testing.expect(storage.preparedBytes(.panel4) != null);
+        try std.testing.expectEqual(quantizedStorageBudgetBytes(&storage), tracked_bytes);
+        try std.testing.expectEqual(tracked_bytes, store.tier_cache.?.host_bytes);
+        var row: [32]f32 = undefined;
+        try quant_codec.dequantizeRow(storage.tensor_type, storage.raw_bytes, 32, 0, &row);
+        try std.testing.expectEqualSlices(f32, &expected_row, &row);
     }
 }
 
