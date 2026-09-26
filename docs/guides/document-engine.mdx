@@ -94,11 +94,13 @@ Use `text` for analyzed search and an exact scalar mapping for exact filters and
 
 The compact `x-antfly-types` shorthand still works for simple and multi-field search mappings, but it never enables exact sort on its own. Sort needs the detailed `x-antfly-field` form with `sortable: true`, so that doc-value storage and build cost land only on the scalar fields that asked for them. A mapping change rebuilds physical coverage. Once the write or rebuild visibility barrier completes, clients can issue `order_by` directly: Antfly validates a cold field on first use and fails closed if physical coverage is incomplete. Status reads never warm columns, so a safe but not-yet-validated field can remain `declared` until that first sort.
 
+Identifier-heavy fields such as SKUs, file paths, hostnames, and code symbols often need "contains" matching rather than word matching. Add `substring` to the shorthand (`"x-antfly-types": ["text", "substring"]`) or use `"type": "substring"` in a dynamic template to get a `fieldName._substring` companion that indexes every suffix of each token and of each adjacent token pair. A `match` or `prefix` query on that companion then finds `RAG3-WEAVER` for `g3we` without scanning the term dictionary, and it matches across separators, so `rag3_weaver` and `rag3weaver` are found too. The companion costs several times the size of its text, so opt in only where infix matching earns it.
+
 Explicit mappings are exact, table-wide physical declarations. Present values must be encodable by the mapping (a `date` mapping accepts an RFC 3339 date string or a non-negative nanosecond timestamp), and invalid writes are rejected before indexing. An `allOf` may contribute an exact mapping. Every alternative of an `anyOf` or `oneOf` must contribute the same normalized mapping; conditional or dynamically named mappings are rejected because they cannot guarantee one stable physical type for the dotted path.
 
 Field capabilities report what the planner can safely do with a concrete field:
 
-- `query_modes` lists modes such as `full_text`, `exact`, `range`, `geo`, and `autocomplete`.
+- `query_modes` lists modes such as `full_text`, `exact`, `range`, `geo`, `autocomplete`, and `substring`.
 - `sortable` says the field is declared sortable.
 - `sort_lifecycle_state` reports cached physical evidence. `queryable` and `accelerated` are already validated; `declared` or `indexed` can be validated by the first exact-sort request; `unsupported` is not sortable.
 - `index_sort_position` and `index_sort_order` identify fields in the table's physical index sort.

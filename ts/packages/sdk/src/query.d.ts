@@ -26,6 +26,14 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /**
+         * @description Analyze the text with the field's analyzer and match any of the
+         *     resulting terms. On a `substring` companion field (`fieldName._substring`)
+         *     the text is lowercased and matched as a contained substring instead:
+         *     `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
+         *     Substring lookups require at least two bytes and reject a token or
+         *     adjacent token pair longer than 32 bytes.
+         */
         MatchQuery: {
             match: string;
             field?: string;
@@ -42,6 +50,13 @@ export interface components {
         MultiMatchQuery: {
             multi_match: components["schemas"]["MultiMatchBody"];
         };
+        /**
+         * @description Match a phrase using the field's analyzer. On a `substring` companion,
+         *     one or two words match contained text across token separators. Three
+         *     or more words are rejected because the suffix index cannot verify
+         *     their word boundaries; lookups over 32 bytes are also rejected.
+         *     Nonzero or automatic fuzziness is rejected on substring fields; use a standalone fuzzy query instead.
+         */
         MatchPhraseQuery: {
             match_phrase: string;
             field?: string;
@@ -69,6 +84,11 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /**
+         * @description Match terms that start with the given bytes. On a `substring`
+         *     companion field the prefix is lowercased and matched as a contained
+         *     substring, exactly like `match` on that field.
+         */
         PrefixQuery: {
             prefix: string;
             field?: string;
