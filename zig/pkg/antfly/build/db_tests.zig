@@ -270,6 +270,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.enrichment_runtime.test.enrichment runtime graph materializer rejects non-finite mapped weights",
         "storage.db.enrichment.enrichment_runtime.test.enrichment worker chunk cache keys preserve embedded separators",
         "storage.db.enrichment.enrichment_runtime.test.enrichment worker retry delay is exponential and capped",
+        "enrichment inline backoff wakes for teardown before and during wait admission",
         "storage.db.enrichment.enrichment_runtime.test.foreground enrichment catch-up guard has a monotonic deadline",
         "storage.db.enrichment.enrichment_runtime.test.foreground enrichment catch-up treats cancellation as a waiter outcome",
         "storage.db.enrichment.enrichment_runtime.test.isolated enrichment request does not advance when durable parking fails",
