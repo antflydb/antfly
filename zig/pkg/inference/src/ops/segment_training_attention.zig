@@ -148,7 +148,7 @@ pub fn forward(a: Allocator, attrs: Attrs, qkv: []const f32, control: []align(1)
     const q = qkv[0 .. batch_tokens * hidden];
     const k = qkv[batch_tokens * hidden .. 2 * batch_tokens * hidden];
     const v = qkv[2 * batch_tokens * hidden .. 3 * batch_tokens * hidden];
-    var result = try linalg.segmentTrainingAttentionForwardHost(
+    const result = try linalg.segmentTrainingAttentionForwardHost(
         a,
         q,
         k,

@@ -46,12 +46,12 @@ test "laya training forward objective and every parameter gradient match PyTorch
     try exerciseGradientParity(std.testing.allocator, false);
 }
 
-/// Same reference fixture, but through the flash-style fused segment
-/// attention graph (roadmap step 2c) instead of the dense materialized-bias
-/// one. The reference gradients were computed against upstream's dense
-/// attention; this checks the fused op does not move the relative L2 error
-/// materially away from the dense path's (LAYA.md, "Verification":
-/// 0.4-0.6% worst per-layer relative L2 on the released-model fixture).
+// Same reference fixture, but through the flash-style fused segment
+// attention graph (roadmap step 2c) instead of the dense materialized-bias
+// one. The reference gradients were computed against upstream's dense
+// attention; this checks the fused op does not move the relative L2 error
+// materially away from the dense path's (LAYA.md, "Verification":
+// 0.4-0.6% worst per-layer relative L2 on the released-model fixture).
 test "laya training forward objective and every parameter gradient match PyTorch (fused segment attention)" {
     try exerciseGradientParity(std.testing.allocator, true);
 }

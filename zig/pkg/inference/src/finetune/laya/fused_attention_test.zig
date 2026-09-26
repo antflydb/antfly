@@ -56,7 +56,10 @@ const MetalFixture = struct {
 
 fn smallConfig() modern.Config {
     return .{
-        .laya = .{ .head_layers = 1, .max_len = 64 },
+        // `packing` enabled so the tree-packed-row test's `l.questions` (one
+        // per question, not one per row) passes `graph.validate`; the
+        // unpacked test's single-question examples are unaffected.
+        .laya = .{ .head_layers = 1, .max_len = 64, .packing = .{ .mode = .question, .max_packed_len = 64 } },
         .vocab_size = 16,
         .hidden_size = 64,
         .num_hidden_layers = 2,
@@ -84,7 +87,7 @@ fn bindRandomWeights(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph:
         for (values) |*v| v.* = random.floatNorm(f32) * 0.2;
         var dims: [8]i32 = undefined;
         for (shape.dims[0..shape.rank()], 0..) |dim, i| dims[i] = @intCast(dim);
-        const value = try cb.fromFloat32Shape(values, dims[0..shape.rank()]) orelse return error.UnsupportedLayaTrainingBackend;
+        const value = try cb.fromFloat32Shape(values, dims[0..shape.rank()]);
         errdefer cb.free(value);
         try result.append(a, .{ .node_id = id, .value = value });
     }
@@ -96,9 +99,17 @@ fn runLogits(a: std.mem.Allocator, cb: *const ops.ComputeBackend, cfg: modern.Co
     var program = try train.Program.initFrozenFused(a, cfg, l, 0, 0, use_fused_attention);
     defer program.deinit();
     const weights = try bindRandomWeights(a, cb, &program.graph, weight_seed);
+    defer a.free(weights);
     defer for (weights) |input| cb.free(input.value);
     var prng = std.Random.DefaultPrng.init(0);
-    const runtime = try train.inputs(a, cb, &program.graph, program.built, cfg, examples, prng.random(), false, use_fused_attention);
+    // `inputs` is written for a scratch/arena allocator (its real callers,
+    // `training.step`/`predict`, pass one): it hands its host scratch arrays
+    // (ids, kinds, markers, positions, bias/control tensors) to the backend
+    // and does not free them itself. `std.testing.allocator` would flag that
+    // as a leak, so give it its own arena here instead of `a`.
+    var input_arena = std.heap.ArenaAllocator.init(a);
+    defer input_arena.deinit();
+    const runtime = try train.inputs(input_arena.allocator(), cb, &program.graph, program.built, cfg, examples, prng.random(), false, use_fused_attention);
     defer for (runtime) |input| cb.free(input.value);
     const combined = try std.mem.concat(a, interpreter.RuntimeInput, &.{ weights, runtime });
     defer a.free(combined);
@@ -137,16 +148,18 @@ test "fused segment attention matches the dense graph on a tree-packed row" {
     const cb = compute.computeBackend();
 
     const cfg = smallConfig();
-    // Trunk [0,3) plus two question branches, positions restart per branch,
-    // matching `laya_tree`'s layout (LAYA.md, "Layout").
+    // Trunk [0,3) plus two question branches (anchor + two options each),
+    // positions restart per branch, matching `laya_tree`'s layout (LAYA.md,
+    // "Layout"). Every question needs at least two valid option markers
+    // (`laya_tree.validate`), so each branch is anchor+opt1+opt2.
     const row = tree.Row{
-        .ids = &.{ 10, 11, 12, 13, 14, 15, 16 },
-        .positions = &.{ 0, 1, 2, 3, 4, 3, 4 },
-        .segments = &.{ 0, 0, 0, 1, 1, 2, 2 },
+        .ids = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9 }, // < vocab_size (16)
+        .positions = &.{ 0, 1, 2, 3, 4, 5, 3, 4, 5 },
+        .segments = &.{ 0, 0, 0, 1, 1, 1, 2, 2, 2 },
         .parents = &.{ -1, 0, 0 },
-        .kinds = &.{ tree.trunk_kind, tree.trunk_kind, tree.trunk_kind, 0, 0, 0, 0 },
-        .anchors = &.{ 3, 5 },
-        .markers = &.{ 4, -1, 6, -1 },
+        .kinds = &.{ tree.trunk_kind, tree.trunk_kind, tree.trunk_kind, 0, 0, 0, 0, 0, 0 },
+        .anchors = &.{ 3, 6 },
+        .markers = &.{ 4, 5, 7, 8 },
         .question_index = &.{ 0, 1 },
         .width = 2,
     };
