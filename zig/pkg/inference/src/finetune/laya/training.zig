@@ -66,18 +66,28 @@ pub fn floatValues(a: std.mem.Allocator, tensor: Tensor) ![]f32 {
     return values;
 }
 
-/// Whether `name` stays at its source value when the lowest `layers` encoder
-/// layers are frozen. Freezing any layer also freezes the token embeddings
-/// beneath it. Gradients stop at the first trainable layer.
-pub fn frozen(name: []const u8, layers: u32) bool {
-    if (layers == 0) return false;
-    if (std.mem.startsWith(u8, name, "encoder.embeddings.")) return true;
-    const prefix = "encoder.layers.";
-    if (!std.mem.startsWith(u8, name, prefix)) return false;
-    const rest = name[prefix.len..];
-    const end = std.mem.indexOfScalar(u8, rest, '.') orelse return false;
-    const index = std.fmt.parseInt(u32, rest[0..end], 10) catch return false;
-    return index < layers;
+/// Whether `name` stays at its source value: either the lowest `layers`
+/// encoder layers are frozen (which also freezes the token embeddings
+/// beneath them; gradients stop at the first trainable layer), or `lora`
+/// targets the linear `name` belongs to (its weight is adapted through A/B
+/// instead of being trained directly; see `architecture.isLoraFrozen`).
+/// A `.lora_A`/`.lora_B` adapter has no source value to freeze to, so
+/// `freeze_layers` never covers it: it stays trainable even under a frozen
+/// layer, which is an ordinary LoRA-on-a-frozen-base configuration.
+pub fn frozen(name: []const u8, layers: u32, lora: ?architecture.Lora) bool {
+    const adapter = std.mem.endsWith(u8, name, ".lora_A") or std.mem.endsWith(u8, name, ".lora_B");
+    if (layers > 0 and !adapter) {
+        if (std.mem.startsWith(u8, name, "encoder.embeddings.")) return true;
+        const prefix = "encoder.layers.";
+        if (std.mem.startsWith(u8, name, prefix)) blk: {
+            const rest = name[prefix.len..];
+            const end = std.mem.indexOfScalar(u8, rest, '.') orelse break :blk;
+            const index = std.fmt.parseInt(u32, rest[0..end], 10) catch break :blk;
+            if (index < layers) return true;
+        }
+    }
+    if (lora) |cfg| if (architecture.isLoraFrozen(name, cfg.targets)) return true;
+    return false;
 }
 
 /// A frozen parameter's value, owned by the caller for the whole run and
@@ -105,21 +115,51 @@ fn floatInput(cb: *const ops.ComputeBackend, values: []const f32, dims: []const 
     return cb.fromFloat32Shape(values, dims);
 }
 
+/// Kaiming-uniform initial values for a `.lora_A` parameter: bound
+/// `1/sqrt(in_dim)`, matching `nn.Linear`'s default initializer and
+/// `boundary_peft_graph.initializeModule`. Deterministic in `seed` and the
+/// parameter's own name, so distinct adapters never share a random stream.
+fn loraInitA(a: std.mem.Allocator, dims: []const i32, seed: u64, name: []const u8) ![]f32 {
+    if (dims.len != 2 or dims[0] <= 0 or dims[1] <= 0) return error.InvalidLayaTrainingWeightShape;
+    const in_dim: usize = @intCast(dims[1]);
+    const values = try a.alloc(f32, @as(usize, @intCast(dims[0])) * in_dim);
+    errdefer a.free(values);
+    var hasher = std.hash.Wyhash.init(seed);
+    hasher.update(name);
+    var random = std.Random.DefaultPrng.init(hasher.final());
+    const bound = 1 / @sqrt(@as(f32, @floatFromInt(in_dim)));
+    for (values) |*v| v.* = random.random().float(f32) * 2 * bound - bound;
+    return values;
+}
+
 /// All returned storage belongs to a caller-owned arena.
-/// Trainable parameters, excluding those frozen by `freeze_layers`.
-pub fn parameters(a: std.mem.Allocator, graph: *const ml.Graph, reader: *const tensors.MMapReader, freeze_layers: u32) ![]controller.Parameter {
+/// Trainable parameters, excluding those frozen by `freeze_layers` or `lora`.
+/// A LoRA `.lora_A`/`.lora_B` parameter has no source tensor: `A` gets a
+/// Kaiming-uniform draw and `B` is zero, so training starts identical to the
+/// unmodified base model (`graph.zig`'s `Lora` doc comment).
+pub fn parameters(a: std.mem.Allocator, graph: *const ml.Graph, reader: *const tensors.MMapReader, freeze_layers: u32, lora: ?architecture.Lora, seed: u64) ![]controller.Parameter {
     var out: std.ArrayListUnmanaged(controller.Parameter) = .empty;
     for (graph.parameters.items) |id| {
         const node = graph.node(id);
         const name = graph.parameterName(node);
-        if (std.mem.startsWith(u8, name, "__") or frozen(name, freeze_layers)) continue;
-        var tensor = try reader.readTensor(name);
-        defer tensor.deinit();
+        if (std.mem.startsWith(u8, name, "__") or frozen(name, freeze_layers, lora)) continue;
         const shape = node.output_shape;
-        if (!std.mem.eql(i64, tensor.shape, shape.dims[0..shape.rank()])) return error.InvalidLayaTrainingWeightShape;
-        const dims = try a.alloc(i32, tensor.shape.len);
-        for (dims, tensor.shape) |*dst, src| dst.* = @intCast(src);
-        try out.append(a, .{ .name = try a.dupe(u8, name), .values = try floatValues(a, tensor), .dimensions = dims, .group = if (std.mem.startsWith(u8, name, "encoder.")) 0 else 1 });
+        const dims = try a.alloc(i32, shape.rank());
+        for (dims, shape.dims[0..shape.rank()]) |*dst, dim| dst.* = @intCast(dim);
+        const values = if (std.mem.endsWith(u8, name, ".lora_A"))
+            try loraInitA(a, dims, seed, name)
+        else if (std.mem.endsWith(u8, name, ".lora_B")) blk: {
+            const count = shape.numElements() orelse return error.InvalidLayaTrainingWeightShape;
+            const zeros = try a.alloc(f32, @intCast(count));
+            @memset(zeros, 0);
+            break :blk zeros;
+        } else blk: {
+            var tensor = try reader.readTensor(name);
+            defer tensor.deinit();
+            if (!std.mem.eql(i64, tensor.shape, shape.dims[0..shape.rank()])) return error.InvalidLayaTrainingWeightShape;
+            break :blk try floatValues(a, tensor);
+        };
+        try out.append(a, .{ .name = try a.dupe(u8, name), .values = values, .dimensions = dims, .group = if (std.mem.startsWith(u8, name, "encoder.")) 0 else 1 });
     }
     return out.toOwnedSlice(a);
 }
@@ -259,16 +299,17 @@ pub const Program = struct {
     frozen: []const Frozen = &.{},
 
     pub fn init(a: std.mem.Allocator, cfg: modern.Config, l: architecture.Layout, dropout: f32) !Program {
-        return initFrozen(a, cfg, l, dropout, 0);
+        return initFrozen(a, cfg, l, dropout, 0, null);
     }
 
     /// Differentiates only the parameters above the lowest `freeze_layers`
-    /// encoder layers; bind the rest through `frozen`.
-    pub fn initFrozen(a: std.mem.Allocator, cfg: modern.Config, l: architecture.Layout, dropout: f32, freeze_layers: u32) !Program {
+    /// encoder layers and outside any `lora`-adapted linear; bind the rest
+    /// through `frozen`.
+    pub fn initFrozen(a: std.mem.Allocator, cfg: modern.Config, l: architecture.Layout, dropout: f32, freeze_layers: u32, lora: ?architecture.Lora) !Program {
         var graph = ml.Graph.init(a);
         errdefer graph.deinit();
         var builder = ml.Builder.init(&graph);
-        var built = try architecture.build(&builder, cfg, l, dropout);
+        var built = try architecture.build(&builder, cfg, l, dropout, lora);
         errdefer built.deinit(a);
         try graph.markOutput(built.logits);
         const seed = try builder.parameter("__laya_cotangent", graph.node(built.logits).output_shape);
@@ -276,7 +317,7 @@ pub const Program = struct {
         defer ids.deinit(a);
         for (graph.parameters.items) |id| {
             const name = graph.parameterName(graph.node(id));
-            if (!std.mem.startsWith(u8, name, "__") and !frozen(name, freeze_layers)) try ids.append(a, id);
+            if (!std.mem.startsWith(u8, name, "__") and !frozen(name, freeze_layers, lora)) try ids.append(a, id);
         }
         const wrt = try ids.toOwnedSlice(a);
         errdefer a.free(wrt);

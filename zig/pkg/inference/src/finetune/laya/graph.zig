@@ -14,6 +14,61 @@ const Shape = ml.Shape;
 /// `questions` counts decision rows: one per unpacked sequence, or every
 /// question of every tree-packed row (pipelines/laya_tree.zig).
 pub const Layout = struct { batch: u32, sequence: u32, options: u32, questions: u32 };
+
+/// Which groups of linears get a low-rank adapter. `encoder` covers each
+/// layer's `attn.Wqkv`, `attn.Wo`, `mlp.Wi`, `mlp.Wo`. `head` covers the
+/// decision head's `self_attn.in_proj`, `self_attn.out_proj`, `linear1`,
+/// `linear2`. The scorer, action head, type embedding, and every norm are
+/// never adapted; they train fully whenever they are not otherwise frozen.
+pub const Targets = struct { encoder: bool = false, head: bool = false };
+/// LoRA settings for the training graph. `rank`/`alpha` follow the usual
+/// convention: the adapter contributes `(alpha/rank) * (x @ A^T) @ B^T`, with
+/// `A` Kaiming-uniform (bound `1/sqrt(in_dim)`, matching `nn.Linear`'s default
+/// and `boundary_peft_graph.initializeModule`) and `B` zero, so training
+/// starts identical to the base model.
+pub const Lora = struct { rank: u32, alpha: f32 = 32, dropout: f32 = 0, targets: Targets };
+
+fn forEncoder(lora: ?Lora) ?Lora {
+    const l = lora orelse return null;
+    return if (l.targets.encoder) l else null;
+}
+fn forHead(lora: ?Lora) ?Lora {
+    const l = lora orelse return null;
+    return if (l.targets.head) l else null;
+}
+const encoder_lora_weight_suffixes = [_][]const u8{ ".attn.Wqkv.weight", ".attn.Wo.weight", ".mlp.Wi.weight", ".mlp.Wo.weight" };
+const head_lora_weight_suffixes = [_][]const u8{ ".self_attn.in_proj_weight", ".self_attn.out_proj.weight", ".linear1.weight", ".linear2.weight" };
+const head_lora_bias_suffixes = [_][]const u8{ ".self_attn.in_proj_bias", ".self_attn.out_proj.bias", ".linear1.bias", ".linear2.bias" };
+
+/// Whether `name` is the base weight of a linear LoRA adapts: frozen, and
+/// merged with `scale * B @ A` at export.
+pub fn isLoraWeight(name: []const u8, targets: Targets) bool {
+    if (targets.encoder and std.mem.startsWith(u8, name, "encoder.layers."))
+        for (encoder_lora_weight_suffixes) |suffix| {
+            if (std.mem.endsWith(u8, name, suffix)) return true;
+        };
+    if (targets.head and std.mem.startsWith(u8, name, "head.layers."))
+        for (head_lora_weight_suffixes) |suffix| {
+            if (std.mem.endsWith(u8, name, suffix)) return true;
+        };
+    return false;
+}
+/// Whether `name` is frozen because LoRA targets its linear: its weight
+/// (adapted through A/B) or its bias (left exactly at the source value).
+pub fn isLoraFrozen(name: []const u8, targets: Targets) bool {
+    if (isLoraWeight(name, targets)) return true;
+    if (targets.head and std.mem.startsWith(u8, name, "head.layers."))
+        for (head_lora_bias_suffixes) |suffix| {
+            if (std.mem.endsWith(u8, name, suffix)) return true;
+        };
+    return false;
+}
+/// The shared prefix under which `<prefix>.lora_A`/`<prefix>.lora_B` are
+/// bound for the base weight `name` (`isLoraWeight(name, ...)` must hold).
+pub fn loraPrefix(name: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, name, ".weight")) return name[0 .. name.len - ".weight".len];
+    return name[0 .. name.len - "_weight".len];
+}
 pub const Inputs = struct {
     ids: Id,
     kinds: Id, // per token; trunk tokens use any valid index with type_mask 0
@@ -46,13 +101,26 @@ fn param(b: *B, prefix: []const u8, suffix: []const u8, dims: []const i64) !Id {
     var name: [256]u8 = undefined;
     return b.parameter(try std.fmt.bufPrint(&name, "{s}.{s}", .{ prefix, suffix }), Shape.init(.f32, dims));
 }
-fn linear(b: *B, x: Id, prefix: []const u8, rows: u32, input: u32, output: u32, bias: bool) !Id {
+fn linear(b: *B, built: *Built, x: Id, prefix: []const u8, rows: u32, input: u32, output: u32, bias: bool, lora: ?Lora) !Id {
     const w = try param(b, prefix, "weight", &.{ output, input });
     const fused = if (bias) try b.linear(x, w, try param(b, prefix, "bias", &.{output}), rows, input, output) else try b.linearNoBias(x, w, rows, input, output);
     // Execute the same arithmetic in the forward and backward replay. Generic
     // inference slots cache weight snapshots and are unsuitable for mutable
     // training parameters (including device-only normalization tensors).
-    return b.graph.node(fused).vjp_alternate;
+    var result = b.graph.node(fused).vjp_alternate;
+    if (lora) |cfg| result = try b.add(result, try loraDelta(b, built, x, prefix, cfg, rows, input, output));
+    return result;
+}
+/// `scale * (x @ A^T) @ B^T`, with `A`/`B` bound at `<lora_prefix>.lora_A`/
+/// `.lora_B`. `x` is the same (undropped) input the base linear reads;
+/// dropout, when configured, applies only to this branch.
+fn loraDelta(b: *B, built: *Built, x: Id, lora_prefix: []const u8, cfg: Lora, rows: u32, input: u32, output: u32) !Id {
+    const a_w = try param(b, lora_prefix, "lora_A", &.{ cfg.rank, input });
+    const b_w = try param(b, lora_prefix, "lora_B", &.{ output, cfg.rank });
+    const xd = try drop(b, built, x, cfg.dropout);
+    const down = b.graph.node(try b.linearNoBias(xd, a_w, rows, input, cfg.rank)).vjp_alternate;
+    const up = b.graph.node(try b.linearNoBias(down, b_w, rows, cfg.rank, output)).vjp_alternate;
+    return b.mul(up, try b.scalarConst(.f32, cfg.alpha / @as(f32, @floatFromInt(cfg.rank))));
 }
 fn norm(b: *B, x: Id, prefix: []const u8, dim: u32, eps: f32, bias: bool) !Id {
     const w = try param(b, prefix, "weight", &.{dim});
@@ -123,7 +191,7 @@ fn rope(b: *B, x: Id, tables: [2]Id, l: Layout, h: u32, d: u32) !Id {
     return b.reshape(try b.concat(first, second, 1), Shape.init(.f32, &.{ l.batch * l.sequence, h * d }));
 }
 
-pub fn validate(cfg: modern.Config, l: Layout, head_dropout: f32) !void {
+pub fn validate(cfg: modern.Config, l: Layout, head_dropout: f32, lora: ?Lora) !void {
     const lc = cfg.laya orelse return error.InvalidLayaConfig;
     if (cfg.checkpoint_layout != .huggingface_fused_qkv_no_bias or cfg.rope_interleaved or
         cfg.hidden_size < 64 or cfg.hidden_size > 4096 or cfg.hidden_size % 64 != 0 or cfg.num_attention_heads == 0 or
@@ -136,14 +204,21 @@ pub fn validate(cfg: modern.Config, l: Layout, head_dropout: f32) !void {
         l.questions < l.batch or l.questions > 512 or (!lc.packing.enabled() and l.questions != l.batch) or
         l.options < 2 or l.options > lc.maxOptions() or !std.math.isFinite(head_dropout) or head_dropout < 0 or head_dropout >= 1)
         return error.InvalidLayaTrainingLayout;
+    if (lora) |cfg2| {
+        if (cfg2.rank == 0 or cfg2.rank > 1024 or !std.math.isFinite(cfg2.alpha) or cfg2.alpha <= 0 or
+            !std.math.isFinite(cfg2.dropout) or cfg2.dropout < 0 or cfg2.dropout >= 1 or (!cfg2.targets.encoder and !cfg2.targets.head))
+            return error.InvalidLayaLoraConfig;
+    }
     // Bound the materialized reference attention before allocating constants.
     if (@as(u64, l.batch) * l.sequence * l.sequence * @max(cfg.num_attention_heads, cfg.hidden_size / 64) > 64 * 1024 * 1024)
         return error.LayaTrainingAttentionLimitExceeded;
 }
 
-pub fn build(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32) !Built {
-    try validate(cfg, l, head_dropout);
+pub fn build(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32, lora: ?Lora) !Built {
+    try validate(cfg, l, head_dropout, lora);
     const lc = cfg.laya.?;
+    const encoder_lora = forEncoder(lora);
+    const head_lora = forHead(lora);
     const h = cfg.hidden_size;
     const n = l.batch * l.sequence;
     const nh = cfg.num_attention_heads;
@@ -172,19 +247,19 @@ pub fn build(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32) !Built {
         var names: [256]u8 = undefined;
         const prefix = try std.fmt.bufPrint(&buffer, "encoder.layers.{d}", .{layer});
         const normalized = if (layer == 0) x else try norm(b, x, try std.fmt.bufPrint(&names, "{s}.attn_norm", .{prefix}), h, cfg.layer_norm_eps, false);
-        const qkv = try linear(b, normalized, try std.fmt.bufPrint(&names, "{s}.attn.Wqkv", .{prefix}), n, h, h * 3, false);
+        const qkv = try linear(b, &result, normalized, try std.fmt.bufPrint(&names, "{s}.attn.Wqkv", .{prefix}), n, h, h * 3, false, encoder_lora);
         const global = layer % cfg.global_attn_every_n_layers == 0;
         const tables = result.inputs.rope[if (global) 0 else 1];
         const q = try rope(b, try b.sliceLastDim(qkv, 0, h), tables, l, nh, h / nh);
         const k = try rope(b, try b.sliceLastDim(qkv, h, h * 2), tables, l, nh, h / nh);
         const v = try b.sliceLastDim(qkv, h * 2, h * 3);
         const attn = try attention(b, &result, q, k, v, if (global) result.inputs.encoder_bias else result.inputs.local_bias, l, nh, h / nh, 0);
-        x = try b.add(x, try linear(b, attn, try std.fmt.bufPrint(&names, "{s}.attn.Wo", .{prefix}), n, h, h, false));
+        x = try b.add(x, try linear(b, &result, attn, try std.fmt.bufPrint(&names, "{s}.attn.Wo", .{prefix}), n, h, h, false, encoder_lora));
         const normed = try norm(b, x, try std.fmt.bufPrint(&names, "{s}.mlp_norm", .{prefix}), h, cfg.layer_norm_eps, false);
-        const up = try linear(b, normed, try std.fmt.bufPrint(&names, "{s}.mlp.Wi", .{prefix}), n, h, cfg.intermediate_size * 2, false);
+        const up = try linear(b, &result, normed, try std.fmt.bufPrint(&names, "{s}.mlp.Wi", .{prefix}), n, h, cfg.intermediate_size * 2, false, encoder_lora);
         const gate = try b.geluExact(try b.sliceLastDim(up, 0, cfg.intermediate_size));
         const product = try b.mul(gate, try b.sliceLastDim(up, cfg.intermediate_size, cfg.intermediate_size * 2));
-        x = try b.add(x, try linear(b, product, try std.fmt.bufPrint(&names, "{s}.mlp.Wo", .{prefix}), n, cfg.intermediate_size, h, false));
+        x = try b.add(x, try linear(b, &result, product, try std.fmt.bufPrint(&names, "{s}.mlp.Wo", .{prefix}), n, cfg.intermediate_size, h, false, encoder_lora));
         try result.trace(b.graph.allocator, prefix, x);
     }
     x = try norm(b, x, "encoder.final_norm", h, cfg.layer_norm_eps, false);
@@ -199,22 +274,26 @@ pub fn build(b: *B, cfg: modern.Config, l: Layout, head_dropout: f32) !Built {
         const w = try param(b, prefix, "self_attn.in_proj_weight", &.{ h * 3, h });
         const bias = try param(b, prefix, "self_attn.in_proj_bias", &.{h * 3});
         const qkv_fused = try b.linear(n1, w, bias, n, h, h * 3);
-        const qkv = b.graph.node(qkv_fused).vjp_alternate;
+        var qkv = b.graph.node(qkv_fused).vjp_alternate;
+        if (head_lora) |lora_cfg| {
+            var lora_prefix: [160]u8 = undefined;
+            qkv = try b.add(qkv, try loraDelta(b, &result, n1, try std.fmt.bufPrint(&lora_prefix, "{s}.self_attn.in_proj", .{prefix}), lora_cfg, n, h, h * 3));
+        }
         const attn = try attention(b, &result, try b.sliceLastDim(qkv, 0, h), try b.sliceLastDim(qkv, h, h * 2), try b.sliceLastDim(qkv, h * 2, h * 3), result.inputs.head_bias, l, hh, 64, head_dropout);
-        const proj = try linear(b, attn, try std.fmt.bufPrint(&names, "{s}.self_attn.out_proj", .{prefix}), n, h, h, true);
+        const proj = try linear(b, &result, attn, try std.fmt.bufPrint(&names, "{s}.self_attn.out_proj", .{prefix}), n, h, h, true, head_lora);
         x = try b.add(x, try drop(b, &result, proj, head_dropout));
         const n2 = try norm(b, x, try std.fmt.bufPrint(&names, "{s}.norm2", .{prefix}), h, 1e-5, true);
-        const up = try linear(b, n2, try std.fmt.bufPrint(&names, "{s}.linear1", .{prefix}), n, h, h * 4, true);
+        const up = try linear(b, &result, n2, try std.fmt.bufPrint(&names, "{s}.linear1", .{prefix}), n, h, h * 4, true, head_lora);
         try result.trace(b.graph.allocator, try std.fmt.bufPrint(&names, "{s}.linear1", .{prefix}), up);
         const activated = try drop(b, &result, try relu(b, up), head_dropout);
-        const down = try linear(b, activated, try std.fmt.bufPrint(&names, "{s}.linear2", .{prefix}), n, h * 4, h, true);
+        const down = try linear(b, &result, activated, try std.fmt.bufPrint(&names, "{s}.linear2", .{prefix}), n, h * 4, h, true, head_lora);
         x = try b.add(x, try drop(b, &result, down, head_dropout));
         try result.trace(b.graph.allocator, prefix, x);
     }
     const m = try b.gather(x, result.inputs.markers, Shape.init(.f32, &.{ l.questions * l.options, h }));
     const normalized = try norm(b, m, "scorer.0", h, 1e-5, true);
-    const up = try linear(b, normalized, "scorer.1", l.questions * l.options, h, h, true);
-    const logits = try linear(b, try b.geluExact(up), "scorer.3", l.questions * l.options, h, 1, true);
+    const up = try linear(b, &result, normalized, "scorer.1", l.questions * l.options, h, h, true, null);
+    const logits = try linear(b, &result, try b.geluExact(up), "scorer.3", l.questions * l.options, h, 1, true, null);
     result.logits = try b.reshape(logits, Shape.init(.f32, &.{ l.questions, l.options }));
     return result;
 }
@@ -225,7 +304,7 @@ test "laya training graph retains upstream parameters and all head dropout sites
     defer graph.deinit();
     var b = B.init(&graph);
     const cfg = modern.Config{ .laya = .{ .head_layers = 1 }, .vocab_size = 64, .hidden_size = 64, .num_hidden_layers = 2, .num_attention_heads = 2, .intermediate_size = 96, .checkpoint_layout = .huggingface_fused_qkv_no_bias, .rope_interleaved = false };
-    var built = try build(&b, cfg, .{ .batch = 2, .sequence = 8, .options = 3, .questions = 2 }, 0.1);
+    var built = try build(&b, cfg, .{ .batch = 2, .sequence = 8, .options = 3, .questions = 2 }, 0.1, null);
     defer built.deinit(a);
     try std.testing.expectEqual(@as(usize, 4), built.dropouts.items.len);
     try std.testing.expectEqual(@as(i64, 6), graph.node(built.logits).output_shape.numElements().?);
@@ -239,4 +318,62 @@ test "laya training graph retains upstream parameters and all head dropout sites
     var grads = try ml.autodiff.gradientWithSeeds(a, &graph, &.{.{ .output = built.logits, .cotangent = seed }}, wrt.items, .{ .require_all_gradients = true });
     defer grads.deinit();
     try std.testing.expectEqual(wrt.items.len, grads.param_grads.len);
+}
+
+test "laya lora adds rank-shaped adapters to every targeted linear and both groups get gradients" {
+    const a = std.testing.allocator;
+    var graph = ml.Graph.init(a);
+    defer graph.deinit();
+    var b = B.init(&graph);
+    const cfg = modern.Config{ .laya = .{ .head_layers = 1 }, .vocab_size = 64, .hidden_size = 64, .num_hidden_layers = 2, .num_attention_heads = 2, .intermediate_size = 96, .checkpoint_layout = .huggingface_fused_qkv_no_bias, .rope_interleaved = false };
+    const lora = Lora{ .rank = 4, .alpha = 8, .targets = .{ .encoder = true, .head = true } };
+    var built = try build(&b, cfg, .{ .batch = 2, .sequence = 8, .options = 3, .questions = 2 }, 0, lora);
+    defer built.deinit(a);
+    var a_params: usize = 0;
+    var b_params: usize = 0;
+    for (graph.parameters.items) |id| {
+        const node = graph.node(id);
+        const name = graph.parameterName(node);
+        if (std.mem.endsWith(u8, name, ".lora_A")) {
+            a_params += 1;
+            try std.testing.expectEqual(@as(i64, 4), node.output_shape.dims[0]);
+        } else if (std.mem.endsWith(u8, name, ".lora_B")) {
+            b_params += 1;
+            try std.testing.expectEqual(@as(i64, 4), node.output_shape.dims[1]);
+        }
+    }
+    // 4 encoder linears/layer * 2 layers + 4 head linears (in_proj/out_proj/linear1/linear2).
+    try std.testing.expectEqual(@as(usize, 12), a_params);
+    try std.testing.expectEqual(@as(usize, 12), b_params);
+    const seed = try b.parameter("__seed", graph.node(built.logits).output_shape);
+    var wrt: std.ArrayListUnmanaged(Id) = .empty;
+    defer wrt.deinit(a);
+    for (graph.parameters.items) |id| {
+        const name = graph.parameterName(graph.node(id));
+        if (!std.mem.startsWith(u8, name, "__") and !isLoraWeight(name, lora.targets)) try wrt.append(a, id);
+    }
+    var grads = try ml.autodiff.gradientWithSeeds(a, &graph, &.{.{ .output = built.logits, .cotangent = seed }}, wrt.items, .{ .require_all_gradients = true });
+    defer grads.deinit();
+    try std.testing.expectEqual(wrt.items.len, grads.param_grads.len);
+}
+
+test "laya lora target and prefix helpers identify exactly the six adapted linears" {
+    const both = Targets{ .encoder = true, .head = true };
+    try std.testing.expect(isLoraWeight("encoder.layers.3.attn.Wqkv.weight", both));
+    try std.testing.expect(isLoraWeight("encoder.layers.3.attn.Wo.weight", both));
+    try std.testing.expect(isLoraWeight("encoder.layers.3.mlp.Wi.weight", both));
+    try std.testing.expect(isLoraWeight("encoder.layers.3.mlp.Wo.weight", both));
+    try std.testing.expect(isLoraWeight("head.layers.0.self_attn.in_proj_weight", both));
+    try std.testing.expect(isLoraWeight("head.layers.0.self_attn.out_proj.weight", both));
+    try std.testing.expect(isLoraWeight("head.layers.0.linear1.weight", both));
+    try std.testing.expect(isLoraWeight("head.layers.0.linear2.weight", both));
+    try std.testing.expect(!isLoraWeight("encoder.embeddings.tok_embeddings.weight", both));
+    try std.testing.expect(!isLoraWeight("scorer.1.weight", both));
+    try std.testing.expect(!isLoraWeight("type_emb.weight", both));
+    try std.testing.expect(!isLoraWeight("head.layers.0.norm1.weight", both));
+    try std.testing.expect(isLoraFrozen("head.layers.0.self_attn.in_proj_bias", both));
+    try std.testing.expect(!isLoraFrozen("head.layers.0.norm1.bias", both));
+    try std.testing.expect(!isLoraWeight("encoder.layers.3.attn.Wqkv.weight", .{ .encoder = false, .head = true }));
+    try std.testing.expectEqualStrings("encoder.layers.3.attn.Wqkv", loraPrefix("encoder.layers.3.attn.Wqkv.weight"));
+    try std.testing.expectEqualStrings("head.layers.0.self_attn.in_proj", loraPrefix("head.layers.0.self_attn.in_proj_weight"));
 }

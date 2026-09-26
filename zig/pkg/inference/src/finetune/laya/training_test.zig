@@ -71,7 +71,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     defer weights.deinit();
     var expected_gradients = try safetensors.MMapReader.openFileAbsolute(a, try std.fmt.allocPrint(scratch, "{s}/gradients.safetensors", .{root}));
     defer expected_gradients.deinit();
-    const parameters = try train.parameters(scratch, &program.graph, &weights, 0);
+    const parameters = try train.parameters(scratch, &program.graph, &weights, 0, null, 0);
     const originals = try scratch.alloc(run.Parameter, parameters.len);
     for (parameters, originals) |p, *o| o.* = .{ .name = p.name, .canonical_name = p.name, .dimensions = p.dimensions, .values = p.values, .kind = .original };
     var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
@@ -263,7 +263,7 @@ test "laya training with frozen lower layers keeps them exact and trains the res
         defer after.deinit();
         const want = try train.floatValues(scratch, before);
         const got = try train.floatValues(scratch, after);
-        if (train.frozen(name, c.freeze_layers)) {
+        if (train.frozen(name, c.freeze_layers, null)) {
             frozen_count += 1;
             try std.testing.expectEqualSlices(f32, want, got);
         } else if (std.mem.startsWith(u8, name, "encoder.layers.") and !std.mem.eql(f32, want, got)) {
@@ -272,6 +272,85 @@ test "laya training with frozen lower layers keeps them exact and trains the res
     }
     try std.testing.expect(frozen_count > 0);
     try std.testing.expect(trainable_moved);
+}
+
+test "laya training with lora adapts only its targets, merges them at export, and resumes exactly" {
+    const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
+    const job = @import("job.zig");
+    const architecture = @import("graph.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const directory = try temp.dir.realPathFileAlloc(io, ".", scratch);
+    var c = job.Config{
+        .model_dir = try std.fs.path.join(scratch, &.{ root, "model" }),
+        .train_file = try std.fs.path.join(scratch, &.{ root, "train.jsonl" }),
+        .eval_file = try std.fs.path.join(scratch, &.{ root, "eval.jsonl" }),
+        .output_dir = try std.fs.path.join(scratch, &.{ directory, "lora" }),
+        .backend = if (platform.env.getenv("ANTFLY_LAYA_METAL") != null) .metal else .cpu,
+        .epochs = 1,
+        .batch_size = 2,
+        .encoder_lr = 0.01,
+        .head_lr = 0.01,
+        .lora = .{ .rank = 4, .alpha = 8, .targets = &.{ "encoder", "head" } },
+    };
+    const lora = architecture.Targets{ .encoder = true, .head = true };
+    try job.execute(a, io, c);
+    var resume_state = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ c.output_dir, "latest.safetensors" }));
+    defer resume_state.deinit();
+    var saw_lora_a = false;
+    var saw_lora_b = false;
+    {
+        var names = resume_state.header.tensors.iterator();
+        while (names.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (std.mem.endsWith(u8, name, ".lora_A")) saw_lora_a = true;
+            if (std.mem.endsWith(u8, name, ".lora_B")) saw_lora_b = true;
+        }
+    }
+    // Adapters are ordinary optimizer-tracked parameters, so resume covers them.
+    try std.testing.expect(saw_lora_a);
+    try std.testing.expect(saw_lora_b);
+    var source = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ root, "model", "model.safetensors" }));
+    defer source.deinit();
+    var exported = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" }));
+    defer exported.deinit();
+    var adapted_weight = false;
+    var names = source.header.tensors.iterator();
+    while (names.next()) |entry| {
+        const name = entry.key_ptr.*;
+        // A merged checkpoint never carries the adapters themselves.
+        try std.testing.expect(!std.mem.endsWith(u8, name, ".lora_A"));
+        try std.testing.expect(!std.mem.endsWith(u8, name, ".lora_B"));
+        var before = try source.readTensor(name);
+        defer before.deinit();
+        var after = try exported.readTensor(name);
+        defer after.deinit();
+        const want = try train.floatValues(scratch, before);
+        const got = try train.floatValues(scratch, after);
+        if (architecture.isLoraWeight(name, lora)) {
+            if (!std.mem.eql(f32, want, got)) adapted_weight = true;
+        } else if (architecture.isLoraFrozen(name, lora)) {
+            // A targeted linear's bias is never part of the low-rank delta.
+            try std.testing.expectEqualSlices(f32, want, got);
+        }
+    }
+    try std.testing.expect(adapted_weight);
+    const full_weights = try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" });
+    c.output_dir = try std.fs.path.join(scratch, &.{ directory, "paused" });
+    c.stop_after_microbatches = 1;
+    try job.execute(a, io, c);
+    c.resume_from = try std.fs.path.join(scratch, &.{ c.output_dir, "latest.safetensors" });
+    c.output_dir = try std.fs.path.join(scratch, &.{ directory, "resumed" });
+    c.stop_after_microbatches = null;
+    try job.execute(a, io, c);
+    const resumed_weights = try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" });
+    const digest = @import("data.zig").digest;
+    try std.testing.expectEqual(digest(try files.readFile(scratch, full_weights)), digest(try files.readFile(scratch, resumed_weights)));
 }
 
 test "laya finetuned export probabilities and tokenization match PyTorch" {
@@ -389,12 +468,30 @@ test "laya finetuned export probabilities and tokenization match PyTorch" {
 }
 
 test "laya frozen layers cover embeddings and the lowest encoder layers only" {
-    try std.testing.expect(!train.frozen("encoder.embeddings.tok_embeddings.weight", 0));
-    try std.testing.expect(train.frozen("encoder.embeddings.tok_embeddings.weight", 1));
-    try std.testing.expect(train.frozen("encoder.embeddings.norm.weight", 2));
-    try std.testing.expect(train.frozen("encoder.layers.1.attn.Wqkv.weight", 2));
-    try std.testing.expect(!train.frozen("encoder.layers.2.attn.Wqkv.weight", 2));
-    try std.testing.expect(!train.frozen("encoder.layers.12.mlp.Wo.weight", 2));
-    try std.testing.expect(!train.frozen("encoder.final_norm.weight", 22));
-    try std.testing.expect(!train.frozen("head.layers.0.attn.Wqkv.weight", 22));
+    try std.testing.expect(!train.frozen("encoder.embeddings.tok_embeddings.weight", 0, null));
+    try std.testing.expect(train.frozen("encoder.embeddings.tok_embeddings.weight", 1, null));
+    try std.testing.expect(train.frozen("encoder.embeddings.norm.weight", 2, null));
+    try std.testing.expect(train.frozen("encoder.layers.1.attn.Wqkv.weight", 2, null));
+    try std.testing.expect(!train.frozen("encoder.layers.2.attn.Wqkv.weight", 2, null));
+    try std.testing.expect(!train.frozen("encoder.layers.12.mlp.Wo.weight", 2, null));
+    try std.testing.expect(!train.frozen("encoder.final_norm.weight", 22, null));
+    try std.testing.expect(!train.frozen("head.layers.0.attn.Wqkv.weight", 22, null));
+}
+
+test "laya lora freezes only its targeted linear weights and biases, on top of frozen layers" {
+    const architecture = @import("graph.zig");
+    const encoder_only = architecture.Lora{ .rank = 8, .alpha = 16, .targets = .{ .encoder = true } };
+    try std.testing.expect(train.frozen("encoder.layers.5.attn.Wqkv.weight", 0, encoder_only));
+    try std.testing.expect(!train.frozen("encoder.layers.5.attn_norm.weight", 0, encoder_only));
+    try std.testing.expect(!train.frozen("head.layers.0.self_attn.in_proj_weight", 0, encoder_only));
+    const head_only = architecture.Lora{ .rank = 8, .alpha = 16, .targets = .{ .head = true } };
+    try std.testing.expect(train.frozen("head.layers.0.self_attn.in_proj_weight", 0, head_only));
+    try std.testing.expect(train.frozen("head.layers.0.self_attn.in_proj_bias", 0, head_only));
+    try std.testing.expect(train.frozen("head.layers.0.linear1.weight", 0, head_only));
+    try std.testing.expect(!train.frozen("head.layers.0.norm1.weight", 0, head_only));
+    try std.testing.expect(!train.frozen("scorer.1.weight", 0, head_only));
+    try std.testing.expect(!train.frozen("type_emb.weight", 0, head_only));
+    // A layer frozen by freeze_layers stays frozen even inside a lora target.
+    try std.testing.expect(train.frozen("encoder.layers.0.attn.Wqkv.weight", 1, encoder_only));
+    try std.testing.expect(train.frozen("encoder.layers.0.attn.Wqkv.lora_A", 1, encoder_only) == false);
 }

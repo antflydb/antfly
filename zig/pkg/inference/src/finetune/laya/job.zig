@@ -52,7 +52,39 @@ pub const Config = struct {
     /// Keep the token embeddings and the lowest N encoder layers at their
     /// source values. Backward work and optimizer state cover only the rest.
     freeze_layers: u32 = 0,
+    /// Low-rank adaptation (models/laya/LAYA.md, "LoRA for Laya training").
+    /// Null trains every unfrozen parameter directly, as before.
+    lora: ?Lora = null,
 };
+
+pub const Lora = struct {
+    /// Adapter rank; `alpha/rank` scales the adapter's contribution.
+    rank: u32,
+    alpha: f32 = 32,
+    /// Dropout on the adapter's input, independent of `head_dropout`.
+    dropout: f32 = 0,
+    /// "encoder" (`attn.Wqkv`/`attn.Wo`/`mlp.Wi`/`mlp.Wo` in every layer) and
+    /// "head" (`self_attn.in_proj`/`self_attn.out_proj`/`linear1`/`linear2`
+    /// in every decision-head layer). At least one, no duplicates.
+    targets: []const []const u8 = &.{ "encoder", "head" },
+};
+
+fn resolveLoraTargets(spec: Lora) !architecture.Targets {
+    var targets = architecture.Targets{};
+    for (spec.targets, 0..) |name, i| {
+        for (spec.targets[0..i]) |prior| if (std.mem.eql(u8, prior, name)) return error.InvalidLayaLoraTarget;
+        if (std.mem.eql(u8, name, "encoder")) targets.encoder = true else if (std.mem.eql(u8, name, "head")) targets.head = true else return error.InvalidLayaLoraTarget;
+    }
+    return targets;
+}
+/// Resolve and validate the job's LoRA setting into the graph's shape.
+fn resolveLora(spec: ?Lora) !?architecture.Lora {
+    const s = spec orelse return null;
+    if (s.rank == 0 or s.rank > 1024 or !std.math.isFinite(s.alpha) or s.alpha <= 0 or
+        !std.math.isFinite(s.dropout) or s.dropout < 0 or s.dropout >= 1 or s.targets.len == 0 or s.targets.len > 2)
+        return error.InvalidLayaJob;
+    return .{ .rank = s.rank, .alpha = s.alpha, .dropout = s.dropout, .targets = try resolveLoraTargets(s) };
+}
 
 pub fn validate(c: Config) !void {
     if (c.version != 1 or c.epochs == 0 or c.epochs > 10000 or c.batch_size == 0 or c.batch_size > 128 or
@@ -66,6 +98,7 @@ pub fn validate(c: Config) !void {
     if (c.calibration_file) |value| if (!std.fs.path.isAbsolute(value)) return error.LayaJobRequiresAbsolutePaths;
     if (c.stop_after_microbatches == 0) return error.InvalidLayaJob;
     if (c.max_packed_len != null and (c.packing == null or c.packing.? == .none)) return error.InvalidLayaJob;
+    _ = try resolveLora(c.lora);
 }
 
 /// Apply the job's packing override with the same bounds as `laya.packing`.
@@ -103,6 +136,7 @@ const Cache = struct {
     config: modern.Config,
     dropout: f32,
     freeze_layers: u32 = 0,
+    lora: ?architecture.Lora = null,
     frozen: []const training.Frozen = &.{},
     program: ?training.Program = null,
     last: architecture.Layout = .{ .batch = 0, .sequence = 0, .options = 0, .questions = 0 },
@@ -111,7 +145,7 @@ const Cache = struct {
         if (self.program == null or !std.meta.eql(l, self.last)) {
             if (self.program) |*p| p.deinit();
             self.program = null;
-            self.program = try training.Program.initFrozen(self.allocator, self.config, l, self.dropout, self.freeze_layers);
+            self.program = try training.Program.initFrozen(self.allocator, self.config, l, self.dropout, self.freeze_layers, self.lora);
             self.last = l;
         }
         self.program.?.frozen = self.frozen;
@@ -215,17 +249,50 @@ fn calibrate(a: std.mem.Allocator, preds: []const Prediction) ![3]f32 {
     return temperatures;
 }
 
-fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.json.Value, layout: model.Packing, assets: Assets, admitted: []const checkpoint.NamedTensor, trainer: *training.controller.Trainer, temperatures: [3]f32) !void {
+fn findTrained(trainer: *training.controller.Trainer, name: []const u8) ?[]const f32 {
+    for (trainer.owner.regular_params.items) |p| if (std.mem.eql(u8, p.name, name)) return p.weights;
+    return null;
+}
+/// `base + scale * (B @ A)`, `base` shaped `[out_dim, in_dim]` row-major (the
+/// checkpoint convention), `a` `[rank, in_dim]`, `b` `[out_dim, rank]`.
+fn mergeLora(a_alloc: std.mem.Allocator, base: []const f32, out_dim: usize, in_dim: usize, a: []const f32, b: []const f32, rank: usize, scale: f32) ![]f32 {
+    if (base.len != out_dim * in_dim or a.len != rank * in_dim or b.len != out_dim * rank) return error.InvalidLayaLoraState;
+    const merged = try a_alloc.dupe(f32, base);
+    for (0..out_dim) |o| {
+        for (0..in_dim) |i| {
+            var sum: f32 = 0;
+            for (0..rank) |r| sum += b[o * rank + r] * a[r * in_dim + i];
+            merged[o * in_dim + i] += scale * sum;
+        }
+    }
+    return merged;
+}
+/// The trained value for `entry`: its optimizer weights when it is directly
+/// trainable, or its base value merged with `scale * B @ A` when LoRA adapts
+/// it instead (`architecture.isLoraWeight`). Every other tensor, including a
+/// LoRA-adapted linear's untouched bias, keeps its frozen source value.
+fn exportedValue(a: std.mem.Allocator, entry: checkpoint.NamedTensor, trainer: *training.controller.Trainer, lora: ?architecture.Lora, temperatures: []const f32) ![]const f32 {
+    if (std.mem.eql(u8, entry.name, "temperature")) return temperatures;
+    if (findTrained(trainer, entry.name)) |values| return values;
+    if (lora) |cfg| if (architecture.isLoraWeight(entry.name, cfg.targets)) {
+        const prefix = architecture.loraPrefix(entry.name);
+        var a_name: [300]u8 = undefined;
+        var b_name: [300]u8 = undefined;
+        const lora_a = findTrained(trainer, try std.fmt.bufPrint(&a_name, "{s}.lora_A", .{prefix})) orelse return error.InvalidLayaLoraState;
+        const lora_b = findTrained(trainer, try std.fmt.bufPrint(&b_name, "{s}.lora_B", .{prefix})) orelse return error.InvalidLayaLoraState;
+        if (entry.shape.len != 2) return error.InvalidLayaLoraState;
+        return mergeLora(a, entry.data, entry.shape[0], entry.shape[1], lora_a, lora_b, cfg.rank, cfg.alpha / @as(f32, @floatFromInt(cfg.rank)));
+    };
+    return entry.data;
+}
+
+fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.json.Value, layout: model.Packing, assets: Assets, admitted: []const checkpoint.NamedTensor, trainer: *training.controller.Trainer, temperatures: [3]f32, lora: ?architecture.Lora) !void {
     try trainer.ensureHostState(null);
     const stage = try path(a, c.output_dir, "model.partial");
     try std.Io.Dir.cwd().createDir(io, stage, .default_dir);
     var entries: std.ArrayListUnmanaged(checkpoint.NamedTensor) = .empty;
     for (admitted) |entry| {
-        const values: []const f32 = blk: {
-            if (std.mem.eql(u8, entry.name, "temperature")) break :blk &temperatures;
-            for (trainer.owner.regular_params.items) |p| if (std.mem.eql(u8, entry.name, p.name)) break :blk p.weights;
-            break :blk entry.data;
-        };
+        const values = try exportedValue(a, entry, trainer, lora, &temperatures);
         try entries.append(a, .{ .name = entry.name, .shape = entry.shape, .data = values });
     }
     try checkpoint.saveControlled(a, try path(a, stage, "model.safetensors"), entries.items, null, true);
@@ -261,7 +328,7 @@ fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.jso
 
 // A shuffled batch can combine the longest sequence with any other record.
 // Admit a conservative bound for the entire split before backend allocation.
-fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32) !void {
+fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32, lora: ?architecture.Lora) !void {
     var layout = architecture.Layout{ .batch = @intCast(@min(batch_size, examples.len)), .sequence = 0, .options = 0, .questions = 0 };
     var questions: u32 = 0;
     for (examples) |e| {
@@ -272,7 +339,7 @@ fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_s
         for (e.ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidLayaTrainingToken;
     }
     layout.questions = @min(questions * layout.batch, 512);
-    try architecture.validate(cfg, layout, dropout);
+    try architecture.validate(cfg, layout, dropout, lora);
 }
 
 const Cursor = struct {
@@ -370,10 +437,11 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
         try data.disjoint(a, train, calib);
         try data.disjoint(a, eval, calib);
     }
-    try admitExamples(encoder, train.examples, c.batch_size, c.head_dropout);
-    try admitExamples(encoder, eval.examples, 1, c.head_dropout);
-    if (calibration) |calib| try admitExamples(encoder, calib.examples, 1, c.head_dropout);
-    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = c.freeze_layers };
+    const lora = try resolveLora(c.lora);
+    try admitExamples(encoder, train.examples, c.batch_size, c.head_dropout, lora);
+    try admitExamples(encoder, eval.examples, 1, c.head_dropout, lora);
+    if (calibration) |calib| try admitExamples(encoder, calib.examples, 1, c.head_dropout, lora);
+    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = c.freeze_layers, .lora = lora };
     defer cache.deinit();
     // Release the raw source snapshot before optimizer initialization/restore.
     // Only owned trainable values, frozen values, and export metadata survive.
@@ -385,7 +453,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
         try @import("../../models/laya.zig").validateReader(&source, laya, encoder);
         if (source.header.tensors.get("temperature")) |meta| if (!std.mem.eql(i64, meta.shape, &.{3})) return error.InvalidLayaWeights;
         const initial = try cache.get(train.examples[0..@min(train.examples.len, c.batch_size)]);
-        const selected = try training.parameters(permanent, &initial.graph, &source, c.freeze_layers);
+        const selected = try training.parameters(permanent, &initial.graph, &source, c.freeze_layers, lora, c.seed);
         const export_tensors = try exportInputs(permanent, &source, selected);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly-laya-training/v1");
@@ -421,7 +489,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
         for (frozen.items) |f| owner.cb.free(f.value);
         frozen.deinit(a);
     }
-    for (admitted.export_tensors) |t| if (training.frozen(t.name, c.freeze_layers)) {
+    for (admitted.export_tensors) |t| if (training.frozen(t.name, c.freeze_layers, lora)) {
         var dims: [8]i32 = undefined;
         if (t.shape.len > dims.len or t.data.len == 0) return error.InvalidLayaWeights;
         for (t.shape, dims[0..t.shape.len]) |dim, *dst| dst.* = std.math.cast(i32, dim) orelse return error.InvalidLayaWeights;
@@ -514,7 +582,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
     for (final_predictions, eval.records) |*p, r| p.id = r.id;
     const after = try metrics(final_predictions, temperatures);
     try writeJson(io, try path(permanent, c.output_dir, "eval_predictions.json"), final_predictions);
-    try exportModel(permanent, io, c, config_json.value, laya.packing, assets, admitted.export_tensors, &trainer, temperatures);
+    try exportModel(permanent, io, c, config_json.value, laya.packing, assets, admitted.export_tensors, &trainer, temperatures, lora);
     const result = .{ .format = "antfly-laya-finetune/v1", .status = "complete", .backend = c.backend, .objective = c.objective, .source_sha256 = .{ .config = std.fmt.bytesToHex(data.digest(config_bytes), .lower), .tokenizer = std.fmt.bytesToHex(data.digest(tokenizer_bytes), .lower), .weights = std.fmt.bytesToHex(admitted.weights_sha256, .lower) }, .calibration_sha256 = if (calibration) |calib| std.fmt.bytesToHex(calib.sha256, .lower) else null, .resumed_microbatches = completed, .train_examples = train.examples.len, .train_records = train.records.len, .packing = laya.packing.mode, .train_sha256 = std.fmt.bytesToHex(train.sha256, .lower), .eval_sha256 = std.fmt.bytesToHex(eval.sha256, .lower), .run_sha256 = std.fmt.bytesToHex(identity, .lower), .optimizer = trainer.identity(), .initial_eval = before, .initial_by_kind = initial_by_kind, .final_eval = after, .final_by_kind = try metricsByKind(a, final_predictions, temperatures), .final_uncalibrated_eval = try metrics(final_predictions, .{ 1, 1, 1 }), .temperature = temperatures, .calibration_examples = if (calibration) |calib| calib.examples.len else 0, .action_head_trained = false, .host_peak_bytes = budget.peak };
     try writeJson(io, try path(permanent, c.output_dir, "report.json"), result);
     try event(io, std.Io.File.stdout(), result);
@@ -560,12 +628,12 @@ test "laya admission checks late long sequences and token vocabulary before trai
     const short = training.Example{ .ids = ids[0..2], .markers = &.{ 0, 1 }, .kind = .noul, .target = &.{ 1, 0 } };
     var long = short;
     long.ids = &ids;
-    try admitExamples(cfg, &.{ short, short }, 2, 0);
-    try admitExamples(cfg, &.{long}, 1, 0);
-    try std.testing.expectError(error.LayaTrainingAttentionLimitExceeded, admitExamples(cfg, &.{ short, short, long }, 2, 0));
+    try admitExamples(cfg, &.{ short, short }, 2, 0, null);
+    try admitExamples(cfg, &.{long}, 1, 0, null);
+    try std.testing.expectError(error.LayaTrainingAttentionLimitExceeded, admitExamples(cfg, &.{ short, short, long }, 2, 0, null));
     var invalid = short;
     invalid.ids = &.{ 0, cfg.vocab_size };
-    try std.testing.expectError(error.InvalidLayaTrainingToken, admitExamples(cfg, &.{ short, invalid }, 1, 0));
+    try std.testing.expectError(error.InvalidLayaTrainingToken, admitExamples(cfg, &.{ short, invalid }, 1, 0, null));
 }
 
 test "laya training rejects malformed encoder metadata instead of defaulting" {
@@ -600,4 +668,37 @@ test "laya admission snapshots frozen export tensors and rejects nonfinite value
     var reader = try safetensors.MMapReader.openFileAbsolute(a, file);
     defer reader.deinit();
     try std.testing.expectError(error.NonFiniteLayaFrozenWeight, exportInputs(arena.allocator(), &reader, &.{}));
+}
+
+test "laya lora merge computes base plus scale times B times A exactly" {
+    const a = std.testing.allocator;
+    // out_dim=2, in_dim=3, rank=2. base is the identity-ish 2x3 matrix below.
+    const base = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const lora_a = [_]f32{ 1, 0, 1, 0, 1, 0 }; // [rank=2, in=3]
+    const lora_b = [_]f32{ 2, 0, 0, 3 }; // [out=2, rank=2]
+    // scale=2: delta = 2 * (B @ A). Row 0: 2*(2*[1,0,1]) = [4,0,4]. Row 1: 2*(3*[0,1,0]) = [0,6,0].
+    const merged = try mergeLora(a, &base, 2, 3, &lora_a, &lora_b, 2, 2);
+    defer a.free(merged);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 2, 7, 4, 11, 6 }, merged);
+    try std.testing.expectError(error.InvalidLayaLoraState, mergeLora(a, &base, 2, 2, &lora_a, &lora_b, 2, 2));
+}
+
+test "laya lora job validation resolves targets and rejects malformed settings" {
+    var c = Config{ .model_dir = "/model", .train_file = "/train", .eval_file = "/eval", .output_dir = "/output", .lora = .{ .rank = 8, .alpha = 16, .targets = &.{ "encoder", "head" } } };
+    try validate(c);
+    const resolved = (try resolveLora(c.lora)).?;
+    try std.testing.expect(resolved.targets.encoder);
+    try std.testing.expect(resolved.targets.head);
+    try std.testing.expectEqual(@as(u32, 8), resolved.rank);
+    c.lora.?.rank = 0;
+    try std.testing.expectError(error.InvalidLayaJob, validate(c));
+    c.lora.?.rank = 8;
+    c.lora.?.targets = &.{"nonsense"};
+    try std.testing.expectError(error.InvalidLayaLoraTarget, validate(c));
+    c.lora.?.targets = &.{ "encoder", "encoder" };
+    try std.testing.expectError(error.InvalidLayaLoraTarget, validate(c));
+    c.lora.?.targets = &.{};
+    try std.testing.expectError(error.InvalidLayaJob, validate(c));
+    c.lora = null;
+    try validate(c);
 }

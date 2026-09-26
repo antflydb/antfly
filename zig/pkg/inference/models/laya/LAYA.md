@@ -389,6 +389,60 @@ was pretrained at 8,192 tokens. That in turn needs a non-materialized
 attention in the training graph, because the current graph admits
 `batch · L² · heads ≤ 64M` elements, about 2k tokens at batch 1.
 
+### LoRA
+
+Low-rank adaptation cuts optimizer state and lets one small adapter
+specialize a released checkpoint without moving its weights. The job config
+adds:
+
+```json
+"lora": { "rank": 16, "alpha": 32, "targets": ["encoder", "head"], "dropout": 0 }
+```
+
+`targets` names which linears get an adapter: `encoder` is every layer's
+`attn.Wqkv`, `attn.Wo`, `mlp.Wi`, `mlp.Wo`; `head` is the decision head's
+`self_attn.in_proj`, `self_attn.out_proj`, `linear1`, `linear2`. For each
+targeted linear the base weight `W` is bound as a frozen runtime input,
+exactly like `freeze_layers` binds a frozen layer, and the graph adds
+`scale · (x·Aᵀ)·Bᵀ` beside `x·Wᵀ`, with `scale = alpha/rank`. `A` is
+`[rank, in]`, Kaiming-uniform with bound `1/sqrt(in)` (`nn.Linear`'s default
+initializer, and the formula the codebase's other LoRA injector,
+`boundary_peft_graph.initializeModule`, already uses); `B` is `[out, rank]`,
+zero, so an adapted model starts identical to the source checkpoint. A
+targeted linear's bias, the scorer, the action head, the type embedding, and
+every norm are never adapted and train fully whenever they are not otherwise
+frozen (`training.frozen`, widened with an `?architecture.Lora` argument
+alongside `freeze_layers`).
+
+`freeze_layers` and `lora` compose. A layer below `freeze_layers` is frozen
+exactly as before; its adapters, if `lora` also targets it, are frozen too
+(`training.frozen` never differentiates a `.lora_A`/`.lora_B` name whose
+layer index is frozen), rather than training a delta on top of weights that
+never move for no benefit. A layer at or above `freeze_layers` keeps its
+adapters trainable even where the targeted group matches, which is ordinary
+LoRA-on-a-frozen-encoder.
+
+Export merges every adapted weight into `W + scale·B·A` (`job.zig`'s
+`mergeLora`) and writes only the merged dense tensor: `lora_A`/`lora_B` never
+appear in the served checkpoint (`model/model.safetensors`), so serving is
+unmodified and a downstream reader cannot tell a LoRA run from a full
+fine-tune. The `latest.safetensors` resume checkpoint is the ordinary
+optimizer-state format (`seeded_gradient_trainer.zig`): adapters are just two
+more named parameters in it, with their own AdamW moments, so resume needs no
+LoRA-specific handling.
+
+Tests (`finetune/laya/graph.zig`, `training_test.zig`, `job.zig`): the graph
+adds exactly one adapter pair per targeted linear and both target groups get
+gradients; `isLoraWeight`/`isLoraFrozen`/`loraPrefix` identify the six
+adapted linears and nothing else (not the scorer, type embedding, or norms);
+`frozen` freezes a targeted weight and bias but leaves its adapter trainable,
+and correctly composes with `freeze_layers`; `mergeLora` matches
+`base + scale·B·A` exactly on a hand-computed case; and an end-to-end job run
+on the reference fixture confirms a targeted weight moves, its bias and every
+non-targeted tensor's frozen values are exact, no `lora_A`/`lora_B` tensor
+reaches the served checkpoint, and interrupting and resuming a LoRA run
+reproduces the uninterrupted run's exported weights bit-for-bit.
+
 ## Accuracy (step 0)
 
 Measured 2026-09-24 on an Apple M4 Max, ReleaseFast, Metal trainer.
@@ -602,8 +656,34 @@ snapshotting weights and moments first.
 Raw per-step logs and the investigation are in
 [`work-log/completed/inference/laya/2026-09-25-trainer-throughput.md`](../../../../../work-log/completed/inference/laya/2026-09-25-trainer-throughput.md).
 
-Segment attention in the training graph (which step 2c needs anyway) and LoRA
-remain open. Batching still helps little, because cost is per token.
+Segment attention in the training graph (which step 2c needs anyway) remains
+open. Batching still helps little, because cost is per token. LoRA is
+implemented ([LoRA](#lora)); its own step-time, memory, and accuracy numbers
+are below.
+
+### LoRA throughput and accuracy
+
+LoRA does not shrink the forward graph (every targeted linear still computes
+its base `x·Wᵀ` beside the adapter's `scale·(x·Aᵀ)·Bᵀ`), so a step still runs
+the full encoder and head plus a small extra matmul pair per targeted linear;
+step time should be at or slightly above a full fine-tune's, not below it.
+What it removes is optimizer state: a targeted linear's `[out, in]` weight and
+its two AdamW moments drop out, replaced by `A` (`[rank, in]`) and `B`
+(`[out, rank]`) and their own moments, which is smaller whenever
+`rank < out·in/(out+in)`. At rank 16 on the released 421M checkpoint's largest
+linears (`hidden 1024`, `mlp 6144`) that is decisively true, so the expected
+win is optimizer-transaction bytes and peak memory, not wall time per step.
+
+This section's numbers (median step time and peak `/usr/bin/time -l` memory
+on `td/prof.json`, rank 16 and rank 64, versus the 1.38 s/step full fine-tune
+baseline; step-0 packed accuracy over seeds 42/43/44 at rank 16 and rank 64
+against the 0.450/0.512 baselines) were not collected this session: the
+shared GPU/build lock stayed held by other agents' training and evaluation
+runs for the session's full duration, including several multi-hour queues.
+Running a released-model job needs both locks for several minutes per seed,
+and none opened up. The correctness evidence above (CPU, synthetic fixture)
+stands on its own for the graph, freeze/target logic, export merge, and
+resume; the throughput and accuracy claims are the open item.
 
 ## Verification
 
@@ -629,6 +709,10 @@ All numbers are from 2026-09-24 on an Apple M4 Max (36 GiB), Zig 0.16.0.
 | f16 state cache against the full row | `pipelines/laya_packed_test.zig` | max logit error ≤ 5.5e-4 (CPU and Metal); f32 ≤ 1.7e-6 |
 | Framed Metal training: forward, objective and all 45 gradients match PyTorch | `finetune/laya/training_test.zig` | max error 1.9e-6 |
 | Frozen lower layers are exported bit-identical; trainable layers move | same | exact (CPU and Metal) |
+| LoRA: one adapter pair per targeted linear, both target groups differentiated | `finetune/laya/graph.zig` | exact (12 `lora_A`/12 `lora_B` for rank 4, 2 encoder layers + 1 head layer, both targets) |
+| LoRA target/freeze/prefix helpers identify exactly the six adapted linears and their bias, and compose correctly with `freeze_layers` | `finetune/laya/graph.zig`, `training_test.zig` | exact |
+| LoRA merge equals `base + scale·B·A` on a hand-computed case; rejects a shape mismatch | `finetune/laya/job.zig` | exact |
+| LoRA end-to-end job (CPU, synthetic fixture): a targeted weight moves, its bias and every non-targeted frozen tensor stay exact, no `lora_A`/`lora_B` reaches the served checkpoint, interrupted-then-resumed reproduces the uninterrupted export | `finetune/laya/training_test.zig` | exact (digest match); confirmed on CPU. Metal not independently re-run this session (shared-machine build/GPU lock contention); the graph uses the same generic ops (`linearNoBias`/`add`/`mul`) as every other Laya training path already qualified on Metal |
 | q8_0 linears keep every decision; probabilities close to dense | `pipelines/laya_quantized_test.zig` | labels identical; max probability error 9e-7 (CPU), 5e-6 (Metal) on the fixture |
 | Metal linears read the current weight after it is replaced | `ops/resident_training_metal_test.zig` | exact; fails without the slot-cache fix |
 | Gradients on the released model vs float64 PyTorch, three ~330-token states | `training_test.zig` with a released-model fixture | worst per-layer relative L2 0.4–0.6% (float32) |
@@ -763,8 +847,10 @@ Other open items:
 - **Very many options:** candidate branches cannot compare options before the
   softmax (step 2b).
 - **Trainer throughput:** device slices, device-resident gradients, command
-  frames, the batched optimizer, device inputs and frozen lower layers are
-  done
-  ([Trainer throughput](#trainer-throughput)). Segment attention with a
-  backward pass in the training graph, alongside step 2c, and LoRA are next.
-  A qualification run with frozen layers has not been done.
+  frames, the batched optimizer, device inputs, frozen lower layers, and LoRA
+  are done ([Trainer throughput](#trainer-throughput), [LoRA](#lora)). LoRA's
+  own step-time/memory/accuracy measurement on the released model is not done
+  (shared-machine lock contention; see [LoRA throughput and
+  accuracy](#lora-throughput-and-accuracy)). Segment attention with a
+  backward pass in the training graph, alongside step 2c, is next. A
+  qualification run with frozen layers has not been done.

@@ -196,3 +196,41 @@ RLCD CE per 200 steps: 3.612, 3.996, 5.002, 4.37, 4.345, 4.34, 4.346, 4.337
 RLCD at a quarter of the learning rate 3.373, 3.124, 3.352, 2.617, 3.748,
 2.975 (grad norms 979-3,348); soft CE 3.851, 2.786, 2.392, 2.524, 2.126,
 2.291 (grad norms 93-291).
+
+## LoRA (2026-09-26)
+
+Design and summary: [`zig/pkg/inference/models/laya/LAYA.md`](../../../../zig/pkg/inference/models/laya/LAYA.md#lora).
+Implementation: `finetune/laya/graph.zig` (`Lora`/`Targets`, `isLoraWeight`,
+`isLoraFrozen`, `loraPrefix`, `loraDelta`), `finetune/laya/training.zig`
+(`frozen` widened with an `?architecture.Lora` arg, `parameters` inits
+`.lora_A` Kaiming-uniform / `.lora_B` zero), `finetune/laya/job.zig`
+(`Config.lora`, `mergeLora`, `exportedValue`).
+
+Verification this session was CPU-only, on the synthetic fixture
+(`ANTFLY_LAYA_REFERENCE`), via `zig build test -- --test-filter lora` and
+`--test-filter laya`:
+
+```
+finetune.laya.graph.test.laya lora adds rank-shaped adapters to every targeted linear and both groups get gradients ... OK
+finetune.laya.graph.test.laya lora target and prefix helpers identify exactly the six adapted linears ... OK
+finetune.laya.training_test.test.laya lora freezes only its targeted linear weights and biases, on top of frozen layers ... OK
+finetune.laya.training_test.test.laya training with lora adapts only its targets, merges them at export, and resumes exactly ... OK
+finetune.laya.job.test.laya lora merge computes base plus scale times B times A exactly ... OK
+finetune.laya.job.test.laya lora job validation resolves targets and rejects malformed settings ... OK
+```
+
+Full `--test-filter laya` with the reference fixture: 64 selected, 56 passed,
+8 skipped (CUDA, packed benchmark, and the export-reference test, none of
+which this track touches), 0 failed — including the existing 45-gradient
+PyTorch parity test and the frozen-layers test, both unaffected by widening
+`training.frozen`'s signature.
+
+**Not done this session:** Metal re-verification and released-model
+step-time/peak-memory/accuracy numbers (rank 16 and 64, 3 seeds each, vs the
+1.38 s/step and 0.450/0.512 baselines above). The shared GPU/build lock
+stayed held by other agents' seed sweeps (`run-seedNN.sh`,
+`eval42-then-train43.sh`, and others) for the whole session; several waits
+exceeded 30 minutes with no opening. The graph change adds only generic ops
+(`linearNoBias`, `add`, `mul`) already exercised on Metal by every other Laya
+training path, so it is expected to work, but that is inference, not a
+measurement.
