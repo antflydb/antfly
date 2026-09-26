@@ -1,5 +1,84 @@
 # Zig E2E flakes
 
+## 2026-09-25: progressive activation observations during admission maintenance
+
+[Main job 108330133910](https://github.com/antflydb/antfly/actions/runs/36213445604/job/108330133910)
+failed `test_progressive_index_is_semantically_queryable_before_full_coverage`:
+`semantic_title_live` retained `runtime_unavailable` beyond the five-second
+activation deadline while `semantic_progressive` continued serving its partial
+generation under provider throttling. Server output records the second index's
+native checkpoint installation followed by bounded-maintenance waiting. The
+job finished with 762 passed, one failed, and seven skipped.
+
+The compiled structural path discarded a fresh resident observation whenever
+its maintenance result was `busy`. The outer scheduler also published only
+when a plan group completed. This unnecessarily tied visibility of an installed
+index to completion of its admission maintenance. Fresh observations now pass
+through the existing leadership, catalog, physical-root, and exact-incarnation
+publication fences even when the group remains pending. Coverage, replay debt,
+and maintenance completion retain their own proofs; observing a runtime does
+not declare the index ready. A bounded quantum visits each initially pending
+group at most once, avoiding duplicate observations and repeated work when a
+busy group rotates back to the head of a small plan.
+
+Enrichment reconfiguration also joined an inline provider retry implemented as
+an ordinary executor sleep. Its delay could reach five seconds, and publishing
+shutdown to the runtime condition did not wake that separate sleep. Retry and
+interactive-yield waits now use a sticky lifecycle event with their original
+monotonic deadline. Teardown wakes them immediately, including a signal that
+arrives before wait admission; spurious wakes do not shorten or extend normal
+backoff. The event resets only when the preceding worker/replay owner has
+joined and a replacement starts. The same teardown entry point publishes
+provider cancellation, and provider admission rejects further dispatch after
+shutdown. The existing lifetime drain still waits for any callback already
+using runtime/provider-owned memory.
+
+A deterministic regression admits a 60-second backoff, signals teardown both
+before admission and while the event is actually waiting, and requires the
+owner to return. Restoring the original sleep makes this regression fail with
+`Timeout`; the fixed wait passes. The test also rejects provider admission
+after teardown. It is included in the enrichment ownership suite. All 12
+focused backoff, retry isolation, restart, and visibility regressions passed
+without skips, failures, or leaks.
+
+The deterministic compiled-owner regression forces busy maintenance with a
+fresh exact index observation, checks publication from the scheduler quantum,
+retains pending coverage and plan debt, and checks one visit per group. Missing
+observations remain blocked. All 30 compiled-owner source regressions passed
+without skips, failures, or leaks. The focused lifecycle/fence selection also
+passed 23 tests without skips, failures, or leaks. Ten unchanged-server local
+reproductions passed; they did not reproduce the original CI timeout. These
+results establish the publication and backoff-wakeup bugs, but the CI logs do
+not prove a sole cause of delay on that runner. The test's five-second
+activation deadline is unchanged.
+
+The final native CPU ReleaseFast build passed all 35 steps; a second build of
+the frozen source was fully cached. A frozen binary from `d23eeeb591`, including
+both activation fixes, atomic quantized preparation, and the merge of
+`origin/main` at `cc9be026f9`, passed **200/200** independent invocations through
+the repository flake loop (four workers, 50 repetitions each). All 200 JUnit
+cases passed with zero errors, failures, or skips. Recorded activation times
+were 67.7 ms median, 71.8 ms p95, and 75.4 ms maximum. These are local gate
+measurements, not evidence of a before/after latency improvement.
+
+Reproduction from the repository root, after building the native CPU binary:
+
+```sh
+SKIP_BUILD=1 ANTFLY_E2E_ENV_LOADED=1 \
+ANTFLY_E2E_REGRESSION_WORKERS=4 \
+ANTFLY_E2E_REGRESSION_REPEATS=50 \
+ANTFLY_E2E_REGRESSION_REPORT_DIR=/private/tmp/pr890-progressive-final-soak-200 \
+ANTFLY_BIN="$PWD/zig/zig-out/bin/antfly" \
+scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_quickstart.py::test_progressive_index_is_semantically_queryable_before_full_coverage
+```
+
+The validation run used a frozen copy of that binary at
+`/private/tmp/pr890-progressive-final-binary/antfly`. Local evidence is retained
+in `/private/tmp/pr890-progressive-final-soak-200.log`, the report directory
+above, `/private/tmp/pr890-progressive-final-soak-build.json` (binary/source
+hashes), and `/private/tmp/pr890-progressive-final-soak-summary.json`.
+
 ## 2026-09-25: main HA promotion retry and CPU inference diagnostics
 
 [Main run 36200131260](https://github.com/antflydb/antfly/actions/runs/36200131260)
@@ -28,7 +107,13 @@ weight lookup semantics, and ordinary matrix consumers retain preparation.
 Regressions cover exact row values, raw-only request accounting, reservation
 release, lazy handle pins, and later matrix preparation. Shared request
 reservations grow once when a matrix borrower needs a larger footprint; a
-denied growth does not add a borrower or leak its original charge. This removes
+denied growth does not add a borrower or leak its original charge. Matrix
+preparation now stages all new layouts and publishes them atomically. If a
+later allocation fails, only the newly allocated buffers are freed; existing
+layouts and raw rows survive, and retained-byte accounting remains exact. The
+allocation-failure regression checks both raw-only and already-prepared row
+layouts, then verifies a successful retry. Seven focused native gather and
+quantized-row tests passed without skips or leaks. This removes
 observed unnecessary work; it does not establish the exact cause of the CI timeout.
 
 The regression loop now selects the inference project's environment for
