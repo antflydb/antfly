@@ -44,9 +44,12 @@ Packing changes what the state tokens can see: they no longer attend to the
 question. A packed model therefore needs fine-tuned weights. The native
 trainer supports this, starting from a released checkpoint and optionally
 distilling from it (see [Training methodology](#training-methodology)).
-At equal training budget on LocalLLaMA/typed-decisions, a packed fine-tune
-matches an unpacked one (accuracy 0.574 vs 0.572) and trains 3.4× faster (see
-[Accuracy (step 0)](#accuracy-step-0)). Candidate mode is not yet qualified.
+On LocalLLaMA/typed-decisions, packed and unpacked fine-tunes at equal budget
+both reached ~0.57 accuracy in single runs, and packed training was 3.4×
+faster. Repeated seeds later showed this small recipe varies from 0.37 to
+0.57 accuracy by seed, so packed-versus-unpacked parity is not yet
+established (see [Accuracy (step 0)](#accuracy-step-0) and
+[Run-to-run variance](#run-to-run-variance)).
 
 ## Evidence and motivation
 
@@ -203,6 +206,12 @@ out-of-range lengths are rejected. The extraction API admits up to 255 labels
 per question. The model enforces its own limit: 20 unless the model is
 candidate-packed.
 
+`"weight_quantization": "q8_0"` (or `ANTFLY_LAYA_WEIGHT_QUANT=q8_0`) serves
+the encoder and decision-head linear weights as Q8_0, quantized from the
+dense checkpoint at load (`weight_source.quantizeDenseQ8_0`). Embeddings,
+norms, the type embedding, the scorer and the action head stay dense. See
+[Weight quantization](#weight-quantization-step-1d).
+
 ### Runtime
 
 | Piece | Location |
@@ -229,9 +238,14 @@ to callers.
 Backend status:
 
 - **CPU and Metal:** use the generic ModernBERT path with segment attention
-  (below).
+  (below). Its linears already run on resident weight slots.
+- **Packed decision head on Metal:** question-type embeddings are gathered on
+  the device, and marker and anchor rows are gathered and scored there. Only
+  the scorer logits (for the action head's confidence statistics) and the
+  action logits are read back, instead of the whole `[rows, dim]` hidden
+  state. CPU scores on the host.
 - **Fused Metal kernels:** the resident Laya kernels (`ops/laya_metal.zig`)
-  are not used for packed rows.
+  are not used for packed rows (see roadmap step 1c).
 - **CUDA:** does not select the Laya profile for packed configs, just as it
   does not for `max_len > 512`.
 
@@ -356,7 +370,9 @@ antfly inference finetune train laya job.json
    upstream would truncate keep their gold target, so the student is never
    taught a distribution computed from a different state. Provenance and
    hashes are written to `<output>.json`.
-3. **Train** with `packing` set and a held-out calibration split. Add
+3. **Train** with `packing` set and a held-out calibration split. Use
+   `"objective": "soft_ce"` for questions with many options: RLCD diverged
+   on 77-option Banking77. Add
    `freeze_layers` to trade adaptation of the lower encoder for step time. The RLCD
    objective is a strictly proper scoring reward with Gaussian logit
    exploration (`finetune/laya/objective.zig`). Soft CE is also supported.
@@ -406,11 +422,38 @@ serving pipeline (`antfly inference finetune eval laya <model> <records>`,
 | **Packed fine-tune** | packed | **0.574** | 1.026 | 0.063 | 0.471 | 0.605 / 0.480 / 0.667 | **56 min** |
 | Upstream `laya-typed-decisions` (`1a793eb`) | unpacked | 0.754 | 0.885 | 0.193 | 0.248 | 0.724 / 0.688 / 0.873 | — |
 
-**Result.** At equal data and optimizer budget, the packed model is within
-noise of the unpacked one on every metric. That is the gate: losing early
-fusion (the state no longer sees the question) did not cost accuracy here.
-Packed training took 3.4× less wall time, and packed evaluation processed
-2.6× fewer tokens (81,745 vs 211,125).
+**Result.** In these single runs (seed 42) the packed model matched the
+unpacked one on every metric. Packed training took 3.4× less wall time, and
+packed evaluation processed 2.6× fewer tokens (81,745 vs 211,125). Repeated
+seeds later showed that one run of this recipe cannot resolve a difference
+this small (next section). Parity is plausible but not established: it needs
+several seeds of each layout.
+
+### Run-to-run variance
+
+Measured 2026-09-25, same data, recipe and serving evaluator as step 0,
+packed question mode. Each row changes only the training seed.
+
+| Trainer | Seed 42 | Seed 43 | Seed 44 | Mean | SD |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Step-0 trainer (host slices) | 0.574 | 0.371 | 0.557 | 0.501 | 0.113 |
+| Current trainer | 0.434 | 0.461 | 0.455 | 0.450 | 0.014 |
+| Current, `freeze_layers: 11` | 0.518 | 0.545 | 0.472 | 0.512 | 0.037 |
+| Current, `freeze_layers: 18` | 0.464 | 0.491 | 0.464 | 0.473 | 0.016 |
+
+- **Seed spread dominates.** The identical step-0 trainer scores 0.574 or
+  0.371 depending on the seed. Seed 42 reproduces step 0 bit for bit.
+- **Current vs step-0 trainer.** They differ only in how strided slices run.
+  The current trainer takes them on the device and computes gradients closer
+  to float64 PyTorch on the released model (worst per-layer relative L2
+  error ~0.4–0.6% against ~0.7–1.2%, three ~330-token sequences). The mean
+  difference (0.05) is below one standard error (~0.07). Without head dropout
+  both give the same training curves over 200 steps (three seeds each).
+- **Frozen lower layers** cost no accuracy at this budget: freezing 11 of 28
+  encoder layers scored at or above full fine-tuning with the same trainer,
+  and trains 1.4× faster (7 instead of 10 minutes per run).
+- **Implication.** Accuracy claims about this recipe need several seeds. A
+  larger training set or more epochs would likely shrink the spread.
 
 **Caveats.**
 
@@ -422,6 +465,45 @@ Packed training took 3.4× less wall time, and packed evaluation processed
   so the layout change alone does not break the model.
 - **Candidate mode:** not yet qualified. Its target, Banking77, is still to
   run.
+
+### Candidate mode on Banking77 (step 0b)
+
+Measured 2026-09-26. `scripts/laya/prepare_laya_banking77.sh` downloads
+Banking77 (PolyAI, pinned commit) and writes one 77-way `choice` question per
+message: 20 train and 5 calibration examples per intent (1,540 and 385), and
+400 eval messages from the test split, all disjoint by normalized text.
+Antfly's unpacked pipeline caps choice questions at 20 options, so only a
+candidate-packed model can serve these. The unpacked reference is the
+released checkpoint scored with upstream's own code
+(`scripts/laya/laya_upstream_baseline.py`), which squeezes all 77 options into
+the fixed head budget.
+
+| Model | Training | Accuracy | Soft CE | ECE |
+| --- | --- | ---: | ---: | ---: |
+| Released `laya`, unpacked (upstream code) | zero-shot | 0.348 | — | — |
+| Upstream reported, released / `laya-typed-decisions` | zero-shot, their 400 cases | 0.425 / 0.492 | — | — |
+| Jev (published) | zero-shot | 0.870 | — | — |
+| Candidate-packed fine-tune, RLCD, seed 42 | 1 epoch | 0.015 (diverged) | 4.335 | 0.002 |
+| **Candidate-packed fine-tune, soft CE, seed 42** | 1 epoch | **0.828** | 0.822 | 0.083 |
+| Candidate-packed fine-tune, soft CE, seed 43 | 1 epoch | 0.810 | 0.851 | 0.109 |
+
+- **Candidate mode makes 77-way choice learnable.** Upstream attributes its
+  0.425 ceiling to the unpacked layout: 77 options share one fixed budget of
+  about 4 tokens each. With a branch per option the fine-tune reaches
+  0.819 mean over two seeds (0.828, 0.810).
+- **Not a like-for-like comparison.** The fine-tune saw 20 in-domain
+  examples per intent; the reference numbers, including Jev's, are
+  zero-shot. An unpacked fine-tune at equal budget is not possible here,
+  because the unpacked layout has no room for 77 options.
+- **RLCD diverges with 77 options.** Cross-entropy rose from 3.6 to 5.0 with
+  gradient norms in the thousands, then collapsed to uniform (ln 77 = 4.34).
+  A quarter of the learning rate did not help. The policy term's Gaussian
+  exploration over all 77 logits is too noisy at batch size 1. Soft CE trains
+  cleanly (gradient norms ~100). Use `"objective": "soft_ce"` for
+  many-option questions.
+- **Cost:** 1,540 training steps took ~30 minutes on Metal (~1.2 s per step
+  at ~370 tokens per row). Evaluating 400 decisions processed 147,764 tokens
+  in ~140 s.
 
 **Training throughput (as measured for step 0).** Steady state on this
 machine: ~5–6 s per unpacked decision, and ~6–9 s per packed case of five
@@ -547,6 +629,9 @@ All numbers are from 2026-09-24 on an Apple M4 Max (36 GiB), Zig 0.16.0.
 | f16 state cache against the full row | `pipelines/laya_packed_test.zig` | max logit error ≤ 5.5e-4 (CPU and Metal); f32 ≤ 1.7e-6 |
 | Framed Metal training: forward, objective and all 45 gradients match PyTorch | `finetune/laya/training_test.zig` | max error 1.9e-6 |
 | Frozen lower layers are exported bit-identical; trainable layers move | same | exact (CPU and Metal) |
+| q8_0 linears keep every decision; probabilities close to dense | `pipelines/laya_quantized_test.zig` | labels identical; max probability error 9e-7 (CPU), 5e-6 (Metal) on the fixture |
+| Metal linears read the current weight after it is replaced | `ops/resident_training_metal_test.zig` | exact; fails without the slot-cache fix |
+| Gradients on the released model vs float64 PyTorch, three ~330-token states | `training_test.zig` with a released-model fixture | worst per-layer relative L2 0.4–0.6% (float32) |
 | CPU segment kernel equals dense masked softmax (three ranges, window, fewer queries than keys) | `lib/linalg/src/attention.zig` | < 1e-5 |
 | Segment attention equals dense tree-masked attention on the session backend, all queries and branch queries only | `pipelines/laya_packed_test.zig` | 2.4e-7 (CPU), 3.6e-7 (Metal) |
 
@@ -617,8 +702,39 @@ How the numbers got here, all on the same machine and checkpoint:
   Metal and 740 ms on CPU. Removing the trunk's zero query rows brought it to
   66 ms and 331 ms.
 
+**Device scoring for packed rows (2026-09-25).** Scoring on the device
+instead of reading the hidden state back is exact and saves 2–4% at 16–64
+questions (for example 12 sentences, 64 questions: 406.8 → 399.5 ms packed,
+363.1 → 355.2 ms cached; 1 sentence, 64 questions: 259.6 → 249.9 ms), and
+nothing measurable below. The packed Metal path is now bound by encoder GPU
+work that the fused resident kernels would compute the same way. So routing
+packed rows through them (step 1c) is not expected to pay off on Metal.
+
 The full raw output of every run is in
 [`work-log/completed/inference/laya/2026-09-24-tree-packing.md`](../../../../../work-log/completed/inference/laya/2026-09-24-tree-packing.md).
+
+### Weight quantization (step 1d)
+
+Released `laya` (unpacked) on the 760 step-0 eval decisions through the
+serving evaluator, 2026-09-25, Apple M4 Max. Footprint is the process's peak
+memory footprint, which includes Metal allocations.
+
+| Weights | Backend | Accuracy | Soft CE | ECE | Peak footprint | Eval time |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| dense | Metal | 0.3868 | 1.3080 | 0.158 | 7.94 GB | 61 s |
+| q8_0 | Metal | 0.3842 | 1.3067 | 0.158 | **5.09 GB** | 67 s |
+| dense | CPU | 0.3868 | 1.3080 | 0.158 | 2.94 GB | 602 s |
+| q8_0 | CPU | 0.3855 | 1.3075 | 0.157 | 3.47 GB | 1,587 s |
+
+On Metal, q8_0 cuts memory by 36% at the same accuracy (two of 760
+decisions change) and is about 10% slower. On CPU it is currently a loss:
+the native q8_0 path keeps prepared layouts beside the quantized bytes, and
+its kernels are slower than the dense BLAS path for these shapes. CPU times
+overlapped with training runs, so treat them as indicative only. It does not
+meet the 5e-5 exact-serving bound and is not meant to; the fixture test
+requires identical labels and probabilities within 2e-2
+(`pipelines/laya_quantized_test.zig`). The fused resident Metal path reads
+dense weights, so a quantized checkpoint runs the generic encoder.
 
 ## Roadmap
 
@@ -626,11 +742,11 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 
 | Step | Retraining | Status | Gate |
 | --- | --- | --- | --- |
-| 0. Qualify packed accuracy | fine-tune | question mode passed on typed-decisions (packed 0.574 vs unpacked 0.572 at equal budget); candidate mode on Banking77 not run | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE |
+| 0. Qualify packed accuracy | fine-tune | question mode: single-seed parity on typed-decisions (0.574 vs 0.572), but the recipe varies 0.37–0.57 by seed, so parity needs several seeds of each layout. Candidate mode: Banking77 0.819 mean over two seeds (0.828, 0.810) with soft CE (RLCD diverges at 77 options) | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
 | 1a. State cache across rows and requests | no | done (CPU and Metal) | Exact against the full row and the oracle; follow-up questions skip trunk projections and feed-forward work |
 | 1b. Segment attention | no | done (CPU and Metal); multi-row calls not started | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call remain, which needs a per-row segment contract |
-| 1c. Metal and CUDA packed kernels | no | not started | Tree masks and explicit positions in the fused Metal and CUDA kernels (the generic Metal path, device cache, and in-stream row joins are done) |
-| 1d. Weight quantization (q8_0) | no | not started | Probability error within the existing 5e-5 qualification bound |
+| 1c. Metal and CUDA packed kernels | no | Metal: packed decisions scored on the device (2–4%); fused kernels not pursued (encoder GPU work dominates). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |
+| 1d. Weight quantization (q8_0) | no | done (CPU and Metal); pays off on Metal | Labels identical and probabilities within 2e-2 of dense on the fixture; on the released model, 36% less Metal memory at the same accuracy. CPU q8_0 kernels need work |
 | 2a. Long-context teacher (Qwen3.8-27B) | labels only | not started | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
 | 2b. Two-stage choice for many options | same fine-tune | not started | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. Measured on Banking77 |
 | 2c. 8k states | yes | not started | Memory-efficient attention in the training graph (today about 2k tokens at batch 1), `max_len` 8192 (ModernBERT's pretraining length), fine-tune on teacher-labelled long states |

@@ -92,3 +92,107 @@ question f16: max error 5.46e-4, hits=2 misses=1 bytes=23040
 candidate f32: max error 1.67e-6, hits=2 misses=1 bytes=46080
 candidate f16: max error 5.32e-4, hits=2 misses=1 bytes=23040
 ```
+
+## Seed variance, frozen layers and the device-slice question
+
+Step-0 recipe (packed question mode, `td/s0-*`), serving-evaluator accuracy on
+760 decisions. "Step-0 trainer" means `TERMITE_METAL_DISABLE_DEVICE_STRIDED_SLICE=1`,
+which is bit-identical to commit 0efff7fb83 for 80 steps (losses and gradient
+norms equal).
+
+```
+trainer           seed 42  seed 43  seed 44
+step-0 (host)     0.5737   0.3711   0.5566
+current           0.4342   0.4605   0.4553
+current fl=11     0.5184   0.5447   0.4724
+current fl=18     0.4645   0.4908   0.4645
+```
+
+Training CE, mean of each 100-step block (dropout 0.1):
+
+```
+current 42  [1.209, 1.176, 1.146, 1.127]
+current 43  [1.218, 1.123, 1.145, 1.175]
+current 44  [1.19, 1.176, 1.141, 1.143]
+step-0 42   [1.207, 1.08, 1.06, 1.039]
+step-0 43   [1.236, 1.198, 1.216, 1.223]
+step-0 44   [1.189, 1.119, 1.092, 1.048]
+```
+
+Without head dropout, 200 steps, CE per 50-step block:
+
+```
+current 42  [1.226, 1.209, 1.156, 1.152]
+current 44  [1.196, 1.147, 1.113, 1.127]
+step-0 42   [1.235, 1.179, 1.142, 1.119]
+step-0 43   [1.243, 1.214, 1.132, 1.13]
+step-0 44   [1.225, 1.158, 1.1, 1.133]
+```
+
+Gradient accuracy on the released model against float64 PyTorch
+(`laya_training_reference.py --precision float64` on three ~330-token real
+states, no dropout; the Zig parity test pointed at that fixture): worst
+per-layer relative L2 error 0.4-0.6% with device slices, 0.7-1.2% without.
+The step-1 gradient-norm difference between the two paths is 1e-4 relative
+without dropout and 6e-4 with it. A single example repeated six times at
+learning rate 1e-30 gives bit-identical gradients every step on both paths,
+so no state is corrupted across steps.
+
+Along the way the investigation found a real, unrelated bug: Metal dynamic
+linear slots cached a private copy of a weight keyed by its buffer address,
+and optimizer-replaced weights reuse addresses. Fixed in 88e2fadd2c with a
+regression test (fails without the fix: -1.75 where 6.5 is expected). The
+Laya trainer did not take that path; seed 42 is bit-identical before and
+after.
+
+## Weight quantization (released `laya`, unpacked, 760 decisions)
+
+```
+dense Metal  acc 0.3868 soft_ce 1.30796 footprint 7.94 GB  61 s
+q8_0  Metal  acc 0.3842 soft_ce 1.30668 footprint 5.09 GB  67 s
+dense CPU    acc 0.3868 soft_ce 1.30796 footprint 2.94 GB  602 s
+q8_0  CPU    acc 0.3855 soft_ce 1.30745 footprint 3.47 GB  1587 s (overlapped training)
+```
+
+## Packed benchmark, device scoring (Metal, ReleaseFast)
+
+`ANTFLY_LAYA_BACKEND=metal ANTFLY_LAYA_PACKED_BENCH=<laya> zig build test
+-Doptimize=ReleaseFast -- --test-filter "laya packed benchmark"`, before
+(6511538e46) and after (5583da02ff). Milliseconds, median of five warm requests.
+
+```
+state q   tokens unpacked  packed before->after  cached before->after
+(1,16)    446    168.0     105.4 -> 103.6        106.0 -> 103.1
+(1,64)    1694   513.1     259.6 -> 249.9        259.8 -> 249.3
+(4,16)    542    411.3     131.7 -> 128.4        128.2 -> 125.8
+(4,64)    1790   1490.2    305.5 -> 293.6        306.7 -> 297.7
+(12,1)    408    196.9     129.4 -> 129.2        73.7 -> 74.7
+(12,16)   798    1490.4    197.6 -> 193.7        145.9 -> 142.8
+(12,64)   2046   5528.6    406.8 -> 399.5        363.1 -> 355.2
+```
+
+## Environment notes
+
+Each fine-tune run writes ~8 GB (optimizer checkpoint plus exported model).
+About twenty runs filled the disk (3.6 GB free), which failed one checkpoint
+write and made memory pressure worse. Run scripts now delete checkpoints after
+evaluation. Two trainers running at once nearly exhausted memory; run one at
+a time.
+
+## Banking77, candidate mode (2026-09-26)
+
+`scripts/laya/prepare_laya_banking77.sh`, 1,540 train / 385 calibration /
+400 eval records (77-way choice). Serving-evaluator results on the 400:
+
+```
+released laya, unpacked, upstream code (laya_upstream_baseline.py)  acc 0.3475
+candidate fine-tune, rlcd, seed 42      acc 0.015  soft_ce 4.335 (diverged)
+candidate fine-tune, soft_ce, seed 42   acc 0.8275 soft_ce 0.8217 ece 0.083  train 1786 s
+candidate fine-tune, soft_ce, seed 43   acc 0.8100 soft_ce 0.8505 ece 0.109
+```
+
+RLCD CE per 200 steps: 3.612, 3.996, 5.002, 4.37, 4.345, 4.34, 4.346, 4.337
+(grad norms 1,255-2,064 early). 300-step diagnostics, CE per 50 steps:
+RLCD at a quarter of the learning rate 3.373, 3.124, 3.352, 2.617, 3.748,
+2.975 (grad norms 979-3,348); soft CE 3.851, 2.786, 2.392, 2.524, 2.126,
+2.291 (grad norms 93-291).
