@@ -251,6 +251,7 @@ type MatchNoneQuery struct {
 // one or two words match contained text across token separators. Three
 // or more words are rejected because the suffix index cannot verify
 // their word boundaries; lookups over 32 bytes are also rejected.
+// Nonzero or automatic fuzziness is rejected on substring fields; use a standalone fuzzy query instead.
 type MatchPhraseQuery struct {
 	Analyzer string `json:"analyzer,omitempty,omitzero"`
 

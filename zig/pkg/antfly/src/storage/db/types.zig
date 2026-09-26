@@ -2246,7 +2246,10 @@ pub fn cloneHighlights(alloc: Allocator, items: []const HighlightedField) ![]Hig
     if (items.len == 0) return &.{};
     const cloned = try alloc.alloc(HighlightedField, items.len);
     var initialized: usize = 0;
-    errdefer freeHighlights(alloc, cloned[0..initialized]);
+    errdefer {
+        for (cloned[0..initialized]) |*field| freeHighlightedField(alloc, field);
+        alloc.free(cloned);
+    }
     for (items, 0..) |item, i| {
         const field = try alloc.dupe(u8, item.field);
         errdefer alloc.free(field);

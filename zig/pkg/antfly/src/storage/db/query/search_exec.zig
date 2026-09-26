@@ -17701,6 +17701,9 @@ pub fn textQueryToSearchQuery(
         .match_phrase => |phrase| blk: {
             const analyzer = try resolveQueryAnalyzer(phrase.field, phrase.analyzer, text_analysis, runtime_schema);
             if (analyzer == &analysis_mod.substring_analyzer) {
+                // Joined suffixes cannot preserve per-word fuzzy phrase
+                // semantics. Reject the option rather than treating it as exact.
+                if (phrase.max_edits > 0 or phrase.auto_fuzzy) return error.InvalidArgument;
                 break :blk try substringPhraseToSearchQuery(alloc, phrase.field, phrase.text, phrase.boost);
             }
             break :blk .{ .phrase = .{
@@ -31219,4 +31222,77 @@ test "highlights resolve arbitrary mapped subfields to stored source" {
     try attachHighlights(alloc, .{}, &.{all_query}, &all, null, .{}, schema);
     try std.testing.expectEqual(@as(usize, 1), all[0].highlights.len);
     try std.testing.expectEqualStrings("title", all[0].highlights[0].field);
+}
+
+test "substring fuzzy phrases reject unsupported fuzziness and preserve fuzzy highlight queries" {
+    const alloc = std.testing.allocator;
+    const schema: runtime_schema_mod.TableSchema = .{ .full_text_documents = &.{.{ .name = "_default", .fields = &.{
+        .{ .path = "name", .emitted_name = "name", .analyzer = "substring" },
+    } }} };
+    const segment = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{.{ .key = "doc:1", .value = "{\"name\":\"Rag3Weaver\"}" }}, .{}, schema)).?;
+    defer alloc.free(segment);
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fuzzy = try textQueryToSearchQuery(arena, .{ .fuzzy = .{ .field = "name", .term = "g3wever", .max_edits = 1 } }, .{}, schema);
+    const fuzzy_filter = try search_mod.searchQueryToFilterArena(arena, fuzzy);
+    var fuzzy_hits = try fuzzy_filter.execute(alloc, &writer.snapshot().segments[0]);
+    defer fuzzy_hits.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fuzzy_hits.cardinality());
+    const exact_phrase = try textQueryToSearchQuery(arena, .{ .match_phrase = .{ .field = "name", .text = "g3weaver" } }, .{}, schema);
+    const exact_filter = try search_mod.searchQueryToFilterArena(arena, exact_phrase);
+    var exact_hits = try exact_filter.execute(alloc, &writer.snapshot().segments[0]);
+    defer exact_hits.deinit();
+    try std.testing.expectEqual(@as(usize, 1), exact_hits.cardinality());
+    for ([_]types.TextQuery{
+        .{ .match_phrase = .{ .field = "name", .text = "g3wever", .max_edits = 1 } },
+        .{ .match_phrase = .{ .field = "name", .text = "rag3 wever", .max_edits = 2 } },
+        .{ .match_phrase = .{ .field = "name", .text = "g3wever", .auto_fuzzy = true } },
+    }) |query| {
+        try std.testing.expectError(error.InvalidArgument, textQueryToSearchQuery(arena, query, .{}, schema));
+        // Analyzer overrides and generated companions follow the same rule.
+        const configured: introducer_mod.TextAnalysisConfig = .{ .field_analyzers = &.{.{ .field_name = "name", .analyzer_name = "substring" }} };
+        try std.testing.expectError(error.InvalidArgument, textQueryToSearchQuery(arena, query, configured, null));
+        var companion = query;
+        companion.match_phrase.field = "name._substring";
+        const companion_config: introducer_mod.TextAnalysisConfig = .{ .field_analyzers = &.{.{ .field_name = "name._substring", .analyzer_name = "substring" }} };
+        try std.testing.expectError(error.InvalidArgument, textQueryToSearchQuery(arena, companion, companion_config, null));
+    }
+    // Ordinary fuzzy phrase support remains available on analyzed text.
+    const standard = try textQueryToSearchQuery(arena, .{ .match_phrase = .{ .field = "title", .text = "hello world", .max_edits = 1 } }, .{}, null);
+    try std.testing.expectEqual(@as(u8, 1), standard.phrase.max_edits);
+}
+
+test "highlight cloning cleans up every allocation failure and owns copied data" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            var spans = [_]types.HighlightSpan{.{ .start = 0, .end = 5 }};
+            var fragments = [_]types.HighlightFragment{
+                .{ .text = @constCast("hello world"), .offset = 0, .spans = &spans },
+                .{ .text = @constCast("hello again"), .offset = 12, .item = 1, .spans = &spans },
+            };
+            var fields = [_]types.HighlightedField{
+                .{ .field = @constCast("title"), .fragments = &fragments },
+                .{ .field = @constCast("body"), .fragments = &fragments },
+            };
+            const cloned = try types.cloneHighlights(alloc, &fields);
+            defer types.freeHighlights(alloc, cloned);
+            try std.testing.expectEqual(@as(usize, 2), cloned.len);
+            try std.testing.expectEqualStrings("body", cloned[1].field);
+            try std.testing.expectEqualStrings("hello again", cloned[1].fragments[1].text);
+            try std.testing.expectEqual(@as(?u32, 1), cloned[1].fragments[1].item);
+            try std.testing.expectEqual(@as(u32, 12), cloned[1].fragments[1].offset);
+            try std.testing.expect(cloned[0].field.ptr != fields[0].field.ptr);
+            try std.testing.expect(cloned[0].fragments[0].text.ptr != fragments[0].text.ptr);
+            spans[0].end = 3;
+            try std.testing.expectEqual(@as(u32, 5), cloned[0].fragments[0].spans[0].end);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    const empty = try types.cloneHighlights(std.testing.allocator, &.{});
+    defer types.freeHighlights(std.testing.allocator, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }

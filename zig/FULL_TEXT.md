@@ -96,7 +96,10 @@ Query lowering in `search_exec.zig` recognizes fields whose resolved analyzer is
 (`unicode_words → lowercase`) and join each adjacent pair of tokens. `match`
 and `prefix` emit one prefix lookup per pair conjoined in a `bool_query`.
 `match_phrase` with three or more words is rejected because the suffix index
-cannot prove word boundaries across that many words. A pair longer than 32 bytes
+cannot prove word boundaries across that many words. Nonzero or automatic
+fuzziness on substring `match_phrase` is also rejected: the joined suffix index
+cannot verify per-word fuzzy phrase semantics. Standalone `fuzzy` queries
+continue to match the suffix dictionary with edit distance. A pair longer than 32 bytes
 is also rejected because the suffix dictionary cannot verify the remaining bytes.
 A single-byte query lowers to `match_none` because one-byte
 suffixes are never indexed; that is the guard against the "two characters match
