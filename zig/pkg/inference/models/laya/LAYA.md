@@ -44,12 +44,11 @@ Packing changes what the state tokens can see: they no longer attend to the
 question. A packed model therefore needs fine-tuned weights. The native
 trainer supports this, starting from a released checkpoint and optionally
 distilling from it (see [Training methodology](#training-methodology)).
-On LocalLLaMA/typed-decisions, packed and unpacked fine-tunes at equal budget
-both reached ~0.57 accuracy in single runs, and packed training was 3.4×
-faster. Repeated seeds later showed this small recipe varies from 0.37 to
-0.57 accuracy by seed, so packed-versus-unpacked parity is not yet
-established (see [Accuracy (step 0)](#accuracy-step-0) and
-[Run-to-run variance](#run-to-run-variance)).
+On LocalLLaMA/typed-decisions, packed question mode loses accuracy at equal
+training budget: 0.450 against 0.621 unpacked over three seeds (see
+[Packed vs unpacked at equal budget](#packed-vs-unpacked-at-equal-budget-2026-09-26)).
+An earlier single-seed parity result did not hold up. Candidate mode learns
+77-way Banking77 (0.819), which the unpacked layout cannot express.
 
 ## Evidence and motivation
 
@@ -496,14 +495,14 @@ number is this same metric):
 
 Fused attention has *fewer* tensors over the strict per-tensor threshold
 than dense in both backends, but its single worst tensor is somewhat higher
-(4.1-4.3% vs 2.3-4.0%). Neither is close to the previously-documented
-0.4-0.6% band; since dense (byte-for-byte unchanged code, same tolerance)
-shows the same order of magnitude, the fixture (or the released checkpoint
-it pins) has likely drifted since that number was recorded, independent of
-this track. Fused attention is not a regression relative to dense on the
-fixture as it exists today, but the 0.4-0.6% band itself needs
-re-establishing (rerun `scripts/laya/prepare_laya_fixtures.sh` against
-pinned revisions and compare) before it can gate anything again.
+(4.1-4.3% vs 2.3-4.0%). A dense-only re-measurement on the merged branch
+(2026-09-26) gives the same picture: worst over `encoder.layers.*` weights
+4.0% (CPU) and 4.1% (Metal), concentrated in the norm weights. The fixture
+has not drifted: an earlier "0.4-0.6%" figure in this document was misread
+from a partial printout of the mismatches and is withdrawn. The per-tensor
+gate in this test is tuned for the tiny synthetic fixture and does not fit
+the 28-layer model; use the worst relative L2 over `encoder.layers.*` as the
+statistic instead.
 
 **Packed job training-vs-serving, and the eval dropout leak.**
 `training_packed_test.zig`'s "converts an unpacked checkpoint into a served
@@ -750,16 +749,43 @@ packed question mode. Each row changes only the training seed.
 - **Seed spread dominates.** The identical step-0 trainer scores 0.574 or
   0.371 depending on the seed. Seed 42 reproduces step 0 bit for bit.
 - **Current vs step-0 trainer.** They differ only in how strided slices run.
-  The current trainer takes them on the device and computes gradients closer
-  to float64 PyTorch on the released model (worst per-layer relative L2
-  error ~0.4–0.6% against ~0.7–1.2%, three ~330-token sequences). The mean
-  difference (0.05) is below one standard error (~0.07). Without head dropout
+  The current trainer takes them on the device. Both paths show a worst
+  per-tensor gradient error of about 4% against float64 PyTorch on the
+  released model (norm weights; an earlier, smaller figure here was a
+  misreading). The mean accuracy difference (0.05) is below one standard
+  error (~0.07). Without head dropout
   both give the same training curves over 200 steps (three seeds each).
 - **Frozen lower layers** cost no accuracy at this budget: freezing 11 of 28
   encoder layers scored at or above full fine-tuning with the same trainer,
   and trains 1.4× faster (7 instead of 10 minutes per run).
 - **Implication.** Accuracy claims about this recipe need several seeds. A
   larger training set or more epochs would likely shrink the spread.
+
+### Packed vs unpacked at equal budget (2026-09-26)
+
+Same current trainer, data, recipe (RLCD, 1 epoch, batch 1; unpacked with
+gradient accumulation 5 so every update sees five decisions) and serving
+evaluator. Three seeds each on the step-0 recipe, one seed on a larger one
+(915 training cases, 1,840 eval decisions from `*-fit.jsonl`):
+
+| Recipe | Layout | Seeds | Accuracy | Mean | SD | Soft CE | ECE |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| Step-0 (400 cases) | packed | 42 / 43 / 44 | 0.434 / 0.461 / 0.455 | **0.450** | 0.014 | 1.129 | 0.049 |
+| Step-0 (400 cases) | unpacked | 42 / 43 / 44 | 0.599 / 0.628 / 0.637 | **0.621** | 0.020 | 0.983 | 0.088 |
+| Larger (915 cases) | packed | 42 | 0.471 | — | — | 1.097 | — |
+| Larger (915 cases) | unpacked | 42 | 0.671 | — | — | 0.946 | 0.105 |
+
+**The step-0 gate fails.** At equal data and optimizer budget, question-mode
+packing costs about 0.17 accuracy on typed-decisions, well outside the seed
+spread, and more data does not close the gap (0.20 on the larger recipe).
+The original single-seed parity (0.574 vs 0.572) was a lucky packed run.
+Losing early fusion (the state no longer attends to the question) matters on
+this dataset. Packed serving stays much cheaper, and candidate mode still
+learns 77-way Banking77 (0.819), where no unpacked layout can fit the
+options. Before packed question mode is used for accuracy-sensitive
+decisions it needs a recipe that closes this gap, for example distilling
+from an unpacked teacher (`prepare_laya_packed_distillation.py`), a longer
+schedule, or letting the trunk see a summary of the questions.
 
 **Caveats.**
 
@@ -1018,6 +1044,28 @@ Segment attention in the training graph landed with step 2c (below). Batching st
 implemented ([LoRA](#lora)); its own step-time, memory, and accuracy numbers
 are below.
 
+### Half-precision training (not adopted)
+
+An opt-in f16 path (half operands with f32 accumulation through MPS for
+every linear's forward and backward matmuls, f32 master weights and
+optimizer state) was built and measured on 2026-09-26 and **not merged**:
+
+- **Not faster:** 1.357 s against 1.312 s median step on `td/prof.json`
+  (3-4% slower); the per-matmul casts cost more than the half GEMMs save.
+- **Not correct at full depth:** worst relative gradient error over
+  `encoder.layers.*` rose from 2.25% (f32) to 353% against float64 PyTorch,
+  although each isolated half GEMM was within 0.1%. Without loss scaling the
+  error compounds over ~340 matmuls per step.
+- **Caching the half weights per step was unsafe:** keyed on buffer address,
+  it served stale casts after Metal reused a freed activation's address
+  within a frame. Half operands for the batched attention matmuls diverged
+  within four steps.
+
+A future attempt needs loss scaling or bf16, per-layer precision choices
+validated against the float64 gradient check, and a weight cache keyed on
+the binding rather than the buffer address. Branch
+`laya/half-precision-training` keeps the attempt.
+
 ### LoRA throughput and accuracy
 
 LoRA does not shrink the forward graph (every targeted linear still computes
@@ -1209,7 +1257,7 @@ All numbers are from 2026-09-24 on an Apple M4 Max (36 GiB), Zig 0.16.0.
 | Full `--test-filter laya` suite unaffected by widening `training.frozen`'s signature and `architecture.build`'s parameter list | all laya tests | 64 selected, 56 passed, 0 failed (8 skipped: CUDA, packed benchmark, export-reference — unrelated to this track), CPU and Metal, including the 45-tensor PyTorch gradient parity test (max abs error 2.4e-6 native / 1.9e-6 resident Metal, unchanged from before this track) |
 | q8_0 linears keep every decision; probabilities close to dense | `pipelines/laya_quantized_test.zig` | labels identical; max probability error 9e-7 (CPU), 5e-6 (Metal) on the fixture |
 | Metal linears read the current weight after it is replaced | `ops/resident_training_metal_test.zig` | exact; fails without the slot-cache fix |
-| Gradients on the released model vs float64 PyTorch, three ~330-token states | `training_test.zig` with a released-model fixture | worst per-layer relative L2 0.4–0.6% (float32) |
+| Gradients on the released model vs float64 PyTorch, three ~330-token states | `training_test.zig` with a released-model fixture | worst relative L2 over `encoder.layers.*` weights 4.0% (CPU), 4.1% (Metal), largest in norm weights (float32) |
 | CPU segment kernel equals dense masked softmax (three ranges, window, fewer queries than keys) | `lib/linalg/src/attention.zig` | < 1e-5 |
 | Segment attention equals dense tree-masked attention on the session backend, all queries and branch queries only | `pipelines/laya_packed_test.zig` | 2.4e-7 (CPU), 3.6e-7 (Metal) |
 | Multi-row coalescing: no token of one state's tree is visible from another's; a batched call over several states equals each state's row run alone (question and candidate modes) | same, "laya multi-row coalescing isolates independent states and matches running them alone" | max probability error < 1e-5 (CPU and Metal) |
@@ -1500,7 +1548,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 
 | Step | Retraining | Status | Gate |
 | --- | --- | --- | --- |
-| 0. Qualify packed accuracy | fine-tune | question mode: single-seed parity on typed-decisions (0.574 vs 0.572), but the recipe varies 0.37–0.57 by seed, so parity needs several seeds of each layout. Candidate mode: Banking77 0.819 mean over two seeds (0.828, 0.810) with soft CE (RLCD diverges at 77 options) | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
+| 0. Qualify packed accuracy | fine-tune | question mode **fails** the gate: 0.450 packed vs 0.621 unpacked over three seeds at equal budget (0.471 vs 0.671 on a larger recipe). Candidate mode: Banking77 0.819 mean over two seeds with soft CE | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
 | 1a. State cache across rows and requests | no | done (CPU and Metal) | Exact against the full row and the oracle; follow-up questions skip trunk projections and feed-forward work |
 | 1b. Segment attention | no | done (CPU and Metal); multi-row batching done (CPU and Metal, question and candidate modes) | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call: exact against running each row alone, isolated by construction; not yet composed with the trunk cache |
 | 1c. Metal and CUDA packed kernels | no | Metal: fused kernels not pursued (encoder GPU work dominates; device scoring gave 2–4% and was reverted after a race). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |

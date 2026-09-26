@@ -133,6 +133,9 @@ Gradient accuracy on the released model against float64 PyTorch
 (`laya_training_reference.py --precision float64` on three ~330-token real
 states, no dropout; the Zig parity test pointed at that fixture): worst
 per-layer relative L2 error 0.4-0.6% with device slices, 0.7-1.2% without.
+**Correction (2026-09-26):** these figures were read from a partial printout
+of the mismatches. The worst relative L2 over `encoder.layers.*` weights is
+4.0% (CPU) and 4.1% (Metal), largest in the norm weights, on both paths.
 The step-1 gradient-norm difference between the two paths is 1e-4 relative
 without dropout and 6e-4 with it. A single example repeated six times at
 learning rate 1e-30 gives bit-identical gradients every step on both paths,
@@ -497,3 +500,16 @@ attempted: they need strictly more memory than a 2k run that already used
 explicit guidance. The recipe and reduced-step job configs are ready to
 rerun once the machine has headroom; `vm_stat` is worth checking
 immediately before doing so.
+
+## Packed vs unpacked at equal budget (2026-09-26)
+
+Current trainer, RLCD, 1 epoch, batch 1, unpacked with gradient accumulation
+5. Serving-evaluator accuracy / soft CE / ECE.
+
+```
+step-0 (400 cases, 760 eval)   packed    42 0.434  43 0.461  44 0.455   mean 0.450 sd 0.014  soft_ce 1.129 ece 0.049
+step-0 (400 cases, 760 eval)   unpacked  42 0.599  43 0.628  44 0.637   mean 0.621 sd 0.020  soft_ce 0.983 ece 0.088
+larger (915 cases, 1840 eval)  packed    42 0.471  soft_ce 1.097
+larger (915 cases, 1840 eval)  unpacked  42 0.671  soft_ce 0.946 ece 0.105
+unpacked train time 1426-1750 s, packed larger 1194 s
+```
