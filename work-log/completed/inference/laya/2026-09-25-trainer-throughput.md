@@ -513,3 +513,14 @@ larger (915 cases, 1840 eval)  packed    42 0.471  soft_ce 1.097
 larger (915 cases, 1840 eval)  unpacked  42 0.671  soft_ce 0.946 ece 0.105
 unpacked train time 1426-1750 s, packed larger 1194 s
 ```
+
+## Distilling packed question mode from an unpacked teacher (2026-09-26)
+
+```
+teacher: unpacked fine-tune, s0-train, seed 42, gradient_accumulation 5   acc 0.599 soft_ce 0.988 ece 0.065  1393 s
+labels:  prepare_laya_packed_distillation.py --gold-weight 0.5, 2000/2000 records distilled
+students (packed question, RLCD, 1 epoch, s0-train-distilled):
+  seed 42 acc 0.464   seed 43 acc 0.433   seed 44 acc 0.455   mean 0.451  soft_ce 1.135  ece 0.033
+  per type (42/43/44): choice 0.368/0.364/0.360  score 0.424/0.362/0.408  noul 0.614/0.596/0.614
+reference: packed on gold 0.450 (0.434/0.461/0.455); unpacked on gold 0.621 (0.599/0.628/0.637)
+```

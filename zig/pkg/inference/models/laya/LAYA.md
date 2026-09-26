@@ -783,9 +783,25 @@ Losing early fusion (the state no longer attends to the question) matters on
 this dataset. Packed serving stays much cheaper, and candidate mode still
 learns 77-way Banking77 (0.819), where no unpacked layout can fit the
 options. Before packed question mode is used for accuracy-sensitive
-decisions it needs a recipe that closes this gap, for example distilling
-from an unpacked teacher (`prepare_laya_packed_distillation.py`), a longer
-schedule, or letting the trunk see a summary of the questions.
+decisions it needs a recipe that closes this gap.
+
+**Distillation does not close it.** An unpacked fine-tune on the same data
+(seed 42: 0.599 accuracy, soft CE 0.988) labelled the step-0 training
+records, blended 50/50 with gold (`prepare_laya_packed_distillation.py`,
+all 2,000 records), and packed students trained on those targets:
+
+| Packed student | Seed 42 | Seed 43 | Seed 44 | Mean | Soft CE | ECE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Gold targets | 0.434 | 0.461 | 0.455 | 0.450 | 1.129 | 0.049 |
+| Distilled targets | 0.464 | 0.433 | 0.455 | 0.451 | 1.135 | 0.033 |
+
+Only calibration improves. Both layouts take the same 400 optimizer updates
+on the same cases, so the gap is not about the targets: without the question
+in view, the state encoding cannot carry what the unpacked model uses. The
+remaining options are architectural (let the trunk see the questions, giving
+up exact trunk reuse across question sets) or to keep question-mode packing
+for cost-sensitive uses and route accuracy-sensitive decisions to the
+unpacked layout.
 
 **Caveats.**
 
