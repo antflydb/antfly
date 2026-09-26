@@ -727,14 +727,91 @@ memory footprint, which includes Metal allocations.
 | q8_0 | CPU | 0.3855 | 1.3075 | 0.157 | 3.47 GB | 1,587 s |
 
 On Metal, q8_0 cuts memory by 36% at the same accuracy (two of 760
-decisions change) and is about 10% slower. On CPU it is currently a loss:
-the native q8_0 path keeps prepared layouts beside the quantized bytes, and
-its kernels are slower than the dense BLAS path for these shapes. CPU times
+decisions change) and is about 10% slower. On CPU it was originally a loss:
+the native q8_0 path kept prepared layouts beside the quantized bytes, and
+its kernels were slower than the dense BLAS path for these shapes. CPU times
 overlapped with training runs, so treat them as indicative only. It does not
 meet the 5e-5 exact-serving bound and is not meant to; the fixture test
 requires identical labels and probabilities within 2e-2
 (`pipelines/laya_quantized_test.zig`). The fused resident Metal path reads
 dense weights, so a quantized checkpoint runs the generic encoder.
+
+**CPU kernel fix (2026-09-26).** Two problems explained the CPU loss:
+
+- **Wrong kernel selected.** `native_compute.zig` already has a
+  dequant-once-then-Accelerate-SGEMM fast path for other quantized
+  architectures (GLiNER, CLIP/CLAP), gated by weight-name heuristics. Laya's
+  ModernBERT-encoder and decision-head linears matched none of them, so every
+  Laya Q8_0 linear fell back to the native int8 dot-product kernel, which
+  loses to Accelerate's SGEMM (used by the dense path) at Laya's shapes (rows
+  in the hundreds to low thousands, `out_dim` 1024-5248).
+- **Triple-counted memory.** The native kernel's on-first-use preparation
+  (`prepareNativeQuantizedStorage`) keeps three representations of the same
+  weight once a Laya linear is touched: the raw compressed bytes, a
+  row-major "prepared" copy, and a 4-row panel copy for the int8 kernel.
+  Each is close to the size of the compressed weight, so the three together
+  land close to the size of the *dense* f32 weight — explaining why the
+  table above shows q8_0 CPU footprint (3.47 GB) larger than dense
+  (2.94 GB) despite Q8_0 packing to about 1/4 the bytes of f32.
+
+The fix (`ops/native_compute.zig`): a dedicated `shouldUseLayaDequantSgemm`
+predicate routes Laya's encoder/head linears through a transient
+dequantize-into-scratch-buffer-then-SGEMM path (`layaDequantScratchSgemm`),
+reusing the same `dispatchSgemmTransB` call the dense path uses; the scratch
+buffer is freed every call, so no persistent dense mirror is kept (unlike the
+GLiNER/ClipClap path, which caches dequantized weights up to a 512 MB budget
+that would not fit Laya's ~330 M encoder parameters). `loadWeight` skips
+`ensurePreparedKBlock` for the same weight names, so the row-major/panel
+copies are never built at all: CPU footprint should now be dominated by the
+compressed Q8_0 bytes alone (about 1/4 of dense f32) plus one small reused
+scratch buffer.
+
+One subtlety cost a wasted first attempt and is worth recording: the natural
+predicate to reuse is `models/laya.zig`'s `quantizedLinear`, which is exactly
+right for *checkpoint* tensor names (`"encoder.layers.N...."`,
+`"head.layers.N...."`). But by the time a weight reaches CPU kernel dispatch,
+`session_factory.normalizeWeightKey` has already rewritten those to runtime
+keys (`"model.layers.N...."` for the encoder, `"model.head.layers.N...."` for
+the head — see `laya_head.weight`). A predicate built on the checkpoint name
+space silently never fires at dispatch time. `shouldUseLayaDequantSgemm`
+matches the runtime key space instead, with a unit test
+(`"laya dequant sgemm predicate matches normalized runtime keys, not
+checkpoint names"`) pinning both spellings so this cannot regress silently
+again.
+
+**Verification.** `--test-filter "laya"` passes on both CPU and Metal (52 of
+60 selected tests; the rest are CUDA-only, benchmark-only, or optional-path
+skips), including the existing `pipelines/laya_quantized_test.zig` parity
+test (max probability error ~1e-6 on each backend, well inside the 2e-2
+gate) and two new `ops/native_compute.zig` tests: the naming-contract test
+above, and an end-to-end test that dispatches a Laya-named Q8_0 linear and
+checks both that it takes the dequant+SGEMM path (via the dispatch counter)
+and that `QuantizedStorage.prepared.ownedBytes()` stays 0 afterward. The
+generic `--test-filter "q8_0"` kernel suite (30 tests covering GLiNER,
+CLIP/CLAP, and general GGUF Q8_0/Q8_1 decode) is unchanged, since the new
+path only activates for Laya's specific runtime weight-name patterns.
+
+**Not yet re-measured.** This session could not get a clean ReleaseFast
+timing/footprint run: the shared build/GPU lock was held continuously by
+other agents' training and evaluation runs for over an hour (a lock-policy
+change mid-session, separating `gpu` holds from `build` holds, did not free
+it — the in-flight holder had already committed to the old combined-hold
+behavior for its own lifetime). The table above therefore still shows the
+pre-fix CPU numbers. Re-run with:
+
+```bash
+~/bin/zig build -Doptimize=ReleaseFast --prefix <dir>
+ANTFLY_LAYA_WEIGHT_QUANT=q8_0 <dir>/bin/antfly-inference finetune eval laya \
+  <laya-released-dir> <records.jsonl> --backend native
+/usr/bin/time -l <same command>   # peak footprint
+```
+
+Expected direction, not yet confirmed: CPU eval time close to or better than
+dense (same SGEMM call, dequant cost is `O(out_dim * in_dim)` per linear
+against `O(rows * out_dim * in_dim)` SGEMM flops, negligible at Laya's row
+counts), and CPU peak footprint close to dense minus roughly 3/4 of the
+encoder+head linear weight bytes (no persistent dense mirror, no triple-kept
+quantized copies).
 
 ## Roadmap
 
@@ -746,7 +823,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 | 1a. State cache across rows and requests | no | done (CPU and Metal) | Exact against the full row and the oracle; follow-up questions skip trunk projections and feed-forward work |
 | 1b. Segment attention | no | done (CPU and Metal); multi-row calls not started | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call remain, which needs a per-row segment contract |
 | 1c. Metal and CUDA packed kernels | no | Metal: packed decisions scored on the device (2–4%); fused kernels not pursued (encoder GPU work dominates). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |
-| 1d. Weight quantization (q8_0) | no | done (CPU and Metal); pays off on Metal | Labels identical and probabilities within 2e-2 of dense on the fixture; on the released model, 36% less Metal memory at the same accuracy. CPU q8_0 kernels need work |
+| 1d. Weight quantization (q8_0) | no | done (CPU and Metal); pays off on Metal; CPU kernel fixed (dequant+SGEMM, no triple-kept prepared copies) but not yet re-measured on ReleaseFast | Labels identical and probabilities within 2e-2 of dense on the fixture; on the released model, 36% less Metal memory at the same accuracy. CPU: re-measure throughput and footprint after the 2026-09-26 kernel fix |
 | 2a. Long-context teacher (Qwen3.8-27B) | labels only | not started | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
 | 2b. Two-stage choice for many options | same fine-tune | not started | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. Measured on Banking77 |
 | 2c. 8k states | yes | not started | Memory-efficient attention in the training graph (today about 2k tokens at batch 1), `max_len` 8192 (ModernBERT's pretraining length), fine-tune on teacher-labelled long states |

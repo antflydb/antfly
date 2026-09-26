@@ -674,6 +674,95 @@ fn shouldUseClipClapDequantSgemm(
         std.mem.endsWith(u8, name, ".output.dense.weight");
 }
 
+/// Laya (LAYA.md "Weight quantization (step 1d)") serves ModernBERT encoder
+/// and decision-head linears as Q8_0. Their shapes (rows in the hundreds to
+/// low thousands, out_dim >= 512) make Accelerate's SGEMM much faster than
+/// the native int8 dot-product kernel, and dequantizing straight from the
+/// compressed bytes into a scratch buffer that is freed every call avoids
+/// keeping the row-major/panel prepared copies (each roughly the size of the
+/// compressed weight) that the native kernel needs. This path is gated on
+/// Laya's own weight names, so no other quantized model's behavior changes.
+///
+/// `models/laya.zig`'s `quantizedLinear` checks *checkpoint* tensor names
+/// ("encoder.layers.N...", "head.layers.N..."). The weight buffer names seen
+/// here are the runtime keys `normalizeWeightKey` produces for the
+/// modern_bert Laya profile: "encoder." is rewritten to "model." for the
+/// encoder, and "model." is prepended unconditionally for the head (see
+/// `session_factory.normalizeWeightKey`, `laya_head.weight`). Mirror the
+/// same suffix lists against those runtime prefixes.
+fn shouldUseLayaDequantSgemm(name: []const u8) bool {
+    const encoder = [_][]const u8{ ".attn.Wqkv.weight", ".attn.Wo.weight", ".mlp.Wi.weight", ".mlp.Wo.weight" };
+    const head = [_][]const u8{ ".self_attn.in_proj_weight", ".self_attn.out_proj.weight", ".linear1.weight", ".linear2.weight" };
+    if (std.mem.startsWith(u8, name, "model.layers.")) {
+        for (encoder) |suffix| if (std.mem.endsWith(u8, name, suffix)) return true;
+    } else if (std.mem.startsWith(u8, name, "model.head.layers.")) {
+        for (head) |suffix| if (std.mem.endsWith(u8, name, suffix)) return true;
+    }
+    return false;
+}
+
+fn layaDequantSgemmSupported(storage: *const QuantizedStorage, in_dim: usize, out_dim: usize) bool {
+    if (storage.shape.len != 2 or storage.shape[0] != out_dim or storage.shape[1] != in_dim) return false;
+    const known = switch (storage.tensor_type) {
+        .known => |value| value,
+        else => return false,
+    };
+    return dequantSgemmSupportedQuant(known);
+}
+
+fn layaDequantScratchSgemm(
+    self: *NativeCompute,
+    storage: *const QuantizedStorage,
+    input: []const f32,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    beta: f32,
+) !bool {
+    if (!layaDequantSgemmSupported(storage, in_dim, out_dim)) return false;
+    const dequant_start = nativeQuantPhaseStart();
+    const scratch = try self.allocator.alloc(f32, out_dim * in_dim);
+    defer self.allocator.free(scratch);
+    try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, scratch);
+    noteNativeQuantDispatch(.dequant_sgemm);
+    noteNativeQuantPhase(.dequant_fetch, dequant_start);
+    const sgemm_start = nativeQuantPhaseStart();
+    try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input, scratch, beta, output);
+    noteNativeQuantPhase(.dequant_sgemm_compute, sgemm_start);
+    return true;
+}
+
+fn tryLayaDequantSgemmNoBias(
+    self: *NativeCompute,
+    storage: *const QuantizedStorage,
+    input: []const f32,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    return layaDequantScratchSgemm(self, storage, input, output, rows, in_dim, out_dim, 0.0);
+}
+
+fn tryLayaDequantSgemmBias(
+    self: *NativeCompute,
+    storage: *const QuantizedStorage,
+    input: []const f32,
+    bias: []const f32,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (!layaDequantSgemmSupported(storage, in_dim, out_dim)) return false;
+    const bias_row = bias[0..out_dim];
+    for (0..rows) |row| {
+        @memcpy(output[row * out_dim ..][0..out_dim], bias_row);
+    }
+    return layaDequantScratchSgemm(self, storage, input, output, rows, in_dim, out_dim, 1.0);
+}
+
 fn shouldUseQuantizedDequantSgemm(
     name: []const u8,
     rows: usize,
@@ -5048,7 +5137,12 @@ fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
 fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
     if (self.data.resident_weights.getPtr(name)) |w| {
         if (w.quantized_storage) |*storage| {
-            try ensurePreparedKBlock(self, storage, null);
+            // Laya's Q8_0 linears (LAYA.md 1d) go through the dequant+SGEMM
+            // path (`shouldUseLayaDequantSgemm`), which reads `raw_bytes`
+            // directly. Skip building the row-major/panel prepared copies
+            // the native int8 kernel needs: each is roughly the size of the
+            // compressed weight, and Laya never dispatches to that kernel.
+            if (!shouldUseLayaDequantSgemm(name)) try ensurePreparedKBlock(self, storage, null);
             const view = if (w.tensor.data.len > 0)
                 try tensorF32View(self, &w.tensor)
             else
@@ -5936,6 +6030,9 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
     if (self.quantized_activation_policy == .strict_f32) return dispatchQuantizedLinearStrictF32(request);
     switch (request.kind) {
         .single_no_bias => {
+            if (shouldUseLayaDequantSgemm(request.name_a)) {
+                if (try tryLayaDequantSgemmNoBias(self, request.storage_a, request.input, request.output_a, request.rows, request.in_dim, request.out_dim)) return true;
+            }
             if (shouldUseQuantizedDequantSgemm(request.name_a, request.rows, request.out_dim, request.storage_a)) {
                 if (try tryLinearQuantizedDequantSgemmNoBias(self, request.storage_a, request.name_a, request.input, request.output_a, request.rows, request.in_dim, request.out_dim)) return true;
             }
@@ -5944,6 +6041,9 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
         },
         .single_bias => {
             const bias = request.bias_a orelse return false;
+            if (shouldUseLayaDequantSgemm(request.name_a)) {
+                if (try tryLayaDequantSgemmBias(self, request.storage_a, request.input, bias, request.output_a, request.rows, request.in_dim, request.out_dim)) return true;
+            }
             if (shouldUseQuantizedDequantSgemm(request.name_a, request.rows, request.out_dim, request.storage_a)) {
                 if (try tryLinearQuantizedDequantSgemm(self, request.storage_a, request.name_a, request.input, bias, request.output_a, request.rows, request.in_dim, request.out_dim)) return true;
             }
@@ -46106,6 +46206,93 @@ test "dequant sgemm cache denial falls back without transient scratch by default
     try std.testing.expectEqual(@as(u64, 0), cache_stats.scratch_fallbacks);
     const dispatch_stats = nativeQuantDispatchStatsForTest();
     try std.testing.expectEqual(@as(u64, 0), dispatch_stats.dequant_sgemm);
+}
+
+test "laya dequant sgemm predicate matches normalized runtime keys, not checkpoint names" {
+    // Runtime keys, as normalizeWeightKey/laya_head.weight produce them.
+    try std.testing.expect(shouldUseLayaDequantSgemm("model.layers.0.attn.Wqkv.weight"));
+    try std.testing.expect(shouldUseLayaDequantSgemm("model.layers.27.attn.Wo.weight"));
+    try std.testing.expect(shouldUseLayaDequantSgemm("model.layers.5.mlp.Wi.weight"));
+    try std.testing.expect(shouldUseLayaDequantSgemm("model.layers.5.mlp.Wo.weight"));
+    try std.testing.expect(shouldUseLayaDequantSgemm("model.head.layers.0.self_attn.in_proj_weight"));
+    try std.testing.expect(shouldUseLayaDequantSgemm("model.head.layers.1.self_attn.out_proj.weight"));
+    try std.testing.expect(shouldUseLayaDequantSgemm("model.head.layers.0.linear1.weight"));
+    try std.testing.expect(shouldUseLayaDequantSgemm("model.head.layers.1.linear2.weight"));
+    // Checkpoint-style names (pre-normalization) must not match: models/laya.zig's
+    // `quantizedLinear` checks exactly these, but dispatch never sees them.
+    try std.testing.expect(!shouldUseLayaDequantSgemm("encoder.layers.0.attn.Wqkv.weight"));
+    try std.testing.expect(!shouldUseLayaDequantSgemm("head.layers.0.linear2.weight"));
+    // Non-linear Laya weights and other architectures must not match.
+    try std.testing.expect(!shouldUseLayaDequantSgemm("model.layers.0.attn_norm.weight"));
+    try std.testing.expect(!shouldUseLayaDequantSgemm("model.embeddings.tok_embeddings.weight"));
+    try std.testing.expect(!shouldUseLayaDequantSgemm("model.head.layers.0.norm1.weight"));
+    try std.testing.expect(!shouldUseLayaDequantSgemm("model.layers.0.self_attn.q_proj.weight"));
+}
+
+test "laya q8_0 encoder linear uses dequant sgemm and skips native panel preparation" {
+    const allocator = std.testing.allocator;
+    const name = "model.layers.0.attn.Wo.weight";
+    var dense = [_]f32{0} ** 64; // out_dim=2, in_dim=32
+    for (&dense, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index)) * 0.25 - 4.0;
+    const raw = try quant_codec.quantizeQ8_0FromF32(allocator, &dense);
+    defer allocator.free(raw);
+    const shape = [_]i64{ 2, 32 };
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.resident_weights.deinit(allocator);
+    try store.resident_weights.put(allocator, name, .{
+        .tensor = .{
+            .data = &.{},
+            .shape = &.{},
+            .dtype = .f32,
+            .name = name,
+            .allocator = allocator,
+            .owns_data = false,
+            .owns_shape = false,
+        },
+        .quantized = true,
+        .quantized_storage = .{
+            .tensor_type = .{ .known = .Q8_0 },
+            .raw_bytes = raw,
+            .shape = &shape,
+            .raw_owned = false,
+            .allocator = allocator,
+        },
+    });
+    var compute = NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+
+    const weight = try getWeight(&compute, name);
+    defer freeTensor(&compute, weight);
+    // Laya's runtime-normalized weight name routes through dequant+SGEMM,
+    // which reads `raw_bytes` directly. The native kernel's row-major/panel
+    // prepared copies (each roughly the size of the compressed weight) must
+    // never be built for it.
+    try std.testing.expectEqual(@as(usize, 0), toBuf(weight).quantized_storage.?.prepared.ownedBytes());
+
+    var input_values = [_]f32{0} ** 96; // rows=3, in_dim=32
+    for (&input_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 7)) - 3.0;
+    const input = try compute.makeBuf(&input_values, false);
+    defer freeTensor(&compute, input);
+    var bias_values = [_]f32{ 0.5, -1.5 };
+    const bias = try compute.makeBuf(&bias_values, false);
+    defer freeTensor(&compute, bias);
+
+    resetNativeQuantDispatchStatsForTest();
+    const result = try linearOp(&compute, input, weight, bias, 3, 32, 2);
+    defer freeTensor(&compute, result);
+    try std.testing.expectEqual(@as(u64, 1), nativeQuantDispatchStatsForTest().dequant_sgemm);
+
+    var dense_weight = [_]f32{0} ** 64;
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q8_0 }, raw, &dense_weight);
+    var expected = [_]f32{0} ** 6;
+    for (0..3) |row| {
+        for (0..2) |col| {
+            var acc: f32 = bias_values[col];
+            for (0..32) |k| acc += input_values[row * 32 + k] * dense_weight[col * 32 + k];
+            expected[row * 2 + col] = acc;
+        }
+    }
+    try std.testing.expectEqualSlices(f32, &expected, getData(result));
 }
 
 test "linear q8_k kernel computes direct matmul" {
