@@ -105,6 +105,60 @@ def test_reserve_excluding_releases_collisions_and_is_bounded():
     assert exhausted.released == [40001, 40002]
 
 
+@pytest.mark.parametrize("exclude_candidate", [False, True])
+def test_random_allocation_preserves_handed_off_port_lease(
+    monkeypatch, exclude_candidate
+):
+    import port_reservations
+
+    lower, _ = port_reservations._listener_range()
+    with LoopbackPortReservations() as candidates:
+        advertised, rejected, available = candidates.reserve_many(3)
+    with LoopbackPortReservations() as reservations:
+        reservations.reserve(advertised)
+        reservations.handoff_to((advertised,), lambda: None)
+        choices = iter(
+            [advertised, rejected, available]
+            if exclude_candidate
+            else [advertised, available]
+        )
+        monkeypatch.setattr(
+            port_reservations.secrets, "randbelow", lambda _limit: next(choices) - lower
+        )
+        if exclude_candidate:
+            allocated = reservations.reserve_excluding({advertised, rejected})
+        else:
+            allocated = reservations.reserve()
+        assert allocated == available
+        with LoopbackPortReservations() as other:
+            with pytest.raises(OSError) as exc_info:
+                other.reserve(advertised)
+            assert exc_info.value.errno == errno.EADDRINUSE
+            if exclude_candidate:
+                assert other.reserve(rejected) == rejected
+        # Explicit fixed-port reacquisition remains available for restart.
+        reservations.ensure_reserved(advertised)
+
+
+def test_random_allocation_exhaustion_preserves_handed_off_port_lease(monkeypatch):
+    import port_reservations
+
+    lower, _ = port_reservations._listener_range()
+    with LoopbackPortReservations() as reservations:
+        advertised = reservations.reserve()
+        reservations.handoff_to((advertised,), lambda: None)
+        monkeypatch.setattr(
+            port_reservations.secrets, "randbelow", lambda _limit: advertised - lower
+        )
+        with pytest.raises(OSError) as exc_info:
+            reservations.reserve()
+        assert exc_info.value.errno == errno.EADDRINUSE
+        with LoopbackPortReservations() as other:
+            with pytest.raises(OSError) as exc_info:
+                other.reserve(advertised)
+            assert exc_info.value.errno == errno.EADDRINUSE
+
+
 def test_ensure_reserved_rolls_back_partial_reacquisition():
     with LoopbackPortReservations() as reservations:
         first_port, second_port = reservations.reserve_many(2)

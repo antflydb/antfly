@@ -102,6 +102,11 @@ class LoopbackPortReservations:
             lower, upper = _listener_range()
             for _ in range(128):
                 candidate = lower + secrets.randbelow(upper - lower)
+                # A handed-off listener may be temporarily unbound. Its lease
+                # still belongs to that child; only explicit restart requests
+                # may reacquire it within this pool.
+                if candidate in self._leases:
+                    continue
                 try:
                     return self._reserve(candidate, reuse_address=reuse_address)
                 except OSError as exc:
