@@ -736,6 +736,171 @@ requires identical labels and probabilities within 2e-2
 (`pipelines/laya_quantized_test.zig`). The fused resident Metal path reads
 dense weights, so a quantized checkpoint runs the generic encoder.
 
+## Long-context teacher (step 2a)
+
+Measured 2026-09-26 on an Apple M4 Max (36 GiB, shared with other agents).
+Step 2a needs soft labels for typed-decisions states Laya's 512-token budget
+cannot see, so a later long-context Laya (step 2c) has something to distil
+from besides gold.
+
+### Teacher choice
+
+The roadmap line names "Qwen3.8-27B", which does not exist: Qwen3's released
+dense sizes are 0.6B, 1.7B, 4B, 8B, 14B and 32B (plus 30B-A3B and 235B-A22B
+mixture-of-experts checkpoints); there is no 27B or "3.8" release. The teacher
+used here is **`Qwen/Qwen3-14B`**, run from the **`mlx-community/Qwen3-14B-4bit`**
+quantized checkpoint (7.8 GB on disk) via **MLX** (`mlx-lm`), not through
+Antfly's own runtime:
+
+- **Antfly cannot give label log-likelihoods.** The generation API documents
+  `logprobs` as "not supported, always null"
+  (`specs/openapi/inference/api.yaml`), so `antfly inference chat` has no path
+  to a label's probability. This step therefore uses the small-Python-path
+  fallback the roadmap allows.
+- **Context.** `max_position_embeddings` is 40,960 (native, no RoPE scaling
+  needed) against the >=32k requirement, and comfortably covers every state in
+  the dataset (the longest is 549 Qwen tokens; see below).
+- **Size vs. footprint.** Qwen3-14B-4bit is the strongest Qwen3 checkpoint that
+  fits the ~18 GB bound with margin. Qwen3-30B-A3B (mixture-of-experts) was
+  considered and rejected: even at 4-bit its resident experts run ~15-16 GB,
+  too little headroom on a 36 GB machine shared by about nine agents.
+  Measured peak resident set (`/usr/bin/time -l`, 300-decision run,
+  `maximum resident set size`): **8.94 GB**.
+- **No compilation.** `mlx-lm` ships prebuilt wheels for macOS/arm64 and needs
+  no CMake/build step, unlike `llama-cpp-python`; loading the model took 1.5-3 s.
+
+### Scoring
+
+`scripts/laya/prepare_laya_longcontext_teacher.py` (new; sibling to, and
+partitions a dataset with, `prepare_laya_packed_distillation.py`):
+
+- **Eligibility.** Reuses the same `state_fits` check against the target
+  unpacked Laya checkpoint's real `max_len`/`head_max_len`
+  (not a raw token count), so a record either gets scored by
+  `prepare_laya_packed_distillation.py`'s Laya teacher (Laya can see it) or by
+  this script's teacher (Laya cannot), never both, never neither.
+- **Prompt.** One prompt per record: the full, untruncated state, the
+  question and its labels with descriptions, asking for exactly one label
+  verbatim. Uses Qwen3's chat template with `enable_thinking=False`.
+- **Label score.** The length-normalized log-likelihood of each label
+  (average log-probability per token, since labels tokenize to different
+  lengths) via teacher forcing. The prompt is encoded once per record; each
+  label branches off a saved copy of the prompt's KV cache instead of
+  re-encoding the prompt (`mlx_lm.models.cache.KVCache.state`), which cut
+  per-label cost from ~2 s (a full prompt-length forward) to ~30-60 ms and
+  left the shared cache unmodified (checked directly: cache offset and key/value
+  shapes are unchanged after branching, and a from-scratch continuation gives
+  the same logits).
+- **Calibration.** One temperature per question type (choice/score/noul),
+  grid-searched to minimize cross-entropy against gold on a calibration split,
+  in the same shape as Laya's own `temperature_by_options`.
+- **Blend.** `target = w * gold + (1 - w) * teacher`, `w = 0.5` by default,
+  identical to `prepare_laya_packed_distillation.py`. Provenance (`<output>.json`)
+  records the teacher's model path and config hash, the common.py hash, a hash
+  of the prompt-building function's source, and the fitted temperatures.
+
+### How much of the dataset is actually invisible to Laya
+
+`prepare_laya_finetune.py` drops any case whose state exceeds 316 *raw* tokens
+from every split, a global bound sized for the worst case (a question that
+uses the full 192-token head budget, leaving `512 - 192 - 3 ≈ 317` tokens for
+state). Most >316-token states belong to questions with fewer labels, which
+leave more of the 512-token budget for state and so still fit. Re-checking
+with the exact `state_fits` budget math, only a fifth of the >316-token
+records are truly invisible to Laya:
+
+| Split | >316-token candidates | Actually invisible to Laya |
+| --- | ---: | ---: |
+| `eval` | 160 | 34 (21%) |
+| `train` | 425 | 69 (16%) |
+| `calibration` | 145 | ~31 (21%, estimated from the fitted counts) |
+
+Only the "actually invisible" column got a teacher target; the roughly 80% of
+"long-looking" records Laya can in fact see keep passing through the existing
+`prepare_laya_packed_distillation.py` path. Calibration counts, split by
+question type: 0 truly-invisible `score` or `noul` calibration examples turned
+up, so those two temperatures fell back to `1.0` (no scaling); `choice` fit to
+`3.99`. **This is the main limitation of this measurement**: LocalLLaMA/typed-decisions'
+states top out at 549 tokens, so genuinely long-context cases are rare here.
+Step 2c's 8k-token states, once available, will produce far more of them.
+
+### Agreement with gold
+
+760 short-state decisions (`td/s0-eval.jsonl`, sampled 300, seed 20260925 —
+both teachers can see the full state) and 103 long-state decisions (the
+"actually invisible" rows above, `eval` + `train` combined — only the
+long-context teacher sees the full state; Laya scores upstream's own
+truncated sequence, exactly as serving would today). `laya_teacher` here
+reproduces the released, zero-shot, unpacked numbers in
+[Accuracy (step 0)](#accuracy-step-0) closely (0.393/1.311/0.152 on this
+short-state sample vs. the reported 0.387/1.308/0.158 on the full 760).
+
+| States | Teacher | Accuracy | Soft CE | ECE | Decisions |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Short (Laya sees them too) | Long-context teacher, calibrated | **0.640** | 4.603 | 0.273 | 300 |
+| Short | Laya, zero-shot | 0.393 | **1.311** | **0.152** | 300 |
+| Long (Laya cannot see them) | Long-context teacher, calibrated | **0.767** | 3.491 | 0.248 | 103 |
+| Long | Laya, zero-shot, truncated state | 0.291 | **1.424** | **0.200** | 103 |
+
+Per question type, long states:
+
+| Type | Teacher accuracy | Laya accuracy | Teacher soft CE | Laya soft CE |
+| --- | ---: | ---: | ---: | ---: |
+| choice | 0.824 | 0.196 | 1.178 | 1.630 |
+| score | 0.632 | 0.184 | 5.936 | 1.446 |
+| noul | 0.929 | 0.929 | 5.285 | 0.616 |
+
+Timing: 1.1-1.9 s/decision end to end (prompt forward plus branched label
+continuations), 34-104,890 prompt tokens per run. A 300-decision run held the
+GPU lock for under 8 minutes.
+
+### Adopt/reject
+
+Mixed, by metric — argmax accuracy and calibration point opposite ways:
+
+- **Accuracy: adopt.** The long-context teacher's argmax matches gold far more
+  often than Laya's, on short states it already handles (0.640 vs. 0.393) and,
+  more relevantly, on the states this step exists for (0.767 vs. 0.291) —
+  Laya's truncated-state accuracy there is barely above chance for choice and
+  score questions (0.196, 0.184).
+- **Soft CE and ECE: not yet.** Laya's released calibration (`temperature`,
+  `temperature_by_options`), tuned over its own training run, still beats this
+  teacher's coarse per-type temperature (fit on as few as 0 truly-invisible
+  calibration examples for `score`/`noul`) on every row above. The teacher's
+  distribution is confidently peaked where gold is often split across two or
+  three labels (typed-decisions targets come from multiple raters), which
+  cross-entropy punishes even when the argmax is right.
+
+**Decision:** adopt the teacher **only for states Laya cannot see**, and only
+through the existing `w = 0.5` gold blend (which already halves the
+overconfidence problem above by averaging with gold), not as a standalone
+calibrated distribution. This is exactly what
+`prepare_laya_longcontext_teacher.py` does by construction: it never touches a
+record `prepare_laya_packed_distillation.py`'s Laya teacher can already score.
+Revisit the calibration once step 2c's 8k-token states give a calibration
+split with enough truly-invisible `score`/`noul` examples to fit per-type
+temperatures properly (option-count buckets, as Laya's own config uses, would
+likely also help).
+
+### Reproduce
+
+```bash
+uv run --script scripts/laya/prepare_laya_longcontext_teacher.py \
+    td/eval-long.jsonl \
+    --teacher-model .tmp/laya/qwen3-14b-4bit \
+    --laya-model .tmp/laya/laya-released --common .tmp/laya/common.py \
+    --calibration td/calibration-long.jsonl --compare-laya \
+    --output distilled-eval-long.jsonl --metrics-output eval-long-metrics.json
+```
+
+`--score-all` scores every record regardless of Laya eligibility (used for the
+short-state comparison above); `--temperatures <prior output>.json` reuses a
+fitted temperature instead of recalibrating. The long-context-teacher-labelled
+long-state dataset (585 native records — 585 = 160 `eval` + 425 `train`
+candidates; 103 actually carry a blended target, the rest pass through gold
+unchanged) is at `.tmp/laya/distilled-longcontext-teacher.jsonl` in the
+producing worktree, for step 2c to pick up.
+
 ## Roadmap
 
 Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
@@ -747,7 +912,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 | 1b. Segment attention | no | done (CPU and Metal); multi-row calls not started | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call remain, which needs a per-row segment contract |
 | 1c. Metal and CUDA packed kernels | no | Metal: packed decisions scored on the device (2–4%); fused kernels not pursued (encoder GPU work dominates). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |
 | 1d. Weight quantization (q8_0) | no | done (CPU and Metal); pays off on Metal | Labels identical and probabilities within 2e-2 of dense on the fixture; on the released model, 36% less Metal memory at the same accuracy. CPU q8_0 kernels need work |
-| 2a. Long-context teacher (Qwen3.8-27B) | labels only | not started | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
+| 2a. Long-context teacher (Qwen3-14B) | labels only | done; see [Long-context teacher (step 2a)](#long-context-teacher-step-2a) | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
 | 2b. Two-stage choice for many options | same fine-tune | not started | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. Measured on Banking77 |
 | 2c. 8k states | yes | not started | Memory-efficient attention in the training graph (today about 2k tokens at batch 1), `max_len` 8192 (ModernBERT's pretraining length), fine-tune on teacher-labelled long states |
 | 2d. ModernBERT-base student | yes | not started | ~150M parameters, about 2–3× cheaper than Laya-large; keep if its agreement with the teacher stays within tolerance of the large model |
