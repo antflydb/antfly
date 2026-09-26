@@ -541,7 +541,7 @@ gliner2.5-base 29/292/3,534 ms on CPU and 224/324/873 ms on Metal; Laya's
 ModernBERT-large 311/1,473/12,720 ms and 209/781/4,903 ms (encoders of
 different sizes; see the report for caveats).
 
-### Step 1: pipeline (done) and pilot (running)
+### Step 1: pipeline (done) and pilot (gate not met)
 
 - `scripts/antenna/init_student.py` builds the student: pretrained
   `answerdotai/ModernBERT-base` (pinned) with fresh published heads, 158.8M
@@ -561,6 +561,16 @@ different sizes; see the report for caveats).
   36 GB Mac.
 - The span-versus-boundary head ablation (Decision 4) is not run: span heads
   exist natively only on DeBERTa.
+- **Pilot result:** the ModernBERT-base student collapses to constant outputs
+  (in-domain classification 0.13, NER F1 0.0), with fresh or with
+  gliner2.5-base's trained heads, in the native trainer and in upstream's
+  PyTorch trainer alike. The same recipe on gliner2.5-base (DeBERTa) lifts
+  in-domain classification 0.728 → 0.808 and NER F1 0.543 → 0.723, so the
+  data and pipeline are sound and the failure is specific to the ModernBERT
+  encoder. Leads, in order: feature scale (ModernBERT's states have 2.7x
+  DeBERTa's norm), the missing [CLS] at position 0, per-word start-of-text
+  tokenization. Details:
+  [work-log/completed/inference/antenna/2026-09-25-pilot.md](../../../../../work-log/completed/inference/antenna/2026-09-25-pilot.md).
 
 ### Step 2: fused ModernBERT training attention (done)
 
