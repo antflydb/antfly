@@ -78,6 +78,7 @@ pub fn view(a: std.mem.Allocator, cfg: modern.Config, inputs: []const Tensor) !t
         .anchors = try matrix(s, inputs[6], questions, 1),
         .question_index = index,
         .width = width,
+        .trunk_sees_tree = laya.packing.trunk_sees_questions,
     };
     try tree.validate(row, laya.max_len, laya.packing.max_packed_len, laya.maxOptions());
     for (ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidLayaInputs;
@@ -103,6 +104,8 @@ pub fn forwardRow(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: mode
     // their cost proportional to visible keys, so batching pays off without
     // the trunk cache; caching a forest of trunks is not implemented yet.
     if (tree.treeCount(row) != 1) return forwardFull(cb, a, cfg, laya, row);
+    // A trunk that sees its questions depends on the question set.
+    if (row.trunk_sees_tree) return forwardFull(cb, a, cfg, laya, row);
     const trunk = trunkRows(row) orelse return forwardFull(cb, a, cfg, laya, row);
     if (store.limit_bytes == 0 or trunk < store.min_tokens or trunk == row.ids.len) return forwardFull(cb, a, cfg, laya, row);
     const layers = cfg.num_hidden_layers + laya.head_layers;

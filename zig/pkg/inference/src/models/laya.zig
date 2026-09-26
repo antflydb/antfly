@@ -58,6 +58,10 @@ pub const Packing = struct {
     /// logical length (trunk plus the longest root-to-leaf branch path).
     max_packed_len: usize = 0,
     two_stage: TwoStage = .{},
+    /// `trunk_sees: "questions"`: state tokens also attend to every branch in
+    /// their tree, restoring early fusion at the cost of trunk reuse
+    /// (LAYA.md, "Question-aware trunk"). Default `"state"`.
+    trunk_sees_questions: bool = false,
 
     pub fn enabled(self: Packing) bool {
         return self.mode != .none;
@@ -154,13 +158,13 @@ fn parsePacking(value: std.json.Value, max_len: usize) !Packing {
     if (value != .object) return error.InvalidLayaConfig;
     var out = Packing{};
     for (value.object.keys()) |key| {
-        if (!std.mem.eql(u8, key, "mode") and !std.mem.eql(u8, key, "max_packed_len") and !std.mem.eql(u8, key, "two_stage")) return error.InvalidLayaConfig;
+        if (!std.mem.eql(u8, key, "mode") and !std.mem.eql(u8, key, "max_packed_len") and !std.mem.eql(u8, key, "two_stage") and !std.mem.eql(u8, key, "trunk_sees")) return error.InvalidLayaConfig;
     }
     const mode = value.object.get("mode") orelse return error.InvalidLayaConfig;
     if (mode != .string) return error.InvalidLayaConfig;
     out.mode = std.meta.stringToEnum(PackingMode, mode.string) orelse return error.InvalidLayaConfig;
     if (out.mode == .none) {
-        if (value.object.get("two_stage") != null) return error.InvalidLayaConfig;
+        if (value.object.get("two_stage") != null or value.object.get("trunk_sees") != null) return error.InvalidLayaConfig;
         return out;
     }
     out.max_packed_len = @min(4 * max_len, max_packed_len_limit);
@@ -172,6 +176,12 @@ fn parsePacking(value: std.json.Value, max_len: usize) !Packing {
     if (value.object.get("two_stage")) |v| {
         if (out.mode != .candidate) return error.InvalidLayaConfig;
         out.two_stage = try parseTwoStage(v);
+    }
+    if (value.object.get("trunk_sees")) |v| {
+        if (v != .string) return error.InvalidLayaConfig;
+        if (std.mem.eql(u8, v.string, "questions")) {
+            out.trunk_sees_questions = true;
+        } else if (!std.mem.eql(u8, v.string, "state")) return error.InvalidLayaConfig;
     }
     return out;
 }

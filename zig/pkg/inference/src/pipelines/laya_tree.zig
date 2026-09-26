@@ -51,6 +51,11 @@ pub const Row = struct {
     /// Question -> index into the caller's question list.
     question_index: []const usize,
     width: usize,
+    /// Trunk tokens attend to their whole tree (state plus every branch),
+    /// not only to the trunk (`packing.trunk_sees: "questions"`). Branches
+    /// still see only their ancestors. The trunk then depends on the
+    /// question set, so it cannot be cached across rows.
+    trunk_sees_tree: bool = false,
 
     pub fn questions(self: Row) usize {
         return self.anchors.len;
@@ -64,6 +69,11 @@ pub const Row = struct {
     /// True when `query` may attend to `key`.
     pub fn visible(self: Row, query: usize, key: usize) bool {
         const target = self.segments[key];
+        if (self.trunk_sees_tree and self.parents[@intCast(self.segments[query])] == -1) {
+            var root = target;
+            while (self.parents[@intCast(root)] != -1) root = self.parents[@intCast(root)];
+            return root == self.segments[query];
+        }
         var segment = self.segments[query];
         while (segment >= 0) : (segment = self.parents[@intCast(segment)]) {
             if (segment == target) return true;
@@ -198,7 +208,8 @@ pub fn coalesce(a: std.mem.Allocator, rows: []const Row) !Coalesced {
         segment_offset += r.parents.len;
         q_offset += r.questions();
     }
-    const row = try own(a, .{ .ids = ids, .positions = positions, .segments = segments, .parents = parents, .kinds = kinds, .anchors = anchors, .markers = markers, .question_index = question_index, .width = width });
+    for (rows) |r| if (r.trunk_sees_tree != rows[0].trunk_sees_tree) return error.InvalidLayaPackedRow;
+    const row = try own(a, .{ .ids = ids, .positions = positions, .segments = segments, .parents = parents, .kinds = kinds, .anchors = anchors, .markers = markers, .question_index = question_index, .width = width, .trunk_sees_tree = rows[0].trunk_sees_tree });
     return .{ .row = row, .owners = owners };
 }
 
@@ -219,7 +230,27 @@ pub fn ranges(a: std.mem.Allocator, row: Row, first: usize) ![]u32 {
     }
     const out = try a.alloc(u32, (row.ids.len - first) * 6);
     @memset(out, 0);
+    // Trees are contiguous: a tree runs from its root segment's first token
+    // to the next root segment's first token.
+    const tree_end = try a.alloc(u32, row.parents.len);
+    defer a.free(tree_end);
+    if (row.trunk_sees_tree) {
+        var root: ?usize = null;
+        for (row.segments, 0..) |seg, t| {
+            const s_: usize = @intCast(seg);
+            if (row.parents[s_] == -1 and (root == null or root.? != s_)) {
+                if (root) |r| tree_end[r] = @intCast(t);
+                root = s_;
+            }
+        }
+        if (root) |r| tree_end[r] = @intCast(row.segments.len);
+    }
     for (first..row.ids.len) |token| {
+        const own_segment: usize = @intCast(row.segments[token]);
+        if (row.trunk_sees_tree and row.parents[own_segment] == -1) {
+            out[(token - first) * 6 ..][0..2].* = .{ extents[own_segment][0], tree_end[own_segment] };
+            continue;
+        }
         var slot: usize = 0;
         var segment = row.segments[token];
         while (segment >= 0 and slot < 3) : (segment = row.parents[@intCast(segment)]) {
@@ -388,7 +419,7 @@ fn emit(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, state: []const 
         if (style == .question) w.put(special.sep_id, question_segment, kind);
     }
     std.debug.assert(w.at == total and segment == segment_count);
-    return own(a, .{ .ids = w.ids, .positions = w.positions, .segments = w.segments, .parents = parents, .kinds = w.kinds, .anchors = anchors, .markers = markers, .question_index = question_index, .width = width });
+    return own(a, .{ .ids = w.ids, .positions = w.positions, .segments = w.segments, .parents = parents, .kinds = w.kinds, .anchors = anchors, .markers = markers, .question_index = question_index, .width = width, .trunk_sees_tree = cfg.packing.trunk_sees_questions });
 }
 
 /// Copy a row into `a`, so a partially built row never leaks on error.
@@ -405,6 +436,7 @@ pub fn own(a: std.mem.Allocator, row: Row) !Row {
         done += 1;
     }
     out.question_index = try a.dupe(usize, row.question_index);
+    out.trunk_sees_tree = row.trunk_sees_tree;
     return out;
 }
 
@@ -424,3 +456,29 @@ const Writer = struct {
         self.position += 1;
     }
 };
+
+test "laya question-aware trunk ranges match visibility, and trees stay isolated" {
+    const a = std.testing.allocator;
+    // Two trees: trunk 0 with branches 1, 2; trunk 3 with branch 4.
+    const one = Row{ .ids = &.{ 1, 2, 3, 4, 5, 6, 7 }, .positions = &.{ 0, 1, 2, 3, 2, 3, 4 }, .segments = &.{ 0, 0, 1, 1, 2, 2, 2 }, .parents = &.{ -1, 0, 0 }, .kinds = &.{ trunk_kind, trunk_kind, 0, 0, 1, 1, 1 }, .anchors = &.{ 2, 4 }, .markers = &.{ 3, -1, 5, 6 }, .question_index = &.{ 0, 1 }, .width = 2, .trunk_sees_tree = true };
+    const two = Row{ .ids = &.{ 8, 9, 10 }, .positions = &.{ 0, 1, 1 }, .segments = &.{ 0, 1, 1 }, .parents = &.{ -1, 0 }, .kinds = &.{ trunk_kind, 2, 2 }, .anchors = &.{1}, .markers = &.{ 1, 2 }, .question_index = &.{0}, .width = 2, .trunk_sees_tree = true };
+    const merged = try coalesce(a, &.{ one, two });
+    defer merged.deinit(a);
+    const row = merged.row;
+    try std.testing.expect(row.trunk_sees_tree);
+    const r = try ranges(a, row, 0);
+    defer a.free(r);
+    for (0..row.ids.len) |q| for (0..row.ids.len) |k| {
+        var in_range = false;
+        for (0..3) |slot| {
+            const lo = r[q * 6 + 2 * slot];
+            const hi = r[q * 6 + 2 * slot + 1];
+            if (k >= lo and k < hi) in_range = true;
+        }
+        try std.testing.expectEqual(row.visible(q, k), in_range);
+    };
+    // A trunk sees its own questions, never the other tree; a branch still
+    // sees only its ancestors.
+    try std.testing.expect(row.visible(0, 5) and !row.visible(0, 7) and !row.visible(7, 0));
+    try std.testing.expect(!row.visible(2, 4) and row.visible(2, 0));
+}

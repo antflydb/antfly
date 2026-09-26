@@ -127,7 +127,15 @@ test "laya packed training graph matches packed serving logits, alone and in a p
 }
 
 test "laya training converts an unpacked checkpoint into a served packed model" {
-    try exerciseUnpackedToPackedParity(false);
+    try exerciseUnpackedToPackedParity(false, false);
+}
+
+// Question-aware trunk (`packing.trunk_sees: "questions"`): the trainer's
+// eval of its final weights must equal serving the exported model, dense
+// and fused attention alike, and the export must carry the setting.
+test "laya training exports a question-aware trunk that serves exactly" {
+    try exerciseUnpackedToPackedParity(false, true);
+    try exerciseUnpackedToPackedParity(true, true);
 }
 
 // Regression coverage for the fused-attention eval dropout leak: a
@@ -140,10 +148,10 @@ test "laya training converts an unpacked checkpoint into a served packed model" 
 // exercises the fused path directly regardless of whether this small
 // fixture would need it on its own.
 test "laya training converts an unpacked checkpoint into a served packed model (forced fused attention)" {
-    try exerciseUnpackedToPackedParity(true);
+    try exerciseUnpackedToPackedParity(true, false);
 }
 
-fn exerciseUnpackedToPackedParity(force_fused_attention: bool) !void {
+fn exerciseUnpackedToPackedParity(force_fused_attention: bool, trunk_sees_questions: bool) !void {
     const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
     const job = @import("job.zig");
     const hf = @import("inference_hf_tokenizer");
@@ -166,6 +174,7 @@ fn exerciseUnpackedToPackedParity(force_fused_attention: bool) !void {
         .objective = .soft_ce,
         .packing = .question,
         .force_fused_attention = force_fused_attention,
+        .trunk_sees_questions = trunk_sees_questions,
     };
     var admission = @import("../../runtime/tier/memory.zig").AdmissionController{};
     try job.execute(a, io, c, &admission);
@@ -173,6 +182,7 @@ fn exerciseUnpackedToPackedParity(force_fused_attention: bool) !void {
     var session = try factory.createNativeSession(a, model_path);
     defer session.close();
     const cfg = factory.getLayaConfig(session) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(trunk_sees_questions, cfg.packing.trunk_sees_questions);
     try std.testing.expectEqual(model.PackingMode.question, cfg.packing.mode);
     // Serving the exported packed model reproduces the job's final evaluation.
     const Prediction = struct { kind: model.QuestionType, logits: []const f32, target: []const f32 };
