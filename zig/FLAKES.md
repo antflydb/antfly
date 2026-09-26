@@ -1,5 +1,24 @@
 # Zig runtime flakes
 
+## 2026-09-25: PR #889 zig-base runner preemption
+
+[Job 108307916600](https://github.com/antflydb/antfly/actions/runs/36207700839/job/108307916600)
+ended during hermetic unit tests with exit code 130 and an Actions runner
+shutdown signal. No test assertion or unit watchdog fired before shutdown.
+Kubernetes events for `arc-antfly-heavy-q8vlq-runner-4f668` record scheduler
+preemption at 2026-09-26 01:48:37 UTC by higher-priority Pod
+`74c343d5-64c3-4ece-a8eb-5e2476f60e95`, followed by a memory-pressure eviction
+at 01:48:49 UTC on node `gk3-antfly-ci-pool-2-3a7329dc-9rzj`.
+ARC recorded the container's SIGTERM exit (143) and removed the failed runner.
+
+This interruption is independent of the qualification timeout below. The
+companion Colony infrastructure change requests GKE Autopilot extended duration
+for both heavy runner profiles, allowing GKE to provision system capacity first
+and defer automatic upgrades/scale-down. It requires an infrastructure rollout
+before a rerun can validate the policy. System-priority preemption and node
+memory pressure remain possible; increasing test timeouts or retrying individual
+tests would not fix runner provisioning.
+
 ## 2026-09-25: VOPR qualification audit failure and cold-build timeout
 
 [PR CI run 36189107289](https://github.com/antflydb/antfly/actions/runs/36189107289)
