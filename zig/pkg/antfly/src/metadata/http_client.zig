@@ -1094,6 +1094,7 @@ pub const MetadataHttpClient = struct {
     /// Read-only retries are safe. The response proves the metadata identity;
     /// callers need no preceding status/discovery round trip on the happy path.
     pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
+        if (input == .fk_initial_retirement_page) return error.InitialFkRetirementNotActivated;
         if (input == .mutate or input == .setting_mutate or input == .policy_definition_mutate or input == .policy_publication_mutate or input == .policy_publication_begin or input == .fk_generation_publication_begin or input == .fk_generation_publication_mutate or input == .fk_initial_create_begin or input == .fk_initial_create_mutate) return error.InvalidCatalogMutation;
         if (remaining_ms == 0) return error.Timeout;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
@@ -1104,7 +1105,7 @@ pub const MetadataHttpClient = struct {
         defer self.alloc.free(uri);
         var remaining_buf: [10]u8 = undefined;
         const authority = @import("../system_catalog/setting_authority.zig");
-        const grant = if (input == .setting_snapshot or input == .policy_snapshot or input == .policy_install_snapshot or input == .policy_publication_status or input == .policy_publication_work or input == .fk_generation_publication_status or input == .fk_generation_publication_work or input == .fk_generation_publication_decision or input == .fk_generation_publication_source_decision or input == .fk_initial_create_prepare or input == .fk_initial_child_decision or input == .fk_initial_create_status or input == .fk_generation_table_locked or input == .fk_initial_create_work or input == .fk_initial_parent_decision or input == .fk_initial_retirement_page) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .read, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
+        const grant = if (input == .setting_snapshot or input == .policy_snapshot or input == .policy_install_snapshot or input == .policy_publication_status or input == .policy_publication_work or input == .fk_generation_publication_status or input == .fk_generation_publication_work or input == .fk_generation_publication_decision or input == .fk_generation_publication_source_decision or input == .fk_initial_create_prepare or input == .fk_initial_child_decision or input == .fk_initial_create_status or input == .fk_generation_table_locked or input == .fk_initial_create_work or input == .fk_initial_parent_decision) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .read, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
         defer if (grant) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
             .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms}) },
@@ -1115,10 +1116,7 @@ pub const MetadataHttpClient = struct {
         var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
         defer response.deinit(self.alloc);
         if (response.status != 200) return switch (response.status) {
-            400 => if (input == .fk_initial_retirement_page and
-                std.mem.eql(u8, response.body, "InvalidInitialFkRetirementPage"))
-                error.InvalidInitialFkRetirementPage
-            else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+            400 => if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
                 input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
                 input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
                 std.mem.eql(u8, response.body, "InvalidGenerationPublication"))
@@ -4460,23 +4458,21 @@ test "system catalog FK decision preserves absent publication for initial-parent
     try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
 }
 
-test "system catalog initial FK retirement page uses read authority and typed invalid page" {
+test "system catalog initial FK retirement page requires a store-bound transport" {
     const Executor = struct {
-        body: []const u8 = "InvalidInitialFkRetirementPage",
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
-            try std.testing.expect((request.header(@import("../system_catalog/setting_authority.zig").header_name) orelse "").len > 0);
-            return .{ .status = 400, .body = try alloc.dupe(u8, self.body) };
+            self.calls += 1;
+            return error.UnexpectedRetirementRequest;
         }
     };
     var executor = Executor{};
     var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
     _ = client.withSettingAuthority("retirement-read-test-secret", "retirement-read-test");
     const call: system_catalog.Call = .{ .fk_initial_retirement_page = .{ .store_id = 13, .limit = 1 } };
-    try std.testing.expectError(error.InvalidInitialFkRetirementPage, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
-    executor.body = "UnrelatedBadRequest";
-    try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    try std.testing.expectError(error.InitialFkRetirementNotActivated, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    try std.testing.expectEqual(@as(usize, 0), executor.calls);
 }
 
 test "metadata mutation topology avoids diagnostics and owns parsed roles across compatibility fallback" {

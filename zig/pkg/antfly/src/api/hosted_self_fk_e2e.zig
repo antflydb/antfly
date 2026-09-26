@@ -16,6 +16,12 @@ const table_router = @import("table_router.zig");
 const publication = @import("../metadata/fk_generation_publication.zig");
 const test_helpers = @import("../public_test_helpers.zig");
 
+fn deinitDriverIfLive(driver: *raft.ManagedProgressDriver, live: *bool) void {
+    if (!live.*) return;
+    driver.deinit();
+    live.* = false;
+}
+
 // A real second/third hosted data Raft voter, not another handle to the
 // first owner's process. Keep the server address stable while its drivers run.
 const DataPeer = struct {
@@ -912,19 +918,29 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
         .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
     }, metadata_uri);
     var data_live = true;
-    defer if (data_live) data.deinit();
+    defer if (data_live) {
+        deinitDriverIfLive(&meta_control, &meta_control_live);
+        data.deinit();
+    };
     try data.start();
     try awaitStoreRegistration(io, &data);
     var data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
     var data_raft_live = true;
-    defer if (data_raft_live) data_raft.deinit();
+    defer if (data_raft_live) {
+        deinitDriverIfLive(&meta_control, &meta_control_live);
+        data_raft.deinit();
+    };
     try data_raft.start();
     var data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, std.time.ns_per_ms);
     var data_control_live = true;
-    defer if (data_control_live) data_control.deinit();
+    defer if (data_control_live) {
+        deinitDriverIfLive(&meta_control, &meta_control_live);
+        data_control.deinit();
+    };
     try data_control.start();
     var peers: [2]?*DataPeer = .{ null, null };
     defer {
+        deinitDriverIfLive(&meta_control, &meta_control_live);
         for (peers) |peer| if (peer) |active| active.destroy(alloc);
     }
     if (leader_transfer) {
@@ -947,9 +963,9 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
 
     var create = try sql(alloc, transport, &headers, base, "CREATE TABLE nodes (id BIGINT PRIMARY KEY, parent_id BIGINT)");
     defer create.deinit(alloc);
-    // Three-voter placement can return committed_pending while the new
-    // replicas converge; awaitTable below is the public readiness barrier.
-    try std.testing.expect(create.status == 200 or (leader_transfer and create.status == 202));
+    // Placement may still be converging after the catalog commit, even for
+    // one owner. awaitTable below is the public readiness barrier.
+    try std.testing.expect(create.status == 200 or create.status == 202);
     const table_id = try awaitTable(alloc, io, transport, &headers, base);
     if (leader_transfer) {
         const physical = try tableGroup(alloc, &metadata, table_id);
@@ -1014,6 +1030,7 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
                 http_server.ApiHttpServer.FkGenerationPublicationTestDriver.resumeBackground(server);
                 paused_data_fk_server = null;
             }
+            deinitDriverIfLive(&meta_control, &meta_control_live);
             data_control.deinit();
             data_control_live = false;
             data_raft.deinit();
@@ -1024,8 +1041,6 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
                 http_server.ApiHttpServer.FkGenerationPublicationTestDriver.resumeBackground(server);
                 paused_metadata_fk_server = null;
             }
-            meta_control.deinit();
-            meta_control_live = false;
             meta_raft.deinit();
             meta_raft_live = false;
             metadata.deinit();
@@ -1172,6 +1187,7 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
         http_server.ApiHttpServer.FkGenerationPublicationTestDriver.resumeBackground(server);
         paused_data_fk_server = null;
     }
+    deinitDriverIfLive(&meta_control, &meta_control_live);
     data_control.deinit();
     data_control_live = false;
     data_raft.deinit();
@@ -1186,6 +1202,9 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
     }, metadata_uri);
     data_live = true;
     try data.start();
+    meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, std.time.ns_per_ms);
+    meta_control_live = true;
+    try meta_control.start();
     try awaitStoreRegistration(io, &data);
     data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
     data_raft_live = true;

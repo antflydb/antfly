@@ -883,6 +883,9 @@ scan-budgeted, and a cold-restart test verifies removed-placement work survives.
 These records are discovery and fencing groundwork, not an unlink grant or ACK.
 The internal store-root retirement Ticket page is likewise read-only discovery;
 serving a canceled-work page does not authorize physical unlink or an ACK.
+Its durable local projection exists, but the generic HTTP system-catalog route
+rejects the page until a store-bound principal can prove that the requested
+`store_id` belongs to the caller; the shared service/read grant is insufficient.
 A returning store must page only its work, verify its cold AICH
 bootstrap and canceled receipt against that immutable proof, fsync a local
 retirement intent, drain/delete the exact root and local replica catalog, then

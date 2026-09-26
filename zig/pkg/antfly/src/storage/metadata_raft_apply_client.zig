@@ -32,6 +32,7 @@ const physical_metadata = @import("../metadata/storage/raft_apply_store.zig");
 const sql_settings = @import("../system_catalog/settings.zig");
 const sql_policies = @import("../system_catalog/policies.zig");
 const fk_generation_publication = @import("../metadata/fk_generation_publication.zig");
+const fk_initial_retirement_wire = @import("../metadata/fk_initial_retirement_wire.zig");
 
 pub const RaftApplyStoreConfig = struct {
     root_dir: []const u8,
@@ -482,6 +483,9 @@ pub const RaftApplyStore = struct {
     }
     pub fn fkInitialCreateWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after_child_table_id: u64) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_work = after_child_table_id });
+    }
+    pub fn fkInitialRetirementTicketPageJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_initial_retirement_wire.PageRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_retirement_page = request });
     }
     pub fn fkInitialParentDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.DecisionRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_parent_decision = request });

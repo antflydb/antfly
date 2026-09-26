@@ -3279,7 +3279,38 @@ fn requireFkGenerationPublicActivation(plan: @import("../metadata/fk_generation_
         return error.ForeignKeySelfPublicationNotActivated;
 }
 
+/// Reject a guarded dual-role publication from the already-authorized schema
+/// images, before the plan builder asks an owner for its integrity catalog.
+/// A newly created table may be committed in metadata while its owner is still
+/// converging; that transient owner state must not turn a deterministic 0A000
+/// capability decision into an internal 500. Existing self-FKs are included so
+/// DROP cannot bypass the same public activation gate.
+fn requireSelfFkPublicationActivatedFromSchemas(alloc: std.mem.Allocator, table_name: []const u8, before_json: []const u8, after_json: []const u8) !void {
+    const schema = @import("../schema/mod.zig");
+    var before = try schema.parseValidatedTableSchema(alloc, before_json);
+    defer before.deinit(alloc);
+    var after = try schema.parseValidatedTableSchema(alloc, after_json);
+    defer after.deinit(alloc);
+    const before_fks = try before.relationalForeignKeyDefinitions(alloc);
+    defer if (before_fks.len > 0) alloc.free(before_fks);
+    const after_fks = try after.relationalForeignKeyDefinitions(alloc);
+    defer if (after_fks.len > 0) alloc.free(after_fks);
+    for (before_fks) |fk| if (std.mem.eql(u8, fk.parent_table, table_name))
+        return error.ForeignKeySelfPublicationNotActivated;
+    for (after_fks) |fk| if (std.mem.eql(u8, fk.parent_table, table_name))
+        return error.ForeignKeySelfPublicationNotActivated;
+}
+
 test "public ordinary self-FK publication remains guarded before metadata admission" {
+    const before_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const after_schema =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_parent","child_columns":["parent"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    try std.testing.expectError(error.ForeignKeySelfPublicationNotActivated, requireSelfFkPublicationActivatedFromSchemas(std.testing.allocator, "nodes", before_schema, after_schema));
+    try std.testing.expectError(error.ForeignKeySelfPublicationNotActivated, requireSelfFkPublicationActivatedFromSchemas(std.testing.allocator, "nodes", after_schema, before_schema));
+    try requireSelfFkPublicationActivatedFromSchemas(std.testing.allocator, "other", before_schema, after_schema);
     const publication = @import("../metadata/fk_generation_publication.zig");
     const parent: publication.Parent = .{
         .table = .{ .table_id = 7, .name = "nodes" },
@@ -5273,6 +5304,7 @@ pub const ApiHttpServer = struct {
         // Native standalone has no durable local publication decision/owner
         // receipt loop yet. Do not admit a plan its supervisor cannot drive.
         if (self.cfg.deployment_mode == .standalone) return error.UnsupportedOperation;
+        try requireSelfFkPublicationActivatedFromSchemas(alloc, before.name, before.schema_json, proposed_schema_json);
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();

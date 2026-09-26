@@ -2062,11 +2062,17 @@ pub const MetadataHttpServer = struct {
         if (body.len > system_catalog.max_command_bytes) return ctx.status(413).text("catalog request too large");
         var parsed = std.json.parseFromSlice(system_catalog.Call, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid catalog request");
         defer parsed.deinit();
+        // Ticket pages name a physical store. The shared service/read grant
+        // authenticates a node, not that store, so admitting this call would
+        // let one node enumerate another store's retirement work. Keep the
+        // transport closed until store-bound principal verification exists.
+        if (parsed.value == .fk_initial_retirement_page)
+            return ctx.status(501).text("store-bound initial FK retirement reads are not active");
         // This transport authenticates the calling service, not a setting
         // administrator. Never infer an admin grant from request JSON.
         const authority = @import("../system_catalog/setting_authority.zig");
         const admin_grant = parsed.value == .setting_mutate or parsed.value == .policy_definition_mutate or parsed.value == .policy_publication_mutate or parsed.value == .policy_publication_begin or parsed.value == .fk_generation_publication_begin or parsed.value == .fk_generation_publication_mutate or parsed.value == .fk_initial_create_begin or parsed.value == .fk_initial_create_mutate;
-        const fk_publication_read = parsed.value == .fk_generation_publication_status or parsed.value == .fk_generation_publication_work or parsed.value == .fk_generation_publication_decision or parsed.value == .fk_generation_publication_source_decision or parsed.value == .fk_initial_create_prepare or parsed.value == .fk_initial_child_decision or parsed.value == .fk_initial_create_status or parsed.value == .fk_generation_table_locked or parsed.value == .fk_initial_create_work or parsed.value == .fk_initial_parent_decision or parsed.value == .fk_initial_retirement_page;
+        const fk_publication_read = parsed.value == .fk_generation_publication_status or parsed.value == .fk_generation_publication_work or parsed.value == .fk_generation_publication_decision or parsed.value == .fk_generation_publication_source_decision or parsed.value == .fk_initial_create_prepare or parsed.value == .fk_initial_child_decision or parsed.value == .fk_initial_create_status or parsed.value == .fk_generation_table_locked or parsed.value == .fk_initial_create_work or parsed.value == .fk_initial_parent_decision;
         if (admin_grant or fk_publication_read or parsed.value == .setting_snapshot or parsed.value == .policy_snapshot or parsed.value == .policy_install_snapshot or parsed.value == .policy_publication_status or parsed.value == .policy_publication_work) {
             if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null) return ctx.status(403).text("setting authority requires an authenticated service");
             authority.verify(

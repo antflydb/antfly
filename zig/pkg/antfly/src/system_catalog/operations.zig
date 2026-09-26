@@ -463,13 +463,11 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.fkInitialParentDecisionJson(alloc, svc.metadata_group_id, request);
         },
-        .fk_initial_retirement_page => |request| blk: {
-            if (!context.fk_generation_publication_authority) return error.Forbidden;
-            try request.validate(svc.metadata_group_id);
-            try svc.ensureLinearizableReadWithContext(context);
-            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-            break :blk store.fkInitialRetirementTicketPageJson(alloc, svc.metadata_group_id, request);
-        },
+        // A shared internal catalog read capability cannot attest to the
+        // requested physical store. Leave the durable projection available to
+        // a future store-bound transport, but never serve it through this
+        // generic operation.
+        .fk_initial_retirement_page => error.InitialFkRetirementNotActivated,
         .setting_mutate => |request| mutateSetting(svc, alloc, context, request),
         .write_validation_revision => blk: {
             try svc.ensureLinearizableReadWithContext(context);

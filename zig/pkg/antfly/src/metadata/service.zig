@@ -697,7 +697,11 @@ fn initialPlacementProofForGroup(service: anytype, range_group_id: u64) !?fk_gen
 
 fn cachedInitialPlacementProof(service: anytype, range_group_id: u64) !?fk_generation_publication.InitialPlacementProof {
     const proof = try initialPlacementProofForGroup(service, range_group_id);
-    if (proof != null) _ = try service.cachedCoordinatedDecoderReadiness(metadata_topology_protocol.fk_initial_create_version);
+    if (proof != null) {
+        if (comptime @hasDecl(@TypeOf(service.*), "cachedCoordinatedDecoderReadiness")) {
+            _ = try service.cachedCoordinatedDecoderReadiness(metadata_topology_protocol.fk_initial_create_version);
+        } else return error.TableTopologyProtocolUpgradeRequired;
+    }
     return proof;
 }
 
@@ -709,10 +713,146 @@ fn ensureInitialPlacementReadCut(service: anytype, request: api_operation.Reques
         try service.ensureLinearizableReadWithContext(request);
 }
 
+/// Background reconciliation retries a slow ReadIndex on its next round. The
+/// cut must finish before taking the catalog gate so a prior leader's BEGIN
+/// cannot be mistaken for an ordinary placement operation.
+fn backgroundInitialPlacementReadCut(service: anytype) !bool {
+    ensureInitialPlacementReadCut(service, .{
+        .deadline_ns = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms,
+    }) catch |err| switch (err) {
+        error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn preflightInitialPlacementForGroupWithContextImpl(service: anytype, request: api_operation.RequestContext, group_id: u64) !void {
+    try request.ensureActive();
+    if (try initialPlacementProofForGroup(service, group_id) == null) return;
+    _ = try service.ensureTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.fk_initial_create_version);
+}
+
+fn preflightProjectedPlacementWithContextImpl(service: anytype, request: api_operation.RequestContext) !void {
+    var required_version: u16 = 0;
+    const ranges = try service.listProjectedRanges(service.alloc);
+    defer service.freeProjectedRanges(service.alloc, ranges);
+    for (ranges) |range| {
+        if (try initialPlacementProofForGroup(service, range.group_id) != null)
+            required_version = @max(required_version, metadata_topology_protocol.fk_initial_create_version);
+    }
+    const placements = try service.listProjectedPlacementIntents(service.alloc);
+    defer service.freeProjectedPlacementIntents(service.alloc, placements);
+    for (placements) |placement| {
+        if (try initialPlacementProofForGroup(service, placement.record.group_id) != null)
+            required_version = @max(required_version, metadata_topology_protocol.fk_initial_create_version);
+    }
+    const tables = try service.listProjectedTables(service.alloc);
+    defer service.freeProjectedTables(service.alloc, tables);
+    for (tables) |table|
+        required_version = @max(required_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+    const splits = try service.listProjectedSplitTransitions(service.alloc);
+    defer service.freeProjectedSplitTransitions(service.alloc, splits);
+    for (splits) |split|
+        required_version = @max(required_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_split_transition = split }));
+    const merges = try service.listProjectedMergeTransitions(service.alloc);
+    defer service.freeProjectedMergeTransitions(service.alloc, merges);
+    for (merges) |merge|
+        required_version = @max(required_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_merge_transition = merge }));
+    if (required_version != 0)
+        _ = try service.ensureTableTopologyProtocolReadyWithContext(request, required_version);
+}
+
+fn preflightTableRecordWithContextImpl(service: anytype, request: api_operation.RequestContext, table: metadata_table_manager.TableRecord) !void {
+    const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table });
+    if (required_version != 0)
+        _ = try service.ensureTableTopologyProtocolReadyWithContext(request, required_version);
+}
+
 fn recheckInitialPlacementProof(service: anytype, range_group_id: u64, expected: ?fk_generation_publication.InitialPlacementProof) !?fk_generation_publication.InitialPlacementProof {
     const current = try initialPlacementProofForGroup(service, range_group_id);
     if (!std.meta.eql(expected, current)) return error.TableTopologyProtocolUpgradeRequired;
     return current;
+}
+
+/// The caller owns the catalog mutation gate and has preflighted the hosted
+/// placement proof. Rechecking it here prevents a changed reservation from
+/// turning a hosted operation into an ordinary placement command.
+fn upsertReplicaIntentCatalogLocked(
+    service: anytype,
+    intent: raft_reconciler.PlacementIntent,
+    expected_metadata_version: ?u64,
+    expected_version_fence: u64,
+    expected_target_drain_requested: bool,
+    preflight: ?fk_generation_publication.InitialPlacementProof,
+) !void {
+    const proof = try recheckInitialPlacementProof(service, intent.record.group_id, preflight);
+    if (proof) |identity| return service.proposeTransitionCommand(.{ .upsert_fk_initial_replica_intent = .{
+        .proof = identity,
+        .expected_metadata_version = expected_metadata_version,
+        .expected_version_fence = expected_version_fence,
+        .expected_target_drain_requested = expected_target_drain_requested,
+        .replacement = intent,
+    } });
+    try service.proposeTransitionCommand(.{ .upsert_replica_intent = .{
+        .expected_metadata_version = expected_metadata_version,
+        .expected_version_fence = expected_version_fence,
+        .expected_target_drain_requested = expected_target_drain_requested,
+        .replacement = intent,
+    } });
+}
+
+fn removeReplicaIntentCatalogLocked(
+    service: anytype,
+    group_id: u64,
+    local_node_id: u64,
+    expected_metadata_version: u64,
+    preflight: ?fk_generation_publication.InitialPlacementProof,
+) !void {
+    const proof = try recheckInitialPlacementProof(service, group_id, preflight);
+    if (proof) |identity| return service.proposeTransitionCommand(.{ .remove_fk_initial_replica_intent = .{
+        .proof = identity,
+        .group_id = group_id,
+        .local_node_id = local_node_id,
+        .expected_metadata_version = expected_metadata_version,
+    } });
+    try service.proposeTransitionCommand(.{ .remove_replica_intent = .{
+        .group_id = group_id,
+        .local_node_id = local_node_id,
+        .expected_metadata_version = expected_metadata_version,
+    } });
+}
+
+fn applyReconciliationPlanMode(service: anytype, plan: *const metadata_reconciler.ReconciliationPlan, comptime catalog_locked: bool) !void {
+    std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
+    for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
+        if (comptime catalog_locked) {
+            // Decoder readiness is cached-only here; it cannot fan out while
+            // the catalog gate is held. The preceding ReadIndex cut and the
+            // locked proof recheck fence a prior leader's hosted BEGIN.
+            const preflight = try cachedInitialPlacementProof(service, intent.record.group_id);
+            try upsertReplicaIntentCatalogLocked(service, intent, precondition.expected_metadata_version, precondition.expected_version_fence, precondition.expected_target_drain_requested, preflight);
+        } else {
+            try service.upsertReplicaIntent(intent, precondition.expected_metadata_version, precondition.expected_version_fence, precondition.expected_target_drain_requested);
+        }
+    }
+    for (plan.table_upserts) |record| try service.upsertTable(record);
+    for (plan.split_admissions) |admission| try service.admitSplitTransition(admission);
+    for (plan.range_upserts) |record| try service.upsertRange(record);
+    for (plan.split_upserts) |record| try service.upsertSplitTransition(record);
+    for (plan.merge_upserts) |record| try service.upsertMergeTransition(record);
+    for (plan.placement_removals) |record| {
+        if (comptime catalog_locked) {
+            const preflight = try cachedInitialPlacementProof(service, record.group_id);
+            try removeReplicaIntentCatalogLocked(service, record.group_id, record.local_node_id, record.expected_metadata_version, preflight);
+        } else {
+            try service.removeReplicaIntent(record.group_id, record.local_node_id, record.expected_metadata_version);
+        }
+    }
+    for (plan.table_removals) |table_id| try service.removeTable(table_id);
+    for (plan.range_removals) |group_id| try service.removeRange(group_id);
+    for (plan.split_removals) |transition_id| try service.removeSplitTransition(transition_id);
+    for (plan.merge_removals) |transition_id| try service.removeMergeTransition(transition_id);
+    if (plan.clear_reallocation_request) |expected| try service.clearReallocationRequest(expected);
 }
 
 /// Materialize a multi-command catalog plan before admitting any part of it,
@@ -727,9 +867,22 @@ fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
     plan: *const metadata_reconciler.ReconciliationPlan,
     request: api_operation.RequestContext,
 ) !void {
+    return applyReconciliationPlanAndWaitAppliedWithContextMode(service, alloc, plan, request, null);
+}
+
+/// A non-null guard transfers an already-held catalog gate from the workflow
+/// to this batch. Admission runs under that gate; the gate is released before
+/// waiting for the terminal Raft receipt.
+fn applyReconciliationPlanAndWaitAppliedWithContextMode(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    plan: *const metadata_reconciler.ReconciliationPlan,
+    request: api_operation.RequestContext,
+    held_catalog_gate: ?*bool,
+) !void {
     try request.ensureActive();
     std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
-    if (plan.placement_upserts.len != 0 or plan.placement_removals.len != 0)
+    if (held_catalog_gate == null and (plan.placement_upserts.len != 0 or plan.placement_removals.len != 0))
         try ensureInitialPlacementReadCut(service, request);
 
     // Network/membership probing stays outside the catalog lock. A second
@@ -739,27 +892,35 @@ fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
     defer alloc.free(upsert_proofs);
     var has_hosted_placement = false;
     for (plan.placement_upserts, upsert_proofs) |intent, *proof| {
-        proof.* = try initialPlacementProofForGroup(service, intent.record.group_id);
+        proof.* = if (held_catalog_gate != null)
+            try cachedInitialPlacementProof(service, intent.record.group_id)
+        else
+            try initialPlacementProofForGroup(service, intent.record.group_id);
         has_hosted_placement = has_hosted_placement or proof.* != null;
     }
     const removal_proofs = try alloc.alloc(?fk_generation_publication.InitialPlacementProof, plan.placement_removals.len);
     defer alloc.free(removal_proofs);
     for (plan.placement_removals, removal_proofs) |record, *proof| {
-        proof.* = try initialPlacementProofForGroup(service, record.group_id);
+        proof.* = if (held_catalog_gate != null)
+            try cachedInitialPlacementProof(service, record.group_id)
+        else
+            try initialPlacementProofForGroup(service, record.group_id);
         has_hosted_placement = has_hosted_placement or proof.* != null;
     }
-    if (has_hosted_placement) {
+    if (has_hosted_placement and held_catalog_gate == null) {
         if (comptime !@hasDecl(@TypeOf(service.*), "ensureTableTopologyProtocolReadyWithContext"))
             return error.TableTopologyProtocolUpgradeRequired;
         _ = try service.ensureTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.fk_initial_create_version);
     }
 
     const has_catalog_lock = comptime @hasDecl(@TypeOf(service.*), "lockCatalogMutation");
-    if (comptime has_catalog_lock) service.lockCatalogMutation();
-    var catalog_locked = has_catalog_lock;
+    if (held_catalog_gate == null) {
+        if (comptime has_catalog_lock) service.lockCatalogMutation();
+    } else std.debug.assert(held_catalog_gate.?.*);
+    var catalog_locked = has_catalog_lock or held_catalog_gate != null;
     defer {
-        if (comptime has_catalog_lock) {
-            if (catalog_locked) service.unlockCatalogMutation();
+        if (catalog_locked and held_catalog_gate == null) {
+            if (comptime has_catalog_lock) service.unlockCatalogMutation();
         }
     }
 
@@ -865,6 +1026,7 @@ fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
     if (catalog_locked) {
         if (comptime has_catalog_lock) service.unlockCatalogMutation();
         catalog_locked = false;
+        if (held_catalog_gate) |guard| guard.* = false;
     }
     service.waitForTransitionAppliedWithContext(receipt, request) catch |err| {
         // A receipt proves that admission completed. Leadership loss,
@@ -970,10 +1132,21 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
     const FakeService = struct {
         metadata_group_id: u64 = 1,
         store: FakeStore = .{},
-        tags: [2]CommandTag = undefined,
+        tags: [4]CommandTag = undefined,
         command_count: usize = 0,
         batch_count: usize = 0,
         waited: bool = false,
+        locked: bool = false,
+        recursive_lock: bool = false,
+
+        fn lockCatalogMutation(self: *@This()) void {
+            if (self.locked) self.recursive_lock = true;
+            self.locked = true;
+        }
+
+        fn unlockCatalogMutation(self: *@This()) void {
+            self.locked = false;
+        }
 
         fn projectedStore(self: *@This()) ?*FakeStore {
             return &self.store;
@@ -988,6 +1161,7 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
             self: *@This(),
             commands: []const metadata_storage.TransitionCommand,
         ) !MetadataProposalReceipt {
+            try std.testing.expect(self.locked);
             for (commands) |command| self.record(command);
             self.batch_count += 1;
             return .{ .term = 3, .index = 9 };
@@ -998,6 +1172,7 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
             receipt: MetadataProposalReceipt,
             request: api_operation.RequestContext,
         ) !void {
+            try std.testing.expect(!self.locked);
             try request.ensureActive();
             try std.testing.expectEqual(@as(u64, 3), receipt.term);
             try std.testing.expectEqual(@as(u64, 9), receipt.index);
@@ -1028,6 +1203,21 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
     try std.testing.expectEqual(CommandTag.upsert_table, fake.tags[0]);
     try std.testing.expectEqual(CommandTag.upsert_range, fake.tags[1]);
     try std.testing.expect(fake.waited);
+    try std.testing.expect(!fake.recursive_lock);
+
+    fake.lockCatalogMutation();
+    var held_catalog_gate = true;
+    try applyReconciliationPlanAndWaitAppliedWithContextMode(
+        &fake,
+        std.testing.allocator,
+        &plan,
+        .{},
+        &held_catalog_gate,
+    );
+    try std.testing.expect(!held_catalog_gate);
+    try std.testing.expect(!fake.locked);
+    try std.testing.expect(!fake.recursive_lock);
+    try std.testing.expectEqual(@as(usize, 2), fake.batch_count);
 }
 
 test "metadata reconciliation never appends an ordinary placement after hidden BEGIN races preflight" {
@@ -1063,6 +1253,9 @@ test "metadata reconciliation never appends an ordinary placement after hidden B
             return &self.store;
         }
         fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: api_operation.RequestContext, required: u16) !TableTopologyProtocolReadiness {
+            return tableTopologyProtocolReadiness(3, required, "0123456789abcdef0123456789abcdef".*, &.{1});
+        }
+        fn cachedCoordinatedDecoderReadiness(_: *@This(), required: u16) !TableTopologyProtocolReadiness {
             return tableTopologyProtocolReadiness(3, required, "0123456789abcdef0123456789abcdef".*, &.{1});
         }
         fn ensureLinearizableReadWithContext(self: *@This(), _: api_operation.RequestContext) !void {
@@ -6073,38 +6266,14 @@ pub const MetadataService = struct {
         const preflight = try cachedInitialPlacementProof(self, intent.record.group_id);
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
-        const proof = try recheckInitialPlacementProof(self, intent.record.group_id, preflight);
-        if (proof) |identity| return self.proposeTransitionCommand(.{ .upsert_fk_initial_replica_intent = .{
-            .proof = identity,
-            .expected_metadata_version = expected_metadata_version,
-            .expected_version_fence = expected_version_fence,
-            .expected_target_drain_requested = expected_target_drain_requested,
-            .replacement = intent,
-        } });
-        try self.proposeTransitionCommand(.{ .upsert_replica_intent = .{
-            .expected_metadata_version = expected_metadata_version,
-            .expected_version_fence = expected_version_fence,
-            .expected_target_drain_requested = expected_target_drain_requested,
-            .replacement = intent,
-        } });
+        try upsertReplicaIntentCatalogLocked(self, intent, expected_metadata_version, expected_version_fence, expected_target_drain_requested, preflight);
     }
 
     pub fn removeReplicaIntent(self: *MetadataService, group_id: u64, local_node_id: u64, expected_metadata_version: u64) !void {
         const preflight = try cachedInitialPlacementProof(self, group_id);
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
-        const proof = try recheckInitialPlacementProof(self, group_id, preflight);
-        if (proof) |identity| return self.proposeTransitionCommand(.{ .remove_fk_initial_replica_intent = .{
-            .proof = identity,
-            .group_id = group_id,
-            .local_node_id = local_node_id,
-            .expected_metadata_version = expected_metadata_version,
-        } });
-        try self.proposeTransitionCommand(.{ .remove_replica_intent = .{
-            .group_id = group_id,
-            .local_node_id = local_node_id,
-            .expected_metadata_version = expected_metadata_version,
-        } });
+        try removeReplicaIntentCatalogLocked(self, group_id, local_node_id, expected_metadata_version, preflight);
     }
 
     pub fn upsertTable(self: *MetadataService, record: metadata_table_manager.TableRecord) !void {
@@ -6576,18 +6745,50 @@ pub const MetadataService = struct {
     pub fn reconcileOnceIfLeaseHeld(self: *MetadataService, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return null;
+        if (!try backgroundInitialPlacementReadCut(self)) {
+            self.lifecycle_reconcile_requested.store(true, .release);
+            return null;
+        }
         return try loop.reconcileOnce(self);
     }
 
     pub fn reconcilePreparedIfLeaseHeld(self: *MetadataService, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return null;
+        if (!try backgroundInitialPlacementReadCut(self)) {
+            self.lifecycle_reconcile_requested.store(true, .release);
+            return null;
+        }
         return try loop.reconcilePrepared(self);
+    }
+
+    pub fn ensureReconciliationPlacementReadCut(self: *MetadataService) !void {
+        if (!try backgroundInitialPlacementReadCut(self)) return error.MetadataLinearizableReadTimeout;
+    }
+
+    pub fn ensureReconciliationPlacementReadCutWithContext(self: *MetadataService, request: api_operation.RequestContext) !void {
+        try ensureInitialPlacementReadCut(self, request);
+    }
+
+    pub fn preflightInitialPlacementForGroupWithContext(self: *MetadataService, request: api_operation.RequestContext, group_id: u64) !void {
+        try preflightInitialPlacementForGroupWithContextImpl(self, request, group_id);
+    }
+
+    pub fn preflightProjectedPlacementWithContext(self: *MetadataService, request: api_operation.RequestContext) !void {
+        try preflightProjectedPlacementWithContextImpl(self, request);
+    }
+
+    pub fn preflightTableRecordWithContext(self: *MetadataService, request: api_operation.RequestContext, table: metadata_table_manager.TableRecord) !void {
+        try preflightTableRecordWithContextImpl(self, request, table);
     }
 
     pub fn reconcileSeededFromProjectedIfLeaseHeld(self: *MetadataService, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return null;
+        if (!try backgroundInitialPlacementReadCut(self)) {
+            self.lifecycle_reconcile_requested.store(true, .release);
+            return null;
+        }
         return try loop.reconcileSeededFromProjected(self);
     }
 
@@ -6638,26 +6839,12 @@ pub const MetadataService = struct {
     }
 
     pub fn applyReconciliationPlan(self: *MetadataService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
-        std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
-        for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
-            try self.upsertReplicaIntent(
-                intent,
-                precondition.expected_metadata_version,
-                precondition.expected_version_fence,
-                precondition.expected_target_drain_requested,
-            );
-        }
-        for (plan.table_upserts) |record| try self.upsertTable(record);
-        for (plan.split_admissions) |admission| try self.admitSplitTransition(admission);
-        for (plan.range_upserts) |record| try self.upsertRange(record);
-        for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
-        for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
-        for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id, record.expected_metadata_version);
-        for (plan.table_removals) |table_id| try self.removeTable(table_id);
-        for (plan.range_removals) |group_id| try self.removeRange(group_id);
-        for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
-        for (plan.merge_removals) |transition_id| try self.removeMergeTransition(transition_id);
-        if (plan.clear_reallocation_request) |expected| try self.clearReallocationRequest(expected);
+        try applyReconciliationPlanMode(self, plan, false);
+    }
+
+    /// Called by the control loop while it owns the catalog mutation gate.
+    pub fn applyReconciliationPlanCatalogLocked(self: *MetadataService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
+        try applyReconciliationPlanMode(self, plan, true);
     }
 
     pub fn applyReconciliationPlanAndWaitAppliedWithContext(
@@ -6666,6 +6853,15 @@ pub const MetadataService = struct {
         request: api_operation.RequestContext,
     ) !void {
         return applyReconciliationPlanAndWaitAppliedWithContextImpl(self, self.alloc, plan, request);
+    }
+
+    pub fn applyReconciliationPlanAndWaitAppliedCatalogLockedWithContext(
+        self: *MetadataService,
+        plan: *const metadata_reconciler.ReconciliationPlan,
+        request: api_operation.RequestContext,
+        held_catalog_gate: *bool,
+    ) !void {
+        return applyReconciliationPlanAndWaitAppliedWithContextMode(self, self.alloc, plan, request, held_catalog_gate);
     }
 
     pub fn observeSplitTransition(self: *MetadataService, transition_id: u64) !?transition_state.SplitObservation {
@@ -9088,38 +9284,14 @@ pub const MetadataHttpService = struct {
         const preflight = try cachedInitialPlacementProof(self, intent.record.group_id);
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
-        const proof = try recheckInitialPlacementProof(self, intent.record.group_id, preflight);
-        if (proof) |identity| return self.proposeTransitionCommand(.{ .upsert_fk_initial_replica_intent = .{
-            .proof = identity,
-            .expected_metadata_version = expected_metadata_version,
-            .expected_version_fence = expected_version_fence,
-            .expected_target_drain_requested = expected_target_drain_requested,
-            .replacement = intent,
-        } });
-        try self.proposeTransitionCommand(.{ .upsert_replica_intent = .{
-            .expected_metadata_version = expected_metadata_version,
-            .expected_version_fence = expected_version_fence,
-            .expected_target_drain_requested = expected_target_drain_requested,
-            .replacement = intent,
-        } });
+        try upsertReplicaIntentCatalogLocked(self, intent, expected_metadata_version, expected_version_fence, expected_target_drain_requested, preflight);
     }
 
     pub fn removeReplicaIntent(self: *MetadataHttpService, group_id: u64, local_node_id: u64, expected_metadata_version: u64) !void {
         const preflight = try cachedInitialPlacementProof(self, group_id);
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
-        const proof = try recheckInitialPlacementProof(self, group_id, preflight);
-        if (proof) |identity| return self.proposeTransitionCommand(.{ .remove_fk_initial_replica_intent = .{
-            .proof = identity,
-            .group_id = group_id,
-            .local_node_id = local_node_id,
-            .expected_metadata_version = expected_metadata_version,
-        } });
-        try self.proposeTransitionCommand(.{ .remove_replica_intent = .{
-            .group_id = group_id,
-            .local_node_id = local_node_id,
-            .expected_metadata_version = expected_metadata_version,
-        } });
+        try removeReplicaIntentCatalogLocked(self, group_id, local_node_id, expected_metadata_version, preflight);
     }
 
     pub fn upsertTable(self: *MetadataHttpService, record: metadata_table_manager.TableRecord) !void {
@@ -10148,18 +10320,50 @@ pub const MetadataHttpService = struct {
         // remains available during rolling upgrades; constrained admission uses
         // only the resulting exact-membership cache while holding that lane.
         _ = self.ensureTableTopologyProtocolReadyWithContext(.{ .deadline_ns = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms }, metadata_topology_protocol.relational_integrity_topology_version) catch {};
+        if (!try backgroundInitialPlacementReadCut(self)) {
+            self.lifecycle_reconcile_requested.store(true, .release);
+            return null;
+        }
         return try loop.reconcileOnce(self);
     }
 
     pub fn reconcilePreparedIfLeaseHeld(self: *MetadataHttpService, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return null;
+        if (!try backgroundInitialPlacementReadCut(self)) {
+            self.lifecycle_reconcile_requested.store(true, .release);
+            return null;
+        }
         return try loop.reconcilePrepared(self);
+    }
+
+    pub fn ensureReconciliationPlacementReadCut(self: *MetadataHttpService) !void {
+        if (!try backgroundInitialPlacementReadCut(self)) return error.MetadataLinearizableReadTimeout;
+    }
+
+    pub fn ensureReconciliationPlacementReadCutWithContext(self: *MetadataHttpService, request: api_operation.RequestContext) !void {
+        try ensureInitialPlacementReadCut(self, request);
+    }
+
+    pub fn preflightInitialPlacementForGroupWithContext(self: *MetadataHttpService, request: api_operation.RequestContext, group_id: u64) !void {
+        try preflightInitialPlacementForGroupWithContextImpl(self, request, group_id);
+    }
+
+    pub fn preflightProjectedPlacementWithContext(self: *MetadataHttpService, request: api_operation.RequestContext) !void {
+        try preflightProjectedPlacementWithContextImpl(self, request);
+    }
+
+    pub fn preflightTableRecordWithContext(self: *MetadataHttpService, request: api_operation.RequestContext, table: metadata_table_manager.TableRecord) !void {
+        try preflightTableRecordWithContextImpl(self, request, table);
     }
 
     pub fn reconcileSeededFromProjectedIfLeaseHeld(self: *MetadataHttpService, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return null;
+        if (!try backgroundInitialPlacementReadCut(self)) {
+            self.lifecycle_reconcile_requested.store(true, .release);
+            return null;
+        }
         return try loop.reconcileSeededFromProjected(self);
     }
 
@@ -10204,26 +10408,12 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn applyReconciliationPlan(self: *MetadataHttpService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
-        std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
-        for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
-            try self.upsertReplicaIntent(
-                intent,
-                precondition.expected_metadata_version,
-                precondition.expected_version_fence,
-                precondition.expected_target_drain_requested,
-            );
-        }
-        for (plan.table_upserts) |record| try self.upsertTable(record);
-        for (plan.split_admissions) |admission| try self.admitSplitTransition(admission);
-        for (plan.range_upserts) |record| try self.upsertRange(record);
-        for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
-        for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
-        for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id, record.expected_metadata_version);
-        for (plan.table_removals) |table_id| try self.removeTable(table_id);
-        for (plan.range_removals) |group_id| try self.removeRange(group_id);
-        for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
-        for (plan.merge_removals) |transition_id| try self.removeMergeTransition(transition_id);
-        if (plan.clear_reallocation_request) |expected| try self.clearReallocationRequest(expected);
+        try applyReconciliationPlanMode(self, plan, false);
+    }
+
+    /// Called by the control loop while it owns the catalog mutation gate.
+    pub fn applyReconciliationPlanCatalogLocked(self: *MetadataHttpService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
+        try applyReconciliationPlanMode(self, plan, true);
     }
 
     pub fn applyReconciliationPlanAndWaitAppliedWithContext(
@@ -10232,6 +10422,15 @@ pub const MetadataHttpService = struct {
         request: api_operation.RequestContext,
     ) !void {
         return applyReconciliationPlanAndWaitAppliedWithContextImpl(self, self.alloc, plan, request);
+    }
+
+    pub fn applyReconciliationPlanAndWaitAppliedCatalogLockedWithContext(
+        self: *MetadataHttpService,
+        plan: *const metadata_reconciler.ReconciliationPlan,
+        request: api_operation.RequestContext,
+        held_catalog_gate: *bool,
+    ) !void {
+        return applyReconciliationPlanAndWaitAppliedWithContextMode(self, self.alloc, plan, request, held_catalog_gate);
     }
 
     pub fn observeSplitTransition(self: *MetadataHttpService, transition_id: u64) !?transition_state.SplitObservation {

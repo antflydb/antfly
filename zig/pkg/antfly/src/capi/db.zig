@@ -4739,6 +4739,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.fkInitialCreateWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .fk_initial_retirement_page => |input| {
+                    const value = handle.store.fkInitialRetirementTicketPageJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .fk_initial_parent_decision => |input| {
                     const value = handle.store.fkInitialParentDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
