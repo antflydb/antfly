@@ -482,7 +482,11 @@ fn transferOwnerLeadership(io: std.Io, first: *data_runtime.DataServer, peers: [
 // Emit one bounded snapshot only when the mounted DROP continuation fails.
 // In particular, compare the metadata API's actual parent-control route with
 // all three Raft/apply owners instead of inferring health from the HTTP status.
-fn printDropParentFailureState(alloc: std.mem.Allocator, metadata: *metadata_runtime.Server, first: *data_runtime.DataServer, peers: [2]*DataPeer, table_name: []const u8, group_id: u64) void {
+fn printDropParentFailureState(alloc: std.mem.Allocator, metadata: *metadata_runtime.Server, first: *data_runtime.DataServer, peers: [2]*DataPeer, table_id: u64, table_name: []const u8, group_id: u64) void {
+    if (publicationPosition(alloc, metadata, table_id)) |position|
+        std.debug.print("self-FK DROP publication phase={s} revision={d}\n", .{ @tagName(position.phase), position.revision })
+    else |err|
+        std.debug.print("self-FK DROP publication status_err={s}\n", .{@errorName(err)});
     const servers = [_]*data_runtime.DataServer{ first, &peers[0].server, &peers[1].server };
     for (servers, 0..) |server, index| {
         const node_id: u64 = 9 + @as(u64, @intCast(index));
@@ -505,6 +509,32 @@ fn printDropParentFailureState(alloc: std.mem.Allocator, metadata: *metadata_run
             defer response.deinit(alloc);
             std.debug.print("self-FK DROP owner node={d} identity=present bytes={d}\n", .{ node_id, response.json.len });
         } else std.debug.print("self-FK DROP owner node={d} identity=absent\n", .{node_id});
+        const publication_status = server.read_source.source().lookupGroupLocal(alloc, group_id, table_name, "", .{
+            .relational_topology_json = "{\"mode\":\"generation_publication\"}",
+            .execution_deadline_ns = platform.time.monotonicNs() +| std.time.ns_per_s,
+        }, .read_index) catch |err| {
+            std.debug.print("self-FK DROP owner node={d} publication_err={s}\n", .{ node_id, @errorName(err) });
+            continue;
+        };
+        if (publication_status) |value| {
+            var response = value;
+            defer response.deinit(alloc);
+            var parsed = std.json.parseFromSlice(@import("../storage/db/relational_integrity_generation_admission.zig").OwnerStatus, alloc, response.json, .{}) catch |err| {
+                std.debug.print("self-FK DROP owner node={d} publication_decode_err={s}\n", .{ node_id, @errorName(err) });
+                continue;
+            };
+            defer parsed.deinit();
+            const status = parsed.value;
+            std.debug.print("self-FK DROP owner node={d} fence={} source_fence={any} staged={any} activated={any} acked={any} installed={any}\n", .{
+                node_id,
+                status.fence != null,
+                if (status.source_fence_receipt) |receipt| receipt.index else null,
+                if (status.staged_receipt) |receipt| receipt.index else null,
+                if (status.activation_receipt) |receipt| receipt.index else null,
+                if (status.acknowledged_receipt) |receipt| receipt.index else null,
+                if (status.source_install_receipt) |receipt| receipt.index else null,
+            });
+        } else std.debug.print("self-FK DROP owner node={d} publication=absent\n", .{node_id});
     }
     const api = metadata.server.owned_public_http_server orelse return;
     const read_source = metadata.server.owned_public_read_source orelse return;
@@ -1041,7 +1071,7 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
         const stopped_at_ack = drivePublicationWithLostRepliesDiagnostic(alloc, io, &metadata, table_id, transport, &headers, follower_base, true, leader_base, &probe_unproven) catch |err| {
             const physical = tableGroup(alloc, &metadata, table_id) catch return err;
             defer alloc.free(physical.name);
-            printDropParentFailureState(alloc, &metadata, &data, .{ peers[0].?, peers[1].? }, physical.name, child_group);
+            printDropParentFailureState(alloc, &metadata, &data, .{ peers[0].?, peers[1].? }, table_id, physical.name, child_group);
             return err;
         };
         try std.testing.expect(!stopped_at_ack);

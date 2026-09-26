@@ -837,7 +837,13 @@ failover matrix are unresolved. One bounded rerun completed ADD and DROP but
 reached the final post-restart delete before the cold owner had reopened; the
 fixture now waits for a local read-index integrity-catalog read before sending
 that mutation once. Another rerun stalled earlier at parent `stage`, so the
-new readiness gate has compiled but has not yet passed its mounted path.
+new readiness gate has compiled but has not yet passed its mounted path. The
+failure-only three-voter snapshot at that stall showed metadata
+`staging_parents` revision 2, every replica at the same committed/applied
+index, the new source-fence receipt at index 21, and only the prior ADD
+parent-stage receipt at index 7. The exact parent-stage prerequisite or
+proposal failure is not yet classified; routing, metadata cutover, or cold
+readiness should not be claimed as the root cause from those observations.
 
 Initial MATCH PARTIAL support-index installation now reserves the parent
 descriptor, hidden child identity, locks, and durable work in one metadata
