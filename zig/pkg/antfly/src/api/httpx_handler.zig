@@ -11049,7 +11049,7 @@ test "httpx relational row query mutation endpoints enforce exact versions and s
     try db.setSchemaJson(alloc, schema_json);
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"id\":9007199254740993,\"name\":\"first\"}" }}, .timestamp_ns = 9007199254740994 });
     var reads = table_reads.BoundTableReadSource.init("docs", 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
-    var writes = @import("table_writes.zig").BoundTableWriteSource.init("docs", &db);
+    var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("docs", &db);
     // Admission and participants must agree on the authoritative schema.
     // The generic lookup fixture advertises a document table at epoch zero,
     // which should be rejected for this schema-fenced relational mutation.

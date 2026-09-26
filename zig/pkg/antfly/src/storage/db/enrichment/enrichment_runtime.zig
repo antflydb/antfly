@@ -832,10 +832,28 @@ fn backoffWriterLockRetry() void {
 fn sleepRetryBackoff(runtime: *EnrichmentRuntime, sleep_ns: u64) void {
     if (comptime builtin.os.tag == .freestanding) return;
     if (runtime.io_impl) |backend| {
-        backend.io().sleep(
-            .fromNanoseconds(@intCast(@min(sleep_ns, @as(u64, std.math.maxInt(i64))))),
-            .awake,
-        ) catch {};
+        const io = backend.io();
+        const deadline = Io.Clock.Timestamp.fromNow(io, .{
+            .raw = .fromNanoseconds(@intCast(@min(sleep_ns, @as(u64, std.math.maxInt(i64))))),
+            .clock = .awake,
+        });
+        // Backoff is producer work, so catalog handoff must be able to join
+        // it immediately. The sticky teardown event also covers shutdown
+        // published before wait admission. Ordinary status/journal wakes must
+        // not shorten the provider's retry delay.
+        while (!runtime.shutdown_event.isSet()) {
+            runtime.shutdown_event.waitTimeout(io, .{ .deadline = deadline }) catch |err| switch (err) {
+                error.Canceled => return,
+                error.Timeout => {
+                    // Event waits may return on a spurious futex wake. Keep
+                    // the original monotonic deadline instead of retrying
+                    // early or extending the backoff from the wake time.
+                    if (deadline.compare(.lte, Io.Clock.Timestamp.now(io, .awake))) return;
+                    continue;
+                },
+            };
+            return;
+        }
         return;
     }
     std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
@@ -3117,6 +3135,11 @@ fn rememberPublishedGeneratedBatch(runtime: *EnrichmentRuntime, batch: derived_t
 }
 
 fn checkProviderInvocation(runtime: *EnrichmentRuntime, recovery_key: InferenceRecoveryKey, foreground_bounded: bool) !void {
+    // A teardown wake retires the wait, not permission to dispatch another
+    // provider request. This also protects providers without a scoped guard.
+    if (comptime builtin.os.tag != .freestanding) {
+        if (runtime.shutdown_requested.load(.acquire)) return error.EnrichmentRetryAborted;
+    }
     lockInferenceRecovery(runtime);
     const circuit_open_until_ns = if (runtime.inference_recovery.get(recovery_key)) |state|
         state.circuit_open_until_ns
@@ -4692,6 +4715,9 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     /// is intentionally separate so provider callbacks can observe shutdown
     /// without acquiring a lock held by the lifecycle owner.
     shutdown_requested: std.atomic.Value(bool) = .init(false),
+    /// Joinable inline retry/yield waits. Reset only after the preceding
+    /// worker and replay owner have drained, immediately before restart.
+    shutdown_event: Io.Event = .unset,
     target_sequence: u64 = 0,
     activity_epoch: u64 = 0,
     applied_sequence: u64 = 0,
@@ -4882,10 +4908,9 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn stop(self: *EnrichmentRuntime) void {
-        self.shutdown_requested.store(true, .release);
+        self.beginTeardown();
         if (self.io_impl) |io_impl| {
             const io = io_impl.io();
-            self.beginTeardown();
 
             if (self.future) |*future| _ = future.await(io);
 
@@ -4913,10 +4938,12 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     /// intentionally un-cancelable condition, so task cancellation alone
     /// cannot wake it to run defers and release DB ownership.
     pub fn beginTeardown(self: *EnrichmentRuntime) void {
+        self.shutdown_requested.store(true, .release);
         const io_impl = self.io_impl orelse return;
         const io = io_impl.io();
         self.mutex.lockUncancelable(io);
         self.shutdown = true;
+        self.shutdown_event.set(io);
         broadcastRuntimeStateChanged(self, io);
         self.mutex.unlock(io);
     }
@@ -4928,6 +4955,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn start(self: *EnrichmentRuntime) !void {
         if (self.future != null) return;
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
+        self.shutdown_event.reset();
         self.shutdown_requested.store(false, .release);
         const cancellation = CancellationToken.fromAtomic(&self.shutdown_requested);
         self.config.cancellation = cancellation;
@@ -5566,6 +5594,58 @@ test "enrichment runtime status reports worker lifecycle diagnostics" {
     failed.worker_failed = true;
     try std.testing.expect(enrichmentWorkerStallReason(failed) == null);
     try std.testing.expect(enrichmentWorkerStallReason(base) == null);
+}
+
+test "enrichment inline backoff wakes for teardown before and during wait admission" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Waiter = struct {
+        done: Io.Event = .unset,
+        fn run(self: *@This(), runtime: *EnrichmentRuntime) void {
+            sleepRetryBackoff(runtime, 60 * std.time.ns_per_s);
+            self.done.set(runtime.io_impl.?.io());
+        }
+    };
+    for ([_]bool{ true, false }) |before_wait| {
+        var runtime = EnrichmentRuntime{
+            .alloc = std.testing.allocator,
+            .io_impl = .{ .borrowed = io },
+            .store = undefined,
+            .owns_store = false,
+            .change_journal = undefined,
+            .replay_source = undefined,
+            .index_manager = undefined,
+            .write_ctx = undefined,
+            .write_fn = undefined,
+            .notify_ctx = undefined,
+            .notify_fn = undefined,
+            .config = .{},
+            .ownership = undefined,
+        };
+        if (before_wait) runtime.beginTeardown();
+        var waiter = Waiter{};
+        var future = try io.concurrent(Waiter.run, .{ &waiter, &runtime });
+        defer future.cancel(io);
+        if (!before_wait) {
+            // Observe actual event-wait admission, rather than sleeping and
+            // hoping the concurrent task reached its retry delay.
+            const deadline = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromSeconds(5), .clock = .awake });
+            while (@atomicLoad(Io.Event, &runtime.shutdown_event, .acquire) == .unset and
+                !deadline.compare(.lte, Io.Clock.Timestamp.now(io, .awake)))
+            {
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expectEqual(Io.Event.waiting, @atomicLoad(Io.Event, &runtime.shutdown_event, .acquire));
+            runtime.beginTeardown();
+        }
+        try std.testing.expect(runtime.shutdown_requested.load(.acquire));
+        try waiter.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        future.await(io);
+        const recovery_key = inferenceRecoveryKey(.{ .model = "test-model", .backend = "test-backend" });
+        try std.testing.expectError(error.EnrichmentRetryAborted, checkProviderInvocation(&runtime, recovery_key, true));
+    }
 }
 
 test "enrichment visibility wait wakes immediately on applied state" {

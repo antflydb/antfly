@@ -12,7 +12,6 @@ Every mutation lives in an isolated source overlay; the checkout is read only.
 from __future__ import annotations
 
 import argparse
-import atexit
 import json
 import os
 import re
@@ -21,6 +20,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import sys
 from pathlib import Path
 
 ZIG_ROOT = Path(__file__).resolve().parents[1]
@@ -65,10 +65,31 @@ def tree_rss(snapshot: str, root_pid: int) -> tuple[int, int]:
     return sum(sizes), max(sizes, default=0)
 
 
-def measured_build(command: list[str], cwd: Path) -> tuple[int, str, dict]:
+def bounded_build_command(zig: str, arguments: list[str]) -> list[str]:
+    return [
+        sys.executable,
+        str(ZIG_ROOT / "tools/run_bounded_zig_build.py"),
+        "--zig",
+        zig,
+        "--",
+        *arguments,
+    ]
+
+
+def write_report(path: Path, records: list[dict]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(records, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def measured_build(
+    command: list[str], cwd: Path, *, timeout_seconds: float = 1800, progress=None
+) -> tuple[int, str, dict]:
     """Sample concurrent RSS; wait4 accounts CPU for the entire waited tree."""
     started = time.monotonic()
     peak_tree = peak_process = samples = 0
+    timed_out = False
+    last_report = started
     with tempfile.TemporaryFile(mode="w+") as output:
         process = subprocess.Popen(
             command,
@@ -84,8 +105,13 @@ def measured_build(command: list[str], cwd: Path) -> tuple[int, str, dict]:
                 if pid:
                     process.returncode = os.waitstatus_to_exitcode(status)
                     break
-                if time.monotonic() - started > 1800:
-                    raise TimeoutError("production compilation exceeded 30 minutes")
+                now = time.monotonic()
+                if not timed_out and now - started > timeout_seconds:
+                    timed_out = True
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                 snapshot = subprocess.check_output(
                     ["ps", "-axo", "pid=,ppid=,rss="],
                     text=True,
@@ -94,6 +120,17 @@ def measured_build(command: list[str], cwd: Path) -> tuple[int, str, dict]:
                 peak_tree = max(peak_tree, tree)
                 peak_process = max(peak_process, largest)
                 samples += 1
+                if now - last_report >= 30:
+                    current = {
+                        "wall_seconds": round(now - started, 3),
+                        "peak_build_tree_rss_bytes": peak_tree,
+                        "peak_process_rss_bytes": peak_process,
+                        "rss_samples": samples,
+                    }
+                    print(f"compilation progress: {current}", flush=True)
+                    if progress is not None:
+                        progress(current)
+                    last_report = now
                 time.sleep(0.25)
         except BaseException:
             try:
@@ -109,10 +146,12 @@ def measured_build(command: list[str], cwd: Path) -> tuple[int, str, dict]:
             {
                 "wall_seconds": round(time.monotonic() - started, 3),
                 "cpu_seconds": round(usage.ru_utime + usage.ru_stime, 3),
+                "cpu_accounting_complete": not timed_out,
                 "peak_build_tree_rss_bytes": peak_tree,
                 "peak_process_rss_bytes": peak_process,
                 "rss_samples": samples,
                 "rss_sample_interval_seconds": 0.25,
+                "timed_out": timed_out,
             },
         )
 
@@ -149,10 +188,14 @@ def main() -> None:
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
     records = []
-    if args.report:
-        atexit.register(
-            lambda: args.report.write_text(json.dumps(records, indent=2) + "\n")
-        )
+    if args.jobs <= 0:
+        parser.error("--jobs must be positive")
+
+    def publish():
+        if args.report:
+            write_report(args.report, records)
+
+    publish()
     with tempfile.TemporaryDirectory(prefix="antfly-storage-compilation-") as temporary:
         work = Path(temporary)
         root = work / "repo"
@@ -235,8 +278,7 @@ def main() -> None:
 
         def build(label: str) -> dict[str, str]:
             print(f"{label}: compiling production artifacts", flush=True)
-            command = [
-                args.zig,
+            arguments = [
                 "build",
                 "check-storage-compilation",
                 "-Doptimize=Debug",
@@ -253,22 +295,44 @@ def main() -> None:
                 str(work / "cache"),
             ]
             if args.global_cache_dir:
-                command += ["--global-cache-dir", args.global_cache_dir]
-            returncode, output, measurements = measured_build(command, root / "zig")
+                arguments += ["--global-cache-dir", args.global_cache_dir]
+            command = bounded_build_command(args.zig, arguments)
+            record = {"case": label, "status": "running", "command": command}
+            records.append(record)
+            publish()
+
+            def progress(current):
+                record.update(current)
+                publish()
+
+            try:
+                returncode, output, measurements = measured_build(
+                    command, root / "zig", progress=progress
+                )
+            except BaseException as err:
+                record.update(status="interrupted", error=type(err).__name__)
+                publish()
+                raise
             states = {
                 ("link:" + name if kind == "exe" else name): state
                 for kind, name, state in COMPILES.findall(output)
             }
             elapsed = measurements["wall_seconds"]
-            records.append(
+            record.update(
                 {
-                    "case": label,
                     **measurements,
+                    "status": "failed" if returncode else "completed",
                     "returncode": returncode,
                     "artifacts": states,
                 }
             )
+            publish()
             if returncode:
+                if measurements["timed_out"]:
+                    print(
+                        f"{label}: production compilation exceeded 30 minutes",
+                        flush=True,
+                    )
                 # Zig's failed compiler command can span hundreds of KB.
                 print(
                     "\n".join(line for line in output.splitlines() if len(line) < 1000)

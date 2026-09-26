@@ -1704,6 +1704,10 @@ pub const ComputeBackend = struct {
         /// acquisition. Free exactly once; the backend must outlive the handle.
         /// Storage may still be borrowed from the model or backend cache.
         acquireWeight: *const fn (ctx: *anyopaque, name: []const u8) anyerror!CT,
+        /// Look up an immutable weight for row gathers. Backends may skip
+        /// matrix-specific packing; use only with embedding lookup operations.
+        /// Handles may be shared: free once per lookup. Defaults to getWeight.
+        getEmbeddingWeight: ?*const fn (ctx: *anyopaque, name: []const u8) anyerror!CT = null,
         prefetchWeightHint: *const fn (ctx: *anyopaque, name: []const u8, hint: u32) void,
         drainPrefetchBudget: *const fn (ctx: *anyopaque, max_items: usize) void,
         debugProfileCheckpoint: ?*const fn (ctx: *anyopaque, label: []const u8, layer: usize) void = null,
@@ -2993,6 +2997,12 @@ pub const ComputeBackend = struct {
     pub fn acquireWeight(self: *const ComputeBackend, name: []const u8) !CT {
         try self.checkExecutionControl();
         return self.vtable.acquireWeight(self.ptr, name);
+    }
+
+    pub fn getEmbeddingWeight(self: *const ComputeBackend, name: []const u8) !CT {
+        try self.checkExecutionControl();
+        const acquire = self.vtable.getEmbeddingWeight orelse self.vtable.getWeight;
+        return acquire(self.ptr, name);
     }
 
     pub fn prefetchWeight(self: *const ComputeBackend, name: []const u8) void {

@@ -19,8 +19,10 @@ const std = @import("std");
 const metadata = @import("../metadata/api.zig");
 const tables = @import("../metadata/table_manager.zig");
 const routing = @import("table_catalog.zig");
-const reads = @import("table_reads.zig");
-const writes = @import("table_writes.zig");
+const reads = @import("table_read_source.zig");
+const read_adapters = @import("antfly_source_root").antfly_sources.table_reads;
+const writes = @import("table_write_source.zig");
+const write_adapters = @import("antfly_source_root").antfly_sources.table_writes;
 const Scope = @import("../storage/db/restore_staging_contract.zig").Scope;
 
 pub const Owner = struct { group_id: u64, scope: Scope };
@@ -143,9 +145,9 @@ pub const Catalog = struct {
 };
 
 pub const Sources = struct {
-    reader: reads.HostedProvisionedTableReadSource,
-    writer: writes.HostedProvisionedTableWriteSource,
-    pub fn bind(self: *Sources, catalog: *Catalog, reader: reads.HostedProvisionedTableReadSource, writer: writes.HostedProvisionedTableWriteSource) void {
+    reader: read_adapters.HostedProvisionedTableReadSource,
+    writer: write_adapters.HostedProvisionedTableWriteSource,
+    pub fn bind(self: *Sources, catalog: *Catalog, reader: read_adapters.HostedProvisionedTableReadSource, writer: write_adapters.HostedProvisionedTableWriteSource) void {
         self.reader = reader;
         self.writer = writer;
         self.reader.catalog = catalog.source();
@@ -191,11 +193,11 @@ pub const ValidationPort = struct {
             return BoundaryAbi.call("bind", self.boundary_dispatch, self.bind, .{ self.ptr, self.secondary, catalog });
         }
 
-        pub fn hosted(reader: *reads.HostedProvisionedTableReadSource, writer: *writes.HostedProvisionedTableWriteSource) @This() {
+        pub fn hosted(reader: *read_adapters.HostedProvisionedTableReadSource, writer: *write_adapters.HostedProvisionedTableWriteSource) @This() {
             return .{ .ptr = reader, .secondary = writer, .bind = bindHosted };
         }
 
-        pub fn local(reader: *reads.ProvisionedTableReadSource, writer: *writes.ProvisionedTableWriteSource) @This() {
+        pub fn local(reader: *read_adapters.ProvisionedTableReadSource, writer: *write_adapters.ProvisionedTableWriteSource) @This() {
             return .{ .ptr = reader, .secondary = writer, .bind = bindLocal };
         }
 
@@ -208,8 +210,8 @@ pub const ValidationPort = struct {
                     self.alloc.destroy(self);
                 }
             };
-            const reader: *reads.HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-            const writer: *writes.HostedProvisionedTableWriteSource = @ptrCast(@alignCast(secondary.?));
+            const reader: *read_adapters.HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+            const writer: *write_adapters.HostedProvisionedTableWriteSource = @ptrCast(@alignCast(secondary.?));
             const owned = try catalog.alloc.create(Owned);
             owned.alloc = catalog.alloc;
             catalog.io = reader.catalog.io;
@@ -220,15 +222,15 @@ pub const ValidationPort = struct {
         fn bindLocal(ptr: *anyopaque, secondary: ?*anyopaque, catalog: *Catalog) !SourcePair {
             const Owned = struct {
                 alloc: std.mem.Allocator,
-                reader: reads.ProvisionedTableReadSource,
-                writer: writes.ProvisionedTableWriteSource,
+                reader: read_adapters.ProvisionedTableReadSource,
+                writer: write_adapters.ProvisionedTableWriteSource,
                 fn release(raw: *anyopaque) void {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     self.alloc.destroy(self);
                 }
             };
-            const reader: *reads.ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-            const writer: *writes.ProvisionedTableWriteSource = @ptrCast(@alignCast(secondary.?));
+            const reader: *read_adapters.ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+            const writer: *write_adapters.ProvisionedTableWriteSource = @ptrCast(@alignCast(secondary.?));
             const owned = try catalog.alloc.create(Owned);
             owned.* = .{ .alloc = catalog.alloc, .reader = reader.*, .writer = writer.* };
             catalog.io = reader.catalog.io;
@@ -359,7 +361,7 @@ pub fn validateSlice(alloc: std.mem.Allocator, catalog: *Catalog, reader: reads.
 }
 
 test "distributed txn staged mixed restore rebuilds fresh FK claims with durable 2PC and hides invalid cohorts" {
-    const db_mod = @import("../storage/db/db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const types = @import("../storage/db/types.zig");
     const native = @import("../storage/db/restore_staging_contract.zig");
     const activation = @import("../storage/db/relational_integrity_activation_contract.zig");

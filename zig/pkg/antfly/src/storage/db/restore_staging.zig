@@ -217,7 +217,7 @@ test "native restore artifact phase cannot skip row fencing or mutate logical pr
     try std.testing.expectError(error.InvalidRestoreStagingCommand, validateImport(alloc, &read, admission, 0, 0));
 }
 
-fn applyTestPage(alloc: Allocator, db: *@import("db.zig").DB, req: @import("types.zig").BatchRequest, index: u64, ha: bool) !void {
+fn applyTestPage(alloc: Allocator, db: *@import("antfly_source_root").antfly_sources.physical_db.DB, req: @import("types.zig").BatchRequest, index: u64, ha: bool) !void {
     if (!ha) return db.batchRaftReplicatedApply(req, .{ .term = 1, .index = index });
     const payload = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, req);
     defer alloc.free(payload);
@@ -226,7 +226,7 @@ fn applyTestPage(alloc: Allocator, db: *@import("db.zig").DB, req: @import("type
 }
 
 test "relational integrity restore staging Raft controls retain HA append obligations and replay original import timestamps" {
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const primary_mod = @import("../hot_standby/primary.zig");
     const effects = @import("../hot_standby/effects.zig");
     const types = @import("types.zig");
@@ -341,7 +341,7 @@ test "relational integrity restore staging Raft controls retain HA append obliga
 }
 
 test "relational integrity restore staging imports typed and document rows with restart and exact timestamps" {
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const types = @import("types.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

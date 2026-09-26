@@ -15,7 +15,7 @@
 //! Receiver-owned preparation. The existing replicated checkpoint/page
 //! appliers remain the only mutation and exact cleanup-prefix authority.
 const std = @import("std");
-const DB = @import("db.zig").DB;
+const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const wire = @import("online_merge_io_contract.zig");
 const pages = @import("merge_page_contract.zig");
 const merge = @import("merge_contract.zig");

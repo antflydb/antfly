@@ -11168,6 +11168,27 @@ pub fn getModelWeight(cb: *const ComputeBackend, config: Config, name: []const u
     return getModelWeightUnprefixedFallback(cb, name);
 }
 
+/// Gather-only weights retain raw quantized storage instead of allocating
+/// matrix panels for every vocabulary row (notably Gemma's PLE table).
+pub fn getModelEmbeddingWeight(cb: *const ComputeBackend, config: Config, name: []const u8) !CT {
+    if (config.weight_prefix.len != 0 and std.mem.startsWith(u8, name, "model.")) {
+        var buf: [256]u8 = undefined;
+        const prefixed = try maybePrefixedModelName(config, name, &buf);
+        return cb.getEmbeddingWeight(prefixed) catch |err| switch (err) {
+            error.MissingWeight, error.WeightNotFound => getModelEmbeddingWeightUnprefixed(cb, name),
+            else => err,
+        };
+    }
+    return getModelEmbeddingWeightUnprefixed(cb, name);
+}
+
+fn getModelEmbeddingWeightUnprefixed(cb: *const ComputeBackend, name: []const u8) !CT {
+    return cb.getEmbeddingWeight(name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => if (modelPrefixStrippedName(name)) |stripped| cb.getEmbeddingWeight(stripped) else err,
+        else => err,
+    };
+}
+
 fn getModelWeightUnprefixedFallback(cb: *const ComputeBackend, name: []const u8) !CT {
     return cb.getWeight(name) catch |err| switch (err) {
         error.MissingWeight, error.WeightNotFound => if (modelPrefixStrippedName(name)) |stripped| cb.getWeight(stripped) else err,
@@ -11467,8 +11488,8 @@ pub fn computePleVectors(
 
     // Token-identity path: look up concatenated per-layer token embeddings,
     // then scale by sqrt(ple_dim) (Gemma4TextScaledWordEmbedding).
-    const token_w = getModelWeight(cb, config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try getModelWeight(cb, config, "model.embed_tokens_per_layer.weight"),
+    const token_w = getModelEmbeddingWeight(cb, config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+        error.MissingWeight => try getModelEmbeddingWeight(cb, config, "model.embed_tokens_per_layer.weight"),
         else => return err,
     };
     defer cb.free(token_w);
@@ -11491,8 +11512,8 @@ pub fn computePleVectorsFromTokenTensor(
     const num_layers: usize = config.num_hidden_layers;
     const ple_total_dim: usize = ple_dim * num_layers;
 
-    const token_w = getModelWeight(cb, config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try getModelWeight(cb, config, "model.embed_tokens_per_layer.weight"),
+    const token_w = getModelEmbeddingWeight(cb, config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+        error.MissingWeight => try getModelEmbeddingWeight(cb, config, "model.embed_tokens_per_layer.weight"),
         else => return err,
     };
     defer cb.free(token_w);

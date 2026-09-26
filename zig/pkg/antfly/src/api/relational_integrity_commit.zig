@@ -2108,7 +2108,7 @@ test "distributed txn generated parent values drive canonical cascade assignment
 }
 
 fn testNativeCascade(generated: bool) !void {
-    const db_mod = @import("../storage/db/db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2180,7 +2180,7 @@ fn testNativeCascade(generated: bool) !void {
 }
 
 test "distributed txn MATCH PARTIAL nullable witnesses survive alternate deletion and apply last-witness actions" {
-    const db_mod = @import("../storage/db/db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;
     inline for (.{ "restrict", "cascade", "set_null" }) |action| {

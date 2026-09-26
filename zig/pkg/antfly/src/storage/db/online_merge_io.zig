@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const DB = @import("db.zig").DB;
+const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const wire = @import("online_merge_io_contract.zig");
 const source = @import("online_source.zig");
 const pages = @import("merge_page_contract.zig");
@@ -302,7 +302,7 @@ test "relational index system online admission facts are unbound read only and r
     try std.testing.expect((try Fetch.run(&typed, request)).eligible);
     const enriched_path = try std.fmt.allocPrint(alloc, "{s}-enriched", .{path});
     defer alloc.free(enriched_path);
-    const enriched_options: @import("db.zig").OpenOptions = .{ .identity_namespace = db.core.identity_namespace, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    const enriched_options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{ .identity_namespace = db.core.identity_namespace, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     var enriched = try DB.open(alloc, enriched_path, enriched_options);
     defer enriched.close();
     try enriched.setSchemaJson(alloc, "{}");
@@ -344,7 +344,7 @@ test "relational index system online receiver status preserves persisted positio
         .snapshot_position = .{ .object = 3, .offset = 17, .remaining = 2 },
         .assembly = .{ .transfer_digest = @splat(2), .last_digest = @splat(3), .next_offset = pages.chunk_bytes },
     };
-    const options: @import("db.zig").OpenOptions = .{ .identity_namespace = scope.receiver_namespace, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    const options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{ .identity_namespace = scope.receiver_namespace, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     {
         var db = try DB.open(alloc, path, options);
         defer db.close();
@@ -582,7 +582,7 @@ test "relational index system rewrite admission owns complete immutable historic
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/history", .{tmp.sub_path});
     defer alloc.free(path);
-    const options: @import("db.zig").OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    const options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     const v1 = "{\"version\":1}";
     const v2 = "{\"version\":2}";
     const v3 = "{\"version\":3}";

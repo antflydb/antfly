@@ -1195,7 +1195,9 @@ jobs:
 
       - name: Verify physical storage compilation ownership
         working-directory: zig
-        run: python3 -u tools/check_storage_compilation.py --report storage-compilation.json
+        run: |
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:8])))')
+          taskset -c "$cpus" python3 -u tools/check_storage_compilation.py --report storage-compilation.json
 
       - name: Upload storage compilation measurements
         if: always()
@@ -1749,6 +1751,7 @@ jobs:
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_SERVER_LOG_DIR: ${{ runner.temp }}/inference-server-logs
           ANTFLY_INFERENCE_DOWNLOAD: "1"
           # Gemma 4 covers ordinary, tool-calling, and multimodal generation;
           # keep one decoder artifact across every generation endpoint.
@@ -1804,6 +1807,15 @@ jobs:
         run: |
           chmod +x ./zig-out/bin/antfly
           taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly
+
+      - name: Retain full inference server logs
+        if: always() && matrix.suite == 'inference'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: antfly-inference-full-server-logs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/inference-server-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Retain failed full E2E server logs and cluster diagnostics
         if: failure() && matrix.suite == 'antfly'

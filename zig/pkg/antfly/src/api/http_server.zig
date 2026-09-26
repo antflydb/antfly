@@ -24268,7 +24268,7 @@ test "storage migration job observation preserves admitted and unpublished catal
 
 test "storage migration command admission fences delayed starts across handlers" {
     const migration = @import("../common/vector_migration.zig");
-    const Db = @import("../storage/db/db.zig").DB;
+    const Db = @import("antfly_source_root").antfly_sources.physical_db.DB;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
