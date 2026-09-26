@@ -389,6 +389,17 @@ pub const VirtualHttpNetwork = struct {
         gop.value_ptr.* = executor_;
     }
 
+    pub fn unregisterNode(self: *VirtualHttpNetwork, node_id: u64) void {
+        var keys = self.routes.keyIterator();
+        while (keys.next()) |key| {
+            const route = splitVirtualUri(key.*) orelse continue;
+            if (route.node_id != node_id) continue;
+            const removed = self.routes.fetchRemove(key.*).?;
+            self.alloc.free(@constCast(removed.key));
+            return;
+        }
+    }
+
     pub fn useQueuedDelivery(self: *VirtualHttpNetwork) void {
         self.delivery_mode = .queued;
     }
@@ -1767,6 +1778,7 @@ pub const ManagedHttpClusterSimulation = struct {
     configs: []ManagedHttpHostSimulationConfig,
     deps: []ManagedHttpHostSimulationDeps,
     nodes: []ManagedHttpHostSimulation,
+    node_live: []bool,
     started: bool = false,
 
     pub const Fault = union(enum) {
@@ -1815,6 +1827,9 @@ pub const ManagedHttpClusterSimulation = struct {
 
         const nodes = try alloc.alloc(ManagedHttpHostSimulation, configs.len);
         errdefer alloc.free(nodes);
+        const node_live = try alloc.alloc(bool, configs.len);
+        errdefer alloc.free(node_live);
+        @memset(node_live, false);
 
         var initialized: usize = 0;
         errdefer {
@@ -1828,6 +1843,7 @@ pub const ManagedHttpClusterSimulation = struct {
         for (owned_configs, owned_deps, 0..) |cfg, dep, i| {
             nodes[i] = try ManagedHttpHostSimulation.init(alloc, cfg, dep);
             initialized += 1;
+            node_live[i] = true;
             const node_id = cfg.host.http.host.local_node_id;
             try nodes[i].useVirtualBaseUri(node_id);
             try network.registerNode(node_id, nodes[i].serverRequestExecutor());
@@ -1839,12 +1855,14 @@ pub const ManagedHttpClusterSimulation = struct {
             .configs = owned_configs,
             .deps = owned_deps,
             .nodes = nodes,
+            .node_live = node_live,
         };
     }
 
     pub fn deinit(self: *ManagedHttpClusterSimulation) void {
-        for (self.nodes) |*sim| sim.deinit();
+        for (self.nodes, self.node_live) |*sim, live| if (live) sim.deinit();
         self.alloc.free(self.nodes);
+        self.alloc.free(self.node_live);
         self.alloc.free(self.configs);
         self.alloc.free(self.deps);
         self.network.deinit();
@@ -1862,7 +1880,8 @@ pub const ManagedHttpClusterSimulation = struct {
             }
         }
 
-        for (self.nodes) |*sim| {
+        for (self.nodes, self.node_live) |*sim, live| {
+            if (!live) return error.SimulationNodeUnavailable;
             try sim.start();
             started += 1;
         }
@@ -1870,17 +1889,20 @@ pub const ManagedHttpClusterSimulation = struct {
     }
 
     pub fn stopAll(self: *ManagedHttpClusterSimulation) void {
-        for (self.nodes) |*sim| sim.stop();
+        for (self.nodes, self.node_live) |*sim, live| if (live) sim.stop();
         self.started = false;
     }
 
     pub fn node(self: *ManagedHttpClusterSimulation, index: usize) *ManagedHttpHostSimulation {
+        std.debug.assert(self.node_live[index]);
         return &self.nodes[index];
     }
 
     pub fn stepAll(self: *ManagedHttpClusterSimulation) !void {
+        for (self.node_live) |live| if (!live) return error.SimulationNodeUnavailable;
         _ = try self.network.drainDue(null);
-        for (self.nodes) |*sim| {
+        for (self.nodes, self.node_live) |*sim, live| {
+            std.debug.assert(live);
             _ = try sim.stepOnce();
             _ = try self.network.drainDue(null);
         }
@@ -1957,12 +1979,23 @@ pub const ManagedHttpClusterSimulation = struct {
     }
 
     pub fn restartNode(self: *ManagedHttpClusterSimulation, index: usize) !void {
-        if (self.started) self.nodes[index].stop();
-        self.nodes[index].deinit();
+        if (index >= self.nodes.len) return error.InvalidNodeIndex;
+        const node_id = self.configs[index].host.http.host.local_node_id;
+        self.network.unregisterNode(node_id);
+        if (self.node_live[index]) {
+            if (self.started) self.nodes[index].stop();
+            self.nodes[index].deinit();
+            self.node_live[index] = false;
+        }
         var cfg = self.configs[index];
         cfg.async_transport = false;
         self.nodes[index] = try ManagedHttpHostSimulation.init(self.alloc, cfg, self.deps[index]);
-        const node_id = self.configs[index].host.http.host.local_node_id;
+        self.node_live[index] = true;
+        errdefer {
+            self.network.unregisterNode(node_id);
+            self.node_live[index] = false;
+            self.nodes[index].deinit();
+        }
         try self.nodes[index].useVirtualBaseUri(node_id);
         try self.network.registerNode(node_id, self.nodes[index].serverRequestExecutor());
         if (self.started) try self.nodes[index].start();
@@ -1975,7 +2008,8 @@ pub const ManagedHttpClusterSimulation = struct {
 
             fn done(cluster: *ManagedHttpClusterSimulation, ptr: *anyopaque) !bool {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
-                for (cluster.nodes) |*sim| {
+                for (cluster.nodes, cluster.node_live) |*sim, live| {
+                    if (!live) continue;
                     if (sim.raftStatus(ctx.group_id)) |status| {
                         if (status.soft.role == .leader) {
                             ctx.leader_id = status.id;
@@ -2004,7 +2038,8 @@ pub const ManagedHttpClusterSimulation = struct {
 
             fn done(cluster: *ManagedHttpClusterSimulation, ptr: *anyopaque) !bool {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
-                for (cluster.nodes) |*sim| {
+                for (cluster.nodes, cluster.node_live) |*sim, live| {
+                    if (!live) continue;
                     if (sim.raftStatus(ctx.group_id)) |status| {
                         if (status.soft.role == .leader and status.id == ctx.expected_leader_id) return true;
                     }

@@ -178,6 +178,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     secret_store: ?*anyopaque = null,
     context: client.Context = .{},
     owns_context: bool = true,
+    context_init_mutex: std.atomic.Mutex = .unlocked,
     mutex: std.atomic.Mutex = .unlocked,
     quiescing: bool = false,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
@@ -409,6 +410,11 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn ensureContextConfigured(self: *ProvisionedKernelOwnerSource) !void {
+        // Cold hidden-owner reads can arrive concurrently with one another or
+        // with an owner acquisition. Context creation and configuration must
+        // publish as one operation before any caller uses the handle.
+        lock(&self.context_init_mutex);
+        defer self.context_init_mutex.unlock();
         try self.context.ensure();
         if (self.remote_content_configured) return;
         const security_json = try common_config.remoteContentSecurityJsonAlloc(self.alloc, self.remote_content);
@@ -625,6 +631,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     pub fn contextMetrics(self: *ProvisionedKernelOwnerSource) !abi.ContextMetricsResult {
+        try self.ensureContextConfigured();
         return try self.context.metrics();
     }
 
@@ -1203,6 +1210,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // table owner. The control-only caller cannot invalidate them through
         // its legacy DB-cache path, so make the physical publication boundary
         // explicit before a new owner can open the replacement generation.
+        try self.ensureContextConfigured();
         try self.context.invalidateCaches();
         return durability_uncertain;
     }
@@ -1347,6 +1355,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// to invent a route for an unpublished owner. Warm reads pin the exact
     /// current generation; cold reads stay inside the compiled storage owner.
     pub fn readHAHiddenOwnerBootstrap(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) {
+        try self.ensureContextConfigured();
         const generation = self.visibleRootGeneration(group_id);
         var resident: ?Lease = blk: {
             lock(&self.mutex);
@@ -1364,8 +1373,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         var output: abi.OwnedBytes = .{};
         try kernel_error_identity.statusToError(abi.antfly_storage_owner_hidden_restore_json(if (resident) |*lease| lease.owner().handle else null, &.{ .operation = .read_bootstrap, .context = self.context.handle, .path = .fromSlice(path), .table_id = table_id }, &output));
         defer abi.antfly_storage_owner_buffer_destroy(&output);
+        if (generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
         if (output.len == 0) return null;
-        if (generation != self.visibleRootGeneration(group_id)) return error.RestoreStagingScopeChanged;
         return try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, output.slice(), .{ .allocate = .alloc_always });
     }
 
@@ -2772,7 +2781,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!std.mem.eql(u8, &scope, &parsed.value.scope.digest()) or
             !std.mem.eql(u8, table_name, parsed.value.table_name) or namespace.shard_id != group_id or
             namespace.table_id != descriptor.descriptor.identity.table_id or namespace.range_id != descriptor.descriptor.identity.range_id or
-            descriptor.descriptor.identity.shard_id != group_id or descriptor.descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.RestoreStagingScopeChanged;
+            descriptor.descriptor.identity.shard_id != group_id) return error.RestoreStagingScopeChanged;
+        // The root can advance after the immutable plan descriptor is read.
+        // Re-resolve it on retry; this is not a changed restore scope.
+        if (descriptor.descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
         if (plan_id) |plan| if (!std.mem.eql(u8, &plan, &parsed.value.scope.plan_id)) return error.RestoreStagingScopeChanged;
         try context.ensureActive();
         return descriptor;
@@ -2821,7 +2833,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// name lookup. Opening and all physical work remain in the compiled owner.
     pub fn primeRestoreOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor) !void {
         if (descriptor.restore_bootstrap_json.len == 0) return error.RestoreStagingScopeChanged;
-        if (descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.RestoreStagingScopeChanged;
+        if (descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
         const path = try std.fmt.allocPrint(self.alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         defer self.alloc.free(path);
         var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor);
@@ -2842,7 +2854,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try request.ensureActive();
         try input.validate(group_id);
         if (descriptor.restore_bootstrap_json.len == 0) return error.RestoreStagingScopeChanged;
-        if (descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.RestoreStagingScopeChanged;
+        if (descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
         var bootstrap = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, descriptor.restore_bootstrap_json, .{});
         defer bootstrap.deinit();
         if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &input.scope.digest())) return error.RestoreStagingScopeChanged;

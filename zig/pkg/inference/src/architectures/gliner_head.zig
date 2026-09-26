@@ -14,8 +14,8 @@
 
 // GLiNER2 span classification head using abstract ComputeBackend ops.
 //
-// Implements SpanMarkerV0 (span representation) and CountLSTMv2 (label projection),
-// then scores spans against labels via matmul.
+// Implements SpanMarkerV0 (span representation) and CountLSTM v1/v2 (label
+// projection), then scores spans against labels via matmul.
 //
 // Input: encoder hidden states [batch, seq_len, H], words_mask, span_idx
 // Output: logits [batch, num_words, max_width, num_labels]
@@ -40,10 +40,25 @@ pub const ForwardCtResult = struct {
     num_labels: usize,
 };
 
+/// Upstream `counting_layer`: `count_lstm` (v1: GRU + concat projector MLP)
+/// or `count_lstm_v2` (GRU residual + DownscaledTransformer).
+pub const CountLayer = enum {
+    count_lstm,
+    count_lstm_v2,
+
+    pub fn parse(value: []const u8) ?CountLayer {
+        if (std.mem.eql(u8, value, "count_lstm")) return .count_lstm;
+        if (std.mem.eql(u8, value, "count_lstm_v2")) return .count_lstm_v2;
+        return null;
+    }
+};
+
 pub const LabelMarkerTokens = struct {
     classification: i64 = 0,
     entity: i64,
     relation: i64 = 0,
+    /// Label projection applied to the marker states before span scoring.
+    count_layer: CountLayer = .count_lstm_v2,
 
     pub fn fromEntityToken(entity_token_id: i64) LabelMarkerTokens {
         return .{ .entity = entity_token_id };
@@ -224,7 +239,7 @@ pub fn forwardCtProfiledWithLabelMarkers(
             try profileSyncTensor(cb, profile, span_ct);
             if (profile) |p| p.span_marker_ns += profileElapsed(timer);
 
-            const logits_ct = try projectAndScoreSamples(cb, allocator, span_ct, label_hidden_ct, batch, num_spans, num_labels, H, profile);
+            const logits_ct = try projectAndScoreSamples(cb, allocator, span_ct, label_hidden_ct, batch, num_spans, num_labels, H, label_markers.count_layer, profile);
             return .{
                 .logits = logits_ct,
                 .num_words = num_words,
@@ -259,7 +274,7 @@ pub fn forwardCtProfiledWithLabelMarkers(
     const label_shape = [_]i32{ @intCast(batch * num_labels), @intCast(H) };
     const label_hidden_ct = try cb.fromFloat32Shape(label_result.embeddings, &label_shape);
     defer cb.free(label_hidden_ct);
-    const logits_ct = try projectAndScoreSamples(cb, allocator, span_ct, label_hidden_ct, batch, num_spans, num_labels, H, profile);
+    const logits_ct = try projectAndScoreSamples(cb, allocator, span_ct, label_hidden_ct, batch, num_spans, num_labels, H, label_markers.count_layer, profile);
     return .{
         .logits = logits_ct,
         .num_words = num_words,
@@ -282,9 +297,10 @@ fn projectAndScoreSamples(
     num_spans: usize,
     num_labels: usize,
     H: usize,
+    count_layer: CountLayer,
     profile: ?*ForwardProfile,
 ) !CT {
-    if (batch == 1) return projectAndScoreSample(cb, allocator, spans, labels, num_spans, num_labels, H, profile);
+    if (batch == 1) return projectAndScoreSample(cb, allocator, spans, labels, num_spans, num_labels, H, count_layer, profile);
 
     // CPU and Metal both provide backend row slicing. Metal also supports
     // copying into one result allocation without downloading activations.
@@ -300,7 +316,7 @@ fn projectAndScoreSamples(
         defer cb.free(sample_labels);
         const sample_spans = try cb.sliceRows2D(allocator, spans, b * num_spans, num_spans, H);
         defer cb.free(sample_spans);
-        const scored = try projectAndScoreSample(cb, allocator, sample_spans, sample_labels, num_spans, num_labels, H, profile);
+        const scored = try projectAndScoreSample(cb, allocator, sample_spans, sample_labels, num_spans, num_labels, H, count_layer, profile);
         if (direct_copy) {
             defer cb.free(scored);
             if (!try cb.copyRows2D(allocator, output.?, b * num_spans, scored, 0, num_spans, num_labels))
@@ -323,10 +339,14 @@ fn projectAndScoreSample(
     num_spans: usize,
     num_labels: usize,
     H: usize,
+    count_layer: CountLayer,
     profile: ?*ForwardProfile,
 ) !CT {
     var timer = profileStart(profile);
-    const projected = try countLstmForwardFromCt(cb, allocator, labels, num_labels, H);
+    const projected = switch (count_layer) {
+        .count_lstm_v2 => try countLstmForwardFromCt(cb, allocator, labels, num_labels, H),
+        .count_lstm => try countLstmV1ForwardFromCt(cb, allocator, labels, num_labels, H),
+    };
     defer cb.free(projected);
     try profileSyncTensor(cb, profile, projected);
     if (profile) |p| p.label_projection_ns += profileElapsed(timer);
@@ -904,6 +924,66 @@ fn countLstmForwardFromCt(
     const label_embs = try cb.toFloat32(label_ct, allocator);
     defer allocator.free(label_embs);
     return countLstmForwardCt(cb, allocator, label_embs, num_labels, H);
+}
+
+/// CountLSTM (v1) forward pass (count=1 at inference time):
+/// projector(concat([GRU(pos[0], h_0=label), label])), projector = 2H→4H→H.
+/// Only the label markers take this path (a handful of rows), so the GRU gate
+/// math stays on the host like the v2 fallback.
+fn countLstmV1ForwardFromCt(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    label_ct: CT,
+    num_labels: usize,
+    H: usize,
+) !CT {
+    if (num_labels == 0) {
+        const empty_shape = [_]i32{ 0, @intCast(H) };
+        return cb.fromFloat32Shape(&.{}, &empty_shape);
+    }
+    const label_embs = try cb.toFloat32(label_ct, allocator);
+    defer allocator.free(label_embs);
+    if (label_embs.len != num_labels * H) return error.UnexpectedInputShape;
+
+    const pos_w = try cb.getWeight("count_embed.pos_embedding.weight");
+    defer cb.free(pos_w);
+    const pos_data = try cb.toFloat32(pos_w, allocator);
+    defer allocator.free(pos_data);
+    if (pos_data.len < H) return error.UnexpectedInputShape;
+    const pos_broadcast = try allocator.alloc(f32, num_labels * H);
+    defer allocator.free(pos_broadcast);
+    for (0..num_labels) |i| @memcpy(pos_broadcast[i * H ..][0..H], pos_data[0..H]);
+
+    const gru_out = try gruStep(cb, allocator, label_embs, pos_broadcast, num_labels, H);
+    defer allocator.free(gru_out);
+
+    const cat = try allocator.alloc(f32, num_labels * 2 * H);
+    defer allocator.free(cat);
+    for (0..num_labels) |i| {
+        @memcpy(cat[i * 2 * H ..][0..H], gru_out[i * H ..][0..H]);
+        @memcpy(cat[i * 2 * H + H ..][0..H], label_embs[i * H ..][0..H]);
+    }
+    const cat_shape = [_]i32{ @intCast(num_labels), @intCast(2 * H) };
+    const cat_ct = try cb.fromFloat32Shape(cat, &cat_shape);
+    defer cb.free(cat_ct);
+
+    const w0 = try cb.getWeight("count_embed.projector.0.weight");
+    defer cb.free(w0);
+    const b0 = try cb.getWeight("count_embed.projector.0.bias");
+    defer cb.free(b0);
+    const hidden = if (try cb.linearRelu(cat_ct, w0, b0, num_labels, 2 * H, 4 * H)) |fused|
+        fused
+    else blk: {
+        const h = try cb.linear(cat_ct, w0, b0, num_labels, 2 * H, 4 * H);
+        defer cb.free(h);
+        break :blk try cb.relu(h);
+    };
+    defer cb.free(hidden);
+    const w2 = try cb.getWeight("count_embed.projector.2.weight");
+    defer cb.free(w2);
+    const b2 = try cb.getWeight("count_embed.projector.2.bias");
+    defer cb.free(b2);
+    return cb.linear(hidden, w2, b2, num_labels, 4 * H, H);
 }
 
 /// GRU single step.

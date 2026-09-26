@@ -52,6 +52,7 @@ const embedding_mod = @import("../pipelines/embedding.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
 const extraction_v2 = @import("../extractors/extraction_v2.zig");
 const boundary_executor = @import("../extractors/gliner_boundary_executor.zig");
+const span_v2_executor = @import("../extractors/gliner_span_v2_executor.zig");
 const BoundedRequestAllocator = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
 const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
@@ -8940,6 +8941,11 @@ pub const Node = struct {
         // this gate, even for an otherwise small extraction request.
         var manifest = try manifest_mod.loadListingFromDir(scratch, model_path);
         defer manifest.deinit();
+        // Only a declared gliner2 2.x span checkpoint has the upstream
+        // classifier head and processor contract this route executes; other
+        // span models keep the prior unsupported-model response.
+        if (manifest.gliner_architecture == .span and manifest.gliner_span_declared)
+            return self.extractV2Span(scratch, model_path, &request, control, failure, response_limit, budget, working_bytes, allocation_failure);
         if (manifest.gliner_architecture != .boundary) return error.UnsupportedExtractionModel;
         const test_qualification = if (builtin.is_test) self.test_allow_unqualified_gliner_boundary else false;
         if (!test_qualification and !manifest.mayLoadQualifiedGlinerBoundaryRuntime()) return error.UnsupportedGlinerBoundaryRuntime;
@@ -9037,6 +9043,92 @@ pub const Node = struct {
         }
     }
 
+    /// schema_version:2 classification on a declared gliner2 2.x span
+    /// (SpanExtractor) checkpoint such as GLiNER2.5-Decide. Span
+    /// entity/relation/structure extraction remains on schema_version 1.
+    fn extractV2Span(
+        self: *Node,
+        scratch: std.mem.Allocator,
+        model_path: []const u8,
+        request: *const extraction_v2.Request,
+        control: ?InferenceExecutionControl,
+        failure: *extraction_v2.FailureContext,
+        response_limit: ?usize,
+        budget: *runtime.tier.memory.RunBudget,
+        working_bytes: usize,
+        allocation_failure: *ExtractionAllocationFailure,
+    ) ![]u8 {
+        var options = span_v2_executor.Options{
+            .control = control,
+            .failure = failure,
+            .max_response_bytes = @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024),
+        };
+        try span_v2_executor.preflight(request, options);
+        failure.* = .{ .stage = "model" };
+        allocation_failure.clear();
+        var handle = self.model_manager.acquireFromDirWithControl(model_path, control orelse .{}) catch |err| {
+            allocation_failure.clear();
+            return err;
+        };
+        defer handle.release();
+        const loaded = handle.get();
+        const backend = loaded.session.backend();
+        if (backend != .native and backend != .metal) return error.UnsupportedExtractionBackend;
+        const config = try session_factory.getGlinerSpanConfig(loaded.session);
+        // Same per-sequence ceiling as the legacy span route: the model's
+        // position budget (512 for DeBERTa-v3).
+        const max_sequence = if (config.max_position_embeddings == 0) 512 else @min(@as(usize, config.max_position_embeddings), options.processor.max_sequence_tokens);
+        options.processor.max_sequence_tokens = max_sequence;
+        options.processor.max_batch_tokens = max_sequence;
+        options.max_prompt_tokens = @min(options.max_prompt_tokens, max_sequence);
+
+        const texts = try scratch.alloc([]const u8, request.items.len);
+        defer scratch.free(texts);
+        var max_labels: usize = 0;
+        for (request.items, texts) |item, *text| {
+            text.* = item.text;
+            var labels: usize = 0;
+            for (item.compiled.schema.classifications) |classification| labels += classification.task.labels.len;
+            max_labels = @max(max_labels, labels);
+        }
+        const executor_contract = try resolvedInferenceExecutorContract(self, "extract", &loaded.manifest);
+        try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, 0, max_labels, 0);
+
+        // Tokenize and split before any model lock, like the boundary
+        // route's workspace geometry pass.
+        failure.* = .{ .stage = "tokenizing" };
+        var request_plan = try span_v2_executor.plan(scratch, loaded.getTokenizer(), request, options);
+        defer request_plan.deinit(scratch);
+        const longest = span_v2_executor.maxPlannedSequenceTokens(&request_plan);
+        try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, longest, max_labels, 0);
+        failure.* = .{ .stage = "model" };
+
+        // Metal work is admitted like the boundary route: a GPU run budget
+        // and a process-wide backend-scratch lease, acquired before the
+        // execution lock because admission can evict other models.
+        var device_lease: ?runtime.tier.memory.AdmissionLease = null;
+        defer if (device_lease) |*owned| owned.release();
+        if (backend == .metal) {
+            const device_limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu));
+            const device_bytes = try span_v2_executor.deviceScratchUpperBound(config, longest);
+            budget.* = runtime.tier.memory.RunBudget.init(device_limits);
+            try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = working_bytes, .scratch_tier = .host });
+            try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = device_bytes, .scratch_tier = .backend });
+            device_lease = try self.model_manager.acquireRunResourceAmounts(.gpu, device_limits, .{ .backend_scratch_bytes = device_bytes });
+        }
+
+        const effective = control orelse InferenceExecutionControl{};
+        const execution_mutex = loaded.targetInferenceExecutionMutex();
+        if (execution_mutex) |mutex| try effective.lock(mutex);
+        defer if (execution_mutex) |mutex| mutex.unlock();
+        var managed = try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, control);
+        defer managed.deinit();
+        const json = try span_v2_executor.executePlanned(&managed.backend, scratch, config, request, &request_plan, options);
+        errdefer scratch.free(json);
+        try effective.check();
+        return json;
+    }
+
     fn extractWithAdmission(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -9057,9 +9149,23 @@ pub const Node = struct {
         // this internal detail. Any resolution failure (bad model name,
         // non-boundary model) leaves the request unmodified.
         var request = supplied_request;
+        var upgraded_schema_json: ?[]u8 = null;
+        defer if (upgraded_schema_json) |bytes| allocator.free(bytes);
         if (request.schema_version == null) upgrade: {
             const io = self.session_manager.io orelse break :upgrade;
-            if (self.resolvesToBoundaryArchitecture(io, model_name)) request.schema_version = 2;
+            if (self.resolvesToBoundaryArchitecture(io, model_name)) {
+                request.schema_version = 2;
+                break :upgrade;
+            }
+            var schema = std.json.parseFromSlice(std.json.Value, allocator, request.schema_json, .{}) catch break :upgrade;
+            defer schema.deinit();
+            if (!self.resolvesToSpanClassification(io, model_name, schema.value)) break :upgrade;
+            var options = std.json.parseFromSlice(std.json.Value, allocator, if (request.options_json.len > 0) request.options_json else "{}", .{}) catch break :upgrade;
+            defer options.deinit();
+            if (carryV1ClassificationThreshold(schema.arena.allocator(), &schema.value, options.value) catch break :upgrade)
+                upgraded_schema_json = std.json.Stringify.valueAlloc(allocator, schema.value, .{}) catch break :upgrade;
+            if (upgraded_schema_json) |bytes| request.schema_json = bytes;
+            request.schema_version = 2;
         }
         const schema_version = request.schema_version orelse 1;
         if (schema_version == 2) {
@@ -18634,6 +18740,21 @@ pub const Node = struct {
         return manifest.gliner_architecture == .boundary;
     }
 
+    /// A classification-only request on a declared gliner2 2.x span
+    /// checkpoint runs the upstream `classifier` head on schema_version:2.
+    /// The legacy route scores span logits of `[C]` markers instead, which is
+    /// not the checkpoint's classification semantics.
+    fn resolvesToSpanClassification(self: *Node, io: std.Io, model_name: []const u8, schema: std.json.Value) bool {
+        if (model_name.len == 0 or !schemaIsClassificationOnly(schema)) return false;
+        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const model_path = self.resolveRequestModelPath(scratch, io, model_name, "extractors") catch return false;
+        var manifest = manifest_mod.loadListingFromDir(scratch, model_path) catch return false;
+        defer manifest.deinit();
+        return manifest.gliner_architecture == .span and manifest.gliner_span_declared;
+    }
+
     /// If `request_json` names a boundary-architecture model and does not
     /// already declare a schema version, returns a new allocation (owned by
     /// `result_allocator`) with `"schema_version":2` stamped on, so
@@ -18671,7 +18792,11 @@ pub const Node = struct {
         if (parsed.value.object.contains("schema_version")) return null;
         const model_value = parsed.value.object.get("model") orelse return null;
         if (model_value != .string or model_value.string.len == 0) return null;
-        if (!self.resolvesToBoundaryArchitecture(io, model_value.string)) return null;
+        if (!self.resolvesToBoundaryArchitecture(io, model_value.string)) {
+            const schema = parsed.value.object.getPtr("schema") orelse return null;
+            if (!self.resolvesToSpanClassification(io, model_value.string, schema.*)) return null;
+            _ = carryV1ClassificationThreshold(scratch, schema, parsed.value.object.get("options") orelse .null) catch return null;
+        }
         parsed.value.object.put(scratch, "schema_version", .{ .integer = 2 }) catch return null;
         return std.json.Stringify.valueAlloc(result_allocator, parsed.value, .{}) catch null;
     }
@@ -19660,6 +19785,80 @@ const CanonicalExtractionOperation = enum {
     classifications,
     structures,
 };
+
+/// schema_version 1 gates multi-label classification labels with the
+/// request-level `options.threshold`; schema_version 2 uses a per-task
+/// `threshold` (default 0.5). When a v1 classification request is upgraded,
+/// carry an explicit request threshold into every task that sets none, so the
+/// caller's cut-off keeps its meaning. Returns whether the schema changed.
+fn carryV1ClassificationThreshold(allocator: std.mem.Allocator, schema: *std.json.Value, options: std.json.Value) !bool {
+    if (options != .object) return false;
+    const threshold = options.object.get("threshold") orelse return false;
+    if (threshold != .float and threshold != .integer) return false;
+    if (schema.* != .object) return false;
+    const tasks = schema.object.getPtr("classifications") orelse return false;
+    if (tasks.* != .array) return false;
+    var changed = false;
+    for (tasks.array.items) |*task| {
+        if (task.* != .object or task.object.contains("threshold")) continue;
+        try task.object.put(allocator, "threshold", threshold);
+        changed = true;
+    }
+    return changed;
+}
+
+test "v1 classification upgrade keeps the request threshold per task" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"classifications":[{"name":"a","labels":["x","y"],"multi_label":true},{"name":"b","labels":["x","y"],"threshold":0.7}]}
+    , .{});
+    const options = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"threshold\":0.2}", .{});
+    try std.testing.expect(try carryV1ClassificationThreshold(a, &schema, options));
+    const tasks = schema.object.get("classifications").?.array.items;
+    try std.testing.expectEqual(@as(f64, 0.2), tasks[0].object.get("threshold").?.float);
+    try std.testing.expectEqual(@as(f64, 0.7), tasks[1].object.get("threshold").?.float);
+    const none = try std.json.parseFromSliceLeaky(std.json.Value, a, "{}", .{});
+    try std.testing.expect(!try carryV1ClassificationThreshold(a, &schema, none));
+}
+
+/// Whether an extraction schema declares classification tasks and nothing else.
+fn schemaIsClassificationOnly(schema: std.json.Value) bool {
+    if (schema != .object) return false;
+    const tasks = schema.object.get("classifications") orelse return false;
+    if (tasks != .array or tasks.array.items.len == 0) return false;
+    var fields = schema.object.iterator();
+    while (fields.next()) |field| {
+        const name = field.key_ptr.*;
+        if (std.mem.eql(u8, name, "classifications")) continue;
+        const value = field.value_ptr.*;
+        if (std.mem.eql(u8, name, "entities") or std.mem.eql(u8, name, "relations")) {
+            if (value == .array and value.array.items.len == 0) continue;
+        } else if (std.mem.eql(u8, name, "structures")) {
+            if (value == .object and value.object.count() == 0) continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+test "span classification upgrade requires a classification-only schema" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { json: []const u8, expected: bool }{
+        .{ .json = "{\"classifications\":[{\"name\":\"intent\",\"labels\":[\"a\",\"b\"]}]}", .expected = true },
+        .{ .json = "{\"entities\":[],\"relations\":[],\"structures\":{},\"classifications\":[{\"name\":\"intent\",\"labels\":[\"a\",\"b\"]}]}", .expected = true },
+        .{ .json = "{\"classifications\":[]}", .expected = false },
+        .{ .json = "{\"entities\":[\"person\"],\"classifications\":[{\"name\":\"x\",\"labels\":[\"a\"]}]}", .expected = false },
+        .{ .json = "{\"entities\":{},\"classifications\":[{\"name\":\"x\",\"labels\":[\"a\"]}]}", .expected = false },
+        .{ .json = "[]", .expected = false },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, case.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expected, schemaIsClassificationOnly(parsed.value));
+    }
+}
 
 fn canonicalExtractionOperation(schema: extraction_api.ExtractionSchema) !CanonicalExtractionOperation {
     const has_entities = if (schema.entities) |entities| entities.len > 0 else false;
