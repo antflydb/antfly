@@ -774,30 +774,42 @@ Antfly's own runtime:
 `scripts/laya/prepare_laya_longcontext_teacher.py` (new; sibling to, and
 partitions a dataset with, `prepare_laya_packed_distillation.py`):
 
-- **Eligibility.** Reuses the same `state_fits` check against the target
-  unpacked Laya checkpoint's real `max_len`/`head_max_len`
-  (not a raw token count), so a record either gets scored by
-  `prepare_laya_packed_distillation.py`'s Laya teacher (Laya can see it) or by
-  this script's teacher (Laya cannot), never both, never neither.
+- **Eligibility (which records get a teacher target).** Reuses the same
+  `state_fits` check against the target unpacked Laya checkpoint's real
+  `max_len`/`head_max_len` (not a raw token count), so a record either gets
+  scored by `prepare_laya_packed_distillation.py`'s Laya teacher (Laya can see
+  it) or by this script's teacher (Laya cannot), never both, never neither.
 - **Prompt.** One prompt per record: the full, untruncated state, the
   question and its labels with descriptions, asking for exactly one label
   verbatim. Uses Qwen3's chat template with `enable_thinking=False`.
-- **Label score.** The length-normalized log-likelihood of each label
-  (average log-probability per token, since labels tokenize to different
-  lengths) via teacher forcing. The prompt is encoded once per record; each
-  label branches off a saved copy of the prompt's KV cache instead of
-  re-encoding the prompt (`mlx_lm.models.cache.KVCache.state`), which cut
-  per-label cost from ~2 s (a full prompt-length forward) to ~30-60 ms and
-  left the shared cache unmodified (checked directly: cache offset and key/value
-  shapes are unchanged after branching, and a from-scratch continuation gives
-  the same logits).
-- **Calibration.** One temperature per question type (choice/score/noul),
-  grid-searched to minimize cross-entropy against gold on a calibration split,
-  in the same shape as Laya's own `temperature_by_options`.
+- **Label score.** Each label's log-likelihood via teacher forcing, in two
+  conventions computed from the same per-token logprobs (free to compute
+  together): raw sum, and length-normalized (average log-probability per
+  token, since labels tokenize to different lengths). The prompt is encoded
+  once per record; each label branches off a saved copy of the prompt's KV
+  cache instead of re-encoding the prompt (`mlx_lm.models.cache.KVCache.state`),
+  which cut per-label cost from ~2 s (a full prompt-length forward) to
+  ~30-60 ms and left the shared cache unmodified (checked directly: cache
+  offset and key/value shapes are unchanged after branching, and a
+  from-scratch continuation gives the same logits).
+- **Calibration (independent of eligibility).** The teacher scores every
+  calibration record itself, short or long, so its own confidence calibration
+  does not depend on whether *Laya* could see that state — only the
+  eligibility check above decides which records receive a teacher-labelled
+  target. `--calibration` therefore scores every record in the given file.
+  Temperatures are fit per question type and, where a (type, option-count)
+  bucket has >=15 calibration examples, per bucket too (the same shape as
+  Laya's own `temperature_by_options`); a bucket short on examples falls back
+  to its type's temperature.
+- **Raw-sum vs. length-normalized.** `--score-mode auto` (default) fits both
+  conventions on the calibration split and keeps whichever gives lower mean
+  cross-entropy. On the 1,000-record calibration split: raw-sum 1.0149 nats,
+  length-normalized 1.0199 nats — raw-sum wins, but narrowly (0.5% relative).
 - **Blend.** `target = w * gold + (1 - w) * teacher`, `w = 0.5` by default,
   identical to `prepare_laya_packed_distillation.py`. Provenance (`<output>.json`)
   records the teacher's model path and config hash, the common.py hash, a hash
-  of the prompt-building function's source, and the fitted temperatures.
+  of the prompt-building function's source, the chosen score mode, and the
+  fitted temperatures (by bucket and by type).
 
 ### How much of the dataset is actually invisible to Laya
 
@@ -813,16 +825,20 @@ records are truly invisible to Laya:
 | --- | ---: | ---: |
 | `eval` | 160 | 34 (21%) |
 | `train` | 425 | 69 (16%) |
-| `calibration` | 145 | ~31 (21%, estimated from the fitted counts) |
 
 Only the "actually invisible" column got a teacher target; the roughly 80% of
 "long-looking" records Laya can in fact see keep passing through the existing
-`prepare_laya_packed_distillation.py` path. Calibration counts, split by
-question type: 0 truly-invisible `score` or `noul` calibration examples turned
-up, so those two temperatures fell back to `1.0` (no scaling); `choice` fit to
-`3.99`. **This is the main limitation of this measurement**: LocalLLaMA/typed-decisions'
-states top out at 549 tokens, so genuinely long-context cases are rare here.
-Step 2c's 8k-token states, once available, will produce far more of them.
+`prepare_laya_packed_distillation.py` path. Calibration used the full,
+1,000-record `td/calibration.jsonl` split regardless of this eligibility split
+(300 `choice`, 400 `score`, 300 `noul`; every kind fell into a single
+option-count bucket — 3-5, 3-5, and 2 respectively — so the dataset does not
+exercise per-bucket temperatures beyond a single bucket per type). **This is
+the main limitation of the underlying dataset**: LocalLLaMA/typed-decisions'
+states top out at 549 tokens and its option counts don't vary within a
+question type, so genuinely long-context and high-cardinality cases are both
+rare here. Step 2c's 8k-token states, once available, will produce more of
+the former; Banking77-style candidate mode already exercises option-count
+variation for a different question.
 
 ### Agreement with gold
 
@@ -830,57 +846,74 @@ Step 2c's 8k-token states, once available, will produce far more of them.
 both teachers can see the full state) and 103 long-state decisions (the
 "actually invisible" rows above, `eval` + `train` combined — only the
 long-context teacher sees the full state; Laya scores upstream's own
-truncated sequence, exactly as serving would today). `laya_teacher` here
-reproduces the released, zero-shot, unpacked numbers in
-[Accuracy (step 0)](#accuracy-step-0) closely (0.393/1.311/0.152 on this
-short-state sample vs. the reported 0.387/1.308/0.158 on the full 760).
+truncated sequence, exactly as serving would today), scored with the teacher's
+final calibration (raw-sum scoring, temperatures fit on the full 1,000-record
+`calibration.jsonl`). `laya_teacher` here reproduces the released, zero-shot,
+unpacked numbers in [Accuracy (step 0)](#accuracy-step-0) closely
+(0.393/1.311/0.152 on this short-state sample vs. the reported
+0.387/1.308/0.158 on the full 760).
 
 | States | Teacher | Accuracy | Soft CE | ECE | Decisions |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Short (Laya sees them too) | Long-context teacher, calibrated | **0.640** | 4.603 | 0.273 | 300 |
-| Short | Laya, zero-shot | 0.393 | **1.311** | **0.152** | 300 |
-| Long (Laya cannot see them) | Long-context teacher, calibrated | **0.767** | 3.491 | 0.248 | 103 |
-| Long | Laya, zero-shot, truncated state | 0.291 | **1.424** | **0.200** | 103 |
+| Short (Laya sees them too) | Long-context teacher, calibrated | **0.640** | **1.018** | **0.104** | 300 |
+| Short | Laya, zero-shot | 0.393 | 1.311 | 0.152 | 300 |
+| Long (Laya cannot see them) | Long-context teacher, calibrated | **0.767** | **0.980** | 0.233 | 103 |
+| Long | Laya, zero-shot, truncated state | 0.291 | 1.424 | **0.200** | 103 |
 
 Per question type, long states:
 
-| Type | Teacher accuracy | Laya accuracy | Teacher soft CE | Laya soft CE |
-| --- | ---: | ---: | ---: | ---: |
-| choice | 0.824 | 0.196 | 1.178 | 1.630 |
-| score | 0.632 | 0.184 | 5.936 | 1.446 |
-| noul | 0.929 | 0.929 | 5.285 | 0.616 |
+| Type | Teacher accuracy | Laya accuracy | Teacher soft CE | Laya soft CE | Teacher ECE | Laya ECE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| choice | 0.824 | 0.196 | 1.058 | 1.630 | 0.323 | 0.166 |
+| score | 0.632 | 0.184 | 1.046 | 1.446 | 0.222 | 0.255 |
+| noul | 0.929 | 0.929 | 0.518 | 0.616 | 0.225 | 0.342 |
 
-Timing: 1.1-1.9 s/decision end to end (prompt forward plus branched label
-continuations), 34-104,890 prompt tokens per run. A 300-decision run held the
-GPU lock for under 8 minutes.
+Fitting on the full calibration split (versus the initial run, which fit only
+on the ~31 long-state calibration examples eligibility happened to select)
+cut the teacher's soft CE by 3-4x on both short and long states and turned an
+ECE loss into a near-wash: the teacher now wins accuracy and soft CE outright
+in every row above, and ECE in 2 of 3 long-state question types (`choice`
+alone still trails Laya's tuned calibration there). This is the expected
+result: the earlier run's poor soft CE was a calibration-sample-size artifact,
+not evidence the teacher's underlying scores were unreliable.
+
+Timing: 1.6-1.9 s/decision end to end (prompt forward plus branched label
+continuations), 21,745-104,890 prompt tokens per run. Peak resident set
+(`/usr/bin/time -l`, 300-decision run): 8.94 GB, unchanged from the first
+measurement and well under the 18 GB bound. A 1,000-record calibration run
+plus 34-decision scoring pass took under 20 minutes of GPU compute (separate
+from time spent queued behind other agents' jobs).
 
 ### Adopt/reject
 
-Mixed, by metric — argmax accuracy and calibration point opposite ways:
+**Decision: adopt**, on both short and long states, using the teacher's
+calibrated distribution directly (still blended `w = 0.5` with gold per the
+existing recipe, for consistency with `prepare_laya_packed_distillation.py`,
+not because the blend is needed to offset overconfidence anymore):
 
-- **Accuracy: adopt.** The long-context teacher's argmax matches gold far more
-  often than Laya's, on short states it already handles (0.640 vs. 0.393) and,
-  more relevantly, on the states this step exists for (0.767 vs. 0.291) —
-  Laya's truncated-state accuracy there is barely above chance for choice and
-  score questions (0.196, 0.184).
-- **Soft CE and ECE: not yet.** Laya's released calibration (`temperature`,
-  `temperature_by_options`), tuned over its own training run, still beats this
-  teacher's coarse per-type temperature (fit on as few as 0 truly-invisible
-  calibration examples for `score`/`noul`) on every row above. The teacher's
-  distribution is confidently peaked where gold is often split across two or
-  three labels (typed-decisions targets come from multiple raters), which
-  cross-entropy punishes even when the argmax is right.
+- **Accuracy.** Decisive win everywhere: 0.640 vs. 0.393 on short states,
+  0.767 vs. 0.291 on the long states this step exists for. Laya's
+  truncated-state accuracy on long `choice`/`score` questions (0.196, 0.184)
+  is barely above chance.
+- **Soft CE.** Also a clear win once temperatures are fit on enough data:
+  1.018 vs. 1.311 (short), 0.980 vs. 1.424 (long) — reversed from the
+  under-calibrated first pass, where the teacher's soft CE was 3-6x worse
+  than Laya's.
+- **ECE.** A win on short states (0.104 vs. 0.152) and a near-tie on long
+  states (0.233 vs. 0.200), with `choice` the one question type where Laya's
+  own tuned calibration still edges out the teacher's single coarse
+  temperature. Not a reason to withhold the teacher's targets: `score` and
+  `noul` ECE both favor the teacher on long states, and the size of the
+  remaining gap is small next to the accuracy and soft-CE swings.
 
-**Decision:** adopt the teacher **only for states Laya cannot see**, and only
-through the existing `w = 0.5` gold blend (which already halves the
-overconfidence problem above by averaging with gold), not as a standalone
-calibrated distribution. This is exactly what
-`prepare_laya_longcontext_teacher.py` does by construction: it never touches a
-record `prepare_laya_packed_distillation.py`'s Laya teacher can already score.
-Revisit the calibration once step 2c's 8k-token states give a calibration
-split with enough truly-invisible `score`/`noul` examples to fit per-type
-temperatures properly (option-count buckets, as Laya's own config uses, would
-likely also help).
+This reverses the initial (pre-recalibration) mixed verdict, which had fit
+temperatures only on the ~31 long-state calibration examples eligibility
+happened to select and left `score`/`noul` at an unfit `1.0`. The lesson: a
+teacher's own calibration is a property of its scoring convention and prompt,
+not of which records happen to be labeled-target-eligible, so it should be
+fit on the largest gold-labeled pool available, not a subset chosen for a
+different reason. Revisit again once step 2c's 8k-token states give a
+calibration split that exercises more than one option-count bucket per type.
 
 ### Reproduce
 
@@ -889,17 +922,19 @@ uv run --script scripts/laya/prepare_laya_longcontext_teacher.py \
     td/eval-long.jsonl \
     --teacher-model .tmp/laya/qwen3-14b-4bit \
     --laya-model .tmp/laya/laya-released --common .tmp/laya/common.py \
-    --calibration td/calibration-long.jsonl --compare-laya \
+    --calibration td/calibration.jsonl --compare-laya \
     --output distilled-eval-long.jsonl --metrics-output eval-long-metrics.json
 ```
 
 `--score-all` scores every record regardless of Laya eligibility (used for the
 short-state comparison above); `--temperatures <prior output>.json` reuses a
-fitted temperature instead of recalibrating. The long-context-teacher-labelled
-long-state dataset (585 native records — 585 = 160 `eval` + 425 `train`
-candidates; 103 actually carry a blended target, the rest pass through gold
-unchanged) is at `.tmp/laya/distilled-longcontext-teacher.jsonl` in the
-producing worktree, for step 2c to pick up.
+fitted score mode and temperatures instead of recalibrating; `--score-mode
+{raw-sum,length-normalized}` overrides the automatic choice. The
+long-context-teacher-labelled long-state dataset (585 native records — 585 =
+160 `eval` + 425 `train` candidates; 103 actually carry a blended target, the
+rest pass through gold unchanged) is at
+`.tmp/laya/distilled-longcontext-teacher.jsonl` in the producing worktree, for
+step 2c to pick up.
 
 ## Roadmap
 

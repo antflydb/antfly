@@ -21,9 +21,10 @@ question fits, and `prepare_laya_packed_distillation.py` leaves those states
 at their gold target because its teacher (the same unpacked Laya checkpoint)
 cannot see them either. This script extends that pipeline: it scores exactly
 the records Laya cannot see with a long-context instruct model (Qwen3-14B,
->=32k native context, run locally via MLX), fits a per-question-type
-temperature on a calibration split, and blends the calibrated distribution
-with gold the same way the original script does. See
+>=32k native context, run locally via MLX), fits per-question-type (and,
+where the calibration pool supports it, per-option-count-bucket) temperatures
+on a calibration split, and blends the calibrated distribution with gold the
+same way the original script does. See
 zig/pkg/inference/models/laya/LAYA.md, "Long-context teacher (step 2a)".
 
     uv run --script prepare_laya_longcontext_teacher.py records.jsonl \\
@@ -31,6 +32,14 @@ zig/pkg/inference/models/laya/LAYA.md, "Long-context teacher (step 2a)".
         --laya-model .tmp/laya/laya-released --common .tmp/laya/common.py \\
         --calibration td/calibration.jsonl \\
         --output distilled-long.jsonl --metrics-output long-metrics.json
+
+Calibration always uses every record in `--calibration`, regardless of
+whether Laya could see its state: the teacher scores every state itself, so
+its own confidence calibration does not depend on Laya's visibility (only the
+*which records get a teacher target* decision below does). Label scores come
+in two flavors, raw-sum and length-normalized log-likelihood (labels tokenize
+to different lengths); `--score-mode auto` (the default) fits both on the
+calibration split and keeps whichever gives lower mean cross-entropy.
 
 Pass `--score-all` to score every record regardless of whether Laya could see
 it (used to compare the two teachers on states both can see) and
@@ -45,6 +54,7 @@ its labels via a branched KV cache) rather than O(decisions x labels).
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import importlib.util
 import inspect
@@ -58,6 +68,8 @@ from pathlib import Path
 
 QTYPES = {"choice": 0, "score": 1, "noul": 2}
 KIND_NAME = {"choice": "a single choice", "score": "an ordinal level", "noul": "a yes/no question"}
+SCORE_MODES = ("raw-sum", "length-normalized")
+MIN_BUCKET_SAMPLES = 15
 
 
 def load_module(path: Path, name: str):
@@ -150,11 +162,14 @@ def build_prompt(record: dict) -> str:
     return "\n".join(lines)
 
 
-def score_record(model, tok, mx, cache_mod, record: dict) -> tuple[list[float], int]:
-    """Average per-token log-likelihood of each label, via one prompt forward pass
-    and one short branched continuation per label (KV cache reused from the
-    prompt; branching does not mutate the shared cache, verified against a
-    from-scratch full-sequence forward on a released Laya fixture prompt)."""
+def score_record(model, tok, mx, cache_mod, record: dict) -> tuple[list[float], list[float], int]:
+    """Each label's raw-sum and length-normalized (average per token)
+    log-likelihood, via one prompt forward pass and one short branched
+    continuation per label (KV cache reused from the prompt; branching does
+    not mutate the shared cache, verified against a from-scratch
+    full-sequence forward on a released Laya fixture prompt). Both scoring
+    conventions come from the same per-token logprobs, so returning both here
+    costs nothing extra."""
     prompt_ids = tok.apply_chat_template(
         [{"role": "user", "content": build_prompt(record)}], add_generation_prompt=True, enable_thinking=False
     )
@@ -165,12 +180,13 @@ def score_record(model, tok, mx, cache_mod, record: dict) -> tuple[list[float], 
     last_logprobs = last_logprobs - mx.logsumexp(last_logprobs)
     saved_state = [c.state for c in cache]
 
-    scores = []
+    raw_scores, norm_scores = [], []
     total_tokens = len(prompt_ids)
     for label in record["labels"]:
         cont_ids = tok.encode(str(label), add_special_tokens=False)
         if not cont_ids:
-            scores.append(float("-inf"))
+            raw_scores.append(float("-inf"))
+            norm_scores.append(float("-inf"))
             continue
         total_tokens += len(cont_ids)
         logprob = float(last_logprobs[cont_ids[0]])
@@ -186,11 +202,16 @@ def score_record(model, tok, mx, cache_mod, record: dict) -> tuple[list[float], 
             step_logprobs = step_logprobs - mx.logsumexp(step_logprobs, axis=-1, keepdims=True)
             for i, next_id in enumerate(cont_ids[1:]):
                 logprob += float(step_logprobs[i, next_id])
-        scores.append(logprob / len(cont_ids))  # length-normalized average log-likelihood
-    return scores, total_tokens
+        raw_scores.append(logprob)
+        norm_scores.append(logprob / len(cont_ids))
+    return raw_scores, norm_scores, total_tokens
 
 
 # --- Calibration and blending (shared shape with prepare_laya_packed_distillation) --------------
+
+
+def option_bucket(count: int) -> str:
+    return "2" if count <= 2 else "3-5" if count <= 5 else "6-10" if count <= 10 else "11+"
 
 
 def softmax_with_temperature(scores: list[float], temp: float) -> list[float]:
@@ -207,8 +228,8 @@ def cross_entropy(probs: list[float], target: list[float]) -> float:
 
 def fit_temperature(scored: list[tuple[list[float], list[float]]]) -> float:
     """Grid-search the scalar temperature minimizing mean cross-entropy against
-    gold on one question type: coarse log-spaced pass, then a refinement pass
-    around the best point."""
+    gold on one group: coarse log-spaced pass, then a refinement pass around
+    the best point."""
     if not scored:
         return 1.0
 
@@ -226,6 +247,42 @@ def fit_temperature(scored: list[tuple[list[float], list[float]]]) -> float:
 
     coarse = search(0.02, 20.0, 60)
     return search(max(0.005, coarse / 3), coarse * 3, 40)
+
+
+def fit_temperatures_bucketed(scored: list[tuple[str, int, list[float], list[float]]]) -> dict:
+    """scored: (kind, label_count, scores, target) rows, one per calibration
+    decision. Fits a temperature per (kind, option-count bucket) -- the same
+    shape as Laya's own `temperature_by_options` -- with a fallback per kind
+    for buckets too small to fit reliably (< MIN_BUCKET_SAMPLES)."""
+    by_kind_groups = collections.defaultdict(list)
+    by_bucket_groups = collections.defaultdict(list)
+    for kind, count, scores, target in scored:
+        by_kind_groups[kind].append((scores, target))
+        by_bucket_groups[f"{kind}:{option_bucket(count)}"].append((scores, target))
+    by_kind = {kind: fit_temperature(rows) for kind, rows in by_kind_groups.items()}
+    by_bucket = {
+        key: fit_temperature(rows) for key, rows in by_bucket_groups.items() if len(rows) >= MIN_BUCKET_SAMPLES
+    }
+    return {"by_bucket": by_bucket, "by_kind": by_kind}
+
+
+def temperature_lookup(temperatures: dict, kind: str, count: int) -> float:
+    bucket_key = f"{kind}:{option_bucket(count)}"
+    if bucket_key in temperatures.get("by_bucket", {}):
+        return temperatures["by_bucket"][bucket_key]
+    if kind in temperatures.get("by_kind", {}):
+        return temperatures["by_kind"][kind]
+    return 1.0
+
+
+def mean_ce_with_temperatures(scored: list[tuple[str, int, list[float], list[float]]], temperatures: dict) -> float:
+    if not scored:
+        return math.inf
+    total = 0.0
+    for kind, count, scores, target in scored:
+        temp = temperature_lookup(temperatures, kind, count)
+        total += cross_entropy(softmax_with_temperature(scores, temp), target)
+    return total / len(scored)
 
 
 def blend(gold: list[float], teacher: list[float], gold_weight: float) -> list[float]:
@@ -279,9 +336,8 @@ def metrics_for(items: list[tuple[str, list[float], list[float]]]) -> dict:
 
 def load_laya_temperature(decision: dict):
     def temperature(kind: str, count: int) -> float:
-        bucket = "2" if count <= 2 else "3-5" if count <= 5 else "6-10" if count <= 10 else "11+"
         buckets = decision.get("temperature_by_options", {})
-        value = buckets.get(f"{kind}:{bucket}")
+        value = buckets.get(f"{kind}:{option_bucket(count)}")
         if value is None:
             value = decision.get("temperature", [1, 1, 1])[QTYPES[kind]]
         return max(0.001, float(value))
@@ -337,8 +393,20 @@ def main():
     parser.add_argument("--teacher-model", type=Path, required=True, help="Local MLX long-context teacher directory")
     parser.add_argument("--laya-model", type=Path, required=True, help="Prepared unpacked Laya directory")
     parser.add_argument("--common", type=Path, required=True, help="Upstream laya/common.py")
-    parser.add_argument("--calibration", type=Path, help="Native records with gold targets to fit per-type temperature")
-    parser.add_argument("--temperatures", type=Path, help="Reuse temperatures from a prior run's provenance JSON")
+    parser.add_argument(
+        "--calibration",
+        type=Path,
+        help="Native records with gold targets to fit temperatures on (every record is used, "
+        "regardless of Laya eligibility: the teacher scores every state itself)",
+    )
+    parser.add_argument("--temperatures", type=Path, help="Reuse score_mode/temperatures from a prior run's provenance JSON")
+    parser.add_argument(
+        "--score-mode",
+        choices=("auto",) + SCORE_MODES,
+        default="auto",
+        help="Label log-likelihood convention. auto (default) fits both on --calibration and keeps "
+        "whichever gives lower mean cross-entropy",
+    )
     parser.add_argument("--gold-weight", type=float, default=0.5)
     parser.add_argument("--score-all", action="store_true", help="Score every record, ignoring Laya eligibility")
     parser.add_argument("--compare-laya", action="store_true", help="Also score with the unpacked Laya checkpoint")
@@ -375,39 +443,52 @@ def main():
     model, teacher_tok = mlx_load(args.teacher_model)
     load_seconds = time.time() - t0
 
-    raw_scores: dict[int, list[float]] = {}
+    def score(record):
+        return score_record(model, teacher_tok, mx, cache_mod, record)
+
+    scores_by_mode = {"raw-sum": {}, "length-normalized": {}}
     total_tokens = 0
     t0 = time.time()
     for i in chosen:
-        scores, tokens = score_record(model, teacher_tok, mx, cache_mod, records[i])
-        raw_scores[i] = scores
+        raw, norm, tokens = score(records[i])
+        scores_by_mode["raw-sum"][i] = raw
+        scores_by_mode["length-normalized"][i] = norm
         total_tokens += tokens
     score_seconds = time.time() - t0
 
-    temperatures: dict[str, float] = {}
+    calibration_report = None
     if args.temperatures:
-        temperatures = json.loads(args.temperatures.read_text())["temperature_by_kind"]
+        prior = json.loads(args.temperatures.read_text())
+        score_mode = prior["score_mode"]
+        temperatures = prior["temperatures"]
     elif args.calibration:
         cal_records = load_records(args.calibration)
-        cal_targets = [
-            r for r in cal_records if not state_fits(laya_tok, r, decision, common.build_sequence)
-        ]
-        for kind in QTYPES:
-            subset = [r for r in cal_targets if r["kind"] == kind]
-            if not subset:
-                temperatures[kind] = 1.0
-                continue
-            scored = []
-            for r in subset:
-                scores, _ = score_record(model, teacher_tok, mx, cache_mod, r)
-                scored.append((scores, r["target"]))
-            temperatures[kind] = fit_temperature(scored)
+        cal_scored = {"raw-sum": [], "length-normalized": []}
+        for r in cal_records:
+            raw, norm, _ = score(r)
+            cal_scored["raw-sum"].append((r["kind"], len(r["labels"]), raw, r["target"]))
+            cal_scored["length-normalized"].append((r["kind"], len(r["labels"]), norm, r["target"]))
+        fitted = {mode: fit_temperatures_bucketed(cal_scored[mode]) for mode in SCORE_MODES}
+        mean_ce = {mode: mean_ce_with_temperatures(cal_scored[mode], fitted[mode]) for mode in SCORE_MODES}
+        if args.score_mode == "auto":
+            score_mode = min(SCORE_MODES, key=lambda m: mean_ce[m])
+        else:
+            score_mode = args.score_mode
+        temperatures = fitted[score_mode]
+        calibration_report = {
+            "calibration_decisions": len(cal_records),
+            "calibration_mean_ce_by_mode": mean_ce,
+            "chosen_score_mode": score_mode,
+            "temperatures_by_mode": fitted,
+        }
     else:
-        temperatures = {kind: 1.0 for kind in QTYPES}
+        score_mode = "length-normalized" if args.score_mode == "auto" else args.score_mode
+        temperatures = {"by_bucket": {}, "by_kind": {}}
 
+    chosen_scores = scores_by_mode[score_mode]
     calibrated: dict[int, list[float]] = {
-        i: softmax_with_temperature(scores, temperatures.get(records[i]["kind"], 1.0))
-        for i, scores in raw_scores.items()
+        i: softmax_with_temperature(scores, temperature_lookup(temperatures, records[i]["kind"], len(records[i]["labels"])))
+        for i, scores in chosen_scores.items()
     }
 
     laya_probs: dict[int, list[float]] = {}
@@ -434,17 +515,20 @@ def main():
 
     if args.metrics_output:
         report = {
-            "format": "antfly-laya-longcontext-teacher/v1",
+            "format": "antfly-laya-longcontext-teacher/v2",
             "teacher_model": str(args.teacher_model),
             "records_scored": len(chosen),
             "records_total": len(records),
             "score_all": args.score_all,
-            "temperature_by_kind": temperatures,
+            "score_mode": score_mode,
+            "temperatures": temperatures,
             "seconds_per_decision": score_seconds / max(1, len(chosen)),
             "prompt_tokens": total_tokens,
             "load_seconds": load_seconds,
         }
-        raw_items = [(records[i]["kind"], softmax_with_temperature(raw_scores[i], 1.0), records[i]["target"]) for i in chosen]
+        if calibration_report:
+            report["calibration"] = calibration_report
+        raw_items = [(records[i]["kind"], softmax_with_temperature(chosen_scores[i], 1.0), records[i]["target"]) for i in chosen]
         calibrated_items = [(records[i]["kind"], calibrated[i], records[i]["target"]) for i in chosen]
         report["teacher_uncalibrated"] = metrics_for(raw_items)
         report["teacher_calibrated"] = metrics_for(calibrated_items)
@@ -456,12 +540,13 @@ def main():
 
     if args.output:
         provenance = {
-            "format": "antfly-laya-longcontext-distillation/v1",
+            "format": "antfly-laya-longcontext-distillation/v2",
             "records": len(records),
             "distilled": len(calibrated),
             "score_all": args.score_all,
             "gold_weight": args.gold_weight,
-            "temperature_by_kind": temperatures,
+            "score_mode": score_mode,
+            "temperatures": temperatures,
             "source_sha256": digest(args.records),
             "teacher_model": str(args.teacher_model),
             "teacher_config_sha256": digest(args.teacher_model / "config.json"),
@@ -470,6 +555,8 @@ def main():
             "prompt_template_sha256": hashlib.sha256(inspect.getsource(build_prompt).encode()).hexdigest(),
             "output_sha256": digest(args.output),
         }
+        if calibration_report:
+            provenance["calibration"] = calibration_report
         Path(f"{args.output}.json").write_text(json.dumps(provenance, indent=2) + "\n")
         print(json.dumps(provenance, indent=2))
 

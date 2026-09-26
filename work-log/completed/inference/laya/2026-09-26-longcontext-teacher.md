@@ -127,7 +127,7 @@ with-lock gpu -- /usr/bin/time -l uv run --script scripts/laya/prepare_laya_long
     --metrics-output .tmp/laya/short-state-metrics.json
 ```
 
-## Open items
+## Open items (as of the first pass, resolved below)
 
 - `score`/`noul` calibration had zero truly-invisible examples in the
   `calibration.jsonl` split, so their temperatures are unfit (default 1.0).
@@ -139,3 +139,121 @@ with-lock gpu -- /usr/bin/time -l uv run --script scripts/laya/prepare_laya_long
 - No option-count bucketing of temperature (Laya's own config buckets by
   `type:count`); a single per-type temperature was used given the small
   calibration pool.
+
+## Recalibration (v2): full calibration split, bucketed temperatures, score-mode comparison
+
+2026-09-26, same machine. The coordinator flagged that the first pass's poor
+soft CE looked like a calibration-sample-size artifact (temperatures were fit
+only on the ~31 calibration examples that happened to be long-state-invisible,
+leaving `score`/`noul` unfit at `1.0`), not a real teacher weakness, since the
+teacher can score every calibration record regardless of whether Laya could
+see its state. Addressed by:
+
+1. **Calibration no longer filters by Laya eligibility.** `--calibration` now
+   scores every record in the given file. Used the full `td/calibration.jsonl`
+   (1,000 records: 300 `choice`, 400 `score`, 300 `noul`) instead of the
+   145-record long-only subset.
+2. **Bucketed temperature fitting**, `option_bucket()` + `fit_temperatures_bucketed()`
+   in `prepare_laya_longcontext_teacher.py`: a temperature per (type,
+   option-count bucket) with >=15 calibration examples, falling back to a
+   per-type temperature otherwise. On this dataset every type has exactly one
+   bucket (`choice:3-5`, `score:3-5`, `noul:2`), so bucket-level and type-level
+   temperatures coincide here; the machinery is in place for a dataset (e.g.
+   Banking77-style candidate mode) that varies option count within a type.
+3. **Raw-sum vs. length-normalized comparison**, `--score-mode auto`: both
+   conventions come from the same per-token logprobs (score_record now returns
+   both), so comparing them costs nothing extra. Fit separately on the full
+   calibration split and compared mean cross-entropy:
+
+   | Score mode | Mean CE on calibration (n=1,000) |
+   | --- | ---: |
+   | raw-sum | **1.0149** |
+   | length-normalized | 1.0199 |
+
+   Raw-sum wins, narrowly (0.5% relative). Fitted temperatures (raw-sum, the
+   chosen mode): `choice` 14.48, `score` 12.94, `noul` 27.26 — an order of
+   magnitude larger than the first pass's `choice: 3.99`, expected since
+   raw-sum log-likelihoods scale with label token count and so need more
+   softening than the length-normalized (per-token) scores the first pass used.
+
+### Rerun note: a crash mid-run
+
+The first recalibration attempt (`eval-long` + calibration fit) was in flight
+when the machine crashed; the process died before writing any output (the
+script's atomic tempfile-then-hardlink write pattern means a crash never
+produces a partial/corrupt `--output` or `--metrics-output` file — confirmed
+nothing existed at that path afterward). Rerun from scratch below.
+
+### Updated results
+
+Same three runs as the first pass (`eval-long`, `train-long` reusing the
+fitted temperatures, and a 300-decision `s0-eval.jsonl` sample), rescored with
+the new calibration:
+
+| Split | Decisions | Teacher accuracy | Teacher soft CE | Teacher ECE | Laya accuracy | Laya soft CE | Laya ECE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `eval-long` | 34 | 0.706 | 0.972 | 0.159 | 0.265 | 1.382 | 0.235 |
+| `train-long` | 69 | 0.797 | 0.984 | 0.270 | 0.304 | 1.445 | 0.182 |
+| long, combined | 103 | 0.767 | 0.980 | 0.233 | 0.291 | 1.424 | 0.200 |
+| short (`s0-eval` sample) | 300 | 0.640 | 1.018 | 0.104 | 0.393 | 1.311 | 0.152 |
+
+Against the first pass's combined long-state numbers (accuracy 0.767 unchanged
+— temperature scaling does not move the argmax; soft CE 3.491 -> 0.980, a
+3.6x improvement; ECE 0.248 -> 0.233, a small improvement) and short-state
+numbers (soft CE 4.603 -> 1.018, ECE 0.273 -> 0.104): the teacher now beats
+Laya on every metric except long-state ECE (0.233 vs. 0.200, `choice`
+specifically: 0.323 vs. 0.166). Full metrics JSON: `eval-long-metrics-v2.json`,
+`train-long-metrics-v2.json`, `short-state-metrics-v2.json` (paths under the
+producing worktree's `.tmp/laya/`, not committed). Memory unchanged: 8.94 GB
+peak RSS (`/usr/bin/time -l`, short-state run).
+
+### Commands run (v2)
+
+```bash
+with-lock gpu -- uv run --script scripts/laya/prepare_laya_longcontext_teacher.py \
+    .tmp/laya/eval-long.jsonl \
+    --teacher-model .tmp/laya/qwen3-14b-4bit \
+    --laya-model .tmp/laya/laya-released --common .tmp/laya/common.py \
+    --calibration .tmp/laya/td/calibration.jsonl --compare-laya \
+    --output .tmp/laya/distilled-eval-long-v2.jsonl \
+    --metrics-output .tmp/laya/eval-long-metrics-v2.json
+
+with-lock gpu -- uv run --script scripts/laya/prepare_laya_longcontext_teacher.py \
+    .tmp/laya/train-long.jsonl \
+    --teacher-model .tmp/laya/qwen3-14b-4bit \
+    --laya-model .tmp/laya/laya-released --common .tmp/laya/common.py \
+    --temperatures .tmp/laya/distilled-eval-long-v2.jsonl.json --compare-laya \
+    --output .tmp/laya/distilled-train-long-v2.jsonl \
+    --metrics-output .tmp/laya/train-long-metrics-v2.json
+
+with-lock gpu -- /usr/bin/time -l uv run --script scripts/laya/prepare_laya_longcontext_teacher.py \
+    .tmp/laya/td/s0-eval.jsonl \
+    --teacher-model .tmp/laya/qwen3-14b-4bit \
+    --laya-model .tmp/laya/laya-released --common .tmp/laya/common.py \
+    --temperatures .tmp/laya/distilled-eval-long-v2.jsonl.json \
+    --score-all --compare-laya --limit 300 --seed 20260925 \
+    --metrics-output .tmp/laya/short-state-metrics-v2.json
+```
+
+Queueing was severe during this recalibration pass: the first `eval-long` run
+above waited roughly 3.5 hours for the GPU lock, cycling through several other
+agents' back-to-back training/eval jobs before acquiring it (visible as a
+rapidly incrementing holder pid in `gpu.lock`, consistent with a wrapper
+script that re-acquires the lock immediately after releasing it, leaving an
+external 5-second poller little chance to win the race). This is a
+lock-fairness gap worth flagging to whoever owns `with-lock`, not a cost of
+the teacher itself; the two follow-up runs queued a few minutes each.
+
+## Open items (updated)
+
+- Resolved: calibration now uses the full 1,000-record split and both score
+  modes were compared; raw-sum adopted.
+- Still open: this dataset exercises only one option-count bucket per
+  question type, so `fit_temperatures_bucketed`'s per-bucket path is
+  implemented but untested against a within-type spread (Banking77's
+  candidate-mode 77-option case would exercise it).
+- Long-state `choice` ECE (0.323) still trails Laya's tuned calibration
+  (0.166); not blocking given the accuracy and soft-CE gap in the teacher's
+  favor, but worth another look if step 2c needs tighter calibration.
+- The GPU-lock queueing behavior observed above (near-starvation against a
+  tight training/eval loop) may be worth a fix independent of this track.
