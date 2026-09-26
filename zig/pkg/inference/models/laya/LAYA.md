@@ -206,6 +206,23 @@ out-of-range lengths are rejected. The extraction API admits up to 255 labels
 per question. The model enforces its own limit: 20 unless the model is
 candidate-packed.
 
+`packing.two_stage` (candidate mode only; see
+[Two-stage choice](#two-stage-choice-roadmap-2b)) shortlists a `choice`
+question's options before comparing the survivors jointly:
+
+```json
+"packing": {
+  "mode": "candidate",
+  "max_packed_len": 2048,
+  "two_stage": { "top_k": 8, "mass_cutoff": 0.9 }
+}
+```
+
+`top_k` (2–255, required to enable it) is the largest shortlist; `mass_cutoff`
+(0–1, optional) can stop shortlisting earlier once that much of stage 1's
+probability mass is captured, never below 2 finalists. Disabled by default
+(`top_k` absent, equivalent to `top_k: 0`).
+
 `"weight_quantization": "q8_0"` (or `ANTFLY_LAYA_WEIGHT_QUANT=q8_0`) serves
 the encoder and decision-head linear weights as Q8_0, quantized from the
 dense checkpoint at load (`weight_source.quantizeDenseQ8_0`). Embeddings,
@@ -630,6 +647,110 @@ since. Several things turned up along the way:
   the work log. See [Training memory](#training-memory) for a breakdown of
   this footprint and the admission gate added to refuse a job that will not
   fit before it starts, instead of relying on the OS to kill a concurrent one.
+
+### Two-stage choice (roadmap 2b)
+
+Candidate branches cannot compare options before the final softmax: each
+option is scored in isolation, so the model never gets to weigh finalists
+against each other directly, only through the shared trunk. [The tree-mask
+hypothesis](#the-tree-mask-hypothesis) attributes exactly this two-step
+procedure to Jev at high option counts: "score candidates independently, then
+make an explicit choice." This section adds it to Laya and measures it on
+Banking77 against the 0.819 candidate baseline above.
+
+**Design.** Stage 1 is the unmodified candidate pass: every option is its own
+branch under the trunk, as above. When a `choice` question has more options
+than `packing.two_stage.top_k`, stage 2 packs the surviving finalists into one
+*joint* branch off the same trunk — `[CLS] head [SEP] ([MASK] option)* [SEP]`,
+the same layout `question` mode uses, so the finalists attend to each other —
+and reruns just that branch. Finalists are the highest-probability options
+under stage 1, capped at `top_k` and optionally cut off earlier once
+`mass_cutoff` of stage 1's probability mass is captured (never below 2). The
+two distributions are blended rather than replaced: writing `m` for the
+stage-1 probability mass stage 1 assigned to the shortlist, each finalist's
+final probability is `m` times its stage-2 share of that mass, and every
+non-finalist keeps its stage-1 probability unchanged. The mix still sums to 1,
+and stage 2 can only move mass among the finalists — it cannot let a
+low-probability option that stage 1 dropped resurface. Everything decodes
+through the existing calibration and readout (`decode`/`finalize`,
+`pipelines/laya.zig`), so a shortlist of `k` options is calibrated exactly
+like a `question`-mode question with `k` options would be.
+
+**One checkpoint, two branch shapes.** Serving stays one call: `executePacked`
+runs the candidate row, decodes it, and for each `choice` question over
+`top_k` options builds and runs a second, one-question row with
+`BranchStyle.question` forced regardless of the model's own `packing.mode`
+(`laya_tree.build`'s new style-override parameter). Both rows share the
+trunk's KV cache, so stage 2 costs only the joint branch's own forward. A
+checkpoint therefore has to answer both branch shapes well, which needs both
+in training: `finetune/laya/data.zig`'s `addStageTwo` adds, for every eligible
+`choice` record, one synthetic record holding the gold label plus `top_k - 1`
+other options sampled uniformly at random (deterministic in the job's seed),
+and `pack` routes it through the joint (`question`) style while the original
+record keeps its ordinary candidate branch. The job JSON's `two_stage_top_k`
+(and optional `two_stage_mass_cutoff`) enable this and are written into the
+served `packing.two_stage` config; leaving them unset trains and serves
+exactly as before.
+
+**Measured on Banking77** (400 eval messages, `packing.two_stage.top_k = 8`,
+starting from the same released checkpoint and recipe as the candidate
+baseline: one epoch, soft CE, `b77/train.jsonl` plus its synthetic stage-2
+rows, calibration on `b77/calibration.jsonl`):
+
+| Model | Accuracy | Soft CE | ECE | Top-8 recall | ms/decision | Tokens/decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Candidate-only baseline (prior work, mean of 2 seeds) | 0.819 | — | — | — | — | — |
+| Two-stage checkpoint, seed 42, **stage 1 alone** (`two_stage` unset) | 0.8525 | 0.632 | 0.057 | 0.995 | 403 | 369 |
+| **Two-stage checkpoint, seed 42, stage 1 + stage 2** | 0.8325 | 0.686 | 0.067 | — | 633 | 435 |
+| Two-stage checkpoint, seed 43, stage 1 alone | 0.8425 | 0.640 | 0.063 | 0.985 | 374 | 369 |
+| **Two-stage checkpoint, seed 43, stage 1 + stage 2** | 0.8375 | 0.785 | 0.071 | — | 625 | 435 |
+| Mean, stage 1 alone (2 seeds) | 0.8475 | 0.636 | 0.060 | 0.990 | 389 | 369 |
+| **Mean, stage 1 + stage 2 (2 seeds)** | **0.8350** | **0.735** | **0.069** | — | 629 | 435 |
+
+- **Stage 2 makes accuracy worse, not better, on this recipe, and it does so
+  on both seeds.** Same checkpoint, same eval set, only the decoding path
+  differs: stage 1 alone scores 0.8525 / 0.8425 (seeds 42 / 43); blending in
+  stage 2 drops both to 0.8325 / 0.8375, a consistent ~1.25-point mean loss,
+  and soft CE and ECE get worse on both seeds too. This is the two-stage
+  design's headline result and it is negative.
+- **It is not a shortlist-recall problem.** Stage 1's top-8 shortlist
+  contains the gold label 99.5% (seed 42) / 98.5% (seed 43) of the time — the
+  99.9th-percentile case for a bound, not the bottleneck. Stage 2's own
+  joint-branch distribution must be miscalibrated or simply wrong often
+  enough, on the finalists it does see, to outweigh the cases where it
+  corrects stage 1.
+- **Also worth noting: stage 1 alone, on this checkpoint, beats the original
+  candidate-only baseline** (0.8475 mean vs 0.819 mean). The two-stage
+  training recipe trains on the candidate rows *and* a same-size batch of
+  synthetic joint rows, which amounts to roughly double the gradient steps
+  over related data; this is not a controlled ablation of stage 2's value,
+  only a by-product of the extra training the mixed recipe happens to do. It
+  means comparing the full two-stage number against the old baseline (0.835
+  vs 0.819) would *understate* how much stage 2 alone costs; the fair,
+  controlled comparison is stage 1 alone vs. stage 1 + stage 2 on the same
+  weights (0.8475 vs 0.8350), which is unambiguous and still negative.
+- **Cost.** Stage 2 adds one joint-branch forward per `choice` decision over
+  `top_k` options (all 400 Banking77 eval messages have 77 > 8 options, so
+  every decision pays it): +66 tokens per decision exactly (369 → 435,
+  reproducible across seeds and runs) and roughly +240 ms per decision on
+  this shared, loaded machine (389 → 629 ms mean; per-run wall time ranged
+  374–693 ms depending on contention from other agents' jobs, so treat the ms
+  figures as indicative only, unlike the token counts).
+- **Hypotheses for the regression, untested here:** (a) the joint branch is
+  trained on far fewer effective examples per class than the candidate branch
+  (one sampled shortlist per record vs. all 77 options), so it may simply be
+  undertrained; (b) uniform random negatives are an easy shortlist most of
+  the time (top-8 recall is 99.5%), so stage 2 rarely has to do real
+  discrimination work in training and may not have learned to firmly prefer
+  the right answer among *hard* look-alikes; (c) the calibration gap is
+  suspect too — the trainer fits one temperature for the whole `choice` kind
+  (`job.zig`'s `calibrate`), mixing 77-way stage-1 rows and 8-way stage-2
+  rows in one calibration set, so neither branch's temperature is fit for
+  its own distribution shape. (c) is the cheapest to try next: fit
+  `temperature_by_options` per count bucket instead of one flat value.
+- **Not yet tried:** hard-negative shortlists (from a stage-1 checkpoint's
+  own confusions) instead of random ones, a larger `top_k`, and a
+  `mass_cutoff` shortlist instead of a fixed size.
 
 ### Trainer throughput
 
@@ -1188,7 +1309,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 | 1c. Metal and CUDA packed kernels | no | Metal: fused kernels not pursued (encoder GPU work dominates; device scoring gave 2–4% and was reverted after a race). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |
 | 1d. Weight quantization (q8_0) | no | done (CPU and Metal). After the CPU kernel fix (dequant+SGEMM), q8_0 matches dense speed on both backends over 760 decisions (CPU 497 vs 491 s, Metal 48 vs 49 s) and saves 37% of Metal memory | Labels identical and probabilities within 2e-2 of dense on the fixture. CPU footprint is still higher than dense (mmap'd dense weights vs allocated quantized bytes; see step 1d), not lower as hoped; a weight-storage-only footprint breakdown is open |
 | 2a. Long-context teacher (Qwen3.8-27B) | labels only | not started | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
-| 2b. Two-stage choice for many options | same fine-tune | not started | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. Measured on Banking77 |
+| 2b. Two-stage choice for many options | same fine-tune | implemented and measured; **negative result** | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. On Banking77, stage 2 made accuracy *worse* than stage 1 alone on the same checkpoint (0.8475 → 0.8350 mean over 2 seeds), despite 99%+ top-8 recall. Not adopted; see [Two-stage choice](#two-stage-choice-roadmap-2b) |
 | 2c. 8k states | yes | not started | Memory-efficient attention in the training graph (today about 2k tokens at batch 1), `max_len` 8192 (ModernBERT's pretraining length), fine-tune on teacher-labelled long states |
 | 2d. ModernBERT-base student | yes | not started | ~150M parameters, about 2–3× cheaper than Laya-large; keep if its agreement with the teacher stays within tolerance of the large model |
 
@@ -1211,7 +1332,11 @@ Other open items:
   could hit too.
 
 - **Very many options:** candidate branches cannot compare options before the
-  softmax (step 2b).
+  softmax. Two-stage choice (step 2b) adds that comparison but currently
+  makes accuracy worse, not better, on Banking77 — see
+  [Two-stage choice](#two-stage-choice-roadmap-2b) for the negative result
+  and untested hypotheses (calibration by shortlist size, hard-negative
+  training shortlists).
 - **Trainer throughput:** device slices, device-resident gradients, command
   frames, the batched optimizer, device inputs, frozen lower layers, and LoRA
   are done ([Trainer throughput](#trainer-throughput), [LoRA](#lora)).

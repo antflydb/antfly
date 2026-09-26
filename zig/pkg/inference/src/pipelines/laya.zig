@@ -157,6 +157,16 @@ pub fn decode(a: std.mem.Allocator, cfg: model.Config, q: Question, logits: []co
     const probabilities = try a.alloc(f32, logits.len);
     errdefer a.free(probabilities);
     try softmax(logits, cfg.scale(q.kind, logits.len), probabilities);
+    var acts: [33]f32 = undefined;
+    try softmax(action, 1, acts[0..action.len]);
+    return finalize(q, probabilities, acts[0]);
+}
+
+/// Build a `Decision` from an already-computed probability distribution
+/// (`probabilities`, which the result owns). Used both by `decode`, from a
+/// softmax, and by two-stage choice's merged distribution
+/// (`mergeTwoStage`), which never runs its own softmax over the full label set.
+fn finalize(q: Question, probabilities: []f32, act_probability: f32) Decision {
     var winner: usize = 0;
     var entropy: f32 = 0;
     var expected: f32 = 0;
@@ -165,18 +175,16 @@ pub fn decode(a: std.mem.Allocator, cfg: model.Config, q: Question, logits: []co
         entropy -= p * @log(@max(p, 1e-12));
         expected += @as(f32, @floatFromInt(i)) * p;
     }
-    var acts: [33]f32 = undefined;
-    try softmax(action, 1, acts[0..action.len]);
     return .{
         .name = q.name,
         .kind = q.kind,
         .label = q.labels[winner],
         .labels = q.labels,
         .probabilities = probabilities,
-        .confidence = if (q.kind == .noul) @max(probabilities[1], 1 - probabilities[1]) else std.math.clamp(1 - entropy / @log(@as(f32, @floatFromInt(logits.len))), 0, 1),
+        .confidence = if (q.kind == .noul) @max(probabilities[1], 1 - probabilities[1]) else std.math.clamp(1 - entropy / @log(@as(f32, @floatFromInt(probabilities.len))), 0, 1),
         .expected_value = if (q.kind == .score) expected else null,
         .true_probability = if (q.kind == .noul) probabilities[1] else null,
-        .act_probability = acts[0],
+        .act_probability = act_probability,
     };
 }
 fn softmax(logits: []const f32, scale: f32, out: []f32) !void {
@@ -277,7 +285,7 @@ pub fn executeWithScratch(a: std.mem.Allocator, scratch: std.mem.Allocator, sess
 
 /// One packed row (or a group of rows for one state that overflowed a single
 /// row) plus the absolute task index of each of its questions.
-const Planned = struct { row: tree.Row, members: []const usize };
+const Planned = struct { row: tree.Row, members: []const usize, text: []const u8 };
 
 /// Tree-packed execution: every task that shares a state text shares one
 /// trunk encoding (see pipelines/laya_tree.zig). Rows are built and validated
@@ -301,10 +309,10 @@ fn executePacked(a: std.mem.Allocator, scratch: std.mem.Allocator, session: Sess
         if (control) |active| try active.check();
         const questions = try plan.alloc(Question, members.items.len);
         for (questions, members.items) |*q, index| q.* = tasks[index].question;
-        for (try tree.build(plan, tok, cfg, text, questions)) |row| {
+        for (try tree.build(plan, tok, cfg, text, questions, null)) |row| {
             if (max_input_tokens) |limit| if (row.ids.len > limit) return error.InferenceInputTokensExceeded;
             tokens += row.ids.len;
-            try rows.append(plan, .{ .row = row, .members = members.items });
+            try rows.append(plan, .{ .row = row, .members = members.items, .text = text });
         }
     }
     const done = try plan.alloc(bool, tasks.len);
@@ -334,7 +342,7 @@ fn executePacked(a: std.mem.Allocator, scratch: std.mem.Allocator, session: Sess
             if (used + next > batch_limit) break;
             used += next;
         };
-        try runPackedBatch(a, plan, scratch, session, cfg, tasks, rows.items[start..end], decisions, done, &decoded, control);
+        try runPackedBatch(a, plan, scratch, session, tok, cfg, tasks, rows.items[start..end], decisions, done, &decoded, control, &tokens);
         execution_chunks += 1;
         start = end;
     }
@@ -346,7 +354,7 @@ fn executePacked(a: std.mem.Allocator, scratch: std.mem.Allocator, session: Sess
 /// Run one session call over `batch`, a run of `Planned` rows (one call
 /// already, or several coalesced into one physical row). `plan` is an arena
 /// scoped to the whole request; `scratch` backs the model's temporaries.
-fn runPackedBatch(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.mem.Allocator, session: Session, cfg: model.Config, tasks: []const Task, batch: []const Planned, decisions: []Decision, done: []bool, decoded: *usize, control: ?Control) !void {
+fn runPackedBatch(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.mem.Allocator, session: Session, tok: Tokenizer, cfg: model.Config, tasks: []const Task, batch: []const Planned, decisions: []Decision, done: []bool, decoded: *usize, control: ?Control, tokens: *usize) !void {
     // `plan` is the request arena; a coalesced row's memory is reclaimed
     // with everything else when `executePacked` tears it down.
     var row: tree.Row = undefined;
@@ -374,7 +382,12 @@ fn runPackedBatch(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.me
         const owner = if (owners.len > 0) owners[qi] else 0;
         const index = batch[owner].members[local];
         const q = tasks[index].question;
-        decisions[index] = try decode(a, cfg, q, logits[qi * row.width ..][0..q.labels.len], acts[qi * cfg.n_act ..][0..cfg.n_act]);
+        var decision = try decode(a, cfg, q, logits[qi * row.width ..][0..q.labels.len], acts[qi * cfg.n_act ..][0..cfg.n_act]);
+        // Two-stage choice (LAYA.md, step 2b): refine many-option choices by
+        // comparing the stage-1 finalists jointly off the same state.
+        if (cfg.packing.mode == .candidate and cfg.packing.two_stage.enabled() and q.kind == .choice and q.labels.len > cfg.packing.two_stage.top_k)
+            decision = try refineTwoStage(a, plan, scratch, session, tok, cfg, batch[owner].text, q, decision, control, tokens);
+        decisions[index] = decision;
         done[index] = true;
         decoded.* += 1;
     }
@@ -409,6 +422,77 @@ fn runPackedRow(session: Session, scratch: std.mem.Allocator, row: tree.Row, que
         initialized += 1;
     }
     return execution.runWithControl(&inputs, scratch, control);
+}
+
+/// Indices of the highest-probability options, ascending, capped at `top_k`
+/// and (once at least 2 are kept) at cumulative mass `mass_cutoff` (0
+/// disables the cutoff). Used only by two-stage choice (roadmap 2b).
+fn selectFinalists(a: std.mem.Allocator, probabilities: []const f32, top_k: usize, mass_cutoff: f32) ![]usize {
+    const order = try a.alloc(usize, probabilities.len);
+    defer a.free(order);
+    for (order, 0..) |*o, i| o.* = i;
+    const Ctx = struct {
+        fn more(probs: []const f32, l: usize, r: usize) bool {
+            return probs[l] > probs[r];
+        }
+    };
+    std.mem.sort(usize, order, probabilities, Ctx.more);
+    var count: usize = 0;
+    var mass: f32 = 0;
+    const cap = @min(top_k, order.len);
+    while (count < cap) {
+        if (mass_cutoff > 0 and count >= 2 and mass >= mass_cutoff) break;
+        mass += probabilities[order[count]];
+        count += 1;
+    }
+    const out = try a.dupe(usize, order[0..count]);
+    std.mem.sort(usize, out, {}, std.sort.asc(usize));
+    return out;
+}
+
+/// Two-stage choice (LAYA.md, roadmap 2b). Stage 1 (`stage1`, already
+/// decoded) scored every option in its own candidate branch; this packs the
+/// surviving finalists into one joint branch off the same trunk (so they can
+/// compare each other) and blends its distribution back in: each finalist's
+/// probability becomes the stage-1 mass captured by the shortlist times its
+/// stage-2 share of that mass, and every other option keeps its stage-1
+/// probability. The mix therefore still sums to 1. Always consumes `stage1`.
+/// Adds the joint branch's row length to `*tokens` (the trunk itself is not
+/// re-counted: a cache hit does not re-encode it, and a miss already counted
+/// it once for stage 1).
+fn refineTwoStage(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.mem.Allocator, session: Session, tok: Tokenizer, cfg: model.Config, text: []const u8, q: Question, stage1: Decision, control: ?Control, tokens: *usize) !Decision {
+    errdefer a.free(stage1.probabilities);
+    const finalists = try selectFinalists(plan, stage1.probabilities, cfg.packing.two_stage.top_k, cfg.packing.two_stage.mass_cutoff);
+    std.debug.assert(finalists.len >= 2);
+    const labels = try plan.alloc([]const u8, finalists.len);
+    const descriptions = try plan.alloc([]const u8, finalists.len);
+    for (finalists, labels, descriptions) |idx, *l, *d| {
+        l.* = q.labels[idx];
+        d.* = q.descriptions[idx];
+    }
+    const shortlist = Question{ .name = q.name, .kind = q.kind, .instruction = q.instruction, .labels = labels, .descriptions = descriptions };
+    const rows = try tree.build(plan, tok, cfg, text, &.{shortlist}, .question);
+    if (rows.len != 1) return error.UnexpectedOutputShape;
+    const row = rows[0];
+    tokens.* += row.ids.len;
+    const outputs = try runPackedRow(session, scratch, row, 1, control);
+    defer {
+        for (outputs) |*output| output.deinit();
+        scratch.free(outputs);
+    }
+    if (outputs.len != 2 or outputs[0].dtype != .f32 or outputs[1].dtype != .f32) return error.UnexpectedOutputShape;
+    const logits = outputs[0].asFloat32();
+    const acts = outputs[1].asFloat32();
+    if (logits.len != row.width or acts.len != cfg.n_act) return error.UnexpectedOutputShape;
+    const stage2 = try decode(scratch, cfg, shortlist, logits[0..labels.len], acts[0..cfg.n_act]);
+    defer scratch.free(stage2.probabilities);
+    var mass: f32 = 0;
+    for (finalists) |idx| mass += stage1.probabilities[idx];
+    const merged = try a.dupe(f32, stage1.probabilities);
+    errdefer a.free(merged);
+    for (finalists, 0..) |idx, j| merged[idx] = mass * stage2.probabilities[j];
+    a.free(stage1.probabilities);
+    return finalize(q, merged, stage1.act_probability);
 }
 
 fn lengthBucket(sequence: Sequence) usize {

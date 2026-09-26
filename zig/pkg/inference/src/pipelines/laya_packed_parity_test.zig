@@ -62,7 +62,7 @@ test "laya packed rows and decisions match the independent PyTorch oracle" {
         const tok = tokenizer.tokenizer();
         defer tok.deinitTokenizer();
         for (@field(ref.modes, mode)) |case| {
-            const rows = try tree.build(s, tok, cfg, case.state, questions);
+            const rows = try tree.build(s, tok, cfg, case.state, questions, null);
             try std.testing.expectEqual(@as(usize, 1), rows.len);
             const row = rows[0];
             // The packer is a second implementation of the same layout.

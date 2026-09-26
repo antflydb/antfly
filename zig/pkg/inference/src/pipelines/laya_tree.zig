@@ -262,11 +262,25 @@ const Branch = struct {
     logical: usize,
 };
 
+/// A branch's shape: `question` packs every option into one branch that sees
+/// its siblings, like upstream's layout; `candidate` gives each option its
+/// own branch, isolated from its siblings (LAYA.md, Layout).
+pub const BranchStyle = enum(u8) { question, candidate };
+
+fn styleOf(mode: model.PackingMode) BranchStyle {
+    return if (mode == .candidate) .candidate else .question;
+}
+
 /// Pack all questions about one state into as few rows as `max_packed_len`
 /// allows. The trunk is repeated only when a single row cannot hold every
-/// branch. Caller owns the returned rows and slice.
-pub fn build(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, text: []const u8, questions: []const laya.Question) ![]Row {
+/// branch. `style` defaults to the shape `cfg.packing.mode` implies; passing
+/// `.question` explicitly builds a joint branch even when `cfg.packing.mode`
+/// is `.candidate`, which is how two-stage choice (LAYA.md, roadmap 2b)
+/// compares a shortlist of finalists off the same trunk. Caller owns the
+/// returned rows and slice.
+pub fn build(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, text: []const u8, questions: []const laya.Question, style_override: ?BranchStyle) ![]Row {
     if (!cfg.packing.enabled() or questions.len == 0) return error.InvalidLayaPackedRow;
+    const style = style_override orelse styleOf(cfg.packing.mode);
     const mask = cfg.mask_token[0..cfg.mask_token_len];
     const state = try laya.encodeClean(a, tok, text, mask);
     defer a.free(state);
@@ -279,7 +293,7 @@ pub fn build(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, text: []co
         const tokens = try laya.questionTokens(a, tok, cfg, q);
         branch.* = .{ .question = i, .kind = q.kind, .tokens = tokens, .physical = 0, .logical = 0 };
         initialized += 1;
-        switch (cfg.packing.mode) {
+        switch (style) {
             .question => {
                 // [CLS] head [SEP] ([MASK] option)* [SEP]: upstream's head/options budget.
                 branch.physical = tokens.head_len + tokens.options_len + 3;
@@ -297,7 +311,6 @@ pub fn build(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, text: []co
                 }
                 branch.logical = head + 2 + longest;
             },
-            .none => unreachable,
         }
         if (trunk + branch.logical > cfg.max_len or trunk + branch.physical > cfg.packing.max_packed_len) return error.ExtractionTextLimitExceeded;
     }
@@ -311,19 +324,19 @@ pub fn build(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, text: []co
         var end = first;
         var used = trunk;
         while (end < branches.len and used + branches[end].physical <= cfg.packing.max_packed_len) : (end += 1) used += branches[end].physical;
-        try rows.append(a, try emit(a, tok, cfg, state, branches[first..end], used));
+        try rows.append(a, try emit(a, tok, cfg, state, branches[first..end], used, style));
         first = end;
     }
     return rows.toOwnedSlice(a);
 }
 
-fn emit(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, state: []const i32, branches: []const Branch, total: usize) !Row {
+fn emit(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, state: []const i32, branches: []const Branch, total: usize, style: BranchStyle) !Row {
     const special = tok.specialTokens();
     var width: usize = 2;
     var segment_count: usize = 1;
     for (branches) |branch| {
         width = @max(width, branch.tokens.options.len);
-        segment_count += 1 + if (cfg.packing.mode == .candidate) branch.tokens.options.len else 0;
+        segment_count += 1 + if (style == .candidate) branch.tokens.options.len else 0;
     }
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -355,14 +368,14 @@ fn emit(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, state: []const 
         anchors[qi] = @intCast(w.at);
         w.position = trunk_end;
         w.put(special.cls_id, question_segment, kind);
-        const head_len = if (cfg.packing.mode == .candidate) @min(t.head.len, cfg.head_max_len) else t.head_len;
+        const head_len = if (style == .candidate) @min(t.head.len, cfg.head_max_len) else t.head_len;
         for (t.head[0..head_len]) |id| w.put(id, question_segment, kind);
         w.put(special.sep_id, question_segment, kind);
         const option_start = w.position;
         for (t.options, 0..) |option, i| {
-            const run = if (cfg.packing.mode == .candidate) 1 + @min(option.len, laya.max_option_tokens) else t.optionRun(i);
+            const run = if (style == .candidate) 1 + @min(option.len, laya.max_option_tokens) else t.optionRun(i);
             var owner = question_segment;
-            if (cfg.packing.mode == .candidate) {
+            if (style == .candidate) {
                 owner = segment;
                 parents[segment] = @intCast(question_segment);
                 segment += 1;
@@ -372,7 +385,7 @@ fn emit(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, state: []const 
             w.put(special.mask_id, owner, kind);
             for (option[0 .. run - 1]) |id| w.put(id, owner, kind);
         }
-        if (cfg.packing.mode == .question) w.put(special.sep_id, question_segment, kind);
+        if (style == .question) w.put(special.sep_id, question_segment, kind);
     }
     std.debug.assert(w.at == total and segment == segment_count);
     return own(a, .{ .ids = w.ids, .positions = w.positions, .segments = w.segments, .parents = parents, .kinds = w.kinds, .anchors = anchors, .markers = markers, .question_index = question_index, .width = width });

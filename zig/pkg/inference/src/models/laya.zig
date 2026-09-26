@@ -30,11 +30,34 @@ pub const max_packed_len_limit = 32768;
 /// Positions restart after the parent at every branch. Released checkpoints
 /// use `.none`; a packed mode requires weights fine-tuned for that layout.
 pub const PackingMode = enum(u8) { none, question, candidate };
+
+/// Two-stage choice (roadmap 2b, LAYA.md "Two-stage choice for many options").
+/// Stage 1 scores every option as its own candidate branch; when a `choice`
+/// question has more options than `top_k`, stage 2 packs the surviving
+/// finalists into one joint (question-style) branch off the same trunk, so
+/// they attend to each other, and its distribution replaces their share of
+/// the stage-1 mass. Only meaningful with `PackingMode.candidate`, and only a
+/// checkpoint fine-tuned on a mix of candidate and joint branches should serve
+/// it (see `finetune/laya/data.zig`).
+pub const TwoStage = struct {
+    /// Finalists kept for the joint branch. 0 disables two-stage choice.
+    top_k: usize = 0,
+    /// Optional cumulative stage-1 probability-mass cutoff in (0, 1] that can
+    /// shortlist fewer than `top_k` finalists; 0 disables it (always `top_k`,
+    /// or every option when there are fewer). Never fewer than 2 finalists.
+    mass_cutoff: f32 = 0,
+
+    pub fn enabled(self: TwoStage) bool {
+        return self.top_k >= 2;
+    }
+};
+
 pub const Packing = struct {
     mode: PackingMode = .none,
     /// Physical tokens in one packed row. `Config.max_len` still bounds the
     /// logical length (trunk plus the longest root-to-leaf branch path).
     max_packed_len: usize = 0,
+    two_stage: TwoStage = .{},
 
     pub fn enabled(self: Packing) bool {
         return self.mode != .none;
@@ -131,18 +154,45 @@ fn parsePacking(value: std.json.Value, max_len: usize) !Packing {
     if (value != .object) return error.InvalidLayaConfig;
     var out = Packing{};
     for (value.object.keys()) |key| {
-        if (!std.mem.eql(u8, key, "mode") and !std.mem.eql(u8, key, "max_packed_len")) return error.InvalidLayaConfig;
+        if (!std.mem.eql(u8, key, "mode") and !std.mem.eql(u8, key, "max_packed_len") and !std.mem.eql(u8, key, "two_stage")) return error.InvalidLayaConfig;
     }
     const mode = value.object.get("mode") orelse return error.InvalidLayaConfig;
     if (mode != .string) return error.InvalidLayaConfig;
     out.mode = std.meta.stringToEnum(PackingMode, mode.string) orelse return error.InvalidLayaConfig;
-    if (out.mode == .none) return out;
+    if (out.mode == .none) {
+        if (value.object.get("two_stage") != null) return error.InvalidLayaConfig;
+        return out;
+    }
     out.max_packed_len = @min(4 * max_len, max_packed_len_limit);
     if (value.object.get("max_packed_len")) |v| {
         if (v != .integer or v.integer < 0) return error.InvalidLayaConfig;
         out.max_packed_len = std.math.cast(usize, v.integer) orelse return error.InvalidLayaConfig;
     }
     if (out.max_packed_len < max_len or out.max_packed_len > max_packed_len_limit) return error.InvalidLayaConfig;
+    if (value.object.get("two_stage")) |v| {
+        if (out.mode != .candidate) return error.InvalidLayaConfig;
+        out.two_stage = try parseTwoStage(v);
+    }
+    return out;
+}
+
+fn parseTwoStage(value: std.json.Value) !TwoStage {
+    if (value != .object) return error.InvalidLayaConfig;
+    for (value.object.keys()) |key| {
+        if (!std.mem.eql(u8, key, "top_k") and !std.mem.eql(u8, key, "mass_cutoff")) return error.InvalidLayaConfig;
+    }
+    const top_k = value.object.get("top_k") orelse return error.InvalidLayaConfig;
+    if (top_k != .integer or top_k.integer < 2 or top_k.integer > max_packed_options) return error.InvalidLayaConfig;
+    var out = TwoStage{ .top_k = @intCast(top_k.integer) };
+    if (value.object.get("mass_cutoff")) |v| {
+        const n: f32 = switch (v) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| @floatCast(f),
+            else => return error.InvalidLayaConfig,
+        };
+        if (!std.math.isFinite(n) or n <= 0 or n > 1) return error.InvalidLayaConfig;
+        out.mass_cutoff = n;
+    }
     return out;
 }
 
@@ -157,6 +207,11 @@ test "laya packing config defaults, bounds, and rejects unknown fields" {
         .{ .json = "{\"packing\":{\"mode\":\"question\",\"max_packed_len\":65536}}", .mode = null },
         .{ .json = "{\"packing\":{\"mode\":\"tree\"}}", .mode = null },
         .{ .json = "{\"packing\":{\"mode\":\"question\",\"shared\":true}}", .mode = null },
+        // Two-stage choice only makes sense with candidate branches.
+        .{ .json = "{\"packing\":{\"mode\":\"question\",\"two_stage\":{\"top_k\":8}}}", .mode = null },
+        .{ .json = "{\"packing\":{\"mode\":\"none\",\"two_stage\":{\"top_k\":8}}}", .mode = null },
+        .{ .json = "{\"packing\":{\"mode\":\"candidate\",\"two_stage\":{\"top_k\":1}}}", .mode = null },
+        .{ .json = "{\"packing\":{\"mode\":\"candidate\",\"two_stage\":{\"top_k\":8,\"mass_cutoff\":1.5}}}", .mode = null },
     };
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, a, case.json, .{});
@@ -168,6 +223,21 @@ test "laya packing config defaults, bounds, and rejects unknown fields" {
             try std.testing.expectEqual(@as(usize, if (mode == .candidate) 255 else 20), cfg.maxOptions());
         } else try std.testing.expectError(error.InvalidLayaConfig, Config.parse(parsed.value));
     }
+}
+
+test "laya two-stage config parses top_k and mass_cutoff and defaults to disabled" {
+    const a = std.testing.allocator;
+    const disabled = try std.json.parseFromSlice(std.json.Value, a, "{\"packing\":{\"mode\":\"candidate\"}}", .{});
+    defer disabled.deinit();
+    const cfg = try Config.parse(disabled.value);
+    try std.testing.expect(!cfg.packing.two_stage.enabled());
+
+    const enabled = try std.json.parseFromSlice(std.json.Value, a, "{\"packing\":{\"mode\":\"candidate\",\"two_stage\":{\"top_k\":8,\"mass_cutoff\":0.9}}}", .{});
+    defer enabled.deinit();
+    const two_stage = (try Config.parse(enabled.value)).packing.two_stage;
+    try std.testing.expect(two_stage.enabled());
+    try std.testing.expectEqual(@as(usize, 8), two_stage.top_k);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), two_stage.mass_cutoff, 1e-9);
 }
 fn positive(value: std.json.Value) !f32 {
     const n: f32 = switch (value) {
