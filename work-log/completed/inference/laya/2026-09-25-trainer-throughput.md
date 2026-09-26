@@ -196,3 +196,78 @@ RLCD CE per 200 steps: 3.612, 3.996, 5.002, 4.37, 4.345, 4.34, 4.346, 4.337
 RLCD at a quarter of the learning rate 3.373, 3.124, 3.352, 2.617, 3.748,
 2.975 (grad norms 979-3,348); soft CE 3.851, 2.786, 2.392, 2.524, 2.126,
 2.291 (grad norms 93-291).
+
+## LoRA (2026-09-26)
+
+Design and summary: [`zig/pkg/inference/models/laya/LAYA.md`](../../../../zig/pkg/inference/models/laya/LAYA.md#lora).
+Implementation: `finetune/laya/graph.zig` (`Lora`/`Targets`, `isLoraWeight`,
+`isLoraFrozen`, `loraPrefix`, `loraDelta`), `finetune/laya/training.zig`
+(`frozen` widened with an `?architecture.Lora` arg, `parameters` inits
+`.lora_A` Kaiming-uniform / `.lora_B` zero), `finetune/laya/job.zig`
+(`Config.lora`, `mergeLora`, `exportedValue`).
+
+Verification this session was CPU-only, on the synthetic fixture
+(`ANTFLY_LAYA_REFERENCE`), via `zig build test -- --test-filter lora` and
+`--test-filter laya`:
+
+```
+finetune.laya.graph.test.laya lora adds rank-shaped adapters to every targeted linear and both groups get gradients ... OK
+finetune.laya.graph.test.laya lora target and prefix helpers identify exactly the six adapted linears ... OK
+finetune.laya.training_test.test.laya lora freezes only its targeted linear weights and biases, on top of frozen layers ... OK
+finetune.laya.training_test.test.laya training with lora adapts only its targets, merges them at export, and resumes exactly ... OK
+finetune.laya.job.test.laya lora merge computes base plus scale times B times A exactly ... OK
+finetune.laya.job.test.laya lora job validation resolves targets and rejects malformed settings ... OK
+```
+
+Full `--test-filter laya` with the reference fixture: 64 selected, 56 passed,
+8 skipped (CUDA, packed benchmark, and the export-reference test, none of
+which this track touches), 0 failed — including the existing 45-gradient
+PyTorch parity test and the frozen-layers test, both unaffected by widening
+`training.frozen`'s signature.
+
+**Update, later the same session (2026-09-26): Metal and released-model
+measurements.** The lock policy changed (`with-lock gpu` no longer also
+holds the build slot; a build only waits on a live GPU job when memory is
+tight), which let the remaining old-policy chain drain and freed the queue.
+
+Metal: `--test-filter laya` with `ANTFLY_LAYA_METAL=1 ANTFLY_LAYA_BACKEND=metal`
+and the reference fixtures: 64 selected, 56 passed, 0 failed, 8 skipped
+(CUDA/benchmark/export-reference, unrelated), including the LoRA end-to-end
+job test (`"backend":"metal"`) and the 45-tensor PyTorch gradient parity
+test (max absolute error 1.9e-6, unchanged from before this track).
+
+Released-model numbers (Apple M4 Max, ReleaseFast, Metal, own worktree
+build, `laya-released` checkpoint, jobs under `.tmp/laya/` with `lora:
+{"rank":16,"alpha":32,"targets":["encoder","head"]}`):
+
+Step time and peak memory, `td/prof.json`-style job (packed question mode,
+batch 1, 14 microbatches), median step after two warm-up steps, `/usr/bin/time -l`:
+
+```
+full fine-tune (remeasured)  median 1.31 s  peak 25.88 GB
+lora rank16                  median 1.23 s  peak 14.43 GB
+```
+
+Raw step_ms, full fine-tune (14 steps): 2373.861, 1342.65, 1409.957,
+1249.336, 1027.417, 1373.559, 1254.247, 1497.145, 1014.922, 1389.317,
+1021.039, 1252.919, 1511.434, 1372.526. Peak footprint (`/usr/bin/time -l`
+"peak memory footprint"): 25882518024 bytes.
+
+Raw step_ms, LoRA rank 16 (14 steps): 1206.345, 1115.658, 1305.337,
+1162.286, 921.686, 1295.197, 1166.301, 1420.939, 927.203, 1297.53, 921.02,
+1160.47, 1436.552, 1304.365. Peak footprint: 14431817760 bytes.
+
+Step-0 packed accuracy, rank 16, same recipe/data/evaluator as the step-0
+and run-to-run-variance sections above (`s0-train.jsonl`, 400 cases;
+`s0-calibration.jsonl`; scored on the full 760-decision `s0-eval.jsonl`
+through the serving evaluator, `--backend metal`):
+
+```
+seed 42: accuracy 0.48026  soft_ce 1.11312  ece 0.03261  (93.1 s eval, 760 decisions)
+seed 43: accuracy 0.47763  soft_ce 1.11338  ece 0.02309  (92.1 s eval)
+seed 44: accuracy 0.45395  soft_ce 1.11733  ece 0.04169  (94.3 s eval)
+mean 0.4706  sd 0.0145 (vs current-trainer full fine-tune mean 0.450 sd 0.014)
+```
+
+Rank 64 was not measured (time). `*.safetensors` were deleted from every run
+directory immediately after its eval.
