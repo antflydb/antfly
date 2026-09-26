@@ -592,11 +592,64 @@ starting from the same released checkpoint and recipe as the candidate
 baseline: one epoch, soft CE, `b77/train.jsonl` plus its synthetic stage-2
 rows, calibration on `b77/calibration.jsonl`):
 
-TWO_STAGE_TABLE_PLACEHOLDER
+| Model | Accuracy | Soft CE | ECE | Top-8 recall | ms/decision | Tokens/decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Candidate-only baseline (prior work, mean of 2 seeds) | 0.819 | — | — | — | — | — |
+| Two-stage checkpoint, seed 42, **stage 1 alone** (`two_stage` unset) | 0.8525 | 0.632 | 0.057 | 0.995 | 403 | 369 |
+| **Two-stage checkpoint, seed 42, stage 1 + stage 2** | 0.8325 | 0.686 | 0.067 | — | 633 | 435 |
+| Two-stage checkpoint, seed 43, stage 1 alone | 0.8425 | 0.640 | 0.063 | 0.985 | 374 | 369 |
+| **Two-stage checkpoint, seed 43, stage 1 + stage 2** | 0.8375 | 0.785 | 0.071 | — | 625 | 435 |
+| Mean, stage 1 alone (2 seeds) | 0.8475 | 0.636 | 0.060 | 0.990 | 389 | 369 |
+| **Mean, stage 1 + stage 2 (2 seeds)** | **0.8350** | **0.735** | **0.069** | — | 629 | 435 |
 
-- TWO_STAGE_FINDINGS_PLACEHOLDER
+- **Stage 2 makes accuracy worse, not better, on this recipe, and it does so
+  on both seeds.** Same checkpoint, same eval set, only the decoding path
+  differs: stage 1 alone scores 0.8525 / 0.8425 (seeds 42 / 43); blending in
+  stage 2 drops both to 0.8325 / 0.8375, a consistent ~1.25-point mean loss,
+  and soft CE and ECE get worse on both seeds too. This is the two-stage
+  design's headline result and it is negative.
+- **It is not a shortlist-recall problem.** Stage 1's top-8 shortlist
+  contains the gold label 99.5% (seed 42) / 98.5% (seed 43) of the time — the
+  99.9th-percentile case for a bound, not the bottleneck. Stage 2's own
+  joint-branch distribution must be miscalibrated or simply wrong often
+  enough, on the finalists it does see, to outweigh the cases where it
+  corrects stage 1.
+- **Also worth noting: stage 1 alone, on this checkpoint, beats the original
+  candidate-only baseline** (0.8475 mean vs 0.819 mean). The two-stage
+  training recipe trains on the candidate rows *and* a same-size batch of
+  synthetic joint rows, which amounts to roughly double the gradient steps
+  over related data; this is not a controlled ablation of stage 2's value,
+  only a by-product of the extra training the mixed recipe happens to do. It
+  means comparing the full two-stage number against the old baseline (0.835
+  vs 0.819) would *understate* how much stage 2 alone costs; the fair,
+  controlled comparison is stage 1 alone vs. stage 1 + stage 2 on the same
+  weights (0.8475 vs 0.8350), which is unambiguous and still negative.
+- **Cost.** Stage 2 adds one joint-branch forward per `choice` decision over
+  `top_k` options (all 400 Banking77 eval messages have 77 > 8 options, so
+  every decision pays it): +66 tokens per decision exactly (369 → 435,
+  reproducible across seeds and runs) and roughly +240 ms per decision on
+  this shared, loaded machine (389 → 629 ms mean; per-run wall time ranged
+  374–693 ms depending on contention from other agents' jobs, so treat the ms
+  figures as indicative only, unlike the token counts).
+- **Hypotheses for the regression, untested here:** (a) the joint branch is
+  trained on far fewer effective examples per class than the candidate branch
+  (one sampled shortlist per record vs. all 77 options), so it may simply be
+  undertrained; (b) uniform random negatives are an easy shortlist most of
+  the time (top-8 recall is 99.5%), so stage 2 rarely has to do real
+  discrimination work in training and may not have learned to firmly prefer
+  the right answer among *hard* look-alikes; (c) the calibration gap is
+  suspect too — the trainer fits one temperature for the whole `choice` kind
+  (`job.zig`'s `calibrate`), mixing 77-way stage-1 rows and 8-way stage-2
+  rows in one calibration set, so neither branch's temperature is fit for
+  its own distribution shape. (c) is the cheapest to try next: fit
+  `temperature_by_options` per count bucket instead of one flat value.
+- **Not yet tried:** hard-negative shortlists (from a stage-1 checkpoint's
+  own confusions) instead of random ones, a larger `top_k`, and a
+  `mass_cutoff` shortlist instead of a fixed size.
 
+### Trainer throughput
 
+Measured 2026-09-25 on the same machine: packed question mode, batch size 1,
 14 microbatches of the step-0 training subset (`td/prof.json` from
 `scripts/laya/prepare_laya_training_data.sh`), median step after two warm-up
 steps, ReleaseFast.
@@ -816,7 +869,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 | 1c. Metal and CUDA packed kernels | no | Metal: packed decisions scored on the device (2–4%); fused kernels not pursued (encoder GPU work dominates). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |
 | 1d. Weight quantization (q8_0) | no | done (CPU and Metal); pays off on Metal | Labels identical and probabilities within 2e-2 of dense on the fixture; on the released model, 36% less Metal memory at the same accuracy. CPU q8_0 kernels need work |
 | 2a. Long-context teacher (Qwen3.8-27B) | labels only | not started | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
-| 2b. Two-stage choice for many options | same fine-tune | not started | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. Measured on Banking77 |
+| 2b. Two-stage choice for many options | same fine-tune | implemented and measured; **negative result** | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. On Banking77, stage 2 made accuracy *worse* than stage 1 alone on the same checkpoint (0.8475 → 0.8350 mean over 2 seeds), despite 99%+ top-8 recall. Not adopted; see [Two-stage choice](#two-stage-choice-roadmap-2b) |
 | 2c. 8k states | yes | not started | Memory-efficient attention in the training graph (today about 2k tokens at batch 1), `max_len` 8192 (ModernBERT's pretraining length), fine-tune on teacher-labelled long states |
 | 2d. ModernBERT-base student | yes | not started | ~150M parameters, about 2–3× cheaper than Laya-large; keep if its agreement with the teacher stays within tolerance of the large model |
 
@@ -829,7 +882,11 @@ pulls ahead well beyond 32k, where Laya's encoder was not pretrained anyway.
 Other open items:
 
 - **Very many options:** candidate branches cannot compare options before the
-  softmax (step 2b).
+  softmax. Two-stage choice (step 2b) adds that comparison but currently
+  makes accuracy worse, not better, on Banking77 — see
+  [Two-stage choice](#two-stage-choice-roadmap-2b) for the negative result
+  and untested hypotheses (calibration by shortlist size, hard-negative
+  training shortlists).
 - **Trainer throughput:** device slices, device-resident gradients, command
   frames, the batched optimizer, device inputs and frozen lower layers are
   done

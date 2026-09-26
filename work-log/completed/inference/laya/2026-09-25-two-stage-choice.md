@@ -35,31 +35,62 @@ Existing single-stage behavior is unchanged when `two_stage` is unset
 override defaults to `null` (keeps the config's own mode) at every pre-existing
 call site.
 
+Two bugs found and fixed while qualifying this on real training runs, both
+before the negative Banking77 result was trustworthy:
+
+- `job.zig`'s `exportModel` rewrote `packing` to `{mode, max_packed_len}`
+  only, silently dropping `two_stage` even when the job trained for it. A
+  served checkpoint would therefore never run stage 2. Caught by inspecting
+  the seed-42 export's `config.json` before evaluating it. Fixed by factoring
+  the packing JSON into `packingConfigJson` (now includes `two_stage`) and
+  covered by a new round-trip test. The already-exported seed-42 checkpoint
+  was hand-patched (`config.json`/`rl_agent_config.json`) rather than
+  retrained, since the weights were already correct.
+- `executePacked` did not add the stage-2 joint branch's row length to the
+  reported `prompt_tokens`, so the "extra serving cost" measurement would
+  have been wrong. Fixed by threading a `*usize` accumulator into
+  `refineTwoStage`.
+
 ## Tests
 
 `~/bin/zig build test -- --test-filter "laya"`, CPU and
 `ANTFLY_LAYA_BACKEND=metal ANTFLY_LAYA_METAL=1`, with and without
-`ANTFLY_LAYA_REFERENCE=<fixtures>/ref`: 61 selected, all pass (45/61 without
-Metal+CUDA-only tests skipped, as before; adds two new tests: a `models/laya.zig`
-two-stage config parse/validate test, and
-`pipelines/laya_packed_test.zig`'s "laya tree style override builds a joint
-branch under a candidate-mode config", which checks the override reproduces a
-pure question-mode build byte for byte). A new `finetune/laya/data.zig` test
-checks `addStageTwo`'s gold-label preservation, target renormalization, and
-seed determinism directly (no tokenizer needed).
+`ANTFLY_LAYA_REFERENCE=<fixtures>/ref`: 64 selected, all pass (48 pass, 16
+skip — Metal/CUDA-only tests skipped on CPU-only runs, as before). New tests:
+a `models/laya.zig` two-stage config parse/validate test; `laya_packed_test.zig`'s
+"laya tree style override builds a joint branch under a candidate-mode config"
+(the override reproduces a pure question-mode build byte for byte) and "laya
+two-stage choice blends a joint shortlist back into the stage-1 distribution"
+(an end-to-end pipeline test against a hand-computed mixture, on the seeded
+synthetic fixture model); `finetune/laya/data.zig`'s `addStageTwo` test (gold
+preservation, target renormalization, seed determinism, no tokenizer needed);
+`job.zig`'s packing-export round-trip test; `evaluate.zig`'s `topKRecall` test.
 
 ## Banking77 measurement
 
 Job (both seeds): `model_dir` = released checkpoint, `train_file` =
-`b77/train.jsonl`, `eval_file` (trainer's own before/after eval) =
-`b77/eval-tiny.jsonl`, `calibration_file` = `b77/calibration.jsonl`,
+`b77/train.jsonl` (1,540 records; `addStageTwo` adds one synthetic stage-2
+record per record, since every Banking77 case has 77 > `top_k` = 8 options,
+so training saw 3,080 examples), `eval_file` (trainer's own before/after
+eval) = `b77/eval-tiny.jsonl`, `calibration_file` = `b77/calibration.jsonl`,
 `backend: metal`, `epochs: 1`, `batch_size: 1`, `objective: soft_ce`,
-`packing: candidate`, `two_stage_top_k: 8`. The authoritative eval is the
-standalone `antfly-inference finetune eval laya <model_dir> <records.jsonl>`
-on the full `b77/eval.jsonl` (400 messages), which goes through the same
-`executePacked` two-stage path as real serving.
+`packing: candidate`, `two_stage_top_k: 8`. ~3,080 steps, ~35 min per run on
+Metal (in line with the candidate-only baseline's ~30 min for half the
+examples).
 
-See LAYA.md, "Two-stage choice (roadmap 2b)" for the numbers and discussion.
+The authoritative eval is the standalone
+`antfly-inference finetune eval laya <model_dir> <records.jsonl>` on the full
+`b77/eval.jsonl` (400 messages), which goes through the same `executePacked`
+two-stage path as real serving. To isolate stage 2's effect on a fixed
+checkpoint, each trained model directory was copied and the copy's
+`packing.two_stage` stripped from its config (`patch_stage1_only_config.py`,
+not checked in — a 4-line JSON edit), then evaluated too. `--top-k-recall 8`
+on the stage-1-only copy gives the stage-1 recall bound.
+
+**Result: negative.** Stage 2 reduces accuracy relative to stage 1 alone on
+the same weights, on both seeds (mean 0.8475 → 0.8350), despite ~99% top-8
+recall. Full numbers, per-seed breakdown, cost, and hypotheses are in
+LAYA.md, "Two-stage choice (roadmap 2b)".
 
 ## Known limitations / open issues
 
@@ -78,3 +109,21 @@ See LAYA.md, "Two-stage choice (roadmap 2b)" for the numbers and discussion.
 - Doubling the training set (one synthetic stage-2 row per stage-1 row, since
   every Banking77 record has 77 > `top_k` options) roughly doubles wall time
   per epoch relative to the single-stage candidate baseline.
+- The two-stage design itself is negative on this first recipe (see above);
+  it should not be adopted as-is. The cheapest untried follow-up is
+  per-shortlist-size calibration (`temperature_by_options`, currently
+  stripped by the trainer's export step); hard-negative training shortlists
+  are the second thing to try.
+
+## Lock usage note
+
+Early runs chained a training run and its evals under one `with-lock gpu`
+call (`eval42-then-train43.sh`), which under the *original* lock script also
+held the build lock for the whole chain. The coordinator changed the lock
+policy mid-track (gpu no longer implies build; builds are memory-gated) and
+asked agents to take one `with-lock gpu` per single run/eval going forward.
+Everything after that message here does one gpu-locked command per
+invocation. `*.safetensors` were deleted from both run directories
+immediately after their evals (kept: job/report/prediction JSON, and the
+exported `config.json`/`rl_agent_config.json`, tokenizer, and manifest under
+each `model/` and `model-stage1-only/`).

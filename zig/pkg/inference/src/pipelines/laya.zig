@@ -339,7 +339,7 @@ fn executePacked(a: std.mem.Allocator, scratch: std.mem.Allocator, session: Sess
             const q = tasks[index].question;
             var decision = try decode(a, cfg, q, logits[qi * row.width ..][0..q.labels.len], acts[qi * cfg.n_act ..][0..cfg.n_act]);
             if (two_stage and q.kind == .choice and q.labels.len > cfg.packing.two_stage.top_k) {
-                decision = try refineTwoStage(a, plan, scratch, session, tok, cfg, planned.text, q, decision, control);
+                decision = try refineTwoStage(a, plan, scratch, session, tok, cfg, planned.text, q, decision, control, &tokens);
             }
             decisions[index] = decision;
             done[index] = true;
@@ -415,7 +415,10 @@ fn selectFinalists(a: std.mem.Allocator, probabilities: []const f32, top_k: usiz
 /// probability becomes the stage-1 mass captured by the shortlist times its
 /// stage-2 share of that mass, and every other option keeps its stage-1
 /// probability. The mix therefore still sums to 1. Always consumes `stage1`.
-fn refineTwoStage(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.mem.Allocator, session: Session, tok: Tokenizer, cfg: model.Config, text: []const u8, q: Question, stage1: Decision, control: ?Control) !Decision {
+/// Adds the joint branch's row length to `*tokens` (the trunk itself is not
+/// re-counted: a cache hit does not re-encode it, and a miss already counted
+/// it once for stage 1).
+fn refineTwoStage(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.mem.Allocator, session: Session, tok: Tokenizer, cfg: model.Config, text: []const u8, q: Question, stage1: Decision, control: ?Control, tokens: *usize) !Decision {
     errdefer a.free(stage1.probabilities);
     const finalists = try selectFinalists(plan, stage1.probabilities, cfg.packing.two_stage.top_k, cfg.packing.two_stage.mass_cutoff);
     std.debug.assert(finalists.len >= 2);
@@ -429,6 +432,7 @@ fn refineTwoStage(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.me
     const rows = try tree.build(plan, tok, cfg, text, &.{shortlist}, .question);
     if (rows.len != 1) return error.UnexpectedOutputShape;
     const row = rows[0];
+    tokens.* += row.ids.len;
     const outputs = try runPackedRow(session, scratch, row, 1, control);
     defer {
         for (outputs) |*output| output.deinit();
