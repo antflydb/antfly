@@ -612,6 +612,11 @@ pub const Operations = struct {
             error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
+            // A fenced or cold-reopening owner can reject ordinary writer
+            // admission before proposal. Accepted-but-unconfirmed apply is
+            // separately OutcomeUnknown. This is retryable availability,
+            // not an internal defect or a proven conflict.
+            error.StorageReadTemporarilyUnavailable => return error.Unavailable,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,
             error.EnrichmentWaitCanceled => return error.EnrichmentWaitCanceled,
@@ -2043,6 +2048,15 @@ fn consumerTests() type {
                 state.visibility_error = failure;
                 try std.testing.expectError(failure, operations.routedBatch(std.testing.allocator, request, 17, "documents", .{}, forwarding));
             }
+            state.visibility_error = error.StorageReadTemporarilyUnavailable;
+            try std.testing.expectError(error.Unavailable, operations.routedBatch(
+                std.testing.allocator,
+                request,
+                17,
+                "documents",
+                .{},
+                forwarding,
+            ));
         }
 
         test "typed internal query workers preserve identity generation validation" {

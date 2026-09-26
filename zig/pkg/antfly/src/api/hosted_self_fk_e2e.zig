@@ -654,8 +654,13 @@ fn drivePublicationWithLostReplies(
             // must not slip through either the child or parent role.
             var fenced_write = try batchOnce(alloc, transport, headers, base, "{\"inserts\":{\"during-fence\":{\"id\":99}},\"sync_level\":\"full_text\"}");
             defer fenced_write.deinit(alloc);
-            if (fenced_write.status != 409) std.debug.print("self-FK fenced write status={d} body={s}\n", .{ fenced_write.status, fenced_write.body });
-            try std.testing.expectEqual(@as(u16, 409), fenced_write.status);
+            // A transferred leader may have to reopen a fence-deferred owner.
+            // 503 is retryable, not a proof that no proposal occurred. The
+            // authoritative post-publication read below proves this exact
+            // write did not commit before treating the probe as successful.
+            if (fenced_write.status != 409 and fenced_write.status != 503)
+                std.debug.print("self-FK fenced write status={d} body={s}\n", .{ fenced_write.status, fenced_write.body });
+            try std.testing.expect(fenced_write.status == 409 or fenced_write.status == 503);
             fenced_write_checked = true;
         }
         // First lose the owner reply before metadata records it. Replaying
