@@ -95,15 +95,16 @@ class BoundedZigBuildTest(unittest.TestCase):
                 re.MULTILINE | re.DOTALL,
             )
         )
-        for job in (
-            "zig-base-tests",
-            "zig-full-tests",
-            "zig-build-cache-tests",
-            "e2e-base-build",
-            "e2e-full-build",
-        ):
+        expected_runners = {
+            "zig-base-tests": "arc-antfly-heavy",
+            "zig-full-tests": "arc-antfly-heavy",
+            "zig-build-cache-tests": "arc-antfly-heavy",
+            "e2e-base-build": "arc-antfly-heavy-runtime",
+            "e2e-full-build": "arc-antfly-heavy-runtime",
+        }
+        for job, runner in expected_runners.items():
             with self.subTest(job=job):
-                self.assertIn("    runs-on: arc-antfly-heavy\n", jobs[job])
+                self.assertIn(f"    runs-on: {runner}\n", jobs[job])
                 budget = re.search(
                     r'^      ANTFLY_ZIG_MAX_RSS: "(\d+)"$',
                     jobs[job],

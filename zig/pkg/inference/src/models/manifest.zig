@@ -350,6 +350,10 @@ pub const ModelManifest = struct {
     gliner_model_type: []const u8 = "", // "gliner2", "gliner2.5", "uniencoder", etc.
     gliner_architecture: gliner_boundary.Architecture = .unknown,
     gliner_boundary_config: ?gliner_boundary.Config = null,
+    /// A span checkpoint with the supported gliner2 2.x marker contract
+    /// (e.g. GLiNER2.5-Decide). Its classification runs the upstream
+    /// `classifier` head on the schema_version:2 route.
+    gliner_span_declared: bool = false,
     gliner_default_labels: [][]const u8 = &.{},
     gliner_relation_labels: [][]const u8 = &.{},
     gliner_relation_threshold: f32 = 0.0,
@@ -1107,6 +1111,45 @@ pub fn loadFromManagedPlanDir(allocator: std.mem.Allocator, model_dir_path: []co
     return loadFromCatalog(allocator, &catalog);
 }
 
+/// Original Fastino span checkpoints keep only wrapper metadata in
+/// config.json; encoder geometry lives in encoder_config/config.json. Without
+/// it, admission would size a deberta-v3-large encoder with base defaults.
+fn applySpanEncoderGeometry(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    catalog: *const ArtifactCatalog,
+    config_bytes: []const u8,
+) !void {
+    if (manifest.gliner_architecture != .span) return;
+    const wrapper = std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{}) catch return;
+    defer wrapper.deinit();
+    if (wrapper.value != .object or wrapper.value.object.contains("hidden_size")) return;
+    const encoder_bytes = try catalog.readOptional("encoder_config/config.json") orelse return;
+    defer allocator.free(encoder_bytes);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, encoder_bytes, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const obj = parsed.value.object;
+    if (obj.get("hidden_size")) |v| if (jsonU32(v)) |val| {
+        manifest.hidden_size = val;
+    };
+    if (obj.get("intermediate_size")) |v| if (jsonU32(v)) |val| {
+        manifest.intermediate_size = val;
+    };
+    if (obj.get("num_hidden_layers")) |v| if (jsonU32(v)) |val| {
+        manifest.num_hidden_layers = val;
+    };
+    if (obj.get("num_attention_heads")) |v| if (jsonU32(v)) |val| {
+        manifest.num_attention_heads = val;
+    };
+    if (obj.get("vocab_size")) |v| if (jsonU32(v)) |val| {
+        manifest.bert_vocab_size = val;
+    };
+    if (obj.get("max_position_embeddings")) |v| if (jsonU32(v)) |val| {
+        manifest.max_position_embeddings = val;
+    };
+}
+
 fn parseBoundaryConfigFromCatalog(
     manifest: *ModelManifest,
     allocator: std.mem.Allocator,
@@ -1116,6 +1159,7 @@ fn parseBoundaryConfigFromCatalog(
     const architecture = try gliner_boundary.detectArchitecture(allocator, config_bytes);
     if (architecture != .boundary) {
         manifest.gliner_architecture = architecture;
+        if (architecture == .span) manifest.gliner_span_declared = try gliner_boundary.declaresSpanArchitecture(allocator, config_bytes);
         return false;
     }
     const encoder_bytes = try catalog.readOptional("encoder_config/config.json") orelse
@@ -1197,6 +1241,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
         if (!try parseBoundaryConfigFromCatalog(&manifest, allocator, catalog, config_bytes)) {
             try ignoreNonResourceMetadataError(parseConfigJson(&manifest, allocator, config_bytes));
             try parseSpanEncoderConfigFromCatalog(&manifest, allocator, catalog, config_bytes);
+            try applySpanEncoderGeometry(&manifest, allocator, catalog, config_bytes);
         }
     }
     if (manifest.gliner_architecture != .boundary and manifest.native_arch_hint == .none and manifest.max_position_embeddings == 512 and manifest.hidden_size == 768) {
@@ -7282,4 +7327,28 @@ test "managed ONNX export uses its own configuration and tokenizer" {
     var listing = try loadListingFromDir(allocator, model_dir);
     defer listing.deinit();
     try std.testing.expect(std.mem.endsWith(u8, listing.config_path.?, "onnx/config.json"));
+}
+
+test "span wrapper manifest takes encoder geometry from encoder_config" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"extractor","architecture":"span","architecture_version":1,"architectures":["SpanExtractor"],"config_version":3,"span_head":{"span_mode":"markerV0"},"counting_layer":"count_lstm","model_name":"microsoft/deberta-v3-large","token_pooling":"first"}
+    });
+    try tmp.dir.createDirPath(io, "encoder_config");
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data =
+        \\{"model_type":"deberta-v2","hidden_size":1024,"intermediate_size":4096,"num_hidden_layers":24,"num_attention_heads":16,"vocab_size":128011,"max_position_embeddings":512}
+    });
+    const model_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_path);
+    var manifest = try loadFromDir(allocator, model_path);
+    defer manifest.deinit();
+    try std.testing.expectEqual(gliner_boundary.Architecture.span, manifest.gliner_architecture);
+    try std.testing.expect(manifest.gliner_span_declared);
+    try std.testing.expectEqual(@as(u32, 1024), manifest.hidden_size);
+    try std.testing.expectEqual(@as(u32, 24), manifest.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 16), manifest.num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 4096), manifest.intermediate_size);
 }

@@ -195,6 +195,48 @@ pub const Key = struct {
     member: bool = true,
 };
 
+const HistoricalProjection = struct {
+    alloc: Allocator,
+    source: schema_registry.SchemaView,
+    indexes: []ProjectedIndex,
+
+    const ProjectedIndex = struct {
+        tuple: ?tuples.TuplePlan = null,
+        cover: ?covering.Source = null,
+        predicate: ?partial.Source = null,
+
+        fn deinit(self: *ProjectedIndex) void {
+            if (self.tuple) |*tuple| tuple.deinit();
+            if (self.cover) |*cover| cover.deinit();
+            if (self.predicate) |*predicate| predicate.deinit();
+        }
+    };
+
+    fn init(alloc: Allocator, plan: View, source: schema_registry.SchemaView) !HistoricalProjection {
+        var retained = source.clone();
+        errdefer retained.release();
+        const indexes = try alloc.alloc(ProjectedIndex, plan.boundIndexes().len);
+        for (indexes) |*index| index.* = .{};
+        errdefer {
+            for (indexes) |*index| index.deinit();
+            alloc.free(indexes);
+        }
+        for (plan.boundIndexes(), indexes) |bound, *projected| {
+            projected.tuple = try bound.tuple.projectSource(alloc, source.tableSchema().*, source.physicalLayout());
+            if (bound.cover) |cover| projected.cover = try cover.projectSource(alloc, source.tableSchema().*, source.physicalLayout());
+            if (bound.predicate) |predicate| projected.predicate = try predicate.projectSource(alloc, source.tableSchema().*, source.physicalLayout());
+        }
+        return .{ .alloc = alloc, .source = retained, .indexes = indexes };
+    }
+
+    fn deinit(self: *HistoricalProjection) void {
+        for (self.indexes) |*index| index.deinit();
+        self.alloc.free(self.indexes);
+        self.source.release();
+        self.* = undefined;
+    }
+};
+
 /// Single-worker builder; share immutable Views, not this mutable buffer.
 /// Offsets survive growth. Returned Key slices borrow bytes until the next
 /// append/reset/deinit. Admission is provided by the caller's backing allocator.
@@ -205,12 +247,14 @@ pub const Batch = struct {
     entries: std.ArrayList(Entry) = .empty,
     row_count: usize = 0,
     predicate_scratch: std.ArrayList(u8) = .empty,
+    historical_projection: ?HistoricalProjection = null,
 
     pub fn init(alloc: Allocator, view: View) Batch {
         return .{ .alloc = alloc, .view = view.clone() };
     }
 
     pub fn deinit(self: *Batch) void {
+        if (self.historical_projection) |*projection| projection.deinit();
         self.bytes.deinit(self.alloc);
         self.entries.deinit(self.alloc);
         self.predicate_scratch.deinit(self.alloc);
@@ -240,6 +284,50 @@ pub const Batch = struct {
         const view = self.view.schemaView();
         if (prepared.schema_version != view.version()) return error.RelationalRowSchemaMismatch;
         return self.append(try prepared.typedView(view.tableSchema().*, view.physicalLayout()));
+    }
+
+    /// A committed write can carry a row encoded before the current index
+    /// catalog was published. Project each current index definition onto that
+    /// row's immutable schema, as the index backfill reader does for stored
+    /// historical rows. The primary row keeps its original schema version.
+    pub fn appendPreparedFromSchema(self: *Batch, prepared: *const mapper.PreparedRelationalWrite, source: schema_registry.SchemaView) !usize {
+        if (prepared.schema_version != source.version()) return error.RelationalRowSchemaMismatch;
+        if (self.historical_projection) |*projection| {
+            if (projection.source.epoch != source.epoch) {
+                projection.deinit();
+                self.historical_projection = null;
+            }
+        }
+        if (self.historical_projection == null)
+            self.historical_projection = try HistoricalProjection.init(self.alloc, self.view, source);
+        const projection = &self.historical_projection.?;
+        const row = try prepared.typedView(source.tableSchema().*, source.physicalLayout());
+        const next_count = try std.math.add(usize, self.row_count, 1);
+        const bytes_start = self.bytes.items.len;
+        const entries_start = self.entries.items.len;
+        errdefer {
+            self.bytes.shrinkRetainingCapacity(bytes_start);
+            self.entries.shrinkRetainingCapacity(entries_start);
+        }
+        try self.entries.ensureUnusedCapacity(self.alloc, self.view.boundIndexes().len);
+        for (self.view.boundIndexes(), projection.indexes) |index, projected| {
+            const start = self.bytes.items.len;
+            if (projected.predicate) |predicate| {
+                if (!try predicate.matches(self.alloc, &self.predicate_scratch, row)) {
+                    self.entries.appendAssumeCapacity(.{ .start = start, .end = start, .payload_end = start, .has_null = false, .member = false });
+                    continue;
+                }
+            }
+            const has_null = try projected.tuple.?.append(self.alloc, &self.bytes, row);
+            const end = self.bytes.items.len;
+            if (index.cover) |cover| {
+                try cover.appendSource(self.alloc, &self.bytes, row, &projected.cover.?);
+            }
+            self.entries.appendAssumeCapacity(.{ .start = start, .end = end, .payload_end = self.bytes.items.len, .has_null = has_null });
+        }
+        const result = self.row_count;
+        self.row_count = next_count;
+        return result;
     }
 
     /// Used for old rows/rebuilds after the caller obtains a validated row view.
@@ -316,6 +404,45 @@ test "relational index plan retains epoch and definitions through prepared batch
     try std.testing.expectEqualStrings("by_id", batch.view.boundIndexes()[0].name);
     try std.testing.expectEqual(@as(usize, 9), (try batch.key(0, 0)).bytes.len);
     try std.testing.expect(!(try batch.key(0, 0)).has_null);
+}
+
+test "relational index plan projects a current index onto a committed historical row" {
+    const alloc = std.testing.allocator;
+    const old_schema = schema.TableSchema{
+        .version = 6,
+        .storage_mode = .relational,
+        .relational_columns = &.{.{ .name = "id", .path = "id", .column_type = .integer }},
+    };
+    var old_registry = try schema_registry.Registry.initCloned(alloc, std.testing.io, old_schema);
+    defer old_registry.deinit();
+    var old_view = old_registry.acquire().?;
+    defer old_view.release();
+    var current_registry = try schema_registry.Registry.initCloned(alloc, std.testing.io, test_schema);
+    defer current_registry.deinit();
+    var current_view = current_registry.acquire().?;
+    defer current_view.release();
+    var plan = try View.init(alloc, current_view, &.{.{ .name = "by_id", .generation = 1, .keys = &.{.{ .column = "id" }} }});
+    defer plan.release();
+    var historical_keys = Batch.init(alloc, plan);
+    defer historical_keys.deinit();
+    var historical_row = try mapper.PreparedRelationalWrite.init(alloc, "row", "{\"id\":42}", null, old_view.tableSchema().*, old_view.physicalLayout());
+    defer historical_row.deinit(alloc);
+    const historical_position = try historical_keys.appendPreparedFromSchema(&historical_row, old_view);
+    const projection = historical_keys.historical_projection.?.indexes.ptr;
+    var next_historical_row = try mapper.PreparedRelationalWrite.init(alloc, "row", "{\"id\":43}", null, old_view.tableSchema().*, old_view.physicalLayout());
+    defer next_historical_row.deinit(alloc);
+    const next_historical_position = try historical_keys.appendPreparedFromSchema(&next_historical_row, old_view);
+    try std.testing.expectEqual(projection, historical_keys.historical_projection.?.indexes.ptr);
+    var current_keys = Batch.init(alloc, plan);
+    defer current_keys.deinit();
+    var current_row = try mapper.PreparedRelationalWrite.init(alloc, "row", "{\"id\":42}", null, current_view.tableSchema().*, current_view.physicalLayout());
+    defer current_row.deinit(alloc);
+    const current_position = try current_keys.appendPrepared(&current_row);
+    try std.testing.expectEqualSlices(u8, (try current_keys.key(current_position, 0)).bytes, (try historical_keys.key(historical_position, 0)).bytes);
+    var next_current_row = try mapper.PreparedRelationalWrite.init(alloc, "row", "{\"id\":43}", null, current_view.tableSchema().*, current_view.physicalLayout());
+    defer next_current_row.deinit(alloc);
+    const next_current_position = try current_keys.appendPrepared(&next_current_row);
+    try std.testing.expectEqualSlices(u8, (try current_keys.key(next_current_position, 0)).bytes, (try historical_keys.key(next_historical_position, 0)).bytes);
 }
 
 test "relational index plan identity binds generation and canonical index order" {

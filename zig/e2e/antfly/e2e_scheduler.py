@@ -558,6 +558,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
     def __init__(self, config: pytest.Config, log: Producer | None = None):
         super().__init__(config, log)
         self.process_slots = int(config.getoption("e2e_process_slots"))
+        self.process_workers = config.getoption("e2e_process_workers")
         self.duration_history = DurationHistory(
             Path(config.getoption("e2e_duration_file"))
         )
@@ -673,6 +674,18 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             self._worker_reserved_process_slots(node) for node in self.assigned_work
         )
 
+    def _process_worker_fits(self, node: WorkerController, scope: str) -> bool:
+        if not self._scope_uses_process(scope):
+            return True
+        limit = getattr(self, "process_workers", None)
+        if limit is None:
+            return True
+        owners = sum(
+            bool(self._worker_reserved_process_slots(candidate))
+            for candidate in self.assigned_work
+        )
+        return bool(self._worker_reserved_process_slots(node)) or owners < limit
+
     def _additional_process_slots(self, node: WorkerController, scope: str) -> int:
         persistent_processes = self._scope_persistent_processes(scope)
         additional = len(
@@ -736,6 +749,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             and reserved_process_slots
             + self._additional_process_slots(candidate, scope)
             <= self.process_slots
+            and self._process_worker_fits(candidate, scope)
             for candidate in self.nodes
         )
 
@@ -845,6 +859,16 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             for scope in queued_scopes
         ):
             return False
+        if getattr(self, "process_workers", None) == 1 and any(
+            self._scope_uses_process(scope)
+            and self._reserved_process_slots()
+            + self._additional_process_slots(node, scope)
+            <= self.process_slots
+            for scope in queued_scopes
+        ):
+            # Reuse the sole process worker when another group can fit beside
+            # its session fixture; rotating it would throw away warm state.
+            return False
         # Waiting for global deadlock leaves an unused session process holding
         # a slot while a different worker drains all transient tests serially.
         # Rotate the exhausted owner even when another worker is making progress.
@@ -943,6 +967,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             for scope, work_unit in self.workqueue.items()
             if any(not complete for complete in work_unit.values())
             and not self._defer_new_persistent_process(node, scope)
+            and self._process_worker_fits(node, scope)
             and (
                 reserved_process_slots + self._additional_process_slots(node, scope)
                 <= self.process_slots
@@ -1131,6 +1156,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Maximum concurrently scheduled Antfly process or cluster work units.",
     )
     group.addoption(
+        "--e2e-process-workers",
+        type=int,
+        default=os.environ.get("ANTFLY_E2E_PROCESS_WORKERS"),
+        help="Maximum workers with an active Antfly process or cluster workload.",
+    )
+    group.addoption(
         "--e2e-duration-file",
         default=os.environ.get(
             "ANTFLY_E2E_DURATION_FILE",
@@ -1145,6 +1176,9 @@ def pytest_configure(config: pytest.Config) -> None:
     slots = int(config.getoption("e2e_process_slots"))
     if slots < 1:
         raise pytest.UsageError("--e2e-process-slots must be a positive integer")
+    process_workers = config.getoption("e2e_process_workers", None)
+    if process_workers is not None and int(process_workers) < 1:
+        raise pytest.UsageError("--e2e-process-workers must be a positive integer")
     dist = config.getoption("dist", "no")
     if dist not in {"no", "loadgroup"} and config.getoption("tx", ()):
         raise pytest.UsageError(
