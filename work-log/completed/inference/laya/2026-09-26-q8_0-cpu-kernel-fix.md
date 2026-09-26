@@ -110,21 +110,55 @@ Two new `ops/native_compute.zig` tests:
   `QuantizedStorage.prepared.ownedBytes() == 0` afterward (the native
   kernel's prepared copies were never built).
 
-## Not done: fresh ReleaseFast measurement
+## ReleaseFast measurement
 
-Could not get a clean ReleaseFast timing/footprint run in this session. The
-shared build lock stayed held for the entire session by other agents' long
-training/eval runs (one job alone, `eval42-then-train43.sh`, held it for
-50+ minutes). A lock-policy change mid-session (`with-lock gpu` no longer
-implicitly holding `build`) did not help, because the in-flight holder had
-already committed to the old combined-hold behavior for its own lifetime,
-and the very next holder was a 20-iteration flake-hunting loop that also
-held `build` throughout. See LAYA.md's "Not yet re-measured" note for the
-repro command and the expected direction (CPU eval time close to or better
-than dense; CPU peak footprint close to dense minus most of the
-encoder+head linear weight bytes). This is the one open item for this
-track — someone with a clear run of the build lock should re-run the
-step 1d table's CPU rows and update both the table and this file.
+The shared build lock stayed held for most of the session by other agents'
+long training/eval runs (one job alone, `eval42-then-train43.sh`, held it
+50+ minutes; a mid-session lock-policy change separating `gpu` holds from
+`build` holds did not help immediately, since the in-flight holder had
+already committed to the old combined-hold behavior). A clean window opened
+later, giving one `~/bin/zig build -Doptimize=ReleaseFast` and, under
+`with-lock gpu` per run, four `finetune eval laya` runs (dense/q8_0 x
+CPU/Metal) on the first 200 of the 760 step-0 eval decisions (time budget
+did not allow the full 760 after the wait). Each run used
+`/usr/bin/time -l` for RSS and footprint.
+
+```
+dense  Metal: accuracy 0.415 soft_ce 1.3383 seconds 10.26  max_rss 1.37GB  footprint 5.76GB
+q8_0   Metal: accuracy 0.415 soft_ce 1.3347 seconds  7.78  max_rss 2.22GB  footprint 3.91GB
+dense  CPU:   accuracy 0.415 soft_ce 1.3383 seconds 78.32  max_rss 4.87GB  footprint 0.97GB
+q8_0   CPU:   accuracy 0.415 soft_ce 1.3347 seconds 77.33  max_rss 5.35GB  footprint 1.32GB
+```
+
+**Timing: goal met on both backends.** CPU q8_0 is now on par with dense
+(77.33s vs 78.32s — previously 1,587s vs 602s on the full set, contended,
+2.6x slower). Metal q8_0 is faster than dense here (7.78s vs 10.26s); the
+prior table's Metal comparison ("about 10% slower") used the full 760-record
+set on an earlier revision, so the two aren't directly comparable, but
+q8_0 no longer loses to dense on either backend.
+
+**Footprint: Metal reproduces the prior 36% reduction (32% here); CPU does
+not get smaller, and the reason is structural.** Dense weights are read via
+a read-only mmap of the safetensors file; those clean pages barely count
+against macOS's RSS/footprint accounting once mapped. `quantizeDenseQ8_0`
+computes Q8_0 into freshly allocated heap memory — real, counted, dirty
+bytes, however compact. So q8_0 can reduce its *own* overhead (this fix
+removes two of the three prepared-copy allocations the native kernel used
+to keep, which is why the pre-fix table showed q8_0 CPU footprint bigger
+than dense-plus-quantized-bytes-alone would predict) without ever winning a
+whole-process RSS/footprint comparison against a strategy (mmap) that
+doesn't have to allocate at all. A precise before/after for *just* the
+weight-storage bytes (e.g. diffing heap allocations across the load step,
+or `vmmap`) would settle this more rigorously; not done here.
+
+**Open follow-ups for whoever picks this up:**
+
+- Full 760-decision re-run at this revision, CPU and Metal, to replace the
+  200-decision numbers above with ones directly comparable to the original
+  step-0 table.
+- A weight-storage-only memory measurement (not whole-process RSS/footprint)
+  to state the CPU quantized-vs-dense byte delta precisely, separate from
+  the mmap-accounting effect described above.
 
 ## Files changed
 

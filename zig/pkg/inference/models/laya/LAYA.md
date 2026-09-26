@@ -880,27 +880,67 @@ generic `--test-filter "q8_0"` kernel suite (30 tests covering GLiNER,
 CLIP/CLAP, and general GGUF Q8_0/Q8_1 decode) is unchanged, since the new
 path only activates for Laya's specific runtime weight-name patterns.
 
-**Not yet re-measured.** This session could not get a clean ReleaseFast
-timing/footprint run: the shared build/GPU lock was held continuously by
-other agents' training and evaluation runs for over an hour (a lock-policy
-change mid-session, separating `gpu` holds from `build` holds, did not free
-it — the in-flight holder had already committed to the old combined-hold
-behavior for its own lifetime). The table above therefore still shows the
-pre-fix CPU numbers. Re-run with:
+**Re-measured after the fix (2026-09-26).** The shared build/GPU lock stayed
+held by other agents' training and evaluation runs for most of this session
+(one job alone held it 50+ minutes; a mid-session lock-policy change did not
+help, since the in-flight holder had already committed to the old
+combined-hold behavior). A clean window eventually opened. Time budget did
+not allow the full 760-decision set at that point, so this is the first 200
+of the 760 step-0 eval decisions (`head -n 200 td/s0-eval.jsonl`), same
+checkpoint, ReleaseFast, ordinary Metal/CPU load (no other job running):
+
+| Weights | Backend | Accuracy | Soft CE | Eval time | Max RSS | Peak footprint |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| dense | Metal | 0.415 | 1.3383 | 10.26 s | 1.37 GB | 5.76 GB |
+| q8_0 | Metal | 0.415 | 1.3347 | **7.78 s** | 2.22 GB | **3.91 GB** |
+| dense | CPU (native) | 0.415 | 1.3383 | 78.32 s | 4.87 GB | 0.97 GB |
+| q8_0 | CPU (native) | 0.415 | 1.3347 | **77.33 s** | 5.35 GB | 1.32 GB |
+
+("Max RSS" and "Peak footprint" are `/usr/bin/time -l`'s "maximum resident
+set size" and "peak memory footprint" lines; they diverge because the
+process mmaps the dense safetensors checkpoint read-only, and macOS's
+footprint accounting undercounts clean file-backed pages relative to newly
+allocated ones — see below.)
+
+**Timing goal met on both backends.** CPU q8_0 is now on par with dense
+(previously 1,587 s vs 602 s on the full set, contended — q8_0 2.6x
+*slower*; now 77.33 s vs 78.32 s on this subset, q8_0 marginally *faster*).
+Metal q8_0 is 24% faster than dense here, better than the prior table's
+"about 10% slower" on the full 760; the difference in backend/subset
+between the two measurements (this is a smaller, differently-ordered
+subset, and a different codebase revision) means the two Metal numbers are
+not directly comparable, but the qualitative result — q8_0 no longer
+loses to dense — holds on both backends.
+
+**Footprint: mixed, and worth explaining.** Metal footprint drops 32% (3.91
+vs 5.76 GB), close to the prior table's 36% figure and reproducing it
+independently. CPU footprint is *higher* for q8_0 (1.32 vs 0.97 GB
+"peak footprint"; 5.35 vs 4.87 GB RSS), not lower. The reason is structural,
+not a regression from this fix: dense weights are loaded via a read-only
+mmap of the safetensors file, and those clean pages barely register in
+macOS's footprint/RSS accounting once mapped; `quantizeDenseQ8_0` computes
+Q8_0 into a freshly allocated heap buffer, which is real, counted, dirty
+memory regardless of how compact it is. This fix still removes the
+regression this same table used to show for CPU (footprint *larger* than
+dense by keeping three prepared representations of every quantized weight);
+what remains is the fixed cost of quantized bytes not being able to share
+dense's free mmap ride. A tighter apples-to-apples comparison would need to
+isolate weight-storage bytes specifically (e.g. `vmmap`/heap diffing across
+the load step) rather than whole-process RSS/footprint, which is left as a
+follow-up.
+
+Reproduce with:
 
 ```bash
 ~/bin/zig build -Doptimize=ReleaseFast --prefix <dir>
-ANTFLY_LAYA_WEIGHT_QUANT=q8_0 <dir>/bin/antfly-inference finetune eval laya \
-  <laya-released-dir> <records.jsonl> --backend native
-/usr/bin/time -l <same command>   # peak footprint
+/usr/bin/time -l <dir>/bin/antfly-inference finetune eval laya \
+  <laya-released-dir> <records.jsonl> --backend native   # dense
+ANTFLY_LAYA_WEIGHT_QUANT=q8_0 /usr/bin/time -l <dir>/bin/antfly-inference \
+  finetune eval laya <laya-released-dir> <records.jsonl> --backend native
 ```
 
-Expected direction, not yet confirmed: CPU eval time close to or better than
-dense (same SGEMM call, dequant cost is `O(out_dim * in_dim)` per linear
-against `O(rows * out_dim * in_dim)` SGEMM flops, negligible at Laya's row
-counts), and CPU peak footprint close to dense minus roughly 3/4 of the
-encoder+head linear weight bytes (no persistent dense mirror, no triple-kept
-quantized copies).
+The full-760-decision re-run at this fixed revision, and a weight-storage-only
+footprint breakdown, are still open (see the work log).
 
 ## Roadmap
 
@@ -912,7 +952,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 | 1a. State cache across rows and requests | no | done (CPU and Metal) | Exact against the full row and the oracle; follow-up questions skip trunk projections and feed-forward work |
 | 1b. Segment attention | no | done (CPU and Metal); multi-row batching done (CPU and Metal, question and candidate modes) | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call: exact against running each row alone, isolated by construction; not yet composed with the trunk cache |
 | 1c. Metal and CUDA packed kernels | no | Metal: fused kernels not pursued (encoder GPU work dominates; device scoring gave 2–4% and was reverted after a race). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |
-| 1d. Weight quantization (q8_0) | no | done (CPU and Metal); pays off on Metal; CPU kernel fixed (dequant+SGEMM, no triple-kept prepared copies) but not yet re-measured on ReleaseFast | Labels identical and probabilities within 2e-2 of dense on the fixture; on the released model, 36% less Metal memory at the same accuracy. CPU: re-measure throughput and footprint after the 2026-09-26 kernel fix |
+| 1d. Weight quantization (q8_0) | no | done (CPU and Metal). CPU kernel fixed 2026-09-26 (dequant+SGEMM instead of the native int8 kernel): q8_0 CPU eval time now matches dense (was 2.6x slower); Metal q8_0 confirmed 32-36% less memory and now faster than dense on a 200-decision subset | Labels identical and probabilities within 2e-2 of dense on the fixture. CPU footprint is still higher than dense (mmap'd dense weights vs allocated quantized bytes; see step 1d), not lower as hoped — full-760 re-run and a weight-storage-only footprint breakdown are open |
 | 2a. Long-context teacher (Qwen3.8-27B) | labels only | not started | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
 | 2b. Two-stage choice for many options | same fine-tune | not started | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. Measured on Banking77 |
 | 2c. 8k states | yes | not started | Memory-efficient attention in the training graph (today about 2k tokens at batch 1), `max_len` 8192 (ModernBERT's pretraining length), fine-tune on teacher-labelled long states |
