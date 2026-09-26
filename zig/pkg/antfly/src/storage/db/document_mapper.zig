@@ -2577,7 +2577,35 @@ fn extractTextFieldsFromValue(
     return try extractSchemaLessTextAndTypedFields(alloc, root.object, text_analysis);
 }
 
-fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
+/// Analyzer provenance for one value emitted into the text index. Highlight
+/// from these contributions instead of guessing analysis from a source name.
+pub const HighlightTextField = struct {
+    indexed_field: []const u8,
+    source_field: []const u8,
+    text: []const u8,
+    analyzer: *const analysis_mod.Analyzer,
+};
+
+pub fn highlightTextFieldsFromValue(
+    alloc: Allocator,
+    root: std.json.Value,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    schema: ?runtime_schema.TableSchema,
+) ![]const HighlightTextField {
+    const extracted = try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null);
+    var fields = std.ArrayListUnmanaged(HighlightTextField).empty;
+    for (extracted.fields) |field| {
+        try fields.append(alloc, .{
+            .indexed_field = field.field_name,
+            .source_field = field.source_field orelse field.field_name,
+            .text = field.text,
+            .analyzer = introducer_mod.effectiveTextFieldAnalyzer(field, text_analysis),
+        });
+    }
+    return try fields.toOwnedSlice(alloc);
+}
+
+pub fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
     if (schema.exact_fields.len > 0) return true;
     if (schema.dynamic_templates.len > 0) return true;
     for (schema.full_text_documents) |doc| {
@@ -2608,12 +2636,14 @@ fn appendSchemaTextFields(
         for (values.items) |text| {
             try fields.append(alloc, .{
                 .field_name = field.emitted_name,
+                .source_field = field.path,
                 .text = text,
                 .analyzer = analyzer,
             });
             if (field.include_in_all) {
                 try fields.append(alloc, .{
                     .field_name = "_all",
+                    .source_field = field.path,
                     .text = text,
                     .analyzer = analyzer,
                 });
@@ -3016,7 +3046,7 @@ fn appendMappedSubfieldTextFields(
         };
         const mapping = field.mapping;
         if (!isTextFieldType(mapping.field_type)) continue;
-        try appendMappedTextField(alloc, fields, subfield_path, text, mapping, text_analysis);
+        if (mapping.do_index) try appendNamedTextField(alloc, fields, subfield_path, path, text, mapping.analyzer, mapping.include_in_all, text_analysis);
         if (observed_field_analyzers) |collector| {
             try appendObservedFieldAnalyzer(alloc, collector, subfield_path, mapping);
         }
@@ -3119,7 +3149,7 @@ fn appendMappedGeoPointTextField(
     const precision = geo_mod.index_geohash_precision;
     const geohash = geo_mod.encode(.{ .lat = point.lat, .lon = point.lon }, precision);
     const term = try alloc.dupe(u8, geohash[0..precision]);
-    try appendNamedTextField(alloc, fields, path, term, "keyword", false, text_analysis);
+    try appendNamedTextField(alloc, fields, path, path, term, "keyword", false, text_analysis);
 }
 
 fn appendMappedTextField(
@@ -3133,7 +3163,7 @@ fn appendMappedTextField(
     if (!mapping.do_index) return;
 
     switch (mapping.field_type) {
-        .text, .html, .keyword, .link, .search_as_you_type => try appendNamedTextField(alloc, fields, path, text, mapping.analyzer, mapping.include_in_all, text_analysis),
+        .text, .html, .keyword, .link, .search_as_you_type, .substring => try appendNamedTextField(alloc, fields, path, path, text, mapping.analyzer, mapping.include_in_all, text_analysis),
         else => {},
     }
 }
@@ -3156,6 +3186,7 @@ fn appendDynamicRuleTextField(
             alloc,
             fields,
             field_name,
+            path,
             text,
             variant.analyzer,
             variant.include_in_all,
@@ -3168,20 +3199,25 @@ fn appendNamedTextField(
     alloc: Allocator,
     fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
     field_name: []const u8,
+    source_field: []const u8,
     text: []const u8,
     analyzer_name: []const u8,
     include_in_all: bool,
     text_analysis: introducer_mod.TextAnalysisConfig,
 ) !void {
     const analyzer = introducer_mod.resolveAnalyzerName(analyzer_name, text_analysis);
+    const owned_name = try alloc.dupe(u8, field_name);
+    const owned_source = if (std.mem.eql(u8, field_name, source_field)) owned_name else try alloc.dupe(u8, source_field);
     try fields.append(alloc, .{
-        .field_name = try alloc.dupe(u8, field_name),
+        .field_name = owned_name,
+        .source_field = owned_source,
         .text = text,
         .analyzer = analyzer,
     });
     if (include_in_all) {
         try fields.append(alloc, .{
             .field_name = "_all",
+            .source_field = owned_source,
             .text = text,
             .analyzer = analyzer,
         });
@@ -3198,7 +3234,7 @@ fn appendDynamicSchemaLessStringTextFields(
 ) !void {
     // Unmapped dynamic strings have the same cross-field search default as
     // schemaless strings. Explicit mappings are handled before this fallback.
-    try appendNamedTextField(alloc, fields, path, text, "standard", true, text_analysis);
+    try appendNamedTextField(alloc, fields, path, path, text, "standard", true, text_analysis);
     if (observed_field_analyzers) |collector| {
         try appendObservedFieldAnalyzer(alloc, collector, path, .{
             .field_type = .text,
@@ -3213,7 +3249,7 @@ fn appendDynamicSchemaLessStringTextFields(
 
     const exact_field = try schemaLessExactFieldNameAlloc(alloc, path);
     defer alloc.free(exact_field);
-    try appendNamedTextField(alloc, fields, exact_field, text, "keyword", false, text_analysis);
+    try appendNamedTextField(alloc, fields, exact_field, path, text, "keyword", false, text_analysis);
     if (observed_field_analyzers) |collector| {
         try appendObservedFieldAnalyzer(alloc, collector, exact_field, .{
             .field_type = .keyword,
@@ -3524,18 +3560,22 @@ fn appendSchemaLessStringTextFields(
     path: []const u8,
     text: []const u8,
 ) !void {
+    const owned_path = try alloc.dupe(u8, path);
     try fields.append(alloc, .{
-        .field_name = try alloc.dupe(u8, path),
+        .field_name = owned_path,
+        .source_field = owned_path,
         .text = text,
     });
     try fields.append(alloc, .{
         .field_name = "_all",
+        .source_field = owned_path,
         .text = text,
     });
     if (text.len > schema_less_exact_max_bytes or std.mem.endsWith(u8, path, schema_less_exact_field_suffix)) return;
     const exact_field = try schemaLessExactFieldNameAlloc(alloc, path);
     try fields.append(alloc, .{
         .field_name = exact_field,
+        .source_field = owned_path,
         .text = text,
         .analyzer = &analysis_mod.keyword_analyzer,
     });
@@ -3595,7 +3635,7 @@ fn collectFieldValues(
 
 fn isTextFieldType(field_type: runtime_schema.AntflyType) bool {
     return switch (field_type) {
-        .text, .html, .keyword, .link, .search_as_you_type => true,
+        .text, .html, .keyword, .link, .search_as_you_type, .substring => true,
         else => false,
     };
 }
@@ -5287,6 +5327,46 @@ test "document mapper emits schema geo point typed doc values" {
     , .{});
     defer invalid_lon.deinit();
     try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, invalid_lon.value)) == null);
+}
+
+test "document mapper indexes substring companions under every suffix" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const schema: runtime_schema.TableSchema = .{
+        .version = 0,
+        .default_type = "product",
+        .ttl_field = "_timestamp",
+        .full_text_documents = &.{
+            .{
+                .name = "product",
+                .fields = &.{
+                    .{ .path = "name", .emitted_name = "name", .analyzer = "standard" },
+                    .{ .path = "name", .emitted_name = "name._substring", .analyzer = "substring" },
+                },
+            },
+        },
+    };
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"name\":\"Rag3-Weaver Kit\"}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    const root = (try reader.invertedIndex("name")) orelse return error.TestExpectedEqual;
+    try std.testing.expect(root.lookup("rag3") != null);
+    try std.testing.expect(root.lookup("g3weaver") == null);
+
+    const companion = (try reader.invertedIndex("name._substring")) orelse return error.TestExpectedEqual;
+    // Whole tokens, inner suffixes, and suffixes of the joined adjacent pair.
+    try std.testing.expect(companion.lookup("rag3") != null);
+    try std.testing.expect(companion.lookup("ag3") != null);
+    try std.testing.expect(companion.lookup("g3weaver") != null);
+    try std.testing.expect(companion.lookup("weaverkit") != null);
+    try std.testing.expect(companion.lookup("g3weaverkit") == null);
+    try std.testing.expect(companion.lookup("t") == null);
 }
 
 test "document mapper emits Go-style dynamic-template search_as_you_type field" {

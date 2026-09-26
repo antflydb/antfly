@@ -583,7 +583,8 @@ pub fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_sch
             std.mem.eql(u8, field_type, "string") or
             std.mem.eql(u8, field_type, "text") or
             std.mem.eql(u8, field_type, "html") or
-            std.mem.eql(u8, field_type, "search_as_you_type")) return .string;
+            std.mem.eql(u8, field_type, "search_as_you_type") or
+            std.mem.eql(u8, field_type, "substring")) return .string;
         if (std.mem.eql(u8, field_type, "blob")) return .blob;
         if (std.mem.eql(u8, field_type, "boolean")) return .boolean;
         if (std.mem.eql(u8, field_type, "datetime")) return .datetime;
@@ -968,7 +969,7 @@ fn appendShorthandRuntimeDeclaredFields(
     antfly_types: []const []const u8,
 ) !void {
     const has_primary = containsString(antfly_types, "text") or containsString(antfly_types, "html");
-    const has_search_as_you_type = containsString(antfly_types, "search_as_you_type");
+    const has_search_as_you_type = containsString(antfly_types, "search_as_you_type") or containsString(antfly_types, "substring");
 
     for (antfly_types) |type_name| {
         const field_type = parseRuntimeFieldType(type_name);
@@ -1139,6 +1140,7 @@ fn defaultDynamicTemplateAnalyzer(field_type: storage_schema.AntflyType) []const
         .html => "html",
         .keyword, .link => "keyword",
         .search_as_you_type => "search_as_you_type",
+        .substring => "substring",
         else => "standard",
     };
 }
@@ -1447,23 +1449,34 @@ fn deriveRuntimeFullTextLeaf(
     const has_primary = has_text or has_html;
     const has_keyword = containsString(types, "keyword") or containsString(types, "link");
     const has_search_as_you_type = containsString(types, "search_as_you_type");
+    const has_substring = containsString(types, "substring");
+    // Companion types always sit next to an analyzed root field.
+    const has_companion = has_search_as_you_type or has_substring;
 
     if (has_text and has_html) return;
 
-    if (has_text or (!has_primary and has_search_as_you_type)) {
+    if (has_text or (!has_primary and has_companion)) {
         try appendFullTextField(alloc, fields, path, path, primary_analyzer, should_include_in_all);
     } else if (has_html) {
         try appendFullTextField(alloc, fields, path, path, effectiveAntflyAnalyzer(property, item) orelse "html", should_include_in_all);
     }
 
     if (has_keyword) {
-        const emitted_name = if (has_primary or has_search_as_you_type)
+        const emitted_name = if (has_primary or has_companion)
             try std.fmt.allocPrint(alloc, "{s}.keyword", .{path})
         else
             try alloc.dupe(u8, path);
         defer alloc.free(emitted_name);
-        const include = should_include_in_all and !has_primary and !has_search_as_you_type;
+        const include = should_include_in_all and !has_primary and !has_companion;
         try appendFullTextField(alloc, fields, path, emitted_name, "keyword", include);
+    }
+
+    if (has_substring) {
+        // Suffix-indexed companion answering "contains" queries; see
+        // `analysis.substring_analyzer`.
+        const emitted_substring = try std.fmt.allocPrint(alloc, "{s}._substring", .{path});
+        defer alloc.free(emitted_substring);
+        try appendFullTextField(alloc, fields, path, emitted_substring, "substring", false);
     }
 
     if (has_search_as_you_type) {
@@ -1693,18 +1706,24 @@ fn appendDynamicLeafRule(
     const has_primary = has_text or has_html;
     const has_keyword = containsString(types, "keyword") or containsString(types, "link");
     const has_search_as_you_type = containsString(types, "search_as_you_type");
+    const has_substring = containsString(types, "substring");
+    const has_companion = has_search_as_you_type or has_substring;
 
     if (has_text and has_html) return;
 
-    if (has_text or (!has_primary and has_search_as_you_type)) {
+    if (has_text or (!has_primary and has_companion)) {
         try appendDynamicVariant(alloc, &variants, "", "standard", false);
     } else if (has_html) {
         try appendDynamicVariant(alloc, &variants, "", "html", false);
     }
 
     if (has_keyword) {
-        const suffix = if (has_primary or has_search_as_you_type) ".keyword" else "";
+        const suffix = if (has_primary or has_companion) ".keyword" else "";
         try appendDynamicVariant(alloc, &variants, suffix, "keyword", false);
+    }
+
+    if (has_substring) {
+        try appendDynamicVariant(alloc, &variants, "._substring", "substring", false);
     }
 
     if (has_search_as_you_type) {
@@ -1813,6 +1832,7 @@ fn inferAntflyType(field_type: []const u8) ?[]const []const u8 {
     if (std.mem.eql(u8, field_type, "keyword")) return &.{"keyword"};
     if (std.mem.eql(u8, field_type, "link")) return &.{"link"};
     if (std.mem.eql(u8, field_type, "search_as_you_type")) return &.{"search_as_you_type"};
+    if (std.mem.eql(u8, field_type, "substring")) return &.{"substring"};
     return null;
 }
 
@@ -1953,6 +1973,59 @@ test "runtime schema records declared and unindexed paths for the dynamic mapper
     try std.testing.expect(try storage_schema.schemasEqual(alloc, runtime, loaded));
     try std.testing.expectEqual(document.declared_paths.len, loaded.full_text_documents[0].declared_paths.len);
     try std.testing.expectEqual(document.unindexed_paths.len, loaded.full_text_documents[0].unindexed_paths.len);
+}
+
+test "runtime schema derives substring companions" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {"schema": {"type":"object", "properties": {
+        \\      "title": {"type":"string", "x-antfly-types":["text","substring"]},
+        \\      "sku": {"type":"string", "x-antfly-types":["substring","keyword"]},
+        \\      "meta": {"type":"object", "additionalProperties":{"type":"string", "x-antfly-types":["substring"]}},
+        \\      "code": {"type":"substring"},
+        \\      "part": {"type":"string", "x-antfly-field":{"type":"substring"}}
+        \\    }}}
+        \\  }
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+    const fields = runtime.full_text_documents[0].fields;
+
+    const title_root = findFullTextField(fields, "title") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("standard", title_root.analyzer);
+    const title_substring = findFullTextField(fields, "title._substring") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("substring", title_substring.analyzer);
+
+    // A lone substring type still gets an analyzed root, and keyword moves to
+    // its companion name exactly as it does next to search_as_you_type.
+    const sku_root = findFullTextField(fields, "sku") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("standard", sku_root.analyzer);
+    try std.testing.expect(findFullTextField(fields, "sku.keyword") != null);
+    try std.testing.expect(findFullTextField(fields, "sku._substring") != null);
+
+    // The bare schema spelling and the explicit mapping form both emit the
+    // analyzed root plus the companion.
+    try std.testing.expect(findFullTextField(fields, "code") != null);
+    try std.testing.expect(findFullTextField(fields, "code._substring") != null);
+    try std.testing.expect(findFullTextField(fields, "part") != null);
+    try std.testing.expect(findFullTextField(fields, "part._substring") != null);
+
+    var dynamic_substring = false;
+    for (runtime.full_text_documents[0].dynamic_rules) |rule| {
+        if (!std.mem.eql(u8, rule.parent_path, "meta")) continue;
+        for (rule.variants) |variant| {
+            if (std.mem.eql(u8, variant.suffix, "._substring")) {
+                try std.testing.expectEqualStrings("substring", variant.analyzer);
+                dynamic_substring = true;
+            }
+        }
+    }
+    try std.testing.expect(dynamic_substring);
 }
 
 test "runtime schema derives authoritative relational columns" {

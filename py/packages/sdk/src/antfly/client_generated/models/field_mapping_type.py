@@ -19,6 +19,7 @@ class FieldMappingType(StrEnum):
     NUMBER = "number"
     NUMERIC = "numeric"
     SEARCH_AS_YOU_TYPE = "search_as_you_type"
+    SUBSTRING = "substring"
     TEXT = "text"
     TIMESTAMP = "timestamp"
 

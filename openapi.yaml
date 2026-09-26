@@ -190,14 +190,19 @@ tags:
       - **With search-as-you-type**: `"x-antfly-types": ["text", "search_as_you_type"]` - Creates `fieldName`
       (text), `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix`
 
+      - **With substring**: `"x-antfly-types": ["text", "substring"]` - Creates `fieldName` (text) and
+      `fieldName._substring`, a suffix-indexed companion that answers "contains" queries without scanning
+      the term dictionary
+
 
       **Type Combination Rules**:
 
       - `text` and `html` are mutually exclusive (choose one as primary type)
 
-      - Primary types (`text`, `html`) can be combined with variants (`keyword`, `search_as_you_type`)
+      - Primary types (`text`, `html`) can be combined with variants (`keyword`, `search_as_you_type`,
+      `substring`)
 
-      - `search_as_you_type` + `keyword` allowed without primary type (auto-adds `text`)
+      - `search_as_you_type` or `substring` + `keyword` allowed without primary type (auto-adds `text`)
 
 
       `x-antfly-types` remains supported as the compact multi-mapping/search
@@ -313,8 +318,9 @@ tags:
 
       ```
 
-      Only text-based types (`text`, `html`, `keyword`, `search_as_you_type`, `link`) are included, and
-      only the primary field (not `.keyword`, `._2gram`, `._3gram`, or `._index_prefix` variants).
+      Only text-based types (`text`, `html`, `keyword`, `search_as_you_type`, `substring`, `link`) are
+      included, and only the primary field (not `.keyword`, `._2gram`, `._3gram`, `._index_prefix`, or
+      `._substring` variants).
 
 
       ## Antfly Types
@@ -331,6 +337,14 @@ tags:
 
       - `search_as_you_type` - Search-as-you-type mappings for autocomplete. Creates `fieldName._2gram`,
       `fieldName._3gram`, and `fieldName._index_prefix` mappings.
+
+      - `substring` - Infix ("contains") matching for identifiers, SKUs, paths, and code. Creates `fieldName._substring`,
+      which indexes every suffix (2 to 32 bytes) of each lowercased token and of each adjacent token pair
+      joined without a separator, so `rag3-weaver`, `rag3_weaver`, and `rag3weaver` all match a `match`
+      or `prefix` query for `g3we` on `fieldName._substring`. Queries are lowercased, adjacent query tokens
+      are joined the same way, and a query of three or more tokens requires every adjacent pair. Single-character
+      queries never match. Expect the companion to cost several times the size of the text it indexes;
+      opt in per field.
 
       - `link` - URL/link field (keyword analyzer).
 
@@ -393,6 +407,8 @@ tags:
       - **Keyword variant**: `fieldName.keyword`
 
       - **Search-as-you-type**: `fieldName._2gram`, `fieldName._3gram`, and `fieldName._index_prefix`
+
+      - **Substring**: `fieldName._substring`
 
 
       Example: `"x-antfly-types": ["text", "keyword", "search_as_you_type"]` creates:
@@ -15190,6 +15206,7 @@ components:
       type: string
       enum:
         - search_as_you_type
+        - substring
         - keyword
         - text
         - html
@@ -20526,6 +20543,8 @@ components:
                   - required:
                       - analyses
                   - required:
+                      - highlight
+                  - required:
                       - aggregations
                   - required:
                       - graph_queries
@@ -20886,6 +20905,9 @@ components:
             - created_at
         hierarchy:
           $ref: '#/components/schemas/QueryHierarchy'
+          x-go-type-skip-optional-pointer: false
+        highlight:
+          $ref: '#/components/schemas/QueryHighlight'
           x-go-type-skip-optional-pointer: false
         limit:
           type: integer
@@ -22352,6 +22374,100 @@ components:
 
             requests whose effective order is `_id` ascending.
           x-go-name: sort
+        _highlights:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/HighlightFragment'
+          description: >
+            Highlighted fragments keyed by source field, present when the request
+
+            set `highlight` and the stored document has the field. Highlights are
+
+            computed from the unprojected document, so a `fields` projection that
+
+            omits a highlighted field does not suppress its highlights. Each
+
+            fragment is a window of the stored field value with byte-offset spans
+
+            marking the text the full-text query matched.
+          x-go-name: highlights
+    QueryHighlight:
+      type: object
+      description: >
+        Ask for highlighted fragments of the stored fields matched by
+
+        `full_text_search` and by named full-text queries. Matches are located
+
+        by re-analyzing the stored value with the field's analyzer, so stemmed
+
+        and stop-word-filtered terms highlight the surface form. `prefix`,
+
+        `wildcard`, `regexp`, and `fuzzy` clauses mark whole tokens; `match`,
+
+        `match_phrase`, or `prefix` on a `substring` companion
+
+        (`field._substring`) marks the exact contained bytes, including
+
+        matches that span two adjacent words.
+      properties:
+        fields:
+          type: array
+          items:
+            type: string
+          description: >
+            Source fields to highlight. Defaults to every field the full-text
+
+            query references (companion suffixes such as `._substring` and
+
+            `.keyword` resolve to their root field).
+          example:
+            - title
+            - body
+        fragment_size:
+          type: integer
+          minimum: 16
+          maximum: 4096
+          default: 150
+          description: Fragment window size in bytes.
+        max_fragments:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 3
+          description: Maximum fragments returned per field.
+    HighlightFragment:
+      type: object
+      required:
+        - text
+        - offset
+        - spans
+      properties:
+        text:
+          type: string
+          description: The fragment of the stored field value.
+        offset:
+          type: integer
+          description: Byte offset of the fragment within the field value.
+        item:
+          type: integer
+          description: Array index for one array; flattened value ordinal for paths through multiple arrays.
+        spans:
+          type: array
+          items:
+            $ref: '#/components/schemas/HighlightSpan'
+    HighlightSpan:
+      type: object
+      required:
+        - start
+        - end
+      description: Half-open byte range within the fragment text.
+      properties:
+        start:
+          type: integer
+        end:
+          type: integer
     QueryHits:
       x-omitempty: false
       x-omitzero: false
@@ -24570,6 +24686,109 @@ components:
           minLength: 1
           description: Optional field selected from this artifact's records. When omitted, the index-level
             field is inherited; when both are omitted, Antfly indexes the default text projection.
+    TextAnalysisComponent:
+      type: object
+      required:
+        - type
+      description: 'One named analysis component: its type and type-specific configuration.'
+      properties:
+        type:
+          type: string
+        config:
+          type: object
+          additionalProperties: true
+    TextAnalysisConfig:
+      type: object
+      description: >
+        Custom text analysis for a full-text index. Component maps are keyed
+
+        by the name that analyzers and `field_analyzers` reference. Built-in
+
+        analyzers (`standard`, `simple`, `keyword`, `html`, `search_as_you_type`,
+
+        `substring`, and the language analyzers such as `german`) are always
+
+        available without declaring them.
+
+
+        Example: split camelCase identifiers and match them as substrings.
+
+
+        ```json
+
+        {
+          "analysis_config": {
+            "field_analyzers": {"symbol": "code"},
+            "token_filters": {
+              "tails": {"type": "suffix", "config": {"min": 3, "max": 24}}
+            },
+            "analyzers": {
+              "code": {
+                "type": "custom",
+                "config": {
+                  "tokenizer": "whitespace",
+                  "token_filters": ["camel_case", "unique", "tails"]
+                }
+              }
+            }
+          }
+        }
+
+        ```
+      properties:
+        field_analyzers:
+          type: object
+          additionalProperties:
+            type: string
+          description: Map of indexed field name to analyzer name. Overrides the analyzer derived from
+            the table schema for that field.
+        char_filters:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/TextAnalysisComponent'
+          description: 'Named character filters. Types: `html_strip` (alias `html`), `ascii_fold`, `zero_width_non_joiner`.'
+        tokenizers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/TextAnalysisComponent'
+          description: 'Named tokenizers. Types: `unicode` (alias `unicode_words`), `whitespace`, `keyword`,
+            `character`, `ngram` (`config.min`, `config.max`), `edge_ngram` (`config.min`, `config.max`,
+            `config.side` of `front` or `back`).'
+        token_filters:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/TextAnalysisComponent'
+          description: 'Named token filters. Types: `lowercase` (alias `to_lower`), `stop_words` (alias
+            `stop`; optional `config.language`), `stemmer` (optional `config.language`), `ngram` and `edge_ngram`
+            (`config.min`, `config.max`), `shingle` (`config.min`, `config.max`, `config.separator` of
+            `space` or `none`), `suffix` (`config.min`, `config.max`; emits every suffix of each token
+            so prefix queries answer containment), `length` (`config.min`, `config.max`), `truncate` (`config.length`),
+            `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`. Languages: english, german, french,
+            spanish, italian, portuguese, dutch, swedish, norwegian, danish, finnish.'
+        analyzers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/TextAnalysisComponent'
+          description: Named analyzers of type `custom`. `config.tokenizer` names a built-in or declared
+            tokenizer; `config.char_filters` and `config.token_filters` list built-in or declared component
+            names in application order. Configuration-free filters (`lowercase`, `stop_words`, `stemmer`,
+            `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`, `suffix`) can be listed by name
+            without declaring them.
+        default_datetime_parser:
+          type: string
+          description: Name of the date-time parser applied to datetime fields without a field-specific
+            parser.
+        field_date_time_parsers:
+          type: object
+          additionalProperties:
+            type: string
+          description: Map of field name to date-time parser name.
+        date_time_parsers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/TextAnalysisComponent'
+          description: Named date-time parsers. Type `sanitizedgo` accepts `config.layouts`, a list of
+            Go reference-time layouts tried in order.
     FullTextIndexConfig:
       type: object
       x-antfly-mutually-exclusive:
@@ -24607,6 +24826,8 @@ components:
           description: Single-source convenience form. Mutually exclusive with sources; normalized responses
             use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless
             deployments.
+        analysis_config:
+          $ref: '#/components/schemas/TextAnalysisConfig'
     IndexPublicationPolicy:
       type: string
       enum:
@@ -26264,6 +26485,7 @@ components:
         - blob
         - link
         - search_as_you_type
+        - substring
     DocumentSubfieldMapping:
       type: object
       additionalProperties: false
@@ -26723,6 +26945,8 @@ components:
           type: boolean
         field:
           type: string
+        analysis_config:
+          $ref: '#/components/schemas/TextAnalysisConfig'
     CreatedFullTextIndex:
       description: Normalized effective full-text index configuration returned after creation.
       allOf:
@@ -30522,6 +30746,18 @@ components:
         - term
     MatchQuery:
       type: object
+      description: >
+        Analyze the text with the field's analyzer and match any of the
+
+        resulting terms. On a `substring` companion field (`fieldName._substring`)
+
+        the text is lowercased and matched as a contained substring instead:
+
+        `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
+
+        Substring lookups require at least two bytes and reject a token or
+
+        adjacent token pair longer than 32 bytes.
       properties:
         match:
           type: string
@@ -30572,6 +30808,16 @@ components:
             - auto
     MatchPhraseQuery:
       type: object
+      description: >
+        Match a phrase using the field's analyzer. On a `substring` companion,
+
+        one or two words match contained text across token separators. Three
+
+        or more words are rejected because the suffix index cannot verify
+
+        their word boundaries; lookups over 32 bytes are also rejected.
+
+        Nonzero or automatic fuzziness is rejected on substring fields; use a standalone fuzzy query instead.
       properties:
         match_phrase:
           type: string
@@ -30637,6 +30883,12 @@ components:
         - term
     PrefixQuery:
       type: object
+      description: >
+        Match terms that start with the given bytes. On a `substring`
+
+        companion field the prefix is lowercased and matched as a contained
+
+        substring, exactly like `match` on that field.
       properties:
         prefix:
           type: string

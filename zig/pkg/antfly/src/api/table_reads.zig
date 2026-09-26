@@ -20058,6 +20058,47 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("page:1", result.hits[0].artifact_ref.?.unit_id.?);
         }
 
+        test "parseRemoteSearchResult preserves shard-computed highlights" {
+            const alloc = std.testing.allocator;
+            var result = try parseRemoteSearchResult(alloc,
+                \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[{"_id":"doc:1","_score":0.5,"_source":{"title":"Rag3-Weaver kit"},"_highlights":{"title":[{"text":"Rag3-Weaver kit","offset":0,"spans":[{"start":2,"end":7}]}],"tags":[{"text":"zulu wing","offset":0,"item":2,"spans":[{"start":0,"end":4}]}]}}],"max_score":0.5},"took":1,"status":200,"table":"docs"}]}
+            );
+            defer result.deinit();
+
+            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+            const highlights = result.hits[0].highlights;
+            try std.testing.expectEqual(@as(usize, 2), highlights.len);
+            try std.testing.expectEqualStrings("title", highlights[0].field);
+            try std.testing.expectEqual(@as(usize, 1), highlights[0].fragments.len);
+            try std.testing.expectEqualStrings("Rag3-Weaver kit", highlights[0].fragments[0].text);
+            try std.testing.expectEqual(@as(u32, 0), highlights[0].fragments[0].offset);
+            try std.testing.expectEqual(@as(?u32, null), highlights[0].fragments[0].item);
+            try std.testing.expectEqual(@as(u32, 2), highlights[0].fragments[0].spans[0].start);
+            try std.testing.expectEqual(@as(u32, 7), highlights[0].fragments[0].spans[0].end);
+            try std.testing.expectEqualStrings("tags", highlights[1].field);
+            try std.testing.expectEqual(@as(?u32, 2), highlights[1].fragments[0].item);
+
+            // Spans outside the fragment text are a malformed shard response.
+            try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
+                \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[{"_id":"doc:1","_score":0.5,"_highlights":{"title":[{"text":"abc","offset":0,"spans":[{"start":1,"end":9}]}]}}],"max_score":0.5},"took":1,"status":200,"table":"docs"}]}
+            ));
+        }
+
+        test "parseRemoteSearchResult cleans up highlights on every allocation failure" {
+            const Repro = struct {
+                fn run(alloc: std.mem.Allocator) !void {
+                    var result = try parseRemoteSearchResult(alloc,
+                        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[{"_id":"doc:1","_score":0.5,"_highlights":{"title":[{"text":"hello there","offset":0,"spans":[{"start":0,"end":5}]},{"text":"hello again","offset":20,"spans":[{"start":0,"end":5}]}],"tags":[{"text":"hello","offset":0,"item":2,"spans":[{"start":0,"end":5}]}]}}]},"took":1,"status":200,"table":"docs"}]}
+                    );
+                    defer result.deinit();
+                    try std.testing.expectEqual(@as(usize, 2), result.hits[0].highlights.len);
+                    try std.testing.expectEqualStrings("hello again", result.hits[0].highlights[0].fragments[1].text);
+                    try std.testing.expectEqual(@as(?u32, 2), result.hits[0].highlights[1].fragments[0].item);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, Repro.run, .{});
+        }
+
         test "parseRemoteSearchResult preserves grouped hierarchy matches" {
             const alloc = std.testing.allocator;
             var result = try parseRemoteSearchResult(alloc,
@@ -21705,6 +21746,39 @@ fn consumerTests() type {
         test "provisioned reads advertise owner-backed physical sort evidence" {
             var source: ProvisionedTableReadSource = undefined;
             try std.testing.expect(source.source().supportsObservedDynamicFieldCapabilitySets());
+        }
+
+        test "encode query request forwards highlight options to shards" {
+            const alloc = std.testing.allocator;
+            const fields = [_][]const u8{ "title", "body" };
+            const encoded = try encodeQueryRequest(alloc, .{
+                .full_text = .{ .match = .{ .field = "body", .text = "hello" } },
+                .highlight = .{ .fields = &fields, .fragment_size = 80, .max_fragments = 2 },
+            });
+            defer alloc.free(encoded);
+
+            var parsed = try parseJsonTestBody(std.json.Value, alloc, encoded);
+            defer parsed.deinit();
+            const highlight = parsed.value.object.get("highlight").?.object;
+            try std.testing.expectEqual(@as(usize, 2), highlight.get("fields").?.array.items.len);
+            try std.testing.expectEqualStrings("body", highlight.get("fields").?.array.items[1].string);
+            try std.testing.expectEqual(@as(i64, 80), highlight.get("fragment_size").?.integer);
+            try std.testing.expectEqual(@as(i64, 2), highlight.get("max_fragments").?.integer);
+
+            // The shard parses the forwarded option back into the same request shape.
+            var owned = try query_contract.parseQueryRequest(alloc, null, "docs", encoded);
+            defer owned.deinit(alloc);
+            const round_trip = owned.req.highlight orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(@as(usize, 2), round_trip.fields.len);
+            try std.testing.expectEqualStrings("title", round_trip.fields[0]);
+            try std.testing.expectEqual(@as(u32, 80), round_trip.fragment_size);
+            try std.testing.expectEqual(@as(u32, 2), round_trip.max_fragments);
+
+            const without = try encodeQueryRequest(alloc, .{
+                .full_text = .{ .match = .{ .field = "body", .text = "hello" } },
+            });
+            defer alloc.free(without);
+            try std.testing.expect(std.mem.indexOf(u8, without, "highlight") == null);
         }
 
         test "encode query request round-trips all public phrase geo and ip queries" {

@@ -18,7 +18,7 @@
 //!   - Character filters: transform raw text before tokenization (HTML strip, ASCII fold)
 //!   - Tokenizers: split text into tokens (unicode_words, whitespace, keyword, ngram, edge_ngram, character)
 //!   - Token filters: transform tokens (lowercase, stop words, Porter2 stemmer, ngram, edge_ngram,
-//!     shingle, length, truncate, unique, reverse, camel_case, elision, apostrophe)
+//!     shingle, suffix, length, truncate, unique, reverse, camel_case, elision, apostrophe)
 //!   - Analyzer: composes char filters + tokenizer + filter chain
 //!
 //! Default analyzer: unicode_words → lowercase → English stop words → Porter2 stemmer
@@ -38,7 +38,34 @@ pub const Token = struct {
     position: u32,
     start_byte: u32,
     end_byte: u32,
+    /// Borrowed scratch mapping used only during analyzeWithSourceOffsets.
+    /// Each analyzed byte records its range in the character-filtered input.
+    /// The analyzer clears this before returning owned tokens to its caller.
+    source_offsets: ?[]const SourceOffset = null,
+
+    const SourceOffset = struct { start: u32, end: u32 };
 };
+
+fn tokenSlice(tok: Token, start: usize, end: usize) Token {
+    var result = tok;
+    result.term = tok.term[start..end];
+    if (tok.source_offsets) |offsets| {
+        const selected = offsets[start..end];
+        result.source_offsets = selected;
+        if (selected.len > 0) {
+            result.start_byte = selected[0].start;
+            result.end_byte = selected[0].end;
+            for (selected[1..]) |offset| {
+                result.start_byte = @min(result.start_byte, offset.start);
+                result.end_byte = @max(result.end_byte, offset.end);
+            }
+        }
+    } else {
+        result.start_byte = tok.start_byte + @as(u32, @intCast(start));
+        result.end_byte = tok.start_byte + @as(u32, @intCast(end));
+    }
+    return result;
+}
 
 // ============================================================================
 // Character Filters
@@ -57,7 +84,153 @@ pub const CharFilter = enum {
             .zero_width_non_joiner => applyZwnj(alloc, text),
         };
     }
+
+    fn applyMapped(self: CharFilter, alloc: Allocator, input: MappedText) !MappedText {
+        const output = try self.apply(alloc, input.text);
+        errdefer alloc.free(output);
+        const starts = try alloc.alloc(u32, output.len);
+        errdefer alloc.free(starts);
+        const ends = try alloc.alloc(u32, output.len);
+        errdefer alloc.free(ends);
+        var mapping = OffsetWriter{ .input = input, .starts = starts, .ends = ends };
+        switch (self) {
+            .html_strip => try mapHtmlStripOffsets(alloc, &mapping, output),
+            .ascii_fold => try mapAsciiFoldOffsets(&mapping, output),
+            .zero_width_non_joiner => try mapZwnjOffsets(&mapping),
+        }
+        if (mapping.cursor != output.len) return error.InvalidData;
+        return .{ .text = output, .starts = starts, .ends = ends };
+    }
 };
+
+const MappedText = struct {
+    text: []u8,
+    starts: []u32,
+    ends: []u32,
+
+    fn identity(alloc: Allocator, text: []const u8) !MappedText {
+        const owned = try alloc.dupe(u8, text);
+        errdefer alloc.free(owned);
+        const starts = try alloc.alloc(u32, text.len);
+        errdefer alloc.free(starts);
+        const ends = try alloc.alloc(u32, text.len);
+        errdefer alloc.free(ends);
+        for (starts, ends, 0..) |*start, *end, i| {
+            start.* = @intCast(i);
+            end.* = @intCast(i + 1);
+        }
+        return .{ .text = owned, .starts = starts, .ends = ends };
+    }
+
+    fn deinit(self: MappedText, alloc: Allocator) void {
+        alloc.free(self.text);
+        alloc.free(self.starts);
+        alloc.free(self.ends);
+    }
+};
+
+const OffsetWriter = struct {
+    input: MappedText,
+    starts: []u32,
+    ends: []u32,
+    cursor: usize = 0,
+
+    fn copy(self: *OffsetWriter, start: usize, end: usize) !void {
+        if (start > end or end > self.input.text.len or self.cursor > self.starts.len or end - start > self.starts.len - self.cursor) return error.InvalidData;
+        for (start..end) |i| {
+            self.starts[self.cursor] = self.input.starts[i];
+            self.ends[self.cursor] = self.input.ends[i];
+            self.cursor += 1;
+        }
+    }
+
+    fn replace(self: *OffsetWriter, start: usize, end: usize, output_len: usize) !void {
+        if (start >= end or end > self.input.text.len or self.cursor > self.starts.len or output_len > self.starts.len - self.cursor) return error.InvalidData;
+        for (0..output_len) |_| {
+            self.starts[self.cursor] = self.input.starts[start];
+            self.ends[self.cursor] = self.input.ends[end - 1];
+            self.cursor += 1;
+        }
+    }
+};
+
+fn mapHtmlStripOffsets(alloc: Allocator, mapping: *OffsetWriter, output: []const u8) !void {
+    const text = mapping.input.text;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '<') {
+            const start = i;
+            i += 1;
+            while (i < text.len and text[i] != '>') : (i += 1) {}
+            if (i < text.len) i += 1;
+            if (mapping.cursor > 0 and output[mapping.cursor - 1] != ' ') try mapping.replace(start, i, 1);
+        } else if (text[i] == '&') {
+            const start = i;
+            i += 1;
+            if (i < text.len and text[i] == '#') {
+                i += 1;
+                const hex = i < text.len and (text[i] == 'x' or text[i] == 'X');
+                if (hex) i += 1;
+                while (i < text.len and text[i] != ';') : (i += 1) {
+                    const c = text[i];
+                    if (hex) {
+                        if (!std.ascii.isHex(c)) break;
+                    } else if (!std.ascii.isDigit(c)) break;
+                }
+                if (i < text.len and text[i] == ';') i += 1;
+            } else {
+                const name_start = i;
+                while (i < text.len and text[i] != ';' and i - name_start < 10) : (i += 1) {}
+                if (i < text.len and text[i] == ';') i += 1;
+            }
+            const replacement = try applyHtmlStrip(alloc, text[start..i]);
+            defer alloc.free(replacement);
+            if (std.mem.eql(u8, replacement, text[start..i])) {
+                try mapping.copy(start, i);
+            } else {
+                try mapping.replace(start, i, replacement.len);
+            }
+        } else {
+            try mapping.copy(i, i + 1);
+            i += 1;
+        }
+    }
+}
+
+fn mapAsciiFoldOffsets(mapping: *OffsetWriter, output: []const u8) !void {
+    const text = mapping.input.text;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (i + 1 < text.len and (text[i] == 0xC3 or text[i] == 0xC4 or text[i] == 0xC5) and
+            mapping.cursor < output.len and output[mapping.cursor] < 0x80)
+        {
+            try mapping.replace(i, i + 2, 1);
+            i += 2;
+        } else {
+            try mapping.copy(i, i + 1);
+            i += 1;
+        }
+    }
+}
+
+fn mapZwnjOffsets(mapping: *OffsetWriter) !void {
+    const text = mapping.input.text;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (i + 2 < text.len and text[i] == 0xE2 and text[i + 1] == 0x80 and
+            (text[i + 2] == 0x8C or text[i + 2] == 0x8B or text[i + 2] == 0x8D))
+        {
+            i += 3;
+            continue;
+        }
+        if (i + 2 < text.len and text[i] == 0xEF and text[i + 1] == 0xBB and text[i + 2] == 0xBF) {
+            i += 3;
+            continue;
+        }
+        try mapping.copy(i, i + 1);
+        i += 1;
+    }
+}
 
 fn applyHtmlStrip(alloc: Allocator, text: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -489,7 +662,8 @@ fn tokenizeNgram(alloc: Allocator, text: []const u8, cfg: NgramConfig) ![]Token 
     var position: u32 = 0;
     const len = text.len;
 
-    var n: u8 = cfg.min;
+    if (cfg.min == 0 or cfg.max < cfg.min) return error.InvalidArgument;
+    var n: usize = cfg.min;
     while (n <= cfg.max) : (n += 1) {
         var start: usize = 0;
         while (start + n <= len) : (start += 1) {
@@ -567,6 +741,7 @@ pub const TokenFilter = union(enum) {
     ngram: NgramConfig,
     edge_ngram: EdgeNgramConfig,
     shingle: ShingleConfig,
+    suffix: SuffixConfig,
     length: LengthConfig,
     truncate: TruncateConfig,
     unique,
@@ -577,7 +752,29 @@ pub const TokenFilter = union(enum) {
     stop_words_lang: Language,
     stemmer_lang: Language,
 
-    pub const ShingleConfig = struct { min: u8 = 2, max: u8 = 2 };
+    pub const ShingleConfig = struct {
+        min: u8 = 2,
+        max: u8 = 2,
+        /// How adjacent tokens are joined. `none` produces compound terms
+        /// such as `rag3weaver` from `rag3 weaver`, which lets substring
+        /// matching cross token boundaries regardless of the separator
+        /// that appeared in the source text.
+        separator: Separator = .space,
+
+        pub const Separator = enum { space, none };
+    };
+    /// Emit every suffix of each token so a prefix query over the resulting
+    /// dictionary answers "token contains X". Suffixes always start on a
+    /// UTF-8 boundary.
+    pub const SuffixConfig = struct {
+        /// Shortest suffix emitted, in bytes. Shorter suffixes match too
+        /// many tokens to be useful and only inflate the dictionary.
+        min: u8 = 2,
+        /// Longest suffix emitted, in bytes. Longer suffixes are truncated
+        /// so a token of n bytes costs at most n × max dictionary bytes;
+        /// substring queries longer than this cannot match.
+        max: u8 = 32,
+    };
     pub const LengthConfig = struct { min: u8 = 0, max: u8 = 255 };
     pub const TruncateConfig = struct { max_len: u8 = 255 };
 
@@ -591,6 +788,7 @@ pub const TokenFilter = union(enum) {
             .ngram => |cfg| applyNgramFilter(alloc, tokens, cfg),
             .edge_ngram => |cfg| applyEdgeNgramFilter(alloc, tokens, cfg),
             .shingle => |cfg| applyShingle(alloc, tokens, cfg),
+            .suffix => |cfg| applySuffix(alloc, tokens, cfg),
             .length => |cfg| applyLength(alloc, tokens, cfg),
             .truncate => |cfg| applyTruncate(alloc, tokens, cfg),
             .unique => applyUnique(alloc, tokens),
@@ -674,13 +872,9 @@ fn applyNgramFilter(alloc: Allocator, tokens: []Token, cfg: NgramConfig) ![]Toke
         while (n <= cfg.max) : (n += 1) {
             var start: usize = 0;
             while (start + n <= word.len) : (start += 1) {
-                const term = try alloc.dupe(u8, word[start..][0..n]);
-                try result.append(alloc, .{
-                    .term = term,
-                    .position = tok.position,
-                    .start_byte = tok.start_byte + @as(u32, @intCast(start)),
-                    .end_byte = tok.start_byte + @as(u32, @intCast(start + n)),
-                });
+                var part = tokenSlice(tok, start, start + n);
+                part.term = try alloc.dupe(u8, part.term);
+                try result.append(alloc, part);
             }
         }
         alloc.free(@constCast(tok.term));
@@ -698,16 +892,14 @@ fn applyEdgeNgramFilter(alloc: Allocator, tokens: []Token, cfg: EdgeNgramConfig)
         const word = tok.term;
         var n: u8 = cfg.min;
         while (n <= cfg.max and n <= word.len) : (n += 1) {
-            const term = if (cfg.side == .front)
-                try alloc.dupe(u8, word[0..n])
-            else
-                try alloc.dupe(u8, word[word.len - n ..]);
-            try result.append(alloc, .{
-                .term = term,
-                .position = tok.position,
-                .start_byte = tok.start_byte,
-                .end_byte = tok.end_byte,
-            });
+            const start = if (cfg.side == .front) 0 else word.len - n;
+            var part = tokenSlice(tok, start, start + n);
+            part.term = try alloc.dupe(u8, part.term);
+            // Edge n-grams highlight the whole surface token. Keep the byte
+            // mapping for subsequent filters that slice this gram again.
+            part.start_byte = tok.start_byte;
+            part.end_byte = tok.end_byte;
+            try result.append(alloc, part);
         }
         alloc.free(@constCast(tok.term));
     }
@@ -721,33 +913,50 @@ fn applyShingle(alloc: Allocator, tokens: []Token, cfg: TokenFilter.ShingleConfi
     defer result.deinit(alloc);
 
     const count = tokens.len;
-    var n: u8 = cfg.min;
+    if (cfg.min == 0 or cfg.max < cfg.min) return error.InvalidArgument;
+    var n: usize = cfg.min;
     while (n <= cfg.max) : (n += 1) {
         if (n > count) continue;
         var i: usize = 0;
         while (i + n <= count) : (i += 1) {
-            // Build shingle: join tokens[i..i+n] with space
+            // Build shingle: join tokens[i..i+n] with the configured separator
+            const separator_len: usize = if (cfg.separator == .space) 1 else 0;
             var total_len: usize = 0;
             for (0..n) |j| {
-                if (j > 0) total_len += 1; // space
+                if (j > 0) total_len += separator_len;
                 total_len += tokens[i + j].term.len;
             }
             const term = try alloc.alloc(u8, total_len);
             var pos: usize = 0;
             for (0..n) |j| {
-                if (j > 0) {
+                if (j > 0 and separator_len > 0) {
                     term[pos] = ' ';
                     pos += 1;
                 }
                 @memcpy(term[pos..][0..tokens[i + j].term.len], tokens[i + j].term);
                 pos += tokens[i + j].term.len;
             }
-            try result.append(alloc, .{
+            const offsets = if (tokens[i].source_offsets != null) try alloc.alloc(Token.SourceOffset, total_len) else null;
+            if (offsets) |mapped| {
+                var cursor: usize = 0;
+                for (tokens[i .. i + n], 0..) |tok, j| {
+                    if (j > 0 and separator_len > 0) {
+                        mapped[cursor] = .{ .start = @min(tokens[i + j - 1].end_byte, tok.start_byte), .end = @max(tokens[i + j - 1].end_byte, tok.start_byte) };
+                        cursor += 1;
+                    }
+                    @memcpy(mapped[cursor..][0..tok.term.len], tok.source_offsets.?);
+                    cursor += tok.term.len;
+                }
+            }
+            var joined: Token = .{
                 .term = term,
                 .position = tokens[i].position,
                 .start_byte = tokens[i].start_byte,
                 .end_byte = tokens[i + n - 1].end_byte,
-            });
+                .source_offsets = offsets,
+            };
+            if (offsets != null) joined = tokenSlice(joined, 0, term.len);
+            try result.append(alloc, joined);
         }
     }
 
@@ -785,6 +994,7 @@ fn applyTruncate(alloc: Allocator, tokens: []Token, cfg: TokenFilter.TruncateCon
             const truncated = try alloc.dupe(u8, tok.term[0..cfg.max_len]);
             alloc.free(@constCast(tok.term));
             tok.term = truncated;
+            if (tok.source_offsets) |offsets| tok.source_offsets = offsets[0..truncated.len];
         }
     }
     return tokens;
@@ -822,8 +1032,54 @@ fn applyReverse(alloc: Allocator, tokens: []Token) ![]Token {
         }
         alloc.free(@constCast(tok.term));
         tok.term = reversed;
+        if (tok.source_offsets) |offsets| {
+            const mapped = try alloc.alloc(Token.SourceOffset, offsets.len);
+            for (offsets, 0..) |offset, index| mapped[offsets.len - 1 - index] = offset;
+            tok.source_offsets = mapped;
+        }
     }
     return tokens;
+}
+
+fn applySuffix(alloc: Allocator, tokens: []Token, cfg: TokenFilter.SuffixConfig) ![]Token {
+    var result = std.ArrayListUnmanaged(Token).empty;
+    defer result.deinit(alloc);
+    const min_len: usize = @max(cfg.min, 1);
+    const max_len: usize = @max(cfg.max, cfg.min);
+
+    for (tokens) |tok| {
+        const word = tok.term;
+        var start: usize = 0;
+        while (start < word.len) : (start += 1) {
+            if (isUtf8Continuation(word[start])) continue;
+            const suffix = word[start..];
+            // Suffixes only get shorter from here on.
+            if (suffix.len < min_len) break;
+            const end = utf8BoundaryAtOrBefore(suffix, @min(suffix.len, max_len));
+            if (end < min_len) continue;
+            var part = tokenSlice(tok, start, start + end);
+            part.term = try alloc.dupe(u8, part.term);
+            // Ordinary indexing retains its existing offsets. Highlight
+            // analysis uses the mapping, including capped suffix endings.
+            if (tok.source_offsets == null) part.end_byte = tok.end_byte;
+            try result.append(alloc, part);
+        }
+        alloc.free(@constCast(tok.term));
+    }
+
+    alloc.free(tokens);
+    return try result.toOwnedSlice(alloc);
+}
+
+fn isUtf8Continuation(byte: u8) bool {
+    return byte & 0xC0 == 0x80;
+}
+
+/// Largest index <= `limit` that does not split a UTF-8 sequence in `text`.
+fn utf8BoundaryAtOrBefore(text: []const u8, limit: usize) usize {
+    var end = limit;
+    while (end > 0 and end < text.len and isUtf8Continuation(text[end])) end -= 1;
+    return end;
 }
 
 fn applyCamelCase(alloc: Allocator, tokens: []Token) ![]Token {
@@ -842,25 +1098,18 @@ fn applyCamelCase(alloc: Allocator, tokens: []Token) ![]Token {
         while (i < word.len) : (i += 1) {
             if (word[i] >= 'A' and word[i] <= 'Z' and i > start) {
                 // Split here
-                const part = try toLowerDupe(alloc, word[start..i]);
-                try result.append(alloc, .{
-                    .term = part,
-                    .position = tok.position,
-                    .start_byte = tok.start_byte + @as(u32, @intCast(start)),
-                    .end_byte = tok.start_byte + @as(u32, @intCast(i)),
-                });
+                var part = tokenSlice(tok, start, i);
+                part.term = try toLowerDupe(alloc, part.term);
+                try result.append(alloc, part);
                 start = i;
             }
         }
         // Last part
         if (start < word.len) {
-            const part = try toLowerDupe(alloc, word[start..]);
-            try result.append(alloc, .{
-                .term = part,
-                .position = tok.position,
-                .start_byte = tok.start_byte + @as(u32, @intCast(start)),
-                .end_byte = tok.end_byte,
-            });
+            var part = tokenSlice(tok, start, word.len);
+            part.term = try toLowerDupe(alloc, part.term);
+            if (tok.source_offsets == null) part.end_byte = tok.end_byte;
+            try result.append(alloc, part);
         }
         alloc.free(@constCast(tok.term));
     }
@@ -886,6 +1135,7 @@ fn applyElision(alloc: Allocator, tokens: []Token) ![]Token {
                 const new_term = try alloc.dupe(u8, tok.term[prefix.len..]);
                 alloc.free(@constCast(tok.term));
                 tok.term = new_term;
+                if (tok.source_offsets) |offsets| tok.source_offsets = offsets[prefix.len..];
                 break;
             }
         }
@@ -906,6 +1156,7 @@ fn applyApostrophe(alloc: Allocator, tokens: []Token) ![]Token {
                     const new_term = try alloc.dupe(u8, tok.term[0..i]);
                     alloc.free(@constCast(tok.term));
                     tok.term = new_term;
+                    if (tok.source_offsets) |offsets| tok.source_offsets = offsets[0..i];
                 }
                 break;
             }
@@ -948,6 +1199,11 @@ fn applyStemmerLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Token 
     for (tokens) |*tok| {
         const stemmed = try stemmers_mod.stem(alloc, tok.term, lang);
         if (stemmed.ptr != tok.term.ptr) {
+            if (tok.source_offsets != null and !std.mem.eql(u8, tok.term, stemmed)) {
+                const mapped = try alloc.alloc(Token.SourceOffset, stemmed.len);
+                for (mapped) |*offset| offset.* = .{ .start = tok.start_byte, .end = tok.end_byte };
+                tok.source_offsets = mapped;
+            }
             alloc.free(@constCast(tok.term));
             tok.term = stemmed;
         }
@@ -1303,6 +1559,74 @@ pub const Analyzer = struct {
         return tokens;
     }
 
+    /// Analyze stored text while returning token positions in the original
+    /// bytes. Character filters may remove or replace bytes, so their token
+    /// offsets cannot be used directly to highlight the stored value.
+    pub fn analyzeWithSourceOffsets(self: *const Analyzer, alloc: Allocator, text: []const u8) ![]Token {
+        // Slicing a transformed token needs byte provenance, not arithmetic
+        // on its surface start. Keep this scratch work out of normal indexing.
+        for (self.filters) |filter| switch (filter) {
+            .suffix, .ngram, .edge_ngram, .camel_case => return self.analyzeWithMappedTokenOffsets(alloc, text),
+            else => {},
+        };
+        if (self.char_filters.len == 0) return self.analyze(alloc, text);
+
+        var mapped = try MappedText.identity(alloc, text);
+        defer mapped.deinit(alloc);
+        for (self.char_filters) |filter| {
+            const next = try filter.applyMapped(alloc, mapped);
+            mapped.deinit(alloc);
+            mapped = next;
+        }
+
+        var tokens = try self.tokenizer.tokenize(alloc, mapped.text);
+        for (self.filters) |filter| tokens = try filter.apply(alloc, tokens);
+        for (tokens) |*token| {
+            if (token.start_byte >= token.end_byte or token.end_byte > mapped.text.len) continue;
+            token.start_byte = mapped.starts[token.start_byte];
+            token.end_byte = mapped.ends[token.end_byte - 1];
+        }
+        return tokens;
+    }
+
+    fn analyzeWithMappedTokenOffsets(self: *const Analyzer, alloc: Allocator, text: []const u8) ![]Token {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+        var mapped = try MappedText.identity(arena, text);
+        for (self.char_filters) |filter| mapped = try filter.applyMapped(arena, mapped);
+        var tokens = try self.tokenizer.tokenize(arena, mapped.text);
+        for (tokens) |*tok| {
+            const offsets = try arena.alloc(Token.SourceOffset, tok.term.len);
+            const start = if (self.tokenizer == .edge_ngram and self.tokenizer.edge_ngram.side == .back)
+                tok.end_byte - @as(u32, @intCast(tok.term.len))
+            else
+                tok.start_byte;
+            for (offsets, 0..) |*offset, index| {
+                offset.* = .{ .start = start + @as(u32, @intCast(index)), .end = start + @as(u32, @intCast(index + 1)) };
+            }
+            tok.source_offsets = offsets;
+        }
+        for (self.filters) |filter| tokens = try filter.apply(arena, tokens);
+        const result = try alloc.alloc(Token, tokens.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |tok| alloc.free(@constCast(tok.term));
+            alloc.free(result);
+        }
+        for (tokens, result) |tok, *out| {
+            out.* = tok;
+            out.term = try alloc.dupe(u8, tok.term);
+            out.source_offsets = null;
+            if (tok.start_byte < tok.end_byte and tok.end_byte <= mapped.text.len) {
+                out.start_byte = mapped.starts[tok.start_byte];
+                out.end_byte = mapped.ends[tok.end_byte - 1];
+            }
+            initialized += 1;
+        }
+        return result;
+    }
+
     fn isDefaultEnglishNoCharFilters(self: *const Analyzer) bool {
         if (self.char_filters.len != 0) return false;
         if (self.tokenizer != .unicode_words) return false;
@@ -1444,6 +1768,38 @@ pub const search_as_you_type_root_prefix_analyzer = Analyzer{
 
 pub const search_as_you_type_analyzer = search_as_you_type_index_prefix_analyzer;
 
+pub const substring_min_query_length: u8 = 2;
+pub const substring_max_query_length: u8 = 32;
+
+/// Substring subfield: unicode_words → lowercase → shingle(1..2, joined without a
+/// separator) → suffix(2..32). Every token and every adjacent token pair is
+/// indexed under all of its suffixes, so a prefix query over this field finds
+/// documents whose text contains the query bytes, including across token
+/// boundaries (`rag3-weaver`, `rag3_weaver`, and `rag3weaver` all match `g3we`).
+pub const substring_analyzer = Analyzer{
+    .tokenizer = .unicode_words,
+    .filters = &.{
+        .lowercase,
+        .{ .shingle = .{ .min = 1, .max = 2, .separator = .none } },
+        .{ .suffix = .{ .min = substring_min_query_length, .max = substring_max_query_length } },
+    },
+};
+
+/// Bound a substring lookup to the longest suffix the index stores, without
+/// splitting a UTF-8 sequence. Callers must reject a longer query rather than
+/// treating this truncated prefix as an exact containment match.
+pub fn substringQueryPrefix(term: []const u8) []const u8 {
+    return term[0..utf8BoundaryAtOrBefore(term, @min(term.len, substring_max_query_length))];
+}
+
+/// Query-side companion for `substring_analyzer`: the same tokenization
+/// without suffix expansion. Adjacent query tokens are joined the same way the
+/// index joins them so a prefix lookup per joined pair answers the query.
+pub const substring_query_analyzer = Analyzer{
+    .tokenizer = .unicode_words,
+    .filters = &.{.lowercase},
+};
+
 /// Language-specific analyzer: unicode_words → lowercase → language stop words → language stemmer
 pub fn languageAnalyzer(comptime lang: Language) Analyzer {
     return .{
@@ -1477,6 +1833,8 @@ pub fn builtinAnalyzerByName(name: []const u8) ?*const Analyzer {
     if (std.mem.eql(u8, name, "search_as_you_type_3gram")) return &search_as_you_type_3gram_analyzer;
     if (std.mem.eql(u8, name, "search_as_you_type_index_prefix")) return &search_as_you_type_index_prefix_analyzer;
     if (std.mem.eql(u8, name, "search_as_you_type_root_prefix")) return &search_as_you_type_root_prefix_analyzer;
+    if (std.mem.eql(u8, name, "substring")) return &substring_analyzer;
+    if (std.mem.eql(u8, name, "substring_query")) return &substring_query_analyzer;
     if (std.mem.eql(u8, name, "german")) return &german_analyzer;
     if (std.mem.eql(u8, name, "french")) return &french_analyzer;
     if (std.mem.eql(u8, name, "spanish")) return &spanish_analyzer;
@@ -1896,6 +2254,72 @@ test "camel_case filter" {
     try std.testing.expectEqual(@as(usize, 2), tokens.len);
     try std.testing.expectEqualStrings("first", tokens[0].term);
     try std.testing.expectEqualStrings("name", tokens[1].term);
+}
+
+test "suffix filter emits every suffix on UTF-8 boundaries" {
+    const alloc = std.testing.allocator;
+    var tokens = try (Tokenizer{ .whitespace = {} }).tokenize(alloc, "café ab");
+    tokens = try (TokenFilter{ .suffix = .{ .min = 2, .max = 4 } }).apply(alloc, tokens);
+    defer {
+        for (tokens) |t| alloc.free(@constCast(t.term));
+        alloc.free(tokens);
+    }
+
+    // "café" is 5 bytes; suffixes start at c, a, f, é (never inside é) and
+    // are truncated to 4 bytes without splitting the two-byte é.
+    try std.testing.expectEqual(@as(usize, 5), tokens.len);
+    try std.testing.expectEqualStrings("caf", tokens[0].term);
+    try std.testing.expectEqualStrings("afé", tokens[1].term);
+    try std.testing.expectEqualStrings("fé", tokens[2].term);
+    try std.testing.expectEqualStrings("é", tokens[3].term);
+    try std.testing.expectEqualStrings("ab", tokens[4].term);
+    try std.testing.expectEqual(@as(u32, 0), tokens[0].position);
+    try std.testing.expectEqual(@as(u32, 0), tokens[0].start_byte);
+    try std.testing.expectEqual(@as(u32, 1), tokens[1].start_byte);
+    try std.testing.expectEqual(@as(u32, 2), tokens[2].start_byte);
+    try std.testing.expectEqual(@as(u32, 5), tokens[2].end_byte);
+    try std.testing.expectEqual(@as(u32, 3), tokens[3].start_byte);
+}
+
+test "shingle filter can join tokens without a separator" {
+    const alloc = std.testing.allocator;
+    var tokens = try (Tokenizer{ .whitespace = {} }).tokenize(alloc, "rag3 weaver");
+    tokens = try (TokenFilter{ .shingle = .{ .min = 1, .max = 2, .separator = .none } }).apply(alloc, tokens);
+    defer {
+        for (tokens) |t| alloc.free(@constCast(t.term));
+        alloc.free(tokens);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tokens.len);
+    try std.testing.expectEqualStrings("rag3", tokens[0].term);
+    try std.testing.expectEqualStrings("weaver", tokens[1].term);
+    try std.testing.expectEqualStrings("rag3weaver", tokens[2].term);
+}
+
+test "substring analyzer indexes suffixes across token separators" {
+    const alloc = std.testing.allocator;
+    const analyzer = builtinAnalyzerByName("substring") orelse return error.TestExpectedEqual;
+
+    for ([_][]const u8{ "Rag3-Weaver", "rag3_weaver", "RAG3WEAVER", "rag3 weaver" }) |text| {
+        const tokens = try analyzer.analyze(alloc, text);
+        defer Analyzer.freeTokens(alloc, tokens);
+        var found = false;
+        for (tokens) |tok| {
+            if (std.mem.startsWith(u8, tok.term, "g3wea")) found = true;
+        }
+        try std.testing.expect(found);
+    }
+
+    // Single-byte suffixes are never emitted.
+    const tokens = try analyzer.analyze(alloc, "ab");
+    defer Analyzer.freeTokens(alloc, tokens);
+    try std.testing.expectEqual(@as(usize, 1), tokens.len);
+    try std.testing.expectEqualStrings("ab", tokens[0].term);
+
+    const query_tokens = try substring_query_analyzer.analyze(alloc, "Rag3 Weaver");
+    defer Analyzer.freeTokens(alloc, query_tokens);
+    try std.testing.expectEqual(@as(usize, 2), query_tokens.len);
+    try std.testing.expectEqualStrings("rag3", query_tokens[0].term);
+    try std.testing.expectEqualStrings("weaver", query_tokens[1].term);
 }
 
 test "elision filter" {

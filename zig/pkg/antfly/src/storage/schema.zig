@@ -66,6 +66,7 @@ pub const AntflyType = enum(u8) {
     blob = 9,
     html = 10,
     search_as_you_type = 11,
+    substring = 12,
 };
 
 pub const MissingNullPolicy = enum(u8) {
@@ -96,6 +97,7 @@ pub fn parseAntflyType(value: []const u8) ?AntflyType {
     if (std.mem.eql(u8, value, "blob")) return .blob;
     if (std.mem.eql(u8, value, "html")) return .html;
     if (std.mem.eql(u8, value, "search_as_you_type")) return .search_as_you_type;
+    if (std.mem.eql(u8, value, "substring")) return .substring;
     return null;
 }
 
@@ -2330,7 +2332,7 @@ pub fn parseDateTimeToNs(text: []const u8) ?u64 {
 /// cannot later disappear from a declared native column.
 pub fn fieldTypeAcceptsRuntimeValue(field_type: AntflyType, value: std.json.Value) bool {
     return switch (field_type) {
-        .text, .keyword, .link, .blob, .html, .search_as_you_type => value == .string,
+        .text, .keyword, .link, .blob, .html, .search_as_you_type, .substring => value == .string,
         .numeric => jsonNumberIsFinite(value),
         .boolean => value == .bool,
         .datetime => switch (value) {

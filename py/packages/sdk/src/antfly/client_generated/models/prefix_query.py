@@ -13,12 +13,15 @@ T = TypeVar("T", bound="PrefixQuery")
 
 @_attrs_define
 class PrefixQuery:
-    """
-    Attributes:
-        prefix (str):
-        field (str | Unset):
-        boost (float | None | Unset): A floating-point number used to decrease or increase the relevance scores of a
-            query.
+    """Match terms that start with the given bytes. On a `substring`
+    companion field the prefix is lowercased and matched as a contained
+    substring, exactly like `match` on that field.
+
+        Attributes:
+            prefix (str):
+            field (str | Unset):
+            boost (float | None | Unset): A floating-point number used to decrease or increase the relevance scores of a
+                query.
     """
 
     prefix: str

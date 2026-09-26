@@ -1741,7 +1741,8 @@ fn relationalColumnType(property: anytype) ?[]const u8 {
             std.mem.eql(u8, field_type, "string") or
             std.mem.eql(u8, field_type, "text") or
             std.mem.eql(u8, field_type, "html") or
-            std.mem.eql(u8, field_type, "search_as_you_type")) return "string";
+            std.mem.eql(u8, field_type, "search_as_you_type") or
+            std.mem.eql(u8, field_type, "substring")) return "string";
         if (std.mem.eql(u8, field_type, "blob")) return "blob";
         if (std.mem.eql(u8, field_type, "boolean")) return "boolean";
         if (std.mem.eql(u8, field_type, "datetime")) return "datetime";

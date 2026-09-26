@@ -604,6 +604,7 @@ components:
           items: { $ref: "#/components/schemas/FullTextArtifactIndexSource" }
         mem_only: { type: boolean }
         field: { type: string }
+        analysis_config: { $ref: "#/components/schemas/TextAnalysisConfig" }
     CreatedGraphIndexConfig:
       type: object
       description: "Credential-free normalized graph configuration returned after creation."
@@ -960,6 +961,87 @@ components:
           type: string
           minLength: 1
           description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
+        analysis_config:
+          $ref: "#/components/schemas/TextAnalysisConfig"
+    TextAnalysisConfig:
+      type: object
+      description: |
+        Custom text analysis for a full-text index. Component maps are keyed
+        by the name that analyzers and `field_analyzers` reference. Built-in
+        analyzers (`standard`, `simple`, `keyword`, `html`, `search_as_you_type`,
+        `substring`, and the language analyzers such as `german`) are always
+        available without declaring them.
+
+        Example: split camelCase identifiers and match them as substrings.
+
+        ```json
+        {
+          "analysis_config": {
+            "field_analyzers": {"symbol": "code"},
+            "token_filters": {
+              "tails": {"type": "suffix", "config": {"min": 3, "max": 24}}
+            },
+            "analyzers": {
+              "code": {
+                "type": "custom",
+                "config": {
+                  "tokenizer": "whitespace",
+                  "token_filters": ["camel_case", "unique", "tails"]
+                }
+              }
+            }
+          }
+        }
+        ```
+      properties:
+        field_analyzers:
+          type: object
+          additionalProperties:
+            type: string
+          description: "Map of indexed field name to analyzer name. Overrides the analyzer derived from the table schema for that field."
+        char_filters:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named character filters. Types: `html_strip` (alias `html`), `ascii_fold`, `zero_width_non_joiner`."
+        tokenizers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named tokenizers. Types: `unicode` (alias `unicode_words`), `whitespace`, `keyword`, `character`, `ngram` (`config.min`, `config.max`), `edge_ngram` (`config.min`, `config.max`, `config.side` of `front` or `back`)."
+        token_filters:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named token filters. Types: `lowercase` (alias `to_lower`), `stop_words` (alias `stop`; optional `config.language`), `stemmer` (optional `config.language`), `ngram` and `edge_ngram` (`config.min`, `config.max`), `shingle` (`config.min`, `config.max`, `config.separator` of `space` or `none`), `suffix` (`config.min`, `config.max`; emits every suffix of each token so prefix queries answer containment), `length` (`config.min`, `config.max`), `truncate` (`config.length`), `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`. Languages: english, german, french, spanish, italian, portuguese, dutch, swedish, norwegian, danish, finnish."
+        analyzers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named analyzers of type `custom`. `config.tokenizer` names a built-in or declared tokenizer; `config.char_filters` and `config.token_filters` list built-in or declared component names in application order. Configuration-free filters (`lowercase`, `stop_words`, `stemmer`, `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`, `suffix`) can be listed by name without declaring them."
+        default_datetime_parser:
+          type: string
+          description: "Name of the date-time parser applied to datetime fields without a field-specific parser."
+        field_date_time_parsers:
+          type: object
+          additionalProperties:
+            type: string
+          description: "Map of field name to date-time parser name."
+        date_time_parsers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named date-time parsers. Type `sanitizedgo` accepts `config.layouts`, a list of Go reference-time layouts tried in order."
+    TextAnalysisComponent:
+      type: object
+      required: [type]
+      description: "One named analysis component: its type and type-specific configuration."
+      properties:
+        type:
+          type: string
+        config:
+          type: object
+          additionalProperties: true
     AlgebraicIndexConfig:
       type: object
       description: "Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned."
@@ -2752,6 +2834,7 @@ components:
       type: string
       enum:
         - search_as_you_type
+        - substring
         - keyword
         - text
         - html

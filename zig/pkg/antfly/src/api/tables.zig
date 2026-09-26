@@ -2364,6 +2364,7 @@ fn queryModesForFieldCapability(capability: runtime_schema_mod.FieldCapability) 
     return switch (capability.field_type) {
         .text, .html => if (capability.searchable) &.{"full_text"} else &.{},
         .search_as_you_type => if (capability.searchable) &.{ "full_text", "autocomplete" } else &.{"autocomplete"},
+        .substring => if (capability.searchable) &.{ "full_text", "substring" } else &.{"substring"},
         .keyword, .link => if (capability.filterable) &.{"exact"} else &.{},
         .numeric, .datetime => if (capability.filterable) &.{ "exact", "range" } else &.{},
         .boolean => if (capability.filterable) &.{"exact"} else &.{},
@@ -2375,6 +2376,7 @@ fn queryModesForFieldCapability(capability: runtime_schema_mod.FieldCapability) 
 fn generatedAntflyType(value: runtime_schema_mod.AntflyType) metadata_openapi.AntflyType {
     return switch (value) {
         .search_as_you_type => .search_as_you_type,
+        .substring => .substring,
         .keyword => .keyword,
         .text => .text,
         .html => .html,
@@ -3581,6 +3583,7 @@ fn antflyTypeName(value: runtime_schema_mod.AntflyType) []const u8 {
         .blob => "blob",
         .html => "html",
         .search_as_you_type => "search_as_you_type",
+        .substring => "substring",
     };
 }
 

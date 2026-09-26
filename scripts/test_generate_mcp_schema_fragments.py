@@ -181,6 +181,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
             ("offset", 0),
             ("search_before", []),
             ("analyses", {"pca": True}),
+            ("highlight", {}),
             ("limit", 101),
             ("search_after", ["position-only"]),
             ("order_by", [{"field": "_hierarchy.position", "desc": True}]),

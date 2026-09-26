@@ -50,6 +50,12 @@ the older Zig-only convention.
 
 - Exact string companions use `.keyword`.
 - `search_as_you_type` emits `._2gram`, `._3gram`, and `._index_prefix`.
+- `substring` emits `._substring`: every lowercased token and every adjacent
+  token pair (joined without a separator) is indexed under all of its suffixes
+  of 2 to 32 bytes. A `match` or `prefix` query on `._substring` lowers to a
+  prefix lookup over that suffix dictionary, so `g3we` finds `rag3-weaver`,
+  `rag3_weaver`, and `rag3weaver` without a dictionary scan. The companion is
+  several times the size of its text, so it is opt-in per field.
 - `._2gram` and `._3gram` are shingle fields for multi-token
   search-as-you-type matching.
 - Prefix/autocomplete matching targets `._index_prefix`; it is
@@ -71,6 +77,85 @@ and from the Go/Bleve naming: the public query surface, schema-derived fields,
 dynamic-template variants, and schema-less exact fields all use one familiar
 subfield convention, adopted before compatibility constraints would have made
 the layout expensive to change.
+
+## Substring Design
+
+`x-antfly-types: ["text", "substring"]` adds a `._substring` companion
+analyzed by `substring_analyzer` (`unicode_words → lowercase → shingle(1..2,
+no separator) → suffix(2..32)`). The suffix filter is the only new storage
+idea: a prefix query over a dictionary of suffixes answers "token contains X"
+with the existing `rangeTermIterator` seek, so nothing in the postings format,
+the BM25 path, or the term dictionary changed. The joined two-token shingle is
+what lets a query cross token boundaries regardless of the separator the source
+text used.
+
+Query lowering in `search_exec.zig` recognizes fields whose resolved analyzer is
+`substring_analyzer` (explicit companions, dynamic-template fields with
+`analyzer: substring`, and `analysis_config` overrides alike). `match`,
+`match_phrase`, and `prefix` on such a field analyze the query with `substring_query_analyzer`
+(`unicode_words → lowercase`) and join each adjacent pair of tokens. `match`
+and `prefix` emit one prefix lookup per pair conjoined in a `bool_query`.
+`match_phrase` with three or more words is rejected because the suffix index
+cannot prove word boundaries across that many words. Nonzero or automatic
+fuzziness on substring `match_phrase` is also rejected: the joined suffix index
+cannot verify per-word fuzzy phrase semantics. Standalone `fuzzy` queries
+continue to match the suffix dictionary with edit distance. A pair longer than 32 bytes
+is also rejected because the suffix dictionary cannot verify the remaining bytes.
+A single-byte query lowers to `match_none` because one-byte
+suffixes are never indexed; that is the guard against the "two characters match
+everything" failure mode described in Lucivy's own benchmarks. Three-or-more
+token `match` queries are answered as "every adjacent pair occurs", a superset
+of the exact phrase.
+
+`term` queries on `._substring` are deliberately left raw: they match tokens
+that end with the given bytes, which is occasionally useful and never
+surprising once documented. Every other path that analyzes query text against
+a field (`multi_match`, `query_string`, bool-prefix expansion) substitutes
+`substring_query_analyzer` when the field resolves to the substring analyzer,
+so query text is never exploded into suffixes.
+
+## Highlighting
+
+`highlight` on a query request asks for `_highlights` on every hit that carries
+stored source: a map of source field to fragments, each a window of the stored
+value with byte-offset spans. Fragments are computed by `attachHighlights` in
+`search_exec.zig` on the node that owns the stored documents, right after the
+DB assembles the result, and a distributed coordinator only relays what shards
+produced. Highlights come from the unprojected stored document (the DB reloads
+it when `_source` was projected or omitted), so a `fields` projection never
+hides a highlight, and every text clause the request carries contributes:
+`full_text_search` plus each named full-text query. Nothing is stored for it:
+the query is lowered once more with the same
+analysis config, each positive clause becomes a `highlight.Matcher` (`term`,
+`prefix`, `wildcard`, `fuzzy`, `regexp`, or `contains`), and the stored field
+value is re-analyzed with the field's analyzer so stemmed and stop-word-filtered
+terms mark their surface form. The mapper carries the stored source path for
+each indexed contribution, including arbitrary mapped subfields and `_all`;
+field names ending in `.keyword` or `._substring` are not assumed to be
+companions. Custom token filters carry byte mappings through joined shingles,
+suffixes, and other token slices before character-filter offsets are mapped
+back to stored text. Replacement stems retain their original surface span.
+`contains` matchers, which come from `substring` companions, are evaluated over the plain surface words (the
+same tokenization the companion indexed) rather than the root analyzer's
+tokens, so a stop word the root analyzer dropped can never be bridged; they
+mark the exact contained bytes and may span two adjacent words. Negative
+clauses never highlight, and traversal requests (`hierarchy.children`) reject
+the option.
+
+Substring highlighting follows the resolved field analyzer, including an
+`analysis_config` override on a source field. Exact terms and wildcard, fuzzy,
+and regexp queries replay the indexed suffixes and map their matches back
+through source separators. Regexp highlights use the same complete-term
+automaton matching as dictionary queries. Fragment merging retains the identity
+of each source value so dotted-key collisions cannot combine unrelated spans.
+
+Highlighting obtains analyzer provenance from the document mapper for each
+indexed value, including each contribution to `_all`. This preserves the
+analyzer that actually produced the terms when a source field has an override
+or a literal key happens to end in a companion suffix. Index field overrides
+take priority over schema-derived analyzers during both indexing and querying.
+Configured shingle filters require `1 <= min <= max <= 255`; the full range is
+safe to iterate.
 
 ## Search-As-You-Type Design
 
