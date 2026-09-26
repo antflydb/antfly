@@ -524,7 +524,9 @@ since. Several things turned up along the way:
   background shell (nice 5, background scheduling policy, display sleep) to a
   few steps per hour; run it in the foreground or clear the policy
   (`taskpolicy -B -p <pid>`) and keep the display awake. The raw logs are in
-  the work log.
+  the work log. See [Training memory](#training-memory) for a breakdown of
+  this footprint and the admission gate added to refuse a job that will not
+  fit before it starts, instead of relying on the OS to kill a concurrent one.
 
 ### Trainer throughput
 
@@ -604,6 +606,105 @@ Raw per-step logs and the investigation are in
 
 Segment attention in the training graph (which step 2c needs anyway) and LoRA
 remain open. Batching still helps little, because cost is per token.
+
+### Training memory
+
+Measured 2026-09-25 on an Apple M4 Max (36 GiB), ReleaseFast, `backend: metal`,
+`packing: question`, batch 1, seed 42, released `laya` (28 layers, hidden
+1024, 16 heads, intermediate 2624, ~394.7M trainable parameters, 0 frozen
+layers), the same step-0 subset as [Trainer throughput](#trainer-throughput).
+`/usr/bin/time -l` around the whole process, one run stopped after 1
+microbatch and one after 14:
+
+| Microbatches | Max RSS | Peak footprint |
+| --- | ---: | ---: |
+| 1 | 8.39 GiB | 23.46 GiB |
+| 14 | 8.39 GiB | 24.11 GiB |
+
+RSS is flat; peak footprint (macOS's combined host-plus-device high-water
+mark) grows about 703 MB (2.8%) from 1 to 14 microbatches. The ~15 GiB gap
+between RSS and footprint is Metal/unified memory: shared-storage buffers a
+kernel-level RSS sample does not attribute to the process the way ordinary
+heap pages are. The small growth across steps tracks bucket-size variation
+among shuffled training examples (`training.bucketedLayout` rounds each
+batch's sequence up to 64 tokens; a later, longer example raises the
+high-water mark), not an unbounded per-step leak: step time also stays in a
+narrow 1.0-2.5 s band with no widening trend. No safe reduction was found
+beyond what [Trainer throughput](#trainer-throughput) already did. The
+resident AdamW transaction's weight/m/v snapshot-then-swap
+(`seeded_device_transaction.prepare`) is the dominant transient, and changing
+it is explicitly out of scope: it exists to keep the transaction all-or-
+nothing, and cutting it needs a transaction-contract change (skip
+re-validating already-committed state, write AdamW out of place) that is
+still open.
+
+**Admission.** The Laya job Config gained `max_backend_bytes` (default 24
+GiB), a device/unified-memory ceiling alongside the existing `max_host_bytes`.
+`execute` estimates the run's device need right after selecting trainable
+parameters and before any device weight or optimizer-state allocation (well
+before creating the output directory), and refuses with
+`LayaBackendMemoryLimitExceeded` if the estimate exceeds the ceiling:
+
+- **Weights and optimizer state (exact).** The resident AdamW transaction
+  keeps weight, m, v, and the gradient accumulator resident (4x trainable f32
+  bytes) and, on every optimizer step, additionally snapshots weight/m/v into
+  new buffers before freeing the old ones, so the transient peak is 7x
+  trainable bytes; frozen tensors add 1x with no optimizer state.
+- **Activations (approximate).** Per encoder layer: about twelve hidden-width
+  buffers, two GeGLU intermediate-width buffers, and eight dense
+  `[batch, heads, seq, seq]`-sized buffers (three tree/padding biases, forward
+  scores and softmax probabilities, and their backward cotangents), summed
+  over the run's admitted layouts and over forward-pass layers plus
+  backward-retained (unfrozen) layers.
+- **Fixed overhead (measured).** 4 GiB for MPS kernel/temporary caches, the
+  in-frame buffer reuse pool, per-step RoPE/bias/dropout runtime inputs, and
+  Metal driver bookkeeping, calibrated against the run above.
+
+For this run's layout (~448-token packed rows after bucketing, batch 1): the
+estimate is **22.9 GB** (device only). Adding a few GB for host-side model
+loading and dataset/tokenizer state (not separately isolated in this
+measurement) lands close to the **25.2-25.9 GB** measured combined peak
+footprint above, so the estimate is a reasonable, if approximate, stand-in for
+the real number. It is not tight: a training graph with dense (non-segment,
+non-checkpointed) attention scales the activation term with `sequence^2`, so a
+longer packed row than this workload's costs much more (the estimate exceeds
+`max_backend_bytes` well before `architecture.validate`'s existing
+`batch*sequence^2*heads <= 64M`-element bound would, which only bounds one
+attention tensor, not the sum of buffers across every layer).
+
+A separate, unpacked run (`s0-train`, `gradient_accumulation: 5`, so only one
+in five microbatches is a stepped optimizer update) showed a 17 GB process
+footprint in `top` and ~20 GB of system wired memory. The estimate for that
+layout (sequence 512, the full unpacked budget) is 24.9 GB: higher than
+observed, as expected, since the estimate assumes every microbatch is a
+stepped update (worst case, matching the default `gradient_accumulation: 1`)
+while most of that run's microbatches were accumulation-only and never paid
+the transaction's transient snapshot.
+
+**Process-wide admission.** `execute` also acquires a lease from the
+inference runtime's `memory.AdmissionController` (`.gpu` backend class for
+`backend: metal`, `.cpu` otherwise), charging the device estimate as
+`backend_scratch_bytes` and enabling the controller's live-memory check only
+for Metal. On macOS, `AdmissionController` charges backend bytes to the same
+live system-memory sample as host bytes (`memory.zig`'s `liveHostBytes`,
+because Metal draws from unified memory), so this check is real cross-process
+protection: two concurrent `antfly-inference finetune train laya` processes
+each request their own device estimate against one shared, live view of
+system memory, and the second is refused once the two would not fit, rather
+than both proceeding into OOM. `max_host_bytes` is deliberately not also
+charged to this live sample: it is an existing generous safety-net ceiling on
+allocator growth (enforced independently by `BoundedAllocator`), not a
+measurement of actual usage, and charging the full default there as well
+would make a single default job's own declared envelope exceed most machines.
+The standalone CLI (`train_laya.zig`) creates one `AdmissionController` per
+process; a caller embedding the trainer in a longer-lived process (for
+example, alongside serving sessions) can share its own controller instead so
+resident models and training compete for the same ledger.
+
+The final `report.json` records `backend_estimated_bytes` (the admission
+estimate) and `backend_peak_bytes` (the Metal runtime's own
+`device_owned_peak_live_bytes`, reset at admission so it reflects this run
+alone), alongside the existing `host_peak_bytes`.
 
 ## Verification
 

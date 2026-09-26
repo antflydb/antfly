@@ -19,6 +19,8 @@ const snapshot = @import("../../runtime/file_snapshot.zig");
 const Assets = @import("assets.zig").Assets;
 const Budget = @import("../../runtime/bounded_allocator.zig").BoundedAllocator;
 const model = @import("../../models/laya.zig");
+const memory = @import("../../runtime/tier/memory.zig");
+const metal_tensor = @import("../../backends/metal_tensor.zig");
 
 pub const Config = struct {
     version: u32 = 1,
@@ -45,6 +47,12 @@ pub const Config = struct {
     checkpoint_every_steps: u32 = 100,
     stop_after_microbatches: ?u64 = null,
     max_host_bytes: usize = 24 * 1024 * 1024 * 1024,
+    /// Device (GPU/unified) memory ceiling for `backend: metal`. Covers
+    /// resident weights and optimizer state, the resident AdamW transaction's
+    /// transient snapshot, and the largest admitted layout's activations
+    /// (models/laya/LAYA.md, "Training memory"). Ignored on `backend: cpu`,
+    /// where the encoder runs in host memory bounded by `max_host_bytes`.
+    max_backend_bytes: usize = 24 * 1024 * 1024 * 1024,
     /// Train (and export) a tree-packed layout (models/laya/LAYA.md). Null
     /// keeps the source checkpoint's layout; released checkpoints are unpacked.
     packing: ?model.PackingMode = null,
@@ -57,7 +65,8 @@ pub const Config = struct {
 pub fn validate(c: Config) !void {
     if (c.version != 1 or c.epochs == 0 or c.epochs > 10000 or c.batch_size == 0 or c.batch_size > 128 or
         c.gradient_accumulation == 0 or c.gradient_accumulation > 65536 or c.group_size < 2 or c.group_size > 64 or
-        c.checkpoint_every_steps == 0 or c.max_host_bytes < 64 * 1024 * 1024 or c.max_host_bytes > 128 * 1024 * 1024 * 1024)
+        c.checkpoint_every_steps == 0 or c.max_host_bytes < 64 * 1024 * 1024 or c.max_host_bytes > 128 * 1024 * 1024 * 1024 or
+        c.max_backend_bytes < 256 * 1024 * 1024 or c.max_backend_bytes > 64 * 1024 * 1024 * 1024)
         return error.InvalidLayaJob;
     for ([_]f32{ c.encoder_lr, c.head_lr, c.sigma_start, c.sigma_end, c.max_grad_norm }) |v| if (!std.math.isFinite(v) or v <= 0) return error.InvalidLayaJob;
     if (!std.math.isFinite(c.weight_decay) or c.weight_decay < 0 or !std.math.isFinite(c.head_dropout) or c.head_dropout < 0 or c.head_dropout >= 1) return error.InvalidLayaJob;
@@ -260,8 +269,8 @@ fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.jso
 }
 
 // A shuffled batch can combine the longest sequence with any other record.
-// Admit a conservative bound for the entire split before backend allocation.
-fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32) !void {
+// Compute a conservative worst-case layout for the entire split.
+fn combinedLayout(cfg: modern.Config, examples: []const training.Example, batch_size: u32) !architecture.Layout {
     var layout = architecture.Layout{ .batch = @intCast(@min(batch_size, examples.len)), .sequence = 0, .options = 0, .questions = 0 };
     var questions: u32 = 0;
     for (examples) |e| {
@@ -272,7 +281,99 @@ fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_s
         for (e.ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidLayaTrainingToken;
     }
     layout.questions = @min(questions * layout.batch, 512);
+    return layout;
+}
+
+// Admit a conservative bound for the entire split before backend allocation.
+fn admitExamples(cfg: modern.Config, examples: []const training.Example, batch_size: u32, dropout: f32) !void {
+    const layout = try combinedLayout(cfg, examples, batch_size);
     try architecture.validate(cfg, layout, dropout);
+}
+
+fn mulBytes(a: usize, b: usize) !usize {
+    return std.math.mul(usize, a, b) catch error.LayaBackendMemoryLimitExceeded;
+}
+fn addBytes(a: usize, b: usize) !usize {
+    return std.math.add(usize, a, b) catch error.LayaBackendMemoryLimitExceeded;
+}
+
+/// Trainable + frozen device weight bytes, f32, at the transaction's peak.
+/// The resident AdamW transaction (`seeded_device_transaction.prepare`) keeps
+/// weight, m, v, and the gradient accumulator resident (4x trainable bytes),
+/// and on every optimizer step additionally snapshots weight/m/v into new
+/// buffers before freeing the old ones
+/// (`finetune/seeded_gradient_trainer.zig:updateResident`), so the transient
+/// peak is 7x trainable bytes. Frozen tensors are uploaded once and carry no
+/// optimizer state.
+fn weightStateBytes(trainable_elements: usize, frozen_elements: usize) !usize {
+    const weight_bytes = try mulBytes(trainable_elements, 4);
+    const peak_trainable = try mulBytes(weight_bytes, 7);
+    return addBytes(peak_trainable, try mulBytes(frozen_elements, 4));
+}
+
+/// Rough upper bound on retained forward/backward activations for one packed
+/// row at `layout`. The training graph materializes dense (non-segment)
+/// attention and keeps no gradient checkpoint, so every layer's forward
+/// tensors are live until its backward pass runs. Per encoder layer this
+/// counts about twelve hidden-width buffers (QKV, attention output, two
+/// layer norms, residual, and their cotangents), two intermediate-width GeGLU
+/// buffers, and eight dense `[batch, heads, seq, seq]` tensors (three
+/// tree/padding biases, forward scores and softmax probabilities, and their
+/// backward cotangents); each is individually bounded by `graph.validate`'s
+/// 64M-element admission, but their sum across layers is not, which is what
+/// this estimate is for. Frozen layers still execute forward (`freeze_layers` in
+/// LAYA.md); only unfrozen layers additionally retain backward state. This is
+/// an admission bound, not a measured footprint: it excludes the decision
+/// head, RoPE tables, and dropout masks, which the fixed overhead below folds
+/// in from measurement instead of modeling directly.
+fn activationBytes(cfg: modern.Config, l: architecture.Layout, freeze_layers: u32) !usize {
+    const batch: usize = @intCast(l.batch);
+    const sequence: usize = @intCast(l.sequence);
+    const hidden: usize = @intCast(cfg.hidden_size);
+    const intermediate: usize = @intCast(cfg.intermediate_size);
+    const heads: usize = @max(@as(usize, @intCast(cfg.num_attention_heads)), hidden / 64);
+    const tokens = try mulBytes(batch, sequence);
+    const hidden_bytes = try mulBytes(try mulBytes(tokens, hidden), 12 * 4);
+    const mlp_bytes = try mulBytes(try mulBytes(tokens, intermediate), 2 * 4);
+    const attn_elements = try mulBytes(try mulBytes(batch, try mulBytes(sequence, sequence)), heads);
+    // Eight buffers of this size: three dense biases (encoder_bias, local_bias,
+    // head_bias in `architecture.Inputs`), forward scores and softmax
+    // probabilities, and their backward cotangents.
+    const attn_bytes = try mulBytes(attn_elements, 8 * 4);
+    const per_layer = try addBytes(try addBytes(hidden_bytes, mlp_bytes), attn_bytes);
+    const forward_layers: usize = @intCast(cfg.num_hidden_layers);
+    const backward_layers: usize = @intCast(cfg.num_hidden_layers - @min(freeze_layers, cfg.num_hidden_layers));
+    return mulBytes(per_layer, try addBytes(forward_layers, backward_layers));
+}
+
+/// Fixed device overhead observed on the Apple M4 Max release trainer beyond
+/// weights/optimizer state and modeled activations: MPS kernel/temporary
+/// caches, the in-frame buffer reuse pool, RoPE/bias/dropout runtime inputs
+/// (uploaded once per step), and Metal driver bookkeeping. See LAYA.md,
+/// "Training memory", for the measurement this constant is calibrated
+/// against.
+const fixed_backend_overhead_bytes: usize = 4 * 1024 * 1024 * 1024;
+
+/// Upper-bound estimate of `backend: metal` device memory for one run: the
+/// admission gate in `execute` compares this against `max_backend_bytes`
+/// before creating the output directory or allocating any device weights.
+fn estimateBackendBytes(cfg: modern.Config, selected: []const training.controller.Parameter, frozen_elements: usize, layouts: []const architecture.Layout, freeze_layers: u32) !usize {
+    var trainable_elements: usize = 0;
+    for (selected) |p| trainable_elements = try addBytes(trainable_elements, p.values.len);
+    var activation: usize = 0;
+    for (layouts) |l| activation = @max(activation, try activationBytes(cfg, l, freeze_layers));
+    const state = try weightStateBytes(trainable_elements, frozen_elements);
+    return addBytes(try addBytes(state, activation), fixed_backend_overhead_bytes);
+}
+
+/// The Metal runtime's process-wide peak of live device-owned buffer bytes,
+/// reset at admission time so it reflects this run alone. Zero on `cpu` or
+/// when the binary has no Metal backend.
+fn backendPeakBytes(c: Config) u64 {
+    if (comptime @import("build_options").enable_metal) {
+        if (c.backend == .metal) return metal_tensor.memoryStatsSnapshot().device_owned_peak_live_bytes;
+    }
+    return 0;
 }
 
 const Cursor = struct {
@@ -332,7 +433,9 @@ fn exportInputs(a: std.mem.Allocator, reader: *const safetensors.MMapReader, sel
 }
 
 /// All source/data admission happens before creating a new run directory.
-pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
+/// Caller supplies the process-wide admission owner; standalone CLI creates
+/// exactly one. Library/server integrations share their existing controller.
+pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory.AdmissionController) !void {
     try validate(c);
     var budget = Budget{ .backing = gpa, .limit = c.max_host_bytes };
     const a = budget.allocator();
@@ -370,9 +473,12 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
         try data.disjoint(a, train, calib);
         try data.disjoint(a, eval, calib);
     }
-    try admitExamples(encoder, train.examples, c.batch_size, c.head_dropout);
-    try admitExamples(encoder, eval.examples, 1, c.head_dropout);
-    if (calibration) |calib| try admitExamples(encoder, calib.examples, 1, c.head_dropout);
+    const train_layout = try combinedLayout(encoder, train.examples, c.batch_size);
+    try architecture.validate(encoder, train_layout, c.head_dropout);
+    const eval_layout = try combinedLayout(encoder, eval.examples, 1);
+    try architecture.validate(encoder, eval_layout, c.head_dropout);
+    const calib_layout = if (calibration) |calib| try combinedLayout(encoder, calib.examples, 1) else null;
+    if (calib_layout) |cl| try architecture.validate(encoder, cl, c.head_dropout);
     var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = c.freeze_layers };
     defer cache.deinit();
     // Release the raw source snapshot before optimizer initialization/restore.
@@ -406,6 +512,46 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
         break :blk .{ .selected = selected, .export_tensors = export_tensors, .identity = hash.finalResult(), .weights_sha256 = data.digest(source_bytes) };
     };
     const selected = admitted.selected;
+    // Device memory admission, before any device weight or optimizer-state
+    // allocation. `frozen_elements` covers tensors below `freeze_layers`,
+    // which are uploaded once but never enter the optimizer.
+    var frozen_elements: usize = 0;
+    for (admitted.export_tensors) |t| {
+        if (training.frozen(t.name, c.freeze_layers)) frozen_elements = try addBytes(frozen_elements, t.data.len);
+    }
+    var layouts: [3]architecture.Layout = undefined;
+    var layout_count: usize = 2;
+    layouts[0] = train_layout;
+    layouts[1] = eval_layout;
+    if (calib_layout) |cl| {
+        layouts[2] = cl;
+        layout_count = 3;
+    }
+    const backend_estimate: usize = if (c.backend == .metal)
+        try estimateBackendBytes(encoder, selected, frozen_elements, layouts[0..layout_count], c.freeze_layers)
+    else
+        0;
+    if (c.backend == .metal and backend_estimate > c.max_backend_bytes) return error.LayaBackendMemoryLimitExceeded;
+    if (comptime @import("build_options").enable_metal) if (c.backend == .metal) metal_tensor.resetMemoryStats();
+    // `max_host_bytes` is already a generous safety-net ceiling enforced by
+    // `budget` (BoundedAllocator), not actual usage, so it is not also
+    // charged to the live-memory sample below: doing so would make a single
+    // default job's own declared envelope exceed most machines. The device
+    // estimate is the actual new risk (previously unbounded, unlike host
+    // memory), so it alone is charged, and only for `backend: metal`, where
+    // Metal buffers draw from the same physical pool `tryAcquire`'s live
+    // check samples (`memory.zig`'s `liveHostBytes`, unified on macOS).
+    var lease = try admission.tryAcquire(
+        if (c.backend == .metal) .gpu else .cpu,
+        .{
+            .host_limit_bytes = c.max_host_bytes,
+            .backend_limit_bytes = if (c.backend == .metal) c.max_backend_bytes else 0,
+            .combined_limit_bytes = try addBytes(c.max_host_bytes, if (c.backend == .metal) c.max_backend_bytes else 0),
+        },
+        .{ .backend_scratch_bytes = backend_estimate },
+        c.backend == .metal,
+    );
+    defer lease.release();
     const originals = try permanent.alloc(run.Parameter, selected.len);
     for (selected, originals) |p, *o| o.* = .{ .name = p.name, .canonical_name = p.name, .dimensions = p.dimensions, .values = p.values, .kind = .original };
     var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
@@ -515,7 +661,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
     const after = try metrics(final_predictions, temperatures);
     try writeJson(io, try path(permanent, c.output_dir, "eval_predictions.json"), final_predictions);
     try exportModel(permanent, io, c, config_json.value, laya.packing, assets, admitted.export_tensors, &trainer, temperatures);
-    const result = .{ .format = "antfly-laya-finetune/v1", .status = "complete", .backend = c.backend, .objective = c.objective, .source_sha256 = .{ .config = std.fmt.bytesToHex(data.digest(config_bytes), .lower), .tokenizer = std.fmt.bytesToHex(data.digest(tokenizer_bytes), .lower), .weights = std.fmt.bytesToHex(admitted.weights_sha256, .lower) }, .calibration_sha256 = if (calibration) |calib| std.fmt.bytesToHex(calib.sha256, .lower) else null, .resumed_microbatches = completed, .train_examples = train.examples.len, .train_records = train.records.len, .packing = laya.packing.mode, .train_sha256 = std.fmt.bytesToHex(train.sha256, .lower), .eval_sha256 = std.fmt.bytesToHex(eval.sha256, .lower), .run_sha256 = std.fmt.bytesToHex(identity, .lower), .optimizer = trainer.identity(), .initial_eval = before, .initial_by_kind = initial_by_kind, .final_eval = after, .final_by_kind = try metricsByKind(a, final_predictions, temperatures), .final_uncalibrated_eval = try metrics(final_predictions, .{ 1, 1, 1 }), .temperature = temperatures, .calibration_examples = if (calibration) |calib| calib.examples.len else 0, .action_head_trained = false, .host_peak_bytes = budget.peak };
+    const result = .{ .format = "antfly-laya-finetune/v1", .status = "complete", .backend = c.backend, .objective = c.objective, .source_sha256 = .{ .config = std.fmt.bytesToHex(data.digest(config_bytes), .lower), .tokenizer = std.fmt.bytesToHex(data.digest(tokenizer_bytes), .lower), .weights = std.fmt.bytesToHex(admitted.weights_sha256, .lower) }, .calibration_sha256 = if (calibration) |calib| std.fmt.bytesToHex(calib.sha256, .lower) else null, .resumed_microbatches = completed, .train_examples = train.examples.len, .train_records = train.records.len, .packing = laya.packing.mode, .train_sha256 = std.fmt.bytesToHex(train.sha256, .lower), .eval_sha256 = std.fmt.bytesToHex(eval.sha256, .lower), .run_sha256 = std.fmt.bytesToHex(identity, .lower), .optimizer = trainer.identity(), .initial_eval = before, .initial_by_kind = initial_by_kind, .final_eval = after, .final_by_kind = try metricsByKind(a, final_predictions, temperatures), .final_uncalibrated_eval = try metrics(final_predictions, .{ 1, 1, 1 }), .temperature = temperatures, .calibration_examples = if (calibration) |calib| calib.examples.len else 0, .action_head_trained = false, .host_peak_bytes = budget.peak, .backend_estimated_bytes = backend_estimate, .backend_peak_bytes = backendPeakBytes(c) };
     try writeJson(io, try path(permanent, c.output_dir, "report.json"), result);
     try event(io, std.Io.File.stdout(), result);
 }
@@ -566,6 +712,48 @@ test "laya admission checks late long sequences and token vocabulary before trai
     var invalid = short;
     invalid.ids = &.{ 0, cfg.vocab_size };
     try std.testing.expectError(error.InvalidLayaTrainingToken, admitExamples(cfg, &.{ short, invalid }, 1, 0));
+}
+
+test "laya job config rejects out-of-range backend memory ceilings" {
+    var c = Config{ .model_dir = "/model", .train_file = "/train", .eval_file = "/eval", .output_dir = "/output" };
+    try validate(c);
+    c.max_backend_bytes = 1024;
+    try std.testing.expectError(error.InvalidLayaJob, validate(c));
+    c.max_backend_bytes = 128 * 1024 * 1024 * 1024;
+    try std.testing.expectError(error.InvalidLayaJob, validate(c));
+}
+
+test "laya weight state bytes charge the resident transaction's transient snapshot" {
+    // 1000 f32 trainable elements: weight+m+v+grad_accum resident (4x) plus a
+    // transient weight/m/v snapshot the transaction takes before the old
+    // buffers are freed (+3x). Frozen elements carry no optimizer state.
+    try std.testing.expectEqual(@as(usize, 1000 * 4 * 7), try weightStateBytes(1000, 0));
+    try std.testing.expectEqual(@as(usize, 1000 * 4 * 7 + 500 * 4), try weightStateBytes(1000, 500));
+}
+
+test "laya activation estimate grows with layout and shrinks with frozen layers" {
+    const cfg = modern.Config{};
+    const small = architecture.Layout{ .batch = 1, .sequence = 64, .options = 2, .questions = 1 };
+    const large = architecture.Layout{ .batch = 1, .sequence = 512, .options = 2, .questions = 1 };
+    const small_bytes = try activationBytes(cfg, small, 0);
+    const large_bytes = try activationBytes(cfg, large, 0);
+    try std.testing.expect(large_bytes > small_bytes);
+    // Freezing every layer still charges one forward pass, never zero.
+    const frozen_bytes = try activationBytes(cfg, large, cfg.num_hidden_layers);
+    try std.testing.expect(frozen_bytes > 0 and frozen_bytes < large_bytes);
+}
+
+test "laya backend estimate covers weights, activations, and the fixed overhead floor" {
+    const cfg = modern.Config{};
+    var values: [1024]f32 = undefined;
+    const params = [_]training.controller.Parameter{.{ .name = "w", .values = &values, .dimensions = &.{1024}, .group = 0 }};
+    const layout = architecture.Layout{ .batch = 1, .sequence = 64, .options = 2, .questions = 1 };
+    const estimate = try estimateBackendBytes(cfg, &params, 0, &.{layout}, 0);
+    try std.testing.expect(estimate > fixed_backend_overhead_bytes);
+    // A larger admitted layout never lowers the estimate.
+    const bigger_layout = architecture.Layout{ .batch = 1, .sequence = 512, .options = 2, .questions = 1 };
+    const bigger = try estimateBackendBytes(cfg, &params, 0, &.{bigger_layout}, 0);
+    try std.testing.expect(bigger > estimate);
 }
 
 test "laya training rejects malformed encoder metadata instead of defaulting" {

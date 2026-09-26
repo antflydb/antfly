@@ -149,7 +149,8 @@ test "laya training converts an unpacked checkpoint into a served packed model" 
         .objective = .soft_ce,
         .packing = .question,
     };
-    try job.execute(a, io, c);
+    var admission = @import("../../runtime/tier/memory.zig").AdmissionController{};
+    try job.execute(a, io, c, &admission);
     const model_path = try std.fs.path.join(scratch, &.{ c.output_dir, "model" });
     var session = try factory.createNativeSession(a, model_path);
     defer session.close();
