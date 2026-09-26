@@ -203,15 +203,16 @@ test "laya training interrupted accumulation resumes to identical serving weight
         .head_lr = 0.001,
         .head_dropout = 0.1,
     };
-    try job.execute(a, io, c);
+    var admission = @import("../../runtime/tier/memory.zig").AdmissionController{};
+    try job.execute(a, io, c, &admission);
     const full_weights = try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" });
     c.output_dir = try std.fs.path.join(scratch, &.{ directory, "paused" });
     c.stop_after_microbatches = 1;
-    try job.execute(a, io, c);
+    try job.execute(a, io, c, &admission);
     c.resume_from = try std.fs.path.join(scratch, &.{ c.output_dir, "latest.safetensors" });
     c.output_dir = try std.fs.path.join(scratch, &.{ directory, "resumed" });
     c.stop_after_microbatches = null;
-    try job.execute(a, io, c);
+    try job.execute(a, io, c, &admission);
     const resumed_weights = try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" });
     const digest = @import("data.zig").digest;
     try std.testing.expectEqual(digest(try files.readFile(scratch, full_weights)), digest(try files.readFile(scratch, resumed_weights)));
@@ -246,7 +247,8 @@ test "laya training with frozen lower layers keeps them exact and trains the res
         .head_lr = 0.001,
         .freeze_layers = 1,
     };
-    try job.execute(a, io, c);
+    var admission = @import("../../runtime/tier/memory.zig").AdmissionController{};
+    try job.execute(a, io, c, &admission);
     var source = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ root, "model", "model.safetensors" }));
     defer source.deinit();
     var exported = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" }));
