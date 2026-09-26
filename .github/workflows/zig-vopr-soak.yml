@@ -77,9 +77,9 @@ jobs:
   qualify:
     if: inputs.diagnostic_run == ''
     runs-on: arc-antfly-heavy
-    # Six cold ReleaseSafe root compiles on a per-run cache; 90 minutes was
-    # observed insufficient once honest max_rss claims serialize the heavy
-    # compiles instead of oversubscribing the 24 GiB pod into swap.
+    # The VOPR runtime roots compile under a bounded 24 GiB pod. General
+    # secrets-test coverage belongs to zig-base; keep the focused secret VOPR
+    # replay here without recompiling the large physical secret backend root.
     timeout-minutes: 120
     env:
       VOPR_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}-qualify
@@ -116,11 +116,17 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
           python3 -m unittest discover -s scripts/ci -p test_zig_e2e_regression_loop.py
-      - name: Test production transport, runtime scheduling, and determinism boundaries
+      - name: Audit replayable VOPR sources
+        working-directory: zig
+        run: >-
+          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build
+          vopr-determinism-audit -Doptimize=ReleaseSafe --summary all
+          --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
+      - name: Test production transport and runtime scheduling
         working-directory: zig
         run: |
           python3 "$GITHUB_WORKSPACE/scripts/ci/measure_disk_usage.py" --output "$RUNNER_TEMP/vopr-qualify-disk.json" --path /mnt/cache --path "$GITHUB_WORKSPACE" -- \
-            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-raft-transport-test standby-vopr-test vopr-runtime-test restore-admission-vopr-test vopr-determinism-audit secrets-test \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-raft-transport-test standby-vopr-test vopr-runtime-test restore-admission-vopr-test secrets-vopr-test \
             -Doptimize=ReleaseSafe --summary all \
             --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
       - name: Retain qualification disk measurements

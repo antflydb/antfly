@@ -1,5 +1,26 @@
 # Zig runtime flakes
 
+## 2026-09-25: VOPR qualification audit failure and cold-build timeout
+
+[PR CI run 36189107289](https://github.com/antflydb/antfly/actions/runs/36189107289)
+cancelled the VOPR `qualify` job at its 120-minute limit. The same job had
+already failed the determinism audit because a teardown diagnostic printed a
+raw pointer from `full_cluster.zig`. The earlier
+[run 36173392068](https://github.com/antflydb/antfly/actions/runs/36173392068)
+reported that audit failure after completing qualification in 99 minutes.
+Its build summary shows the physical secret backend root taking 44 minutes
+to compile in ReleaseSafe; the regular `zig-base` lane already runs that
+target. The restore-admission replay itself took 25 seconds in that run.
+
+The teardown diagnostic now prints only stable sender and shutdown state.
+Qualification runs the small audit first and replaces the broad secrets
+target with the focused secret lifecycle VOPR replay. This keeps the VOPR
+transport, runtime, restore-admission, and secret lifecycle targets in
+qualification. The runner logs do not expose which compilation was still
+active when the later job timed out, so the
+duplicate work is the documented cost source, not a proven explanation for
+every minute of that particular timeout.
+
 ## 2026-09-23: executable chunk embeddings and transient rewrite owner routing
 
 [PR #868 CI run 35937420037](https://github.com/antflydb/antfly/actions/runs/35937420037)

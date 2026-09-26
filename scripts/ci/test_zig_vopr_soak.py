@@ -138,15 +138,20 @@ class SoakTests(unittest.TestCase):
         workflow = (
             Path(__file__).resolve().parents[2] / ".github/workflows/zig-vopr-soak.yml"
         ).read_text()
+        self.assertLess(
+            workflow.index("      - name: Audit replayable VOPR sources\n"),
+            workflow.index("      - name: Test production transport and runtime scheduling\n"),
+        )
         for step_name, targets in (
+            ("Audit replayable VOPR sources", ["vopr-determinism-audit"]),
             (
-                "Test production transport, runtime scheduling, and determinism boundaries",
+                "Test production transport and runtime scheduling",
                 [
                     "antfly-raft-transport-test",
                     "standby-vopr-test",
                     "vopr-runtime-test",
                     "restore-admission-vopr-test",
-                    "vopr-determinism-audit",
+                    "secrets-vopr-test",
                 ],
             ),
             ("Build campaign runner", ["vopr-build"]),
@@ -170,7 +175,12 @@ class SoakTests(unittest.TestCase):
                 )
                 step = workflow.split(f"      - name: {step_name}\n", 1)[1]
                 step = step.split("      - name:", 1)[0]
-                command = textwrap.dedent(step.split("        run: |\n", 1)[1])
+                if "        run: |\n" in step:
+                    command = textwrap.dedent(step.split("        run: |\n", 1)[1])
+                else:
+                    command = " ".join(
+                        textwrap.dedent(step.split("        run: >-\n", 1)[1]).splitlines()
+                    )
                 result = subprocess.run(
                     ["bash", "-e", "-o", "pipefail", "-c", command],
                     cwd=root,
@@ -191,6 +201,7 @@ class SoakTests(unittest.TestCase):
                     args[:4], ["--max-rss-cap", "23622320128", "--", "build"]
                 )
                 self.assertEqual(args[4 : 4 + len(targets)], targets)
+                self.assertNotIn("secrets-test", args)
                 self.assertFalse(
                     any(re.fullmatch(r"-j(?:[0-9]+)?", arg) for arg in args)
                 )
