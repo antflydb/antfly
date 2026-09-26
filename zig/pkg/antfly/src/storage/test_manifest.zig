@@ -46,6 +46,7 @@ comptime {
     _ = @import("db/relational_integrity_activation.zig");
     _ = @import("db/relational_integrity_retirement.zig");
     _ = @import("db/relational_integrity_topology.zig");
+    _ = @import("db/empty_generation_handoff.zig");
     _ = @import("db/relational_integrity_generation_retirement.zig");
     _ = @import("db/relational_integrity_generation_admission.zig");
     _ = @import("db/relational_initial_child_publication.zig");
@@ -53,12 +54,14 @@ comptime {
     _ = @import("db/row_policy_bundle.zig");
     _ = @import("db/restore_staging.zig");
     _ = @import("db/restore_staging_contract.zig");
+    _ = @import("db/restore_generation_admissions.zig");
     _ = @import("db/relational_index_gc.zig");
     _ = @import("db/relational_row_cursor.zig");
     _ = @import("db/relational_predicate.zig");
     _ = @import("admission_waiter.zig");
     _ = @import("coordinated_ttl.zig");
     _ = @import("restore_owner.zig");
+    _ = @import("restore_decoder_cache.zig");
     _ = @import("artifact_payload.zig");
     _ = @import("dense_work_admission.zig");
     _ = @import("maintenance_signal.zig");
@@ -155,6 +158,7 @@ comptime {
     _ = @import("db/graph_asset_state.zig");
     _ = @import("db/graph_edge_contender.zig");
     _ = @import("db/graph_retirement_config.zig");
+    _ = @import("db/graph_retirement_seal.zig");
     _ = @import("db/graph_state_name.zig");
     _ = @import("db/lease.zig");
     _ = @import("db/maintenance/graph_metric_runtime.zig");

@@ -216,6 +216,7 @@ pub fn excludes(txn: anytype, reference: integrity.Reference) !bool {
 /// An absent scope is the first publication for this child/constraint pair;
 /// subsequent publications must retire exactly its currently accepted value.
 pub fn activateTruncate(alloc: std.mem.Allocator, txn: anytype, entry: @import("relational_integrity_topology_contract.zig").ParentRetirementEntry, plan_id: [16]u8, decision_digest: integrity.Digest) !void {
+    if (try @import("empty_generation_handoff.zig").active(txn)) return error.IntegrityTopologyChanged;
     const key = try scopeKey(entry.child_table_name, entry.constraint_name);
     const previous = try load(txn, entry.child_table_name, entry.constraint_name);
     if (previous) |prior| {
@@ -241,6 +242,7 @@ pub fn activateTruncate(alloc: std.mem.Allocator, txn: anytype, entry: @import("
 /// child is fenced. An absent scope becomes default-deny, so a newly added FK
 /// cannot attach until every parent owner activates the exact generation.
 pub fn stageTransition(alloc: std.mem.Allocator, txn: anytype, transition: Transition) !void {
+    if (try @import("empty_generation_handoff.zig").active(txn)) return error.IntegrityTopologyChanged;
     try transition.validate();
     const key = try scopeKey(transition.child_table_name, transition.constraint_name);
     const before = try load(txn, transition.child_table_name, transition.constraint_name);
@@ -276,6 +278,7 @@ pub fn stageTransition(alloc: std.mem.Allocator, txn: anytype, transition: Trans
 /// it through the owner's Raft log. Neither a coordinator token nor the
 /// caller-supplied digest alone authorizes this irreversible flip.
 pub fn activateTransition(alloc: std.mem.Allocator, txn: anytype, transition: Transition) !void {
+    if (try @import("empty_generation_handoff.zig").active(txn)) return error.IntegrityTopologyChanged;
     try transition.validate();
     const key = try scopeKey(transition.child_table_name, transition.constraint_name);
     const before = (try load(txn, transition.child_table_name, transition.constraint_name)) orelse return error.GenerationAdmissionChanged;
@@ -302,6 +305,7 @@ pub fn activateTransition(alloc: std.mem.Allocator, txn: anytype, transition: Tr
 }
 
 pub fn cancelTransition(alloc: std.mem.Allocator, txn: anytype, transition: Transition) !void {
+    if (try @import("empty_generation_handoff.zig").active(txn)) return error.IntegrityTopologyChanged;
     try transition.validate();
     const key = try scopeKey(transition.child_table_name, transition.constraint_name);
     const before = (try load(txn, transition.child_table_name, transition.constraint_name)) orelse return;
@@ -618,10 +622,10 @@ test "parent generation scope denies retired and unknown generations after activ
 test "parent generation publication stages then activates exact successor and remains default-deny after drop" {
     const Mock = struct {
         value: ?[]u8 = null,
-        fn get(self: *@This(), _: []const u8) error{NotFound}![]const u8 {
+        pub fn get(self: *@This(), _: []const u8) error{NotFound}![]const u8 {
             return self.value orelse error.NotFound;
         }
-        fn put(self: *@This(), _: []const u8, value: []const u8) !void {
+        pub fn put(self: *@This(), _: []const u8, value: []const u8) !void {
             if (self.value) |prior| std.testing.allocator.free(prior);
             self.value = try std.testing.allocator.dupe(u8, value);
         }

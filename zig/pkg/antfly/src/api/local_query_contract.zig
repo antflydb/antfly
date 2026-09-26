@@ -3520,11 +3520,17 @@ test "compiled lookup wire preserves binary scope and every integrity control" {
         .relational_activation_json = "{\"mode\":\"status\"}",
         .relational_index_status_json = "{\"name\":\"by_id\",\"schema_version\":2}",
         .relational_topology_json = "{\"mode\":\"identity\"}",
+        .fk_generation_source_control = true,
+        .fk_generation_source_read_index_certified = true,
+        .generation_handoff_install_read_index_certified = true,
         .row_policy_receipt = .{ .generation = 9, .phase = .pending_install },
         .execution_deadline_ns = 1234,
     };
     const encoded = try encodeStorageKernelLookupRequest(alloc, "\xff\x00\x80", options);
     defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "fk_generation_source_control") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "fk_generation_source_read_index_certified") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "generation_handoff_install_read_index_certified") == null);
     var decoded = try std.json.parseFromSlice(StorageKernelLookupWireRequest, alloc, encoded, .{});
     defer decoded.deinit();
     try std.testing.expectEqualStrings("\xff\x00\x80", decoded.value.key);

@@ -32760,6 +32760,36 @@ fn importPortableBackupFileWithOptions(alloc: std.mem.Allocator, store: *db_mod.
 
 const freeBackupShards = local_write_contract.freeBackupShards;
 
+pub fn cloneAcceptedGenerationSummary(
+    alloc: std.mem.Allocator,
+    entries: []const @import("backup_contract.zig").SourceGenerationAdmissionSummaryEntry,
+) ![]const @import("backup_contract.zig").SourceGenerationAdmissionSummaryEntry {
+    if (entries.len == 0) return &.{};
+    const out = try alloc.alloc(@import("backup_contract.zig").SourceGenerationAdmissionSummaryEntry, entries.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |entry| {
+            alloc.free(entry.child_table_name);
+            alloc.free(entry.constraint_name);
+        }
+        alloc.free(out);
+    }
+    for (entries, out) |source, *target| {
+        const child_name = try alloc.dupe(u8, source.child_table_name);
+        errdefer alloc.free(child_name);
+        const constraint_name = try alloc.dupe(u8, source.constraint_name);
+        target.* = .{
+            .child_table_id = source.child_table_id,
+            .child_table_name = child_name,
+            .constraint_name = constraint_name,
+            .active_generation = source.active_generation,
+            .source_scope_digest = source.source_scope_digest,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
 fn cloneShardSnapshots(
     alloc: std.mem.Allocator,
     shards: []const backups_api.ShardSnapshot,
@@ -32790,8 +32820,10 @@ fn cloneShardSnapshots(
                 try alloc.dupe(u8, shard.native_manifest_sha256)
             else
                 "",
+            .accepted_generation_summary_digest = shard.accepted_generation_summary_digest,
         };
         initialized += 1;
+        out[i].accepted_generation_summary = try cloneAcceptedGenerationSummary(alloc, shard.accepted_generation_summary);
     }
     return out;
 }
@@ -63358,10 +63390,12 @@ pub fn exportPortableBackupShardWithSeal(
 
     const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, rel_path });
     defer alloc.free(dest_path);
+    var source_summary: ?[]@import("../storage/portable_backup.zig").SourceGenerationAdmissionSummaryEntry = null;
+    errdefer if (source_summary) |entries| @import("../storage/portable_backup.zig").freeSourceGenerationAdmissionSummary(alloc, entries);
     if (sealed) |proof| {
         var fallback: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
         defer if (fallback) |*owned| owned.deinit();
-        try exportPortableBackupFileWithSource(alloc, db.core.store, dest_path, shared_io orelse fallback.?.io(), .{ .db = db, .handle = proof.handle, .cancellation = cancellation });
+        try exportPortableBackupFileWithSource(alloc, db.core.store, dest_path, shared_io orelse fallback.?.io(), .{ .db = db, .handle = proof.handle, .cancellation = cancellation, .source_generation_summary_output = &source_summary });
     } else try exportPortableBackupFile(alloc, db.core.store, dest_path, shared_io);
 
     const byte_range = db.getRange();
@@ -63374,5 +63408,9 @@ pub fn exportPortableBackupShardWithSeal(
     };
     errdefer shards[0].deinit(alloc);
     try backups_api.populateShardArtifactIntegrity(alloc, shared_io, .portable, dest_path, &shards[0]);
+    if (sealed != null) {
+        try physical_local_write.populateAcceptedGenerationSummary(db.core.identity_namespace, source_summary orelse return error.BackupIntegrityFailure, &shards[0]);
+        source_summary = null;
+    }
     return shards;
 }

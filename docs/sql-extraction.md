@@ -606,44 +606,45 @@ opaque values, so no sequence counter exists to reset. Once owned sequences
 are introduced, their new counter generation must be part of the same staging
 plan and publication transaction.
 
-Graph indexes still require a graph cutover proof. Admission rejects the entire
-FK-closed TRUNCATE cohort before owner reads or job creation if any selected
-table has a graph index, including an incoming-FK CASCADE child. Existing
-generation-bound graph retirement intent and pristine-new-owner checks remain
-preparatory only: graph-derived state, metrics, readers and workers must be
-fenced with their old owner generation before this guard can be removed.
-The new V2 graph configuration digest is a tested prerequisite: metadata
-declarations and loaded owner definitions agree across JSON key ordering,
-explicit incarnations, and the provisioner's derived-incarnation fallback.
-It is not a seal receipt or publication authority. In-flight V1 plans retain
-their raw-JSON digest and current guarded behavior.
+Graph-index TRUNCATE has an owner-verified cutover protocol, but its public
+admission guard remains ON. The old owner closes graph reader, mutation,
+maintenance, and worker-snapshot admission under its catalog/apply locks,
+drains schedule pins, and persists a Raft-bound seal whose digest includes the
+active source fence, old owner identity, locally verified graph configuration,
+fresh generation, and staging-plan digest. The gate is reconstructed from
+durable intent before optional graph runtimes start. The coordinator resolves
+an uncertain seal reply by read-indexing the owner receipt; metadata requires
+that exact digest for every old range before atomic publication. Graph plans
+use only the new semantic configuration digest, not legacy raw-JSON matching.
+Metadata treats graph `begin_cutover` as irreversible, so a late cancellation
+cannot move a sealed owner into an unreopenable cancel phase; pre-cutover
+cancellation remains available.
 
-The required graph cutover is one coordinated owner/metadata protocol, not a
-coordinator-computed digest on the existing `old_fenced` command:
+Focused tests cover graph read/apply pinning, worker pin drain, direct graph
+write and maintenance rejection, lost seal reply, forged/missing Raft markers
+and metadata receipts, duplicate seal replay, late cancellation, and a closed
+gate after both pre-seal and post-seal restarts. A
+test-only, single-use table-bound permit exercised public SQL TRUNCATE in a
+mounted metadata/data cluster: guard rejection, exact old-owner seal receipt
+before publication, a fresh table/index with the old document absent, and
+cold data restart all passed. A mounted dependency-closed parent/child CASCADE
+cutover now also passes: both new owners expose their Plan-bound durable handoff
+receipts via read-indexed public routing before and after a cold data-owner
+restart, and old parent/child rows remain absent. This does not activate the
+public graph route. Repeated mounted recovery under injected seal, owner-loss,
+and uncertain-reply failures is still required; the public guard stays ON
+until that fault matrix passes.
 
-- Add a pre-seal owner admission gate for every graph metric coordinator and
-  worker sweep, direct maintenance entrypoint, graph mutation, and graph read.
-  Close new worker-snapshot admission under the index catalog lock, then drain
-  existing schedule pins without holding a lock a pinned worker needs. The
-  ordinary topology `drained` bit currently covers transactions only.
-- Persist an exact old-owner graph seal through Raft, bound to the active
-  rewrite-source fence, old physical table/incarnation, locally verified graph
-  index declarations, target generation, and staging-plan digest. Do not trust
-  the plan's graph digest without comparing it to the owner's durable index
-  configuration. A retry must return the same receipt; stale attempts fail.
-- Rehydrate the closed graph admission gate from the durable fence/seal before
-  optional graph runtimes start after restart. Cancellation reopens it only
-  after the exact durable cancel tombstone, while publication retains the old
-  generation closed until its retirement is complete.
-- Have the coordinator read the seal receipt from the old owner at read-index,
-  then require its exact digest for every old range in metadata's `old_fenced`
-  transition before atomic cohort publication. Metadata currently validates
-  only group/range and plan digest and accepts any nonzero old completion
-  digest; a coordinator-made hash of the fence is not owner evidence.
-- Keep public graph TRUNCATE guarded until fault tests cover an in-flight
-  worker/read/write at seal, lost seal reply, owner restart before and after
-  receipt, stale or forged receipt, cancellation, and multi-table CASCADE
-  cutover with new-owner pristine graph state.
+The empty-generation source takes one coherent, read-indexed scan of historical
+retirement tombstones for planning and one after its write fence for preflight.
+Seal retries now read only the durable fence, intent, and seal receipt; they do
+not rescan the tombstones. The one-time scan is still proportional to retained
+retirements and holds source read admission. Before lifting the graph guard or
+promising unbounded-churn TRUNCATE latency, benchmark planning and preflight at
+the maximum retained-tombstone envelope and prove a deadline-bounded path. A
+future resumable scan needs a fenced stable snapshot/progress protocol, or a
+transactional authenticated-set digest maintained across activation, transfer,
+GC, and restore; a read-side cache alone is not publication proof.
 
 Incoming-FK CASCADE selection must never truncate an outgoing parent implicitly.
 The current safe boundary rejects a selected child whose FK parent is outside
@@ -751,13 +752,44 @@ nondefault ADD/enforcement/DROP/restart probe that may run only during an
 authorized bounded guard lift. It passed one mounted run with ADD publication,
 parent/child inserts, blocked parent delete, DROP publication, cold owner
 restart, and permitted parent delete. The guard was restored immediately;
-one happy-path run is not the lost-ACK/concurrency/failover matrix below.
+one happy-path run is not the lost-ACK/concurrency/failover matrix below. The
+separate opt-in `antfly-api-hosted-self-fk-fault-diagnostic` passed mounted ADD
+and DROP with background FK supervisors on both metadata and data APIs paused
+and drained. At every phase it discarded an owner-result reply before metadata
+CAS, then a metadata reply after CAS, reset the volatile supervisor cursor,
+and required the same plan's next linearizable revision before continuing.
+A concurrent old-generation batch at the durable dual-role fence was rejected
+with retryable HTTP 409 in both ADD and DROP; the ADD probe row remained absent
+after publication. The test also covered a cold data-owner restart after DROP
+and permitted the formerly blocked parent delete. The public batch adapter
+now classifies pre-decision `IntegrityTopologyBusy` as that typed 409 instead
+of an internal 500. The public guard was restored immediately after this
+bounded diagnostic. The separate opt-in metadata-restart diagnostic now passes
+mounted ADD/DROP after replacing both metadata and data-owner processes at
+the parent ACK: the replacement supervisor resumes from the exact durable
+plan revision, and the owner reports the expected catalog digest, public
+schema, install and ACK receipts, released fence, and enforced activation
+before post-cutover writes. An initial run exposed a one-second stale metadata
+snapshot: public batch and explicit transaction preparation could bind the
+old no-FK declaration after the owner installed the new generation. Both now
+use one read-indexed catalog refresh and complete pre-write replan on
+`PreparedGenerationChanged`, and an uncoordinated relational fast path
+requires an authoritative catalog snapshot before commit. A deterministic
+stale no-FK-to-self-FK test proves both entry points reach owner preparation
+without committing the orphan write. This correctness gate adds a metadata
+read to uncoordinated relational writes; document-table cached writes retain
+their fast path. Removing that cost needs a validated current-generation
+cache token or owner pre-decision proof, not a retry after an ambiguous write.
+The public guard remains on: same-node cold restart does not prove replica
+leadership failover, active-fence standby handoff, or a crash between metadata
+publication and owner install.
 Focused owner tests now prove that an old transaction blocks staging until it
 drains, duplicate Raft phase entries are idempotent, and the exact dual fence
 and old schema pin survive separate cold restarts after begin, stage,
 activation, and ACK. Metadata phase tests reject forged/stale receipts and
-recover after activation and ACK for both ADD and DROP. Coordinator restart
-and active-fence standby/handoff still need deterministic fault proof.
+recover after activation and ACK for both ADD and DROP. Metadata-process
+cold restart at parent ACK is now mounted and passing; replica leadership
+failover and active-fence standby/handoff still need deterministic fault proof.
 
 Self-FK dual-role implementation ledger (keep the public guard until all steps
 are proved):

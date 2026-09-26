@@ -1449,9 +1449,11 @@ pub fn exportPortableBackupShardWithSeal(alloc: std.mem.Allocator, db: *db_mod.D
     shards[0].snapshot_path = try portableBackupShardRelPath(alloc, backup_id, group_id);
     const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, shards[0].snapshot_path });
     defer alloc.free(dest_path);
+    var source_summary: ?[]@import("portable_backup.zig").SourceGenerationAdmissionSummaryEntry = null;
+    errdefer if (source_summary) |entries| @import("portable_backup.zig").freeSourceGenerationAdmissionSummary(alloc, entries);
     if (sealed) |proof| {
         const io = shared_io orelse db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
-        try exportPortableBackupFileWithSource(alloc, db.core.store, dest_path, io, .{ .db = db, .handle = proof.handle, .cancellation = cancellation });
+        try exportPortableBackupFileWithSource(alloc, db.core.store, dest_path, io, .{ .db = db, .handle = proof.handle, .cancellation = cancellation, .source_generation_summary_output = &source_summary });
     } else try exportPortableBackupFile(alloc, db.core.store, dest_path, shared_io);
 
     const byte_range = db.getRange();
@@ -1459,7 +1461,21 @@ pub fn exportPortableBackupShardWithSeal(alloc: std.mem.Allocator, db: *db_mod.D
     shards[0].end_key = if (byte_range.end.len > 0) try alloc.dupe(u8, byte_range.end) else null;
     try cancellation.check();
     try backups_api.populateShardArtifactIntegrity(alloc, shared_io, .portable, dest_path, &shards[0]);
+    if (sealed != null) {
+        try populateAcceptedGenerationSummary(db.core.identity_namespace, source_summary orelse return error.BackupIntegrityFailure, &shards[0]);
+        source_summary = null;
+    }
     return shards;
+}
+
+/// Source-owner backup evidence only. New restore generations must remap the
+/// source IDs; these descriptors never become active admission records by
+/// simply copying the shard or importing its portable stream.
+pub fn populateAcceptedGenerationSummary(namespace: @import("db/doc_identity.zig").Namespace, entries: []@import("portable_backup.zig").SourceGenerationAdmissionSummaryEntry, shard: *backups_api.ShardSnapshot) !void {
+    const portable = @import("portable_backup.zig");
+    const digest = try portable.sourceGenerationAdmissionSummaryDigest(namespace, entries);
+    shard.accepted_generation_summary_digest = digest;
+    shard.accepted_generation_summary = entries;
 }
 
 pub const NativeBackupShardSnapshot = struct {
@@ -1543,18 +1559,19 @@ pub fn prepareNativeBackupShardSnapshot(
     const end_key = if (byte_range.end.len > 0) try alloc.dupe(u8, byte_range.end) else null;
     errdefer if (end_key) |value| alloc.free(value);
 
+    const shard: backups_api.ShardSnapshot = .{
+        .group_id = group_id,
+        .start_key = start_key,
+        .end_key = end_key,
+        .snapshot_path = rel_path,
+    };
     return .{
         .snapshot_root = snapshot_root,
         .snapshot_attempt = snapshot_attempt,
         .dest_root = dest_root,
         .io = snapshot_io,
         .cancellation = plan.cancellation,
-        .shard = .{
-            .group_id = group_id,
-            .start_key = start_key,
-            .end_key = end_key,
-            .snapshot_path = rel_path,
-        },
+        .shard = shard,
     };
 }
 
@@ -1718,8 +1735,10 @@ pub fn applyLocalTableSchemaJson(
     // immediately use the same authoritative validator as API writes.
     // A cold owner may reopen while its durable backup fence is held. Opening
     // an exact descriptor is a read, not a schema mutation or a new HA event.
-    if (!try db.rehydrateSchemaJson(effective_schema_json))
+    const rehydrated = try db.rehydrateSchemaJson(effective_schema_json);
+    if (!rehydrated) {
         try db.setSchemaJson(alloc, effective_schema_json);
+    }
     // Propagate schema-derived changes to live algebraic indexes so dynamic
     // template updates take effect without a reopen.
     try db.reloadAlgebraicSchemaConfigs(effective_schema_json);
@@ -1767,7 +1786,7 @@ pub fn configureStorageKernelOwnerDb(
     remote_content: ?*const scraping.RemoteContentConfig,
     installed: ?*OwnerManagedConfig,
 ) !void {
-    return configureStorageKernelOwnerDbAtOpen(alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, installed, false);
+    _ = try configureStorageKernelOwnerDbAtOpen(alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, installed, false);
 }
 
 /// A pinned Raft descriptor is write-admission history, not current catalog
@@ -1785,7 +1804,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
     remote_content: ?*const scraping.RemoteContentConfig,
     installed: ?*OwnerManagedConfig,
     historical_raft_apply: bool,
-) !void {
+) !bool {
     if (historical_raft_apply) {
         const stored = try loadOwnerCatalogContract(alloc, db);
         defer if (stored) |value| alloc.free(value);
@@ -1799,19 +1818,22 @@ pub fn configureStorageKernelOwnerDbAtOpen(
                 try db.resumeEnrichmentRuntimeAfterReconfigure("historical owner reopen", "*");
                 if (installed) |state| state.publish(value);
             }
-            return;
+            return false;
         }
-        if (try db.raftAppliedEntry() != null) return;
+        if (try db.raftAppliedEntry() != null) return false;
         // Older physical roots predate the marker. Existing index definitions
         // still prove that replay must not replace their current catalog.
         const indexes = try db.listIndexes(alloc);
         defer db_mod.types.freeIndexConfigs(alloc, indexes);
-        if (indexes.len != 0) return;
+        if (indexes.len != 0) return false;
     }
     // Metadata publishes the successor only after parent ACKs, before the
     // exact child install Raft entry. A cold owner must reopen on its durable
     // old schema and index catalog while the child-source fence is active.
-    if (schema_json.len > 0 and try db.childGenerationSourcePinsSchemaJson(schema_json)) return;
+    if (schema_json.len > 0) {
+        const pinned = try db.childGenerationSourcePinsSchemaJson(schema_json);
+        if (pinned) return true;
+    }
     // Catch-up may request an owner using an older Raft entry's pinned
     // descriptor after this physical generation has a newer durable schema.
     // Never roll back its schema, managed runtimes, or index definitions.
@@ -1822,9 +1844,15 @@ pub fn configureStorageKernelOwnerDbAtOpen(
             null;
         defer if (descriptor_schema) |*parsed| parsed.deinit(alloc);
         const descriptor_version: u32 = if (descriptor_schema) |parsed| parsed.version else 0;
-        if (descriptor_version < durable_schema.version) return;
+        if (descriptor_version < durable_schema.version) return false;
     }
     if (schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
+    // Schema install and parent ACK are separate committed Raft operations.
+    // Once the schema has been installed, the descriptor can equal the durable
+    // schema while the child-source/dual fence still protects its old physical
+    // indexes. Open the owner for exact topology control, but do not attempt
+    // catalog-driven index/runtime mutation or mark it configured yet.
+    if (try db.childGenerationSourceDefersOwnerCatalog()) return true;
     if (indexes_json.len > 0) {
         const installed_matches = if (installed) |state| state.matches(indexes_json) else false;
         const replace = backend_runtime != null and !installed_matches;
@@ -1847,6 +1875,61 @@ pub fn configureStorageKernelOwnerDbAtOpen(
         if (!installed_matches) try persistOwnerCatalogContract(alloc, db, indexes_json);
         if (installed) |state| state.publish(indexes_json);
     }
+    return false;
+}
+
+test "fenced owner reopen defers index deletion until exact cancellation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fenced-owner", .{tmp.sub_path});
+    defer alloc.free(path);
+    const namespace: db_mod.DocIdentityNamespace = .{ .table_id = 17, .shard_id = 19, .range_id = 19 };
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const old_indexes = "{\"old\":{\"type\":\"full_text\"}}";
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = namespace, .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc, schema_json);
+    try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(alloc, &db, "rows", schema_json, old_indexes, null, null, null, null, null, false)));
+    try std.testing.expect(db.hasIndex("old"));
+    const catalog = try db.core.store.get(alloc, @import("db/relational_integrity_catalog.zig").key);
+    defer alloc.free(catalog);
+    var catalog_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(catalog, &catalog_digest, .{});
+    const fence: @import("db/relational_integrity_topology.zig").Fence = .{
+        .transition_id = 1,
+        .attempt = 1,
+        .peer_group_id = 19,
+        .owner_group_id = 19,
+        .role = .child_generation_dual,
+        .namespace = namespace,
+        .catalog_digest = catalog_digest,
+    };
+    try db.batch(.{ .relational_topology = .{ .action = .begin, .fence = fence } });
+    try std.testing.expect(try configureStorageKernelOwnerDbAtOpen(alloc, &db, "rows", schema_json, "{}", null, null, null, null, null, false));
+    try std.testing.expect(db.hasIndex("old"));
+    const pinned_contract = (try loadOwnerCatalogContract(alloc, &db)).?;
+    defer alloc.free(pinned_contract);
+    try std.testing.expectEqualStrings(old_indexes, pinned_contract);
+    try std.testing.expectEqual(contract.StorageKernelReconcileState.busy, (try reconcileStorageKernelOwnerDb(alloc, &db, "rows", schema_json, "{}", null, false, null, null, null)).state);
+    const transition: @import("db/relational_integrity_generation_admission.zig").Transition = .{
+        .child_table_id = 17,
+        .child_table_name = "rows",
+        .constraint_name = "fk",
+        .expected_generation = null,
+        .next_generation = @splat(1),
+        .plan_id = @splat(2),
+        .decision_digest = @splat(3),
+    };
+    try db.batch(.{ .relational_topology = .{ .action = .cancel, .fence = fence, .child_generations = &.{transition} } });
+    const reconciled = try reconcileStorageKernelOwnerDb(alloc, &db, "rows", schema_json, "{}", null, false, null, null, null);
+    try std.testing.expect(reconciled.state != .busy);
+    try std.testing.expect(!db.hasIndex("old"));
+    const installed_contract = (try loadOwnerCatalogContract(alloc, &db)).?;
+    defer alloc.free(installed_contract);
+    try std.testing.expectEqualStrings("{}", installed_contract);
 }
 
 pub fn openStorageKernelRestoreDb(
@@ -1943,6 +2026,8 @@ pub fn reconcileStorageKernelOwnerDb(
     installed: ?*OwnerManagedConfig,
 ) !StorageKernelReconcileResult {
     if (schema_json.len > 0 and try db.childGenerationSourcePinsSchemaJson(schema_json))
+        return .{ .state = .busy };
+    if (try db.childGenerationSourceDefersOwnerCatalog())
         return .{ .state = .busy };
     if (target_index_name == null and schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
     const installed_matches = if (installed) |state| state.matches(indexes_json) else false;
@@ -2268,9 +2353,20 @@ pub fn reconfigureManagedDbEnrichmentRuntimePaused(
     try db.reconfigureEnrichmentRuntimePaused(enrichments.takeConfig());
 }
 
-pub const PortableCohortSource = struct { db: *db_mod.DB, handle: @import("db/native_backup_seal.zig").Handle, cancellation: @import("../api/operation.zig").CancellationToken };
+pub const PortableCohortSource = struct {
+    db: *db_mod.DB,
+    handle: @import("db/native_backup_seal.zig").Handle,
+    cancellation: @import("../api/operation.zig").CancellationToken,
+    source_generation_summary_output: ?*?[]portable_backup.SourceGenerationAdmissionSummaryEntry = null,
+};
 
 pub fn exportPortableBackupFileWithSource(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, io: std.Io, sealed: ?PortableCohortSource) !void {
+    const summary_output = if (sealed) |source| source.source_generation_summary_output else null;
+    if (summary_output) |output| output.* = null;
+    errdefer if (summary_output) |output| if (output.*) |entries| {
+        portable_backup.freeSourceGenerationAdmissionSummary(alloc, entries);
+        output.* = null;
+    };
     if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
     defer alloc.free(tmp_path);
@@ -2291,7 +2387,7 @@ pub fn exportPortableBackupFileWithSource(alloc: std.mem.Allocator, store: *db_m
     defer spool_file.close(io);
     var buf: [64 * 1024]u8 = undefined;
     var writer = file.writer(io, &buf);
-    const options: portable_backup.ExportOptions = .{ .spool = .{ .io = io, .file = spool_file } };
+    const options: portable_backup.ExportOptions = .{ .spool = .{ .io = io, .file = spool_file }, .source_generation_summary_output = if (summary_output) |output| .{ .alloc = alloc, .output = output } else null };
     if (sealed) |source|
         try source.db.exportBackupCohortPortable(source.handle, &writer.interface, options, source.cancellation)
     else

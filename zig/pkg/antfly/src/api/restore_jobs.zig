@@ -983,6 +983,13 @@ pub const Store = struct {
     /// Unknown admission retains the proposed identity. It must never enter
     /// the dispatch queue until a durable conditional create is confirmed.
     pub fn startRecoverable(self: *Store, alloc: std.mem.Allocator, request: StartRequest) !Admission {
+        return self.startRecoverableGuarded(alloc, request, true);
+    }
+
+    /// A feature gate may reject only a NEW job. Exact idempotent retries and
+    /// destination reauthorization retain their existing durable outcome;
+    /// checking here under the store mutex avoids a probe/insert race.
+    pub fn startRecoverableGuarded(self: *Store, alloc: std.mem.Allocator, request: StartRequest, allow_new: bool) !Admission {
         var req = request;
         var generated_key_buf: [37]u8 = undefined;
         if (req.idempotency_key == null) {
@@ -1091,6 +1098,8 @@ pub const Store = struct {
                 return .{ .accepted = try alloc.dupe(u8, encoded) };
             }
         }
+
+        if (!allow_new) return error.RestoreNewAdmissionGuarded;
 
         const now = nowMillis();
         const job_id = admissionJobId(explicit_map_key.?);
@@ -2862,6 +2871,34 @@ fn idempotencyMapKeyAlloc(alloc: std.mem.Allocator, namespace: []const u8, key: 
 
 fn jobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{x:0>16}", .{ key_prefix, job_id });
+}
+
+test "restore admission gate rejects new jobs but retains exact idempotent outcomes" {
+    const alloc = std.testing.allocator;
+    var store = Store.initWithIo(alloc, std.testing.io);
+    defer store.deinit();
+    const request: StartRequest = .{
+        .scope = .cluster,
+        .backup_id = "cohort",
+        .location = "file:///backup",
+        .connection = "test-backups",
+        .idempotency_namespace = "restore:cluster",
+        .idempotency_key = "same-request",
+    };
+    try std.testing.expectError(error.RestoreNewAdmissionGuarded, store.startRecoverableGuarded(alloc, request, false));
+    try std.testing.expectEqual(@as(usize, 0), store.jobs.count());
+    const first = try store.startRecoverableGuarded(alloc, request, true);
+    try std.testing.expect(first == .accepted);
+    defer alloc.free(first.accepted);
+    const repeated = try store.startRecoverableGuarded(alloc, request, false);
+    try std.testing.expect(repeated == .accepted);
+    defer alloc.free(repeated.accepted);
+    try std.testing.expectEqualStrings(first.accepted, repeated.accepted);
+    try std.testing.expectEqual(@as(usize, 1), store.jobs.count());
+    var changed = request;
+    changed.backup_id = "different";
+    try std.testing.expectError(error.IdempotencyConflict, store.startRecoverableGuarded(alloc, changed, false));
+    try std.testing.expectEqual(@as(usize, 1), store.jobs.count());
 }
 
 pub fn jobIdForIdempotency(alloc: std.mem.Allocator, namespace: []const u8, key: []const u8) !u64 {

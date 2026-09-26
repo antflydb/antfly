@@ -449,7 +449,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, restore_owner_test_mod, true, true);
     const restore_owner_tests = b.addTest(.{
         .root_module = restore_owner_test_mod,
-        .filters = &.{ "restore owner verified decoder", "relational integrity portable decoder resumes bounded row pages across LSM reopen" },
+        .filters = &.{ "restore owner verified decoder", "restore decoder", "relational integrity portable decoder resumes bounded row pages across LSM reopen", "mapped restore admission" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-restore-owner-test", "Run authenticated source cache and replicated owner control integration").dependOn(&addFilteredTestRunArtifact(b, restore_owner_tests).step);
@@ -538,6 +538,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "export and import documents preserve timestamps",
             "portable backup round trips relational rows and schema metadata",
             "portable backup refuses retained retirement and topology authority without a catalog",
+            "portable accepted-generation proof requires a sealed v3 reader and canonical unique scope",
+            "portable accepted-generation proof page reads only canonical sealed decoder metadata",
             "portable restore validates historical rows with their public schema epoch",
             "portable archive accepts long history with a bounded decoded working set",
             "ordinal rows bind layout support projection checksum and canonical bytes",
@@ -1544,6 +1546,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx schema rewrite authorizes incoming dependencies before source admission",
         "httpx schema rewrite accepted job atomically stores draft and preserves idempotent live schema",
         "httpx restore owner accepts bounded rewrite source chunks above legacy control limit",
+        "httpx hidden handoff receipt rejects public caller even in legacy internal mode",
+        "httpx FK source control rejects missing service token in legacy internal mode",
+        "hidden generation handoff receipt requires exact scoped read-index request",
         "httpx schema patch merges at the authority and accepts version zero ETag",
         "httpx relational row query mutation endpoints enforce exact versions and schema epochs",
         "httpx SQL",
@@ -1894,6 +1899,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_runtime_default_filters = [_][]const u8{
         "http host reserves service workers through its runtime and rolls back overcommit",
         "managed raft progress driver advances independently and joins on stop",
+        "managed raft progress driver wakes immediately when deferred apply owner opens",
         "managed raft progress driver publishes source failure",
         "managed raft progress driver reports a wedged round unhealthy",
         "managed raft progress driver ignores a completed observed generation",
@@ -5319,6 +5325,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const db_restore_identity_step = b.step("antfly-storage-db-restore-identity-test", "Run the focused run-backed identity restore regression");
     db_restore_identity_step.dependOn(&run_db_restore_identity_tests.step);
 
+    const db_handoff_reopen_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{"db empty-generation install receipt survives hidden to public owner reopen"},
+    });
+    const run_db_handoff_reopen_tests = addFilteredTestRunArtifact(b, db_handoff_reopen_tests);
+    b.step("antfly-storage-db-handoff-reopen-test", "Run hidden-to-public generation handoff receipt persistence regression")
+        .dependOn(&run_db_handoff_reopen_tests.step);
+
     // These focused regressions protect production paths introduced by this
     // branch. Keep them in the PR/base gate instead of defining orphan steps
     // that run only when invoked manually.
@@ -5509,6 +5523,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.graph_asset_state.",
             "storage.db.graph_edge_contender.",
             "storage.db.graph_retirement_config.",
+            "storage.db.graph_retirement_seal.",
+            "storage.db.empty_generation_handoff.",
             "storage.db.graph_state_name.",
             "storage.db.lease.",
             "storage.db.merge_contract.",
@@ -5565,6 +5581,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.row_policy_bundle.",
             "storage.db.restore_staging.",
             "storage.db.restore_staging_contract.",
+            "storage.db.restore_generation_admissions.",
             "storage.db.relational_integrity_topology.",
             "storage.db.relational_index_gc.",
             "storage.db.relational_row_cursor.",
@@ -5651,6 +5668,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.source_pin_state.",
             "storage.source_snapshot.",
             "storage.restore_owner.",
+            "storage.restore_decoder_cache.",
             "storage.relational_index.",
             "storage.rowsource.",
             "storage.schema.",

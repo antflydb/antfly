@@ -5275,6 +5275,7 @@ pub const DB = struct {
     row_policy_table_name: ?[]const u8 = null,
     rewrite_program_cache: @import("../rewrite_program_cache.zig").Cache = .{},
     rewrite_tail_cache: @import("../rewrite_tail_spool.zig").Cache = .{},
+    restore_decoder_cache: @import("../restore_decoder_cache.zig").Cache = .{},
     online_merge_reader: @import("online_merge_io.zig").Cache = .{},
     source_publication: @import("source_publication_job.zig").Job = .{},
     restore_staging_required: std.atomic.Value(bool) = .init(false),
@@ -6606,6 +6607,12 @@ pub const DB = struct {
                     if (opts.initial_child_bootstrap) |bootstrap| if (!bootstrap.matches(hidden)) return error.InitialChildPublicationChanged;
                     db.initial_child_hidden.store(hidden.phase != .released, .release);
                 }
+                // A cold old owner must not start graph workers or admit graph
+                // reads between reopening its index catalog and a resumed
+                // coordinator observing the durable cutover fence.
+                const graph_retirement = try @import("graph_retirement_seal.zig").status(&hidden_read);
+                if (graph_retirement.intent != null)
+                    db.core.index_manager.setGraphRetirementAdmissionAssumeCatalogLock(false);
             }
             const optional_runtimes_initialized = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and !ha_standby_role;
             const optional_runtime_workers_enabled = optional_runtimes_initialized and opts.start_optional_runtime_workers;
@@ -7351,6 +7358,7 @@ pub const DB = struct {
         if (self.closed) return;
         self.closed = true;
         self.source_publication.stop(self.backend_runtime.io() orelse std.Options.debug_io);
+        self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse std.Options.debug_io);
         self.online_merge_reader.retire(self.backend_runtime.io() orelse std.Options.debug_io, null);
         self.rewrite_program_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
         self.rewrite_tail_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
@@ -10634,7 +10642,7 @@ pub const DB = struct {
             .batch_mutation => {
                 var decoded = try ha_effects_mod.decodeBatchMutationRequest(self.alloc, record);
                 defer decoded.deinit();
-                if (decoded.value.initial_child_raft_entry) |entry| {
+                if (decoded.value.initial_child_raft_entry orelse decoded.value.graph_retirement_raft_entry orelse decoded.value.restore_generation_admission_raft_entry) |entry| {
                     try self.batchInternal(decoded.value.request, null, .{
                         .validate_range_ownership = false,
                         .wait_for_sync_level = false,
@@ -10972,22 +10980,40 @@ pub const DB = struct {
                     _ = finish;
                     return self.applyRestoreStagingControl(req, opts);
                 },
+                .install_generation_admissions => |install| {
+                    if (req.writes.len != 0 or req.deletes.len != 0) return error.InvalidRestoreStagingCommand;
+                    try install.validate();
+                    return self.applyRestoreStagingControl(req, opts);
+                },
                 .import_page, .rewrite_page => |page| {
                     if (req.writes.len +| req.deletes.len > 128 or page.timestamps.len != req.writes.len or page.next.len > 8 * 1024 * 1024) return error.InvalidRestoreStagingCommand;
-                    if (page.artifacts.len > 128 or (page.artifact_page and page.projection_page) or
-                        ((page.artifact_page or page.projection_page) and (control != .import_page or req.writes.len != 0 or req.deletes.len != 0)) or
-                        (!page.artifact_page and !page.projection_page and page.artifacts.len != 0)) return error.InvalidRestoreStagingCommand;
+                    if (page.artifacts.len > (if (page.source_generation_proof_page) @as(usize, 1024) else 128) or
+                        @as(u8, @intFromBool(page.artifact_page)) + @as(u8, @intFromBool(page.projection_page)) + @as(u8, @intFromBool(page.source_generation_proof_page)) > 1 or
+                        ((page.artifact_page or page.projection_page or page.source_generation_proof_page) and (control != .import_page or req.writes.len != 0 or req.deletes.len != 0)) or
+                        (!page.artifact_page and !page.projection_page and !page.source_generation_proof_page and page.artifacts.len != 0)) return error.InvalidRestoreStagingCommand;
                     var timestamps: std.StringHashMapUnmanaged(u64) = .empty;
                     defer timestamps.deinit(self.alloc);
                     var input_bytes: usize = 0;
                     var previous_artifact: ?[]const u8 = null;
                     for (page.artifacts) |artifact| {
-                        if (!(if (page.projection_page) isMergeArtifactKey(artifact.key) else isRestoreArtifactKey(artifact.key))) return error.InvalidRestoreStagingCommand;
+                        if (page.source_generation_proof_page) {
+                            const portable = @import("../portable_backup.zig");
+                            const accepted = @import("relational_integrity_generation_admission.zig");
+                            if (!std.mem.startsWith(u8, artifact.key, portable.source_generation_admission_prefix) or
+                                artifact.key.len != portable.source_generation_admission_prefix.len + 32) return error.InvalidRestoreStagingCommand;
+                            const decoded = accepted.Scope.decode(artifact.value) catch return error.InvalidRestoreStagingCommand;
+                            if (decoded.phase != .active) return error.InvalidRestoreStagingCommand;
+                            const key = try accepted.scopeKey(decoded.child_table_name, decoded.constraint_name);
+                            if (!std.mem.eql(u8, artifact.key[portable.source_generation_admission_prefix.len..], key[accepted.prefix.len..]))
+                                return error.InvalidRestoreStagingCommand;
+                        } else if (!(if (page.projection_page) isMergeArtifactKey(artifact.key) else isRestoreArtifactKey(artifact.key))) return error.InvalidRestoreStagingCommand;
                         if (previous_artifact) |previous| if (std.mem.order(u8, previous, artifact.key) != .lt) return error.InvalidRestoreStagingCommand;
                         previous_artifact = artifact.key;
-                        const owner = (try internal_keys.decodeDocumentComponentAlloc(self.alloc, artifact.key)) orelse return error.InvalidRestoreStagingCommand;
-                        defer self.alloc.free(owner);
-                        if (!self.core.byteRange().contains(owner)) return error.KeyOutOfRange;
+                        if (!page.source_generation_proof_page) {
+                            const owner = (try internal_keys.decodeDocumentComponentAlloc(self.alloc, artifact.key)) orelse return error.InvalidRestoreStagingCommand;
+                            defer self.alloc.free(owner);
+                            if (!self.core.byteRange().contains(owner)) return error.KeyOutOfRange;
+                        }
                         input_bytes = std.math.add(usize, input_bytes, artifact.key.len +| artifact.value.len) catch return error.TransactionTooLarge;
                         if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
                     }
@@ -11008,18 +11034,18 @@ pub const DB = struct {
                     }
                     var apply_req = req;
                     apply_req.restore_staging = null;
-                    apply_req.sync_level = if (page.artifact_page) .write else .full_index;
+                    apply_req.sync_level = if (page.artifact_page or page.source_generation_proof_page) .write else .full_index;
                     var apply_opts = opts;
-                    apply_opts.wait_for_sync_level = !page.artifact_page;
-                    apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects, .artifact_page = page.artifact_page, .projection_page = page.projection_page };
+                    apply_opts.wait_for_sync_level = !page.artifact_page and !page.source_generation_proof_page;
+                    apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects, .artifact_page = page.artifact_page, .projection_page = page.projection_page, .source_generation_proof_page = page.source_generation_proof_page };
                     apply_opts.restore_timestamps = &timestamps;
                     apply_opts.restore_ha_request = req;
                     apply_opts.restore_artifacts = page.artifacts;
-                    const extra = try self.alloc.alloc(docstore_mod.KVPair, opts.extra_store_writes.len + 1 + @intFromBool(page.artifacts.len != 0));
+                    const extra = try self.alloc.alloc(docstore_mod.KVPair, opts.extra_store_writes.len + 1 + @intFromBool(page.artifacts.len != 0 and !page.source_generation_proof_page));
                     defer self.alloc.free(extra);
                     @memcpy(extra[0..opts.extra_store_writes.len], opts.extra_store_writes);
                     extra[opts.extra_store_writes.len] = .{ .key = @import("restore_staging.zig").key, .value = page.next };
-                    if (page.artifacts.len != 0) {
+                    if (page.artifacts.len != 0 and !page.source_generation_proof_page) {
                         self.core.artifact_cleanup_maybe.store(true, .release);
                         extra[extra.len - 1] = .{ .key = internal_keys.artifact_presence_key[0..], .value = "1" };
                     }
@@ -24302,7 +24328,14 @@ pub const DB = struct {
             const foreign_count = if (public_schema.foreign_keys) |values| values.value.len else 0;
             const per_row = @max(@as(usize, 1), @max(unique_count, foreign_count));
             const declaration_limit = @max(@as(usize, 1), @import("relational_integrity.zig").max_commands / (2 * per_row));
-            var page = (try activation.Page.prepare(alloc, self.backend_runtime.io(), self.core, .{ .rows = @min(request.value.max_rows, declaration_limit), .output_bytes = 1024 * 1024 })) orelse return null;
+            // Activation pages commit through distributed 2PC. A bounded
+            // 100 ms source scan amortizes that commit without changing the
+            // reusable reader's caller-specified budget or its row/byte caps.
+            var page = (try activation.Page.prepare(alloc, self.backend_runtime.io(), self.core, .{
+                .rows = @min(request.value.max_rows, declaration_limit),
+                .output_bytes = 1024 * 1024,
+                .time_ns = 100 * std.time.ns_per_ms,
+            })) orelse return null;
             defer page.deinit();
             if (page.progress.schema_version != view.version()) return error.PreparedGenerationChanged;
             const Row = struct { key: []const u8, json: []const u8, version: u64, expected_content_digest: ?[32]u8 };
@@ -25149,6 +25182,11 @@ pub const DB = struct {
     /// Portable logical rows from the identical immutable cut used by native
     /// cohorts. The live root may already have resumed writes at this point.
     pub fn exportBackupCohortPortable(self: *DB, handle: @import("native_backup_seal.zig").Handle, writer: *std.Io.Writer, options: portable_backup.ExportOptions, cancellation: types.CancellationToken) !void {
+        if (options.source_generation_summary_output) |summary| summary.output.* = null;
+        errdefer if (options.source_generation_summary_output) |summary| if (summary.output.*) |entries| {
+            portable_backup.freeSourceGenerationAdmissionSummary(summary.alloc, entries);
+            summary.output.* = null;
+        };
         var row_policy_lease = try self.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
         const checkpoint: RowPolicyOutputCheckpoint = .{ .upstream = cancellation, .lease = &row_policy_lease };
@@ -29433,7 +29471,7 @@ pub const DB = struct {
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
-            mode: enum { identity, status, completed, parent_activation, generation_publication, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
+            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, graph_retirement, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
             scope: ?@import("online_source_contract.zig").Scope = null,
         }, alloc, request_json, .{});
         defer request.deinit();
@@ -29497,6 +29535,39 @@ pub const DB = struct {
                 defer read.abort();
                 const value = try @import("relational_integrity_generation_admission.zig").ownerStatus(&read);
                 try @import("relational_integrity_json.zig").write(value, &stream);
+            },
+            .generation_handoff_summary => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                // This status scans bounded live scopes and streams the
+                // historical retirement digest. Probe transactions cannot
+                // open physical cursors; pin one coherent read snapshot.
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                var value = try @import("empty_generation_handoff.zig").summaryAlloc(alloc, &read, self.core.identity_namespace);
+                defer value.deinit(alloc);
+                try @import("relational_integrity_json.zig").write(value, &stream);
+            },
+            .generation_handoff_seal => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                try @import("relational_integrity_json.zig").write(try @import("empty_generation_handoff.zig").sealStatus(&read, self.core.identity_namespace), &stream);
+            },
+            .generation_handoff_install => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                try @import("relational_integrity_json.zig").write(try @import("empty_generation_handoff.zig").loadInstallReceipt(&read), &stream);
+            },
+            .graph_retirement => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                try @import("relational_integrity_json.zig").write(try @import("graph_retirement_seal.zig").status(&read), &stream);
             },
             .initial_child_publication => {
                 self.core.lockApplyShared();
@@ -29627,17 +29698,23 @@ pub const DB = struct {
         return .{ .fence = fence, .drained = !try manager.hasTopologySensitiveTransactions() };
     }
 
-    fn childGenerationSourcePinsSchema(core: *db_core.DBCore, candidate_version: u32) !bool {
+    fn childGenerationSourceFence(core: *db_core.DBCore) !bool {
         var read = try core.store.beginProbeTxn();
         defer read.abort();
         const fence = (try @import("relational_integrity_topology.zig").current(&read)) orelse return false;
         if (fence.role != .child_generation_source and fence.role != .child_generation_dual) return false;
-        const durable = core.schema orelse return error.IntegrityCatalogChanged;
+        _ = core.schema orelse return error.IntegrityCatalogChanged;
         if (!fence.namespace.eql(core.identity_namespace)) return error.IdentityNamespaceMismatch;
         const encoded_catalog = read.get(@import("relational_integrity_catalog.zig").key) catch return error.IntegrityCatalogChanged;
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(encoded_catalog, &digest, .{});
         if (!std.mem.eql(u8, &digest, &fence.catalog_digest)) return error.IntegrityCatalogChanged;
+        return true;
+    }
+
+    fn childGenerationSourcePinsSchema(core: *db_core.DBCore, candidate_version: u32) !bool {
+        if (!try childGenerationSourceFence(core)) return false;
+        const durable = core.schema orelse return error.IntegrityCatalogChanged;
         if (candidate_version <= durable.version) return false;
         if (candidate_version != (std.math.add(u32, durable.version, 1) catch return error.GenerationAdmissionChanged))
             return error.GenerationAdmissionChanged;
@@ -29653,6 +29730,16 @@ pub const DB = struct {
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
         return childGenerationSourcePinsSchema(self.core, parsed.version);
+    }
+
+    /// A cold current-catalog owner may reopen after the exact child schema
+    /// install but before parent ACK removes the dual/source fence. During that
+    /// interval its durable index catalog is authoritative; metadata-driven
+    /// add/remove/repair is a mutation and must wait for fence release.
+    pub fn childGenerationSourceDefersOwnerCatalog(self: *DB) !bool {
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        return childGenerationSourceFence(self.core);
     }
 
     /// The allocator belongs to one bounded transfer request/arena. All slices
@@ -29973,16 +30060,29 @@ pub const DB = struct {
 
     fn applyRelationalTopologyBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
         if (req.relational_index_maintenance != null) return error.InvalidBatchRequest;
+        const hidden_handoff_install = if (req.relational_topology) |control| control.action == .install_generation_handoff else false;
+        if (hidden_handoff_install) {
+            const control = req.relational_topology.?;
+            const install = control.generation_handoff_install orelse return error.InvalidBatchRequest;
+            var expected_plan_id: [16]u8 = undefined;
+            std.mem.writeInt(u64, expected_plan_id[0..8], control.fence.transition_id, .little);
+            std.mem.writeInt(u64, expected_plan_id[8..16], control.fence.attempt, .little);
+            if (req.restore_staging_scope == null or req.restore_staging_plan_id == null or
+                !std.mem.eql(u8, &req.restore_staging_scope.?, &install.scope) or
+                !std.mem.eql(u8, &req.restore_staging_plan_id.?, &expected_plan_id)) return error.InvalidBatchRequest;
+        } else if (req.restore_staging_scope != null or req.restore_staging_plan_id != null) return error.InvalidBatchRequest;
         if (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
             req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.integrity.len != 0 or
             req.integrity_commands.len != 0 or req.predicates.len != 0 or req.transaction != null or
-            req.restore_staging != null or req.restore_staging_scope != null or
+            req.restore_staging != null or
             req.relational_activation != null or req.relational_retirement != null or
             req.relational_repair or req.split_checkpoint != null or req.split_replication != null or
             req.merge_checkpoint != null or req.merge_replication != null or
             req.merge_source_transition != null or req.merge_artifacts.len != 0) return error.InvalidBatchRequest;
         if (req.relational_topology != null and req.split_transition != null) return error.InvalidBatchRequest;
         if (req.relational_topology) |command| if (command.fence.role == .backup_snapshot and (command.action != .begin and command.action != .release and command.action != .cancel)) return error.InvalidBatchRequest;
+        if (req.relational_topology) |command| if ((command.action == .seal_graph_retirement and command.graph_retirement == null) or
+            (command.graph_retirement != null and command.action != .begin and command.action != .seal_graph_retirement)) return error.InvalidBatchRequest;
         if (req.split_transition) |transition| if (transition.kind != .finalize) return error.InvalidBatchRequest;
         if (req.relational_topology) |command| if (command.action == .install_child_schema) {
             if ((command.fence.role != .child_generation_source and command.fence.role != .child_generation_dual) or command.child_schema_install == null or
@@ -30065,7 +30165,13 @@ pub const DB = struct {
             try self.preflightHABatchSyncCommit();
         }
         const payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
-            try ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
+            if (req.relational_topology) |command|
+                if (command.action == .seal_graph_retirement)
+                    try ha_effects_mod.encodeGraphRetirementSealMutationRequestAlloc(self.alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest)
+                else
+                    try ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
+            else
+                try ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
         else
             null;
         defer if (payload) |bytes| self.alloc.free(bytes);
@@ -30096,6 +30202,12 @@ pub const DB = struct {
             .already_applied => return,
             .apply => {},
         };
+        const graph_catalog_lock_required = command.graph_retirement != null or
+            (command.fence.role == .rewrite_source and (command.action == .cancel or command.action == .abort_transition));
+        if (graph_catalog_lock_required and !self.core.index_manager.catalog_mutex.tryLockExclusive()) return error.StorageBusy;
+        defer if (graph_catalog_lock_required) self.core.index_manager.catalog_mutex.unlockExclusive();
+        var close_graph_after_commit = false;
+        var open_graph_after_commit = false;
         if (!command.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
@@ -30108,6 +30220,11 @@ pub const DB = struct {
         }
         const topology = @import("relational_integrity_topology.zig");
         if ((command.action == .transfer) != (command.transfer != null) or
+            (command.action == .seal_graph_retirement and command.graph_retirement == null) or
+            (command.graph_retirement != null and command.action != .begin and command.action != .seal_graph_retirement) or
+            (command.generation_handoff != null and command.action != .begin) or
+            ((command.action == .seal_generation_handoff) != (command.generation_handoff_seal != null)) or
+            ((command.action == .install_generation_handoff) != (command.generation_handoff_install != null)) or
             (command.action == .stage_parent_retirement) != (command.parent_retirement != null) or
             ((command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement) != (command.parent_activation != null)) or
             ((command.action == .stage_child_generation or command.action == .activate_child_generation or command.action == .acknowledge_child_generation or
@@ -30115,6 +30232,11 @@ pub const DB = struct {
         if (command.child_schema_install != null) return error.InvalidBatchRequest;
         switch (command.action) {
             .begin => {
+                if (command.graph_retirement) |scope| {
+                    if (!scope.fence.eql(command.fence)) return error.InvalidBatchRequest;
+                    const loaded = (try self.core.index_manager.graphRetirementConfigDigestAssumeCatalogLock(self.alloc)) orelse return error.InvalidBatchRequest;
+                    if (!std.mem.eql(u8, &loaded, &scope.graph_config_digest)) return error.InvalidBatchRequest;
+                }
                 if (try topology.current(&txn) == null) {
                     if (command.fence.role == .split_destination) {
                         const previous_manifest = txn.get(@import("relational_integrity_handoff.zig").manifest_key) catch |err| switch (err) {
@@ -30149,9 +30271,55 @@ pub const DB = struct {
                         if (try manager.hasTopologySensitiveTransactions()) return error.IntegrityTopologyBusy;
                     }
                 }
-                try topology.stageBegin(&txn, command.fence);
+                try topology.stageBeginWithHandoff(&txn, command.fence, command.generation_handoff);
+                if (command.graph_retirement) |scope| {
+                    try @import("graph_retirement_seal.zig").stageBegin(&txn, scope);
+                    close_graph_after_commit = true;
+                }
                 if (command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual)
                     try @import("relational_integrity_generation_admission.zig").stageSourceFencedReceipt(&txn, command.fence, if (raft_entry) |entry| entry.term else 0, if (raft_entry) |entry| entry.index else 0);
+            },
+            .seal_graph_retirement => {
+                const scope = command.graph_retirement.?;
+                if (!scope.fence.eql(command.fence)) return error.InvalidBatchRequest;
+                if (!self.core.index_manager.graphRetirementPinsDrainedAssumeCatalogLock()) return error.StorageBusy;
+                const loaded = (try self.core.index_manager.graphRetirementConfigDigestAssumeCatalogLock(self.alloc)) orelse return error.InvalidBatchRequest;
+                if (!std.mem.eql(u8, &loaded, &scope.graph_config_digest)) return error.InvalidBatchRequest;
+                const entry = raft_entry orelse return error.InvalidBatchRequest;
+                _ = try @import("graph_retirement_seal.zig").stageSeal(&txn, scope, entry.term, entry.index);
+            },
+            .seal_generation_handoff => {
+                const entry = raft_entry orelse return error.InvalidBatchRequest;
+                try @import("empty_generation_handoff.zig").stageSeal(&txn, command.fence, command.generation_handoff_seal.?, entry.term, entry.index);
+            },
+            .install_generation_handoff => {
+                if (command.fence.role != .rewrite_destination) return error.InvalidGenerationHandoff;
+                const entry = raft_entry orelse return error.InvalidBatchRequest;
+                const install = command.generation_handoff_install.?;
+                const contract = @import("restore_staging_contract.zig");
+                const logical = try @import("empty_generation_handoff.zig").installReceiptDigest(install);
+                var expected_plan_id: [16]u8 = undefined;
+                std.mem.writeInt(u64, expected_plan_id[0..8], command.fence.transition_id, .little);
+                std.mem.writeInt(u64, expected_plan_id[8..16], command.fence.attempt, .little);
+                const bootstrap_raw = txn.get(contract.bootstrap_key) catch return error.RestoreStagingScopeChanged;
+                var bootstrap = try contract.OwnerBootstrap.decode(self.alloc, bootstrap_raw);
+                defer bootstrap.deinit();
+                const binding = bootstrap.value.empty_generation_handoff orelse return error.GenerationHandoffIntentMissing;
+                const raw_progress = txn.get(contract.key) catch return error.RestoreStagingScopeChanged;
+                var progress = try contract.Progress.decode(self.alloc, raw_progress);
+                defer progress.deinit();
+                if (!bootstrap.value.scope.empty_generation or
+                    !bootstrap.value.scope.target_namespace.eql(command.fence.namespace) or
+                    !std.mem.eql(u8, &bootstrap.value.scope.plan_id, &expected_plan_id) or
+                    !std.mem.eql(u8, &bootstrap.value.scope.digest(), &install.scope) or
+                    !std.mem.eql(u8, &progress.value.scope.digest(), &install.scope) or
+                    progress.value.phase != .validated or
+                    !std.mem.eql(u8, &binding.source_summary_digest, &install.source_summary_digest) or
+                    !std.mem.eql(u8, &binding.retired_digest, &install.retired_digest) or
+                    binding.retired_count != install.retired_count or
+                    !std.mem.eql(u8, &binding.expected_install_receipt_digest, &logical))
+                    return error.RestoreStagingScopeChanged;
+                _ = try @import("empty_generation_handoff.zig").stageInstall(self.alloc, &txn, install, bootstrap.value.scope.plan_id, entry.term, entry.index);
             },
             .release => {
                 if (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual or command.fence.role == .truncate_parent)
@@ -30203,6 +30371,8 @@ pub const DB = struct {
                     const encoded_fence = try command.fence.encode();
                     try txn.put(@import("relational_integrity_generation_admission.zig").dual_canceled_fence_key, &encoded_fence);
                 }
+                if (command.fence.role == .rewrite_source)
+                    open_graph_after_commit = try @import("graph_retirement_seal.zig").stageCancel(&txn, command.fence);
             },
             .abort_transition => {
                 if (command.fence.role == .merge_destination and try topology.current(&txn) != null) {
@@ -30232,6 +30402,8 @@ pub const DB = struct {
                     }
                 }
                 try topology.stageAbortTransition(&txn, command.fence);
+                if (command.fence.role == .rewrite_source)
+                    open_graph_after_commit = try @import("graph_retirement_seal.zig").stageCancel(&txn, command.fence);
             },
             .transfer => {
                 var manager = try self.core.initTxnManager();
@@ -30347,6 +30519,8 @@ pub const DB = struct {
         }
         try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
         try txn.commit();
+        if (close_graph_after_commit) self.core.index_manager.setGraphRetirementAdmissionAssumeCatalogLock(false);
+        if (open_graph_after_commit) self.core.index_manager.setGraphRetirementAdmissionAssumeCatalogLock(true);
     }
 
     pub fn markTransactionParticipantResolved(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
@@ -30466,6 +30640,7 @@ pub const DB = struct {
         if (key.len == 0) return try alloc.alloc(graph_mod.Edge, 0);
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const edges = try self.core.graphGetEdges(alloc, index_name, key, edge_type, direction);
         errdefer graph_mod.GraphIndex.freeEdges(alloc, edges);
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -30484,6 +30659,7 @@ pub const DB = struct {
         if (start_key.len == 0) return try alloc.alloc(traversal_mod.TraversalResult, 0);
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const results = try self.core.graphTraverseEdges(alloc, index_name, start_key, rules);
         errdefer traversal_mod.freeOwnedResults(alloc, results);
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -30528,6 +30704,7 @@ pub const DB = struct {
         if (source.len == 0 or target.len == 0) return null;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (try self.findAlgebraicShortestPath(alloc, index_name, source, target, edge_types, direction, weight_mode, max_depth, min_weight, max_weight)) |path| {
             return path;
         }
@@ -30575,6 +30752,7 @@ pub const DB = struct {
         }
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.graphFindKShortestPaths(
             alloc,
             index_name,
@@ -30696,6 +30874,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         var work_budget = graph_pattern_mod.WorkBudget.init(
             graph_pattern_mod.default_max_explored_nodes,
             graph_pattern_mod.default_max_explored_edges,
@@ -30903,6 +31082,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (req.identity_read_generation == null) {
             for (input_sets) |input_set| {
                 if (input_set.hit_ids.len > 0) return error.UnsupportedQueryRequest;
@@ -34231,6 +34411,10 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         while (true) {
             lockApply(self);
+            if (!self.core.index_manager.graphRetirementAdmissionOpen()) {
+                self.core.unlockApply();
+                return error.IntegrityTopologyBusy;
+            }
             const more = self.core.index_manager.runGraphOwnershipCleanupStep() catch |err| {
                 self.core.unlockApply();
                 return err;
@@ -34248,6 +34432,7 @@ pub const DB = struct {
         }
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return switch (self.graph_metric_idle_maintenance) {
             .legacy => try self.core.index_manager.runGraphMetricMaintenance(),
             .planned, .auto => unreachable,
@@ -34296,6 +34481,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedMaintenance(options);
     }
 
@@ -34384,6 +34570,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.enableGraphMetric(metric_name);
         var status = try entry.index.runGraphMetric(metric_name);
@@ -34397,6 +34584,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.enableGraphMetric(metric_name);
         var status = try entry.index.runGraphMetric(metric_name);
@@ -34420,6 +34608,7 @@ pub const DB = struct {
         const owned_status = blk: {
             lockApply(self);
             defer self.core.unlockApply();
+            if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
             const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
             var current = try entry.index.graphMetricStatus(metric_name);
             defer current.deinit(entry.index.alloc);
@@ -34455,6 +34644,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.deleteGraphMetricMaterialization(metric_name);
         var status = try entry.index.graphMetricStatus(metric_name);
@@ -34468,6 +34658,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         var status = try entry.index.pauseGraphMetricMaintenance(metric_name);
         defer status.deinit(entry.index.alloc);
@@ -34478,6 +34669,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         var status = try entry.index.resumeGraphMetricMaintenance(metric_name);
         defer status.deinit(entry.index.alloc);
@@ -34494,6 +34686,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         var status = try self.core.index_manager.ensureGraphMetricPlannedBuild(index_name, metric_name, target_generation);
         defer status.deinit(self.core.index_manager.alloc);
         return try cloneGraphMetricStatusFromGraph(alloc, status);
@@ -34503,6 +34696,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedWorkerPageStep(index_name, metric_name, worker_id);
     }
 
@@ -34510,6 +34704,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedWorkerPageStepAt(index_name, metric_name, worker_id, now_ms);
     }
 
@@ -34517,6 +34712,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedCoordinatorStep(index_name, metric_name);
     }
 
@@ -34524,6 +34720,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         return try self.core.index_manager.runGraphMetricPlannedCoordinatorStepAt(index_name, metric_name, now_ms);
     }
 
@@ -34531,6 +34728,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         var status = try self.core.index_manager.failGraphMetricPlannedBuild(index_name, metric_name, err);
         defer status.deinit(self.core.index_manager.alloc);
         return try cloneGraphMetricStatusFromGraph(alloc, status);
@@ -34540,6 +34738,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         var status = try self.core.index_manager.runGraphMetricPlannedDrain(index_name, metric_name, target_generation, options);
         defer status.deinit(self.core.index_manager.alloc);
         return try cloneGraphMetricStatusFromGraph(alloc, status);
@@ -39186,6 +39385,12 @@ pub const DB = struct {
         return try staging.Progress.decode(alloc, raw);
     }
 
+    pub fn restoreGenerationAdmissionReceipt(self: *DB) !?@import("restore_staging_contract.zig").GenerationAdmissionReceipt {
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return @import("restore_generation_admissions.zig").loadReceipt(&read);
+    }
+
     /// Private provisioners call this before cache adoption, after installing
     /// the durable reservation. Initial empty schema/index admission must not
     /// emit an HA mutation before its owner authorization exists.
@@ -39461,8 +39666,10 @@ pub const DB = struct {
         return @import("relational_initial_child_publication.zig").load(&txn);
     }
 
-    fn encodeRestoreStagingHAPayload(self: *DB, req: types.BatchRequest) ![]u8 {
+    fn encodeRestoreStagingHAPayload(self: *DB, req: types.BatchRequest, raft_entry: ?RaftAppliedEntryIdentity) ![]u8 {
         const staging = @import("restore_staging.zig");
+        if (req.restore_staging.? == .install_generation_admissions)
+            return ha_effects_mod.encodeRestoreGenerationAdmissionMutationRequestAlloc(self.alloc, req, raft_entry orelse return error.InvalidRestoreStagingCommand);
         if (req.restore_staging.? == .begin) {
             const stored = try self.core.getStoreValue(self.alloc, staging.bootstrap_key);
             defer if (stored) |bytes| self.alloc.free(bytes);
@@ -39494,6 +39701,61 @@ pub const DB = struct {
         if (!ready) return error.RestoreProjectionCatchUpPending;
     }
 
+    fn installRestoreGenerationAdmissionsWithMarker(
+        self: *DB,
+        alloc: Allocator,
+        command: @import("restore_staging_contract.zig").InstallGenerationAdmissions,
+        marker: ?RaftAppliedEntryIdentity,
+        ha_lsn: ?u64,
+        ha_payload: ?[]const u8,
+    ) !@import("restore_staging_contract.zig").GenerationAdmissionReceipt {
+        const contract = @import("restore_staging_contract.zig");
+        const entry = marker orelse return error.InvalidRestoreStagingCommand;
+        const expected = try contract.admissionReceiptDigest(command);
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var txn = try self.core.store.beginWriteTxn();
+        var txn_open = true;
+        defer if (txn_open) txn.abort();
+        const bootstrap_bytes = txn.get(contract.bootstrap_key) catch |err| switch (err) {
+            error.NotFound => return error.RestoreStagingScopeChanged,
+            else => return err,
+        };
+        var bootstrap = try contract.OwnerBootstrap.decode(alloc, bootstrap_bytes);
+        defer bootstrap.deinit();
+        const binding = bootstrap.value.generation_admission orelse return error.RestoreSourceProofMissing;
+        const source_proof_digest = bootstrap.value.source_generation_proof_digest orelse return error.RestoreSourceProofMissing;
+        if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &command.scope) or
+            !std.mem.eql(u8, &source_proof_digest, &binding.source_summary_digest) or
+            !std.mem.eql(u8, &binding.source_summary_digest, &command.source_summary_digest) or
+            !std.mem.eql(u8, &binding.expected_receipt_digest, &expected))
+            return error.RestoreStagingScopeChanged;
+        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(alloc, self.core.store), entry)) {
+            .already_applied => {
+                const receipt = (try @import("restore_generation_admissions.zig").loadReceipt(&txn)) orelse
+                    return error.RestoreSourceProofMissing;
+                if (!std.mem.eql(u8, &receipt.logical_digest, &expected) or
+                    !std.mem.eql(u8, &receipt.scope, &command.scope)) return error.RestoreStagingScopeChanged;
+                return receipt;
+            },
+            .apply => {},
+        }
+        const receipt = try @import("restore_generation_admissions.zig").stageInstall(alloc, &txn, command, entry.term, entry.index);
+        var marker_bytes: [raft_applied_entry_value_len]u8 = undefined;
+        const applied = raftAppliedEntryWrite(entry, &marker_bytes);
+        try txn.put(applied.key, applied.value);
+        if (ha_lsn) |lsn| {
+            var lsn_bytes: [ha_applied_lsn_value_len]u8 = undefined;
+            const replicated = haAppliedReplicationLsnWrite(lsn, &lsn_bytes);
+            try txn.put(replicated.key, replicated.value);
+        }
+        try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+        try txn.commit();
+        txn_open = false;
+        try self.core.store.sync(true);
+        return receipt;
+    }
+
     /// Control payload and owner marker are committed together. Every HA mode
     /// retains a local append obligation; remote acknowledgement still follows
     /// the configured policy. Retrying an applied Raft entry drains this record.
@@ -39517,13 +39779,14 @@ pub const DB = struct {
             try self.preflightHABatchSyncCommit();
         }
         const payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
-            try self.encodeRestoreStagingHAPayload(req)
+            try self.encodeRestoreStagingHAPayload(req, opts.raft_applied_entry_marker)
         else
             null;
         defer if (payload) |bytes| self.alloc.free(bytes);
         switch (req.restore_staging.?) {
             .begin => |scope| try self.beginRestoreStagingWithMarker(self.alloc, scope, opts.raft_applied_entry_marker, opts.ha_applied_lsn_marker, payload),
             .finish => |finish| _ = try self.finishRestoreStagingWithMarker(self.alloc, finish.scope, finish.phase, opts.raft_applied_entry_marker, opts.ha_applied_lsn_marker, payload),
+            .install_generation_admissions => |install| _ = try self.installRestoreGenerationAdmissionsWithMarker(self.alloc, install, opts.raft_applied_entry_marker, opts.ha_applied_lsn_marker, payload),
             .import_page, .rewrite_page => unreachable,
         }
         if (payload != null) try self.flushDurableHAOutboxes();
@@ -39753,7 +40016,18 @@ pub const DB = struct {
                 try txn.put(@import("relational_integrity_activation.zig").key, coverage);
             }
         }
-        const initial = try (staging.Progress{ .scope = scope, .phase = if (scope.empty_generation) .imported else .importing, .rewrite = if (scope.rewrite) |rewrite| .{ .sequence = rewrite.retained_start } else null }).encode(alloc);
+        const bootstrap_raw = txn.get(staging.bootstrap_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        var source_proofs_required = false;
+        if (bootstrap_raw) |bytes| {
+            var bootstrap = try staging.OwnerBootstrap.decode(alloc, bytes);
+            defer bootstrap.deinit();
+            if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &scope.digest())) return error.RestoreStagingScopeChanged;
+            source_proofs_required = bootstrap.value.source_generation_proof_digest != null;
+        }
+        const initial = try (staging.Progress{ .scope = scope, .phase = if (scope.empty_generation) .imported else .importing, .source_generation_proofs_complete = !source_proofs_required, .rewrite = if (scope.rewrite) |rewrite| .{ .sequence = rewrite.retained_start } else null }).encode(alloc);
         defer alloc.free(initial);
         try txn.put(staging.key, initial);
         try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
@@ -39810,6 +40084,34 @@ pub const DB = struct {
         if (next.phase == .canceled) return error.RestoreStagingCanceled;
         if (next.phase == .reserved) return error.RestoreStagingInProgress;
         if (next.phase != .importing) return .{ .arena = arena, .phase = next.phase, .batch = null };
+        if (!next.source_generation_proofs_complete) {
+            const portable = @import("../portable_backup.zig");
+            var bootstrap = (try self.readRestoreStagingBootstrap(alloc)) orelse return error.RestoreSourceProofMissing;
+            defer bootstrap.deinit();
+            const expected_digest = bootstrap.value.source_generation_proof_digest orelse return error.RestoreSourceProofMissing;
+            if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &scope.digest())) return error.RestoreStagingScopeChanged;
+            var source_read = try source.core.store.beginReadTxn();
+            defer source_read.abort();
+            var proofs = try portable.sourceGenerationAdmissionProofPageAlloc(alloc, &source_read, scope.source_namespace);
+            defer proofs.deinit();
+            if (!std.mem.eql(u8, &expected_digest, &try portable.sourceGenerationAdmissionSummaryDigest(scope.source_namespace, proofs.entries)))
+                return error.RestoreSourceProofMissing;
+            const artifacts = try owned.alloc(staging.Artifact, proofs.artifacts.len);
+            for (proofs.artifacts, artifacts) |proof, *artifact| artifact.* = .{
+                .key = try owned.dupe(u8, proof.key),
+                .value = try owned.dupe(u8, proof.value),
+            };
+            next.source_generation_proofs_complete = true;
+            const encoded_progress = try next.encode(owned);
+            return .{ .arena = arena, .phase = next.phase, .batch = .{ .sync_level = .write, .restore_staging = .{ .import_page = .{
+                .expected = staging.digest(raw),
+                .next = encoded_progress,
+                .scope = scope.digest(),
+                .timestamps = &.{},
+                .source_generation_proof_page = true,
+                .artifacts = artifacts,
+            } } } };
+        }
         if (next.rewrite) |rewrite| if (rewrite.snapshot_complete) return .{ .arena = arena, .phase = next.phase, .batch = null };
         if (scope.preserve_artifacts and (!next.artifacts_complete or next.rows_complete)) {
             // Import immutable generated inputs before primary rows. Normal
@@ -39841,7 +40143,12 @@ pub const DB = struct {
             var artifacts: std.ArrayList(staging.Artifact) = .empty;
             var artifact_bytes: usize = 0;
             var examined_artifacts: usize = 0;
-            const artifact_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_ms;
+            // Artifact and projection passes only scan the immutable source;
+            // they often emit no writes. Give a bounded cursor turn enough
+            // time to amortize reopening the decoder and committing its
+            // continuation, while retaining per-record cancellation and the
+            // 1024-record/128-artifact/16 MiB page ceilings below.
+            const artifact_deadline = monotonicTimeNs() +| 100 * std.time.ns_per_ms;
             while (artifact_entry) |row| : (artifact_entry = try artifacts_cursor.next()) {
                 _ = record_arena.reset(.retain_capacity);
                 const scratch = record_arena.allocator();
@@ -39954,14 +40261,24 @@ pub const DB = struct {
         defer if (historical) |*view| view.release();
         var bytes: usize = 0;
         var examined: usize = 0;
-        const deadline = monotonicTimeNs() +| 5 * std.time.ns_per_ms;
+        const row_started = monotonicTimeNs();
+        const row_soft_deadline = row_started +| 5 * std.time.ns_per_ms;
+        const row_hard_deadline = row_started +| 100 * std.time.ns_per_ms;
         while (entry) |row| : (entry = try cursor.next()) {
             if (cancellation.isCancelled()) return error.Canceled;
             if (row.key.len == 0 or row.key[0] != internal_keys.user_namespace) {
                 entry = null;
                 break;
             }
-            if (writes.items.len == max_rows or examined == 1024 or (examined != 0 and monotonicTimeNs() >= deadline)) break;
+            if (writes.items.len == max_rows or examined == 1024) break;
+            if (examined != 0) {
+                const now = monotonicTimeNs();
+                // Restore pages pay a durable apply and index update each
+                // time. Amortize those costs over at least 32 ordinary rows
+                // when possible, but keep the 100 ms hard slice, row/byte/
+                // examined-record ceilings and per-record cancellation.
+                if (now >= row_hard_deadline or (writes.items.len >= 32 and now >= row_soft_deadline)) break;
+            }
             const document_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(owned, row.key)) orelse {
                 continuation_buffer.clearRetainingCapacity();
                 try continuation_buffer.appendSlice(alloc, row.key);
@@ -40093,6 +40410,19 @@ pub const DB = struct {
             return next.receipt();
         }
         if (phase == .validated) {
+            const bootstrap_raw = txn.get(staging.bootstrap_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (bootstrap_raw) |bytes| {
+                var bootstrap = try staging.OwnerBootstrap.decode(alloc, bytes);
+                defer bootstrap.deinit();
+                if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &scope)) return error.RestoreStagingScopeChanged;
+                if (bootstrap.value.source_generation_proof_digest) |expected_digest| {
+                    if (!next.source_generation_proofs_complete) return error.RestoreSourceProofMissing;
+                    try @import("restore_generation_admissions.zig").verifyImportedProofSummary(alloc, &txn, next.scope.source_namespace, expected_digest);
+                }
+            }
             if (self.core.acquireSchemaView()) |active| {
                 var view = active;
                 defer view.release();
@@ -42684,6 +43014,9 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
+        if ((req.query == .graph or req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.graph_metric_rerank != null or req.graph_query_transport != null) and
+            !self.core.index_manager.graphRetirementAdmissionOpen())
+            return error.IntegrityTopologyBusy;
         // Validate canonical collapse-and-expand work before executing the
         // primary selection query. This protects direct storage callers and
         // internal worker envelopes in addition to the public API boundary.
@@ -45307,7 +45640,12 @@ pub const DB = struct {
     }
 
     fn publishedDenseRequestEligible(req: types.SearchRequest) bool {
-        if (req.graph_queries.len != 0) return false;
+        // Graph execution must hold apply-shared from the retirement-gate
+        // check through the entire read. The published-dense lease only pins
+        // dense catalog entries and cannot fence a concurrent graph seal.
+        if (req.query == .graph or req.graph_queries.len != 0 or
+            req.graph_metric_queries.len != 0 or req.graph_metric_rerank != null or
+            req.graph_query_transport != null) return false;
         if (req.full_text != null or req.sparse != null) return false;
         if (req.full_text_queries.len != 0 or req.dense_queries.len != 0 or req.sparse_queries.len != 0) return false;
         if (req.merge_config != null) return false;
@@ -45689,6 +46027,7 @@ pub const DB = struct {
     ) ![]types.SearchHit {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
 
         const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
         var admission = try self.filterGraphKeysWithOrdinalsAlloc(
@@ -45737,6 +46076,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         // Validate under the same apply lease as the reverse snapshot. A
         // out-of-lease check can race index replacement and certify an
         // old index's negative answers under the new incarnation's cache key.
@@ -88081,6 +88421,168 @@ test "db direct graph writes record graph artifacts in the replay stream instead
     try std.testing.expect(internal_keys.isGraphEdgeArtifactKey(journal_record.record.changed_artifact_keys[0]));
 }
 
+test "graph rerank read pins apply across retirement seal admission" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("graph-retirement-read-pin");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+
+    var request: types.SearchRequest = .{ .dense = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } };
+    try std.testing.expect(DB.publishedDenseRequestEligible(request));
+    request.graph_metric_rerank = .{ .index_name = "links", .metric_name = "rank" };
+    try std.testing.expect(!DB.publishedDenseRequestEligible(request));
+    {
+        const access = db.beginDenseSearchAccess(request);
+        defer db.endDenseSearchAccess(access);
+        try std.testing.expectEqual(DB.DenseSearchAccess.apply_shared, access);
+        // The Raft seal takes apply-exclusive before closing the graph gate;
+        // it cannot cross this in-flight graph read after its gate check.
+        try std.testing.expect(!db.core.tryLockApplyExclusive());
+    }
+    try std.testing.expect(db.core.tryLockApplyExclusive());
+    db.core.unlockApply();
+
+    request.graph_metric_rerank = null;
+    request.graph_metric_queries = &.{.{ .name = "metric", .query = .{ .index_name = "links", .metric_name = "rank" } }};
+    try std.testing.expect(!DB.publishedDenseRequestEligible(request));
+    request.graph_metric_queries = &.{};
+    const anchor: u8 = 0;
+    request.graph_query_transport = .{ .dialect = .canonical, .operations_json = "{}", .admitted_operations_ptr = &anchor, .admitted_operations_len = 0 };
+    try std.testing.expect(!DB.publishedDenseRequestEligible(request));
+}
+
+test "storage.hot_standby graph retirement seal replays exact Raft receipt and rejects missing marker" {
+    const alloc = std.testing.allocator;
+    const ha_effects = @import("../hot_standby/effects.zig");
+    const seal = @import("graph_retirement_seal.zig");
+    var path_tmp = try TestDirectory.init("graph-retirement-ha-replay");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const namespace: doc_identity.Namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 };
+    var db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false });
+    var db_open = true;
+    defer if (db_open) db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":0,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{}", .coverage_generation = 1 });
+    const graph_digest = (try db.core.index_manager.graphRetirementConfigDigest(alloc)) orelse return error.TestUnexpectedResult;
+    const catalog = try db.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+    defer alloc.free(catalog);
+    var catalog_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(catalog, &catalog_digest, .{});
+    const scope: seal.Scope = .{
+        .fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .admission_epoch = 1, .peer_group_id = 401, .owner_group_id = 301, .namespace = namespace, .catalog_digest = catalog_digest },
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .target_table_id = 10,
+        .graph_config_digest = graph_digest,
+    };
+    const begin_req: types.BatchRequest = .{ .relational_topology = .{ .action = .begin, .fence = scope.fence, .graph_retirement = scope } };
+    const begin_payload = try ha_effects.encodeBatchMutationRequestAlloc(alloc, begin_req);
+    defer alloc.free(begin_payload);
+    var record: ha_replication_record_mod.RecordView = .{
+        .kind = .batch_mutation,
+        .payload_codec = .json,
+        .cluster_id = 1,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .table_id = namespace.table_id,
+        .shard_id = namespace.shard_id,
+        .payload = begin_payload,
+    };
+    try db.applyHAReplicationRecord(record);
+    try std.testing.expect(!db.core.index_manager.graphRetirementAdmissionOpen());
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.findKShortestPaths(alloc, "links", "a", "b", 2, &.{}, .out, .min_hops, 4, null, null));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.matchPattern(alloc, "links", &.{"a"}, &.{}, 1, &.{}));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.search(alloc, .{
+        .graph_metric_queries = &.{.{ .name = "metric", .query = .{ .index_name = "links", .metric_name = "rank" } }},
+    }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.search(alloc, .{
+        .graph_metric_rerank = .{ .index_name = "links", .metric_name = "rank" },
+    }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.batch(.{
+        .graph_writes = &.{.{ .index_name = "links", .source = "a", .target = "b", .edge_type = "related", .weight = 1.0 }},
+    }));
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.runGraphMetricMaintenanceForIdle());
+    // The begin intent alone must rehydrate the closed gate before optional
+    // graph runtimes start. No seal receipt exists yet, so restart cannot
+    // accidentally treat the owner as either unguarded or completed.
+    db.close();
+    db_open = false;
+    db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false });
+    db_open = true;
+    try std.testing.expect(!db.core.index_manager.graphRetirementAdmissionOpen());
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const status = try seal.status(&read);
+        try std.testing.expect(status.intent.?.eql(scope));
+        try std.testing.expect(status.receipt == null);
+    }
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.search(alloc, .{
+        .graph_metric_rerank = .{ .index_name = "links", .metric_name = "rank" },
+    }));
+    const seal_req: types.BatchRequest = .{ .relational_topology = .{ .action = .seal_graph_retirement, .fence = scope.fence, .graph_retirement = scope } };
+    try std.testing.expectError(error.InvalidBatchRequest, db.applyRelationalTopologyControlWithHA(
+        .{ .action = .seal_graph_retirement, .fence = scope.fence },
+        .{ .term = 5, .index = 8 },
+        null,
+        null,
+    ));
+    const missing_marker = try std.json.Stringify.valueAlloc(alloc, ha_effects.BatchMutationPayload{ .schema_version = 9, .request = seal_req }, .{});
+    defer alloc.free(missing_marker);
+    record.lsn = 2;
+    record.previous_lsn = 1;
+    record.payload = missing_marker;
+    try std.testing.expectError(error.InvalidGraphRetirementSeal, db.applyHAReplicationRecord(record));
+    const invalid_marker = try std.json.Stringify.valueAlloc(alloc, ha_effects.BatchMutationPayload{ .schema_version = 9, .request = seal_req, .graph_retirement_raft_entry = .{ .term = 0, .index = 8 } }, .{});
+    defer alloc.free(invalid_marker);
+    record.payload = invalid_marker;
+    try std.testing.expectError(error.InvalidGraphRetirementSeal, db.applyHAReplicationRecord(record));
+    const sealed_payload = try ha_effects.encodeGraphRetirementSealMutationRequestAlloc(alloc, seal_req, .{ .term = 5, .index = 8 });
+    defer alloc.free(sealed_payload);
+    record.payload = sealed_payload;
+    db.core.index_manager.graph_metric_schedule_pins.store(1, .release);
+    try std.testing.expectError(error.StorageBusy, db.applyHAReplicationRecord(record));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try seal.status(&read)).receipt == null);
+    }
+    db.core.index_manager.graph_metric_schedule_pins.store(0, .release);
+    try db.applyHAReplicationRecord(record);
+    try db.applyHAReplicationRecord(record);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const status = try seal.status(&read);
+        try std.testing.expect(status.intent.?.eql(scope));
+        try std.testing.expectEqual(@as(u64, 5), status.receipt.?.applied_term);
+        try std.testing.expectEqual(@as(u64, 8), status.receipt.?.applied_index);
+        try std.testing.expectEqualDeep(try scope.sealDigest(), status.receipt.?.digest);
+    }
+    try std.testing.expect(!db.core.index_manager.graphRetirementAdmissionOpen());
+    db.close();
+    db_open = false;
+    db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .start_index_workers = false, .start_optional_runtimes = false });
+    db_open = true;
+    try std.testing.expect(!db.core.index_manager.graphRetirementAdmissionOpen());
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const status = try seal.status(&read);
+        try std.testing.expect(status.intent.?.eql(scope));
+        try std.testing.expectEqualDeep(try scope.sealDigest(), status.receipt.?.digest);
+    }
+}
+
 test "db _edges writes record graph artifacts in the replay stream instead of graph payload replay" {
     const alloc = std.testing.allocator;
 
@@ -129355,6 +129857,7 @@ test "db owner reopen pins old child schema until exact generation install" {
         };
         try db.batch(.{ .relational_topology = .{ .action = .begin, .fence = fence } });
         try std.testing.expect(try db.childGenerationSourcePinsSchemaJson(next_json));
+        try std.testing.expect(try db.childGenerationSourceDefersOwnerCatalog());
     }
     var after_catalog_digest: [32]u8 = undefined;
     {
@@ -129392,6 +129895,7 @@ test "db owner reopen pins old child schema until exact generation install" {
         try reopened.installPublishedChildSchema(alloc, next_json, install);
         try std.testing.expectEqual(@as(u32, 1), reopened.core.schema.?.version);
         try std.testing.expect((try reopened.relationalTopologyStatus()).fence == null);
+        try std.testing.expect(!(try reopened.childGenerationSourceDefersOwnerCatalog()));
     }
     var installed = try DB.open(alloc, std.mem.span(path), .{
         .identity_namespace = namespace,
@@ -129414,6 +129918,22 @@ test "db owner reopen pins old child schema until exact generation install" {
     const receipt = try @import("relational_integrity_generation_admission.zig").AppliedReceipt.decode(receipt_bytes);
     try std.testing.expectEqual(@as(u64, 1), receipt.term);
     try std.testing.expectEqual(@as(u64, 1), receipt.index);
+    // A later DROP publication fences the already-installed v1 layout. The
+    // schema pin is intentionally false for an equal version, but cold owner
+    // index reconciliation must still wait for this dual-role fence.
+    const dual_fence: @import("relational_integrity_topology.zig").Fence = .{
+        .admission_epoch = 2,
+        .transition_id = 2,
+        .attempt = 1,
+        .peer_group_id = 19,
+        .owner_group_id = 19,
+        .role = .child_generation_dual,
+        .namespace = namespace,
+        .catalog_digest = installed_digest,
+    };
+    try installed.batch(.{ .relational_topology = .{ .action = .begin, .fence = dual_fence } });
+    try std.testing.expect(!(try installed.childGenerationSourcePinsSchemaJson(next_json)));
+    try std.testing.expect(try installed.childGenerationSourceDefersOwnerCatalog());
 }
 
 test "db provisioning schema is persisted before configured full text indexes open" {
@@ -143596,4 +144116,79 @@ test "source vector migration converts legacy ANN generations in both modes" {
         defer result.deinit();
         try std.testing.expectEqualStrings("a", result.hits[0].id);
     }
+}
+
+test "db empty-generation install receipt survives hidden to public owner reopen" {
+    const alloc = std.testing.allocator;
+    const staging = @import("restore_staging_contract.zig");
+    const handoff = @import("empty_generation_handoff.zig");
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/handoff-public-reopen", .{tmp.sub_path});
+    defer alloc.free(path);
+    const namespace: doc_identity.Namespace = .{ .table_id = 201, .shard_id = 202, .range_id = 202 };
+    const hidden_options: OpenOptions = .{
+        .identity_namespace = namespace,
+        .primary_backend = .{ .lsm = .{} },
+        .schema_before_index_load = .{ .runtime_schema = runtime_schema, .public_schema_json = schema_json },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    };
+    const scope: staging.Scope = .{
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .source_artifact_digest = @splat(0),
+        .source_namespace = .{ .table_id = 101, .shard_id = 102, .range_id = 102 },
+        .target_namespace = namespace,
+        .target_schema_digest = @splat(3),
+        .empty_generation = true,
+    };
+    const install: handoff.Install = .{
+        .scope = scope.digest(),
+        .source_summary_digest = @splat(4),
+        .retired_digest = @splat(5),
+        .retired_count = 0,
+        .mappings = &.{},
+    };
+    {
+        var hidden = try DB.open(alloc, path, hidden_options);
+        defer hidden.close();
+        try hidden.reserveRestoreStagingScoped(alloc, scope);
+        const imported = try (staging.Progress{ .scope = scope, .phase = .imported, .rows_complete = true, .artifacts_complete = true }).encode(alloc);
+        defer alloc.free(imported);
+        try hidden.core.store.put(staging.key, imported);
+        _ = try hidden.finishRestoreStaging(alloc, scope.digest(), .validated);
+        var txn = try hidden.core.store.beginWriteTxn();
+        var txn_open = true;
+        defer if (txn_open) txn.abort();
+        const applied = try handoff.stageInstall(alloc, &txn, install, scope.plan_id, 7, 11);
+        try txn.commit();
+        txn_open = false;
+        try std.testing.expectEqual(@as(u64, 11), applied.applied_index);
+        _ = try hidden.finishRestoreStaging(alloc, scope.digest(), .published);
+        var read = try hidden.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 11), (try handoff.loadInstallReceipt(&read)).?.applied_index);
+    }
+    var published_options = hidden_options;
+    published_options.reject_stale_schema_before_index_load = true;
+    published_options.prefer_existing_identity_namespace = true;
+    published_options.start_optional_runtimes = true;
+    var published = try DB.open(alloc, path, published_options);
+    defer published.close();
+    var read = try published.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u64, 11), (try handoff.loadInstallReceipt(&read)).?.applied_index);
+    var response = (try published.lookup(alloc, "", .{ .relational_topology_json = "{\"mode\":\"generation_handoff_install\"}" })) orelse return error.GenerationHandoffInstallMissing;
+    defer response.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(?staging.GenerationAdmissionReceipt, alloc, response.json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 11), (parsed.value orelse return error.GenerationHandoffInstallMissing).applied_index);
 }

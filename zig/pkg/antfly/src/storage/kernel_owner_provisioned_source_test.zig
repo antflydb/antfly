@@ -180,9 +180,9 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
     var owners = Source.init(alloc, root, table_catalog.emptyCatalogSource(), barrier);
     defer owners.deinit();
     _ = try owners.restoreOwnerControl(alloc, 7196, "hidden", descriptor, .{ .scope = scope, .action = .begin }, null, .{}, .{});
-    const before = try (staging.Progress{ .scope = scope }).encode(alloc);
+    const before = try (staging.Progress{ .scope = scope, .phase = .importing, .source_generation_proofs_complete = true }).encode(alloc);
     defer alloc.free(before);
-    const imported = try (staging.Progress{ .scope = scope, .phase = .imported }).encode(alloc);
+    const imported = try (staging.Progress{ .scope = scope, .phase = .imported, .source_generation_proofs_complete = true }).encode(alloc);
     defer alloc.free(imported);
     try owners.applyPreparedReplicatedBatchGroupLocal(alloc, 7196, "hidden", descriptor, .{
         .restore_staging = .{ .import_page = .{ .expected = staging.digest(before), .next = imported, .scope = scope.digest(), .timestamps = &.{} } },

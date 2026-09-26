@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 68;
+pub const abi_version: u32 = 69;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1057,6 +1057,9 @@ pub const OpenRequest = extern struct {
     /// This owner is being opened to apply an entry whose catalog descriptor
     /// may predate the configuration already persisted by this replica.
     historical_raft_apply: u8 = 0,
+    /// Optional result: the physical owner opened for exact topology control
+    /// while current-catalog index reconciliation remains fence-deferred.
+    owner_catalog_deferred_out: ?*u8 = null,
     _restore_reserved: [4]u8 = @splat(0),
     target_observer: TargetObserver = .{},
     transaction_recovery: TransactionRecoveryConfig = .{},

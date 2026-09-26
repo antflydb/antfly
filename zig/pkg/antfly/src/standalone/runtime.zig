@@ -3225,6 +3225,10 @@ const LocalStandaloneMetadata = struct {
                 }
                 const scope = try Staging.ownerScope(self.alloc, job.value.plan, job.value.plan_digest, target, range);
                 if (comptime control_only_storage_sources) {
+                    const handoff = if (scope.empty_generation)
+                        (try Staging.mappedEmptyGenerationHandoffForGroup(self.alloc, job.value.plan, job.value.plan_digest, range.group_id)) orelse return error.RestoreStagingScopeChanged
+                    else
+                        null;
                     const bootstrap: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap = .{
                         .scope = scope,
                         .table_name = target.table.name,
@@ -3232,7 +3236,16 @@ const LocalStandaloneMetadata = struct {
                         .read_schema_json = target.table.read_schema_json,
                         .indexes_json = target.table.indexes_json,
                         .byte_range = .{ .start = range.start_key, .end = range.end_key orelse "" },
+                        .source_generation_proof_digest = try Staging.sourceGenerationProofDigestForGroup(job.value.plan, range.group_id),
+                        .generation_admission = try Staging.expectedGenerationAdmissionReceiptForGroup(self.alloc, job.value.plan, job.value.plan_digest, range.group_id),
+                        .empty_generation_handoff = if (handoff) |mapped| .{
+                            .source_summary_digest = mapped.command.source_summary_digest,
+                            .retired_digest = mapped.command.retired_digest,
+                            .retired_count = mapped.command.retired_count,
+                            .expected_install_receipt_digest = mapped.expected_receipt_digest,
+                        } else null,
                     };
+                    try bootstrap.validate();
                     const bootstrap_json = try std.json.Stringify.valueAlloc(self.alloc, bootstrap, .{});
                     defer self.alloc.free(bootstrap_json);
                     try server.primeRestoreOwnerDescriptor(range.group_id, target.table.name, .{

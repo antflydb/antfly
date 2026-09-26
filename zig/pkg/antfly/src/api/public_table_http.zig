@@ -112,6 +112,7 @@ pub const TableApi = struct {
         GraphMetricMaterializationRejected,
         NotFound,
         Conflict,
+        IntegrityTopologyBusy,
         UniqueConstraintViolation,
         ForeignKeyParentMissing,
         ForeignKeyReferenced,
@@ -1703,6 +1704,12 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         },
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "batch transaction conflicted") },
+        error.IntegrityTopologyBusy => return .{
+            .status = 409,
+            .body = try alloc.dupe(u8, "{\"code\":\"integrity_topology_busy\",\"message\":\"table integrity topology is changing; retry this batch after publication\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced => return .{
             .status = 409,
             .json = true,
@@ -3715,8 +3722,10 @@ test "public table batch handler maps write unavailable errors" {
         status: u16,
         body: []const u8,
         json: bool = false,
+        retry_after_seconds: ?u32 = null,
     }{
         .{ .err = error.WriteUnavailable, .status = 503, .body = "write unavailable" },
+        .{ .err = error.IntegrityTopologyBusy, .status = 409, .body = "{\"code\":\"integrity_topology_busy\",\"message\":\"table integrity topology is changing; retry this batch after publication\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{
             .err = error.OutcomeUnknown,
             .status = 409,
@@ -3740,6 +3749,7 @@ test "public table batch handler maps write unavailable errors" {
         try std.testing.expectEqual(tc.status, resp.status);
         try std.testing.expectEqualStrings(tc.body, resp.body);
         try std.testing.expectEqual(tc.json, resp.json);
+        try std.testing.expectEqual(tc.retry_after_seconds, resp.retry_after_seconds);
     }
 }
 

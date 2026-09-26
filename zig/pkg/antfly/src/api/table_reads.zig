@@ -5244,6 +5244,11 @@ pub const ProvisionedTableReadSource = struct {
         return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest);
     }
 
+    fn certifiedHandoffReceipt(opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency, strict_read_index_absence: bool) bool {
+        return std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") and
+            consistency == .read_index and strict_read_index_absence;
+    }
+
     fn lookupGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -5261,7 +5266,14 @@ pub const ProvisionedTableReadSource = struct {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = key, .opts = opts } }, consistency, .general, 0);
             defer if (read_activity) |*activity| activity.deinit();
             const local_source = try self.groupLocalSourceForGroup(alloc, group_id, table_name, .{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io }, opts.cancellation);
-            return local_source.lookupGroupLocal(alloc, group_id, table_name, key, opts, .stale) catch |err| switch (err) {
+            var local_opts = opts;
+            // The strict read-index barrier above precedes structural read
+            // admission. The owner must not repeat it while apply waits for
+            // that admission, so pass only a local, non-wire proof.
+            local_opts.fk_generation_source_read_index_certified = opts.fk_generation_source_control and
+                consistency == .read_index and local_source.strict_read_index_absence;
+            local_opts.generation_handoff_install_read_index_certified = certifiedHandoffReceipt(opts, consistency, local_source.strict_read_index_absence);
+            return local_source.lookupGroupLocal(alloc, group_id, table_name, key, local_opts, .stale) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     if (read_activity) |*activity| activity.deinit();
                     read_activity = null;
@@ -6311,6 +6323,28 @@ pub const HostedProvisionedTableReadSource = struct {
             .execute = executeInternalRequest,
             .execute_stream = executeInternalRequestStream,
         } };
+    }
+
+    // Only the exact hidden handoff receipt read may route without a public
+    // catalog fence. The remote endpoint independently checks service auth,
+    // scope, Plan and read-index, and the owner resolves the hidden descriptor.
+    fn handoffReceiptExecutor(self: *HostedProvisionedTableReadSource) http_common.RequestExecutor {
+        return .{ .ptr = self, .vtable = &.{ .execute = executeHandoffReceiptRequest } };
+    }
+
+    fn executeHandoffReceiptRequest(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const secret = self.internal_service_secret orelse return error.CatalogRouteFenceRequired;
+        if (secret.len == 0 or internalGroupIdFromUri(request.uri) == null) return error.CatalogRouteFenceRequired;
+        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+        _ = client.withInternalServiceAuth(secret, self.internal_service_issuer);
+        return client.executeRequest(request) catch |err| normalizeDistributedReadTransportError(err);
+    }
+
+    fn scopedHandoffReceiptLookup(key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) bool {
+        return key.len == 0 and consistency == .read_index and
+            std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") and
+            opts.restore_staging_scope != null and opts.restore_staging_plan_id != null;
     }
 
     fn executeInternalRequestStream(
@@ -7428,6 +7462,23 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") and
+            (opts.restore_staging_scope != null or opts.restore_staging_plan_id != null))
+        {
+            if (!scopedHandoffReceiptLookup(key, opts, consistency)) return error.RestoreStagingScopeChanged;
+            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(opts)), group_id, routePolicyForConsistency(.read_index))) orelse return error.TopologyChanged;
+            defer route.deinit(alloc);
+            return switch (route) {
+                .local => try self.groupLocalSource().lookupGroupLocal(alloc, group_id, table_name, key, opts, .read_index),
+                .remote => |remote| try lookupRemote(self.handoffReceiptExecutor(), alloc, remote.base_uri, group_id, table_name, key, opts, .read_index),
+            };
+        }
+        if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") and
+            self.router.localStatus(group_id) != .active)
+            return error.NotLeader;
+        // Once published, the hidden scope has retired. The ordinary branch
+        // below attaches the current public catalog fence; the owner still
+        // returns only the read-indexed, plan-bound persisted receipt.
         return try (try self.groupLocalSourceForGroup(alloc, group_id, table_name, .{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io }, opts.cancellation)).lookupGroupLocal(alloc, group_id, table_name, key, opts, consistency);
     }
 
@@ -16961,6 +17012,27 @@ fn consumerTests() type {
                 acknowledge: bool = true,
                 absence: []const u8 = "1",
                 status: u16 = 404,
+                certified_reads: usize = 0,
+                barrier_calls: usize = 0,
+                activity_active: usize = 0,
+                fn readIndexBeforeAdmission(ptr: *anyopaque, _: u64, _: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    // Raft apply needs exclusive admission. A second barrier
+                    // while this read is admitted would invert that order.
+                    try std.testing.expectEqual(@as(usize, 0), self.activity_active);
+                    self.barrier_calls += 1;
+                }
+                fn prepareForRead(_: *anyopaque, _: []const u8, _: ReadPreparation.Kind) void {}
+                fn beginRead(ptr: *anyopaque, table_name: []const u8, _: ReadPreparation.Kind) ReadPreparation.Activity {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.activity_active += 1;
+                    return .{ .ptr = ptr, .table_name = table_name, .release_fn = endRead };
+                }
+                fn endRead(ptr: *anyopaque, _: []const u8) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    std.debug.assert(self.activity_active == 1);
+                    self.activity_active -= 1;
+                }
                 fn restoreScope(_: *anyopaque, _: []const u8, _: u64) !?[32]u8 {
                     return null;
                 }
@@ -17002,10 +17074,16 @@ fn consumerTests() type {
                     groups[0] = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } };
                     return .{ .found = .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .groups = groups } };
                 }
-                fn lookup(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group: u64, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?LookupResponse {
+                fn lookup(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group: u64, _: []const u8, _: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?LookupResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqual(@as(u64, 7), group);
                     try std.testing.expectEqual(group, fence.route.group_id);
+                    if (opts.fk_generation_source_control) {
+                        try std.testing.expect(opts.fk_generation_source_read_index_certified);
+                        try std.testing.expectEqual(raft_mod.ReadConsistency.stale, consistency);
+                        try std.testing.expectEqual(@as(usize, 1), self.activity_active);
+                        self.certified_reads += 1;
+                    }
                     self.reads += 1;
                     if (self.failure) |err| return err;
                     return null;
@@ -17076,6 +17154,16 @@ fn consumerTests() type {
             try std.testing.expect(provisioned.source().strict_read_index_absence);
             try std.testing.expect(hosted.source().strict_read_index_absence);
             try std.testing.expectError(error.NotLeader, provisioned.prepareGroupsForReadAdmission(std.testing.allocator, &.{7}, .{ .lookup = .{ .key = "absent", .opts = .{} } }, .read_index));
+            const fk_control: db_mod.types.LookupOptions = .{ .relational_integrity_catalog = true, .fk_generation_source_control = true };
+            try std.testing.expectError(error.NotLeader, provisioned.source().lookupGroupLocal(std.testing.allocator, 7, "rows", "", fk_control, .read_index));
+            try std.testing.expectEqual(@as(usize, 0), fixture.certified_reads);
+            var ready = ProvisionedTableReadSource.init("unused", catalog, .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.readIndexBeforeAdmission } });
+            _ = ready.withLocalReadSource(hosted.local_read_source.?);
+            ready.prepare_for_read = .{ .ptr = &fixture, .vtable = &.{ .prepare_for_read = Fixture.prepareForRead, .begin_read = Fixture.beginRead } };
+            try std.testing.expect((try ready.source().lookupGroupLocal(std.testing.allocator, 7, "rows", "", fk_control, .read_index)) == null);
+            try std.testing.expectEqual(@as(usize, 1), fixture.certified_reads);
+            try std.testing.expectEqual(@as(usize, 1), fixture.barrier_calls);
+            try std.testing.expectEqual(@as(usize, 0), fixture.activity_active);
         }
 
         test "relational row query primary digest transport preserves snapshot proof and rejects missing or invalid headers" {
@@ -26565,6 +26653,17 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(builtin.is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "generation handoff receipt local forwarding certifies the strict read index before admission" {
+            const certify = ProvisionedTableReadSource.certifiedHandoffReceipt;
+            const receipt: db_mod.types.LookupOptions = .{ .relational_topology_json = "{\"mode\":\"generation_handoff_install\"}" };
+            try std.testing.expect(certify(receipt, .read_index, true));
+            try std.testing.expect(!certify(receipt, .read_index, false));
+            try std.testing.expect(!certify(receipt, .stale, true));
+            try std.testing.expect(!certify(.{ .relational_integrity_catalog = true, .fk_generation_source_control = true }, .read_index, true));
+            try std.testing.expect(!certify(.{}, .read_index, true));
+            try std.testing.expect(!certify(.{ .relational_topology_json = "{\"mode\":\"generation_handoff_summary\"}" }, .read_index, true));
+        }
+
         test "delayed SQL conflict reads require a bounded owner cohort" {
             try certifyDelayedOwnerCut(1);
             try certifyDelayedOwnerCut(2);

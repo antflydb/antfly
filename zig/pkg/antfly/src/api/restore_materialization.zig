@@ -151,14 +151,17 @@ pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.I
     const portable = @import("../storage/portable_backup.zig");
     // A page may only advance a manifest/layout phase, without importing a
     // row. Amortize decoder opens and coordinator RPCs across a bounded burst
-    // of these durable steps. Each page still commits its restart checkpoint;
-    // cancellation and either budget end the burst without losing progress.
+    // of these durable steps. A decoder reopen and coordinator RPC cost more
+    // than a small logical page on LSM, so allow a bounded 100 ms burst while
+    // retaining each page's own durable restart checkpoint. Cancellation is
+    // checked before every page and within the importer; neither limit may
+    // turn this into an unbounded owner request.
     const started = std.Io.Clock.awake.now(io);
     var complete = false;
-    for (0..8) |_| {
+    for (0..16) |_| {
         try cancellation.check();
         complete = if (source.rewrite) |rewrite| try portable.importSourceCopyFilePage(alloc, &store, io, artifact, source.artifact_size_bytes, .{ .scope = rewrite.source_scope orelse return error.RestoreSourceProofMissing, .applied_index = rewrite.source_applied_index, .retained_start = rewrite.retained_start }, scope.digest(), 128, cancellation) else try portable.importCohortFilePage(alloc, &store, io, artifact, source.artifact_size_bytes, .{ .seal = source.cohort_seal.?, .namespace = scope.source_namespace }, scope.digest(), 128, cancellation);
-        if (complete or started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds() >= 25 * std.time.ns_per_ms) break;
+        if (complete or started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds() >= 100 * std.time.ns_per_ms) break;
     }
     if (complete) try bindPortableDecoderRange(alloc, &store, owner_range);
     try fs.syncDirPortable(io, files);

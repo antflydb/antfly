@@ -84,6 +84,11 @@ fn stageReceipt(txn: anytype, fence: Fence) !void {
 /// rejecting the Raft entry would prevent later resolution entries from ever
 /// draining those participants. Snapshot/cutover independently require drained.
 pub fn stageBegin(txn: anytype, fence: Fence) !void {
+    return stageBeginWithHandoff(txn, fence, null);
+}
+
+pub fn stageBeginWithHandoff(txn: anytype, fence: Fence, handoff: ?@import("relational_integrity_topology_contract.zig").GenerationHandoffIntent) !void {
+    if (handoff != null and fence.role != .rewrite_source) return error.InvalidGenerationHandoff;
     _ = try fence.encode();
     const abort_key = abortedKey(fence);
     if (try optional(txn, &abort_key)) |attempt| {
@@ -93,6 +98,7 @@ pub fn stageBegin(txn: anytype, fence: Fence) !void {
     if (try @import("relational_integrity_retirement.zig").active(txn)) return error.ConstraintRetirementInProgress;
     if (try current(txn)) |existing| {
         if (!existing.eql(fence)) return error.IntegrityTopologyBusy;
+        if (handoff) |intent| try @import("empty_generation_handoff.zig").stageBegin(txn, fence, intent);
         return;
     }
     try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
@@ -101,7 +107,7 @@ pub fn stageBegin(txn: anytype, fence: Fence) !void {
     // Split/merge transfer the durable generation tombstones through the
     // integrity handoff stream. Rewrite has a different copy protocol and
     // remains fenced until it transfers the same authority.
-    if (fence.role == .rewrite_source)
+    if (fence.role == .rewrite_source and handoff == null)
         try @import("relational_integrity_generation_retirement.zig").requireNoActive(txn);
     if (try optional(txn, receipt_key)) |bytes| {
         const previous = try Fence.decode(bytes);
@@ -114,6 +120,7 @@ pub fn stageBegin(txn: anytype, fence: Fence) !void {
     if (!std.mem.eql(u8, &digest, &fence.catalog_digest)) return error.IntegrityCatalogChanged;
     const bytes = try fence.encode();
     try txn.put(fence_key, &bytes);
+    if (handoff) |intent| try @import("empty_generation_handoff.zig").stageBegin(txn, fence, intent);
 }
 
 /// Ordinary document owners need the same source fence for online transfer,
@@ -155,6 +162,7 @@ pub fn stageAbortTransition(txn: anytype, expected: Fence) !void {
     } else 0;
     if (try current(txn)) |fence| {
         if (fence.role == expected.role and fence.transition_id == expected.transition_id and fence.attempt <= expected.attempt) {
+            if (fence.role == .rewrite_source) try @import("empty_generation_handoff.zig").stageCancel(txn, fence);
             if (fence.role == .truncate_parent) try @import("relational_integrity_generation_retirement.zig").stageCancel(txn, fence) else try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
             try stageReceipt(txn, fence);
             try txn.delete(fence_key);
@@ -218,6 +226,7 @@ pub fn stageCancel(txn: anytype, expected: Fence) !void {
     if (try current(txn)) |actual| {
         if (actual.admission_epoch == expected.admission_epoch and !actual.eql(expected)) return error.IntegrityTopologyChanged;
         if (actual.eql(expected)) {
+            if (expected.role == .rewrite_source) try @import("empty_generation_handoff.zig").stageCancel(txn, expected);
             if (expected.role == .truncate_parent) try @import("relational_integrity_generation_retirement.zig").stageCancel(txn, expected) else try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
             try txn.delete(fence_key);
         }

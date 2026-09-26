@@ -102,6 +102,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlTruncateReferenced => .{ .code = "2BP01", .message = "TRUNCATE has referencing tables outside the requested set.", .hint = "List every referencing table or explicitly request CASCADE.", .retryable = false },
         error.SqlTruncateExternalForeignKey => .{ .code = "0A000", .message = "TRUNCATE cannot yet retire inverse foreign-key witnesses on an untouched parent.", .hint = "Use DELETE, or explicitly truncate a complete dependency cohort. No barrier was admitted.", .retryable = false },
         error.RelationalCheckViolation => .{ .code = "23514", .message = "The mutation violates a check constraint.", .hint = "Change the row values to satisfy the table's check constraints.", .retryable = false },
+        error.StoredDestinationAuthorizationRevoked => .{ .code = "42501", .message = "The durable credential no longer authorizes this SQL operation.", .hint = "Use a current Basic or API-key credential with whole-table admin permission before retrying DDL.", .retryable = false },
         error.Forbidden, error.Unauthorized, error.AccessDenied => .{ .code = "42501", .message = "Permission denied for this SQL operation.", .hint = "Check the current credential and permissions for every affected table.", .retryable = false },
         error.SqlTypeMismatch, error.InvalidSqlParameters, error.InvalidBatchRequest, error.InvalidRelationalExpressionInput, error.InvalidRelationalGeneratedValue => .{ .code = "22023", .message = "A parameter or row value does not match the required type.", .hint = "Check parameter count, nullability, and the current column types." },
         error.InvalidCatalogName => .{ .code = "22023", .message = "The database, namespace, or table name is invalid.", .hint = "Use a valid catalog name without empty components." },
@@ -155,4 +156,12 @@ test "SQL diagnostics hide unrecognized implementation errors" {
     try std.testing.expect(std.mem.indexOf(u8, value.message, "Secret") == null);
     try std.testing.expectEqual(@as(u16, 500), value.httpStatus());
     try std.testing.expectEqual(@as(u16, 409), describe(error.SqlMutationOutcomeUnknown).httpStatus());
+}
+
+test "durable SQL destination credential rejection is forbidden, not internal" {
+    const value = describe(error.StoredDestinationAuthorizationRevoked);
+    try std.testing.expectEqualStrings("42501", value.code);
+    try std.testing.expectEqual(@as(u16, 403), value.httpStatus());
+    try std.testing.expectEqual(@as(?bool, false), value.retryable);
+    try std.testing.expect(std.mem.indexOf(u8, value.message, "StoredDestinationAuthorizationRevoked") == null);
 }

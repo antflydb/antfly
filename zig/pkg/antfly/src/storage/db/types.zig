@@ -1378,6 +1378,16 @@ pub const LookupOptions = struct {
     relational_activation_json: []const u8 = "",
     relational_index_status_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
+    /// Local FK source-control capability. Never parsed from HTTP or encoded
+    /// on the lookup wire; only the authenticated owner receiver sets it.
+    fk_generation_source_control: bool = false,
+    /// Set only by the local read wrapper after its strict Raft read-index
+    /// barrier, before entering structural read admission. Not on any wire.
+    fk_generation_source_read_index_certified: bool = false,
+    /// The published handoff receipt's read-index was completed by the local
+    /// read wrapper before it entered structural admission. This proof is
+    /// never parsed or serialized on either HTTP or storage-kernel wires.
+    generation_handoff_install_read_index_certified: bool = false,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     /// Internal, absolute monotonic deadline used by routed lookups. It is not

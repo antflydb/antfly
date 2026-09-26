@@ -92,6 +92,24 @@ pub fn metadataRequiresCoordination(alloc: Allocator, metadata: ?[]const TableRe
     return coordinated;
 }
 
+/// A cached no-constraint declaration is not proof that a relational table
+/// still has no constraints: publication can install an FK before this cache
+/// expires. The HTTP fast path must acquire an authoritative snapshot before
+/// sending such a mutation to the ordinary batch writer.
+pub fn uncoordinatedMutationNeedsAuthority(alloc: Allocator, metadata: []const TableRecord, requests: []const contract.TableCommitRequest) !bool {
+    for (requests) |request| {
+        if (request.relational_schema_version != null) return true;
+        const record = for (metadata) |table| {
+            if (std.mem.eql(u8, table.name, request.table_name)) break table;
+        } else return error.TableNotFound;
+        if (record.schema_json.len == 0) continue;
+        var parsed = try schema_api.parseValidatedTableSchema(alloc, record.schema_json);
+        defer parsed.deinit(alloc);
+        if (parsed.storage_mode == .relational) return true;
+    }
+    return false;
+}
+
 pub fn authorizePrimaryMutations(request: RequestContext, authentication_required: bool, tables: []const contract.TableCommitRequest) !void {
     for (tables) |table| {
         if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0) continue;

@@ -51,6 +51,12 @@ pub const BatchMutationPayload = struct {
     /// must preserve that exact entry identity for owner receipts and reject
     /// an ordinary batch carrying the same private command.
     initial_child_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+    /// Graph owner seals bind a durable receipt to the primary's exact Raft
+    /// apply entry; a standby must replay the same term/index.
+    graph_retirement_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+    /// Imported FK proof becomes target admission only at this exact primary
+    /// Raft entry. A standby may not invent a local term/index for its receipt.
+    restore_generation_admission_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
     /// Original source cut identity, assigned by native apply, never by a caller.
     online_source_applied_index: ?u64 = null,
     restore_staging_bootstrap: ?@import("../db/restore_staging_contract.zig").OwnerBootstrap = null,
@@ -61,10 +67,14 @@ pub const BatchMutationPayload = struct {
 /// Page semantics cannot be silently ignored by older standbys. Their V1
 /// decoder rejects V2 before applying rows, independently of Raft negotiation.
 fn batchMutationVersion(request: db_types.BatchRequest) u32 {
+    if (request.restore_staging) |command| if (command == .import_page and command.import_page.source_generation_proof_page) return 11;
+    if (request.restore_staging) |command| if (command == .install_generation_admissions) return 10;
     if (request.relational_topology) |command| switch (command.action) {
         .provision_initial_child, .release_initial_child, .cancel_initial_child => return 8,
+        .seal_graph_retirement => return 9,
         else => {},
     };
+    if (request.relational_topology) |command| if (command.action == .begin and command.graph_retirement != null) return 9;
     if (request.restore_staging != null or request.online_source != null or
         (if (request.merge_page) |page| page.source.retention != null else false) or
         (if (request.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| source.retention != null else false else false)) return 7;
@@ -79,6 +89,97 @@ fn batchMutationVersion(request: db_types.BatchRequest) u32 {
     if (request.merge_checkpoint) |checkpoint|
         if (checkpoint.page_source != null or checkpoint.page_receiver_namespace != null) return 2;
     return 1;
+}
+
+test "storage.hot_standby graph retirement begin and seal require versioned standby decoder" {
+    const alloc = std.testing.allocator;
+    const scope: @import("../db/graph_retirement_seal.zig").Scope = .{
+        .fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .admission_epoch = 1, .peer_group_id = 401, .owner_group_id = 301, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) },
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .target_table_id = 10,
+        .graph_config_digest = @splat(3),
+    };
+    inline for (.{ .begin, .seal_graph_retirement }) |action| {
+        const request: db_types.BatchRequest = .{ .relational_topology = .{ .action = action, .fence = scope.fence, .graph_retirement = scope } };
+        const encoded = if (action == .seal_graph_retirement)
+            try encodeGraphRetirementSealMutationRequestAlloc(alloc, request, .{ .term = 2, .index = 3 })
+        else
+            try encodeBatchMutationRequestAlloc(alloc, request);
+        defer alloc.free(encoded);
+        var record: replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = encoded };
+        var decoded = try decodeBatchMutationRequest(alloc, record);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(u32, 9), decoded.value.schema_version);
+        try std.testing.expect(decoded.value.request.relational_topology.?.graph_retirement.?.eql(scope));
+        if (action == .seal_graph_retirement) {
+            try std.testing.expectEqual(@as(u64, 3), decoded.value.graph_retirement_raft_entry.?.index);
+            try std.testing.expectError(error.InvalidGraphRetirementSeal, encodeBatchMutationRequestAlloc(alloc, request));
+        } else try std.testing.expect(decoded.value.graph_retirement_raft_entry == null);
+        const downgraded = try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .request = request }, .{});
+        defer alloc.free(downgraded);
+        record.payload = downgraded;
+        try std.testing.expectError(error.UnsupportedBatchMutationPayloadVersion, decodeBatchMutationRequest(alloc, record));
+    }
+}
+
+test "storage.hot_standby mapped restore admissions require original Raft receipt identity" {
+    const alloc = std.testing.allocator;
+    const contract = @import("../db/restore_staging_contract.zig");
+    const mappings = [_]contract.GenerationAdmissionMapping{.{
+        .source_child_table_id = 11,
+        .source_child_table_name = "children",
+        .target_child_table_id = 21,
+        .target_child_table_name = "children",
+        .constraint_name = "parent_fk",
+        .source_generation = @splat(1),
+        .target_generation = @splat(2),
+        .source_scope_digest = @splat(3),
+    }};
+    const request: db_types.BatchRequest = .{ .restore_staging = .{ .install_generation_admissions = .{
+        .scope = @splat(4),
+        .source_summary_digest = @splat(5),
+        .mappings = &mappings,
+    } } };
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, encodeBatchMutationRequestAlloc(alloc, request));
+    const encoded = try encodeRestoreGenerationAdmissionMutationRequestAlloc(alloc, request, .{ .term = 6, .index = 7 });
+    defer alloc.free(encoded);
+    var record: replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = encoded };
+    var decoded = try decodeBatchMutationRequest(alloc, record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 10), decoded.value.schema_version);
+    try std.testing.expectEqual(@as(u64, 6), decoded.value.restore_generation_admission_raft_entry.?.term);
+    const missing = try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .schema_version = 10, .request = request }, .{});
+    defer alloc.free(missing);
+    record.payload = missing;
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, decodeBatchMutationRequest(alloc, record));
+    const downgraded = try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .schema_version = 7, .request = request }, .{});
+    defer alloc.free(downgraded);
+    record.payload = downgraded;
+    try std.testing.expectError(error.UnsupportedBatchMutationPayloadVersion, decodeBatchMutationRequest(alloc, record));
+}
+
+test "storage.hot_standby source generation proof page requires versioned standby decoder" {
+    const alloc = std.testing.allocator;
+    const request: db_types.BatchRequest = .{ .restore_staging = .{ .import_page = .{
+        .expected = @splat(1),
+        .next = "proof progress",
+        .scope = @splat(2),
+        .timestamps = &.{},
+        .source_generation_proof_page = true,
+        .artifacts = &.{},
+    } } };
+    const encoded = try encodeBatchMutationRequestAlloc(alloc, request);
+    defer alloc.free(encoded);
+    var record: replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = encoded };
+    var decoded = try decodeBatchMutationRequest(alloc, record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 11), decoded.value.schema_version);
+    try std.testing.expect(decoded.value.request.restore_staging.?.import_page.source_generation_proof_page);
+    const downgraded = try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .schema_version = 7, .request = request }, .{});
+    defer alloc.free(downgraded);
+    record.payload = downgraded;
+    try std.testing.expectError(error.UnsupportedBatchMutationPayloadVersion, decodeBatchMutationRequest(alloc, record));
 }
 
 pub fn encodeInitialChildMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.RaftAppliedEntryIdentity) ![]u8 {
@@ -405,11 +506,46 @@ pub fn encodeBatchMutationRequestAlloc(
     request: db_types.BatchRequest,
 ) ![]u8 {
     if (batchMutationVersion(request) == 8) return error.InvalidInitialChildPublication;
+    if (batchMutationVersion(request) == 10) return error.InvalidRestoreStagingCommand;
+    if (request.relational_topology) |command| if (command.action == .seal_graph_retirement) return error.InvalidGraphRetirementSeal;
     if (request.online_source != null) return error.MissingOnlineSourceAppliedIndex;
     try validatePageFields(request);
     return try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{
         .schema_version = batchMutationVersion(request),
         .request = request,
+    }, .{});
+}
+
+pub fn encodeGraphRetirementSealMutationRequestAlloc(
+    alloc: Allocator,
+    request: db_types.BatchRequest,
+    entry: db_types.RaftAppliedEntryIdentity,
+) ![]u8 {
+    const command = request.relational_topology orelse return error.InvalidGraphRetirementSeal;
+    if (command.action != .seal_graph_retirement or command.graph_retirement == null or
+        entry.term == 0 or entry.index == 0) return error.InvalidGraphRetirementSeal;
+    try validatePageFields(request);
+    return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{
+        .schema_version = 9,
+        .request = request,
+        .graph_retirement_raft_entry = entry,
+    }, .{});
+}
+
+pub fn encodeRestoreGenerationAdmissionMutationRequestAlloc(
+    alloc: Allocator,
+    request: db_types.BatchRequest,
+    entry: db_types.RaftAppliedEntryIdentity,
+) ![]u8 {
+    const command = request.restore_staging orelse return error.InvalidRestoreStagingCommand;
+    if (command != .install_generation_admissions or entry.term == 0 or entry.index == 0)
+        return error.InvalidRestoreStagingCommand;
+    try command.install_generation_admissions.validate();
+    try validatePageFields(request);
+    return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{
+        .schema_version = 10,
+        .request = request,
+        .restore_generation_admission_raft_entry = entry,
     }, .{});
 }
 
@@ -471,6 +607,13 @@ pub fn decodeBatchMutationRequest(
     if (parsed.value.schema_version != batchMutationVersion(parsed.value.request)) return error.UnsupportedBatchMutationPayloadVersion;
     if ((parsed.value.schema_version == 8) != (parsed.value.initial_child_raft_entry != null)) return error.InvalidInitialChildPublication;
     if (parsed.value.initial_child_raft_entry) |entry| if (entry.term == 0 or entry.index == 0) return error.InvalidInitialChildPublication;
+    const graph_seal = if (parsed.value.request.relational_topology) |command| command.action == .seal_graph_retirement else false;
+    if (graph_seal != (parsed.value.graph_retirement_raft_entry != null)) return error.InvalidGraphRetirementSeal;
+    if (parsed.value.graph_retirement_raft_entry) |entry| if (entry.term == 0 or entry.index == 0) return error.InvalidGraphRetirementSeal;
+    if ((parsed.value.schema_version == 10) != (parsed.value.restore_generation_admission_raft_entry != null))
+        return error.InvalidRestoreStagingCommand;
+    if (parsed.value.restore_generation_admission_raft_entry) |entry| if (entry.term == 0 or entry.index == 0)
+        return error.InvalidRestoreStagingCommand;
     if ((parsed.value.request.online_source != null) != (parsed.value.online_source_applied_index != null)) return error.MissingOnlineSourceAppliedIndex;
     try validatePageFields(parsed.value.request);
     return parsed;

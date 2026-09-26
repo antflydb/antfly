@@ -163,7 +163,7 @@ pub fn requireMutableScope(alloc: Allocator, txn: anytype, expected: ?Digest) !v
 }
 
 /// Internal PreparedRow import admission, consumed under the DB apply fence.
-pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest, rewrite: bool = false, source_effects: u32 = 0, artifact_page: bool = false, projection_page: bool = false };
+pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest, rewrite: bool = false, source_effects: u32 = 0, artifact_page: bool = false, projection_page: bool = false, source_generation_proof_page: bool = false };
 pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission, row_count: usize, delete_count: usize) !void {
     const raw = (try optional(txn)) orelse return error.RestoreStagingScopeChanged;
     if (!std.mem.eql(u8, &digest(raw), &admission.expected)) return error.RestoreStagingProgressChanged;
@@ -180,6 +180,26 @@ pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission,
         after.value.rows != std.math.add(u64, before.value.rows, row_count +| delete_count) catch return error.InvalidRestoreStagingCommand)
         return error.InvalidRestoreStagingCommand;
     if (admission.rewrite != (before.value.scope.rewrite != null)) return error.InvalidRestoreStagingCommand;
+    if (admission.source_generation_proof_page) {
+        if (admission.rewrite or admission.artifact_page or admission.projection_page or
+            before.value.source_generation_proofs_complete or !after.value.source_generation_proofs_complete or
+            before.value.phase != .importing or after.value.phase != .importing or
+            row_count != 0 or delete_count != 0 or admission.source_effects != 0 or
+            before.value.rows != 0 or before.value.cursor.len != 0 or before.value.artifact_cursor.len != 0 or
+            before.value.projection_cursor.len != 0 or before.value.artifacts_complete or before.value.rows_complete or
+            before.value.rows != after.value.rows or
+            !std.mem.eql(u8, before.value.cursor, after.value.cursor) or
+            !std.mem.eql(u8, before.value.artifact_cursor, after.value.artifact_cursor) or
+            !std.mem.eql(u8, before.value.projection_cursor, after.value.projection_cursor) or
+            before.value.artifacts_complete != after.value.artifacts_complete or
+            before.value.rows_complete != after.value.rows_complete or
+            !std.mem.eql(u8, &before.value.logical_digest, &after.value.logical_digest) or
+            !std.meta.eql(before.value.rewrite, after.value.rewrite)) return error.InvalidRestoreStagingCommand;
+        return;
+    }
+    if (!before.value.source_generation_proofs_complete) return error.InvalidRestoreStagingCommand;
+    if (before.value.source_generation_proofs_complete != after.value.source_generation_proofs_complete)
+        return error.InvalidRestoreStagingCommand;
     if (admission.projection_page) {
         if (admission.artifact_page or admission.rewrite or !before.value.scope.preserve_artifacts or !before.value.artifacts_complete or
             !before.value.rows_complete or !after.value.rows_complete or !after.value.artifacts_complete or

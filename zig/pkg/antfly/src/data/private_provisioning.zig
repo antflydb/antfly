@@ -17,7 +17,15 @@
 const std = @import("std");
 const staging = @import("../metadata/restore_staging.zig");
 const tables = @import("../metadata/table_manager.zig");
-pub const Owner = struct { plan_id: [16]u8, plan_digest: [32]u8, table: tables.TableRecord, range: tables.RangeRecord, scope: @import("../storage/db/restore_staging_contract.zig").Scope, cancel_recovery: bool = false };
+pub const Owner = struct {
+    plan_id: [16]u8,
+    plan_digest: [32]u8,
+    table: tables.TableRecord,
+    range: tables.RangeRecord,
+    scope: @import("../storage/db/restore_staging_contract.zig").Scope,
+    empty_generation_handoff: ?@import("../storage/db/restore_staging_contract.zig").EmptyGenerationHandoffExpectation = null,
+    cancel_recovery: bool = false,
+};
 pub const InitialOwner = struct {
     descriptor: staging.ProvisioningProjection.InitialFkOwner,
     table: tables.TableRecord,
@@ -113,7 +121,7 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
             const actual = maybe_actual orelse continue;
             for (public_tables) |published| if (published.table_id == target.table.table_id) return error.InvalidRestoreStaging;
             if (!tables.tableDefinitionsEqual(expected, actual)) return error.InvalidRestoreStaging;
-            for (target.ranges) |range| {
+            for (target.ranges, 0..) |range, range_index| {
                 var expected_range = try tables.cloneRange(alloc, range);
                 defer tables.freeRange(alloc, expected_range);
                 try tables.clearOwnedRangeRestoreIntent(alloc, &expected_range);
@@ -128,7 +136,36 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
                 if (inserted.found_existing) return error.InvalidRestoreStaging;
                 const scope = try staging.ownerScope(alloc, parsed.value.plan, parsed.value.plan_digest, target, range);
                 try scope.validate();
-                try owners.append(alloc, .{ .plan_id = parsed.value.plan.id, .plan_digest = parsed.value.plan_digest, .table = actual, .range = actual_range, .scope = scope, .cancel_recovery = parsed.value.state == .canceling });
+                // The validated plan aligns each old/new range and its
+                // handoff by ordinal. Avoid rescanning every target for each
+                // projected owner on the hot metadata snapshot path.
+                const handoff = if (scope.empty_generation) handoff: {
+                    if (range_index >= target.generation_handoffs.len) return error.InvalidRestoreStaging;
+                    const pinned = target.generation_handoffs[range_index];
+                    if (pinned.target_group_id != range.group_id) return error.InvalidRestoreStaging;
+                    const command: @import("../storage/db/relational_integrity_topology_contract.zig").GenerationHandoffInstall = .{
+                        .scope = scope.digest(),
+                        .source_summary_digest = pinned.admissions_digest,
+                        .retired_digest = pinned.retired_digest,
+                        .retired_count = pinned.retired_count,
+                        .mappings = pinned.mappings,
+                    };
+                    break :handoff @import("../storage/db/restore_staging_contract.zig").EmptyGenerationHandoffExpectation{
+                        .source_summary_digest = command.source_summary_digest,
+                        .retired_digest = command.retired_digest,
+                        .retired_count = command.retired_count,
+                        .expected_install_receipt_digest = try @import("../storage/db/empty_generation_handoff.zig").installReceiptDigest(command),
+                    };
+                } else null;
+                try owners.append(alloc, .{
+                    .plan_id = parsed.value.plan.id,
+                    .plan_digest = parsed.value.plan_digest,
+                    .table = actual,
+                    .range = actual_range,
+                    .scope = scope,
+                    .empty_generation_handoff = handoff,
+                    .cancel_recovery = parsed.value.state == .canceling,
+                });
             }
         }
     }

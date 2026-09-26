@@ -10,6 +10,7 @@ pub const test_sources = [_][]const u8{
     "kernel_owner_test.zig",
     "kernel_owner_provisioned_source_test.zig",
     "enrichment_compute_test.zig",
+    "kernel_owner_handoff_reopen_test.zig",
 };
 
 /// Exercise the same storage archive linked by serving and embedded consumers.
@@ -22,6 +23,7 @@ pub fn add(
     optimize: std.builtin.OptimizeMode,
     imports: AntflyRootImports,
     vopr: *std.Build.Module,
+    lmdb_engine: *std.Build.Module,
     artifacts: [std.meta.fields(runtime.RuntimeLibraryUnit).len]?*std.Build.Step.Compile,
 ) Result {
     const owner_filter = b.option([]const u8, "storage-owner-test-filter", "Compile and run one matching storage owner test subset");
@@ -87,5 +89,27 @@ pub fn add(
                 module.linkLibrary(artifacts[@intFromEnum(@as(runtime.RuntimeLibraryUnit, unit))].?);
         }
     }
+    const physical_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/storage_kernel_owner_physical_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    physical_module.addImport("vopr", vopr);
+    var physical_imports = imports;
+    physical_imports.boundary_profile = .owner;
+    physical_imports.configureStorage(b, physical_module, true);
+    @import("storage.zig").configureLmdb(b, physical_module, lmdb_engine, true);
+    physical_imports.storage_boundary.configureProfile(physical_module, true, true, .owner);
+    const handoff_tests = @import("linked_tests.zig").add(b, .{
+        .name = "storage-owner-handoff-reopen-tests",
+        .root_module = physical_module,
+        .filters = &.{"storage owner handoff receipt survives shared-context hidden to public reopen"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    handoff_tests.executable.root_module.addObject(test_metadata.object);
+    inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+        handoff_tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(@as(runtime.RuntimeLibraryUnit, unit))].?);
+    b.step("antfly-storage-owner-handoff-reopen-test", "Run physical shared-context owner handoff receipt reopen regression")
+        .dependOn(&handoff_tests.run(b).step);
     return .{ .runs = runs, .benchmark = benchmark };
 }

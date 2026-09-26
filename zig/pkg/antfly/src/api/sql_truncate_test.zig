@@ -243,6 +243,29 @@ test "SQL TRUNCATE graph index fails before owner reads and job admission" {
     }
 }
 
+test "SQL TRUNCATE revoked durable credential is a forbidden pre-admission failure" {
+    var fixture: Fixture = .{};
+    defer fixture.deinit();
+    fixture.tables[0].indexes_json = "{\"links\":{\"type\":\"graph\"}}";
+    var server = try fixture.server();
+    defer server.deinit();
+    server.cfg.auth_enabled = true;
+    var permissions = [_]@import("../usermgr/mod.zig").Permission{.{ .resource = @constCast("*"), .resource_type = .table, .type = .admin }};
+    const identity: http.AuthenticatedIdentity = .{
+        .username = @constCast("trusted-admin"),
+        .credential_principal = @constCast("trusted:ephemeral-admin"),
+        .permissions = &permissions,
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try std.testing.expectError(error.StoredDestinationAuthorizationRevoked, truncate.execute(&server, identity, .{}, "default", "public", arena.allocator(), ddl));
+    try std.testing.expectEqual(@as(usize, 0), fixture.owner_reads);
+    try std.testing.expectEqual(@as(usize, 0), fixture.admissions);
+    const diagnostic = @import("../sql/errors.zig").describe(error.StoredDestinationAuthorizationRevoked);
+    try std.testing.expectEqualStrings("42501", diagnostic.code);
+    try std.testing.expectEqual(@as(u16, 403), diagnostic.httpStatus());
+}
+
 test "SQL TRUNCATE CASCADE rejects graph child before admitting whole cohort" {
     var fixture: Fixture = .{ .logical_name = "parent", .second_logical_name = "child" };
     defer fixture.deinit();

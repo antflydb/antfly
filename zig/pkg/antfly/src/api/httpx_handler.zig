@@ -2416,6 +2416,12 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalGroupFkGenerationSource(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        // This private endpoint can advance a durable owner fence. Legacy
+        // internal-route compatibility must not make it unauthenticated.
+        const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+        defer service.deinit(self.api_server.alloc);
+        if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "FK generation source request required");
@@ -2576,6 +2582,15 @@ pub const AntflyApiHandler = struct {
             ctx.request.uri.query orelse "",
         ) catch return textResponse(ctx, 400, "invalid lookup options");
         defer lookup_options.deinit(ctx.allocator);
+        if (std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}")) {
+            // A legacy unauthenticated internal peer must never gain the
+            // hidden, unfenced receipt capability merely by setting a query
+            // parameter. Public route middleware is not sufficient here.
+            const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+            var identity = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+            defer identity.deinit(self.api_server.alloc);
+            if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        }
         const control_lookup = lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_index_status_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0;
         const logical_key = if (control_lookup and std.mem.eql(u8, key, "\x00relational_control")) "" else key;
         const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch
@@ -14055,6 +14070,55 @@ test "httpx retained read refuses unsigned migration requests and requires catal
     try std.testing.expectEqual(@as(u16, 503), authenticated.status.code);
     try std.testing.expect(std.mem.indexOf(u8, authenticated.body.?, "source unavailable") != null);
     try std.testing.expect(api_server.retained_read_runtime == null);
+}
+
+test "httpx hidden handoff receipt rejects public caller even in legacy internal mode" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .internal_service_secret = "hidden-handoff-test-secret",
+        .internal_service_issuer = "httpx-test",
+        .internal_service_accept_legacy_unauthenticated = true,
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/internal/v1/groups/7/tables/hidden/documents/control?read_consistency=read_index&_relational_topology=%7B%22mode%22%3A%22generation_handoff_install%22%7D&_restore_staging_scope=1111111111111111111111111111111111111111111111111111111111111111&_restore_staging_plan_id=22222222222222222222222222222222");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, undefined, &request);
+    defer ctx.deinit();
+    const params = [_]httpx.RouteParam{
+        .{ .name = "group_id", .value = "7" },
+        .{ .name = "table_name", .value = "hidden" },
+        .{ .name = "key", .value = "control" },
+    };
+    ctx.params = &params;
+    var response = try handler.internalGroupLookup(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 401), response.status.code);
+}
+
+test "httpx FK source control rejects missing service token in legacy internal mode" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .internal_service_secret = "fk-source-test-secret",
+        .internal_service_issuer = "httpx-test",
+        .internal_service_accept_legacy_unauthenticated = true,
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/children/fk-generation-source");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, undefined, &request);
+    defer ctx.deinit();
+    const params = [_]httpx.RouteParam{
+        .{ .name = "group_id", .value = "7" },
+        .{ .name = "table_name", .value = "children" },
+    };
+    ctx.params = &params;
+    var response = try handler.internalGroupFkGenerationSource(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 401), response.status.code);
 }
 
 test "httpx restore owner accepts bounded rewrite source chunks above legacy control limit" {

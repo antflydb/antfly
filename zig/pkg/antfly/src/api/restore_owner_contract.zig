@@ -37,7 +37,8 @@ pub const Source = struct {
 };
 pub const Request = struct {
     scope: staging.Scope,
-    action: enum { begin, import_page, status, validate, publish, cancel },
+    action: enum { begin, import_page, status, validate, install_generation_admissions, publish, cancel },
+    generation_admissions: ?staging.InstallGenerationAdmissions = null,
     source: ?Source = null,
     source_chunk: ?@import("../storage/db/source_artifact_transfer.zig").ReadResponse = null,
     rewrite: ?@import("../storage/db/relational_rewrite_contract.zig").Intent = null,
@@ -54,6 +55,13 @@ pub const Request = struct {
     }
     pub fn validate(self: Request, group_id: u64) !void {
         try self.scope.validate();
+        if ((self.action == .install_generation_admissions) != (self.generation_admissions != null)) return error.InvalidRestoreStagingCommand;
+        if (self.generation_admissions) |command| {
+            try command.validate();
+            if (!std.mem.eql(u8, &command.scope, &self.scope.digest()) or self.source != null or self.source_chunk != null or
+                self.rewrite != null or self.rewrite_tail != null or self.rewrite_finish != null)
+                return error.InvalidRestoreStagingCommand;
+        }
         if (self.scope.empty_generation and (self.action == .import_page or self.source != null or self.source_chunk != null or self.rewrite != null or self.rewrite_tail != null or self.rewrite_finish != null)) return error.InvalidRestoreStagingCommand;
         if (self.scope.target_namespace.shard_id != group_id or self.max_rows == 0 or self.max_rows > 128) return error.InvalidRestoreStagingCommand;
         if (self.source_chunk != null and (self.action != .import_page or self.source == null or self.source.?.peer_descriptor == null or self.rewrite_tail != null or self.rewrite_finish != null)) return error.InvalidRestoreStagingCommand;
@@ -88,6 +96,7 @@ pub const Response = struct {
     phase: staging.Phase,
     rows: u64,
     receipt: staging.Digest,
+    generation_admission_receipt: ?staging.Digest = null,
     rewrite: ?@import("../storage/db/relational_rewrite_contract.zig").Progress = null,
     tail_next: u32 = 0,
     source_next_offset: u64 = 0,

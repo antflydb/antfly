@@ -3494,6 +3494,94 @@ test "relational integrity restore staging publishes all targets only after exac
     try std.testing.expectEqual(restore_staging.State.published, loaded.value.state);
 }
 
+test "relational integrity restore staging portable FK cannot publish before exact mapped parent admission receipt" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable-fk-admission", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const group_id = group_ids.main_metadata_group_id;
+    const id = try restore_staging.idForAttempt(7, 1);
+    const parent_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const child_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const parent_artifact: restore_staging.SourceArtifact = .{ .target_group_id = 701, .source_namespace = .{ .table_id = 1, .shard_id = 101, .range_id = 101 }, .format = .portable, .snapshot_path = "parent.afb", .artifact_size_bytes = 1, .artifact_sha256 = @splat(2) };
+    const parent_artifact_second: restore_staging.SourceArtifact = .{ .target_group_id = 703, .source_namespace = .{ .table_id = 1, .shard_id = 103, .range_id = 103 }, .format = .portable, .snapshot_path = "parent-second.afb", .artifact_size_bytes = 1, .artifact_sha256 = @splat(8) };
+    const child_artifact: restore_staging.SourceArtifact = .{ .target_group_id = 702, .source_namespace = .{ .table_id = 2, .shard_id = 102, .range_id = 102 }, .format = .portable, .snapshot_path = "child.afb", .artifact_size_bytes = 1, .artifact_sha256 = @splat(3) };
+    const child: restore_staging.Target = .{ .source_table_id = 2, .source_table_name = "children", .table = .{ .table_id = 12, .name = "children", .schema_json = child_schema }, .ranges = &.{.{ .table_id = 12, .group_id = 702, .range_id = 702, .doc_identity_shard_id = 702, .doc_identity_range_id = 702, .start_key = "" }}, .source_artifacts = &.{child_artifact}, .source_generation_admissions = &.{.{ .target_group_id = 702, .source_namespace = child_artifact.source_namespace, .entries = &.{}, .digest = try @import("../../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(child_artifact.source_namespace, &.{}) }} };
+    var source_child = child;
+    source_child.table.table_id = 2;
+    const source_generation = try restore_staging.plannedForeignGeneration(alloc, source_child, "fk");
+    const summaries = [_]@import("../../storage/portable_backup.zig").SourceGenerationAdmissionSummaryEntry{.{ .child_table_id = 2, .child_table_name = "children", .constraint_name = "fk", .active_generation = source_generation, .source_scope_digest = @splat(4) }};
+    const summaries_second = [_]@import("../../storage/portable_backup.zig").SourceGenerationAdmissionSummaryEntry{.{ .child_table_id = 2, .child_table_name = "children", .constraint_name = "fk", .active_generation = source_generation, .source_scope_digest = @splat(9) }};
+    const parent: restore_staging.Target = .{ .source_table_id = 1, .source_table_name = "parents", .table = .{ .table_id = 11, .name = "parents", .schema_json = parent_schema, .min_ranges = 2 }, .ranges = &.{
+        .{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "", .end_key = "m" },
+        .{ .table_id = 11, .group_id = 703, .range_id = 703, .doc_identity_shard_id = 703, .doc_identity_range_id = 703, .start_key = "m" },
+    }, .source_artifacts = &.{ parent_artifact, parent_artifact_second }, .source_generation_admissions = &.{
+        .{ .target_group_id = 701, .source_namespace = parent_artifact.source_namespace, .entries = &summaries, .digest = try @import("../../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(parent_artifact.source_namespace, &summaries) },
+        .{ .target_group_id = 703, .source_namespace = parent_artifact_second.source_namespace, .entries = &summaries_second, .digest = try @import("../../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(parent_artifact_second.source_namespace, &summaries_second) },
+    } };
+    var projection_arena = std.heap.ArenaAllocator.init(alloc);
+    defer projection_arena.deinit();
+    var targets = [_]restore_staging.Target{ parent, child };
+    try restore_staging.prepareTargetProjectionsAlloc(projection_arena.allocator(), &targets);
+    const plan: restore_staging.Plan = .{ .id = id, .cohort_digest = @splat(9), .targets = &targets };
+    try plan.validate(alloc);
+    const digest = try plan.digest(alloc);
+    var mapped = (try restore_staging.mappedGenerationAdmissionsForGroupAlloc(alloc, plan, digest, 701)).?;
+    defer mapped.deinit(alloc);
+    var mapped_second = (try restore_staging.mappedGenerationAdmissionsForGroupAlloc(alloc, plan, digest, 703)).?;
+    defer mapped_second.deinit(alloc);
+    try std.testing.expect(!std.mem.eql(u8, &mapped.command.source_summary_digest, &mapped_second.command.source_summary_digest));
+    var txn = try store.store.beginWriteTxn();
+    var txn_open = true;
+    defer if (txn_open) txn.abort();
+    var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .reserve, .plan = plan });
+    for (plan.targets) |target| for (target.ranges) |range| {
+        try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .imported, .expected_revision = 1, .receipt = .{ .group_id = range.group_id, .range_id = range.range_id, .plan_digest = digest, .completion_digest = @splat(5) } });
+    };
+    for (plan.targets) |target| for (target.ranges) |range| {
+        try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .validated, .expected_revision = 2, .receipt = .{ .group_id = range.group_id, .range_id = range.range_id, .plan_digest = digest, .completion_digest = @splat(6) } });
+    };
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 2 });
+    try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&key_buf, group_id, 11)));
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_activation, .expected_revision = 2 });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_cancel, .expected_revision = 3 });
+    const forged: restore_staging.OwnerReceipt = .{ .group_id = 701, .range_id = 701, .plan_digest = digest, .completion_digest = @splat(7) };
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .target_admissions_activated, .expected_revision = 3, .receipt = forged });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 3 });
+    try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&key_buf, group_id, 11)));
+    var exact = forged;
+    exact.completion_digest = mapped.expected_receipt_digest;
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .target_admissions_activated, .expected_revision = 3, .receipt = exact });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .target_admissions_activated, .expected_revision = 3, .receipt = exact });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 3 });
+    try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&key_buf, group_id, 11)));
+    try txn.commit();
+    txn_open = false;
+    store.deinit();
+    store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    txn = try store.store.beginWriteTxn();
+    txn_open = true;
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .target_admissions_activated, .expected_revision = 2, .receipt = exact });
+    var exact_second = exact;
+    exact_second.group_id = 703;
+    exact_second.range_id = 703;
+    exact_second.completion_digest = mapped_second.expected_receipt_digest;
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .target_admissions_activated, .expected_revision = 3, .receipt = exact_second });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 3 });
+    _ = try txn.get(try tableKeyForGroup(&key_buf, group_id, 11));
+    _ = try txn.get(try tableKeyForGroup(&key_buf, group_id, 12));
+    txn.abort();
+    txn_open = false;
+}
+
 test "relational integrity restore staging cancellation survives snapshots without reopening identities" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3683,12 +3771,14 @@ test "relational integrity restore staging graph empty-generation cutover replay
     const old: metadata.TableRecord = .{ .table_id = 1, .name = "documents", .schema_json = "{}", .indexes_json = indexes };
     const old_range: metadata.RangeRecord = .{ .table_id = 1, .group_id = 601, .range_id = 601, .start_key = "" };
     const fence: @import("../../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .owner_group_id = 601, .peer_group_id = 701, .namespace = .{ .table_id = 1, .shard_id = 601, .range_id = 601 }, .catalog_digest = @splat(4) };
+    const handoff: restore_staging.GenerationHandoffRange = .{ .source_group_id = 601, .target_group_id = 701, .source_namespace = fence.namespace, .admissions = &.{}, .admissions_digest = try @import("../../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(fence.namespace, &.{}), .retired_digest = @splat(8), .retired_count = 0 };
     var replacement = old;
     replacement.table_id = 11;
     const target: restore_staging.Target = .{
         .source_table_id = 1,
         .empty_generation = true,
-        .graph_retirement_digest = restore_staging.graphRetirementDigest(1, 11, indexes),
+        .graph_retirement_digest = try restore_staging.graphRetirementDigest(alloc, 1, 11, indexes),
+        .generation_handoffs = &.{handoff},
         .table = replacement,
         .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }},
         .replace = .{ .table = old, .ranges = &.{old_range}, .fences = &.{fence} },
@@ -3696,6 +3786,28 @@ test "relational integrity restore staging graph empty-generation cutover replay
     const plan: restore_staging.Plan = .{ .id = try restore_staging.idForAttempt(7, 1), .cohort_digest = @splat(9), .targets = &.{target} };
     try plan.validate(alloc);
     const digest = try plan.digest(alloc);
+    const graph_scope = (try restore_staging.graphSealScopeForOldRange(alloc, plan, digest, target, old_range)).?;
+    const graph_seal = try graph_scope.sealDigest();
+    const preflight = try restore_staging.generationHandoffPreflightDigest(fence, digest, handoff);
+    const handoff_seal = try restore_staging.generationHandoffSealDigest(fence, digest, handoff);
+    const combined_seal = try restore_staging.generationHandoffOldFenceDigest(fence, handoff_seal, graph_seal);
+    const target_install = (try restore_staging.mappedEmptyGenerationHandoffForGroup(alloc, plan, digest, 701)).?;
+    {
+        const cancel_root = try std.fmt.allocPrint(alloc, "{s}-before-cutover", .{root});
+        defer alloc.free(cancel_root);
+        var cancel_store = try RaftApplyStore.init(alloc, .{ .root_dir = cancel_root });
+        defer cancel_store.deinit();
+        var txn = try cancel_store.store.beginWriteTxn();
+        var txn_open = true;
+        defer if (txn_open) txn.abort();
+        try cancel_store.applyTransitionCommandTxn(&txn, group_id, .{ .upsert_table = old });
+        try cancel_store.applyTransitionCommandTxn(&txn, group_id, .{ .upsert_range = old_range });
+        try applyRestoreStagingForTest(&cancel_store, &txn, group_id, .{ .id = plan.id, .action = .reserve, .plan = plan });
+        try applyRestoreStagingForTest(&cancel_store, &txn, group_id, .{ .id = plan.id, .action = .begin_cancel, .expected_revision = 1 });
+        try txn.commit();
+        txn_open = false;
+        try std.testing.expectEqual(restore_staging.State.canceling, (try cancel_store.loadRestoreStagingProgress(alloc, group_id, plan.id)).?.state);
+    }
     {
         var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
         defer store.deinit();
@@ -3721,8 +3833,21 @@ test "relational integrity restore staging graph empty-generation cutover replay
             .{ .id = plan.id, .action = .imported, .expected_revision = 1, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = digest, .completion_digest = @splat(1) } },
             .{ .id = plan.id, .action = .validated, .expected_revision = 2, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = digest, .completion_digest = @splat(2) } },
             .{ .id = plan.id, .action = .begin_cutover, .expected_revision = 2 },
-            .{ .id = plan.id, .action = .old_fenced, .expected_revision = 3, .receipt = .{ .group_id = 601, .range_id = 601, .plan_digest = digest, .completion_digest = @splat(3) } },
-            .{ .id = plan.id, .action = .publish, .expected_revision = 3 },
+            .{ .id = plan.id, .action = .source_handoff_checked, .expected_revision = 2, .receipt = .{ .group_id = 601, .range_id = 601, .plan_digest = digest, .completion_digest = @splat(3) } },
+            .{ .id = plan.id, .action = .source_handoff_checked, .expected_revision = 2, .receipt = .{ .group_id = 601, .range_id = 601, .plan_digest = digest, .completion_digest = preflight } },
+            .{ .id = plan.id, .action = .begin_cutover, .expected_revision = 3 },
+            .{ .id = plan.id, .action = .old_fenced, .expected_revision = 4, .receipt = .{ .group_id = 601, .range_id = 601, .plan_digest = digest, .completion_digest = @splat(3) } },
+            .{ .id = plan.id, .action = .old_fenced, .expected_revision = 4, .receipt = .{ .group_id = 601, .range_id = 602, .plan_digest = digest, .completion_digest = combined_seal } },
+            .{ .id = plan.id, .action = .old_fenced, .expected_revision = 4, .receipt = .{ .group_id = 601, .range_id = 601, .plan_digest = digest, .completion_digest = graph_seal } },
+            .{ .id = plan.id, .action = .old_fenced, .expected_revision = 4, .receipt = .{ .group_id = 601, .range_id = 601, .plan_digest = digest, .completion_digest = combined_seal } },
+            // Graph begin_cutover is irreversible: a late cancellation may
+            // not move metadata to canceling after the owner sealed its gate.
+            .{ .id = plan.id, .action = .begin_cancel, .expected_revision = 4 },
+            .{ .id = plan.id, .action = .publish, .expected_revision = 4 },
+            .{ .id = plan.id, .action = .begin_activation, .expected_revision = 4 },
+            .{ .id = plan.id, .action = .target_admissions_activated, .expected_revision = 5, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = digest, .completion_digest = @splat(3) } },
+            .{ .id = plan.id, .action = .target_admissions_activated, .expected_revision = 5, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = digest, .completion_digest = target_install.expected_receipt_digest } },
+            .{ .id = plan.id, .action = .publish, .expected_revision = 5 },
         }) |command| try applyRestoreStagingForTest(&store, &txn, group_id, command);
         try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&key_buf, group_id, 1)));
         _ = try txn.get(try tableKeyForGroup(&key_buf, group_id, 11));
@@ -3865,7 +3990,8 @@ test "relational integrity restore staging reserves external parent and rejects 
     const old: metadata.TableRecord = .{ .table_id = 9, .name = "children", .schema_json = child_schema };
     const old_range: metadata.RangeRecord = .{ .table_id = 9, .group_id = 301, .range_id = 301, .start_key = "" };
     const old_fence: @import("../../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 401, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) };
-    const target: restore_staging.Target = .{ .source_table_id = 9, .empty_generation = true, .table = .{ .table_id = 10, .name = "children", .schema_json = child_schema }, .ranges = &.{.{ .table_id = 10, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" }}, .replace = .{ .table = old, .ranges = &.{old_range}, .fences = &.{old_fence} } };
+    const handoff: restore_staging.GenerationHandoffRange = .{ .source_group_id = 301, .target_group_id = 401, .source_namespace = old_fence.namespace, .admissions = &.{}, .admissions_digest = try @import("../../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(old_fence.namespace, &.{}), .retired_digest = @splat(8), .retired_count = 0 };
+    const target: restore_staging.Target = .{ .source_table_id = 9, .empty_generation = true, .table = .{ .table_id = 10, .name = "children", .schema_json = child_schema }, .ranges = &.{.{ .table_id = 10, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" }}, .generation_handoffs = &.{handoff}, .replace = .{ .table = old, .ranges = &.{old_range}, .fences = &.{old_fence} } };
     const parent_table: metadata.TableRecord = .{ .table_id = 11, .name = "parents", .schema_json = parent_schema };
     const parent_range: metadata.RangeRecord = .{ .table_id = 11, .group_id = 501, .range_id = 501, .start_key = "" };
     const parent_fence: @import("../../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .role = .truncate_parent, .transition_id = 7, .attempt = 1, .owner_group_id = 501, .peer_group_id = 501, .namespace = .{ .table_id = 11, .shard_id = 501, .range_id = 501 }, .catalog_digest = @splat(6) };
@@ -3911,21 +4037,27 @@ test "relational integrity restore staging reserves external parent and rejects 
     txn_open = true;
     try std.testing.expect(try restoreStagingLocksTableTxn(&txn, group_id, parent_table.table_id));
     const digest = try plan.digest(alloc);
+    const preflight = try restore_staging.generationHandoffPreflightDigest(old_fence, digest, handoff);
+    const handoff_seal = try restore_staging.generationHandoffSealDigest(old_fence, digest, handoff);
+    const old_completion = try restore_staging.generationHandoffOldFenceDigest(old_fence, handoff_seal, null);
+    const target_install = (try restore_staging.mappedEmptyGenerationHandoffForGroup(alloc, plan, digest, 401)).?;
     const new_receipt: restore_staging.OwnerReceipt = .{ .group_id = 401, .range_id = 401, .plan_digest = digest, .completion_digest = @splat(1) };
     const parent_receipt: restore_staging.OwnerReceipt = .{ .group_id = 501, .range_id = 501, .plan_digest = digest, .completion_digest = @splat(2) };
-    const old_receipt: restore_staging.OwnerReceipt = .{ .group_id = 301, .range_id = 301, .plan_digest = digest, .completion_digest = @splat(3) };
+    const old_receipt: restore_staging.OwnerReceipt = .{ .group_id = 301, .range_id = 301, .plan_digest = digest, .completion_digest = old_completion };
     // A parent acknowledgement cannot arrive before cutover.
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_fenced, .expected_revision = 1, .receipt = parent_receipt });
     try std.testing.expectError(error.NotFound, txn.get(try restore_staging.receiptKey(&buf, group_id, id, .cutover, 501)));
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .imported, .expected_revision = 1, .receipt = new_receipt });
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .validated, .expected_revision = 2, .receipt = new_receipt });
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_cutover, .expected_revision = 2 });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .source_handoff_checked, .expected_revision = 2, .receipt = .{ .group_id = 301, .range_id = 301, .plan_digest = digest, .completion_digest = preflight } });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_cutover, .expected_revision = 3 });
     // Old-child cutover cannot outrun the parent pending record.
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .old_fenced, .expected_revision = 3, .receipt = old_receipt });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .old_fenced, .expected_revision = 4, .receipt = old_receipt });
     try std.testing.expectError(error.NotFound, txn.get(try restore_staging.receiptKey(&buf, group_id, id, .cutover, 301)));
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_fenced, .expected_revision = 3, .receipt = parent_receipt });
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_fenced, .expected_revision = 3, .receipt = parent_receipt });
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .old_fenced, .expected_revision = 3, .receipt = old_receipt });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_fenced, .expected_revision = 4, .receipt = parent_receipt });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_fenced, .expected_revision = 4, .receipt = parent_receipt });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .old_fenced, .expected_revision = 4, .receipt = old_receipt });
     try txn.commit();
     txn_open = false;
     // Crash between parent/old-child cutover receipts and the irreversible
@@ -3939,21 +4071,24 @@ test "relational integrity restore staging reserves external parent and rejects 
     // inverse references invisible, cancellation cannot revive the child.
     // A fabricated receipt is rejected; an exact owner publication receipt
     // permits the all-table metadata switch only after the decision.
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_activation, .expected_revision = 3 });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_activation, .expected_revision = 4 });
     const activating_bytes = try txn.get(try restore_staging.progressKey(&buf, group_id, id));
     var activating = try std.json.parseFromSlice(restore_staging.Progress, alloc, activating_bytes, .{});
     defer activating.deinit();
     try std.testing.expectEqual(restore_staging.State.activating, activating.value.state);
-    try std.testing.expectEqual(@as(u64, 4), activating.value.revision);
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_cancel, .expected_revision = 4 });
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_activated, .expected_revision = 4, .receipt = parent_receipt });
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 4 });
+    try std.testing.expectEqual(@as(u64, 5), activating.value.revision);
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_cancel, .expected_revision = 5 });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_activated, .expected_revision = 5, .receipt = parent_receipt });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 5 });
     try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&buf, group_id, target.table.table_id)));
     const verified_digest = try @import("../../storage/db/relational_integrity_generation_retirement.zig").activationReceipt(parent_fence, digest, @import("../../storage/db/relational_integrity_generation_retirement.zig").publicationDigest(id, digest));
     var verified_receipt = parent_receipt;
     verified_receipt.completion_digest = verified_digest;
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_activated, .expected_revision = 4, .receipt = verified_receipt });
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 4 });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .parent_activated, .expected_revision = 5, .receipt = verified_receipt });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 5 });
+    try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&buf, group_id, target.table.table_id)));
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .target_admissions_activated, .expected_revision = 5, .receipt = .{ .group_id = 401, .range_id = 401, .plan_digest = digest, .completion_digest = target_install.expected_receipt_digest } });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 5 });
     _ = try txn.get(try tableKeyForGroup(&buf, group_id, target.table.table_id));
     txn.abort();
     txn_open = false;
@@ -3962,18 +4097,13 @@ test "relational integrity restore staging reserves external parent and rejects 
     txn = try store.store.beginWriteTxn();
     txn_open = true;
     // Publication is still impossible without activation proof.
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 3 });
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .publish, .expected_revision = 4 });
     try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&buf, group_id, target.table.table_id)));
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_cancel, .expected_revision = 3 });
-    for ([_]restore_staging.OwnerReceipt{ new_receipt, parent_receipt, old_receipt }, 0..) |receipt, index| {
-        try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .canceled, .expected_revision = 4, .receipt = receipt });
-        try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .canceled, .expected_revision = 4, .receipt = receipt });
-        if (index == 0) try std.testing.expect(try restoreStagingLocksTableTxn(&txn, group_id, parent_table.table_id));
-    }
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .finish_cancel, .expected_revision = 4 });
-    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .finish_cancel, .expected_revision = 4 });
-    try std.testing.expect(!try restoreStagingLocksTableTxn(&txn, group_id, parent_table.table_id));
-    try std.testing.expectError(error.NotFound, txn.get(try restore_staging.identityKey(&buf, group_id, .parent_group, parent_range.group_id)));
+    // Cutover is irreversible once source handoff can be sealed. Removing a
+    // replica does not turn this into a cancellable job or release the parent
+    // lock; a new leader must finish the exact activation receipts.
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .begin_cancel, .expected_revision = 4 });
+    try std.testing.expect(try restoreStagingLocksTableTxn(&txn, group_id, parent_table.table_id));
     _ = try txn.get(try tableKeyForGroup(&buf, group_id, parent_table.table_id));
     _ = try txn.get(try rangeKeyForGroup(&buf, group_id, parent_range.group_id));
 }
@@ -13389,9 +13519,14 @@ pub const RaftApplyStore = struct {
             var total: u32 = 0;
             var old_total: u32 = 0;
             var parent_total: u32 = 0;
+            var admission_total: u32 = 0;
             for (job.value.plan.targets) |target| {
                 total += @intCast(target.ranges.len);
                 if (target.replace) |old| old_total += @intCast(old.ranges.len);
+                for (target.source_generation_admissions) |range_proof| if (range_proof.entries.len != 0) {
+                    admission_total += 1;
+                };
+                admission_total += @intCast(target.generation_handoffs.len);
             }
             for (job.value.plan.external_fk_parents) |parent| parent_total += @intCast(parent.ranges.len);
             switch (command.action) {
@@ -13437,12 +13572,12 @@ pub const RaftApplyStore = struct {
                     next.completed_owners = 0;
                     next.revision += 1;
                 },
-                .imported, .validated, .old_fenced, .canceled, .parent_fenced, .parent_activated => {
+                .imported, .validated, .old_fenced, .canceled, .parent_fenced, .parent_activated, .target_admissions_activated => {
                     const expected_state: restore_staging.State = switch (command.action) {
                         .imported => .importing,
                         .validated => .validating,
                         .old_fenced, .parent_fenced => .cutover,
-                        .parent_activated => .activating,
+                        .parent_activated, .target_admissions_activated => .activating,
                         .canceled => .canceling,
                         else => unreachable,
                     };
@@ -13454,6 +13589,7 @@ pub const RaftApplyStore = struct {
                     if (command.action == .old_fenced and next.completed_owners < parent_total) return;
                     if (command.action == .parent_fenced and next.completed_owners >= parent_total) return;
                     if (command.action == .parent_activated and next.completed_owners >= parent_total) return;
+                    if (command.action == .target_admissions_activated and (next.completed_owners < parent_total or next.completed_owners >= parent_total + admission_total)) return;
                     const receipt = command.receipt.?;
                     if (!std.mem.eql(u8, &receipt.plan_digest, &job.value.plan_digest)) return;
                     if (command.action == .parent_activated) {
@@ -13465,7 +13601,31 @@ pub const RaftApplyStore = struct {
                         const expected_receipt = try retirement.activationReceipt(planned_fence, job.value.plan_digest, expected_publication);
                         if (!std.mem.eql(u8, &receipt.completion_digest, &expected_receipt)) return;
                     }
+                    if (command.action == .target_admissions_activated) {
+                        const handoff = restore_staging.mappedEmptyGenerationHandoffForGroup(self.alloc, job.value.plan, job.value.plan_digest, receipt.group_id) catch |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            else => return,
+                        };
+                        if (handoff) |mapped| {
+                            if (!std.mem.eql(u8, &receipt.completion_digest, &mapped.expected_receipt_digest)) return;
+                        } else {
+                            var mapped = (restore_staging.mappedGenerationAdmissionsForGroupAlloc(self.alloc, job.value.plan, job.value.plan_digest, receipt.group_id) catch |err| switch (err) {
+                                error.OutOfMemory => return err,
+                                else => return,
+                            }) orelse return;
+                            defer mapped.deinit(self.alloc);
+                            if (!std.mem.eql(u8, &receipt.completion_digest, &mapped.expected_receipt_digest)) return;
+                        }
+                    }
                     const owner_matches = outer: for (job.value.plan.targets) |target| {
+                        if (command.action == .target_admissions_activated) {
+                            const admitted = blk: {
+                                for (target.generation_handoffs) |handoff| if (handoff.target_group_id == receipt.group_id) break :blk true;
+                                for (target.source_generation_admissions) |range_proof| if (range_proof.target_group_id == receipt.group_id and range_proof.entries.len != 0) break :blk true;
+                                break :blk false;
+                            };
+                            if (!admitted) continue;
+                        }
                         if (command.action != .old_fenced and !job.value.plan.preparing_sources) for (target.ranges) |range| {
                             if (range.group_id == receipt.group_id and range.range_id == receipt.range_id) break :outer true;
                         };
@@ -13479,6 +13639,32 @@ pub const RaftApplyStore = struct {
                         break :blk false;
                     };
                     if (!owner_matches) return;
+                    if (command.action == .old_fenced) {
+                        // A graph or FK handoff old-owner receipt is not an
+                        // arbitrary coordinator hash. Recompute both exact
+                        // logical seals from the immutable Plan, requiring a
+                        // combined receipt when both share one old owner.
+                        for (job.value.plan.targets) |target| if (target.replace) |old| {
+                            for (old.ranges) |range| {
+                                if (range.group_id != receipt.group_id or
+                                    (if (range.range_id == 0) range.group_id else range.range_id) != receipt.range_id) continue;
+                                const graph_scope = restore_staging.graphSealScopeForOldRange(self.alloc, job.value.plan, job.value.plan_digest, target, range) catch |err| switch (err) {
+                                    error.OutOfMemory => return err,
+                                    else => return,
+                                };
+                                const graph_digest: ?[32]u8 = if (graph_scope) |scope| scope.sealDigest() catch return else null;
+                                const handoff = restore_staging.generationHandoffForOldRange(target, range) catch return;
+                                const expected: [32]u8 = if (handoff) |proof| blk: {
+                                    const fence = for (old.fences) |candidate| {
+                                        if (candidate.owner_group_id == range.group_id) break candidate;
+                                    } else return;
+                                    const sealed = restore_staging.generationHandoffSealDigest(fence, job.value.plan_digest, proof) catch return;
+                                    break :blk restore_staging.generationHandoffOldFenceDigest(fence, sealed, graph_digest) catch return;
+                                } else graph_digest orelse break;
+                                if (!std.mem.eql(u8, &expected, &receipt.completion_digest)) return;
+                            }
+                        };
+                    }
                     var receipt_buf: [256]u8 = undefined;
                     const receipt_key = try restore_staging.receiptKey(&receipt_buf, group_id, command.id, next.state, receipt.group_id);
                     if (try stagingGet(txn, receipt_key) != null) return;
@@ -13490,14 +13676,54 @@ pub const RaftApplyStore = struct {
                         next.revision += 1;
                     }
                 },
+                .source_handoff_checked => {
+                    if (next.state != .validating or next.completed_owners != total) return;
+                    const receipt = command.receipt.?;
+                    if (!std.mem.eql(u8, &receipt.plan_digest, &job.value.plan_digest)) return;
+                    const expected = outer: for (job.value.plan.targets) |target| {
+                        if (!target.empty_generation) continue;
+                        const old = target.replace orelse return;
+                        for (old.ranges) |range| {
+                            if (range.group_id != receipt.group_id or (if (range.range_id == 0) range.group_id else range.range_id) != receipt.range_id) continue;
+                            const handoff = (restore_staging.generationHandoffForOldRange(target, range) catch return) orelse return;
+                            const fence = for (old.fences) |candidate| {
+                                if (candidate.owner_group_id == range.group_id) break candidate;
+                            } else return;
+                            break :outer restore_staging.generationHandoffPreflightDigest(fence, job.value.plan_digest, handoff) catch return;
+                        }
+                    } else return;
+                    if (!std.mem.eql(u8, &expected, &receipt.completion_digest)) return;
+                    var receipt_buf: [256]u8 = undefined;
+                    const receipt_key = try restore_staging.receiptKey(&receipt_buf, group_id, command.id, .validating, receipt.group_id);
+                    if (try stagingGet(txn, receipt_key) != null) return;
+                    try txn.put(receipt_key, &receipt.completion_digest);
+                    next.revision += 1;
+                },
                 .begin_cutover => {
                     if (next.state != .validating or next.completed_owners != total or old_total == 0) return;
+                    for (job.value.plan.targets) |target| {
+                        if (!target.empty_generation) continue;
+                        const old = target.replace orelse return;
+                        for (old.ranges) |range| {
+                            var receipt_buf: [256]u8 = undefined;
+                            const receipt_key = try restore_staging.receiptKey(&receipt_buf, group_id, command.id, .validating, range.group_id);
+                            const actual = (try stagingGet(txn, receipt_key)) orelse return;
+                            const handoff = (restore_staging.generationHandoffForOldRange(target, range) catch return) orelse return;
+                            const fence = for (old.fences) |candidate| {
+                                if (candidate.owner_group_id == range.group_id) break candidate;
+                            } else return;
+                            const expected = restore_staging.generationHandoffPreflightDigest(fence, job.value.plan_digest, handoff) catch return;
+                            if (!std.mem.eql(u8, actual, &expected)) return;
+                        }
+                    }
                     next.state = .cutover;
                     next.completed_owners = 0;
                     next.revision += 1;
                 },
                 .begin_activation => {
-                    if (parent_total == 0 or next.state != .cutover or next.completed_owners != old_total + parent_total) return;
+                    if (parent_total + admission_total == 0 or
+                        !((next.state == .cutover and next.completed_owners == old_total + parent_total) or
+                            (old_total == 0 and next.state == .validating and next.completed_owners == total))) return;
                     // This transition is the irrevocable metadata decision.
                     // Recheck the full topology and dependency closure in the
                     // same transaction; external owners may only activate
@@ -13510,7 +13736,10 @@ pub const RaftApplyStore = struct {
                     next.revision += 1;
                 },
                 .begin_cancel => {
-                    if (next.state == .canceling or next.state == .activating) return;
+                    if (next.state == .canceling or next.state == .activating or next.state == .published or next.state == .canceled) return;
+                    if (next.state == .cutover) for (job.value.plan.targets) |target| {
+                        if (target.graph_retirement_digest != null or target.generation_handoffs.len != 0) return;
+                    };
                     next.state = .canceling;
                     next.completed_owners = 0;
                     next.revision += 1;
@@ -13521,15 +13750,36 @@ pub const RaftApplyStore = struct {
                     // admitted only for its planned fence and publication.
                     const required = if (command.action == .finish_cancel)
                         (if (job.value.plan.preparing_sources) old_total else total + old_total + parent_total)
-                    else if (parent_total != 0)
-                        parent_total
+                    else if (parent_total + admission_total != 0)
+                        parent_total + admission_total
                     else if (old_total != 0)
                         old_total
                     else
                         total;
                     if (next.completed_owners != required or
-                        (command.action == .publish and next.state != (if (parent_total != 0) restore_staging.State.activating else if (old_total != 0) restore_staging.State.cutover else .validating)) or
+                        (command.action == .publish and next.state != (if (parent_total + admission_total != 0) restore_staging.State.activating else if (old_total != 0) restore_staging.State.cutover else .validating)) or
                         (command.action == .finish_cancel and next.state != .canceling)) return;
+                    if (command.action == .publish) for (job.value.plan.targets) |target| if (target.replace) |old| {
+                        for (old.ranges) |range| {
+                            const graph_scope = restore_staging.graphSealScopeForOldRange(self.alloc, job.value.plan, job.value.plan_digest, target, range) catch |err| switch (err) {
+                                error.OutOfMemory => return err,
+                                else => return,
+                            };
+                            const graph_digest: ?[32]u8 = if (graph_scope) |scope| scope.sealDigest() catch return else null;
+                            const handoff = restore_staging.generationHandoffForOldRange(target, range) catch return;
+                            const expected: [32]u8 = if (handoff) |proof| blk: {
+                                const fence = for (old.fences) |candidate| {
+                                    if (candidate.owner_group_id == range.group_id) break candidate;
+                                } else return;
+                                const sealed = restore_staging.generationHandoffSealDigest(fence, job.value.plan_digest, proof) catch return;
+                                break :blk restore_staging.generationHandoffOldFenceDigest(fence, sealed, graph_digest) catch return;
+                            } else graph_digest orelse continue;
+                            var graph_receipt_buf: [256]u8 = undefined;
+                            const graph_receipt_key = try restore_staging.receiptKey(&graph_receipt_buf, group_id, command.id, .cutover, range.group_id);
+                            const actual = (try stagingGet(txn, graph_receipt_key)) orelse return;
+                            if (!std.mem.eql(u8, actual, &expected)) return;
+                        }
+                    };
                     // Verify reservations before publication; stale/corrupt
                     // ownership must never partially expose the target set.
                     for (job.value.plan.targets) |target| {

@@ -47,23 +47,9 @@ pub fn hasGraphIndex(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {
     return false;
 }
 
-pub fn graphRetirementDigest(source_table_id: u64, target_table_id: u64, indexes_json: []const u8) Digest {
-    var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update("antfly-empty-generation-graph-retirement-v1");
-    var ids: [16]u8 = undefined;
-    std.mem.writeInt(u64, ids[0..8], source_table_id, .little);
-    std.mem.writeInt(u64, ids[8..16], target_table_id, .little);
-    hash.update(&ids);
-    hash.update(indexes_json);
-    var digest: Digest = undefined;
-    hash.final(&digest);
-    return digest;
-}
-
-/// Versioned owner-comparable digest for a future graph seal. The v1 raw-JSON
-/// digest above remains the plan format for already admitted jobs; changing it
-/// in place would invalidate replayed immutable plans.
-pub fn graphRetirementDigestV2(alloc: std.mem.Allocator, source_table_id: u64, target_table_id: u64, indexes_json: []const u8) !?Digest {
+/// Owner-comparable semantic graph declaration digest. Graph plans are new in
+/// this feature and have no legacy raw-JSON digest compatibility mode.
+pub fn graphRetirementDigest(alloc: std.mem.Allocator, source_table_id: u64, target_table_id: u64, indexes_json: []const u8) !?Digest {
     const config_digest = (try @import("../storage/db/graph_retirement_config.zig").fromMetadata(alloc, indexes_json)) orelse return null;
     return @import("../storage/db/graph_retirement_config.zig").retirementDigest(source_table_id, target_table_id, config_digest);
 }
@@ -83,7 +69,7 @@ test "graph retirement digest matches production index config extraction for exp
         var loaded = try table_index_config.parseIndexConfig(alloc, "links", raw);
         defer loaded.deinit(alloc);
         try std.testing.expectEqualDeep((try graph_config.fromMetadata(alloc, indexes_json)).?, (try graph_config.fromLoaded(alloc, &.{loaded})).?);
-        try std.testing.expectEqualDeep((try graphRetirementDigestV2(alloc, 100, 200, indexes_json)).?, graph_config.retirementDigest(100, 200, (try graph_config.fromLoaded(alloc, &.{loaded})).?));
+        try std.testing.expectEqualDeep((try graphRetirementDigest(alloc, 100, 200, indexes_json)).?, graph_config.retirementDigest(100, 200, (try graph_config.fromLoaded(alloc, &.{loaded})).?));
     }
 }
 pub const ProvisioningProjection = @import("restore_provisioning_contract.zig").ProvisioningProjection;
@@ -184,12 +170,42 @@ pub const ProvisioningSnapshot = struct {
 /// this point would revive old children without their inverse references.
 pub const State = enum { importing, validating, cutover, activating, published, canceling, canceled, preparing_sources };
 pub const SourceArtifact = @import("restore_provisioning_contract.zig").SourceArtifact;
+pub const SourceRangeGenerationAdmissions = struct {
+    target_group_id: u64,
+    source_namespace: @import("../storage/db/doc_identity_namespace.zig").Namespace,
+    entries: []const @import("../storage/portable_backup.zig").SourceGenerationAdmissionSummaryEntry,
+    digest: Digest,
+    /// Derived once from the complete selected cohort and authenticated by
+    /// the immutable Plan digest. Worker ticks borrow these canonical values.
+    mappings: []const @import("../storage/db/restore_staging_contract.zig").GenerationAdmissionMapping = &.{},
+};
+/// Exact old-owner state observed before an empty-generation rewrite is
+/// admitted. The source owner later fences and seals this same state; only
+/// active, dependency-closed scopes are remapped into the fresh parent.
+/// Null scopes and historical retirement tombstones stay on the fenced old
+/// physical owner, but their digests remain part of the publication proof.
+pub const GenerationHandoffRange = struct {
+    source_group_id: u64,
+    target_group_id: u64,
+    source_namespace: @import("../storage/db/doc_identity_namespace.zig").Namespace,
+    admissions: []const @import("../storage/portable_backup.zig").SourceGenerationAdmissionSummaryEntry,
+    admissions_digest: Digest,
+    retired_digest: Digest,
+    retired_count: u64,
+    mappings: []const @import("../storage/db/restore_staging_contract.zig").GenerationAdmissionMapping = &.{},
+};
 pub const Target = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
         return (std.mem.eql(u8, name, "empty_generation") and !self.empty_generation) or
-            (std.mem.eql(u8, name, "graph_retirement_digest") and self.graph_retirement_digest == null);
+            (std.mem.eql(u8, name, "graph_retirement_digest") and self.graph_retirement_digest == null) or
+            (std.mem.eql(u8, name, "source_table_name") and self.source_table_name.len == 0) or
+            (std.mem.eql(u8, name, "target_schema_digest") and self.target_schema_digest == null) or
+            (std.mem.eql(u8, name, "generation_handoffs") and self.generation_handoffs.len == 0) or
+            (std.mem.eql(u8, name, "source_generation_admissions") and self.source_generation_admissions.len == 0);
     }
     source_table_id: u64,
+    source_table_name: []const u8 = "",
+    target_schema_digest: ?Digest = null,
     empty_generation: bool = false,
     /// Binds graph artifact retirement to the exact old/new physical table
     /// incarnations and unchanged index declarations. Old edge/metric stores
@@ -204,6 +220,13 @@ pub const Target = struct {
     /// Native owner reservations bind these authenticated source identities
     /// before accepting an import RPC. No full-plan transfer per row page.
     source_artifacts: []const SourceArtifact = &.{},
+    /// Source-parent proof only. Never copy an archived accepted scope into a
+    /// target owner: child IDs and FK generations change with incarnation.
+    source_generation_admissions: []const SourceRangeGenerationAdmissions = &.{},
+    /// Every old physical range of an empty-generation rewrite has an exact
+    /// namespace-bound accepted-scope and retirement summary, even if both
+    /// sets are empty. Generic rewrites never carry this authority.
+    generation_handoffs: []const GenerationHandoffRange = &.{},
     /// Explicitly distinct from restoration of the authenticated source
     /// definition. It must be serviced by the snapshot+retained-tail rewrite
     /// driver, never by the preservation-only backup restore worker.
@@ -240,6 +263,10 @@ pub const ExternalFkParent = struct {
 };
 
 pub fn plannedForeignGeneration(alloc: std.mem.Allocator, child: Target, name: []const u8) !@import("../storage/db/relational_integrity_contract.zig").Generation {
+    return foreignGenerationForTableId(alloc, child, child.table.table_id, name);
+}
+
+fn foreignGenerationForTableId(alloc: std.mem.Allocator, child: Target, table_id: u64, name: []const u8) !@import("../storage/db/relational_integrity_contract.zig").Generation {
     const schema_api = @import("../schema/mod.zig");
     const native = @import("../storage/schema.zig");
     const declarations = @import("../schema/relational_declarations.zig");
@@ -254,10 +281,96 @@ pub fn plannedForeignGeneration(alloc: std.mem.Allocator, child: Target, name: [
     std.crypto.hash.Blake3.hash(serialized, &schema_digest, .{});
     const definitions = try declarations.definitionFingerprints(alloc, parsed, runtime);
     defer declarations.freeDefinitions(alloc, definitions);
-    var update = try catalog.prepare(alloc, null, try catalog.incarnationFromTableId(child.table.table_id), runtime.version, schema_digest, definitions);
+    var update = try catalog.prepare(alloc, null, try catalog.incarnationFromTableId(table_id), runtime.version, schema_digest, definitions);
     defer update.deinit();
     return (update.catalog.find(.foreign_key, name) orelse return error.InvalidRestoreStaging).generation;
 }
+
+pub fn runtimeSchemaDigestForTable(alloc: std.mem.Allocator, schema_json: []const u8) !Digest {
+    const api_tables = @import("../api/tables.zig");
+    const runtime_schema = @import("../storage/schema.zig");
+    var schema = try api_tables.parseValidatedTableSchema(alloc, schema_json);
+    defer schema.deinit(alloc);
+    const typed = try api_tables.deriveRuntimeTableSchema(alloc, schema);
+    defer runtime_schema.freeSchema(alloc, typed);
+    const encoded = try runtime_schema.serializeSchema(alloc, typed);
+    defer alloc.free(encoded);
+    return @import("../storage/db/restore_staging_contract.zig").digest(encoded);
+}
+
+/// A build-time projection: expensive schema/catalog derivation occurs once,
+/// before the immutable Plan is hashed. Each worker tick then only hashes its
+/// compact owner scope and already validated per-range mapping.
+pub fn prepareTargetProjectionsAlloc(alloc: std.mem.Allocator, targets: []Target) !void {
+    const contract = @import("../storage/db/restore_staging_contract.zig");
+    for (targets) |*target| target.target_schema_digest = try runtimeSchemaDigestForTable(alloc, target.table.schema_json);
+    for (targets) |*parent| {
+        if (parent.source_generation_admissions.len == 0) continue;
+        const proofs = try alloc.alloc(SourceRangeGenerationAdmissions, parent.source_generation_admissions.len);
+        for (parent.source_generation_admissions, proofs) |source, *proof| {
+            proof.* = source;
+            const mappings = try alloc.alloc(contract.GenerationAdmissionMapping, source.entries.len);
+            for (source.entries, mappings) |entry, *mapping| {
+                const child: Target = for (targets) |candidate| {
+                    if (candidate.source_table_id == entry.child_table_id and
+                        std.mem.eql(u8, candidate.source_table_name, entry.child_table_name)) break candidate;
+                } else return error.RestoreDependencyMissing;
+                mapping.* = .{
+                    .source_child_table_id = entry.child_table_id,
+                    .source_child_table_name = entry.child_table_name,
+                    .target_child_table_id = child.table.table_id,
+                    .target_child_table_name = child.table.name,
+                    .constraint_name = entry.constraint_name,
+                    .source_generation = entry.active_generation,
+                    .target_generation = if (entry.active_generation != null) try plannedForeignGeneration(alloc, child, entry.constraint_name) else null,
+                    .source_scope_digest = entry.source_scope_digest,
+                };
+            }
+            proof.mappings = mappings;
+        }
+        parent.source_generation_admissions = proofs;
+    }
+}
+
+/// Build immutable, active-only destination admissions from the complete
+/// selected TRUNCATE cohort. The old-owner summary includes null tombstones,
+/// but a fresh namespace cannot inherit their old physical identity.
+pub fn prepareEmptyGenerationHandoffMappingsAlloc(alloc: std.mem.Allocator, targets: []Target) !void {
+    const Mapping = @import("../storage/db/restore_staging_contract.zig").GenerationAdmissionMapping;
+    for (targets) |*parent| {
+        if (!parent.empty_generation) continue;
+        const handoffs = try alloc.dupe(GenerationHandoffRange, parent.generation_handoffs);
+        for (handoffs) |*handoff| {
+            var active_count: usize = 0;
+            for (handoff.admissions) |entry| if (entry.active_generation != null) {
+                active_count += 1;
+            };
+            const mappings = try alloc.alloc(Mapping, active_count);
+            var index: usize = 0;
+            for (handoff.admissions) |entry| {
+                const generation = entry.active_generation orelse continue;
+                const child: Target = for (targets) |candidate| {
+                    if (candidate.empty_generation and candidate.source_table_id == entry.child_table_id and
+                        candidate.replace != null and std.mem.eql(u8, candidate.replace.?.table.name, entry.child_table_name)) break candidate;
+                } else return error.RestoreDependencyMissing;
+                mappings[index] = .{
+                    .source_child_table_id = entry.child_table_id,
+                    .source_child_table_name = entry.child_table_name,
+                    .target_child_table_id = child.table.table_id,
+                    .target_child_table_name = child.table.name,
+                    .constraint_name = entry.constraint_name,
+                    .source_generation = generation,
+                    .target_generation = try plannedForeignGeneration(alloc, child, entry.constraint_name),
+                    .source_scope_digest = entry.source_scope_digest,
+                };
+                index += 1;
+            }
+            handoff.mappings = mappings;
+        }
+        parent.generation_handoffs = handoffs;
+    }
+}
+
 pub const Plan = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
         // Preserve the canonical digest of in-flight plans created before
@@ -292,6 +405,7 @@ pub const Plan = struct {
         var range_count: usize = 0;
         var schema_bytes: usize = 0;
         var old_range_count: usize = 0;
+        var handoff_entry_count: usize = 0;
         var group_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer group_ids.deinit(alloc);
         // Receipt keys use physical owner identity. Old/new overlap or an
@@ -362,22 +476,111 @@ pub const Plan = struct {
         }
         for (self.targets, 0..) |target, index| {
             const table = target.table;
+            if (target.target_schema_digest) |cached| {
+                if (!std.mem.eql(u8, &cached, &try runtimeSchemaDigestForTable(alloc, table.schema_json))) return error.InvalidRestoreStaging;
+            }
             if (target.empty_generation) {
                 const old = target.replace orelse return error.InvalidRestoreStaging;
                 if (self.preparing_sources or target.rewrite != null or target.rewrite_sources.len != 0 or target.source_artifacts.len != 0 or old.table.table_id != target.source_table_id or old.fences.len != old.ranges.len or old.ranges.len != target.ranges.len) return error.InvalidRestoreStaging;
+                if (target.generation_handoffs.len != old.ranges.len) return error.InvalidRestoreStaging;
                 if (!std.mem.eql(u8, old.table.schema_json, table.schema_json) or !std.mem.eql(u8, old.table.read_schema_json, table.read_schema_json) or !std.mem.eql(u8, old.table.indexes_json, table.indexes_json)) return error.InvalidRestoreStaging;
                 const graph_index = try hasGraphIndex(alloc, table.indexes_json);
                 if (graph_index != (target.graph_retirement_digest != null)) return error.InvalidRestoreStaging;
-                if (target.graph_retirement_digest) |retirement_digest| if (!std.mem.eql(u8, &retirement_digest, &graphRetirementDigest(old.table.table_id, table.table_id, table.indexes_json))) return error.InvalidRestoreStaging;
-                for (old.ranges, target.ranges) |source, destination| {
+                if (target.graph_retirement_digest) |retirement_digest| {
+                    const expected = (try graphRetirementDigest(alloc, old.table.table_id, table.table_id, table.indexes_json)) orelse return error.InvalidRestoreStaging;
+                    if (!std.mem.eql(u8, &retirement_digest, &expected)) return error.InvalidRestoreStaging;
+                }
+                for (old.ranges, target.ranges, target.generation_handoffs) |source, destination, handoff| {
                     if (!std.mem.eql(u8, source.start_key, destination.start_key) or !std.mem.eql(u8, source.end_key orelse "", destination.end_key orelse "")) return error.InvalidRestoreStaging;
                     const fence = for (old.fences) |item| {
                         if (item.owner_group_id == source.group_id) break item;
                     } else return error.InvalidRestoreStaging;
                     if (fence.role != .rewrite_source or fence.peer_group_id != destination.group_id or fence.transition_id != std.mem.readInt(u64, self.id[0..8], .little) or fence.attempt != std.mem.readInt(u64, self.id[8..16], .little)) return error.InvalidRestoreStaging;
+                    if (handoff.source_group_id != source.group_id or handoff.target_group_id != destination.group_id or
+                        !handoff.source_namespace.eql(fence.namespace) or
+                        std.mem.allEqual(u8, &handoff.retired_digest, 0) or
+                        handoff.mappings.len > handoff.admissions.len or
+                        !std.mem.eql(u8, &handoff.admissions_digest, &try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(handoff.source_namespace, handoff.admissions))) return error.InvalidRestoreStaging;
+                    handoff_entry_count = std.math.add(usize, handoff_entry_count, handoff.admissions.len) catch return error.InvalidRestoreStaging;
+                    if (handoff_entry_count > 4096) return error.InvalidRestoreStaging;
+                    var mapped_index: usize = 0;
+                    for (handoff.admissions) |entry| {
+                        if (std.mem.allEqual(u8, &entry.source_scope_digest, 0)) return error.InvalidRestoreStaging;
+                        const generation = entry.active_generation orelse continue;
+                        const child: Target = for (self.targets) |candidate| {
+                            if (candidate.empty_generation and candidate.source_table_id == entry.child_table_id and
+                                candidate.replace != null and std.mem.eql(u8, candidate.replace.?.table.name, entry.child_table_name)) break candidate;
+                        } else return error.RestoreDependencyMissing;
+                        const old_generation = try foreignGenerationForTableId(alloc, child, child.source_table_id, entry.constraint_name);
+                        if (!std.mem.eql(u8, &generation, &old_generation)) return error.InvalidRestoreStaging;
+                        var declared = false;
+                        var child_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, child.table.schema_json);
+                        defer child_schema.deinit(alloc);
+                        if (child_schema.foreign_keys) |fks| for (fks.value) |fk| {
+                            if (std.mem.eql(u8, fk.name, entry.constraint_name) and std.mem.eql(u8, fk.parent_table, old.table.name)) declared = true;
+                        };
+                        if (!declared or mapped_index >= handoff.mappings.len) return error.InvalidRestoreStaging;
+                        const mapping = handoff.mappings[mapped_index];
+                        try mapping.validate();
+                        const next_generation = try plannedForeignGeneration(alloc, child, entry.constraint_name);
+                        if (mapping.source_child_table_id != entry.child_table_id or
+                            !std.mem.eql(u8, mapping.source_child_table_name, entry.child_table_name) or
+                            mapping.target_child_table_id != child.table.table_id or
+                            !std.mem.eql(u8, mapping.target_child_table_name, child.table.name) or
+                            !std.mem.eql(u8, mapping.constraint_name, entry.constraint_name) or
+                            !std.meta.eql(mapping.source_generation, entry.active_generation) or
+                            mapping.target_generation == null or
+                            !std.mem.eql(u8, &mapping.target_generation.?, &next_generation) or
+                            !std.mem.eql(u8, &mapping.source_scope_digest, &entry.source_scope_digest)) return error.InvalidRestoreStaging;
+                        mapped_index += 1;
+                    }
+                    if (mapped_index != handoff.mappings.len) return error.InvalidRestoreStaging;
                 }
             }
-            if (!target.empty_generation and target.graph_retirement_digest != null) return error.InvalidRestoreStaging;
+            if (!target.empty_generation and (target.graph_retirement_digest != null or target.generation_handoffs.len != 0)) return error.InvalidRestoreStaging;
+            if (target.source_generation_admissions.len != 0) {
+                if (target.source_table_name.len == 0 or target.source_table_name.len > 256 or
+                    target.target_schema_digest == null or
+                    target.source_generation_admissions.len != target.ranges.len or
+                    target.source_artifacts.len != target.ranges.len)
+                    return error.InvalidRestoreStaging;
+                for (target.source_artifacts) |artifact| if (artifact.format != .portable) return error.InvalidRestoreStaging;
+                for (target.source_generation_admissions, 0..) |range_proof, proof_index| {
+                    const artifact = target.source_artifacts[proof_index];
+                    if (range_proof.target_group_id != artifact.target_group_id or
+                        !range_proof.source_namespace.eql(artifact.source_namespace) or
+                        range_proof.mappings.len != range_proof.entries.len or
+                        !std.mem.eql(u8, &range_proof.digest, &try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(range_proof.source_namespace, range_proof.entries)))
+                        return error.InvalidRestoreStaging;
+                    for (range_proof.entries, range_proof.mappings) |entry, mapping| {
+                        try mapping.validate();
+                        if (std.mem.allEqual(u8, &entry.source_scope_digest, 0)) return error.InvalidRestoreStaging;
+                        const child: Target = for (self.targets) |candidate| {
+                            if (candidate.source_table_id == entry.child_table_id) break candidate;
+                        } else return error.RestoreDependencyMissing;
+                        if (!std.mem.eql(u8, child.source_table_name, entry.child_table_name)) return error.InvalidRestoreStaging;
+                        var child_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, child.table.schema_json);
+                        defer child_schema.deinit(alloc);
+                        var declared = false;
+                        if (child_schema.foreign_keys) |fks| for (fks.value) |fk| {
+                            if (std.mem.eql(u8, fk.name, entry.constraint_name) and std.mem.eql(u8, fk.parent_table, target.source_table_name)) declared = true;
+                        };
+                        if (entry.active_generation) |generation| {
+                            if (!declared or !std.mem.eql(u8, &generation, &try foreignGenerationForTableId(alloc, child, child.source_table_id, entry.constraint_name)))
+                                return error.InvalidRestoreStaging;
+                        } else if (declared) return error.InvalidRestoreStaging;
+                        if (mapping.source_child_table_id != entry.child_table_id or
+                            !std.mem.eql(u8, mapping.source_child_table_name, entry.child_table_name) or
+                            mapping.target_child_table_id != child.table.table_id or
+                            !std.mem.eql(u8, mapping.target_child_table_name, child.table.name) or
+                            !std.mem.eql(u8, mapping.constraint_name, entry.constraint_name) or
+                            !std.meta.eql(mapping.source_generation, entry.active_generation) or
+                            !std.mem.eql(u8, &mapping.source_scope_digest, &entry.source_scope_digest) or
+                            !std.meta.eql(mapping.target_generation, if (entry.active_generation != null) try plannedForeignGeneration(alloc, child, entry.constraint_name) else null))
+                            return error.InvalidRestoreStaging;
+                    }
+                }
+            } else if (target.rewrite == null and target.source_artifacts.len != 0 and target.source_artifacts[0].format == .portable) return error.InvalidRestoreStaging;
             if (target.catalog_binding) |binding| {
                 if (binding.kind != .table or binding.id != table.table_id or binding.parent_id == 0 or
                     !std.mem.eql(u8, binding.storage_name, table.name)) return error.InvalidRestoreStaging;
@@ -509,15 +712,58 @@ pub const Plan = struct {
                     if (schema.storage_mode != required_mode) return error.InvalidRestoreStaging;
                 }
                 if (schema.foreign_keys) |foreign_keys| for (foreign_keys.value) |fk| {
-                    const parent = blk: {
-                        for (self.targets) |candidate| if (std.mem.eql(u8, candidate.table.name, fk.parent_table)) break :blk candidate.table;
+                    const selected_parent: ?Target = for (self.targets) |candidate| {
+                        const lookup_name = if (target.source_generation_admissions.len != 0) candidate.source_table_name else candidate.table.name;
+                        if (std.mem.eql(u8, lookup_name, fk.parent_table)) break candidate;
+                    } else null;
+                    if (selected_parent) |planned_parent| if (planned_parent.empty_generation) {
+                        if (!target.empty_generation or target.replace == null) return error.RestoreDependencyMissing;
+                        // Every physical parent range must attest the old
+                        // active generation. A selected child declaration
+                        // without a corresponding accepted scope is not a
+                        // dependency-closed handoff, even if its schema is
+                        // otherwise valid.
+                        const source_generation = try foreignGenerationForTableId(alloc, target, target.source_table_id, fk.name);
+                        for (planned_parent.generation_handoffs) |handoff| {
+                            const present = for (handoff.admissions) |entry| {
+                                if (entry.child_table_id == target.source_table_id and
+                                    std.mem.eql(u8, entry.child_table_name, target.replace.?.table.name) and
+                                    std.mem.eql(u8, entry.constraint_name, fk.name) and
+                                    entry.active_generation != null and
+                                    std.mem.eql(u8, &entry.active_generation.?, &source_generation)) break true;
+                            } else false;
+                            if (!present) return error.RestoreDependencyMissing;
+                        }
+                    };
+                    const parent = if (selected_parent) |selected| selected.table else blk: {
                         for (self.external_fk_parents) |external| if (std.mem.eql(u8, external.table.name, fk.parent_table)) {
                             for (external.foreign_keys) |foreign| if (foreign.child_table_id == target.source_table_id and std.mem.eql(u8, foreign.constraint_name, fk.name)) break :blk external.table;
                             return error.RestoreDependencyMissing;
                         };
                         return error.RestoreDependencyMissing;
                     };
+                    // Portable artifacts contain the source FK schema. A
+                    // destination parent rename needs an explicit schema
+                    // rewrite, not merely a remapped admission identity.
+                    if (target.source_generation_admissions.len != 0 and
+                        !std.mem.eql(u8, parent.name, fk.parent_table)) return error.RestoreDependencyMissing;
                     try @import("../schema/relational_foreign_key_target.zig").validate(alloc, schema_json, parent.name, parent.schema_json);
+                    if (target.source_artifacts.len != 0 and target.source_artifacts[0].format == .portable) {
+                        const selected = selected_parent orelse return error.RestoreDependencyMissing;
+                        if (selected.source_generation_admissions.len == 0) return error.RestoreSourceProofMissing;
+                        const source_generation = try foreignGenerationForTableId(alloc, target, target.source_table_id, fk.name);
+                        for (selected.source_generation_admissions) |range_proof| {
+                            const found = for (range_proof.entries) |entry| {
+                                if (entry.child_table_id == target.source_table_id and
+                                    std.mem.eql(u8, entry.child_table_name, target.source_table_name) and
+                                    std.mem.eql(u8, entry.constraint_name, fk.name) and
+                                    entry.active_generation != null and
+                                    std.mem.eql(u8, &entry.active_generation.?, &source_generation)) break true;
+                            } else false;
+                            if (!found) return error.RestoreSourceProofMissing;
+                        }
+                        _ = try plannedForeignGeneration(alloc, target, fk.name);
+                    }
                 };
             }
         }
@@ -549,6 +795,100 @@ pub const Plan = struct {
     }
 };
 
+/// Recompute one exact old-owner graph scope from immutable metadata.
+pub fn graphSealScopeForOldRange(
+    alloc: std.mem.Allocator,
+    plan: Plan,
+    plan_digest: Digest,
+    target: Target,
+    old_range: records.RangeRecord,
+) !?@import("../storage/db/graph_retirement_seal.zig").Scope {
+    const declared = target.graph_retirement_digest orelse return null;
+    const old = target.replace orelse return error.InvalidRestoreStaging;
+    if (!target.empty_generation or old_range.table_id != old.table.table_id or
+        target.source_table_id != old.table.table_id) return error.InvalidRestoreStaging;
+    const config_digest = (try @import("../storage/db/graph_retirement_config.zig").fromMetadata(alloc, old.table.indexes_json)) orelse return error.InvalidRestoreStaging;
+    const v2 = @import("../storage/db/graph_retirement_config.zig").retirementDigest(old.table.table_id, target.table.table_id, config_digest);
+    if (!std.mem.eql(u8, &declared, &v2)) return error.InvalidRestoreStaging;
+    const fence = for (old.fences) |candidate| {
+        if (candidate.owner_group_id == old_range.group_id) break candidate;
+    } else return error.InvalidRestoreStaging;
+    const range_id = if (old_range.range_id == 0) old_range.group_id else old_range.range_id;
+    if (fence.namespace.range_id != tables.rangeDocIdentityRangeId(old_range) or
+        fence.owner_group_id != old_range.group_id or range_id == 0) return error.InvalidRestoreStaging;
+    const scope: @import("../storage/db/graph_retirement_seal.zig").Scope = .{
+        .fence = fence,
+        .plan_id = plan.id,
+        .plan_digest = plan_digest,
+        .target_table_id = target.table.table_id,
+        .graph_config_digest = config_digest,
+    };
+    try scope.validate();
+    return scope;
+}
+
+pub fn generationHandoffForOldRange(target: Target, old_range: records.RangeRecord) !?GenerationHandoffRange {
+    if (!target.empty_generation) return null;
+    const old = target.replace orelse return error.InvalidRestoreStaging;
+    if (old.ranges.len != target.generation_handoffs.len) return error.InvalidRestoreStaging;
+    for (old.ranges, target.generation_handoffs) |candidate, handoff| {
+        if (candidate.group_id != old_range.group_id) continue;
+        if (candidate.table_id != old_range.table_id or handoff.source_group_id != candidate.group_id or
+            handoff.source_namespace.table_id != old.table.table_id) return error.InvalidRestoreStaging;
+        return handoff;
+    }
+    return error.InvalidRestoreStaging;
+}
+
+/// Exact logical metadata identity of a fenced, read-indexed source preview.
+/// The durable Raft seal and applied watermark are checked separately before
+/// old_fenced. This receipt only allows the reversible validating phase to
+/// enter cutover after all source summaries match the immutable Plan.
+pub fn generationHandoffPreflightDigest(fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence, plan_digest: Digest, handoff: GenerationHandoffRange) !Digest {
+    if (!handoff.source_namespace.eql(fence.namespace) or handoff.source_group_id != fence.owner_group_id) return error.InvalidRestoreStaging;
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("antfly empty generation source preflight v1");
+    hash.update(&try fence.encode());
+    hash.update(&plan_digest);
+    hash.update(&handoff.admissions_digest);
+    hash.update(&handoff.retired_digest);
+    var number: [8]u8 = undefined;
+    std.mem.writeInt(u64, &number, handoff.retired_count, .little);
+    hash.update(&number);
+    var result: Digest = undefined;
+    hash.final(&result);
+    return result;
+}
+
+pub fn generationHandoffSealDigest(fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence, plan_digest: Digest, handoff: GenerationHandoffRange) !Digest {
+    if (!handoff.source_namespace.eql(fence.namespace) or handoff.source_group_id != fence.owner_group_id) return error.InvalidRestoreStaging;
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("antfly empty generation source sealed v1");
+    hash.update(&try fence.encode());
+    hash.update(&plan_digest);
+    hash.update(&handoff.admissions_digest);
+    hash.update(&handoff.retired_digest);
+    var number: [8]u8 = undefined;
+    std.mem.writeInt(u64, &number, handoff.retired_count, .little);
+    hash.update(&number);
+    var result: Digest = undefined;
+    hash.final(&result);
+    return result;
+}
+
+/// One old_fenced receipt must prove both protocols when a graph index and
+/// accepted FK generations coexist on the same retired physical owner.
+pub fn generationHandoffOldFenceDigest(fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence, handoff_seal_digest: Digest, graph_seal_digest: ?Digest) !Digest {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("antfly old owner graph and generation handoff v1");
+    hash.update(&try fence.encode());
+    hash.update(&handoff_seal_digest);
+    hash.update(if (graph_seal_digest) |digest| &digest else &([_]u8{0} ** 32));
+    var result: Digest = undefined;
+    hash.final(&result);
+    return result;
+}
+
 pub const Job = struct {
     plan: Plan,
     plan_digest: Digest,
@@ -565,14 +905,7 @@ pub const Job = struct {
 /// coordinator. Hash the encoded runtime schema, not the public JSON spelling.
 pub fn ownerScope(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, range: records.RangeRecord) !@import("../storage/db/restore_staging_contract.zig").Scope {
     if (range.table_id != target.table.table_id) return error.InvalidRestoreStaging;
-    const api_tables = @import("../api/tables.zig");
-    const runtime_schema = @import("../storage/schema.zig");
-    var schema = try api_tables.parseValidatedTableSchema(alloc, target.table.schema_json);
-    defer schema.deinit(alloc);
-    const typed = try api_tables.deriveRuntimeTableSchema(alloc, schema);
-    defer runtime_schema.freeSchema(alloc, typed);
-    const encoded = try runtime_schema.serializeSchema(alloc, typed);
-    defer alloc.free(encoded);
+    const schema_digest = target.target_schema_digest orelse try runtimeSchemaDigestForTable(alloc, target.table.schema_json);
     if (target.empty_generation) {
         const old = target.replace orelse return error.InvalidRestoreStaging;
         const source = for (old.ranges) |item| {
@@ -584,7 +917,7 @@ pub fn ownerScope(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, tar
             .source_artifact_digest = @splat(0),
             .source_namespace = .{ .table_id = old.table.table_id, .shard_id = tables.rangeDocIdentityShardId(source), .range_id = tables.rangeDocIdentityRangeId(source) },
             .target_namespace = .{ .table_id = target.table.table_id, .shard_id = tables.rangeDocIdentityShardId(range), .range_id = tables.rangeDocIdentityRangeId(range) },
-            .target_schema_digest = @import("../storage/db/restore_staging_contract.zig").digest(encoded),
+            .target_schema_digest = schema_digest,
             .empty_generation = true,
             .graph_retirement_digest = target.graph_retirement_digest,
         };
@@ -599,10 +932,128 @@ pub fn ownerScope(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, tar
         .source_descriptor_digest = try artifact.digest(alloc),
         .source_namespace = artifact.source_namespace,
         .target_namespace = .{ .table_id = target.table.table_id, .shard_id = tables.rangeDocIdentityShardId(range), .range_id = tables.rangeDocIdentityRangeId(range) },
-        .target_schema_digest = @import("../storage/db/restore_staging_contract.zig").digest(encoded),
+        .target_schema_digest = schema_digest,
         .preserve_artifacts = artifact.rewrite == null,
         .rewrite = artifact.rewrite,
     };
+}
+
+pub const MappedGenerationAdmission = struct {
+    command: @import("../storage/db/restore_staging_contract.zig").InstallGenerationAdmissions,
+    expected_receipt_digest: Digest,
+
+    pub fn deinit(self: *@This(), _: std.mem.Allocator) void {
+        self.* = undefined;
+    }
+};
+
+pub const MappedEmptyGenerationHandoff = struct {
+    command: @import("../storage/db/relational_integrity_topology_contract.zig").GenerationHandoffInstall,
+    expected_receipt_digest: Digest,
+};
+
+pub fn mappedEmptyGenerationHandoffForGroup(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, group_id: u64) !?MappedEmptyGenerationHandoff {
+    for (plan.targets) |target| {
+        if (!target.empty_generation) continue;
+        if (target.ranges.len != target.generation_handoffs.len) return error.InvalidRestoreStaging;
+        for (target.ranges, target.generation_handoffs) |range, handoff| {
+            if (range.group_id != group_id) continue;
+            if (handoff.target_group_id != group_id) return error.InvalidRestoreStaging;
+            const scope = try ownerScope(alloc, plan, plan_digest, target, range);
+            const command: @import("../storage/db/relational_integrity_topology_contract.zig").GenerationHandoffInstall = .{
+                .scope = scope.digest(),
+                .source_summary_digest = handoff.admissions_digest,
+                .retired_digest = handoff.retired_digest,
+                .retired_count = handoff.retired_count,
+                .mappings = handoff.mappings,
+            };
+            return .{ .command = command, .expected_receipt_digest = try @import("../storage/db/empty_generation_handoff.zig").installReceiptDigest(command) };
+        }
+    }
+    return null;
+}
+
+pub fn emptyGenerationDestinationFence(plan: Plan, target: Target, range: records.RangeRecord, handoff: GenerationHandoffRange, scope: @import("../storage/db/restore_staging_contract.zig").Scope) !@import("../storage/db/relational_integrity_topology_contract.zig").Fence {
+    if (!target.empty_generation or range.group_id != handoff.target_group_id or
+        handoff.source_group_id == 0 or !scope.target_namespace.eql(.{
+        .table_id = target.table.table_id,
+        .shard_id = tables.rangeDocIdentityShardId(range),
+        .range_id = tables.rangeDocIdentityRangeId(range),
+    })) return error.InvalidRestoreStaging;
+    const fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence = .{
+        .transition_id = std.mem.readInt(u64, plan.id[0..8], .little),
+        .attempt = std.mem.readInt(u64, plan.id[8..16], .little),
+        .peer_group_id = handoff.source_group_id,
+        .owner_group_id = range.group_id,
+        .role = .rewrite_destination,
+        .namespace = scope.target_namespace,
+        .catalog_digest = scope.target_schema_digest,
+    };
+    _ = try fence.encode();
+    return fence;
+}
+
+/// The same immutable staged plan drives hidden-owner bootstrap, coordinator
+/// requests, and metadata receipt validation. Source scopes are proof only;
+/// fresh child IDs and FK generations are recomputed from the target plan.
+pub fn mappedGenerationAdmissionsForGroupAlloc(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, group_id: u64) !?MappedGenerationAdmission {
+    const contract = @import("../storage/db/restore_staging_contract.zig");
+    const parent: Target = parent: {
+        for (plan.targets) |target| for (target.ranges) |range| {
+            if (range.group_id == group_id) break :parent target;
+        };
+        return error.InvalidRestoreStaging;
+    };
+    if (parent.source_generation_admissions.len == 0) return null;
+    const range = for (parent.ranges) |candidate| {
+        if (candidate.group_id == group_id) break candidate;
+    } else return error.InvalidRestoreStaging;
+    const range_proof = for (parent.source_generation_admissions) |candidate| {
+        if (candidate.target_group_id == group_id) break candidate;
+    } else return error.InvalidRestoreStaging;
+    if (range_proof.entries.len == 0) return null;
+    const scope = try ownerScope(alloc, plan, plan_digest, parent, range);
+    if (range_proof.mappings.len != range_proof.entries.len) return error.InvalidRestoreStaging;
+    const command: contract.InstallGenerationAdmissions = .{ .scope = scope.digest(), .source_summary_digest = range_proof.digest, .mappings = range_proof.mappings };
+    return .{ .command = command, .expected_receipt_digest = try contract.admissionReceiptDigest(command) };
+}
+
+pub const ExpectedGenerationAdmission = @import("../storage/db/restore_staging_contract.zig").GenerationAdmissionExpectation;
+
+/// The source-proof check is independent of installing a target admission:
+/// an empty sealed portable range still has an authenticated summary digest.
+pub fn sourceGenerationProofDigestForGroup(plan: Plan, group_id: u64) !?Digest {
+    for (plan.targets) |target| {
+        for (target.ranges) |range| {
+            if (range.group_id != group_id) continue;
+            if (target.source_generation_admissions.len == 0) return null;
+            for (target.source_generation_admissions) |proof| {
+                if (proof.target_group_id == group_id) return proof.digest;
+            }
+            return error.InvalidRestoreStaging;
+        }
+    }
+    return error.InvalidRestoreStaging;
+}
+
+pub fn expectedGenerationAdmissionReceiptForGroup(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, group_id: u64) !?ExpectedGenerationAdmission {
+    var mapped = (try mappedGenerationAdmissionsForGroupAlloc(alloc, plan, plan_digest, group_id)) orelse return null;
+    defer mapped.deinit(alloc);
+    return .{ .source_summary_digest = mapped.command.source_summary_digest, .expected_receipt_digest = mapped.expected_receipt_digest };
+}
+
+test "relational integrity restore staging sealed portable empty source admission still projects namespace-bound proof" {
+    const namespace: @import("../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 9, .shard_id = 10, .range_id = 11 };
+    const proof_digest = try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(namespace, &.{});
+    const ranges = [_]records.RangeRecord{.{ .table_id = 20, .group_id = 30, .range_id = 30, .doc_identity_shard_id = 30, .doc_identity_range_id = 30, .start_key = "" }};
+    const proofs = [_]SourceRangeGenerationAdmissions{.{ .target_group_id = 30, .source_namespace = namespace, .entries = &.{}, .digest = proof_digest }};
+    const targets = [_]Target{.{ .source_table_id = 9, .source_table_name = "parent", .table = .{ .table_id = 20, .name = "parent", .schema_json = "{}" }, .ranges = &ranges, .source_generation_admissions = &proofs }};
+    const plan: Plan = .{ .id = @splat(1), .cohort_digest = @splat(2), .targets = &targets };
+    try std.testing.expectEqualDeep(proof_digest, (try sourceGenerationProofDigestForGroup(plan, 30)).?);
+    try std.testing.expect((try expectedGenerationAdmissionReceiptForGroup(std.testing.allocator, plan, @splat(3), 30)) == null);
+    try std.testing.expectError(error.InvalidRestoreStaging, sourceGenerationProofDigestForGroup(plan, 31));
+    const plain_targets = [_]Target{.{ .source_table_id = 9, .table = .{ .table_id = 20, .name = "parent", .schema_json = "{}" }, .ranges = &ranges }};
+    try std.testing.expect((try sourceGenerationProofDigestForGroup(.{ .id = @splat(1), .cohort_digest = @splat(2), .targets = &plain_targets }, 30)) == null);
 }
 
 /// Progress is separate from the immutable plan so per-owner acknowledgements
@@ -766,7 +1217,7 @@ pub const OwnerReceipt = struct {
 pub const Command = struct {
     id: Id,
     expected_revision: u64 = 0,
-    action: enum { reserve, cancel_reservation, imported, validated, begin_cutover, old_fenced, begin_activation, parent_activated, publish, begin_cancel, canceled, finish_cancel, freeze_rewrite, rewrite_source_ready, parent_fenced },
+    action: enum { reserve, cancel_reservation, imported, validated, source_handoff_checked, begin_cutover, old_fenced, begin_activation, parent_activated, target_admissions_activated, publish, begin_cancel, canceled, finish_cancel, freeze_rewrite, rewrite_source_ready, parent_fenced },
     plan: ?Plan = null,
     receipt: ?OwnerReceipt = null,
     source_artifact: ?SourceArtifact = null,
@@ -800,7 +1251,7 @@ pub const Command = struct {
                 !artifact.source_namespace.eql(scope.fence.namespace) or artifact.target_group_id != scope.fence.peer_group_id or
                 scope.fence.transition_id != std.mem.readInt(u64, self.id[0..8], .little) or scope.fence.attempt != std.mem.readInt(u64, self.id[8..16], .little)) return error.InvalidRestoreStaging;
         }
-        const needs_receipt = self.action == .imported or self.action == .validated or self.action == .old_fenced or self.action == .canceled or self.action == .parent_fenced or self.action == .parent_activated;
+        const needs_receipt = self.action == .imported or self.action == .validated or self.action == .source_handoff_checked or self.action == .old_fenced or self.action == .canceled or self.action == .parent_fenced or self.action == .parent_activated or self.action == .target_admissions_activated;
         if (needs_receipt != (self.receipt != null)) return error.InvalidRestoreStaging;
         if (self.receipt) |receipt| {
             if (receipt.group_id == 0 or receipt.range_id == 0 or std.mem.allEqual(u8, &receipt.plan_digest, 0) or
@@ -865,9 +1316,22 @@ test "relational integrity restore staging empty generation binds old fences wit
     const old: records.TableRecord = .{ .table_id = 9, .name = "docs", .schema_json = "{}" };
     const old_range: records.RangeRecord = .{ .table_id = 9, .group_id = 301, .start_key = "" };
     const fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 401, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) };
-    var targets = [_]Target{.{ .source_table_id = 9, .empty_generation = true, .table = .{ .table_id = 10, .name = "docs", .schema_json = "{}" }, .ranges = &.{.{ .table_id = 10, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" }}, .replace = .{ .table = old, .ranges = &.{old_range}, .fences = &.{fence} } }};
+    const empty_handoff: GenerationHandoffRange = .{ .source_group_id = 301, .target_group_id = 401, .source_namespace = fence.namespace, .admissions = &.{}, .admissions_digest = try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(fence.namespace, &.{}), .retired_digest = @splat(8), .retired_count = 0 };
+    var targets = [_]Target{.{ .source_table_id = 9, .empty_generation = true, .table = .{ .table_id = 10, .name = "docs", .schema_json = "{}" }, .ranges = &.{.{ .table_id = 10, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" }}, .generation_handoffs = &.{empty_handoff}, .replace = .{ .table = old, .ranges = &.{old_range}, .fences = &.{fence} } }};
     const plan: Plan = .{ .id = id, .cohort_digest = @splat(3), .targets = &targets };
     try plan.validate(alloc);
+    targets[0].generation_handoffs = &.{};
+    try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(alloc));
+    targets[0].generation_handoffs = &.{empty_handoff};
+    var forged_handoff = empty_handoff;
+    forged_handoff.admissions_digest[0] ^= 1;
+    targets[0].generation_handoffs = &.{forged_handoff};
+    try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(alloc));
+    forged_handoff = empty_handoff;
+    forged_handoff.target_group_id = 402;
+    targets[0].generation_handoffs = &.{forged_handoff};
+    try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(alloc));
+    targets[0].generation_handoffs = &.{empty_handoff};
     const scope = try ownerScope(alloc, plan, try plan.digest(alloc), targets[0], targets[0].ranges[0]);
     try scope.validate();
     try std.testing.expect(scope.empty_generation);
@@ -883,11 +1347,21 @@ test "relational integrity restore staging empty generation binds old fences wit
     targets[0].table.indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}";
     targets[0].replace.?.table.indexes_json = targets[0].table.indexes_json;
     try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(alloc));
-    targets[0].graph_retirement_digest = graphRetirementDigest(9, 10, targets[0].table.indexes_json);
+    targets[0].graph_retirement_digest = try graphRetirementDigest(alloc, 9, 10, targets[0].table.indexes_json);
     try plan.validate(alloc);
     const graph_scope = try ownerScope(alloc, plan, try plan.digest(alloc), targets[0], targets[0].ranges[0]);
     try std.testing.expectEqualDeep(targets[0].graph_retirement_digest, graph_scope.graph_retirement_digest);
-    targets[0].graph_retirement_digest = graphRetirementDigest(9, 11, targets[0].table.indexes_json);
+    var wrong_digest = targets[0].graph_retirement_digest.?;
+    wrong_digest[0] ^= 1;
+    targets[0].graph_retirement_digest = wrong_digest;
+    try std.testing.expectError(error.InvalidRestoreStaging, graphSealScopeForOldRange(alloc, plan, try plan.digest(alloc), targets[0], old_range));
+    targets[0].graph_retirement_digest = try graphRetirementDigest(alloc, 9, 10, targets[0].table.indexes_json);
+    try plan.validate(alloc);
+    const seal_scope = (try graphSealScopeForOldRange(alloc, plan, try plan.digest(alloc), targets[0], old_range)).?;
+    try std.testing.expect(seal_scope.fence.eql(fence));
+    try std.testing.expectEqualDeep(targets[0].graph_retirement_digest.?, seal_scope.retirementDigest());
+    try std.testing.expectEqualDeep(try plan.digest(alloc), seal_scope.plan_digest);
+    targets[0].graph_retirement_digest = try graphRetirementDigest(alloc, 9, 11, targets[0].table.indexes_json);
     try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(alloc));
 }
 
@@ -911,7 +1385,8 @@ test "relational integrity restore staging pins an untouched FK parent and exact
     const old: records.TableRecord = .{ .table_id = 9, .name = "children", .schema_json = child_schema };
     const old_range: records.RangeRecord = .{ .table_id = 9, .group_id = 301, .start_key = "" };
     const old_fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 401, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) };
-    const target: Target = .{ .source_table_id = 9, .empty_generation = true, .table = .{ .table_id = 10, .name = "children", .schema_json = child_schema }, .ranges = &.{.{ .table_id = 10, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" }}, .replace = .{ .table = old, .ranges = &.{old_range}, .fences = &.{old_fence} } };
+    const empty_handoff: GenerationHandoffRange = .{ .source_group_id = 301, .target_group_id = 401, .source_namespace = old_fence.namespace, .admissions = &.{}, .admissions_digest = try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(old_fence.namespace, &.{}), .retired_digest = @splat(8), .retired_count = 0 };
+    const target: Target = .{ .source_table_id = 9, .empty_generation = true, .table = .{ .table_id = 10, .name = "children", .schema_json = child_schema }, .ranges = &.{.{ .table_id = 10, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" }}, .generation_handoffs = &.{empty_handoff}, .replace = .{ .table = old, .ranges = &.{old_range}, .fences = &.{old_fence} } };
     const parent_range: records.RangeRecord = .{ .table_id = 11, .group_id = 501, .start_key = "" };
     const parent_fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .role = .truncate_parent, .transition_id = 7, .attempt = 1, .owner_group_id = 501, .peer_group_id = 501, .namespace = .{ .table_id = 11, .shard_id = 501, .range_id = 501 }, .catalog_digest = @splat(6) };
     const next_generation = try plannedForeignGeneration(alloc, target, "fk");

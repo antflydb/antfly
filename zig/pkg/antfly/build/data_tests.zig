@@ -36,6 +36,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
     const lib_data_runtime_default_filters = [_][]const u8{
+        "pure topology control bypasses only ordinary dense repair writer preflight",
         "data ownership fallback requires a single store across all roles",
         "data relational maintenance yields to raft persistence and follows elections",
         "data runtime background worker capacity is reserved and closes with its owner",
@@ -259,6 +260,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_data_runtime_tests = @import("linked_tests.zig").runPair(b, lib_data_runtime_tests, implementation_tests);
     const lib_data_runtime_test_step = b.step("antfly-data-runtime-test", "Run focused data runtime tests");
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
+    const private_initial_owner_predicate_tests = b.addTest(.{
+        .name = "data-private-initial-owner-predicate-tests",
+        .root_module = options.data_implementation_module,
+        .filters = &.{"ordinary unpublished placement does not require a private initial FK owner snapshot"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-data-private-initial-owner-predicate-test", "Verify hidden initial-FK owner preflight excludes ordinary unpublished placements")
+        .dependOn(&addFilteredTestRunArtifact(b, private_initial_owner_predicate_tests).step);
 
     const lib_data_storage_default_filters = [_][]const u8{
         // Regressions previously selected only by unit-test-progress.

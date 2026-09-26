@@ -446,6 +446,7 @@ pub fn requireNoActive(txn: anytype) !void {
 /// only the private owner activation endpoint may submit its command.
 /// The caller stages this together with topology release in ONE owner txn.
 pub fn stageVerifiedActivation(alloc: std.mem.Allocator, txn: anytype, fence: topology.Fence, plan_id: [16]u8, plan_digest: integrity.Digest, publication_digest: integrity.Digest) !void {
+    if (try @import("empty_generation_handoff.zig").active(txn)) return error.IntegrityTopologyChanged;
     const actual = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
     if (!actual.eql(fence)) return error.IntegrityTopologyChanged;
     const pending = (try current(txn)) orelse return error.GenerationRetirementPending;
@@ -487,6 +488,7 @@ pub fn stageVerifiedActivation(alloc: std.mem.Allocator, txn: anytype, fence: to
 /// inverse records to retire. The accepted scope remains even after GC, so a
 /// delayed old-generation attach can never resurrect deleted references.
 pub fn stageChildGenerationRetirements(alloc: std.mem.Allocator, txn: anytype, fence: topology.Fence, transitions: []const @import("relational_integrity_generation_admission.zig").Transition) !void {
+    if (try @import("empty_generation_handoff.zig").active(txn)) return error.IntegrityTopologyChanged;
     const admission = @import("relational_integrity_generation_admission.zig");
     if (fence.role != .child_generation_parent and fence.role != .child_generation_dual) return error.InvalidGenerationRetirement;
     try admission.validateTransitions(transitions);
@@ -695,6 +697,11 @@ pub fn prepareGcPage(alloc: std.mem.Allocator, txn: anytype, max_records: usize,
 /// make a stale page harmless rather than deleting a newly rewritten record.
 pub fn applyGcPage(txn: anytype, page: anytype) !void {
     try page.validate();
+    // An empty-generation rewrite attests the *entire* retired namespace
+    // after its source fence closes. Even reference-phase GC can advance to
+    // tombstone deletion in the same page; freeze both phases until cutover or
+    // reversible cancellation so the read-index digest remains stable.
+    if (try @import("empty_generation_handoff.zig").active(txn)) return error.IntegrityTopologyChanged;
     const raw = (try optionalKey(txn, gc_progress_key)) orelse return error.GenerationRetirementChanged;
     if (!std.mem.eql(u8, raw, page.expected)) return error.GenerationRetirementChanged;
     const before = try GcProgress.decode(page.expected);

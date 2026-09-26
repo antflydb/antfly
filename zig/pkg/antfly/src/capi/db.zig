@@ -6182,25 +6182,30 @@ pub fn storageOwnerOpen(
     // after the DB occupies its final address, and drain them on failure.
     if (restore_bootstrap) |bootstrap| {
         local_write.configureRestoreOwnerDb(alloc, &handle.db, bootstrap.value, request.restore_cancel_recovery != 0, request.restore_ha_replay != 0) catch |err| return storageOwnerStatusFromError(err);
-    } else local_write.configureStorageKernelOwnerDbAtOpen(
-        alloc,
-        &handle.db,
-        table_name,
-        request.schema_json.slice(),
-        request.indexes_json.slice(),
-        if (owner_context) |context| context.backend_runtime.ptr() else null,
-        if (owner_context) |context| context.antflyProvider() else null,
-        if (owner_context) |context| context.secret_store else null,
-        if (owner_context) |context| context.remoteContent() else null,
-        &handle.storage_owner_managed_config,
-        request.historical_raft_apply != 0,
-    ) catch |err| return storageOwnerStatusFromError(err);
+    } else {
+        const deferred = local_write.configureStorageKernelOwnerDbAtOpen(
+            alloc,
+            &handle.db,
+            table_name,
+            request.schema_json.slice(),
+            request.indexes_json.slice(),
+            if (owner_context) |context| context.backend_runtime.ptr() else null,
+            if (owner_context) |context| context.antflyProvider() else null,
+            if (owner_context) |context| context.secret_store else null,
+            if (owner_context) |context| context.remoteContent() else null,
+            &handle.storage_owner_managed_config,
+            request.historical_raft_apply != 0,
+        ) catch |err| return storageOwnerStatusFromError(err);
+        if (request.owner_catalog_deferred_out) |out| out.* = @intFromBool(deferred);
+    }
     // DB.open returns by value. Only now is the compiled owner's DB at its
     // permanent address with configuration installed; use the same startup as
     // resident caches so relational builds, retirement and durable outboxes
     // make progress. Hidden restore owners must remain unpublished/quiescent.
     if (restore_bootstrap == null) {
-        handle.db.activateResolverReplayRuntimes() catch |err| return storageOwnerStatusFromError(err);
+        handle.db.activateResolverReplayRuntimes() catch |err| {
+            return storageOwnerStatusFromError(err);
+        };
         handle.db.startResidentBackgroundWorkersIfNeeded();
     }
     // Register as the last fallible step: on failure the defers above close
@@ -6216,6 +6221,17 @@ pub fn storageOwnerOpen(
 
 pub fn storageOwnerClose(owner: ?*anyopaque) callconv(.c) void {
     antfly_db_close(owner);
+}
+
+test "storage owner open rejects prior ABI before reading expanded request fields" {
+    var owner: ?*anyopaque = @ptrFromInt(1);
+    const old_request: kernel_owner_abi.OpenRequest = .{
+        .version = 68,
+        .path = .{ .ptr = @ptrFromInt(1), .len = 1 },
+        .owner_catalog_deferred_out = @ptrFromInt(1),
+    };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_abi, storageOwnerOpen(&old_request, &owner));
+    try std.testing.expect(owner == null);
 }
 
 pub fn storageOwnerConfigure(

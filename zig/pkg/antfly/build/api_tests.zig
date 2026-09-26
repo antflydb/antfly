@@ -242,6 +242,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx relational row query mutation endpoints enforce exact versions and schema epochs",
         "httpx SQL",
         "httpx retained read",
+        "httpx hidden handoff receipt rejects public caller even in legacy internal mode",
+        "httpx FK source control rejects missing service token in legacy internal mode",
+        "hidden generation handoff receipt requires exact scoped read-index request",
         "api.sql_execution",
         "api.sql_pgwire",
         "api.sql_session",
@@ -1131,6 +1134,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "hierarchy navigation hydration validates the planned unit fingerprint",
             "hosted hierarchy navigation routes projection-safe hydration and advances cursors",
             "routed internal reads require an explicit peer fence acknowledgement",
+            "generation handoff receipt local forwarding certifies the strict read index before admission",
             "routing sessions reserve authoritative snapshots for cross-table plans",
             "encode query request preserves unit grouping ancestor projections",
             "parseRemoteSearchResult preserves grouped hierarchy matches",
@@ -2081,6 +2085,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-hosted-fk-drop-test", "Run mounted external-parent FK DROP retirement and restart")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_drop_tests).step);
+    const hosted_graph_truncate_tests = b.addTest(.{
+        .root_module = hosted_fk_drop_test_mod,
+        .filters = &.{"mounted hosted graph TRUNCATE seals and CASCADE retires FK cohort across restart"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-graph-truncate-test", "Run mounted graph TRUNCATE seal and restart diagnostic")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_graph_truncate_tests).step);
     const hosted_self_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_self_fk_test_root.zig"),
         .target = target,
@@ -2113,6 +2124,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-hosted-self-fk-diagnostic", "Opt-in mounted self-FK ADD/DROP/restart diagnostic; requires a bounded guard lift")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_diagnostic_tests).step);
+    const hosted_self_fk_fault_tests = b.addTest(.{
+        .root_module = hosted_self_fk_test_mod,
+        .filters = &.{"mounted hosted self-FK publication resumes after lost owner and metadata replies"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-self-fk-fault-diagnostic", "Opt-in mounted self-FK publication lost-reply recovery; requires a bounded guard lift")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_fault_tests).step);
+    const hosted_self_fk_metadata_restart_tests = b.addTest(.{
+        .root_module = hosted_self_fk_test_mod,
+        .filters = &.{"mounted hosted self-FK resumes after metadata and owner cold restart at parent ACK"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-self-fk-metadata-restart-diagnostic", "Opt-in mounted self-FK metadata and owner cold restart at parent ACK; requires a bounded guard lift")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_metadata_restart_tests).step);
+    const hosted_self_fk_leader_transfer_tests = b.addTest(.{
+        .root_module = hosted_self_fk_test_mod,
+        .filters = &.{"mounted hosted self-FK survives three-voter owner leadership transfer at ADD and DROP ACK"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-self-fk-leader-transfer-diagnostic", "Opt-in mounted three-voter self-FK ADD/DROP owner leadership transfer; requires a bounded guard lift")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_leader_transfer_tests).step);
     const lib_api_standalone_backup_restore_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{
@@ -2170,6 +2202,36 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-staged-restore-driver-test", "Run bounded staged restore publication and cancellation driver regressions").dependOn(&addFilteredTestRunArtifact(b, staged_restore_driver_tests).step);
+    const staged_restore_proof_tests = b.addTest(.{
+        .root_module = api_backup_restore_test_mod,
+        .filters = &.{ "staged restore worker rebuilds a dependency complete mixed portable cohort", "staged table restore worker uses shared dependency complete cohort" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-staged-restore-proof-test", "Run portable accepted-generation and table-cohort restore regressions").dependOn(&addFilteredTestRunArtifact(b, staged_restore_proof_tests).step);
+    const staged_restore_portable_fk_tests = b.addTest(.{
+        .root_module = api_backup_restore_test_mod,
+        .filters = &.{"staged restore worker rebuilds a dependency complete mixed portable cohort"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-staged-restore-portable-fk-test", "Run portable accepted-generation restore regression").dependOn(&addFilteredTestRunArtifact(b, staged_restore_portable_fk_tests).step);
+    const portable_fk_restore_admission_tests = b.addTest(.{
+        .root_module = api_backup_restore_test_mod,
+        .filters = &.{ "public portable foreign-key restore rejects a new job without losing an exact retry", "portable foreign-key worker guard is terminal and not a corrupt archive" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-portable-fk-restore-admission-test", "Run fail-closed public portable FK restore admission regression").dependOn(&addFilteredTestRunArtifact(b, portable_fk_restore_admission_tests).step);
+    const staged_restore_benchmark_tests = b.addTest(.{
+        .root_module = api_backup_restore_test_mod,
+        .filters = &.{"staged restore worker measures bounded LSM native and portable work"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-staged-restore-benchmark-test", "Measure bounded native and portable LSM restore work").dependOn(&addFilteredTestRunArtifact(b, staged_restore_benchmark_tests).step);
+    const staged_restore_portable_terminal_tests = b.addTest(.{
+        .root_module = api_backup_restore_test_mod,
+        .filters = &.{"staged portable restore proves terminal correctness with a bounded extended budget"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-staged-restore-portable-terminal-test", "Prove large portable staged restore reaches durable publication").dependOn(&addFilteredTestRunArtifact(b, staged_restore_portable_terminal_tests).step);
     const rewrite_driver_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{ "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners", "restore immutable rewrite failures are terminal" },
@@ -2203,7 +2265,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_transactions_docid_tests = run_api_transactions_docid_tests,
         .run_api_table_writes_docid_tests = run_api_table_writes_docid_tests,
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_fk_drop_tests, hosted_self_fk_guard_tests, hosted_self_fk_diagnostic_tests }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_self_fk_guard_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,
