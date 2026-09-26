@@ -564,12 +564,14 @@ different sizes; see the report for caveats).
 - **Pilot result:** the ModernBERT-base student collapses to constant outputs
   (in-domain classification 0.13, NER F1 0.0), with fresh or with
   gliner2.5-base's trained heads, in the native trainer and in upstream's
-  PyTorch trainer alike. The same recipe on gliner2.5-base (DeBERTa) lifts
-  in-domain classification 0.728 → 0.808 and NER F1 0.543 → 0.723, so the
-  data and pipeline are sound and the failure is specific to the ModernBERT
-  encoder. Leads, in order: feature scale (ModernBERT's states have 2.7x
-  DeBERTa's norm), the missing [CLS] at position 0, per-word start-of-text
-  tokenization. Details:
+  PyTorch trainer alike. The same recipe on gliner2.5-base lifts in-domain
+  classification 0.728 → 0.808 and NER F1 0.543 → 0.723, but that encoder is
+  already GLiNER-trained: raw DeBERTa-v3-base with the same fresh heads
+  collapses too, faster. The pilot recipe (fresh heads, 4,560 rows) cannot
+  teach GLiNER's label matching to a raw encoder; head warmup, lower encoder
+  learning rate, feature rescaling and cosine feature distillation do not fix
+  it. Next: relational distillation and a larger teacher-labeled set.
+  Details:
   [work-log/completed/inference/antenna/2026-09-25-pilot.md](../../../../../work-log/completed/inference/antenna/2026-09-25-pilot.md).
 
 ### Step 2: fused ModernBERT training attention (done)
