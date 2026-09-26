@@ -1892,6 +1892,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
             "replica retirement journal batches preserve every group phase",
+            "replica retirement journal distinguishes active retained and committed removal",
             "private initial child retirement requires canceled local publication",
         },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },

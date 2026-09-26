@@ -40183,6 +40183,14 @@ fn consumerTests() type {
                 source: ?*ProvisionedTableWriteSource = null,
                 drained: bool = false,
 
+                fn readInitialChild(_: *anyopaque, _: std.mem.Allocator, group_id: u64) !InitialChildRetirementObservation {
+                    try std.testing.expectEqual(@as(u64, 7001), group_id);
+                    // This fixture models an ordinary replica with no private
+                    // initial-child marker; a control-only source cannot open
+                    // the on-disk DB to infer that fact itself.
+                    return .{};
+                }
+
                 fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
                     return error.UnexpectedBatch;
                 }
@@ -40215,6 +40223,7 @@ fn consumerTests() type {
             ownership.source = &source;
             _ = source.withLocalWriteSource(.{ .ptr = &ownership, .vtable = &.{ .batch = Ownership.batch, .retire_table_group_local = Ownership.retire } });
             _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
+            _ = source.withInitialChildRetirementReader(.{ .ptr = &ownership, .read = Ownership.readInitialChild });
             var prepared = try source.prepareReplicaRetirements(alloc, &.{.{ .group_id = 7001, .table_name = "docs" }});
             defer prepared.deinit();
             try std.testing.expect(prepared.batch_created);
