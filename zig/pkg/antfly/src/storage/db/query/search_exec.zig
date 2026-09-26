@@ -17988,6 +17988,7 @@ const highlight_regex_mod = @import("../../../search/regex.zig");
 
 const HighlightMatcherEntry = struct {
     field: []const u8,
+    indexed_field: []const u8,
     matcher: highlight_mod.Matcher,
     query_index: usize = 0,
 };
@@ -18049,28 +18050,31 @@ fn collectHighlightMatchers(
         .match => |match| {
             const analyzer = match.analyzer orelse &analysis_mod.default_analyzer;
             const tokens = try analyzer.analyze(arena, match.text);
-            for (tokens) |token| try out.append(arena, .{ .field = highlightRootField(match.field), .matcher = .{ .term = token.term } });
+            for (tokens) |token| try out.append(arena, .{ .field = highlightRootField(match.field), .indexed_field = match.field, .matcher = .{ .term = token.term } });
         },
         .phrase => |phrase| {
             const analyzer = phrase.analyzer orelse &analysis_mod.default_analyzer;
             const tokens = try analyzer.analyze(arena, phrase.text);
             for (tokens) |token| try out.append(arena, .{
                 .field = highlightRootField(phrase.field),
+                .indexed_field = phrase.field,
                 .matcher = highlightPhraseMatcher(token.term, phrase.max_edits, phrase.auto_fuzzy),
             });
         },
         .term => |term| try out.append(arena, .{
             .field = highlightRootField(term.field),
+            .indexed_field = term.field,
             .matcher = if (highlightFieldIsKeyword(term.field)) .{ .literal = term.term } else if (highlightFieldIsSubstring(term.field)) .{ .contains = term.term } else .{ .term = term.term },
         }),
         .term_phrase => |phrase| for (phrase.terms) |term| {
-            try out.append(arena, .{ .field = highlightRootField(phrase.field), .matcher = highlightPhraseMatcher(term, phrase.max_edits, phrase.auto_fuzzy) });
+            try out.append(arena, .{ .field = highlightRootField(phrase.field), .indexed_field = phrase.field, .matcher = highlightPhraseMatcher(term, phrase.max_edits, phrase.auto_fuzzy) });
         },
         .multi_phrase => |phrase| for (phrase.terms) |alternatives| for (alternatives) |term| {
-            try out.append(arena, .{ .field = highlightRootField(phrase.field), .matcher = highlightPhraseMatcher(term, phrase.max_edits, phrase.auto_fuzzy) });
+            try out.append(arena, .{ .field = highlightRootField(phrase.field), .indexed_field = phrase.field, .matcher = highlightPhraseMatcher(term, phrase.max_edits, phrase.auto_fuzzy) });
         },
         .fuzzy => |fuzzy| try out.append(arena, .{
             .field = highlightRootField(fuzzy.field),
+            .indexed_field = fuzzy.field,
             .matcher = .{ .fuzzy = .{
                 .term = fuzzy.term,
                 .max_edits = if (fuzzy.auto_fuzzy) highlightAutoFuzziness(fuzzy.term) else fuzzy.max_edits,
@@ -18079,14 +18083,16 @@ fn collectHighlightMatchers(
         }),
         .prefix => |prefix| try out.append(arena, .{
             .field = highlightRootField(prefix.field),
+            .indexed_field = prefix.field,
             .matcher = if (highlightFieldIsKeyword(prefix.field)) .{ .literal_prefix = prefix.prefix } else if (highlightFieldIsSubstring(prefix.field)) .{ .contains = prefix.prefix } else .{ .prefix = prefix.prefix },
         }),
-        .wildcard => |wildcard| try out.append(arena, .{ .field = highlightRootField(wildcard.field), .matcher = .{ .wildcard = wildcard.pattern } }),
+        .wildcard => |wildcard| try out.append(arena, .{ .field = highlightRootField(wildcard.field), .indexed_field = wildcard.field, .matcher = .{ .wildcard = wildcard.pattern } }),
         .regexp => |regexp| {
             const compiled = try arena.create(highlight_regex_mod.RegexAutomaton);
             compiled.* = highlight_regex_mod.compile(arena, regexp.pattern) catch return;
             try out.append(arena, .{
                 .field = highlightRootField(regexp.field),
+                .indexed_field = regexp.field,
                 .matcher = .{ .regexp = .{ .pattern = regexp.pattern, .compiled = compiled } },
             });
         },
@@ -18292,19 +18298,20 @@ pub fn attachHighlightsWithIndexQueries(
     }
     if (entries.items.len == 0) return;
 
-    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    var default_fields = std.ArrayListUnmanaged([]const u8).empty;
     if (options.fields.len > 0) {
-        for (options.fields) |field| try fields.append(arena, field);
+        for (options.fields) |field| try default_fields.append(arena, field);
     } else {
         for (entries.items) |entry| {
+            if (std.mem.eql(u8, entry.field, "_all")) continue;
             var seen = false;
-            for (fields.items) |existing| {
+            for (default_fields.items) |existing| {
                 if (std.mem.eql(u8, existing, entry.field)) {
                     seen = true;
                     break;
                 }
             }
-            if (!seen) try fields.append(arena, entry.field);
+            if (!seen) try default_fields.append(arena, entry.field);
         }
     }
     const fragment_size = @max(options.fragment_size, 1);
@@ -18327,6 +18334,36 @@ pub fn attachHighlightsWithIndexQueries(
         const hit_arena = hit_arena_state.allocator();
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, hit_arena, stored, .{}) catch continue;
 
+        const all_fields = try hit_arena.alloc([]const []const u8, indexed_queries.len);
+        var fields = std.ArrayListUnmanaged([]const u8).empty;
+        try fields.appendSlice(hit_arena, default_fields.items);
+        for (indexed_queries, 0..) |indexed, query_index| {
+            var needs_all = false;
+            for (entries.items) |entry| {
+                if (entry.query_index == query_index and std.mem.eql(u8, entry.indexed_field, "_all")) {
+                    needs_all = true;
+                    break;
+                }
+            }
+            all_fields[query_index] = if (needs_all)
+                try mapper_mod.allSourceTextFieldsFromValue(hit_arena, parsed, indexed.text_analysis, indexed.runtime_schema)
+            else
+                &.{};
+            if (needs_all and options.fields.len == 0) {
+                for (all_fields[query_index]) |indexed_field| {
+                    const field = highlightRootField(indexed_field);
+                    var seen = false;
+                    for (fields.items) |existing| {
+                        if (std.mem.eql(u8, existing, field)) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (!seen) try fields.append(hit_arena, field);
+                }
+            }
+        }
+
         var highlighted = std.ArrayListUnmanaged(types.HighlightedField).empty;
         errdefer {
             for (highlighted.items) |*item| types.freeHighlightedField(alloc, item);
@@ -18340,21 +18377,47 @@ pub fn attachHighlightsWithIndexQueries(
                 fragments.deinit(alloc);
             }
             for (indexed_queries, 0..) |indexed, query_index| {
-                var matchers = std.ArrayListUnmanaged(highlight_mod.Matcher).empty;
+                var processed = std.ArrayListUnmanaged([]const u8).empty;
                 for (entries.items) |entry| {
-                    if (entry.query_index == query_index and std.mem.eql(u8, entry.field, field)) {
-                        try matchers.append(hit_arena, entry.matcher);
+                    if (entry.query_index != query_index) continue;
+                    const matches_field = if (std.mem.eql(u8, entry.indexed_field, "_all")) blk: {
+                        for (all_fields[query_index]) |indexed_field| {
+                            if (std.mem.eql(u8, highlightRootField(indexed_field), field)) break :blk true;
+                        }
+                        break :blk false;
+                    } else std.mem.eql(u8, entry.field, field);
+                    if (!matches_field) continue;
+                    var seen = false;
+                    for (processed.items) |prior| {
+                        if (std.mem.eql(u8, prior, entry.indexed_field)) {
+                            seen = true;
+                            break;
+                        }
                     }
-                }
-                if (matchers.items.len == 0) continue;
-                const analyzer = (resolveQueryAnalyzer(field, null, indexed.text_analysis, indexed.runtime_schema) catch null) orelse &analysis_mod.default_analyzer;
-                switch (value) {
-                    .string => |text| try appendHighlightFragments(alloc, &fragments, text, null, matchers.items, analyzer, max_fragments, fragment_size),
-                    .array => |items| for (items.items, 0..) |item, item_index| {
-                        if (item != .string) continue;
-                        try appendHighlightFragments(alloc, &fragments, item.string, @intCast(item_index), matchers.items, analyzer, max_fragments, fragment_size);
-                    },
-                    else => {},
+                    if (seen) continue;
+                    try processed.append(hit_arena, entry.indexed_field);
+
+                    var matchers = std.ArrayListUnmanaged(highlight_mod.Matcher).empty;
+                    for (entries.items) |candidate| {
+                        if (candidate.query_index == query_index and
+                            std.mem.eql(u8, candidate.indexed_field, entry.indexed_field))
+                        {
+                            try matchers.append(hit_arena, candidate.matcher);
+                        }
+                    }
+                    // Substring matchers scan surface words themselves; avoid
+                    // expanding every indexed suffix while highlighting.
+                    const analyzer_field = if (std.mem.eql(u8, entry.indexed_field, "_all") or
+                        highlightFieldIsSubstring(entry.indexed_field)) field else entry.indexed_field;
+                    const analyzer = (resolveQueryAnalyzer(analyzer_field, null, indexed.text_analysis, indexed.runtime_schema) catch null) orelse &analysis_mod.default_analyzer;
+                    switch (value) {
+                        .string => |text| try appendHighlightFragments(alloc, &fragments, text, null, matchers.items, analyzer, max_fragments, fragment_size),
+                        .array => |items| for (items.items, 0..) |item, item_index| {
+                            if (item != .string) continue;
+                            try appendHighlightFragments(alloc, &fragments, item.string, @intCast(item_index), matchers.items, analyzer, max_fragments, fragment_size);
+                        },
+                        else => {},
+                    }
                 }
             }
             if (fragments.items.len == 0) continue;
@@ -18460,6 +18523,68 @@ test "attachHighlights marks analyzed, prefix, and substring matches on stored s
     try attachHighlights(alloc, .{ .fields = &only_title }, &.{query}, &projected, &full_sources, text_analysis, null);
     try std.testing.expectEqual(@as(usize, 1), projected[0].highlights.len);
     try std.testing.expectEqualStrings("title", projected[0].highlights[0].field);
+}
+
+test "_all highlights the source fields emitted into the index" {
+    const alloc = std.testing.allocator;
+    const query: types.TextQuery = .{ .match = .{ .field = "_all", .text = "runners" } };
+    for ([_]types.HighlightRequest{ .{}, .{ .fields = &.{"title"} } }) |options| {
+        var hits = [_]types.SearchHit{.{
+            .id = try alloc.dupe(u8, "doc:1"),
+            .stored_data = try alloc.dupe(u8, "{\"title\":\"Runners Handbook\",\"other\":\"Quiet\"}"),
+        }};
+        defer hits[0].deinit(alloc);
+        try attachHighlights(alloc, options, &.{query}, &hits, null, .{}, null);
+        try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+        try std.testing.expectEqualStrings("title", hits[0].highlights[0].field);
+        const fragment = hits[0].highlights[0].fragments[0];
+        try std.testing.expectEqualStrings("Runners", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
+    }
+
+    const schema: runtime_schema_mod.TableSchema = .{
+        .full_text_documents = &.{.{
+            .name = "_default",
+            .fields = &.{
+                .{ .path = "title", .emitted_name = "title", .analyzer = "standard", .include_in_all = true },
+                .{ .path = "secret", .emitted_name = "secret", .analyzer = "standard" },
+            },
+        }},
+    };
+    var hits = [_]types.SearchHit{.{
+        .id = try alloc.dupe(u8, "doc:2"),
+        .stored_data = try alloc.dupe(u8, "{\"title\":\"Runners Handbook\",\"secret\":\"Runners Handbook\"}"),
+    }};
+    defer hits[0].deinit(alloc);
+    try attachHighlights(alloc, .{}, &.{query}, &hits, null, .{}, schema);
+    try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+    try std.testing.expectEqualStrings("title", hits[0].highlights[0].field);
+}
+
+test "keyword companion pattern matches highlight the whole indexed value" {
+    const alloc = std.testing.allocator;
+    const text_analysis: introducer_mod.TextAnalysisConfig = .{
+        .field_analyzers = &.{
+            .{ .field_name = "place", .analyzer_name = "standard" },
+            .{ .field_name = "place.keyword", .analyzer_name = "keyword" },
+        },
+    };
+    const queries = [_]types.TextQuery{
+        .{ .wildcard = .{ .field = "place.keyword", .pattern = "New*City" } },
+        .{ .regexp = .{ .field = "place.keyword", .pattern = "New.*City" } },
+        .{ .fuzzy = .{ .field = "place.keyword", .term = "New York Cith", .max_edits = 1 } },
+    };
+    for (queries) |query| {
+        var hits = [_]types.SearchHit{.{
+            .id = try alloc.dupe(u8, "doc:1"),
+            .stored_data = try alloc.dupe(u8, "{\"place\":\"New York City\"}"),
+        }};
+        defer hits[0].deinit(alloc);
+        try attachHighlights(alloc, .{}, &.{query}, &hits, null, text_analysis, null);
+        try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+        try std.testing.expectEqualStrings("place", hits[0].highlights[0].field);
+        const fragment = hits[0].highlights[0].fragments[0];
+        try std.testing.expectEqualStrings("New York City", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
+    }
 }
 
 test "named highlight queries use their own index analyzers" {

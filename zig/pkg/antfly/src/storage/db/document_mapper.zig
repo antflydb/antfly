@@ -2577,6 +2577,24 @@ fn extractTextFieldsFromValue(
     return try extractSchemaLessTextAndTypedFields(alloc, root.object, text_analysis);
 }
 
+/// Return the indexed fields whose values were also emitted into `_all`.
+/// Keep this in the mapper so highlighting follows the same schema and
+/// dynamic-field decisions as indexing.
+pub fn allSourceTextFieldsFromValue(
+    alloc: Allocator,
+    root: std.json.Value,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    schema: ?runtime_schema.TableSchema,
+) ![]const []const u8 {
+    const extracted = try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null);
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    for (extracted.fields, 0..) |field, index| {
+        if (!std.mem.eql(u8, field.field_name, "_all") or index == 0) continue;
+        try names.append(alloc, extracted.fields[index - 1].field_name);
+    }
+    return try names.toOwnedSlice(alloc);
+}
+
 fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
     if (schema.exact_fields.len > 0) return true;
     if (schema.dynamic_templates.len > 0) return true;

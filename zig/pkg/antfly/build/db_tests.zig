@@ -503,6 +503,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "mixed numeric concrete sort keys share one cursor domain",
         "schema boolean doc values back native sort planner",
         "db exact sort resolves mapped geo metadata filters from typed doc values",
+        "_all highlights the source fields emitted into the index",
+        "keyword companion pattern matches highlight the whole indexed value",
     };
     const lib_db_query_tests = b.addTest(.{
         .root_module = antfly_test_mod,
