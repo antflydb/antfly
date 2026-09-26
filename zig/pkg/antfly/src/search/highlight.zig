@@ -51,6 +51,10 @@ pub const Matcher = union(enum) {
     wildcard: []const u8,
     fuzzy: Fuzzy,
     regexp: Regexp,
+    /// Pattern queries against a suffix-indexed substring companion.
+    substring_wildcard: []const u8,
+    substring_fuzzy: Fuzzy,
+    substring_regexp: Regexp,
 
     pub const Fuzzy = struct {
         term: []const u8,
@@ -123,11 +127,17 @@ pub fn highlightMatchers(
     // field's stop words or stemming. Evaluate them over the plain surface
     // words so a span can never bridge a word the companion never joined.
     var has_contains = false;
-    for (matchers) |matcher| has_contains = has_contains or matcher == .contains;
-    if (has_contains) {
+    var has_substring_pattern = false;
+    for (matchers) |matcher| {
+        has_contains = has_contains or matcher == .contains;
+        has_substring_pattern = has_substring_pattern or matcher == .substring_wildcard or
+            matcher == .substring_fuzzy or matcher == .substring_regexp;
+    }
+    if (has_contains or has_substring_pattern) {
         const words = try analysis_mod.substring_query_analyzer.analyze(alloc, text);
         defer analysis_mod.Analyzer.freeTokens(alloc, words);
-        try collectContainsSpans(alloc, text, words, matchers, &spans);
+        if (has_contains) try collectContainsSpans(alloc, text, words, matchers, &spans);
+        if (has_substring_pattern) try collectSubstringPatternSpans(alloc, words, matchers, &spans);
     }
     if (spans.items.len == 0) return &.{};
     normalizeSpans(&spans);
@@ -234,9 +244,74 @@ fn collectMatchSpans(
                     }
                 },
                 .regexp => |regexp| if (regex_mod.matchesCompiled(regexp.pattern, regexp.compiled, tok.term)) try spans.append(alloc, .{ .start = tok.start_byte, .end = tok.end_byte }),
-                .contains => {},
+                .contains, .substring_wildcard, .substring_fuzzy, .substring_regexp => {},
                 .literal, .literal_prefix => {},
             }
+        }
+    }
+}
+
+/// Replay the substring companion's one-word and adjacent-word suffixes,
+/// mapping positions through the source separator instead of treating a
+/// joined shingle's byte offsets as contiguous source bytes.
+fn collectSubstringPatternSpans(
+    alloc: Allocator,
+    words: []const analysis_mod.Token,
+    matchers: []const Matcher,
+    spans: *std.ArrayListUnmanaged(Span),
+) !void {
+    for (words, 0..) |first, index| {
+        try collectSubstringPatternTermSpans(alloc, first, null, first.term, matchers, spans);
+        if (index + 1 < words.len) {
+            const second = words[index + 1];
+            const joined = try std.mem.concat(alloc, u8, &.{ first.term, second.term });
+            defer alloc.free(joined);
+            try collectSubstringPatternTermSpans(alloc, first, second, joined, matchers, spans);
+        }
+    }
+}
+
+fn collectSubstringPatternTermSpans(
+    alloc: Allocator,
+    first: analysis_mod.Token,
+    second: ?analysis_mod.Token,
+    term: []const u8,
+    matchers: []const Matcher,
+    spans: *std.ArrayListUnmanaged(Span),
+) !void {
+    var start: usize = 0;
+    while (start < term.len) : (start += 1) {
+        if ((term[start] & 0xC0) == 0x80) continue;
+        const suffix = term[start..];
+        if (suffix.len < analysis_mod.substring_min_query_length) break;
+        var length = @min(suffix.len, analysis_mod.substring_max_query_length);
+        while (length > 0 and length < suffix.len and (suffix[length] & 0xC0) == 0x80) length -= 1;
+        if (length < analysis_mod.substring_min_query_length) continue;
+        const indexed_term = suffix[0..length];
+
+        for (matchers) |matcher| {
+            const matches = switch (matcher) {
+                .substring_wildcard => |pattern| wildcard_mod.match(pattern, indexed_term),
+                .substring_regexp => |regexp| regex_mod.matchesCompiled(regexp.pattern, regexp.compiled, indexed_term),
+                .substring_fuzzy => |fuzzy| blk: {
+                    const prefix_len: usize = fuzzy.prefix_len;
+                    if (indexed_term.len < prefix_len or fuzzy.term.len < prefix_len or
+                        !std.mem.eql(u8, indexed_term[0..prefix_len], fuzzy.term[0..prefix_len])) break :blk false;
+                    break :blk try boundedEditDistance(alloc, indexed_term, fuzzy.term, fuzzy.max_edits) <= fuzzy.max_edits;
+                },
+                else => false,
+            };
+            if (!matches) continue;
+            const span_start = if (second) |next|
+                if (start >= first.term.len) next.start_byte + @as(u32, @intCast(start - first.term.len)) else first.start_byte + @as(u32, @intCast(start))
+            else
+                first.start_byte + @as(u32, @intCast(start));
+            const term_end = start + length;
+            const span_end = if (second) |next|
+                if (term_end > first.term.len) next.start_byte + @as(u32, @intCast(term_end - first.term.len)) else first.start_byte + @as(u32, @intCast(term_end))
+            else
+                first.start_byte + @as(u32, @intCast(term_end));
+            try spans.append(alloc, .{ .start = span_start, .end = span_end });
         }
     }
 }
@@ -600,6 +675,27 @@ test "highlight prefix wildcard fuzzy and regexp matchers mark whole tokens" {
     try std.testing.expectEqualStrings("scheduler", fragments[0].text[fragments[0].highlights[0].start..fragments[0].highlights[0].end]);
     try std.testing.expectEqualStrings("schedules", fragments[0].text[fragments[0].highlights[1].start..fragments[0].highlights[1].end]);
     try std.testing.expectEqualStrings("schedule", fragments[0].text[fragments[0].highlights[2].start..fragments[0].highlights[2].end]);
+}
+
+test "substring pattern matchers map joined suffixes to source bytes" {
+    const alloc = std.testing.allocator;
+    const text = "Rag3-Weaver";
+    var compiled = try regex_mod.compile(alloc, "^g3we.*$");
+    defer compiled.deinit();
+    const matchers = [_]Matcher{
+        .{ .substring_wildcard = "g3we*" },
+        .{ .substring_regexp = .{ .pattern = "^g3we.*$", .compiled = &compiled } },
+        .{ .substring_fuzzy = .{ .term = "g3weaver", .max_edits = 0 } },
+    };
+    for (matchers) |matcher| {
+        const fragments = try highlightMatchers(alloc, text, &.{matcher}, &analysis_mod.default_analyzer, 1, 100);
+        defer freeFragments(alloc, fragments);
+        try std.testing.expectEqual(@as(usize, 1), fragments.len);
+        try std.testing.expectEqualStrings("g3-Weaver", fragments[0].text[fragments[0].highlights[0].start..fragments[0].highlights[0].end]);
+    }
+    const second_word = try highlightMatchers(alloc, text, &.{.{ .substring_wildcard = "we*" }}, &analysis_mod.default_analyzer, 1, 100);
+    defer freeFragments(alloc, second_word);
+    try std.testing.expectEqualStrings("Weaver", second_word[0].text[second_word[0].highlights[0].start..second_word[0].highlights[0].end]);
 }
 
 test "highlight fragments respect size and count limits" {

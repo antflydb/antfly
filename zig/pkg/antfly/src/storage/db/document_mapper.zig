@@ -2595,7 +2595,7 @@ pub fn allSourceTextFieldsFromValue(
     return try names.toOwnedSlice(alloc);
 }
 
-fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
+pub fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
     if (schema.exact_fields.len > 0) return true;
     if (schema.dynamic_templates.len > 0) return true;
     for (schema.full_text_documents) |doc| {

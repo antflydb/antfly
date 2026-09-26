@@ -17999,6 +17999,10 @@ pub const HighlightQuery = struct {
     runtime_schema: ?runtime_schema_mod.TableSchema,
 };
 
+fn highlightUsesSchemaLessText(indexed: HighlightQuery) bool {
+    return if (indexed.runtime_schema) |schema| !mapper_mod.runtimeHasSchemaDrivenText(schema) else true;
+}
+
 const highlight_companion_suffixes = [_][]const u8{
     "._substring",
     "._2gram",
@@ -18072,28 +18076,31 @@ fn collectHighlightMatchers(
         .multi_phrase => |phrase| for (phrase.terms) |alternatives| for (alternatives) |term| {
             try out.append(arena, .{ .field = highlightRootField(phrase.field), .indexed_field = phrase.field, .matcher = highlightPhraseMatcher(term, phrase.max_edits, phrase.auto_fuzzy) });
         },
-        .fuzzy => |fuzzy| try out.append(arena, .{
-            .field = highlightRootField(fuzzy.field),
-            .indexed_field = fuzzy.field,
-            .matcher = .{ .fuzzy = .{
+        .fuzzy => |fuzzy| {
+            const needle: highlight_mod.Matcher.Fuzzy = .{
                 .term = fuzzy.term,
                 .max_edits = if (fuzzy.auto_fuzzy) highlightAutoFuzziness(fuzzy.term) else fuzzy.max_edits,
                 .prefix_len = fuzzy.prefix_len,
-            } },
-        }),
+            };
+            try out.append(arena, .{
+                .field = highlightRootField(fuzzy.field),
+                .indexed_field = fuzzy.field,
+                .matcher = if (highlightFieldIsSubstring(fuzzy.field)) .{ .substring_fuzzy = needle } else .{ .fuzzy = needle },
+            });
+        },
         .prefix => |prefix| try out.append(arena, .{
             .field = highlightRootField(prefix.field),
             .indexed_field = prefix.field,
             .matcher = if (highlightFieldIsKeyword(prefix.field)) .{ .literal_prefix = prefix.prefix } else if (highlightFieldIsSubstring(prefix.field)) .{ .contains = prefix.prefix } else .{ .prefix = prefix.prefix },
         }),
-        .wildcard => |wildcard| try out.append(arena, .{ .field = highlightRootField(wildcard.field), .indexed_field = wildcard.field, .matcher = .{ .wildcard = wildcard.pattern } }),
+        .wildcard => |wildcard| try out.append(arena, .{ .field = highlightRootField(wildcard.field), .indexed_field = wildcard.field, .matcher = if (highlightFieldIsSubstring(wildcard.field)) .{ .substring_wildcard = wildcard.pattern } else .{ .wildcard = wildcard.pattern } }),
         .regexp => |regexp| {
             const compiled = try arena.create(highlight_regex_mod.RegexAutomaton);
             compiled.* = highlight_regex_mod.compile(arena, regexp.pattern) catch return;
             try out.append(arena, .{
                 .field = highlightRootField(regexp.field),
                 .indexed_field = regexp.field,
-                .matcher = .{ .regexp = .{ .pattern = regexp.pattern, .compiled = compiled } },
+                .matcher = if (highlightFieldIsSubstring(regexp.field)) .{ .substring_regexp = .{ .pattern = regexp.pattern, .compiled = compiled } } else .{ .regexp = .{ .pattern = regexp.pattern, .compiled = compiled } },
             });
         },
         .bool_query => |bool_query| {
@@ -18108,10 +18115,12 @@ const HighlightSourceValue = struct {
     text: []const u8,
     item: ?u32,
     array_depth: u32,
+    literal_dotted: bool,
 };
 
 /// Follow the same dotted paths through arrays of objects that the document
-/// mapper indexes. Direct keys containing dots take precedence over traversal.
+/// mapper indexes. Schema-less documents may also contain literal dotted
+/// keys that the mapper emits under the same indexed field name.
 fn collectHighlightSourceValues(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(HighlightSourceValue),
@@ -18119,28 +18128,37 @@ fn collectHighlightSourceValues(
     path: []const u8,
     first_item: ?u32,
     array_depth: u32,
+    literal_dotted: bool,
 ) !void {
     switch (value) {
         .array => |items| {
             for (items.items, 0..) |child, index| {
-                try collectHighlightSourceValues(alloc, out, child, path, first_item orelse @as(u32, @intCast(index)), array_depth + 1);
+                try collectHighlightSourceValues(alloc, out, child, path, first_item orelse @as(u32, @intCast(index)), array_depth + 1, literal_dotted);
             }
         },
         .string => |text| {
-            if (path.len == 0) try out.append(alloc, .{ .text = text, .item = first_item, .array_depth = array_depth });
+            if (path.len == 0) try out.append(alloc, .{ .text = text, .item = first_item, .array_depth = array_depth, .literal_dotted = literal_dotted });
         },
         .object => |object| {
             if (path.len == 0) return;
             if (object.get(path)) |direct| {
-                try collectHighlightSourceValues(alloc, out, direct, "", first_item, array_depth);
-                return;
+                try collectHighlightSourceValues(alloc, out, direct, "", first_item, array_depth, literal_dotted or std.mem.indexOfScalar(u8, path, '.') != null);
             }
             const dot = std.mem.indexOfScalar(u8, path, '.') orelse return;
             const child = object.get(path[0..dot]) orelse return;
-            try collectHighlightSourceValues(alloc, out, child, path[dot + 1 ..], first_item, array_depth);
+            try collectHighlightSourceValues(alloc, out, child, path[dot + 1 ..], first_item, array_depth, literal_dotted);
         },
         else => {},
     }
+}
+
+fn hasLiteralDottedHighlightValue(alloc: Allocator, root: std.json.Value, path: []const u8) !bool {
+    var values = std.ArrayListUnmanaged(HighlightSourceValue).empty;
+    try collectHighlightSourceValues(alloc, &values, root, path, null, 0, false);
+    for (values.items) |value| {
+        if (value.literal_dotted) return true;
+    }
+    return false;
 }
 
 fn appendHighlightFragments(
@@ -18388,6 +18406,27 @@ pub fn attachHighlightsWithIndexQueries(
                     if (!seen) try fields.append(hit_arena, field);
                 }
             }
+            if (options.fields.len == 0 and highlightUsesSchemaLessText(indexed)) {
+                for (entries.items) |entry| {
+                    if (entry.query_index != query_index) continue;
+                    const candidate_fields: []const []const u8 = if (std.mem.eql(u8, entry.indexed_field, "_all"))
+                        all_fields[query_index]
+                    else
+                        &.{entry.indexed_field};
+                    for (candidate_fields) |candidate| {
+                        if (std.mem.eql(u8, highlightRootField(candidate), candidate) or
+                            !try hasLiteralDottedHighlightValue(hit_arena, parsed, candidate)) continue;
+                        var seen = false;
+                        for (fields.items) |existing| {
+                            if (std.mem.eql(u8, existing, candidate)) {
+                                seen = true;
+                                break;
+                            }
+                        }
+                        if (!seen) try fields.append(hit_arena, candidate);
+                    }
+                }
+            }
         }
 
         var highlighted = std.ArrayListUnmanaged(types.HighlightedField).empty;
@@ -18397,7 +18436,7 @@ pub fn attachHighlightsWithIndexQueries(
         }
         for (fields.items) |field| {
             var source_values = std.ArrayListUnmanaged(HighlightSourceValue).empty;
-            try collectHighlightSourceValues(hit_arena, &source_values, parsed, field, null, 0);
+            try collectHighlightSourceValues(hit_arena, &source_values, parsed, field, null, 0, false);
             if (source_values.items.len == 0) continue;
             var has_nested_arrays = false;
             for (source_values.items) |source_value| {
@@ -18421,10 +18460,12 @@ pub fn attachHighlightsWithIndexQueries(
                     if (entry.query_index != query_index) continue;
                     const matches_field = if (std.mem.eql(u8, entry.indexed_field, "_all")) blk: {
                         for (all_fields[query_index]) |indexed_field| {
-                            if (std.mem.eql(u8, highlightRootField(indexed_field), field)) break :blk true;
+                            if (std.mem.eql(u8, highlightRootField(indexed_field), field) or
+                                (highlightUsesSchemaLessText(indexed) and std.mem.eql(u8, indexed_field, field))) break :blk true;
                         }
                         break :blk false;
-                    } else std.mem.eql(u8, entry.field, field);
+                    } else std.mem.eql(u8, entry.field, field) or
+                        (highlightUsesSchemaLessText(indexed) and std.mem.eql(u8, entry.indexed_field, field));
                     if (!matches_field) continue;
                     var seen = false;
                     for (processed.items) |prior| {
@@ -18451,7 +18492,12 @@ pub fn attachHighlightsWithIndexQueries(
                     const analyzer = (resolveQueryAnalyzer(analyzer_field, null, indexed.text_analysis, indexed.runtime_schema) catch null) orelse
                         (if (highlightFieldIsKeyword(entry.indexed_field)) &analysis_mod.keyword_analyzer else &analysis_mod.default_analyzer);
                     for (source_values.items) |source_value| {
-                        try appendHighlightFragments(alloc, &fragments, source_value.text, source_value.item, matchers.items, analyzer, max_fragments, fragment_size);
+                        if (source_value.literal_dotted and !highlightUsesSchemaLessText(indexed)) continue;
+                        const source_analyzer = if (source_value.literal_dotted)
+                            (resolveQueryAnalyzer(field, null, indexed.text_analysis, indexed.runtime_schema) catch null) orelse &analysis_mod.default_analyzer
+                        else
+                            analyzer;
+                        try appendHighlightFragments(alloc, &fragments, source_value.text, source_value.item, matchers.items, source_analyzer, max_fragments, fragment_size);
                     }
                 }
             }
@@ -18620,6 +18666,77 @@ test "keyword companion pattern matches highlight the whole indexed value" {
         const fragment = hits[0].highlights[0].fragments[0];
         try std.testing.expectEqualStrings("New York City", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
     }
+}
+
+test "substring companion pattern queries highlight matched suffixes" {
+    const alloc = std.testing.allocator;
+    const text_analysis: introducer_mod.TextAnalysisConfig = .{
+        .field_analyzers = &.{
+            .{ .field_name = "name", .analyzer_name = "standard" },
+            .{ .field_name = "name._substring", .analyzer_name = "substring" },
+        },
+    };
+    const queries = [_]types.TextQuery{
+        .{ .wildcard = .{ .field = "name._substring", .pattern = "g3we*" } },
+        .{ .regexp = .{ .field = "name._substring", .pattern = "^g3we.*$" } },
+        .{ .fuzzy = .{ .field = "name._substring", .term = "g3weaver", .max_edits = 0 } },
+    };
+    for (queries) |query| {
+        var hits = [_]types.SearchHit{.{
+            .id = try alloc.dupe(u8, "doc:1"),
+            .stored_data = try alloc.dupe(u8, "{\"name\":\"Rag3-Weaver\"}"),
+        }};
+        defer hits[0].deinit(alloc);
+        try attachHighlights(alloc, .{}, &.{query}, &hits, null, text_analysis, null);
+        try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+        try std.testing.expectEqualStrings("name", hits[0].highlights[0].field);
+        const fragment = hits[0].highlights[0].fragments[0];
+        try std.testing.expectEqualStrings("g3-Weaver", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
+    }
+}
+
+test "schema-less dotted source collisions highlight both indexed values" {
+    const alloc = std.testing.allocator;
+    var hits = [_]types.SearchHit{.{
+        .id = try alloc.dupe(u8, "doc:1"),
+        .stored_data = try alloc.dupe(u8, "{\"a.b\":\"Quiet\",\"a\":{\"b\":\"River\"}}"),
+    }};
+    defer hits[0].deinit(alloc);
+    const query: types.TextQuery = .{ .match = .{ .field = "a.b", .text = "river" } };
+    try attachHighlights(alloc, .{}, &.{query}, &hits, null, .{}, null);
+    try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+    const fragment = hits[0].highlights[0].fragments[0];
+    try std.testing.expectEqualStrings("River", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
+
+    var all_hits = [_]types.SearchHit{.{
+        .id = try alloc.dupe(u8, "doc:2"),
+        .stored_data = try alloc.dupe(u8, "{\"code.keyword\":\"River\"}"),
+    }};
+    defer all_hits[0].deinit(alloc);
+    const all_query: types.TextQuery = .{ .match = .{ .field = "_all", .text = "river" } };
+    try attachHighlights(alloc, .{}, &.{all_query}, &all_hits, null, .{}, null);
+    try std.testing.expectEqual(@as(usize, 1), all_hits[0].highlights.len);
+    try std.testing.expectEqualStrings("code.keyword", all_hits[0].highlights[0].field);
+}
+
+test "schema-driven dotted path ignores unindexed literal key" {
+    const alloc = std.testing.allocator;
+    const schema: runtime_schema_mod.TableSchema = .{
+        .full_text_documents = &.{.{
+            .name = "_default",
+            .fields = &.{.{ .path = "a.b", .emitted_name = "a.b", .analyzer = "standard" }},
+        }},
+    };
+    var hits = [_]types.SearchHit{.{
+        .id = try alloc.dupe(u8, "doc:1"),
+        .stored_data = try alloc.dupe(u8, "{\"a.b\":\"River\",\"a\":{\"b\":\"Quiet\"}}"),
+    }};
+    defer hits[0].deinit(alloc);
+    const query: types.TextQuery = .{ .match = .{ .field = "a.b", .text = "quiet" } };
+    try attachHighlights(alloc, .{}, &.{query}, &hits, null, .{}, schema);
+    try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+    const fragment = hits[0].highlights[0].fragments[0];
+    try std.testing.expectEqualStrings("Quiet", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
 }
 
 test "dotted highlight paths traverse arrays of objects" {

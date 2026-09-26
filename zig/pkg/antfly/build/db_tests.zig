@@ -505,6 +505,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db exact sort resolves mapped geo metadata filters from typed doc values",
         "_all highlights the source fields emitted into the index",
         "keyword companion pattern matches highlight the whole indexed value",
+        "substring companion pattern queries highlight matched suffixes",
+        "schema-less dotted source collisions highlight both indexed values",
+        "schema-driven dotted path ignores unindexed literal key",
         "dotted highlight paths traverse arrays of objects",
         "exact keyword highlights only the matching array value",
     };
