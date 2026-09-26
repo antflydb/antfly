@@ -243,10 +243,59 @@ logits on an unpacked example and a synthetic tree-packed row with identical
 random weights). `finetune/laya/job.zig`'s admission tests gained a case
 showing the fused path admits a batch the dense bound rejects.
 
-Open: no Metal (or CUDA) kernel -- Metal training stays on the dense path,
-so it does not yet benefit from the 8k bound. The long-state smoke test
-(2k/4k/8k synthetic states, tens of fine-tune steps, step time and peak
-memory under the gpu lock) is specified in LAYA.md but blocked on this
-machine's shared build lock during this session (nine agents, one lock);
-see LAYA.md's Long states section for the recipe. A real long-state
-fine-tune on teacher-labelled data depends on step 2a (not this track).
+## Metal: host-bridged execution (2026-09-25, same day)
+
+Added `MetalCompute.segmentTrainingAttentionV1Op`/`BackwardV1Op`
+(`ops/metal_compute.zig`), wired into the Metal `ComputeBackend` vtable.
+These do not add an on-device kernel; they reuse the `HostFallbackNative`
+bridge that `hostFallbackSdpa` and `hostFallbackDisentangledRelativeAttention`
+already use for their own device-kernel-missing cases: download `qkv`/
+`control`/`dOut` to a `NativeCompute` instance, run the exact same CPU
+kernel, upload the result back. `MetalTensor.toHostSlice` already flushes
+any active command frame before reading (`metal_tensor.zig`:
+"a runtime frame may still be queuing GPU writes to this buffer... The
+flush is a cheap no-op when no frame is active"), so this is safe inside
+`training.executeFramed`'s framed forward/backward without further
+changes -- no separate unframed-training carve-out was needed.
+`finetune/laya/job.zig` now sets `use_fused_attention = true`
+unconditionally (both backends); Metal jobs get the same `seq_len <= 8192`
+admission bound as CPU, without GPU parallelism for this op.
+
+Added a Metal variant of the fused-vs-dense parity test
+(`fused_attention_test.zig`, `SkipZigTest` without a Metal device) and a
+fused-attention variant of the released-model gradient-parity test
+(`training_test.zig`, gated by `ANTFLY_LAYA_REFERENCE`) that reuses the
+relfix/ref oracle but with a looser tolerance (2e-3 absolute / 2% relative
+vs. the dense path's 5e-5 / 0.2%) since the tiled kernel sums in a
+different order than the dense generic matmul/softmax path.
+
+A true on-device Metal kernel remains open. Sketched design: a forward
+kernel extending `termite_sdpa_f32_segments` with a batch dimension,
+dropout and saved `(row_max, row_sum)`, plus a backward that avoids
+cross-threadgroup atomics by computing `dQ` query-major (reusing the saved
+stats and an in-kernel `delta_i = dot(dOut_i, O_i)`) and `dK`/`dV` key-major
+via a *range-symmetry* argument: for unpacked rows every token's `ranges`
+entry is the same `[0, seq_len)` (or window) on both the query and key
+side, so a key's threadgroup can reuse `ranges[key]` to find the queries
+that see it. That symmetry does not hold for tree-packed rows (a trunk key
+is visible from many branches, but the trunk's own range does not list
+them), so this design does not extend to Metal training on packed rows
+without either atomics or a real reverse-range structure.
+
+## Open items and verification status
+
+No CUDA kernel. The long-state smoke test (2k/4k/8k synthetic states,
+tens of fine-tune steps, step time and peak memory under the gpu lock) is
+specified in LAYA.md's Long states section with a ready recipe (data
+synthesized from `td/train.jsonl` by concatenation, `laya.max_len` raised
+to 8192 in a released-checkpoint copy). This session's build lock stayed
+contended by other agents' training/eval runs for well over an hour
+straight, so the CPU unit tests, the Metal parity tests, the relfix
+comparison under fused attention, and the smoke test itself could not be
+run and reported with real numbers before this write-up. All code in this
+section is written and manually cross-checked against already-compiling
+patterns in this codebase, but is not yet compiler-verified -- treat it as
+unverified until a `zig build test-linalg -- --test-filter segmentTraining`
+and `zig build test -- --test-filter laya` pass is recorded here. A real
+long-state fine-tune on teacher-labelled data depends on step 2a (not this
+track).

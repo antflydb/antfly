@@ -373,10 +373,11 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
         try data.disjoint(a, train, calib);
         try data.disjoint(a, eval, calib);
     }
-    // Flash-style segment attention (roadmap step 2c) has no device kernel
-    // yet; only the CPU backend uses it, which is also where it matters most
-    // (Metal's dense path already runs the fused resident kernels below ~2k).
-    const use_fused_attention = c.backend == .cpu;
+    // Flash-style segment attention (roadmap step 2c): no on-device Metal
+    // kernel yet, so a Metal job runs it host-bridged (see
+    // MetalCompute.segmentTrainingAttentionV1Op) -- correct and within the
+    // same 8k memory bound, but without GPU parallelism for this op.
+    const use_fused_attention = true;
     try admitExamples(encoder, train.examples, c.batch_size, c.head_dropout, use_fused_attention);
     try admitExamples(encoder, eval.examples, 1, c.head_dropout, use_fused_attention);
     if (calibration) |calib| try admitExamples(encoder, calib.examples, 1, c.head_dropout, use_fused_attention);

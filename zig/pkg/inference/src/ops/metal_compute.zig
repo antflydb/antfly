@@ -7201,6 +7201,54 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return residentTrainingInstructionOp(ctx, &instruction, &.{ qkv, relative, control_i32, d_out }, .{}, control);
     }
 
+    /// Host-bridged, not an on-device kernel (see `models/laya/LAYA.md`,
+    /// "Long states"): downloads `qkv`/`control` (draining any active frame
+    /// first -- `MetalTensor.toHostSlice` already flushes it, so this is
+    /// safe mid-`executeFramed`), runs the exact same tiled CPU kernel used
+    /// by the native backend (`ops/segment_training_attention.zig`), and
+    /// uploads the result back. No `[tokens, tokens]` tensor is ever
+    /// materialized on either side of the bridge, so Metal jobs get the same
+    /// memory bound as CPU; they do not yet get GPU parallelism for this op.
+    fn segmentTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: @import("ml").graph.SegmentTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (control) |c| try c.check();
+        _ = try attrs.layout();
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+        const qkv_shape = toBuf(qkv).logical_shape;
+        const control_shape = toBuf(control_i32).logical_shape;
+        const n_qkv = try self.importCtToHostNative(&native_ctx, qkv, qkv_shape);
+        defer native_ctx.cb.free(n_qkv);
+        const n_control = try self.importCtToHostNative(&native_ctx, control_i32, control_shape);
+        defer native_ctx.cb.free(n_control);
+        if (control) |c| try c.check();
+        const n_output = try native_ctx.cb.segmentTrainingAttentionV1(n_qkv, n_control, attrs);
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, null);
+    }
+
+    /// See `segmentTrainingAttentionV1Op`: same host bridge, backward.
+    fn segmentTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, d_out: CT, attrs: @import("ml").graph.SegmentTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (control) |c| try c.check();
+        _ = try attrs.layout();
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+        const qkv_shape = toBuf(qkv).logical_shape;
+        const control_shape = toBuf(control_i32).logical_shape;
+        const dout_shape = toBuf(d_out).logical_shape;
+        const n_qkv = try self.importCtToHostNative(&native_ctx, qkv, qkv_shape);
+        defer native_ctx.cb.free(n_qkv);
+        const n_control = try self.importCtToHostNative(&native_ctx, control_i32, control_shape);
+        defer native_ctx.cb.free(n_control);
+        const n_dout = try self.importCtToHostNative(&native_ctx, d_out, dout_shape);
+        defer native_ctx.cb.free(n_dout);
+        if (control) |c| try c.check();
+        const n_grad = try native_ctx.cb.segmentTrainingAttentionBackwardV1(n_qkv, n_control, n_dout, attrs);
+        defer native_ctx.cb.free(n_grad);
+        return self.exportCtFromHostNative(&native_ctx, n_grad, null);
+    }
+
     fn residentTrainingPrimitiveOp(ctx: *anyopaque, request: *const ops.resident_training.Request, limits: ops.resident_training.Limits, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!self.provider_impl.hasDecoderRuntime()) return error.UnsupportedResidentTrainingPrimitive;
@@ -30552,6 +30600,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // native hooks would cast this Metal context to NativeCompute.
         vt.debertaTrainingAttentionV1 = debertaTrainingAttentionV1Op;
         vt.debertaTrainingAttentionBackwardV1 = debertaTrainingAttentionBackwardV1Op;
+        // Host-bridged (no device kernel yet); see segmentTrainingAttentionV1Op.
+        vt.segmentTrainingAttentionV1 = segmentTrainingAttentionV1Op;
+        vt.segmentTrainingAttentionBackwardV1 = segmentTrainingAttentionBackwardV1Op;
         vt.causalSelfAttention = causalSelfAttentionOp;
         vt.crossAttention = crossAttentionOp;
         vt.logSoftmaxOp = logSoftmaxOp;

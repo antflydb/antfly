@@ -8,14 +8,51 @@
 //! backend -- not just the isolated kernel (see `lib/linalg/src/attention.zig`
 //! and `ops/segment_training_attention.zig` for that).
 const std = @import("std");
+const build_options = @import("build_options");
 const ml = @import("ml").graph;
 const ops = @import("../../ops/ops.zig");
 const native = @import("../../ops/native_compute.zig");
+const metal = @import("../../ops/metal_compute.zig");
+const gpu_store = @import("../../ops/gpu_hosted_store.zig");
+const metal_runtime = @import("../../backends/metal_runtime.zig");
 const interpreter = @import("../../graph/interpreter.zig");
 const modern = @import("../../architectures/modern_bert.zig");
 const train = @import("training.zig");
 const tree = @import("../../pipelines/laya_tree.zig");
 const Kind = @import("../../models/laya.zig").QuestionType;
+
+/// Mirrors `ops/resident_training_metal_test.zig`'s `Fixture`: a bare
+/// `MetalCompute` + `ComputeBackend`, no resident-training/weight-group
+/// machinery needed for a plain forward pass through the interpreter.
+const MetalFixture = struct {
+    allocator: std.mem.Allocator,
+    store: *gpu_store.WeightStore,
+    backend: *metal.MetalCompute,
+
+    fn init(a: std.mem.Allocator) !MetalFixture {
+        const store = try a.create(gpu_store.WeightStore);
+        errdefer a.destroy(store);
+        store.* = .{ .allocator = a, .prefix = "", .lazy_weights = .empty, .prefer_f32_dense_tensors = true };
+        errdefer store.lazy_weights.deinit(a);
+        metal.initPrefetchQueue(store, a);
+        errdefer metal.deinitPrefetchQueue(store);
+        errdefer metal.deinitSharedNativeProvider(store);
+        const backend = try a.create(metal.MetalCompute);
+        errdefer a.destroy(backend);
+        backend.* = try metal.MetalCompute.init(a, store, null);
+        return .{ .allocator = a, .store = store, .backend = backend };
+    }
+
+    fn deinit(self: *MetalFixture) void {
+        self.backend.deinit();
+        self.allocator.destroy(self.backend);
+        metal.deinitSharedNativeProvider(self.store);
+        metal.deinitPrefetchQueue(self.store);
+        self.store.lazy_weights.deinit(self.allocator);
+        self.allocator.destroy(self.store);
+        self.* = undefined;
+    }
+};
 
 fn smallConfig() modern.Config {
     return .{
@@ -119,6 +156,29 @@ test "fused segment attention matches the dense graph on a tree-packed row" {
     const dense = try runLogits(a, &cb, cfg, &examples, false, 7);
     defer a.free(dense);
     const fused = try runLogits(a, &cb, cfg, &examples, true, 7);
+    defer a.free(fused);
+    try std.testing.expectEqual(dense.len, fused.len);
+    var worst: f32 = 0;
+    for (dense, fused) |d, f| worst = @max(worst, @abs(d - f));
+    try std.testing.expect(worst < 2e-3);
+}
+
+test "fused segment attention matches the dense graph on Metal (host-bridged)" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fixture = try MetalFixture.init(a);
+    defer fixture.deinit();
+    const cb = fixture.backend.computeBackend();
+
+    const cfg = smallConfig();
+    const ids = [_]i64{ 1, 2, 3, 4, 5 };
+    const examples = [_]train.Example{
+        .{ .ids = &ids, .markers = &.{ 0, 1 }, .kind = .noul, .target = &.{ 1, 0 } },
+    };
+    const dense = try runLogits(a, &cb, cfg, &examples, false, 42);
+    defer a.free(dense);
+    const fused = try runLogits(a, &cb, cfg, &examples, true, 42);
     defer a.free(fused);
     try std.testing.expectEqual(dense.len, fused.len);
     var worst: f32 = 0;
