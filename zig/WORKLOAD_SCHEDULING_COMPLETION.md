@@ -715,3 +715,19 @@ background helpers, and real mixed-runtime saturation remain item-7 work.
   blocked read-safety barrier itself does not accept a deadline or cancellation
   token, although the callback rejects late status after it returns. Bounded
   barrier occupancy remains open for item 8.
+- Direct Raft-backed DATA public transactions now use the hosted participant
+  coordinator rather than a local-only first-decision path. After split
+  cutover, public ingress on a follower can route the first decision to the
+  group leader without weakening the local accepted-entry receipt proof.
+  Candidate retries require definite non-submission; ambiguous decisions do
+  not retry. Signed first decisions prefer the advertised protected control
+  URL, cached with the accepted peer generation, and rolling peers without an
+  internal URL retain the public endpoint. Routing rejects unreadable peers.
+  The full Debug DATA gate passed 49 implementation and 174 consumer tests,
+  including the three-node merge/split/restart VOPR regression and protected
+  URI selection. The Debug API transaction gate passed 98/98. Test corrections
+  restore strictly increasing retained-effects fixture Raft indexes, seed the
+  ticker fixture's metadata authority before completion admission, and compare
+  the current protocol against mutation-completion version 14. Formatting and
+  `git diff --check` pass. Release performance and larger replicated physical
+  completion qualification remain open.
