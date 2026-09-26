@@ -589,3 +589,124 @@ test "boundary native trainer CUDA fused boundary attention preserves durable re
     try exerciseWithBoundaryAttention(std.testing.allocator, .resident_cuda, .materialized_v1, .retained_v1, true);
     try exerciseWithBoundaryAttention(std.testing.allocator, .resident_cuda, .replay_tiled_v1, .layer_recompute_v1, true);
 }
+
+/// Deterministic teacher states sized to each microbatch's student routes.
+const SyntheticTeacher = struct {
+    hidden: usize,
+    calls: usize = 0,
+
+    fn teacher(self: *SyntheticTeacher, salt: u8) trainer.Teacher {
+        var identity: [32]u8 = @splat(0);
+        identity[0] = salt;
+        return .{ .ptr = self, .identity = identity, .encode = encode };
+    }
+
+    const Owned = struct {
+        allocator: std.mem.Allocator,
+        values: [4][]f32,
+        fn release(raw: ?*anyopaque) void {
+            const self: *Owned = @ptrCast(@alignCast(raw.?));
+            for (self.values) |values| self.allocator.free(values);
+            self.allocator.destroy(self);
+        }
+    };
+
+    fn encode(raw: *anyopaque, a: std.mem.Allocator, items: []const processor.Item, student: *const processor.PreparedBatch, _: ?@import("../../execution_control.zig").InferenceExecutionControl) !trainer.TeacherStates {
+        const self: *SyntheticTeacher = @ptrCast(@alignCast(raw));
+        if (items.len != student.samples.len) return error.TestUnexpectedResult;
+        self.calls += 1;
+        const owned = try a.create(Owned);
+        owned.allocator = a;
+        const rows = [_]usize{ student.text_word_mask.len, student.query_marker_mask.len, student.cls_marker_mask.len, student.parent_marker_mask.len };
+        for (&owned.values, rows, 0..) |*values, count, route| {
+            values.* = try a.alloc(f32, count * self.hidden);
+            for (values.*, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i * 5 + route * 17 + 1)) * 0.41) + 0.25 * @as(f32, @floatFromInt(i % self.hidden));
+        }
+        return .{ .text = owned.values[0], .queries = owned.values[1], .classifications = owned.values[2], .parents = owned.values[3], .context = owned, .release = Owned.release };
+    }
+};
+
+test "boundary native trainer distills a necked ModernBERT from a teacher and leaves every head weight frozen" {
+    const a = std.testing.allocator;
+    var config = helper.config();
+    config.backbone = .modern_bert;
+    config.encoder = .{ .hidden_size = 4, .intermediate_size = 8, .num_hidden_layers = 2, .num_attention_heads = 2, .vocab_size = 512, .max_position_embeddings = 256, .position_buckets = 0, .layer_norm_eps = 1e-5, .hidden_dropout_prob = 0, .attention_probs_dropout_prob = 0, .pad_token_id = 0, .family = .modern_bert, .global_rope_theta = 160000, .local_rope_theta = 10000, .local_attention_window = 8, .global_attn_every_n_layers = 2 };
+    config.neck = .linear;
+    var samples = try dataset(a);
+    defer samples.deinit();
+    var tokenizer = helper.TestTokenizer{};
+    var first = try samples.sample(0, null, null);
+    defer first.deinit();
+    var prepared = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = first.row.text, .schema = &first.schema }}, .{});
+    defer prepared.deinit();
+    // Enroll every source tensor, heads included, as a full job's source has them.
+    var graph = try step.buildWithAttentionProfile(a, config, &prepared, &.{&first.schema}, .{}, .training, .materialized_v1, .{});
+    defer graph.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var parameters = std.ArrayListUnmanaged(run.Parameter).empty;
+    for (graph.graph.parameters.items) |id| {
+        const node = graph.graph.node(id);
+        const borrowed_name = graph.graph.parameterName(node);
+        if (std.mem.startsWith(u8, borrowed_name, "__")) continue;
+        const name = try a.dupe(u8, borrowed_name);
+        var enrolled = false;
+        errdefer if (!enrolled) a.free(name);
+        const shape = node.output_shape;
+        const values = try scratch.alloc(f32, @intCast(shape.numElements().?));
+        for (values, 0..) |*v, index| v.* = if (std.mem.endsWith(u8, name, ".bias")) 0 else if (std.mem.indexOf(u8, name, "norm") != null) 1 else 0.05 * @sin(@as(f32, @floatFromInt(index + @as(usize, id) * 11 + 1)));
+        var tensor = try Tensor.initFloat32(a, name, shape.dims[0..shape.rank_], values);
+        errdefer if (!enrolled) tensor.deinit();
+        try store.resident_weights.put(a, name, .{ .tensor = tensor });
+        enrolled = true;
+        const dims = try scratch.alloc(i32, shape.rank_);
+        for (dims, shape.dims[0..shape.rank_]) |*dim, size| dim.* = @intCast(size);
+        const encoder_name = std.mem.startsWith(u8, name, "embeddings.") or std.mem.startsWith(u8, name, "layers.") or std.mem.startsWith(u8, name, "final_norm.");
+        const canonical = if (std.mem.eql(u8, name, "classifier.2.weight")) "classifier.3.weight" else if (std.mem.eql(u8, name, "classifier.2.bias")) "classifier.3.bias" else if (encoder_name) try std.fmt.allocPrint(scratch, "encoder.{s}", .{name}) else name;
+        try parameters.append(scratch, .{ .name = name, .canonical_name = canonical, .dimensions = dims, .values = tensor.asFloat32(), .kind = .original });
+    }
+    const source = bundle.Identity{ .backbone = config.backbone, .precision = .fp32, .weight = bundle.Digest.of("immutable tiny test weights"), .sidecars = .{ bundle.Digest.of("model"), bundle.Digest.of("encoder"), bundle.Digest.of("tokenizer"), bundle.Digest.of("tokenizer config") } };
+    var teacher = SyntheticTeacher{ .hidden = config.encoder.hidden_size };
+    var options = trainer.Options{ .run = .{ .mode = .full, .epochs = 1, .batch_size = 2, .accumulation = 1, .seed = 918, .encoder_lr = 0.001, .task_lr = 0.002 }, .source_reserved_bytes = 16 * 1024 * 1024, .distillation = .{ .teacher = teacher.teacher(1) }, .limits = .{ .max_host_bytes = 256 * 1024 * 1024, .max_backend_bytes = 256 * 1024 * 1024, .max_combined_bytes = 1024 * 1024 * 1024 } };
+    var distilled = try trainer.Trainer.init(a, &store, tokenizer.tokenizer(), source, config, &samples, parameters.items, options, null);
+    defer distilled.deinit();
+    var steps: usize = 0;
+    while (try distilled.next(null)) |report| {
+        const terms = report.terms orelse continue;
+        try std.testing.expect(terms.distillation > 0);
+        try std.testing.expectEqual(terms.distillation, terms.total);
+        steps += 1;
+    }
+    try std.testing.expect(steps > 0);
+    try std.testing.expectEqual(steps, teacher.calls);
+    var moved_trunk = false;
+    var moved_neck = false;
+    for (distilled.optimizer.owner.regular_params.items) |slot| {
+        const initial = for (parameters.items) |parameter| {
+            if (std.mem.eql(u8, parameter.name, slot.name)) break parameter.values;
+        } else return error.TestUnexpectedResult;
+        const changed = !std.mem.eql(f32, initial, slot.weights);
+        const trunk = std.mem.startsWith(u8, slot.name, "embeddings.") or std.mem.startsWith(u8, slot.name, "layers.") or std.mem.startsWith(u8, slot.name, "final_norm.");
+        if (std.mem.startsWith(u8, slot.name, "gliner_neck.")) {
+            moved_neck = moved_neck or changed;
+        } else if (trunk) {
+            moved_trunk = moved_trunk or changed;
+        } else if (changed) {
+            std.debug.print("head weight moved under pure distillation: {s}\n", .{slot.name});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(moved_trunk and moved_neck);
+    // The teacher identity and the objective bind into the run fingerprint.
+    options.distillation.?.teacher = teacher.teacher(2);
+    var other_teacher = try trainer.Trainer.init(a, &store, tokenizer.tokenizer(), source, config, &samples, parameters.items, options, null);
+    defer other_teacher.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &distilled.fingerprint, &other_teacher.fingerprint));
+    options.distillation = null;
+    var plain = try trainer.Trainer.init(a, &store, tokenizer.tokenizer(), source, config, &samples, parameters.items, options, null);
+    defer plain.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &distilled.fingerprint, &plain.fingerprint));
+}

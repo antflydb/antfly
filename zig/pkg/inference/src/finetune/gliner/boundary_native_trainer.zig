@@ -51,6 +51,36 @@ pub const Limits = struct {
     differentiation: seeded.Options = .{},
 };
 pub const DecisionEvents = @import("boundary_training_decisions.zig");
+/// A frozen teacher encoder's final states at one microbatch's routes, row
+/// aligned with the student's prepared batch (see step.Distillation).
+pub const TeacherStates = struct {
+    text: []const f32,
+    queries: []const f32,
+    classifications: []const f32,
+    parents: []const f32,
+    context: ?*anyopaque = null,
+    release: ?*const fn (?*anyopaque) void = null,
+
+    pub fn deinit(self: *TeacherStates) void {
+        if (self.release) |free| free(self.context);
+        self.* = undefined;
+    }
+};
+/// Encodes the student's items with a frozen teacher. `identity` names the
+/// teacher's exact weights and settings; it is bound into the run fingerprint
+/// so a durable resume cannot silently change the distillation target.
+pub const Teacher = struct {
+    ptr: *anyopaque,
+    identity: [32]u8,
+    encode: *const fn (ptr: *anyopaque, a: Allocator, items: []const processor.Item, student: *const processor.PreparedBatch, control: ?Control) anyerror!TeacherStates,
+};
+pub const Distillation = struct {
+    teacher: Teacher,
+    weight: f32 = 1,
+    /// Also train the task heads on the rows' labels. Pure distillation
+    /// builds no head, so every head weight stays exactly as loaded.
+    heads: bool = false,
+};
 pub const Options = struct {
     /// Borrowed diagnostics over decisions already produced by the step.
     decision_observer: ?DecisionEvents.Observer = null,
@@ -72,7 +102,14 @@ pub const Options = struct {
     gold_hold_fraction: f32 = 0.15,
     require_gold_relation_coverage: bool = false,
     regex: regex.ContextOptions = .{},
+    /// Antenna feature distillation (boundary_distillation.zig).
+    distillation: ?Distillation = null,
     limits: Limits = .{},
+
+    pub fn stepObjectives(self: Options) step.Objectives {
+        const value = self.distillation orelse return .{};
+        return .{ .heads = value.heads, .distillation = true };
+    }
 };
 pub const Report = struct {
     epoch: u64,
@@ -270,6 +307,10 @@ pub const Trainer = struct {
             const weight = @field(options.weights, field.name);
             if (!std.math.isFinite(weight) or weight < 0) return error.InvalidBoundaryTrainingRun;
         }
+        if (options.distillation) |value| {
+            // Recomputation regions end at the trunk, before the neck.
+            if (!std.math.isFinite(value.weight) or value.weight <= 0 or options.activation_profile != .retained_v1) return error.InvalidBoundaryTrainingRun;
+        }
         var arena = std.heap.ArenaAllocator.init(host);
         defer arena.deinit();
         const scratch = arena.allocator();
@@ -361,8 +402,22 @@ pub const Trainer = struct {
             hash.update(@tagName(options.activation_profile));
             hash.update("\x00");
         }
-        const settings = try std.json.Stringify.valueAlloc(scratch, .{ .model = config, .capacities = options.capacities, .weights = options.weights, .gold_start = options.gold_start, .gold_end = options.gold_end, .gold_hold_fraction = options.gold_hold_fraction, .require_gold_relation_coverage = options.require_gold_relation_coverage, .word_splitter = options.processor.word_splitter, .validators = "native_python312_unicode15_v1" }, .{});
+        // The model serializes its pre-neck fields exactly as before the neck
+        // existed, so existing run fingerprints (and durable resumes) hold.
+        const model_settings = .{ .version = config.version, .architecture_version = config.architecture_version, .max_len = config.max_len, .backbone = config.backbone, .head = config.head, .encoder = config.encoder };
+        const settings = try std.json.Stringify.valueAlloc(scratch, .{ .model = model_settings, .capacities = options.capacities, .weights = options.weights, .gold_start = options.gold_start, .gold_end = options.gold_end, .gold_hold_fraction = options.gold_hold_fraction, .require_gold_relation_coverage = options.require_gold_relation_coverage, .word_splitter = options.processor.word_splitter, .validators = "native_python312_unicode15_v1" }, .{});
         hash.update(settings);
+        if (config.neck != .none) {
+            hash.update("\x00neck\x00");
+            hash.update(@tagName(config.neck));
+            hash.update("\x00");
+        }
+        if (options.distillation) |value| {
+            hash.update("\x00distillation.zspace_mse.v1\x00");
+            hash.update(&value.teacher.identity);
+            hash.update(std.mem.asBytes(&value.weight));
+            hash.update(&.{@intFromBool(value.heads)});
+        }
         self.fingerprint = hash.finalResult();
         var processor_options = options.processor;
         processor_options.control = control;
@@ -562,6 +617,10 @@ pub const Trainer = struct {
         processor_options.control = control;
         var prepared = try processor.prepare(a, self.tokenizer, inputs, processor_options);
         defer prepared.deinit();
+        // The teacher encodes the same items; its states stay live through
+        // the step, which borrows them.
+        var teacher_states: ?TeacherStates = if (self.options.distillation) |value| try value.teacher.encode(value.teacher.ptr, a, inputs, &prepared, control) else null;
+        defer if (teacher_states) |*states| states.deinit();
         self.memory_failures.begin(.graph_preparation);
         try self.ensurePlan(&prepared, schemas, control);
         self.memory_failures.begin(.batch_preparation);
@@ -574,7 +633,7 @@ pub const Trainer = struct {
         const negative_draws = try scratch.alloc(f32, @as(usize, plan.encoder.layout.batch) * plan.encoder.layout.queries);
         var negative_rng = run.Random.init(self.run_plan.config.seed, identity.microbatch_step, "negative_queries");
         for (negative_draws) |*value| value.* = negative_rng.uniform();
-        const context = step.StepContext{ .decision_observer = self.options.decision_observer, .identity = .{ .binding = self.fingerprint, .optimizer_step = identity.optimizer_step, .microbatch = identity.microbatch_step }, .replay = .{ .seed = self.run_plan.config.seed, .micro_batch = identity.microbatch_step }, .progress = .{ .optimizer_step = identity.optimizer_step, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = self.options.gold_start, .gold_end = self.options.gold_end, .gold_hold_fraction = self.options.gold_hold_fraction }, .weights = self.options.weights, .injection_draws = draws, .negative_query_draws = negative_draws, .require_gold_relation_coverage = self.options.require_gold_relation_coverage };
+        const context = step.StepContext{ .decision_observer = self.options.decision_observer, .identity = .{ .binding = self.fingerprint, .optimizer_step = identity.optimizer_step, .microbatch = identity.microbatch_step }, .replay = .{ .seed = self.run_plan.config.seed, .micro_batch = identity.microbatch_step }, .progress = .{ .optimizer_step = identity.optimizer_step, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = self.options.gold_start, .gold_end = self.options.gold_end, .gold_hold_fraction = self.options.gold_hold_fraction }, .weights = self.options.weights, .injection_draws = draws, .negative_query_draws = negative_draws, .require_gold_relation_coverage = self.options.require_gold_relation_coverage, .distillation = if (teacher_states) |states| .{ .text = states.text, .queries = states.queries, .classifications = states.classifications, .parents = states.parents, .weight = self.options.distillation.?.weight } else null };
         var result = blk: {
             self.memory_failures.begin(.forward_backward);
             var bindings = try self.optimizer.bind(plan.graph, control);
@@ -704,7 +763,7 @@ pub const Trainer = struct {
         step_limits.recomputation.max_backend_bytes = @min(step_limits.recomputation.max_backend_bytes, self.options.limits.max_backend_bytes);
         step_limits.recomputation.max_host_bytes = @min(step_limits.recomputation.max_host_bytes, try std.math.add(usize, self.options.source_reserved_bytes, self.options.limits.max_host_bytes));
         const arithmetic: step.AttentionArithmetic = if (self.options.execution == .resident_cuda and self.options.attention_profile == .materialized_v1) .pytorch_fp32 else .scale_after_sum;
-        var plan = try step.buildWithTrainingArithmetic(a, self.model_config, prepared, schemas, self.options.capacities, .training, self.options.attention_profile, self.options.activation_profile, .{ .encoder = arithmetic, .boundary = if (self.options.execution == .resident_cuda and self.backend.cuda_backend.?.boundary_attention != null) .cuda_fused_d32_v1 else .materialized_v1, .prefix = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .tree_v1, .score = if (self.options.execution == .resident_cuda) .pytorch_sequential_v1 else .grouped_v1, .candidate_features = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .host_v1, .input_gradients = if (self.options.execution == .resident_cuda) .pytorch_v2 else .grouped_v1, .gather = if (self.options.execution == .resident_cuda) .pytorch_gather_v1 else .serial_v1, .sigmoid = if (self.options.execution == .resident_cuda) .pytorch_saved_v1 else .decomposed_v1, .record = if (self.options.execution == .resident_cuda) .pytorch_batch_v1 else .per_group_v1 }, step_limits);
+        var plan = try step.buildWithObjectives(a, self.model_config, prepared, schemas, self.options.capacities, .training, self.options.attention_profile, self.options.activation_profile, .{ .encoder = arithmetic, .boundary = if (self.options.execution == .resident_cuda and self.backend.cuda_backend.?.boundary_attention != null) .cuda_fused_d32_v1 else .materialized_v1, .prefix = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .tree_v1, .score = if (self.options.execution == .resident_cuda) .pytorch_sequential_v1 else .grouped_v1, .candidate_features = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .host_v1, .input_gradients = if (self.options.execution == .resident_cuda) .pytorch_v2 else .grouped_v1, .gather = if (self.options.execution == .resident_cuda) .pytorch_gather_v1 else .serial_v1, .sigmoid = if (self.options.execution == .resident_cuda) .pytorch_saved_v1 else .decomposed_v1, .record = if (self.options.execution == .resident_cuda) .pytorch_batch_v1 else .per_group_v1 }, self.options.stepObjectives(), step_limits);
         errdefer plan.deinit();
         if (self.options.execution == .resident_cuda) try plan.enableCudaTrainingFusion();
         if (self.adapter_layout) |adapter_layout| {
@@ -845,6 +904,9 @@ fn gradientRoute(plan: *const step.Plan, result: *const step.StepResult, name: [
         route = .{ .kind = presence.kind, .gradient_index = std.mem.indexOfScalar(ml.NodeId, result.backward.parameter_ids, presence.parameter) };
         if (route.kind == .computed and route.gradient_index == null) return error.MissingBoundaryTrainingGradient;
     }
-    if (route.kind == .absent and step.isTouchParameter(name, plan.config.head)) route.kind = .computed_zero;
+    // Upstream touches the optional record and relation heads with a zero
+    // loss. A plan without heads touches nothing, so they stay absent (and
+    // untouched by weight decay).
+    if (route.kind == .absent and plan.objectives.heads and step.isTouchParameter(name, plan.config.head)) route.kind = .computed_zero;
     return route;
 }

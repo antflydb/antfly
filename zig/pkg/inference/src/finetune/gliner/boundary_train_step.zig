@@ -1904,7 +1904,7 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
         var kind: GradientPresence = if (reached) .computed else .absent;
         if (!class_supervision and std.mem.startsWith(u8, name, "classifier.")) kind = .absent;
         if (q == 0 and !class_supervision and !plan.objectives.distillation) kind = .absent;
-        if (kind == .absent and isTouchParameter(name, plan.config.head)) kind = .computed_zero;
+        if (kind == .absent and plan.objectives.heads and isTouchParameter(name, plan.config.head)) kind = .computed_zero;
         out.* = .{ .parameter = parameter, .kind = kind };
     }
     try work.charge(0);

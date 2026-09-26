@@ -123,6 +123,29 @@ ANTFLY_ANTENNA_DATA=<cache> python teacher_targets.py --upstream <GLiNER2> \
 antfly-inference finetune train gliner25 <job.json>
 ```
 
+### Feature distillation
+
+A raw trunk trained on task labels collapses; the student first learns a
+teacher encoder's states (work-log/completed/inference/antenna/2026-09-25-pilot.md).
+`distill_pool.py` writes an unlabeled pool (train-split texts under random
+classification or entity schemas), and a job's `distillation` section names
+the frozen teacher:
+
+```json
+"distillation": {"teacher_dir": "<gliner2.5-base dir>", "weight": 1.0, "heads": false}
+```
+
+The teacher encodes each microbatch on the CPU; the student's necked routed
+states are regressed onto it in the teacher's per-dimension z-space. With
+`heads: false` no head is built and every head weight stays as loaded; the
+teacher's identity is part of the run fingerprint. The student needs a neck
+fitted before training (a random or identity neck collapses the trunk).
+
+```sh
+ANTFLY_ANTENNA_DATA=<cache> python distill_pool.py --upstream <GLiNER2> --output <pool> \
+  --rows 80000 --entity-share 0.5
+```
+
 A ModernBERT-base job on resident Metal needs larger budgets than the job
 defaults, which are sized for the small DeBERTa checkpoint: for example
 `"memory": {"host_bytes": 6 GiB, "backend_bytes": 14 GiB, "combined_bytes":
