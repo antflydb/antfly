@@ -227,6 +227,21 @@ fn calibrate(a: std.mem.Allocator, preds: []const Prediction) ![3]f32 {
     return temperatures;
 }
 
+/// The served `laya.packing` object for an enabled layout, including
+/// `two_stage` when set. `exportModel` only calls this when `layout.enabled()`.
+fn packingConfigJson(a: std.mem.Allocator, layout: model.Packing) !std.json.Value {
+    var object: std.json.ObjectMap = .empty;
+    try object.put(a, "mode", .{ .string = @tagName(layout.mode) });
+    try object.put(a, "max_packed_len", .{ .integer = @intCast(layout.max_packed_len) });
+    if (layout.two_stage.enabled()) {
+        var two_stage: std.json.ObjectMap = .empty;
+        try two_stage.put(a, "top_k", .{ .integer = @intCast(layout.two_stage.top_k) });
+        if (layout.two_stage.mass_cutoff > 0) try two_stage.put(a, "mass_cutoff", .{ .float = layout.two_stage.mass_cutoff });
+        try object.put(a, "two_stage", .{ .object = two_stage });
+    }
+    return .{ .object = object };
+}
+
 fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.json.Value, layout: model.Packing, assets: Assets, admitted: []const checkpoint.NamedTensor, trainer: *training.controller.Trainer, temperatures: [3]f32) !void {
     try trainer.ensureHostState(null);
     const stage = try path(a, c.output_dir, "model.partial");
@@ -249,12 +264,7 @@ fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.jso
     // A packing override changes the serving layout the weights were trained for.
     if (c.packing != null) {
         _ = decision.object.swapRemove("packing");
-        if (layout.enabled()) {
-            var object: std.json.ObjectMap = .empty;
-            try object.put(a, "mode", .{ .string = @tagName(layout.mode) });
-            try object.put(a, "max_packed_len", .{ .integer = @intCast(layout.max_packed_len) });
-            try decision.object.put(a, "packing", .{ .object = object });
-        }
+        if (layout.enabled()) try decision.object.put(a, "packing", try packingConfigJson(a, layout));
     }
     // The old option buckets override per-type temperatures in inference.
     // They must never survive a change to the trained weights.
@@ -530,6 +540,32 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config) !void {
     const result = .{ .format = "antfly-laya-finetune/v1", .status = "complete", .backend = c.backend, .objective = c.objective, .source_sha256 = .{ .config = std.fmt.bytesToHex(data.digest(config_bytes), .lower), .tokenizer = std.fmt.bytesToHex(data.digest(tokenizer_bytes), .lower), .weights = std.fmt.bytesToHex(admitted.weights_sha256, .lower) }, .calibration_sha256 = if (calibration) |calib| std.fmt.bytesToHex(calib.sha256, .lower) else null, .resumed_microbatches = completed, .train_examples = train.examples.len, .train_records = train.records.len, .packing = laya.packing.mode, .train_sha256 = std.fmt.bytesToHex(train.sha256, .lower), .eval_sha256 = std.fmt.bytesToHex(eval.sha256, .lower), .run_sha256 = std.fmt.bytesToHex(identity, .lower), .optimizer = trainer.identity(), .initial_eval = before, .initial_by_kind = initial_by_kind, .final_eval = after, .final_by_kind = try metricsByKind(a, final_predictions, temperatures), .final_uncalibrated_eval = try metrics(final_predictions, .{ 1, 1, 1 }), .temperature = temperatures, .calibration_examples = if (calibration) |calib| calib.examples.len else 0, .action_head_trained = false, .host_peak_bytes = budget.peak };
     try writeJson(io, try path(permanent, c.output_dir, "report.json"), result);
     try event(io, std.Io.File.stdout(), result);
+}
+
+test "laya exported packing config round-trips two_stage through model.Config.parse" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const layout = model.Packing{ .mode = .candidate, .max_packed_len = 2048, .two_stage = .{ .top_k = 8, .mass_cutoff = 0.9 } };
+    const value = try packingConfigJson(arena.allocator(), layout);
+    var out = std.Io.Writer.Allocating.init(a);
+    defer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    var wrapper = std.Io.Writer.Allocating.init(a);
+    defer wrapper.deinit();
+    try wrapper.writer.print("{{\"packing\":{s}}}", .{out.written()});
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, wrapper.written(), .{});
+    defer parsed.deinit();
+    const cfg = try model.Config.parse(parsed.value);
+    try std.testing.expectEqual(model.PackingMode.candidate, cfg.packing.mode);
+    try std.testing.expectEqual(@as(usize, 2048), cfg.packing.max_packed_len);
+    try std.testing.expect(cfg.packing.two_stage.enabled());
+    try std.testing.expectEqual(@as(usize, 8), cfg.packing.two_stage.top_k);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), cfg.packing.two_stage.mass_cutoff, 1e-6);
+
+    // Without two_stage, the exported object omits it (single-stage default).
+    const single = try packingConfigJson(arena.allocator(), .{ .mode = .candidate, .max_packed_len = 2048 });
+    try std.testing.expect(single.object.get("two_stage") == null);
 }
 
 test "laya training job rejects invalid paths and optimizer settings" {
