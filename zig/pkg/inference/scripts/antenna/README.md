@@ -143,7 +143,7 @@ fitted before training (a random or identity neck collapses the trunk).
 
 ```sh
 ANTFLY_ANTENNA_DATA=<cache> python distill_pool.py --upstream <GLiNER2> --output <pool> \
-  --rows 80000 --entity-share 0.5
+  --rows 120000 --entity-share 0.5 --wikipedia <wiki-articles-10k-v001.json>
 ```
 
 A ModernBERT-base job on resident Metal needs larger budgets than the job
