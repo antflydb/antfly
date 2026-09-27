@@ -208,7 +208,10 @@ fn parityProfile(a: Allocator, cb: *const ops.ComputeBackend, profile: encoder_g
     var wrt: std.ArrayListUnmanaged(ml.NodeId) = .empty;
     defer wrt.deinit(a);
     for (graph.parameters.items) |id| if (!std.mem.startsWith(u8, graph.parameterName(graph.node(id)), "__")) try wrt.append(a, id);
-    try std.testing.expectEqual(@as(usize, 20), wrt.items.len);
+    // Embeddings and final norm, five tensors per layer plus attn_norm after
+    // layer 0, and a neck's weight and bias.
+    const layers: usize = config.encoder.num_hidden_layers;
+    try std.testing.expectEqual(6 * layers + 2 + @as(usize, if (config.neck == .linear) 2 else 0), wrt.items.len);
     var gradients = try ml.autodiff.gradientWithSeeds(a, &graph, &seeds, wrt.items, .{ .require_all_gradients = true });
     defer gradients.deinit();
     gradients.graph.outputs.clearRetainingCapacity();
@@ -263,11 +266,17 @@ fn parityProfile(a: Allocator, cb: *const ops.ComputeBackend, profile: encoder_g
     var backward = try interpreter.execute(a, &gradients.graph, cb, .{ .runtime_inputs = backward_inputs, .strict_integer_constants = true });
     defer backward.deinit(cb);
     var worst: f32 = 0;
+    var compared: usize = 0;
     for (wrt.items, backward.outputs) |id, output| {
         const name = graph.parameterName(graph.node(id));
         errdefer std.debug.print("ModernBERT boundary encoder parity: gradient {s}\n", .{name});
         var key: [256]u8 = undefined;
-        const expected = try reference.tensors.floats(try std.fmt.bufPrint(&key, "gradient.{s}", .{name}));
+        // A real-checkpoint capture keeps a representative subset.
+        const expected = reference.tensors.floats(try std.fmt.bufPrint(&key, "gradient.{s}", .{name})) catch |err| switch (err) {
+            error.TensorNotFound => if (layers > 3) continue else return err,
+            else => return err,
+        };
+        compared += 1;
         const actual = try cb.toFloat32(output, a);
         defer a.free(actual);
         var largest: f32 = 0;
@@ -276,7 +285,8 @@ fn parityProfile(a: Allocator, cb: *const ops.ComputeBackend, profile: encoder_g
         try fixtures.expectFloats(expected, actual, 5e-5 + 0.002 * largest, 0);
         for (expected, actual) |want, got| worst = @max(worst, @abs(want - got));
     }
-    std.debug.print("ModernBERT boundary encoder ({s}, {s}): 20 gradient tensors, max absolute error={d}\n", .{ @tagName(cb.kind()), @tagName(profile), worst });
+    try std.testing.expect(compared >= 3);
+    std.debug.print("ModernBERT boundary encoder ({s}, {s}): {d} gradient tensors, max absolute error={d}\n", .{ @tagName(cb.kind()), @tagName(profile), compared, worst });
 }
 
 test "GLiNER2.5 ModernBERT encoder states and every encoder gradient match PyTorch" {

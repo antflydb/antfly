@@ -19,6 +19,12 @@ byte-level pre-tokenizer (``add_prefix_space=False``) an isolated word gets
 its start-of-text form ("john", not "Ġjohn"); ``tokenization`` in the report
 records that, and the native processor must match it.
 
+With ``--checkpoint <dir>`` it captures the same tensors from an existing
+boundary checkpoint instead (an Antenna student, loaded through
+``scripts/antenna/neck.py`` so a GLiNER neck applies to the routed states and
+its gradients are captured too), adding a case longer than ModernBERT's local
+attention window.
+
 Diagnostic evidence only: this is not a pretrained model or a qualification.
 
     PYTHONDONTWRITEBYTECODE=1 <oracle venv>/bin/python modernbert_reference.py \\
@@ -61,6 +67,17 @@ CASES = [
                          '{"person":{"description":"A named person"},"location":{"description":"A named place"}}}',
     },
 ]
+
+# A real ModernBERT's 128-token local window needs a longer row.
+LONG_CASE = {
+    "id": "long_document",
+    "text": " ".join(["Alice Johnson joined Acme Corporation in Boston after a decade at Globex, where she led the"
+                      " analytics team and later the research group that built its forecasting platform."] * 4),
+    "upstream_schema": {"entities": ["person", "organization", "location"],
+                        "classifications": [{"task": "topic", "labels": ["business", "sports", "science"]}]},
+    "native_schema": '{"entities":["person","organization","location"],'
+                     '"classifications":[{"name":"topic","labels":["business","sports","science"]}]}',
+}
 
 SPECIALS = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
 
@@ -129,20 +146,39 @@ def build_model(torch: Any) -> Any:
     return model
 
 
+def load_checkpoint(path: Path) -> Any:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "antenna"))
+    import neck
+
+    model = neck.load(path, local_files_only=True, map_location="cpu", use_flashdeberta=False).float().cpu().eval()
+    if model.encoder.config.model_type != "modernbert":
+        raise oracle.ContractError("the checkpoint encoder must be ModernBERT")
+    return model
+
+
 def capture(args: argparse.Namespace) -> dict[str, Any]:
     provenance, torch = oracle.prepare_runtime(args.upstream)
-    model = build_model(torch)
+    model = load_checkpoint(args.checkpoint) if args.checkpoint else build_model(torch)
+    cases = CASES + ([LONG_CASE] if args.checkpoint else [])
     tokenizer = model.processor.tokenizer
     batch = model.processor.collate_fn_inference(
-        [(case["text"], oracle.build_extract_schema(case["upstream_schema"]).build()) for case in CASES],
+        [(case["text"], oracle.build_extract_schema(case["upstream_schema"]).build()) for case in cases],
         max_len=MAX_WORDS, architecture="boundary", error_policy="raise", build_targets=False,
         on_capacity_exceeded="raise")
     lengths = batch.attention_mask.sum(-1).tolist()
-    if len(set(lengths)) != 2 or min(lengths) <= 8:
-        raise oracle.ContractError("the batch must pad one row and exceed the local window")
+    if len(set(lengths)) < 2 or min(lengths) <= 8 or max(lengths) <= model.encoder.config.local_attention:
+        raise oracle.ContractError("the batch must pad a row and exceed the local window")
 
     encoder = model.encoder
-    names = [name for name, _ in encoder.named_parameters()]
+    # Encoder weights under their native names (no `encoder.` prefix), then
+    # the neck under its checkpoint name.
+    named = list(encoder.named_parameters())
+    neck_module = getattr(model, "gliner_neck", None)
+    if neck_module is not None:
+        named += [(f"gliner_neck.{name}", value) for name, value in neck_module.named_parameters()]
+    names = [name for name, _ in named]
     hidden = encoder(input_ids=batch.input_ids, attention_mask=batch.attention_mask).last_hidden_state
 
     def routed(indices: Any, mask: Any) -> Any:
@@ -159,7 +195,7 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
     cotangents = {kind: torch.randn(value.shape, generator=generator) * routes[kind][1].unsqueeze(-1)
                   for kind, value in states.items()}
     objective = sum((states[kind] * cotangents[kind]).sum() for kind in states)
-    gradients = torch.autograd.grad(objective, list(encoder.parameters()))
+    gradients = torch.autograd.grad(objective, [value for _, value in named])
 
     with oracle.atomic_output_directory(args.output) as directory:
         checkpoint = directory / "checkpoint"
@@ -171,9 +207,16 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
             tensors[f"encoded.{kind}"] = states[kind]
             tensors[f"cotangent.{kind}"] = cotangents[kind]
         tensors["encoded.hidden"] = hidden
-        # Native graph names strip the checkpoint's `encoder.` prefix.
+        # Native graph names strip the checkpoint's `encoder.` prefix. A real
+        # checkpoint's gradients would exceed the capture bound, so it keeps a
+        # representative subset: the first layer's attention, the last layer's
+        # MLP output, the final norm and the neck.
+        last = model.encoder.config.num_hidden_layers - 1
+        kept = {"layers.0.attn.Wqkv.weight", f"layers.{last}.mlp.Wo.weight", "final_norm.weight",
+                "gliner_neck.weight", "gliner_neck.bias"}
         for name, gradient in zip(names, gradients):
-            tensors[f"gradient.{name}"] = gradient
+            if args.checkpoint is None or name in kept:
+                tensors[f"gradient.{name}"] = gradient
         # The word as upstream sees it, and the same word after a space.
         words = ["john", "works", "apple", "café", "東京"]
         report = {
@@ -181,7 +224,8 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
             "real_model_qualified": False, "native_runtime_qualified": False, "training_qualified": False,
             "provenance": provenance, "generator_sha256": oracle.sha256_file(Path(__file__)),
             "seed": SEED, "cotangent_seed": COTANGENT_SEED,
-            "cases": [{key: case[key] for key in ("id", "text", "native_schema")} for case in CASES],
+            "cases": [{key: case[key] for key in ("id", "text", "native_schema")} for case in cases],
+            "checkpoint": str(args.checkpoint) if args.checkpoint else None,
             "encoder_parameters": names,
             "tokenization": {
                 "rule": "each word and schema fragment is tokenized alone, without [CLS]/[SEP]",
@@ -208,6 +252,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--upstream", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, help="capture from this boundary checkpoint instead of the tiny model")
     print(json.dumps(capture(parser.parse_args()), sort_keys=True))
     return 0
 
