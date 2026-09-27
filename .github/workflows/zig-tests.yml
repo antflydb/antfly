@@ -1158,6 +1158,7 @@ jobs:
       ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+      ANTFLY_BUILD_CACHE_TMPDIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/tmp
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1184,7 +1185,12 @@ jobs:
           use-cache: false
 
       - name: Prepare ARC Zig cache dirs
-        run: mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+        run: |
+          mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR" "$ANTFLY_BUILD_CACHE_TMPDIR"
+          # These checks explicitly place private compiler caches inside Python
+          # temporary workspaces. Route those workspaces to the PVC as well:
+          # /tmp counts toward the runner pod's 10 GiB ephemeral-storage limit.
+          echo "TMPDIR=$ANTFLY_BUILD_CACHE_TMPDIR" >> "$GITHUB_ENV"
 
       # Each test owns its temporary source overlay and local cache. Keep
       # those isolated; only the normal global dependency cache is shared.
@@ -1206,6 +1212,13 @@ jobs:
           name: storage-compilation
           path: zig/storage-compilation.json
           if-no-files-found: ignore
+
+      - name: Remove build-cache temporary workspaces
+        if: always()
+        run: |
+          # Restore the normal temporary root before action post steps run.
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          rm -rf -- "$ANTFLY_BUILD_CACHE_TMPDIR"
 
   zig-base:
     if: >-
