@@ -9669,6 +9669,14 @@ pub const DataServer = struct {
             const peers = try metadata.acquireControlReadGeneration(budget);
             defer peers.release();
             var pinned: PinnedReadPeerRouter = .{ .server = self, .peers = peers };
+            if (try antfly.public_api.table_router.resolveGroupRoutes(alloc, self.read_source.catalog, pinned.router().withBudget(budget), group_ids, policy)) |routes| return routes;
+            // Compact table routing can already name a published replacement
+            // while the independently cached peer view still has its hidden
+            // placements. Refresh once, sharing the refresh with other misses
+            // on this exact immutable view. Warm serving routes remain local.
+            const refreshed = try metadata.refreshControlReadGenerationAfterMiss(peers, budget);
+            defer refreshed.release();
+            pinned.peers = refreshed;
             return antfly.public_api.table_router.resolveGroupRoutes(alloc, self.read_source.catalog, pinned.router().withBudget(budget), group_ids, policy);
         }
         var vtable = self.dataReadGroupRouter().vtable.*;
@@ -23698,6 +23706,47 @@ const RemoteMetadataSource = struct {
         return self.fetchSnapshotResult(.peers, budget);
     }
 
+    fn refreshControlReadGenerationAfterMiss(self: *RemoteMetadataSource, observed: *ControlReadGeneration, caller: antfly.public_api.table_router.RouteBudget) !*ControlReadGeneration {
+        try caller.check();
+        const clock = antfly.public_api.table_catalog.RoutingBudget.initIo(null, self.io);
+        const deadline_ns = @min(clock.deadlineFrom(caller.clock) orelse std.math.maxInt(u64), self.awakeNs() +| remote_metadata_snapshot_timeout_ns);
+        var cancellation = if (caller.cancellation) |token| antfly.common.http.http_common.RequestCancellation.fromToken(token) else antfly.common.http.http_common.RequestCancellation{};
+        const budget: antfly.metadata_http_client.RequestBudget = .{
+            .deadline_ns = deadline_ns,
+            .io = self.io,
+            .cancellation = if (caller.cancellation != null) &cancellation else null,
+        };
+        try self.lockWithBudget(&self.control_read_refresh_mutex, budget);
+        defer self.control_read_refresh_mutex.unlock();
+        try self.lockWithBudget(&self.cache_mutex, budget);
+        // A completed refresh already superseded this caller's observation.
+        // Retained references prevent pointer reuse while comparing identity.
+        if (self.control_read_generation) |current| {
+            if (current != observed and self.awakeMs() -| self.control_read_generation_at_ms <= metadata_snapshot_cache_ttl_ms) {
+                const retained = current.retain();
+                self.cache_mutex.unlock();
+                return retained;
+            }
+        }
+        const retired_snapshot = self.cached_snapshot;
+        const retired_peers = self.control_read_generation;
+        self.cached_snapshot = null;
+        self.control_read_generation = null;
+        self.cached_head = null;
+        self.cached_head_at_ms = 0;
+        self.snapshot_fence_generation +%= 1;
+        self.snapshot_invalidation_generation +%= 1;
+        self.cache_mutex.unlock();
+        if (retired_peers) |peers| peers.release();
+        if (retired_snapshot) |value| {
+            var snapshot = value;
+            freeAdminSnapshotOwned(self.alloc, &snapshot);
+        }
+        // Keep the compact routing cache: only the stale endpoint/placement
+        // generation is invalidated, and the caller keeps its original budget.
+        return self.fetchSnapshotResult(.peers, budget);
+    }
+
     fn remoteAcquireJoinPlanning(ptr: *anyopaque, caller: antfly.public_api.table_router.RouteBudget) !?*antfly.public_api.join_planning.Generation {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         const peers = try self.acquireControlReadGeneration(caller);
@@ -33833,7 +33882,17 @@ fn consumerTests() type {
                     try sim.scheduler().enumerateReady(&enabled, alloc);
                     try enabled.canonicalize();
                     if (enabled.items.items.len == 0) return error.VoprApplyWaitDeadlock;
-                    try sim.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+                    // Measure wake latency after dispatching runnable work.
+                    // VOPR also permits advancing to the deadline while a
+                    // wake is runnable; that models starvation, not polling.
+                    var selected = enabled.items.items[0];
+                    for (enabled.items.items) |candidate| {
+                        if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
+                            selected = candidate;
+                            break;
+                        }
+                    }
+                    try sim.scheduler().executeReady(selected.id, &events, alloc);
                 }
                 const expected: ?anyerror = switch (mode) {
                     .retirement, .reuse => error.UnknownGroup,
@@ -40631,6 +40690,50 @@ fn consumerTests() type {
             }));
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
             try std.testing.expect(source.control_read_generation == null);
+        }
+
+        test "system catalog read peer miss refresh shares publication and preserves budgets" {
+            const alloc = std.testing.allocator;
+            const Fake = struct {
+                fn execute(_: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    return error.UnexpectedPeerFetch;
+                }
+            };
+            var cookie: u8 = 0;
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &cookie, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            defer source.deinit();
+            const snapshot: antfly.metadata_api.AdminSnapshot = .{
+                .status = .{ .metadata_group_id = 9, .metadata_incarnation = "11111111111111111111111111111111".*, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+                .merged_group_statuses = &.{},
+            };
+            try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, try source.acceptLinearizableSnapshot(try cloneAdminSnapshotOwned(alloc, snapshot), source.beginLinearizableSnapshot()));
+            const observed = try source.acquireControlReadGeneration(.{});
+            defer observed.release();
+            try std.testing.expectError(error.Timeout, source.refreshControlReadGenerationAfterMiss(observed, .{ .clock = .{ .deadline_ns = 0 } }));
+            var canceled: std.atomic.Value(bool) = .init(true);
+            try std.testing.expectError(error.Cancelled, source.refreshControlReadGenerationAfterMiss(observed, .{ .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&canceled) }));
+            try std.testing.expect(source.control_read_generation == observed);
+            source.test_faults.fetch_head_error = error.ConnectionRefused;
+            // A missing route forces a fresh head even inside the cache TTL.
+            try std.testing.expectError(error.ConnectionRefused, source.refreshControlReadGenerationAfterMiss(observed, .{}));
+            try std.testing.expect(source.control_read_generation == null);
+            // Active readers retain the old immutable view across retirement.
+            try std.testing.expectEqual(@as(usize, 0), observed.groups.count());
+            try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, try source.acceptLinearizableSnapshot(try cloneAdminSnapshotOwned(alloc, snapshot), source.beginLinearizableSnapshot()));
+            const shared = try source.refreshControlReadGenerationAfterMiss(observed, .{});
+            defer shared.release();
+            try std.testing.expect(shared != observed);
+            try std.testing.expect(shared == source.control_read_generation);
+            const second = try source.refreshControlReadGenerationAfterMiss(observed, .{});
+            defer second.release();
+            try std.testing.expect(second == shared);
+            // Both callers reuse publication despite the injected fetch error.
         }
 
         test "system catalog read peer routing retains healthy relocation views across publication and invalidation" {

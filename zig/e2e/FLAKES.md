@@ -2039,8 +2039,33 @@ contracts. The deterministic tests cover prompt completion, already-complete
 work, unrelated wakes, deadlines, cancellation, group reuse, capacity exhaustion,
 coordinator reply loss, unconfirmed abort decisions, contact masks, retained
 cohorts, failed resolution, and failed acknowledgments. Nine Python verification
-and seed-helper contracts, Ruff lint/format, and diff checks pass. Qualification
-of the new frozen executable is pending.
+and seed-helper contracts, Ruff lint/format, and diff checks pass.
+
+The subsequent apply-notification executable
+`8d0429ea50c12b59bc8056627f87c5b3eb2238e3fd8c092d0f0e795d706c8dd2`
+passed Autograph **200/200**, but its recovery qualification caught a schema
+rewrite document read returning 404 after the job reported success. The recovery
+cohort was stopped with 24 FK-merge passes, 22 schema passes plus one failure,
+and 21 cascade passes. These are superseded evidence, not final acceptance.
+An external request-tracing plugin reproduced the same signature twice: all
+three rewritten parent documents were readable through two nodes, while the
+first node returned 404 for every key. Tracing runs retain the original test
+assertions and are excluded from qualification counts.
+
+Compact table routing can observe published replacement groups before the
+independent cached peer directory includes their serving placements. A route
+miss now refreshes that exact peer generation once under the existing refresh
+mutex; concurrent callers reuse a superseding generation, active readers retain
+their old immutable view, and compact routing stays cached. Refresh retains the
+original deadline and cancellation. A catalog-known group with no serving route
+returns temporary unavailability rather than document absence. Warm routes and
+local leaders keep the existing fast path. Regression checks cover cache-TTL
+bypass on a miss, shared publication, reader lifetime, expiry, cancellation, and
+absence fencing. The apply-wake latency fixture drains runnable work before
+advancing virtual time; advancing directly to a deadline while a wake remains
+runnable models starvation rather than polling delay.
+
+Final executable qualification remains pending.
 
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
 
