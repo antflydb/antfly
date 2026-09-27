@@ -103,14 +103,17 @@ def test_last(cli_server, setup_probe):
     assert phase != "call", "injected call failure"
 """)
     env = os.environ.copy()
+    # The nested pytest run must not add its repeated probe names to a CI lane.
     env.update(
         PYTHONPATH=str(Path(e2e_conftest.__file__).parent),
         PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
         PROBE_FAILURE_PHASE=failure_phase,
         ANTFLY_E2E_PRESERVE_ROOT="1" if preservation == "always" else "0",
         ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE=("1" if preservation == "failure" else "0"),
+        ANTFLY_E2E_DURATION_FILE=str(tmp_path / "probe-durations.json"),
     )
     env.pop("PYTEST_ADDOPTS", None)
+    env.pop("ANTFLY_E2E_REPORT_DIR", None)
     result = subprocess.run(
         [
             sys.executable,
@@ -132,6 +135,7 @@ def test_last(cli_server, setup_probe):
         timeout=30,
     )
     output = result.stdout + result.stderr
+    assert (tmp_path / "probe-durations.json").exists(), output
     assert "INTERNALERROR" not in output, output
     assert result.returncode == (0 if failure_phase == "none" else 1), output
     if failure_phase != "none":
