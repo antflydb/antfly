@@ -27,7 +27,9 @@ def _ready(api, table):
 @pytest.mark.parametrize("with_fk", [False, True])
 def test_relational_fk_binding_preserves_exact_schema_defaults(auth_api, with_fk):
     api = auth_api
-    api.s.headers["Authorization"] = auth._basic_auth("admin", "admin")
+    api.s.headers["Authorization"] = auth._basic_auth(
+        "admin", auth.AUTH_BOOTSTRAP_PASSWORD
+    )
     api.post("/tables/parents", {"schema": _schema()})
     _ready(api, "parents")
     for case, spelling in enumerate(
@@ -56,7 +58,9 @@ def test_relational_fk_binding_preserves_exact_schema_defaults(auth_api, with_fk
 @pytest.mark.parametrize("coordinated", [False, True])
 def test_relational_exact_numbers_across_mutation_and_session(auth_api, coordinated):
     api = auth_api
-    api.s.headers["Authorization"] = auth._basic_auth("admin", "admin")
+    api.s.headers["Authorization"] = auth._basic_auth(
+        "admin", auth.AUTH_BOOTSTRAP_PASSWORD
+    )
     for case, (spelling, expected) in enumerate(
         [
             ("9007199254740993.0", 9007199254740993),
@@ -109,7 +113,9 @@ def test_relational_session_authorizes_effects_not_private_witnesses(
     auth_api, child_permission, action
 ):
     api = auth_api
-    api.s.headers["Authorization"] = auth._basic_auth("admin", "admin")
+    api.s.headers["Authorization"] = auth._basic_auth(
+        "admin", auth.AUTH_BOOTSTRAP_PASSWORD
+    )
     child = _schema("parents")
     child["foreign_keys"][0].update(on_delete=action, on_update=action)
     for table, schema in [("parents", _schema()), ("children", child)]:
@@ -142,7 +148,9 @@ def test_relational_session_authorizes_effects_not_private_witnesses(
     )
     if action == "cascade" and child_permission != "write":
         assert response.status_code == 403, response.text
-        api.s.headers["Authorization"] = auth._basic_auth("admin", "admin")
+        api.s.headers["Authorization"] = auth._basic_auth(
+            "admin", auth.AUTH_BOOTSTRAP_PASSWORD
+        )
         assert api.lookup_key("parents", "row") == {"id": 1}
         assert api.lookup_key("children", "row") == {"id": 1}
         return
@@ -153,7 +161,9 @@ def test_relational_session_authorizes_effects_not_private_witnesses(
         "POST", f"/transactions/{tx}/commit", json={}, timeout=30
     )
     assert response.status_code == 200, response.text
-    api.s.headers["Authorization"] = auth._basic_auth("admin", "admin")
+    api.s.headers["Authorization"] = auth._basic_auth(
+        "admin", auth.AUTH_BOOTSTRAP_PASSWORD
+    )
     assert api.lookup_key("parents", "replacement") == {"id": 1}
     if action == "no_action":
         assert api.lookup_key("children", "row") == {"id": 1}

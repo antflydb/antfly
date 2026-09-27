@@ -6,8 +6,8 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio-data:/data
     healthcheck:
@@ -49,8 +49,8 @@ services:
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
     ports:
-      - "8080:8080"
-      - "4200:4200"
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:4200:4200"
     volumes:
       - ./config.json:/etc/antfly/config.json:ro
       - antfly-query-cache:/tmp/antfly-serverless-cache
