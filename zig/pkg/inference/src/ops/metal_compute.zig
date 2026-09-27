@@ -7127,10 +7127,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             .dot_general => blk: {
                 const dot = geometry.dot.?;
+                // The device kernels read the left operand as [rows, contracting]
+                // and take the right operand's contracting axis: 0 for
+                // [contracting, columns], 1 for [columns, contracting]. A
+                // transposed left operand has no kernel; never run it as if it
+                // were untransposed.
+                if (dot.lhs_transposed) return error.UnsupportedResidentProgramInstruction;
+                const rhs_contract_axis: u32 = if (dot.rhs_transposed) 1 else 0;
                 const output = if (instruction.inputs[0].rank_ == 2)
-                    try metal_runtime.decoderRuntimeDotGeneral2DF32Device(self.provider_impl, tensors[0], tensors[1], dot.rows, dot.columns, dot.contracting, 0)
+                    try metal_runtime.decoderRuntimeDotGeneral2DF32Device(self.provider_impl, tensors[0], tensors[1], dot.rows, dot.columns, dot.contracting, rhs_contract_axis)
                 else
-                    try metal_runtime.decoderRuntimeDotGeneralBatchedF32Device(self.provider_impl, tensors[0], tensors[1], dot.batch, dot.rows, dot.columns, dot.contracting, 0, shape);
+                    try metal_runtime.decoderRuntimeDotGeneralBatchedF32Device(self.provider_impl, tensors[0], tensors[1], dot.batch, dot.rows, dot.columns, dot.contracting, rhs_contract_axis, shape);
                 break :blk output orelse return error.UnsupportedResidentProgramInstruction;
             },
             else => return error.UnsupportedResidentProgramInstruction,

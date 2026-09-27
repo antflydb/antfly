@@ -379,3 +379,102 @@ test "GLiNER2.5 ModernBERT student checkpoint loads and tokenizes as upstream" {
     try expectProcessorPin(&pin.value, &prepared.batch);
     std.debug.print("ModernBERT student: {d} tensors, vocabulary {d}, hidden {d}, {d} layers\n", .{ source.parameter_count, source.config.encoder.vocab_size, source.config.encoder.hidden_size, source.config.encoder.num_hidden_layers });
 }
+
+/// A distillation "teacher" that returns the PyTorch reference's own final
+/// states at the student's routes, so the distillation term measures how far
+/// the trainer's encoder output is from PyTorch.
+const ReferenceTeacher = struct {
+    reference: *Reference,
+    pin: *const Pin,
+
+    const Owned = struct {
+        allocator: Allocator,
+        values: [4][]f32,
+        fn release(raw: ?*anyopaque) void {
+            const self: *Owned = @ptrCast(@alignCast(raw.?));
+            for (self.values) |values| self.allocator.free(values);
+            self.allocator.destroy(self);
+        }
+    };
+
+    fn teacher(self: *ReferenceTeacher) @import("boundary_distillation.zig").Teacher {
+        return .{ .ptr = self, .identity = @splat(7), .encode = encode };
+    }
+
+    fn encode(raw: *anyopaque, a: Allocator, items: []const processor.Item, student: *const processor.PreparedBatch, _: ?@import("../../execution_control.zig").InferenceExecutionControl) !@import("boundary_distillation.zig").TeacherStates {
+        const self: *ReferenceTeacher = @ptrCast(@alignCast(raw));
+        const hidden_tensor = try self.reference.tensors.tensor("encoded.hidden");
+        const hidden = try self.reference.tensors.floats("encoded.hidden");
+        const sequence: usize = @intCast(hidden_tensor.shape[1]);
+        const h: usize = @intCast(hidden_tensor.shape[2]);
+        const rows = try a.alloc(usize, items.len);
+        defer a.free(rows);
+        for (items, rows) |item, *row| row.* = for (self.pin.cases, 0..) |case, index| {
+            if (std.mem.eql(u8, case.text, item.text)) break index;
+        } else return error.MissingReferenceCase;
+        const owned = try a.create(Owned);
+        owned.allocator = a;
+        const routes = [_]struct { []const i64, []const bool }{
+            .{ student.text_word_indices, student.text_word_mask },
+            .{ student.query_marker_indices, student.query_marker_mask },
+            .{ student.cls_marker_indices, student.cls_marker_mask },
+            .{ student.parent_marker_indices, student.parent_marker_mask },
+        };
+        for (routes, &owned.values) |route, *values| {
+            values.* = try a.alloc(f32, route[0].len * h);
+            @memset(values.*, 0);
+            const width = route[0].len / items.len;
+            for (route[0], route[1], 0..) |position, valid, index| {
+                if (!valid) continue;
+                const row = rows[index / width];
+                const at: usize = @intCast(position);
+                if (at >= sequence) return error.InvalidReferenceRoute;
+                @memcpy(values.*[index * h ..][0..h], hidden[(row * sequence + at) * h ..][0..h]);
+            }
+        }
+        return .{ .text = owned.values[0], .queries = owned.values[1], .classifications = owned.values[2], .parents = owned.values[3], .context = owned, .release = Owned.release };
+    }
+};
+
+fn distillationToReference(a: Allocator, reference: *Reference, execution: @import("../seeded_gradient_trainer.zig").Execution) !f32 {
+    const trainer = @import("boundary_native_trainer.zig");
+    const data = @import("boundary_dataset.zig");
+    var bytes = std.Io.Writer.Allocating.init(a);
+    defer bytes.deinit();
+    for (reference.pin.value.cases, 0..) |case, i| {
+        try bytes.writer.print("{{\"version\":1,\"id\":\"{d}\",\"text\":", .{i});
+        try std.json.Stringify.value(case.text, .{}, &bytes.writer);
+        try bytes.writer.print(",\"schema\":{s}}}\n", .{case.native_schema});
+    }
+    var samples = try data.Dataset.fromBytes(a, bytes.written(), .{ .limits = .{ .max_host_bytes = 16 * 1024 * 1024 } }, null, null);
+    defer samples.deinit();
+    var teacher = ReferenceTeacher{ .reference = reference, .pin = &reference.pin.value };
+    const source = reference.source;
+    const gib: usize = 1024 * 1024 * 1024;
+    // The ModernBERT-base job limits (scripts/antenna/README.md).
+    const limits_mod = @import("boundary_training_limits.zig");
+    const parsed = try std.json.parseFromSlice(limits_mod.Config, a,
+        \\{"encoder":{"max_forward_tensor_bytes":17179869184},"differentiation":{"max_tape_bytes":6442450944,"max_cotangent_bytes":1073741824},"resident":{"program":{"max_working_bytes":6442450944,"max_capture_bytes":6442450944}}}
+    , .{});
+    defer parsed.deinit();
+    const limits = try limits_mod.apply(parsed.value, .{ .max_host_bytes = 8 * gib, .max_backend_bytes = 12 * gib, .max_backend_host_bytes = 512 * 1024 * 1024, .max_combined_bytes = 24 * gib, .optimizer = .{ .max_state_bytes = 8 * gib, .max_transaction_bytes = 8 * gib } });
+    const options = trainer.Options{ .execution = execution, .run = .{ .mode = .full, .epochs = 1, .batch_size = @intCast(reference.pin.value.cases.len), .accumulation = 1, .seed = 2509, .encoder_lr = 1e-12, .task_lr = 1e-12 }, .source_reserved_bytes = source.reserved_source_bytes, .distillation = .{ .teacher = teacher.teacher() }, .limits = limits };
+    var owner = try trainer.Trainer.init(a, &source.store, source.tokenizer(), source.identity, source.config, &samples, source.parameters[0..source.parameter_count], options, null);
+    defer owner.deinit();
+    while (try owner.next(null)) |report| if (report.terms) |terms| return terms.distillation;
+    return error.TestUnexpectedResult;
+}
+
+test "GLiNER2.5 ModernBERT training program reproduces the reference encoder states" {
+    const a = std.testing.allocator;
+    var reference = try Reference.open(a);
+    defer reference.deinit();
+    const cpu = try distillationToReference(a, &reference, .native);
+    std.debug.print("ModernBERT trainer encoder vs PyTorch (z-space MSE): native={d}\n", .{cpu});
+    try std.testing.expect(cpu < 1e-3);
+    if (comptime !build_options.enable_metal) return;
+    if (!@import("../../backends/metal_runtime.zig").metalDeviceAvailable()) return;
+    const metal = try distillationToReference(a, &reference, .resident_metal);
+    std.debug.print("ModernBERT trainer encoder vs PyTorch (z-space MSE): resident Metal={d}\n", .{metal});
+    try std.testing.expect(metal < 1e-3);
+}

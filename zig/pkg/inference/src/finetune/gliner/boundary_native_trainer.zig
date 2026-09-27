@@ -63,6 +63,8 @@ pub const Distillation = struct {
     heads: bool = false,
     /// Fit the (identity) neck in closed form before the first update.
     fit: neck_fit.Options = .{},
+    /// Borrowed diagnostics: sees each step's aligned student and teacher rows.
+    observer: ?distillation.Observer = null,
 };
 pub const Options = struct {
     /// Borrowed diagnostics over decisions already produced by the step.
@@ -649,7 +651,7 @@ pub const Trainer = struct {
         const negative_draws = try scratch.alloc(f32, @as(usize, plan.encoder.layout.batch) * plan.encoder.layout.queries);
         var negative_rng = run.Random.init(self.run_plan.config.seed, identity.microbatch_step, "negative_queries");
         for (negative_draws) |*value| value.* = negative_rng.uniform();
-        const context = step.StepContext{ .decision_observer = self.options.decision_observer, .identity = .{ .binding = self.fingerprint, .optimizer_step = identity.optimizer_step, .microbatch = identity.microbatch_step }, .replay = .{ .seed = self.run_plan.config.seed, .micro_batch = identity.microbatch_step }, .progress = .{ .optimizer_step = identity.optimizer_step, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = self.options.gold_start, .gold_end = self.options.gold_end, .gold_hold_fraction = self.options.gold_hold_fraction }, .weights = self.options.weights, .injection_draws = draws, .negative_query_draws = negative_draws, .require_gold_relation_coverage = self.options.require_gold_relation_coverage, .distillation = if (teacher_states) |states| .{ .text = states.text, .queries = states.queries, .classifications = states.classifications, .parents = states.parents, .weight = self.options.distillation.?.weight } else null };
+        const context = step.StepContext{ .decision_observer = self.options.decision_observer, .identity = .{ .binding = self.fingerprint, .optimizer_step = identity.optimizer_step, .microbatch = identity.microbatch_step }, .replay = .{ .seed = self.run_plan.config.seed, .micro_batch = identity.microbatch_step }, .progress = .{ .optimizer_step = identity.optimizer_step, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = self.options.gold_start, .gold_end = self.options.gold_end, .gold_hold_fraction = self.options.gold_hold_fraction }, .weights = self.options.weights, .injection_draws = draws, .negative_query_draws = negative_draws, .require_gold_relation_coverage = self.options.require_gold_relation_coverage, .distillation = if (teacher_states) |states| .{ .text = states.text, .queries = states.queries, .classifications = states.classifications, .parents = states.parents, .weight = self.options.distillation.?.weight, .observer = self.options.distillation.?.observer } else null };
         var result = blk: {
             self.memory_failures.begin(.forward_backward);
             var bindings = try self.optimizer.bind(plan.graph, control);

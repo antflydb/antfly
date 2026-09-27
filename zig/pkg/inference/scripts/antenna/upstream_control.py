@@ -57,6 +57,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     torch.manual_seed(args.seed)
     model = neck.load(args.student, local_files_only=True, map_location=args.device, use_flashdeberta=False).float()
+    if args.no_augmentation:
+        # Upstream's training collate samples schema augmentation (synthetic
+        # labels, label dropping, shuffles). The native trainer has none; this
+        # isolates that difference.
+        from gliner2.processor import SamplingConfig
+
+        model.processor.sampling_config = SamplingConfig(
+            remove_json_structure_prob=0.0, shuffle_json_fields=False, remove_json_field_prob=0.0,
+            remove_entities_prob=0.0, shuffle_entities=False, remove_entity_prob=0.0, synthetic_entity_label_prob=0.0,
+            remove_relations_prob=0.0, swap_head_tail_prob=0.0, remove_classification_prob=0.0,
+            shuffle_classification_labels=False, remove_classification_label_prob=0.0, synthetic_label_prob=0.0,
+            include_true_label_prob=1.0)
     train = examples(args.train)
     config = TrainingConfig(output_dir=str(args.output / "trainer"), num_epochs=args.epochs, batch_size=args.batch_size,
                             gradient_accumulation_steps=args.accumulation, encoder_lr=args.encoder_lr,
@@ -71,7 +83,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "train_sha256": oracle.sha256_file(args.train), "examples": len(train),
         "settings": {k: getattr(config, k) for k in ("num_epochs", "batch_size", "gradient_accumulation_steps",
                                                         "encoder_lr", "task_lr", "warmup_ratio", "seed")},
-        "device": args.device, "provenance": provenance, "generator_sha256": oracle.sha256_file(Path(__file__)),
+        "device": args.device, "augmentation": not args.no_augmentation, "provenance": provenance, "generator_sha256": oracle.sha256_file(Path(__file__)),
     })
     return {"status": "trained", "output": str(args.output.resolve()), "examples": len(train)}
 
@@ -89,6 +101,7 @@ def main() -> int:
     parser.add_argument("--task-lr", type=float, default=5e-4)
     parser.add_argument("--seed", type=int, default=2509)
     parser.add_argument("--device", default="mps")
+    parser.add_argument("--no-augmentation", action="store_true", help="disable upstream's training-time schema augmentation")
     print(json.dumps(run(parser.parse_args()), sort_keys=True))
     return 0
 
