@@ -301,12 +301,15 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
     if (calibration) |*value| try value.preflight(source.tokenizer(), tokenization, holdout_targets, control, null);
     if (heldout) |*value| try value.preflight(source.tokenizer(), tokenization, holdout_targets, control, null);
     const trainer_limits = try trainerLimits(config);
-    var teacher: ?teacher_mod.SourceTeacher = null;
+    // The teacher lives in fixed storage; the optional pointer says whether it
+    // was initialized (an optional assigned `undefined` has no defined tag).
+    var teacher_storage: teacher_mod.SourceTeacher = undefined;
+    var teacher: ?*teacher_mod.SourceTeacher = null;
     if (teacher_source) |value| {
-        teacher = undefined;
-        try teacher.?.init(a, value, tokenization, trainer_limits.step.encoder.input);
+        try teacher_storage.init(a, value, tokenization, trainer_limits.step.encoder.input);
+        teacher = &teacher_storage;
     }
-    defer if (teacher) |*value| value.deinit();
+    defer if (teacher) |value| value.deinit();
     const calibration_sha256: ?[32]u8 = if (calibration) |value| value.sha256 else null;
     const test_sha256: ?[32]u8 = if (heldout) |value| value.sha256 else null;
     if (calibration) |*value| value.deinit();
@@ -329,7 +332,7 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
         .gold_end = config.gold_end,
         .gold_hold_fraction = config.gold_hold_fraction,
         .require_gold_relation_coverage = config.require_gold_relation_coverage,
-        .distillation = if (teacher) |*value| .{ .teacher = value.teacher(), .weight = config.distillation.?.weight, .heads = config.distillation.?.heads, .fit = config.distillation.?.fit } else null,
+        .distillation = if (teacher) |value| .{ .teacher = value.teacher(), .weight = config.distillation.?.weight, .heads = config.distillation.?.heads, .fit = config.distillation.?.fit } else null,
         .limits = trainer_limits,
     }, control);
     defer trainer.deinit();
