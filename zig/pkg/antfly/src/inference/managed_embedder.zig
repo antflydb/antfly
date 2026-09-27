@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const ant_json = @import("antfly-json");
@@ -50,8 +50,8 @@ const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test)
 else
     @import("../template_remote.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const http_common = @import("../raft/transport/http_common.zig");
-const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+const http_common = @import("../common/http/http_common.zig");
+const std_http_listener = @import("../common/http/std_http_listener.zig");
 const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const inference_work = @import("work.zig");
@@ -60,7 +60,7 @@ const remote_capabilities = @import("remote_capabilities.zig");
 const execution_context = @import("execution_context.zig");
 const shared_vector = @import("antfly_vector").vector;
 const antfly_image = @import("antfly_image");
-var traced_local_batches = std.atomic.Value(u64).init(0);
+var traced_local_batches = @import("antfly_platform").atomic.Value(u64).init(0);
 
 pub const SparseEmbedding = db_embedder.SparseEmbedding;
 

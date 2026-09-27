@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const httpx = @import("httpx");
@@ -18,8 +18,8 @@ const inference_api = @import("inference_api");
 const chunking_types = @import("types.zig");
 const chunk_mod = @import("chunk.zig");
 const Chunk = chunk_mod.Chunk;
-const http_common = @import("../raft/transport/http_common.zig");
-const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+const http_common = @import("../common/http/http_common.zig");
+const std_http_listener = @import("../common/http/std_http_listener.zig");
 const inference_chunker = @import("inference_chunker");
 const chunk_provider = @import("provider.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");

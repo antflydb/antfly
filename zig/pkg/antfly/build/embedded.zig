@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const AntflyRootImports = @import("imports.zig").AntflyRootImports;
@@ -104,6 +104,7 @@ pub const AddEmbeddedResult = struct {
     libantfly_link_mod: *std.Build.Module,
     install_libantfly: *std.Build.Step.InstallArtifact,
     install_capi_header: *std.Build.Step.InstallFile,
+    install_licenses: *std.Build.Step,
     run_capi_smoke: *std.Build.Step.Run,
     run_capi_conformance: *std.Build.Step.Run,
     run_lite_go_tests: *std.Build.Step.Run,
@@ -281,6 +282,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     antfly_imports.storage_boundary.configure(capi_mod, false, false);
     capi_mod.addImport("antfly_source_root", capi_root_mod);
+    capi_mod.addImport("antfly_platform", platform_mod);
     const capi_options = b.addOptions();
     capi_options.addOption(bool, "linked_storage", false);
     // The inference runtime is always linked into libantfly (see
@@ -293,14 +295,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_mod.addImport("antfly_vector", vector_mod);
     capi_mod.addImport("structlog", structlog_mod);
 
-    // The public C ABI and executable reuse the distributed PIC storage
-    // archive, so production builds analyze and optimize that graph once.
-    // libantfly embeds the standalone inference runtime in-process, the same
-    // as the `antfly` executable (see link_anchor.zig and addRuntime's
-    // storage_kernel unit): this is a deliberate product decision
-    // (2026-09-17) so Lite hosts get local inference without a separate
-    // runtime, at the cost of a much larger shared library (see
-    // COMPILATION.md's "C API composition" section).
+    // The C ABI links the Apache Lite owner, enrichment and inference archives.
+    // The ELv2 executable has its own storage owner for server-only exports;
+    // both owners compile the same shared local engine implementation.
     const libantfly_link_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/capi/link_anchor.zig"),
         .target = target,
@@ -327,9 +324,11 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "antfly.h",
     );
 
+    const install_licenses = @import("../../../lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly-lite", "share/licenses/antfly-lite");
     const capi_step = b.step("capi", "Build the public libantfly C ABI shared library");
     capi_step.dependOn(&install_libantfly.step);
     capi_step.dependOn(&install_capi_header.step);
+    capi_step.dependOn(install_licenses);
 
     const capi_smoke_mod = b.createModule(.{
         .target = target,
@@ -554,6 +553,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .libantfly_link_mod = libantfly_link_mod,
         .install_libantfly = install_libantfly,
         .install_capi_header = install_capi_header,
+        .install_licenses = install_licenses,
         .run_capi_smoke = run_capi_smoke,
         .run_capi_conformance = run_capi_conformance,
         .run_lite_go_tests = run_lite_go_tests,

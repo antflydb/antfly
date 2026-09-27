@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Multi-segment index with MVCC snapshots.
 //!
@@ -140,7 +140,7 @@ pub const SegmentShared = struct {
     /// intact when this transitions to cold; only clean file-backed pages are
     /// advised away. A subsequent query marks the segment resident again.
     mapped_residency_state: std.atomic.Value(u8) = .init(mapped_residency_cold),
-    last_mapped_access_ns: std.atomic.Value(u64) = .init(0),
+    last_mapped_access_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     active_mapped_readers: std.atomic.Value(u32) = .init(0),
     /// Deletion bitmap shared by every snapshot referencing this segment.
     /// `deletion_lock` protects the bitmap's reallocatable containers. The
@@ -1398,7 +1398,7 @@ pub const IndexWriter = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     mapped_residency_mu: std.atomic.Mutex,
     mapped_residency_accounted_bytes: u64,
-    mapped_residency_next_check_ns: std.atomic.Value(u64),
+    mapped_residency_next_check_ns: @import("antfly_platform").atomic.Value(u64),
     mapped_residency_evictions: u64,
 
     /// A completely allocated replacement snapshot held behind the writer

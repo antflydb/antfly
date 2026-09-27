@@ -11,30 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//
-// Self-contained correctness prototype for the BF16 tensor-core Q4_0 linear
-// kernel that mirrors termite_linear_q4_0_f32_tc_hmma_bf16 in
-// src/ops/cuda/artifacts/inference_cuda_kernels.cu.
-//
-// It launches BOTH the bf16-tile and the f16-tile variant of the exact
-// production tile (MODE 0, FMT Q4_0) over the same q4_0_hmma packed weights and
-// compares each against a DOUBLE-precision reference matmul computed over the
-// identical dequantized weights. It prints max_abs_diff AND max_rel_diff for
-// BOTH tiles so the bf16-vs-f16 accuracy gap is visible per shape.
-//
-// The final "large-activation overflow" case injects activations above f16's
-// 65504 range: the f16 tile overflows to +/-inf (huge error) while the bf16
-// tile -- which shares f32's exponent range -- stays accurate. This is the
-// numeric reason the bf16 mirror fixes the Gemma f16 divergence at token 29.
-//
-// Build (CPU-side only; DO NOT run here -- another process owns the GPU):
-//   nvcc -arch=sm_89 -std=c++17 q4_0_tc_hmma_bf16_sm89.cu -o /tmp/.../proto
-// Optional host parallelism for the f64 reference:
-//   nvcc -arch=sm_89 -std=c++17 -Xcompiler -fopenmp ... -o proto
-//
-// Exit code: nonzero if the bf16 tile exceeds the (generous) tolerance on ANY
-// shape. The f16 tile is reported for comparison only and is EXPECTED to fail
-// the overflow case.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

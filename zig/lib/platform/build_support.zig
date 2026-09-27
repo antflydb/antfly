@@ -89,6 +89,21 @@ pub fn addTests(b: *std.Build, options: struct {
         .link_libc = link_libc,
     });
     const unit = b.addTest(.{ .root_module = supervisor });
+    const atomic_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = options.root.path(b, "src/atomic.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_atomic_tests = b.addRunArtifact(atomic_tests);
+    const entropy_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = options.root.path(b, "src/entropy.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_entropy_tests = b.addRunArtifact(entropy_tests);
+    const run_unit = b.addRunArtifact(unit);
+    run_unit.step.dependOn(&run_atomic_tests.step);
+    run_unit.step.dependOn(&run_entropy_tests.step);
     const one_shot = b.createModule(.{
         .root_source_file = options.root.path(b, "src/one_shot_process.zig"),
         .target = target,
@@ -130,7 +145,7 @@ pub fn addTests(b: *std.Build, options: struct {
         one_shot_process = addNativeProcessTest(b, one_shot_fixture, options.root.path(b, "tests/test_one_shot_process.py"));
     }
     return .{
-        .unit = b.addRunArtifact(unit),
+        .unit = run_unit,
         .process = process,
         .one_shot_unit = b.addRunArtifact(one_shot_unit),
         .one_shot_process = one_shot_process,

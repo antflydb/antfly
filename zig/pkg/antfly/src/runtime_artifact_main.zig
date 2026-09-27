@@ -18,7 +18,10 @@ const std = @import("std");
 const bridge = @import("runtime_bridge.zig");
 const role_options = @import("runtime_artifact_options");
 const structlog = @import("structlog");
-const inference_process_supervisor = @import("antfly_platform").inference_process_supervisor;
+comptime {
+    if (role_options.role == .inference)
+        @compileError("inference artifacts must use runtime_inference_main.zig");
+}
 
 extern fn antfly_runtime_cli(context: *const bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const bridge.Context) callconv(.c) c_int;
@@ -46,12 +49,6 @@ pub fn main(init: std.process.Init) void {
 fn mainImpl(init: std.process.Init) anyerror!void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
-    var worker_lifetime = inference_process_supervisor.WorkerLifetime{};
-    defer worker_lifetime.deinit(init.io);
-    if (comptime role_options.role == .inference) {
-        if (try inference_process_supervisor.runIfNeeded(init, 1, &worker_lifetime)) return;
-    }
-
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer args.deinit();
     _ = args.next();
@@ -76,16 +73,6 @@ fn mainImpl(init: std.process.Init) anyerror!void {
     if (worker_invocation) command = "inference";
     const runtime_arguments = if (worker_invocation) argument_views.items[1..] else argument_views.items;
 
-    if (comptime role_options.role == .inference) {
-        const one_shot = @import("antfly_platform").one_shot_process;
-        if (one_shot.isTrainingInvocation(init.minimal.args)) {
-            // Preserve the executable's invocation before the runtime ABI
-            // substitutes its synthetic argv vector. Ignore inherited claims.
-            const original = try one_shot.encodeOriginalArguments(init.gpa, init.minimal.args);
-            defer init.gpa.free(original);
-            try init.environ_map.put(one_shot.original_argv_env, original);
-        }
-    }
     const environment_names = init.environ_map.keys();
     const environment_values = init.environ_map.values();
     std.debug.assert(environment_names.len == environment_values.len);
@@ -105,7 +92,7 @@ fn mainImpl(init: std.process.Init) anyerror!void {
     const code = switch (role_options.role) {
         .cli => antfly_runtime_cli(&context),
         .data => antfly_runtime_data(&context),
-        .inference => antfly_runtime_inference(&context),
+        .inference => unreachable,
         .metadata => antfly_runtime_metadata(&context),
         .standalone => if (worker_invocation) antfly_runtime_inference(&context) else antfly_runtime_standalone(&context),
     };

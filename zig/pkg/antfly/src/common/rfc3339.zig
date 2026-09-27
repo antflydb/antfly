@@ -1,8 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the License at https://www.antfly.io/licensing/ELv2-license.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Allocation-free RFC 3339 parsing for public query contracts.
 //!
@@ -92,7 +100,7 @@ fn parseDigits(text: []const u8) ?u64 {
 fn validDate(year: u64, month: u64, day: u64) bool {
     if (year == 0 or month < 1 or month > 12 or day < 1) return false;
     const days_in_month = [_]u8{ 31, if (isLeapYear(year)) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    return day <= days_in_month[month - 1];
+    return day <= days_in_month[@intCast(month - 1)];
 }
 
 fn isLeapYear(year: u64) bool {

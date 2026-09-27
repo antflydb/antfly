@@ -26,6 +26,7 @@ pub const Context = struct {
     runtime_test_filter: bool = false,
     step_prefix: []const u8 = "",
     add_native_process_test: *const fn (*std.Build, *std.Build.Step.Compile, std.Build.LazyPath) *std.Build.Step,
+    install_apache_licenses: *const fn (*std.Build, std.Build.LazyPath, []const u8, []const u8) *std.Build.Step,
 
     pub fn step(ctx: Context, name: []const u8, description: []const u8) *std.Build.Step {
         return ctx.b.step(ctx.b.fmt("{s}{s}", .{ ctx.step_prefix, name }), description);

@@ -1,14 +1,26 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Shared contracts for bounded multimodal work. These types describe the
 //! scheduler boundary; task-specific request and result types remain in their
 //! owning model-family packages.
 
 const std = @import("std");
-const data_uri = @import("antfly_scraping").data_uri;
+const data_uri = if (@import("builtin").os.tag == .freestanding)
+    @import("antfly_data_uri")
+else
+    @import("antfly_scraping").data_uri;
 const antfly_image = @import("antfly_image");
 
 pub const mimeTypeEssence = data_uri.mediaTypeEssence;
@@ -915,7 +927,7 @@ pub const InferenceCapabilities = struct {
     /// may derive pixels from its wire budget; encoded inputs keep model limits.
     pub fn renderPixelLimit(self: InferenceCapabilities, raw: bool) u64 {
         const pixels = self.batch.max_decoded_pixels orelse std.math.maxInt(u64);
-        return if (raw) @min(pixels, if (self.attachment_payload_max_bytes) |bytes| bytes / 4 else std.math.maxInt(u64)) else pixels;
+        return if (raw) @min(pixels, if (self.attachment_payload_max_bytes) |bytes| @as(u64, bytes) / 4 else std.math.maxInt(u64)) else pixels;
     }
 
     pub fn validate(self: InferenceCapabilities) !void {

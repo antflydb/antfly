@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const httpx = @import("httpx");
@@ -1731,7 +1731,7 @@ test "template remote preserves PDF content type across a multi-megabyte downloa
     _ = FakeApp;
 
     const ListenerApp = struct {
-        fn executor() @import("raft/transport/http_common.zig").RequestExecutor {
+        fn executor() @import("common/http/http_common.zig").RequestExecutor {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -1740,8 +1740,8 @@ test "template remote preserves PDF content type across a multi-megabyte downloa
             };
         }
 
-        fn execute(_: *anyopaque, req_alloc: Allocator, req: @import("raft/transport/http_common.zig").HttpRequest) !@import("raft/transport/http_common.zig").HttpResponse {
-            try std.testing.expectEqual(@import("raft/transport/http_common.zig").Method.GET, req.method);
+        fn execute(_: *anyopaque, req_alloc: Allocator, req: @import("common/http/http_common.zig").HttpRequest) !@import("common/http/http_common.zig").HttpResponse {
+            try std.testing.expectEqual(@import("common/http/http_common.zig").Method.GET, req.method);
             if (std.mem.endsWith(u8, req.uri, "/doc.pdf")) {
                 const body = try req_alloc.alloc(u8, 3_062_180);
                 @memset(body, 'x');
@@ -1759,7 +1759,7 @@ test "template remote preserves PDF content type across a multi-megabyte downloa
         }
     };
 
-    var listener = @import("raft/transport/std_http_listener.zig").StdHttpListener.init(alloc, .{}, ListenerApp.executor());
+    var listener = @import("common/http/std_http_listener.zig").StdHttpListener.init(alloc, .{}, ListenerApp.executor());
     defer listener.deinit();
     try listener.start();
 
@@ -1803,7 +1803,7 @@ test "template remote renders remoteMedia pdf mode=render with injected pdf back
     };
 
     const ListenerApp = struct {
-        fn executor() @import("raft/transport/http_common.zig").RequestExecutor {
+        fn executor() @import("common/http/http_common.zig").RequestExecutor {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -1812,8 +1812,8 @@ test "template remote renders remoteMedia pdf mode=render with injected pdf back
             };
         }
 
-        fn execute(_: *anyopaque, req_alloc: Allocator, req: @import("raft/transport/http_common.zig").HttpRequest) !@import("raft/transport/http_common.zig").HttpResponse {
-            try std.testing.expectEqual(@import("raft/transport/http_common.zig").Method.GET, req.method);
+        fn execute(_: *anyopaque, req_alloc: Allocator, req: @import("common/http/http_common.zig").HttpRequest) !@import("common/http/http_common.zig").HttpResponse {
+            try std.testing.expectEqual(@import("common/http/http_common.zig").Method.GET, req.method);
             return .{
                 .status = 200,
                 .content_type = try req_alloc.dupe(u8, "application/pdf"),
@@ -1822,7 +1822,7 @@ test "template remote renders remoteMedia pdf mode=render with injected pdf back
         }
     };
 
-    var listener = @import("raft/transport/std_http_listener.zig").StdHttpListener.init(alloc, .{}, ListenerApp.executor());
+    var listener = @import("common/http/std_http_listener.zig").StdHttpListener.init(alloc, .{}, ListenerApp.executor());
     defer listener.deinit();
     try listener.start();
 
@@ -1864,7 +1864,7 @@ test "template remote preserves http status from shared scraping fetches" {
     const alloc = std.testing.allocator;
 
     const ListenerApp = struct {
-        fn executor() @import("raft/transport/http_common.zig").RequestExecutor {
+        fn executor() @import("common/http/http_common.zig").RequestExecutor {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -1873,8 +1873,8 @@ test "template remote preserves http status from shared scraping fetches" {
             };
         }
 
-        fn execute(_: *anyopaque, req_alloc: Allocator, req: @import("raft/transport/http_common.zig").HttpRequest) !@import("raft/transport/http_common.zig").HttpResponse {
-            try std.testing.expectEqual(@import("raft/transport/http_common.zig").Method.GET, req.method);
+        fn execute(_: *anyopaque, req_alloc: Allocator, req: @import("common/http/http_common.zig").HttpRequest) !@import("common/http/http_common.zig").HttpResponse {
+            try std.testing.expectEqual(@import("common/http/http_common.zig").Method.GET, req.method);
             return .{
                 .status = 404,
                 .content_type = try req_alloc.dupe(u8, "text/plain"),
@@ -1883,7 +1883,7 @@ test "template remote preserves http status from shared scraping fetches" {
         }
     };
 
-    var listener = @import("raft/transport/std_http_listener.zig").StdHttpListener.init(alloc, .{}, ListenerApp.executor());
+    var listener = @import("common/http/std_http_listener.zig").StdHttpListener.init(alloc, .{}, ListenerApp.executor());
     defer listener.deinit();
     try listener.start();
 
@@ -1932,7 +1932,7 @@ test "template remote validated text rejects oversized remote media directive" {
     const alloc = std.testing.allocator;
 
     const ListenerApp = struct {
-        fn executor() @import("raft/transport/http_common.zig").RequestExecutor {
+        fn executor() @import("common/http/http_common.zig").RequestExecutor {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -1941,8 +1941,8 @@ test "template remote validated text rejects oversized remote media directive" {
             };
         }
 
-        fn execute(_: *anyopaque, req_alloc: Allocator, req: @import("raft/transport/http_common.zig").HttpRequest) !@import("raft/transport/http_common.zig").HttpResponse {
-            try std.testing.expectEqual(@import("raft/transport/http_common.zig").Method.GET, req.method);
+        fn execute(_: *anyopaque, req_alloc: Allocator, req: @import("common/http/http_common.zig").HttpRequest) !@import("common/http/http_common.zig").HttpResponse {
+            try std.testing.expectEqual(@import("common/http/http_common.zig").Method.GET, req.method);
             return .{
                 .status = 200,
                 .content_type = try req_alloc.dupe(u8, "image/png"),
@@ -1951,7 +1951,7 @@ test "template remote validated text rejects oversized remote media directive" {
         }
     };
 
-    var listener = @import("raft/transport/std_http_listener.zig").StdHttpListener.init(alloc, .{}, ListenerApp.executor());
+    var listener = @import("common/http/std_http_listener.zig").StdHttpListener.init(alloc, .{}, ListenerApp.executor());
     defer listener.deinit();
     try listener.start();
 

@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc.
-// Licensed under the Elastic License 2.0 (ELv2).
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Exact source payload ownership independent of ANN index lifetime.
 //! Immutable identities include the complete logical artifact key and envelope.
@@ -29,7 +40,7 @@ const MarkInterleaving = if (@import("builtin").is_test) struct {
 
     fn pause(_: *Store) void {
         entered.store(true, .release);
-        while (!resume_scan.load(.acquire)) std.Thread.yield() catch {};
+        while (!resume_scan.load(.acquire)) @import("antfly_platform").time.yieldNow();
     }
     fn scan(source: *Store) void {
         source.advanceMarkingSnapshot() catch |err| {
@@ -45,7 +56,7 @@ const MarkInterleaving = if (@import("builtin").is_test) struct {
         const start = time.monotonicNs();
         while (!flag.load(.acquire)) {
             if (time.monotonicNs() -| start > 10 * std.time.ns_per_s) return error.InterleavingTimedOut;
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
     }
 } else void;
@@ -76,8 +87,8 @@ pub const Store = struct {
     /// Candidate references are protected by the durable migration job until
     /// all primary rows and their final reference coverage have been verified.
     migration_retention: std.atomic.Value(bool) = .init(false),
-    migration_disk_reserve: std.atomic.Value(u64) = .init(0),
-    migration_temporary_limit: std.atomic.Value(u64) = .init(0),
+    migration_disk_reserve: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    migration_temporary_limit: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
@@ -91,8 +102,8 @@ pub const Store = struct {
     checkpoint_write_waiters: std.atomic.Value(usize) = .init(0),
     checkpoint_epoch: std.atomic.Value(u32) = .init(0),
     checkpoint_test_hook: if (@import("builtin").is_test) ?*const fn (*Store, CheckpointPhase) anyerror!void else void = if (@import("builtin").is_test) null else {},
-    active_sessions: std.atomic.Value(u64) = .init(0),
-    session_start_epoch: std.atomic.Value(u64) = .init(0),
+    active_sessions: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    session_start_epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
     read_stats: ReadStats = .{},
     opened: native.Opened,
     stats: Stats = .{},
@@ -154,7 +165,7 @@ pub const Store = struct {
     prepare_head: ?*PrepareRequest = null,
     prepare_tail: ?*PrepareRequest = null,
     prepare_running: bool = false,
-    prepare_requests: std.atomic.Value(u64) = .init(0),
+    prepare_requests: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     directory: ?*@import("source_location_directory.zig").Directory = null,
 
@@ -202,11 +213,11 @@ pub const Store = struct {
     }
 
     const ReadStats = struct {
-        resolved_payloads: std.atomic.Value(u64) = .init(0),
-        resolved_bytes: std.atomic.Value(u64) = .init(0),
-        snapshot_read_ns: std.atomic.Value(u64) = .init(0),
-        catalog_metadata_bytes_shared: std.atomic.Value(u64) = .init(0),
-        catalog_metadata_bytes_copied: std.atomic.Value(u64) = .init(0),
+        resolved_payloads: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        resolved_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        snapshot_read_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        catalog_metadata_bytes_shared: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        catalog_metadata_bytes_copied: @import("antfly_platform").atomic.Value(u64) = .init(0),
     };
 
     const ReadView = struct {
@@ -231,7 +242,7 @@ pub const Store = struct {
     }
 
     fn lockPublication(self: *Store) void {
-        while (!self.publication_mutex.tryLock()) std.Thread.yield() catch {};
+        while (!self.publication_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
     }
 
     // Allocate before durability. Publication itself cannot fail and never
@@ -1167,7 +1178,7 @@ pub const Store = struct {
             if (self.marking) |marking| {
                 if (marking.running) {
                     self.mutex.unlock();
-                    std.Thread.yield() catch {};
+                    @import("antfly_platform").time.yieldNow();
                     continue;
                 }
                 marking.deinit(self.alloc);
@@ -1496,7 +1507,7 @@ pub const Store = struct {
         return @ptrCast(@alignCast(ptr));
     }
     fn lock(self: *Store) void {
-        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
     }
     fn retain(ptr: *anyopaque) void {
         const self = cast(ptr);
@@ -1588,13 +1599,13 @@ pub const Store = struct {
                     return;
                 },
                 2 => return if (request.err) |err| err else {},
-                else => std.Thread.yield() catch {},
+                else => @import("antfly_platform").time.yieldNow(),
             }
         }
     }
 
     fn queueLock(self: *Store) void {
-        while (!self.prepare_queue_mutex.tryLock()) std.Thread.yield() catch {};
+        while (!self.prepare_queue_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
     }
 
     /// Cancelling unpublished work retains every preparation in the WAL.
@@ -4408,7 +4419,7 @@ test "source vector payloads group commit batches waiting preparations without a
         source.prepare_queue_mutex.unlock();
         if (queued == 8) break;
         if (time.monotonicNs() > deadline) return error.TestUnexpectedResult;
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     for (&contexts) |*ctx| try std.testing.expect(!ctx.done.load(.acquire));
     source.queueLock();
@@ -6065,7 +6076,7 @@ fn checkPublishedCheckpointProgress(base: bool, pause_phase: Store.CheckpointPha
         fn hook(_: *Store, current: Store.CheckpointPhase) !void {
             if (current != phase) return;
             entered.store(true, .release);
-            while (!resume_work.load(.acquire)) std.Thread.yield() catch {};
+            while (!resume_work.load(.acquire)) @import("antfly_platform").time.yieldNow();
         }
         fn run(source: *Store) void {
             source.lock();
@@ -6148,12 +6159,12 @@ fn checkPublishedCheckpointProgress(base: bool, pause_phase: Store.CheckpointPha
         const wait_started = time.monotonicNs();
         while (source.checkpoint_write_waiters.load(.acquire) == 0) {
             if (time.monotonicNs() -| wait_started > 10 * std.time.ns_per_s) return error.InterleavingTimedOut;
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
         // A blocked writer releases SourceLock so publication can finish.
         while (!source.mutex.tryLock()) {
             if (time.monotonicNs() -| wait_started > 10 * std.time.ns_per_s) return error.InterleavingTimedOut;
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
         source.mutex.unlock();
     } else {

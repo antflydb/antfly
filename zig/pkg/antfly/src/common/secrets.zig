@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
@@ -429,7 +429,7 @@ pub const FileStore = struct {
     entries: std.StringArrayHashMapUnmanaged(StoredSecret) = .{},
     observed_metadata: ?FileMetadata = null,
     generation_value: u64 = 0,
-    generation_snapshot: std.atomic.Value(u64) = .init(0),
+    generation_snapshot: @import("antfly_platform").atomic.Value(u64) = .init(0),
     content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
     source_generation: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
     last_reload_failed: bool = false,
@@ -437,7 +437,7 @@ pub const FileStore = struct {
     reload_failure_count: u64 = 0,
     last_success_ns: u64 = 0,
     last_failure_ns: u64 = 0,
-    next_throttled_refresh_ns: std.atomic.Value(u64) = .init(0),
+    next_throttled_refresh_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileStore {
         return initWithIo(alloc, std.Options.debug_io, path);

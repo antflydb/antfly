@@ -1,21 +1,21 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
-const antfly = @import("../cli_root.zig");
+const antfly = @import("../lite_cli_root.zig");
 const antfly_client = @import("antfly-client");
-const cli = @import("cli/mod.zig");
+const cli = @import("cli/io.zig");
 const httpx = @import("httpx");
 const kernel_owner_abi = @import("kernel_owner_abi");
 const local_query_client = @import("local_query_client");
@@ -115,10 +115,6 @@ fn dispatchSubcommand(init: std.process.Init, argv0: []const u8, subcommand: []c
     if (std.mem.eql(u8, subcommand, "check")) return try check(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "compact")) return try compact(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "vacuum")) return try vacuum(allocator, io, args);
-    if (std.mem.eql(u8, subcommand, "serve")) {
-        if (comptime antfly.build_options.linked_storage) return error.InvalidArguments;
-        return try lite_serve.run(init, args);
-    }
 
     std.debug.print("unknown lite subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
@@ -162,7 +158,7 @@ fn openEmbeddedDataSurface(allocator: Allocator, path: []const u8, mode: db_mod.
     var lite = try LiteDb.open(allocator, path, mode);
     errdefer lite.close();
     if (try lite.backend.isStandaloneArtifact() and !lite.backend.hasStandaloneRootAdoption()) {
-        std.debug.print("error: this Lite artifact contains standalone table namespaces; use antfly lite serve and the /db/v1 API\n", .{});
+        std.debug.print("error: this Lite artifact contains standalone table namespaces; use antfly standalone --storage-engine lite --storage-path <db.aflite> and the /db/v1 API\n", .{});
         return error.StandaloneLiteRequiresApi;
     }
     return lite;
@@ -968,15 +964,6 @@ fn compactLite(lite: *LiteDb) !CompactReport {
     };
 }
 
-const lite_serve = if (antfly.build_options.linked_storage) struct {} else @import("antfly_source_root").antfly_sources.lite_serve;
-const ServeOptions = lite_serve.ServeOptions;
-const LiteListenAddress = lite_serve.LiteListenAddress;
-const parseServeOptions = lite_serve.parseServeOptions;
-const isReservedLiteServeFlag = lite_serve.isReservedLiteServeFlag;
-const parseLiteBool = lite_serve.parseLiteBool;
-const parseLiteListenAddress = lite_serve.parseLiteListenAddress;
-const isLiteLocalListenHost = lite_serve.isLiteLocalListenHost;
-
 fn batchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
     var owned = try batch_api.parseBatchRequest(allocator, body);
     defer owned.deinit(allocator);
@@ -1407,7 +1394,6 @@ fn printUsage(argv0: []const u8) void {
         \\  check <db.aflite>
         \\  compact <db.aflite>
         \\  vacuum <db.aflite>
-        \\  serve <db.aflite> --addr 127.0.0.1:8080 [--fsync <true|false>] [standalone options]
         \\
     , .{argv0});
 }
@@ -1432,61 +1418,6 @@ test "lite restore source validation accepts afb and aflite" {
     try requireRestoreSourcePath("app.afb");
     try requireRestoreSourcePath("app.aflite");
     try std.testing.expectError(error.InvalidArguments, requireRestoreSourcePath("app.db"));
-}
-
-test "lite serve parser preserves convenience flags and forwards standalone options" {
-    {
-        const argv = [_][*:0]const u8{"app.aflite"};
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        var opts = try parseServeOptions(std.testing.allocator, &args);
-        defer opts.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings("app.aflite", opts.path);
-        try std.testing.expectEqualStrings("127.0.0.1:8080", opts.addr);
-        try std.testing.expect(opts.fsync);
-        const listen = try parseLiteListenAddress(opts.addr);
-        try std.testing.expectEqualStrings("127.0.0.1", listen.host);
-        try std.testing.expectEqual(@as(u16, 8080), listen.port);
-    }
-    {
-        const argv = [_][*:0]const u8{ "app.aflite", "--fsync=false" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        var opts = try parseServeOptions(std.testing.allocator, &args);
-        defer opts.deinit(std.testing.allocator);
-        try std.testing.expect(!opts.fsync);
-    }
-    {
-        const argv = [_][*:0]const u8{ "app.aflite", "--addr", "127.0.0.1:9090" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        var opts = try parseServeOptions(std.testing.allocator, &args);
-        defer opts.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings("app.aflite", opts.path);
-        try std.testing.expectEqualStrings("127.0.0.1:9090", opts.addr);
-        const listen = try parseLiteListenAddress(opts.addr);
-        try std.testing.expectEqualStrings("127.0.0.1", listen.host);
-        try std.testing.expectEqual(@as(u16, 9090), listen.port);
-    }
-    {
-        const argv = [_][*:0]const u8{ "app.aflite", "--port", "9090" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        try std.testing.expectError(error.InvalidArguments, parseServeOptions(std.testing.allocator, &args));
-    }
-    {
-        const argv = [_][*:0]const u8{ "app.aflite", "--config", "production.json", "--admin-api-token", "secret" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        var opts = try parseServeOptions(std.testing.allocator, &args);
-        defer opts.deinit(std.testing.allocator);
-        try std.testing.expectEqualSlices([]const u8, &.{ "--config", "production.json", "--admin-api-token", "secret" }, opts.standalone_args.items);
-    }
-    try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress("127.0.0.1"));
-    try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress(":8080"));
-    try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress("0.0.0.0:8080"));
-    try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress("192.168.1.10:8080"));
-    try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress("[::]:8080"));
-    {
-        const listen = try parseLiteListenAddress("localhost:8080");
-        try std.testing.expectEqualStrings("localhost", listen.host);
-        try std.testing.expectEqual(@as(u16, 8080), listen.port);
-    }
 }
 
 test "lite promote parser requires values and derives default backup id" {

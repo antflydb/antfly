@@ -1,14 +1,23 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const background_runtime = @import("background_runtime.zig");
 const platform_time = @import("antfly_platform").time;
 const platform_sync = @import("antfly_platform").sync;
 
-var coordinator_boot_sequence: std.atomic.Value(u64) = .init(1);
+var coordinator_boot_sequence: @import("antfly_platform").atomic.Value(u64) = .init(1);
 
 pub const Operation = enum { check, compact, vacuum };
 pub const State = enum { queued, running, succeeded, failed, canceled };
@@ -365,7 +374,7 @@ test "storage maintenance requires an asynchronous backend runtime" {
 
 test "storage maintenance coordinator is idempotent and single flight" {
     const Fake = struct {
-        runs: std.atomic.Value(u64) = .init(0),
+        runs: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
         fn source(self: *@This()) Source {
             return .{ .ptr = self, .vtable = &.{ .status = status, .run = run } };

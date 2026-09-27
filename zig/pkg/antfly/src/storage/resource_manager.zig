@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -106,7 +106,7 @@ const PressureChange = if (supports_pressure_wait)
     struct {
         mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
         cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
-        epoch: std.atomic.Value(u64) = .init(0),
+        epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
         fn snapshot(self: *@This()) u64 {
             return self.epoch.load(.acquire);
@@ -129,7 +129,7 @@ const PressureChange = if (supports_pressure_wait)
     }
 else
     struct {
-        epoch: std.atomic.Value(u64) = .init(0),
+        epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
         fn snapshot(self: *@This()) u64 {
             return self.epoch.load(.acquire);
@@ -700,12 +700,12 @@ pub const DerivedRecoverableRetryStats = struct {
 };
 
 const DerivedRecoverableRetryCounters = struct {
-    total: std.atomic.Value(u64) = .init(0),
-    writer_locked: std.atomic.Value(u64) = .init(0),
-    resource_budget: std.atomic.Value(u64) = .init(0),
-    replay_document_not_visible: std.atomic.Value(u64) = .init(0),
-    artifact_repair_required: std.atomic.Value(u64) = .init(0),
-    not_found: std.atomic.Value(u64) = .init(0),
+    total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    writer_locked: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    resource_budget: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    replay_document_not_visible: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    artifact_repair_required: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    not_found: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     fn record(self: *@This(), err: anyerror) void {
         _ = self.total.fetchAdd(1, .monotonic);
@@ -831,18 +831,18 @@ pub const ResourceManager = struct {
     reclaimers: std.ArrayListUnmanaged(ReclaimerSlot) = .empty,
     next_reclaimer_identity: u64 = 1,
     reclaimer_cursor: usize = 0,
-    reclaim_requests: std.atomic.Value(u64) = .init(0),
-    reclaimed_bytes: std.atomic.Value(u64) = .init(0),
-    hbc_benefit_sample_counter: std.atomic.Value(u64) = .init(0),
+    reclaim_requests: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    reclaimed_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    hbc_benefit_sample_counter: @import("antfly_platform").atomic.Value(u64) = .init(0),
     hbc_cache_benefit: [@typeInfo(HbcCacheClass).@"enum".fields.len]HbcCacheBenefitState = .{HbcCacheBenefitState{}} ** @typeInfo(HbcCacheClass).@"enum".fields.len,
     pressure_change: PressureChange = .{},
     memory: MutableMemory,
-    latency_sensitive_derived_replay_sessions: std.atomic.Value(u64) = .init(0),
-    latency_sensitive_derived_replay_quiet_until_ns: std.atomic.Value(u64) = .init(0),
-    foreground_query_sessions: std.atomic.Value(u64) = .init(0),
-    foreground_query_quiet_until_ns: std.atomic.Value(u64) = .init(0),
-    foreground_write_sessions: std.atomic.Value(u64) = .init(0),
-    foreground_write_quiet_until_ns: std.atomic.Value(u64) = .init(0),
+    latency_sensitive_derived_replay_sessions: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    latency_sensitive_derived_replay_quiet_until_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    foreground_query_sessions: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    foreground_query_quiet_until_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    foreground_write_sessions: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    foreground_write_quiet_until_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     dense_search_admission_mutex: std.atomic.Mutex = .unlocked,
     dense_search_bandwidth_capacity_bytes: u64 = 0,
     dense_search_active_bytes: u64 = 0,
@@ -895,9 +895,9 @@ pub const ResourceManager = struct {
     dense_projection_pages_mutex: std.atomic.Mutex = .unlocked,
     dense_read_extra_tasks: std.atomic.Value(u32) = .init(0),
     dense_read_peak_extra_tasks: std.atomic.Value(u32) = .init(0),
-    dense_read_denied_tasks: std.atomic.Value(u64) = .init(0),
-    dense_physically_ordered_batches: std.atomic.Value(u64) = .init(0),
-    dense_physically_ordered_requests: std.atomic.Value(u64) = .init(0),
+    dense_read_denied_tasks: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    dense_physically_ordered_batches: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    dense_physically_ordered_requests: @import("antfly_platform").atomic.Value(u64) = .init(0),
     slices: [slice_count]MutableSlice,
     dense_replay_window_budget_bytes: u64 = 0,
     dense_replay_last_finish_ns: u64 = 0,

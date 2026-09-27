@@ -1,10 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Durable table-level store for mmap exact-vector blocks.
 //!
@@ -54,8 +60,8 @@ const wal_checkpoint_bytes: usize = 64 * 1024 * 1024;
 // publication/collection performs the full streaming consolidation.
 const checkpoint_merge_input_bytes: u64 = 4 * wal_checkpoint_bytes;
 const max_block_bytes: usize = if (@sizeOf(usize) >= 8) 8 * 1024 * 1024 * 1024 else std.math.maxInt(usize);
-var positional_read_test_nonce: std.atomic.Value(u64) = .init(0);
-var retained_block_identity: std.atomic.Value(u64) = .init(1);
+var positional_read_test_nonce: @import("antfly_platform").atomic.Value(u64) = .init(0);
+var retained_block_identity: @import("antfly_platform").atomic.Value(u64) = .init(1);
 
 pub fn checkpointBlockPathAlloc(alloc: Allocator, root_dir: []const u8, generation: u64, shard_id: u32) ![]u8 {
     const name = try std.fmt.allocPrint(alloc, "block-{d}-{d}.afvb", .{ generation, shard_id });
@@ -84,7 +90,7 @@ pub const RetainedBlock = struct {
 
     const Shared = struct {
         alloc: Allocator,
-        refs: std.atomic.Value(u64) = .init(1),
+        refs: @import("antfly_platform").atomic.Value(u64) = .init(1),
         identity: u64,
         payload: Payload,
     };
@@ -138,6 +144,7 @@ pub const RetainedBlock = struct {
     /// query can fault the page back without observing different bytes. Heap
     /// test/fallback blocks are allocator demand and must not be discarded.
     fn discardResidentPages(self: RetainedBlock) void {
+        if (comptime builtin.os.tag == .freestanding) return;
         switch (self.shared.payload) {
             .mapped => |mapped| std.posix.madvise(mapped.bytes.ptr, mapped.bytes.len, std.posix.MADV.DONTNEED) catch {},
             .heap => {},
@@ -150,6 +157,7 @@ pub const RetainedBlock = struct {
         if (shared.refs.fetchSub(1, .acq_rel) != 1) return;
         switch (shared.payload) {
             .mapped => |mapped| {
+                if (comptime builtin.os.tag == .freestanding) unreachable;
                 std.posix.munmap(mapped.bytes);
                 _ = std.posix.system.close(mapped.fd);
             },
@@ -245,6 +253,7 @@ pub const StagedBaseBuild = struct {
 
     pub fn deinit(self: *StagedBaseBuild) void {
         if (self.cleanup_staged) discardStagedBlocksAt(
+            self.alloc,
             self.storage,
             self.root_dir,
             self.staged,
@@ -271,19 +280,20 @@ pub const StagedWalCheckpoint = struct {
 };
 
 fn discardStagedBlocksAt(
+    alloc: Allocator,
     storage: lsm_backend.Storage,
     root_dir: []const u8,
     staged: []const StagedBlock,
 ) void {
     for (staged) |receipt| {
-        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const separator = if (std.mem.endsWith(u8, root_dir, std.fs.path.sep_str)) "" else std.fs.path.sep_str;
-        const path = std.fmt.bufPrint(&path_buffer, "{s}{s}block-{d}-{d}.afvb", .{
+        const path = std.fmt.allocPrint(alloc, "{s}{s}block-{d}-{d}.afvb", .{
             root_dir,
             separator,
             receipt.generation,
             receipt.shard_id,
         }) catch continue;
+        defer alloc.free(path);
         storage.deleteFileAbsolute(path) catch {};
     }
 }
@@ -795,7 +805,7 @@ pub const Store = struct {
     /// referenced by CURRENT until publication, so cleanup is safe even while
     /// readers retain the preceding generation.
     pub fn discardStagedBlocks(self: *const Store, staged: []const StagedBlock) void {
-        discardStagedBlocksAt(self.storage, self.root_dir, staged);
+        discardStagedBlocksAt(self.alloc, self.storage, self.root_dir, staged);
     }
 
     pub const StreamingBlock = struct {
@@ -1854,10 +1864,10 @@ pub const ReferenceLocationCache = struct {
     stripes: [16]Stripe = @splat(.{}),
     manager: ?*resources.ResourceManager = null,
     reclaimer: u64 = 0,
-    resident_bytes: std.atomic.Value(u64) = .init(0),
-    reclaimed_bytes: std.atomic.Value(u64) = .init(0),
-    hits: std.atomic.Value(u64) = .init(0),
-    misses: std.atomic.Value(u64) = .init(0),
+    resident_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    reclaimed_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    hits: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    misses: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn create(alloc: Allocator, count: usize) !*ReferenceLocationCache {
         return createWithPolicy(alloc, count, false);
@@ -1944,7 +1954,7 @@ pub const ReferenceLocationCache = struct {
         if (!stripe.mutex.tryLock()) return;
         defer stripe.mutex.unlock();
         if (self.adaptive) {
-            const probe = &stripe.probation[(hash >> 16) % stripe.probation.len];
+            const probe = &stripe.probation[@intCast((hash >> 16) % stripe.probation.len)];
             const fingerprint = hash | 1;
             if (probe.* != fingerprint) {
                 probe.* = fingerprint;
@@ -3992,8 +4002,8 @@ fn runPositionalReadBatchProfiled(
         next: std.atomic.Value(usize) = .init(0),
         manager: ?*resource_manager_mod.ResourceManager,
         profiled: bool,
-        worker_wall_ns: std.atomic.Value(u64) = .init(0),
-        worker_start_delay_ns: std.atomic.Value(u64) = .init(0),
+        worker_wall_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        worker_start_delay_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
         fn worker(work: *@This(), submitted: u64) std.Io.Cancelable!void {
             defer if (work.manager) |manager| manager.releaseDenseReadTask();
@@ -4903,24 +4913,26 @@ pub fn validateStagedBlock(store: *const Store, staged: StagedBlock) !ValidatedB
 fn readBlockValidated(store: *const Store, descriptor: vector_manifest.Segment) !ValidatedBlock {
     const path = try store.blockPathAlloc(descriptor.generation, descriptor.shard_id);
     defer store.alloc.free(path);
-    if (mapBlockFile(path)) |mapped| {
-        if (mapped.bytes.len == descriptor.bytes) {
-            if (vector_block.Reader.init(mapped.bytes)) |reader| {
-                if (reader.generation == descriptor.generation and reader.shard_id == descriptor.shard_id and
-                    reader.covered_source_sequence == descriptor.covered_source_sequence and reader.admissionChecksum() == descriptor.admission_checksum)
-                {
-                    const retained = RetainedBlock.init(store.alloc, .{ .mapped = mapped }) catch |err| {
-                        std.posix.munmap(mapped.bytes);
-                        _ = std.posix.system.close(mapped.fd);
-                        return err;
-                    };
-                    return .{ .block = retained, .reader = reader };
-                }
-            } else |_| {}
-        }
-        std.posix.munmap(mapped.bytes);
-        _ = std.posix.system.close(mapped.fd);
-    } else |_| {}
+    if (comptime builtin.os.tag != .freestanding) {
+        if (mapBlockFile(path)) |mapped| {
+            if (mapped.bytes.len == descriptor.bytes) {
+                if (vector_block.Reader.init(mapped.bytes)) |reader| {
+                    if (reader.generation == descriptor.generation and reader.shard_id == descriptor.shard_id and
+                        reader.covered_source_sequence == descriptor.covered_source_sequence and reader.admissionChecksum() == descriptor.admission_checksum)
+                    {
+                        const retained = RetainedBlock.init(store.alloc, .{ .mapped = mapped }) catch |err| {
+                            std.posix.munmap(mapped.bytes);
+                            _ = std.posix.system.close(mapped.fd);
+                            return err;
+                        };
+                        return .{ .block = retained, .reader = reader };
+                    }
+                } else |_| {}
+            }
+            std.posix.munmap(mapped.bytes);
+            _ = std.posix.system.close(mapped.fd);
+        } else |_| {}
+    }
     const bytes = store.storage.readFileAlloc(store.alloc, path, boundedReadLimit(max_block_bytes)) catch |err| switch (err) {
         error.FileNotFound => return error.MissingVectorBlock,
         else => return err,

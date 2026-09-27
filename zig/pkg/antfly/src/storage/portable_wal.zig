@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
@@ -21,6 +21,34 @@ const storage_io = @import("lsm_backend/storage_io.zig");
 const storage_sim = @import("sim_runtime.zig");
 
 pub const CommitStats = struct {};
+
+test "portable WAL read-only mutations fail without changing persisted bytes" {
+    var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    const storage = memory.storage();
+    var writer = try WAL.open("/wal", .{ .storage = storage });
+    try std.testing.expectEqual(@as(u64, 1), try writer.append("retained"));
+    writer.abandonAfterCrash();
+
+    const original = try storage.readFileAlloc(std.testing.allocator, "/wal/log.bin", 1024);
+    defer std.testing.allocator.free(original);
+    var reader = try WAL.open("/wal", .{ .storage = storage, .read_only = true });
+    defer reader.close();
+    try std.testing.expectError(error.ReadOnly, reader.append("forbidden"));
+    try std.testing.expectError(error.ReadOnly, reader.appendBatch(&.{}));
+    try std.testing.expectError(error.ReadOnly, reader.truncate(1));
+    try reader.checkpointLsmWalAfterDurableBoundary();
+    const persisted = try storage.readFileAlloc(std.testing.allocator, "/wal/log.bin", 1024);
+    defer std.testing.allocator.free(persisted);
+    try std.testing.expectEqualSlices(u8, original, persisted);
+    const entries = try reader.iterateFrom(std.testing.allocator, 1);
+    defer {
+        for (entries) |entry| std.testing.allocator.free(@constCast(entry.data));
+        std.testing.allocator.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("retained", entries[0].data);
+}
 
 pub const CommitBackend = enum {
     sync,
@@ -36,6 +64,7 @@ pub const StorageBackend = enum {
 };
 
 pub const WalOptions = struct {
+    read_only: bool = false,
     map_size: usize = 64 * 1024 * 1024,
     no_sync: bool = false,
     artificial_sync_delay_ns: u64 = 0,
@@ -106,6 +135,7 @@ pub const ScanAction = enum {
 
 pub const WAL = struct {
     alloc: Allocator,
+    read_only: bool = false,
     storage: storage_io.Storage,
     root_path: []u8,
     log_path: []u8,
@@ -122,7 +152,7 @@ pub const WAL = struct {
         const log_path = try std.fmt.allocPrint(alloc, "{s}/log.bin", .{root_path});
         errdefer alloc.free(log_path);
 
-        try storage.createDirPath(root_path);
+        if (!opts.read_only) try storage.createDirPath(root_path);
 
         const log_bytes = storage.readFileAlloc(alloc, log_path, std.math.maxInt(usize)) catch |err| switch (err) {
             error.FileNotFound => try alloc.alloc(u8, 0),
@@ -132,12 +162,18 @@ pub const WAL = struct {
 
         return .{
             .alloc = alloc,
+            .read_only = opts.read_only,
             .storage = storage,
             .root_path = root_path,
             .log_path = log_path,
             .next_lsn = computeNextLsn(log_bytes),
             .log_bytes = log_bytes,
         };
+    }
+
+    /// Portable WAL owns buffers only; crash abandonment never publishes them.
+    pub fn abandonAfterCrash(self: *WAL) void {
+        self.close();
     }
 
     pub fn close(self: *WAL) void {
@@ -153,6 +189,7 @@ pub const WAL = struct {
     }
 
     pub fn appendBatch(self: *WAL, entries: []const []const u8) !BatchAppendResult {
+        if (self.read_only) return error.ReadOnly;
         if (entries.len == 0) {
             return .{ .first_lsn = self.next_lsn, .count = 0 };
         }
@@ -217,6 +254,7 @@ pub const WAL = struct {
     }
 
     pub fn truncate(self: *WAL, up_to_lsn: u64) !void {
+        if (self.read_only) return error.ReadOnly;
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
@@ -285,6 +323,9 @@ pub const WAL = struct {
     }
 
     pub fn sync(_: *WAL, _: bool) !void {}
+
+    /// Whole-file publication has no separate physical LSM WAL to checkpoint.
+    pub fn checkpointLsmWalAfterDurableBoundary(_: *WAL) !void {}
 };
 
 const ParsedEntry = struct {

@@ -109,7 +109,6 @@ extern fn antfly_runtime_storage(context: *const runtime_bridge.Context) callcon
 extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standalone(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_lite(context: *const runtime_bridge.Context) callconv(.c) c_int;
-extern fn antfly_runtime_standalone_lite(context: *const runtime_bridge.Context) callconv(.c) c_int;
 
 pub fn runRuntimeUnit(
     comptime role: RuntimeRole,
@@ -156,10 +155,7 @@ pub fn runRuntimeUnit(
         .storage => antfly_runtime_storage(&context),
         .serverless => antfly_runtime_serverless(&context),
         .standalone => if (std.mem.eql(u8, command, "lite"))
-            if (argument_views.items.len > 0 and std.mem.eql(u8, argument_views.items[0].slice(), "serve"))
-                antfly_runtime_standalone_lite(&context)
-            else
-                antfly_runtime_lite(&context)
+            antfly_runtime_lite(&context)
         else
             antfly_runtime_standalone(&context),
     };

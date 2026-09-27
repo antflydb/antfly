@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Immutable bounded scalar bytecode. Names, types, literals and operations
 //! determine identity; schema epochs and physical ordinals do not.
@@ -1000,36 +1000,6 @@ test "relational declarations generated FK assignment actions cannot overwrite d
     const deletion = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
     defer alloc.free(deletion);
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, impl.parseSchema(alloc, deletion));
-}
-
-test "relational declarations metadata generated update admission precedes catalog publication" {
-    const alloc = std.testing.allocator;
-    const json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"x","expression":{"op":"literal","type":"integer","value":"2"}}],"generated_columns":[{"column":"y","expression":{"op":"column","column":"x"}},{"column":"z","expression":{"op":"column","column":"y"}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"z":{"type":"integer"}},"additionalProperties":false}}}}
-    ;
-    const manager = @import("../metadata/table_manager.zig");
-    const tables = @import("../api/tables.zig");
-    const table: manager.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = json, .indexes_json = "{}" };
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{ .parse_numbers = false });
-    defer parsed.deinit();
-    const arena = parsed.arena.allocator();
-    const declarations = parsed.value.object.getPtr("generated_columns").?.array.items;
-    std.mem.swap(std.json.Value, &declarations[0], &declarations[1]);
-    const default_value = parsed.value.object.getPtr("column_defaults").?.array.items[0].object.getPtr("expression").?.object.getPtr("value").?;
-    default_value.* = .{ .string = "4" };
-    const reordered = try std.json.Stringify.valueAlloc(arena, parsed.value, .{});
-    const updated = try tables.applySchemaUpdateRecord(alloc, &table, reordered);
-    defer manager.freeTable(alloc, updated);
-    const y_expression = declarations[1].object.getPtr("expression").?;
-    y_expression.* = (try std.json.parseFromSlice(std.json.Value, arena, "{\"op\":\"literal\",\"type\":\"integer\",\"value\":99}", .{})).value;
-    const changed = try std.json.Stringify.valueAlloc(arena, parsed.value, .{});
-    try std.testing.expectError(error.GeneratedColumnRewriteRequired, tables.applySchemaUpdateRecord(alloc, &table, changed));
-    try std.testing.expectEqualStrings(json, table.schema_json);
-    _ = parsed.value.object.orderedRemove("generated_columns");
-    const removed = try std.json.Stringify.valueAlloc(arena, parsed.value, .{});
-    try std.testing.expectError(error.GeneratedColumnRewriteRequired, tables.applySchemaUpdateRecord(alloc, &table, removed));
-    const plain: manager.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = removed, .indexes_json = "{}" };
-    try std.testing.expectError(error.GeneratedColumnRewriteRequired, tables.applySchemaUpdateRecord(alloc, &plain, json));
 }
 
 test "relational declarations omitted scalar literal value is typed NULL for generated SDKs" {

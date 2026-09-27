@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -118,6 +118,7 @@ pub const WriteProfile = struct {
 };
 
 pub const SparseIndex = struct {
+    doc_count: u64 = 0,
     next_doc_num: u64 = 0,
     chunk_size: u32 = 1024,
 
@@ -149,7 +150,13 @@ pub const SparseIndex = struct {
 
     pub fn close(_: *SparseIndex) void {}
 
+    pub fn abandonAfterCrash(_: *SparseIndex) void {}
+
     pub fn sync(_: *SparseIndex, _: bool) !void {}
+
+    pub fn checkpointLsmWalAfterDurableBoundary(_: *SparseIndex) !void {
+        return error.UnsupportedPlatform;
+    }
 
     pub fn syncReplayState(_: *SparseIndex) !void {
         return error.UnsupportedPlatform;

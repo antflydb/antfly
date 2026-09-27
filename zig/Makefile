@@ -101,6 +101,7 @@ license-headers: ## Add license headers to first-party source files.
 
 license-check: ## Check first-party source files have license headers.
 	$(SCRIPTS_PY) ../scripts/license_headers.py --check
+	$(SCRIPTS_PY) ../scripts/check_apache_boundary.py
 
 tla-tools:
 	@bash ../scripts/tla-tools.sh

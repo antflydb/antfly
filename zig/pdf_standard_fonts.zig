@@ -12,5 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub const regular = @embedFile("pkg/antfly/antfarm/fonts/Aeonik-Regular.ttf");
-pub const bold = @embedFile("pkg/antfly/antfarm/fonts/Aeonik-Bold.ttf");
+pub const regular = @embedFile("lib/pdf/fonts/roboto/Roboto-Regular.ttf");
+pub const bold = @embedFile("lib/pdf/fonts/roboto/Roboto-Bold.ttf");

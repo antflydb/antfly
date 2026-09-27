@@ -12,14 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Copyright 2026 Antfly, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-
 /**
  * Coverage beyond the shared conformance cases for the storage_kind /
  * cross-storage-restore surface added in the capi/naming-cleanup ABI

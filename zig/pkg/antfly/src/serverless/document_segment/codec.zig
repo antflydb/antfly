@@ -4,7 +4,7 @@
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
 // the Elastic License 2.0 at
 //
-// https://www.antfly.io/licensing/ELv2-license
+//     https://www.antfly.io/licensing/ELv2-license
 //
 // Unless required by applicable law or agreed to in writing, software distributed
 // under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT

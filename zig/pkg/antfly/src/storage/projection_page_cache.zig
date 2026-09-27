@@ -1,3 +1,17 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Node-wide optional clean-page cache. Keys identify an immutable open file,
 //! not a path or generation number that another index might reuse. Readers
 //! copy under a short stripe lock; no I/O or resource admission holds that lock.
@@ -22,10 +36,10 @@ pub const Cache = struct {
     metadata: resources.Reservation,
     reclaimer: u64 = 0,
     entries: [slot_count]Entry = @splat(.{}),
-    hits: std.atomic.Value(u64) = .init(0),
-    misses: std.atomic.Value(u64) = .init(0),
-    resident: std.atomic.Value(u64) = .init(0),
-    reclaimed: std.atomic.Value(u64) = .init(0),
+    hits: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    misses: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    resident: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    reclaimed: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn create(manager: *resources.ResourceManager) !*Cache {
         var reservation = try manager.reserveImmediate(.hbc_node_metadata_cache, @sizeOf(Cache));
@@ -41,7 +55,7 @@ pub const Cache = struct {
         var key: [16]u8 = undefined;
         std.mem.writeInt(u64, key[0..8], file, .little);
         std.mem.writeInt(u64, key[8..16], @intCast(offset), .little);
-        return &self.entries[std.hash.Wyhash.hash(0, &key) & (slot_count - 1)];
+        return &self.entries[@intCast(std.hash.Wyhash.hash(0, &key) & (slot_count - 1))];
     }
 
     pub const Lookup = enum { hit, miss, admit };

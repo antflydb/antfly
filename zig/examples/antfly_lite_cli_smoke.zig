@@ -1,10 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 
@@ -20,6 +26,7 @@ pub fn main(init: std.process.Init) !void {
 
     const allocator = init.gpa;
     const io = init.io;
+    try expectServeRemoved(allocator, io, antfly_path);
     const pid: u32 = @intCast(std.posix.system.getpid());
     const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/lite-cli-smoke-{d}", .{pid});
     defer allocator.free(root);
@@ -196,6 +203,22 @@ fn expectCommandContains(
         printCommandFailure(argv, result.stdout, result.stderr);
         return error.UnexpectedOutput;
     }
+}
+
+fn expectServeRemoved(allocator: std.mem.Allocator, io: std.Io, antfly_path: []const u8) !void {
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ antfly_path, "lite", "serve", "--help" },
+        .stdout_limit = .limited(max_output_bytes),
+        .stderr_limit = .limited(max_output_bytes),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return error.RemovedServeCommandSucceeded,
+        else => return error.CommandFailed,
+    }
+    if (std.mem.indexOf(u8, result.stderr, "unknown lite subcommand: serve") == null)
+        return error.UnexpectedOutput;
 }
 
 fn printCommandFailure(argv: []const []const u8, stdout: []const u8, stderr: []const u8) void {

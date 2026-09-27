@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -123,7 +123,7 @@ else
         }
     };
 
-var file_pin_release_epoch: std.atomic.Value(u64) = .init(0);
+var file_pin_release_epoch: @import("antfly_platform").atomic.Value(u64) = .init(0);
 
 const ObsoletePathRefRegistry = struct {
     mutex: std.atomic.Mutex = .unlocked,
@@ -5729,7 +5729,7 @@ pub const Backend = struct {
         return live.tree.root == durable.tree.root;
     }
 
-    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool) !usize {
+    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool) !u64 {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         var turn = try self.beginManifestTurn();
         defer turn.deinit();
@@ -5738,7 +5738,7 @@ pub const Backend = struct {
 
     /// Caller owns the publication lane and backend lock. Administrative callers
     /// acquire that lane before constructing their prospective ownership graph.
-    fn writeRunSetManifestSnapshotInTurnLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool, waited: bool) !usize {
+    fn writeRunSetManifestSnapshotInTurnLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool, waited: bool) !u64 {
         std.debug.assert(self.manifest_publish_in_flight);
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         self.manifest_publish_allow_concurrency = live;
@@ -8136,22 +8136,18 @@ pub const Backend = struct {
         const runs_dir = try std.fs.path.join(self.allocator, &.{ root_dir, "runs" });
         defer self.allocator.free(runs_dir);
 
-        var io_impl = std.Io.Threaded.init(self.allocator, .{});
-        defer io_impl.deinit();
-
-        var dir = std.Io.Dir.cwd().openDir(io_impl.io(), runs_dir, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return .{},
+        const storage = self.storage.?;
+        const names = storage.listFileNamesAlloc(self.allocator, runs_dir) catch |err| switch (err) {
+            error.FileNotFound, error.DirectoryListingUnsupported => return .{},
             else => return err,
         };
-        defer dir.close(io_impl.io());
+        defer storage_io.Storage.freeFileNames(self.allocator, names);
 
         var stats = RecoveredRunFileCleanupStats{};
-        var it = dir.iterate();
-        while (try it.next(io_impl.io())) |entry| {
-            if (entry.kind != .file) continue;
-            _ = parseRunIdFromRecoveredTableTempFileName(entry.name) orelse continue;
+        for (names) |name| {
+            _ = parseRunIdFromRecoveredTableTempFileName(name) orelse continue;
 
-            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, entry.name });
+            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, name });
             defer self.allocator.free(path);
             const size = self.storage.?.fileSize(path) catch 0;
             repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, path) catch |err| switch (err) {
@@ -8172,23 +8168,19 @@ pub const Backend = struct {
         const runs_dir = try std.fs.path.join(self.allocator, &.{ root_dir, "runs" });
         defer self.allocator.free(runs_dir);
 
-        var io_impl = std.Io.Threaded.init(self.allocator, .{});
-        defer io_impl.deinit();
-
-        var dir = std.Io.Dir.cwd().openDir(io_impl.io(), runs_dir, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return .{},
+        const storage = self.storage.?;
+        const names = storage.listFileNamesAlloc(self.allocator, runs_dir) catch |err| switch (err) {
+            error.FileNotFound, error.DirectoryListingUnsupported => return .{},
             else => return err,
         };
-        defer dir.close(io_impl.io());
+        defer storage_io.Storage.freeFileNames(self.allocator, names);
 
         var stats: RecoveredRunFileCleanupStats = .{};
-        var it = dir.iterate();
-        while (try it.next(io_impl.io())) |entry| {
-            if (entry.kind != .file) continue;
-            const run_id = parseRunIdFromTableFileName(entry.name) orelse continue;
+        for (names) |name| {
+            const run_id = parseRunIdFromTableFileName(name) orelse continue;
             if (self.runIdTrackedByManifestLocked(run_id)) continue;
 
-            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, entry.name });
+            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, name });
             defer self.allocator.free(path);
             if (self.pathTrackedByManifestLocked(path) or self.obsoletePathPinnedByOpenVersion(path)) continue;
 
@@ -8200,9 +8192,14 @@ pub const Backend = struct {
             stats.files_deleted +|= 1;
             stats.bytes_deleted +|= size;
         }
-        const manifest_stats = try self.cleanupOrphanedManifestFilesForSet(io_impl.io());
-        stats.files_deleted +|= manifest_stats.files_deleted;
-        stats.bytes_deleted +|= manifest_stats.bytes_deleted;
+        // Manifest-set inventory requires the native exclusive writer lease.
+        if (builtin.os.tag != .freestanding) {
+            var io_impl = std.Io.Threaded.init(self.allocator, .{});
+            defer io_impl.deinit();
+            const manifest_stats = try self.cleanupOrphanedManifestFilesForSet(io_impl.io());
+            stats.files_deleted +|= manifest_stats.files_deleted;
+            stats.bytes_deleted +|= manifest_stats.bytes_deleted;
+        }
         return stats;
     }
 

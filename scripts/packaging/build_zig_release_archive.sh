@@ -17,21 +17,26 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
+usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--product server|lite] [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
 
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
   antfly
-  completions/
+  completions/ (server only)
   share/
   lib/
   include/
   README.md
   LICENSE
   THIRD_PARTY_NOTICES.md
+  LICENSING.md
+  scripts/apache_engine_files.txt
+  LICENSES/Apache-2.0.txt
+  LICENSES/Elastic-2.0.txt
 EOF
 }
 
+product=server
 version=
 target=
 archive_name=
@@ -44,6 +49,10 @@ jobs=
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --product)
+      product="${2:?missing --product value}"
+      shift 2
+      ;;
     --version)
       version="${2:?missing --version value}"
       shift 2
@@ -92,6 +101,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+case "$product" in
+  server|lite) ;;
+  *) echo "invalid --product: $product (expected server or lite)" >&2; exit 2 ;;
+esac
+
 if [ -z "$version" ] || [ -z "$target" ] || [ -z "$archive_name" ] || [ -z "$out_dir" ]; then
   usage
   exit 2
@@ -129,7 +143,7 @@ if ! [[ "$source_date_epoch" =~ ^[0-9]+$ ]]; then
 fi
 export SOURCE_DATE_EPOCH="$source_date_epoch"
 
-work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${target}"
+work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${product}-${target}"
 prefix="${work_root}/zig-out"
 stage="${work_root}/stage"
 local_cache="${work_root}/zig-cache"
@@ -256,7 +270,11 @@ run_zig_build_steps_with_retry() {
   # Runtime archives carry measured max-RSS admission claims. Independent units
   # can compile concurrently when they fit the release memory budget; there are
   # no artificial ordering dependencies between those compilations.
-  run_zig_build_steps_with_retry archive antfly capi
+  if [ "$product" = lite ]; then
+    run_zig_build_steps_with_retry archive lite
+  else
+    run_zig_build_steps_with_retry archive antfly capi
+  fi
 )
 
 test -x "$prefix/bin/antfly"
@@ -277,9 +295,23 @@ if [ -d "$prefix/include" ]; then
   cp -R "$prefix/include" "$stage/include"
 fi
 cp "$repo_root/README.md" "$stage/README.md"
-cp "$repo_root/LICENSE" "$stage/LICENSE"
+cp "$repo_root/LICENSING.md" "$stage/LICENSING.md"
+mkdir -p "$stage/scripts"
+cp "$repo_root/scripts/apache_engine_files.txt" "$stage/scripts/apache_engine_files.txt"
+cp "$repo_root/scripts/embedded_asset_licenses.json" "$stage/scripts/embedded_asset_licenses.json"
+mkdir -p "$stage/LICENSES"
+cp "$repo_root/LICENSES/Apache-2.0.txt" "$stage/LICENSES/Apache-2.0.txt"
+cp "$repo_root/LICENSES/Elastic-2.0.txt" "$stage/LICENSES/Elastic-2.0.txt"
+cp -R "$repo_root/LICENSES/third-party" "$stage/LICENSES/third-party"
+if [ "$product" = lite ]; then
+  cp "$repo_root/LICENSES/Apache-2.0.txt" "$stage/LICENSE"
+else
+  cp "$repo_root/LICENSE" "$stage/LICENSE"
+fi
 cp "$repo_root/THIRD_PARTY_NOTICES.md" "$stage/THIRD_PARTY_NOTICES.md"
-"$repo_root/scripts/completions.sh" "$stage/completions"
+if [ "$product" = server ]; then
+  "$repo_root/scripts/completions.sh" "$stage/completions"
+fi
 
 python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
   --source "$stage" \
@@ -289,7 +321,12 @@ tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
 grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "./THIRD_PARTY_NOTICES.md" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null
-grep -Fx "./completions/antfly.bash" "$work_root/archive-contents.txt" >/dev/null
-grep -Fx "./completions/antfly.zsh" "$work_root/archive-contents.txt" >/dev/null
-grep -Fx "./completions/antfly.fish" "$work_root/archive-contents.txt" >/dev/null
+if [ "$product" = server ]; then
+  grep -Fx "./completions/antfly.bash" "$work_root/archive-contents.txt" >/dev/null
+  grep -Fx "./completions/antfly.zsh" "$work_root/archive-contents.txt" >/dev/null
+  grep -Fx "./completions/antfly.fish" "$work_root/archive-contents.txt" >/dev/null
+fi
+grep -Fx "./LICENSES/Elastic-2.0.txt" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "./LICENSES/Apache-2.0.txt" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "./scripts/apache_engine_files.txt" "$work_root/archive-contents.txt" >/dev/null
 echo "wrote $out_dir/$archive_name"

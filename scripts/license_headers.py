@@ -19,11 +19,15 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from asset_licenses import check_asset_records
+from qualification_provenance import check_frozen_helpers, frozen_pins
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
@@ -31,15 +35,16 @@ REPO_ROOT = ROOT
 
 ELV2_ROOTS = (
     "zig/pkg/antfly",
-    "zig/pkg/antfly-embedded",
     "zig/e2e/antfly",
 )
 
 APACHE_ROOTS = (
     "zig/build.zig",
     "zig/build.zig.zon",
+    "zig/pkg/antfly-embedded",
     "zig/pkg/antfly-client",
     "zig/pkg/inference",
+    "zig/pkg/inference-client",
     "zig/lib",
     "zig/e2e/inference",
     "go/pkg/lite",
@@ -64,7 +69,9 @@ APACHE_ROOTS = (
 # Files inside an ELv2 root that are Apache-2.0 anyway. The public C ABI
 # header is vendored or transcribed by the Apache-licensed Lite bindings.
 APACHE_FILES = {
-    "zig/pkg/antfly/include/antfly.h",
+    line.strip()
+    for line in (SCRIPT_DIR / "apache_engine_files.txt").read_text().splitlines()
+    if line.strip() and not line.startswith("#")
 }
 EXCLUDED_PARTS = {
     ".git",
@@ -86,12 +93,26 @@ EXCLUDED_PARTS = {
 
 EXCLUDED_GLOBS = (
     "deps/**",
+    # Vendored MIT fork: package license covers sources without per-file notices.
+    "zig/lib/httpx/**",
+    # Bundled frontend output retains upstream and generator headers.
+    "zig/pkg/antfly/antfarm/assets/**",
     "specs/tla/*etcdraft*",
     "scripts/uv.lock",
     "e2e/*/uv.lock",
     # Its generator emits the Apache header; CI checks the file is current.
     "rs/crates/sdk/src/graph_identifier_policy_generated.rs",
 )
+
+# These adapted/vendored sources retain their upstream or combined notices.
+# Validate them separately rather than replacing them with a first-party header.
+PRESERVED_NOTICES = json.loads(
+    (SCRIPT_DIR / "preserved_license_notices.json").read_text()
+)
+# Retained qualification tooling is licensed by its Apache package LICENSE.
+# Its exact bytes identify recorded evidence, so check pins instead of rewriting.
+FROZEN_FILES = {name for name, _, _ in frozen_pins(ROOT)}
+
 
 SLASH_EXTS = {
     ".c",
@@ -111,6 +132,7 @@ SLASH_EXTS = {
     ".wgsl",
     ".zig",
     ".zon",
+    ".y",
 }
 
 HASH_EXTS = {
@@ -156,6 +178,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="print changed or non-compliant files",
     )
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        help="optional source paths to normalize (relative to the current directory)",
+    )
     return parser.parse_args()
 
 
@@ -184,7 +211,7 @@ def is_under(path: str, roots: tuple[str, ...]) -> bool:
 
 def excluded(path: str) -> bool:
     parts = set(Path(path).parts)
-    if parts & EXCLUDED_PARTS:
+    if path in PRESERVED_NOTICES or path in FROZEN_FILES or parts & EXCLUDED_PARTS:
         return True
     return any(fnmatch.fnmatch(path, pattern) for pattern in EXCLUDED_GLOBS)
 
@@ -266,30 +293,49 @@ def strip_existing_antfly_header(text: str, path: Path) -> tuple[str, int]:
     if (
         not first.startswith(prefix)
         or "Copyright " not in first
-        or "Antfly, Inc." not in first
+        or not any(
+            owner in first for owner in ("Antfly, Inc.", "The Antfly Contributors")
+        )
     ):
         return text, offset
 
+    # Stop at the legal notice's final line, even when usage comments follow
+    # without an uncommented blank line. Comments after the notice are source.
     end = offset + 1
-    scan_limit = min(len(lines), offset + 40)
-    while end < scan_limit:
+    while end < min(len(lines), offset + 40):
         line = lines[end].strip()
-        if line and not line.startswith(prefix):
-            return text, offset
-        end += 1
-        if "limitations" in line:
+        if (
+            not line
+            or not line.startswith(prefix)
+            or line.startswith((prefix + "!", prefix + "/"))
+        ):
             break
-    else:
+        end += 1
+        body = line[len(prefix) :].strip()
+        if (
+            body == "limitations."
+            or body.startswith("SPDX-License-Identifier:")
+            or body == "except in compliance with the Elastic License 2.0."
+            or body == "Licensed under the Elastic License 2.0 (ELv2)."
+        ):
+            break
+    notice = "".join(lines[offset:end])
+    if not any(
+        marker in notice for marker in ("Licensed under", "SPDX-License-Identifier:")
+    ) or not any(name in notice for name in ("Apache", "Elastic", "ELv2")):
         return text, offset
-
     while end < len(lines) and lines[end].strip() == "":
         end += 1
-
     return "".join(lines[:offset] + lines[end:]), offset
 
 
 def apply_header(text: str, path: Path, header: Header) -> str:
     stripped, offset = strip_existing_antfly_header(text, path)
+    while True:
+        cleaned, offset = strip_existing_antfly_header(stripped, path)
+        if cleaned == stripped:
+            break
+        stripped = cleaned
     lines = stripped.splitlines(keepends=True)
     # The rendered header ends with its own blank line; drop any the body
     # already starts with so applying twice gives the same result.
@@ -301,15 +347,67 @@ def apply_header(text: str, path: Path, header: Header) -> str:
     return "".join(lines[:offset]) + rendered + "".join(lines[offset:])
 
 
+def normalized_notice(text: str) -> str:
+    # Ignore source comment decoration and whitespace, while retaining every
+    # copyright, condition, and disclaimer word from the canonical notice.
+    lines = [re.sub(r"^\s*(?://|\*) ?", "", line) for line in text.splitlines()]
+    return " ".join("\n".join(lines).split())
+
+
+def check_preserved_notices(selected_group: str) -> list[str]:
+    errors = []
+    bundle = ROOT / "THIRD_PARTY_NOTICES.md"
+    bundle_text = normalized_notice(bundle.read_text()) if bundle.is_file() else ""
+    for name, definition in PRESERVED_NOTICES.items():
+        if group_for(name, selected_group) is None:
+            continue
+        canonical = ROOT / definition["file"]
+        if not canonical.is_file() or not canonical.read_text().strip():
+            errors.append(f"missing canonical license notice: {canonical}")
+            continue
+        expected = normalized_notice(canonical.read_text())
+        path = ROOT / name
+        if not path.is_file():
+            errors.append(f"missing source with preserved license: {name}")
+        elif expected not in normalized_notice(path.read_text()) or any(
+            required not in path.read_text()
+            for required in definition.get("required", ())
+        ):
+            errors.append(f"missing or changed preserved license notice: {name}")
+        if expected not in bundle_text:
+            errors.append(f"missing bundled license notice: {definition['file']}")
+    return sorted(set(errors))
+
+
 def main() -> int:
     args = parse_args()
     headers = {
         "apache": read_header("apache"),
         "elv2": read_header("elv2"),
     }
+    errors = check_preserved_notices(args.group)
+    if args.group in ("all", "apache"):
+        errors.extend(check_frozen_helpers(ROOT))
+        errors.extend(check_asset_records(ROOT))
+    if errors:
+        for error in errors:
+            print(error, file=sys.stderr)
+        return 1
     changed: list[str] = []
 
-    for path, group in discover(args.group):
+    selected_paths = {Path(name).resolve() for name in args.paths}
+    files = discover(args.group)
+    unknown_paths = selected_paths - {path.resolve() for path, _ in files}
+    if unknown_paths:
+        for path in sorted(unknown_paths):
+            print(
+                f"source path is outside the selected first-party policy: {path}",
+                file=sys.stderr,
+            )
+        return 1
+    for path, group in files:
+        if selected_paths and path.resolve() not in selected_paths:
+            continue
         original = path.read_text()
         updated = apply_header(original, path, headers[group])
         if updated == original:

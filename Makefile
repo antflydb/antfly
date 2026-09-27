@@ -72,7 +72,7 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check fmt fmt-check repository-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main release-scripting-test
+.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check fmt fmt-check repository-check lint license-headers license-check apache-license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main release-scripting-test
 .PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check zig-checksums-check
 
 build-antfarm: build-antfarm-main
@@ -116,8 +116,12 @@ graph-identifier-check:
 license-headers: ## Add first-party license headers.
 	$(SCRIPTS_PY) scripts/license_headers.py
 
+apache-license-check: ## Check Apache engine headers and server dependency boundary.
+	$(SCRIPTS_PY) scripts/check_apache_boundary.py
+
 license-check: ## Check first-party license headers.
 	$(SCRIPTS_PY) scripts/license_headers.py --check
+	$(SCRIPTS_PY) scripts/check_apache_boundary.py
 
 zig-build:
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"

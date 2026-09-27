@@ -550,6 +550,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     inference_pjrt_mod.addImport("xla_proto", inference_pjrt_xla_proto_mod);
 
     const tokenizer = @import("lib/tokenizer/build_support.zig").create(b, .{
+        .platform = platform_mod,
         .root = b.path("lib/tokenizer"),
         .target = target,
         .optimize = optimize,
@@ -636,6 +637,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         "sentencepiece_proto",
         sentencepiece_proto_mod,
     );
+    hf_tokenizer_tests.root_module.addImport("antfly_platform", platform_mod);
     const run_hf_tokenizer_tests = b.addRunArtifact(hf_tokenizer_tests);
     const hf_tokenizer_test_step = b.step(
         "lib-tokenizer-test",
@@ -668,6 +670,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     synthesizing_mod.addImport("httpx", httpx_mod);
 
     const inference_workflow = @import("pkg/inference/build/context.zig").Context{
+        .install_apache_licenses = @import("lib/product_licenses/build.zig").installApache,
         .b = b,
         .target = target,
         .optimize = optimize,
@@ -1483,8 +1486,8 @@ pub fn create(b: *std.Build) ?Artifacts {
         .name = "antfly-lite",
         .root_module = lite_main_mod,
     });
-    // Lite administration shares storage; serving shares the server runtime.
-    for ([_]RuntimeLibraryUnit{ .storage_kernel, .distributed, .api_kernel, .enrichment_compute, .inference }) |unit| {
+    lite_main.root_module.linkLibrary(runtime.lite_storage);
+    for ([_]RuntimeLibraryUnit{ .enrichment_compute, .inference }) |unit| {
         lite_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);
     }
     const lite_cli_smoke = b.addExecutable(.{
@@ -1514,6 +1517,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lite_step.dependOn(&install_lite_main.step);
     lite_step.dependOn(&install_libantfly.step);
     lite_step.dependOn(&install_capi_header.step);
+    lite_step.dependOn(embedded.install_licenses);
 
     const lite_test_step = b.step("lite-test", "Run Lite backend, CLI, bindings, examples, and C ABI packaging checks");
     lite_test_step.dependOn(&run_antfly_main_tests.step);

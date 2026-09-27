@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Table-owned immutable column blocks and a transactionally maintained dirty
 //! key directory. Scans merge typed blocks with authoritative row deltas in
@@ -61,36 +61,36 @@ const null_bytes = max_rows / 8;
 /// Process-local observations, sampled without taking the maintenance lock.
 /// The fairness cursor itself is durable and advances even when a build fails.
 pub const Maintenance = struct {
-    cell_slots_examined: std.atomic.Value(u64) = .init(0),
-    payloads_reused: std.atomic.Value(u64) = .init(0),
-    payload_bytes_written: std.atomic.Value(u64) = .init(0),
-    payload_encoding_bytes: std.atomic.Value(u64) = .init(0),
-    payload_slices_repacked: std.atomic.Value(u64) = .init(0),
+    cell_slots_examined: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    payloads_reused: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    payload_bytes_written: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    payload_encoding_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    payload_slices_repacked: @import("antfly_platform").atomic.Value(u64) = .init(0),
     pending: std.atomic.Value(bool) = .init(false),
     backing_off: std.atomic.Value(bool) = .init(false),
-    retry_after_ns: std.atomic.Value(u64) = .init(0),
-    observed_since_ns: std.atomic.Value(u64) = .init(0),
-    passes: std.atomic.Value(u64) = .init(0),
-    ranges_compacted: std.atomic.Value(u64) = .init(0),
-    blocks_written: std.atomic.Value(u64) = .init(0),
-    rows_written: std.atomic.Value(u64) = .init(0),
-    ranges_merged: std.atomic.Value(u64) = .init(0),
-    dirty_markers_cleared: std.atomic.Value(u64) = .init(0),
-    gc_records_deleted: std.atomic.Value(u64) = .init(0),
-    failures: std.atomic.Value(u64) = .init(0),
-    last_pass_ns: std.atomic.Value(u64) = .init(0),
-    ranges_deferred: std.atomic.Value(u64) = .init(0),
-    bootstrap_quanta: std.atomic.Value(u64) = .init(0),
-    bytes_written: std.atomic.Value(u64) = .init(0),
-    owners_examined: std.atomic.Value(u64) = .init(0),
-    covered_rows_read: std.atomic.Value(u64) = .init(0),
-    primary_rows_read: std.atomic.Value(u64) = .init(0),
-    scheduler_candidates: std.atomic.Value(u64) = .init(0),
-    scheduler_commits: std.atomic.Value(u64) = .init(0),
-    admission_root_reads: std.atomic.Value(u64) = .init(0),
-    admission_dirty_probes: std.atomic.Value(u64) = .init(0),
-    waiting_until_ns: std.atomic.Value(u64) = .init(0),
-    read_revision: std.atomic.Value(u64) = .init(0),
+    retry_after_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    observed_since_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    passes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    ranges_compacted: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    blocks_written: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    rows_written: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    ranges_merged: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    dirty_markers_cleared: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    gc_records_deleted: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    failures: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    last_pass_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    ranges_deferred: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    bootstrap_quanta: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    bytes_written: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    owners_examined: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    covered_rows_read: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    primary_rows_read: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    scheduler_candidates: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    scheduler_commits: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    admission_root_reads: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    admission_dirty_probes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    waiting_until_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    read_revision: @import("antfly_platform").atomic.Value(u64) = .init(0),
     // Worker-owned hints. Durable timers/cursor remain authoritative on restart.
     waiting_since_ns: u64 = 0,
     waiting_version: u64 = 0,
@@ -100,11 +100,11 @@ pub const Maintenance = struct {
     waiting_namespace: u64 = 0,
     /// Bounded, lossy read-cost hints, never correctness state. Hash collisions
     /// can admit a cold range early but cannot delay a hot range past its age cap.
-    read_debt: [256]std.atomic.Value(u64) = @splat(.init(0)),
+    read_debt: [256]@import("antfly_platform").atomic.Value(u64) = @splat(.init(0)),
 
-    fn debtSlot(self: *@This(), generation: u64, block: u64) *std.atomic.Value(u64) {
+    fn debtSlot(self: *@This(), generation: u64, block: u64) *@import("antfly_platform").atomic.Value(u64) {
         const hash = std.hash.Wyhash.hash(generation, std.mem.asBytes(&block));
-        return &self.read_debt[hash % self.read_debt.len];
+        return &self.read_debt[@intCast(hash % self.read_debt.len)];
     }
 
     fn noteRead(self: *@This(), generation: u64, block: u64, bytes: u64) void {

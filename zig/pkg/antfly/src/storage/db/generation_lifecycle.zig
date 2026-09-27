@@ -1,10 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -1523,6 +1529,7 @@ fn waitForRetiredCleanupRetry(self: *RetiredGenerationCleanupBatch, delay_ms: i6
 }
 
 fn deleteRetiredGenerationPaths(alloc: Allocator, io: std.Io, paths: []const []const u8, parent: []const u8) !void {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     const lock_path = try std.fs.path.join(alloc, &.{ parent, retired_cleanup_lock_name });
     defer alloc.free(lock_path);
     const cleanup_lock = std.Io.Dir.cwd().createFile(io, lock_path, .{
@@ -1836,6 +1843,7 @@ fn acquirePublishedGenerationReadWithRuntimeAndIo(
     runtime: ?*background_runtime.BackendRuntime,
     io_override: ?std.Io,
 ) !?ReadLease {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     var fallback_io_impl: std.Io.Threaded = undefined;
     var fallback_io_owned = false;
     defer if (fallback_io_owned) fallback_io_impl.deinit();

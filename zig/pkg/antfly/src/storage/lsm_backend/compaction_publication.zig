@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! An admitted compaction installs three immutable roots, not K locked edits.
 //! The caller owns inputs/outputs until this registered job finishes. All
@@ -107,7 +107,7 @@ pub const Job = struct {
         return self.base.at(if (i < self.plan.source_len) self.plan.sourceIndex(i) else self.plan.targetIndex(i - self.plan.source_len));
     }
 
-    fn admitNames(self: *Job, bytes: usize) !void {
+    fn admitNames(self: *Job, bytes: u64) !void {
         if (self.reservation) |*lease| try lease.growBoundedOversized(bytes, 1);
     }
 

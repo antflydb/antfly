@@ -30,13 +30,9 @@ pub const agents = @import("agents.zig");
 pub const internal = @import("internal.zig");
 pub const auth = @import("auth.zig");
 
-pub const OutputFormat = enum { json, table_fmt };
+pub const OutputFormat = @import("io.zig").OutputFormat;
 
-pub const GlobalConfig = struct {
-    url: []const u8 = "http://127.0.0.1:8080",
-    token: ?[]const u8 = null,
-    output: OutputFormat = .json,
-};
+pub const GlobalConfig = @import("io.zig").GlobalConfig;
 
 pub const CatalogFlags = struct {
     database: ?[]const u8 = null,
@@ -208,31 +204,11 @@ test "client commands expose help without a server" {
 /// Supported env vars:
 ///   ANTFLY_URL    — server base URL (default http://127.0.0.1:8080)
 ///   ANTFLY_TOKEN  — bearer token for authentication
-pub fn parseGlobalFlags() GlobalConfig {
-    var config = GlobalConfig{};
-    if (platform.env.getenv("ANTFLY_URL")) |raw| {
-        config.url = raw;
-    }
-    if (platform.env.getenv("ANTFLY_TOKEN")) |raw| {
-        config.token = raw;
-    }
-    return config;
-}
+pub const parseGlobalFlags = @import("io.zig").parseGlobalFlags;
 
-pub fn initClient(allocator: std.mem.Allocator, http: *httpx.Client, config: GlobalConfig) !antfly_client.AntflyClient {
-    var client = try antfly_client.AntflyClient.init(allocator, http, config.url);
-    if (config.token) |token| {
-        try client.setBearer(token);
-    }
-    return client;
-}
+pub const initClient = @import("io.zig").initClient;
 
-pub fn writeJson(allocator: std.mem.Allocator, io: std.Io, value: anytype) !void {
-    const json = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
-    defer allocator.free(json);
-    writeStdout(io, json);
-    writeStdout(io, "\n");
-}
+pub const writeJson = @import("io.zig").writeJson;
 
 pub fn printResponse(allocator: std.mem.Allocator, io: std.Io, resp: anytype) !void {
     if (resp.data) |parsed| {
@@ -243,20 +219,11 @@ pub fn printResponse(allocator: std.mem.Allocator, io: std.Io, resp: anytype) !v
     try writeJson(allocator, io, .{ .status = resp.status_code });
 }
 
-pub fn expectHttpSuccess(resp: anytype) void {
-    if (resp.status_code >= 400) {
-        if (resp.err_body) |body| fatal("request failed with HTTP {d}: {s}", .{ resp.status_code, body });
-        fatal("request failed with HTTP {d}", .{resp.status_code});
-    }
-}
+pub const expectHttpSuccess = @import("io.zig").expectHttpSuccess;
 
-pub fn writeStdout(io: std.Io, bytes: []const u8) void {
-    std.Io.File.stdout().writeStreamingAll(io, bytes) catch {};
-}
+pub const writeStdout = @import("io.zig").writeStdout;
 
-pub fn readFileAlloc(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
-}
+pub const readFileAlloc = @import("io.zig").readFileAlloc;
 
 pub fn splitCommaListAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -272,10 +239,7 @@ pub fn splitCommaListAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]con
     return try list.toOwnedSlice(allocator);
 }
 
-pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
-    std.debug.print("error: " ++ fmt ++ "\n", args);
-    std.process.exit(1);
-}
+pub const fatal = @import("io.zig").fatal;
 
 test "cli mod compiles" {
     _ = table;

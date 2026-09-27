@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -167,12 +167,12 @@ pub const Registry = struct {
     /// suspending the current std.Io task. Replacement flips banks, then waits
     /// only for the old load-and-retain windows; returned SchemaViews own epoch
     /// references and never delay publication or reclamation admission.
-    acquisition_generation: std.atomic.Value(u64) = .init(0),
+    acquisition_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
     acquisition_readers: [acquisition_bank_count][acquisition_stripe_count]AcquisitionStripe =
         [_][acquisition_stripe_count]AcquisitionStripe{
             [_]AcquisitionStripe{.{}} ** acquisition_stripe_count,
         } ** acquisition_bank_count,
-    namespace_generation: std.atomic.Value(u64) = .init(0),
+    namespace_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
     pending_publications: usize = 0,
     historical_clock: u64 = 0,
     historical_admission: Admission = .{},

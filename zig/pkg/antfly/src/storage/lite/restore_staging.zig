@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -20,7 +20,7 @@ const Allocator = std.mem.Allocator;
 const backup_codec = @import("../backup_codec.zig");
 const backup_bundle = @import("../backup_bundle.zig");
 const backup_bundle_io = @import("../backup_bundle_io.zig");
-const backups_api = @import("../../api/backups.zig");
+const backups_api = @import("../../api/local_backups.zig");
 const connection = @import("connection.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const db_types = @import("../db/types.zig");
@@ -28,7 +28,7 @@ const group_ids = @import("../../common/group_ids.zig");
 const internal_keys = @import("../internal_keys.zig");
 const portable_backup = @import("../portable_backup.zig");
 const query_api = @import("../../api/query.zig");
-const tables_api = @import("../../api/tables.zig");
+const tables_api = @import("../../api/local_tables.zig");
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const fs_paths = @import("../../common/fs_paths.zig");
 const full_text_index_defaults = @import("../../common/full_text_index_defaults.zig");
@@ -1305,7 +1305,7 @@ test "lite restore staging expands a self-contained native AFB2 bundle" {
     try std.testing.expectEqual(backups_api.BackupFormat.native, target.format);
     try std.testing.expectEqualStrings("restored_docs", target.table_name);
     const restore_table = try backups_api.deriveRestoreTableRecord(allocator, "restored_docs", target_location, &target);
-    defer @import("../../metadata/table_manager.zig").freeTable(allocator, restore_table);
+    defer @import("../../metadata/local_catalog.zig").freeTable(allocator, restore_table);
     try std.testing.expectEqualStrings("restored_docs", restore_table.name);
     const restored_payload = try std.fmt.allocPrint(allocator, "{s}/{s}/primary.bin", .{ target_root, snapshot_path });
     defer allocator.free(restored_payload);

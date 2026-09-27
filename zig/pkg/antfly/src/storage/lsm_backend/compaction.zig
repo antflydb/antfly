@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const work_budget = @import("work_budget.zig");
@@ -2500,7 +2500,7 @@ fn selectDirectoryPlanOffLock(backend: anytype, l0_limit: usize, l0_only: bool, 
     var snapshot = Snapshot{ .allocator = backend.allocator, .options = backend.options, .planner_seed = backend.planner_seed, .directory = directory };
     // Reserve distinct candidate tickets before allowing another planner in.
     backend.planner_seed +%= 8;
-    const io: ?std.Io = if (snapshot.options.read_runtime) |runtime| runtime.io else null;
+    const io: ?std.Io = if (snapshot.options.read_runtime) |runtime| runtime.getIo() else null;
     runtime_mod.unlockBackend(BackendType, backend, true);
     const result = selectDirectoryPlanBudgeted(&snapshot, l0_limit, l0_only, max_bytes, allow_oversized, stats, .{ .max_inputs = directory.count(), .resumable = true, .io = io });
     _ = runtime_mod.lockBackend(BackendType, backend);

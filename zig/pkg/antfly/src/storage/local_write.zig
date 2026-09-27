@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Storage-owned batch, enrichment configuration, restore, and backup operations.
 
@@ -19,8 +19,8 @@ const std = @import("std");
 const scraping = @import("antfly_scraping");
 const common_secrets = @import("../common/secrets.zig");
 const fs_paths = @import("../common/fs_paths.zig");
-const backups_api = @import("../api/backups.zig");
-const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
+const backups_api = @import("../api/local_backups.zig");
+const metadata_table_provisioner = @import("../metadata/local_index_reconcile.zig");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
 const transactions_mod = @import("transactions.zig");
 const doc_identity = @import("db/doc_identity.zig");
@@ -29,7 +29,7 @@ const lsm_backend = @import("lsm_backend/mod.zig");
 const portable_backup = @import("portable_backup.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const storage_schema = @import("schema.zig");
-const tables_api = @import("../api/tables.zig");
+const tables_api = @import("../api/local_tables.zig");
 const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const remote_capabilities = @import("../inference/remote_capabilities.zig");
@@ -37,7 +37,7 @@ const db_embedder = @import("db/enrichment/embedder.zig");
 const asset_producer_runtime = @import("../asset_producer_runtime.zig");
 const asset_producer_mod = @import("db/enrichment/asset_producer.zig");
 const document_extraction_mod = @import("db/enrichment/document_extraction.zig");
-const distributed_txn = @import("../api/distributed_txn.zig");
+const distributed_txn = @import("../api/local_transaction_contract.zig");
 const platform_time = @import("antfly_platform").time;
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const control_only_storage_sources = false;
@@ -70,7 +70,7 @@ pub fn nativeSnapshotAttemptTokenAlloc(
     shard_label: []const u8,
 ) ![]u8 {
     var entropy: [16]u8 = undefined;
-    try io.randomSecure(&entropy);
+    try @import("antfly_platform").entropy.fill(io, &entropy);
     const nonce = std.fmt.bytesToHex(entropy, .lower);
     return try std.fmt.allocPrint(alloc, "{s}-{s}-attempt-{s}", .{ backup_id, shard_label, &nonce });
 }
@@ -643,7 +643,7 @@ pub fn configureRestoreOwnerDb(alloc: std.mem.Allocator, db: *db_mod.DB, bootstr
         if (bootstrap.schema_json.len != 0) try db.setSchemaJson(alloc, bootstrap.schema_json);
     }
     try db.installRestoreStagingReadSchema(alloc, bootstrap.scope, bootstrap.read_schema_json);
-    _ = try @import("../metadata/table_provisioner.zig").reconcileDbIndexesWithOptions(alloc, db, bootstrap.indexes_json, .{ .restore_build_only = true });
+    _ = try @import("../metadata/local_index_reconcile.zig").reconcileDbIndexesWithOptions(alloc, db, bootstrap.indexes_json, .{ .restore_build_only = true });
     try db.updateRange(bootstrap.byte_range);
     try db.reserveRestoreStagingScoped(alloc, bootstrap.scope);
     try db.installRestoreStagingBootstrap(alloc, bootstrap);

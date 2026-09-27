@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const api_tests = @import("api_tests.zig");
@@ -849,6 +849,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const embedded_db_tests = b.addTest(.{
         .root_module = embedded_db_mod,
         .filters = &.{
+            "embedded custom storage owns its physical namespace",
             "embedded db openLite persists documents in aflite file",
             "embedded db openLite close syncs unsynced batch before readonly reopen",
             "embedded db openLite propagates no_sync to aflite backend",
@@ -1734,6 +1735,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lite_native_tests = addFilteredTestRunArtifact(b, lite_native_tests);
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
+    const portable_wal_tests = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .filters = &.{"portable WAL"},
+    });
+    const run_portable_wal_tests = b.addRunArtifact(portable_wal_tests);
+    b.step("portable-wal-test", "Run hosted WAL durability and read-only tests").dependOn(&run_portable_wal_tests.step);
+    lite_native_test_step.dependOn(&run_portable_wal_tests.step);
     const lite_benchmark = b.addTest(.{
         .root_module = lite_native_test_mod,
         .filters = &.{"lite throughput benchmark"},

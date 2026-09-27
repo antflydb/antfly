@@ -12,23 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Deterministic gates for explicitly enabled ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE
-# (spec-decode P2 fold): with the fold on, every run must produce token ids identical to the
-# plain target, materializations must drop to 0 (replaced by
-# deferred_materializations), and pending tokens must be flushed before the
-# mid-generation standardDecode fallbacks.
-#
-# Covers the handoff's scripted scenarios:
-#   1. correction -> pending -> next verify   (force k=1/2/4 identity runs)
-#   3. bonus -> pending -> next verify        (same runs with ACCEPT_BONUS=1)
-#   2. pending -> standardDecode fallback     (zero-match / acceptance / cost
-#      gates; zero-match k=1 asserts pending_flushes=1)
-#   5. EOS/max-tokens while pending           (all runs end at max-tokens with
-#      fold rounds outstanding; clean exit + identity)
-# (Scenario 4, verify-error rollback while pending, is unit-level:
-#  "gemma4 mtp pending token bookkeeping holds kv invariant across round
-#  shapes" in generation.zig.)
 
 set -euo pipefail
 

@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const ha_contract = @import("ha_contract.zig");
@@ -1629,7 +1629,7 @@ const AsyncContext = struct {
     /// Avoid taking the scheduler mutex on the common derived-watermark path
     /// when no repair is waiting for index progress.
     index_repair_progress_wait_pending: std.atomic.Value(bool) = .init(false),
-    index_repair_scheduler_revision: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    index_repair_scheduler_revision: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     index_repair_scheduler: IndexRepairSchedulerDirectory = .{},
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
@@ -1903,8 +1903,8 @@ var test_fail_portable_activation_retry_fallback_submit: std.atomic.Value(bool) 
 var test_pause_portable_activation_retry_probe_before_lifecycle_lock: std.atomic.Value(bool) = .init(false);
 var test_portable_activation_retry_probe_paused: std.atomic.Value(bool) = .init(false);
 var test_release_portable_activation_retry_probe: std.atomic.Value(bool) = .init(false);
-var test_graph_repair_stream_flushes: std.atomic.Value(u64) = .init(0);
-var test_graph_repair_stream_scans: std.atomic.Value(u64) = .init(0);
+var test_graph_repair_stream_flushes: @import("antfly_platform").atomic.Value(u64) = .init(0);
+var test_graph_repair_stream_scans: @import("antfly_platform").atomic.Value(u64) = .init(0);
 var test_dense_repair_rebuild_batch_size: ?usize = null;
 var test_algebraic_repair_rebuild_batch_size: ?usize = null;
 var test_index_repair_catch_up_max_records_per_window: ?usize = null;
@@ -4276,6 +4276,7 @@ fn loadOrCreateDurableRootIdentity(
     backend_runtime: ?*background_runtime_mod.BackendRuntime,
     path: []const u8,
 ) !root_identity.State {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     if (backend_runtime) |runtime| {
         const io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         return try root_identity.loadOrCreate(alloc, io, path);
@@ -4477,7 +4478,7 @@ fn writeRestoreMarkerAtomicWithIo(
 ) !void {
     if (raw.len > max_restore_marker_bytes) return error.RestoreMarkerTooLarge;
     var entropy: [8]u8 = undefined;
-    try io.randomSecure(&entropy);
+    try @import("antfly_platform").entropy.fill(io, &entropy);
     const nonce = std.fmt.bytesToHex(entropy, .lower);
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{s}", .{ path, &nonce });
     defer alloc.free(tmp_path);
@@ -5294,14 +5295,14 @@ pub const DB = struct {
     /// under apply before committing an outbox; only an apply-fenced empty scan
     /// may return it to false.
     durable_ha_outbox_maybe: std.atomic.Value(bool) = .init(true),
-    source_pin_gc_epoch: std.atomic.Value(u64) = .init(1),
-    source_pin_gc_turn: std.atomic.Value(u64) = .init(0),
-    source_pin_gc_next_ns: std.atomic.Value(u64) = .init(0),
-    source_pin_gc_failures: std.atomic.Value(u64) = .init(0),
-    source_pin_gc_failure_streak: std.atomic.Value(u64) = .init(0),
-    source_pin_gc_work_units: std.atomic.Value(u64) = .init(0),
+    source_pin_gc_epoch: @import("antfly_platform").atomic.Value(u64) = .init(1),
+    source_pin_gc_turn: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    source_pin_gc_next_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    source_pin_gc_failures: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    source_pin_gc_failure_streak: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    source_pin_gc_work_units: @import("antfly_platform").atomic.Value(u64) = .init(0),
     source_pin_gc_error: std.atomic.Value(u32) = .init(0),
-    source_pin_gc_log_next_ns: std.atomic.Value(u64) = .init(0),
+    source_pin_gc_log_next_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     durable_ha_flush_mutex: std.Io.Mutex = .init,
     /// Crash-left records must be replayed before this process publishes its
     /// first HA mutation. Once crossed, foreground commits append under the
@@ -5312,7 +5313,7 @@ pub const DB = struct {
     /// records; steady-state mutations then wait on independent LSN watermarks.
     durable_ha_recovery_state: std.atomic.Value(u8) = .init(0),
     durable_ha_recovery_failure_streak: u32 = 0,
-    durable_ha_recovery_next_attempt_ns: std.atomic.Value(u64) = .init(0),
+    durable_ha_recovery_next_attempt_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     /// 0 = idle, 1 = queued/running, 2 = rerun requested. The owner-scoped
     /// durable lane is drained before DB teardown, so jobs may safely borrow
     /// this DB while keeping schema publication latency independent of index
@@ -5355,7 +5356,7 @@ pub const DB = struct {
     relational_column_maintenance: relational_columns.Maintenance = .{},
     relational_index_maintenance_cursor: std.atomic.Value(usize) = .init(0),
     relational_index_maintenance_sweep: @import("relational_index_maintenance_sweep.zig").Sweep = .{},
-    relational_index_retry_after_ns: std.atomic.Value(u64) = .init(0),
+    relational_index_retry_after_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     artifact_metadata_retry_after_ns: u64 = 0,
     artifact_repair_metadata_due_ns: u64 = 0,
     artifact_repair_metadata_pending: bool = true,
@@ -5388,8 +5389,8 @@ pub const DB = struct {
     // Managed admission is a durable outbox. Requested/completed generations
     // prevent a drain from erasing work committed while its marker snapshot is
     // in flight; the mutex makes concurrent drainers a single-flight loop.
-    managed_admission_materialization_requested: std.atomic.Value(u64) = .init(0),
-    managed_admission_materialization_completed: std.atomic.Value(u64) = .init(0),
+    managed_admission_materialization_requested: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    managed_admission_materialization_completed: @import("antfly_platform").atomic.Value(u64) = .init(0),
     managed_admission_materialization_mutex: std.atomic.Mutex = .unlocked,
     index_structural_mutation_mutex: std.atomic.Mutex = .unlocked,
     snapshot_publication_mutex: std.atomic.Mutex = .unlocked,
@@ -6671,10 +6672,16 @@ pub const DB = struct {
                 if (!openModeRequiresReadOnlyBackends(self.open_mode)) {
                     const root = try std.fs.path.join(self.alloc, &.{ self.core.path, "source-vectors" });
                     defer self.alloc.free(root);
-                    const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
-                    std.Io.Dir.cwd().deleteTree(io, root) catch |err| {
-                        std.log.warn("cancelled source candidate cleanup deferred err={s}", .{@errorName(err)});
-                    };
+                    if (self.primary_lsm_storage) |storage| {
+                        storage.deleteTree(root) catch |err| {
+                            std.log.warn("cancelled source candidate cleanup deferred err={s}", .{@errorName(err)});
+                        };
+                    } else if (comptime builtin.os.tag != .freestanding) {
+                        const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+                        std.Io.Dir.cwd().deleteTree(io, root) catch |err| {
+                            std.log.warn("cancelled source candidate cleanup deferred err={s}", .{@errorName(err)});
+                        };
+                    } else return error.UnsupportedPlatform;
                 }
             } else if (job.value.active()) {
                 try self.openSourceVectors(false);
@@ -10716,7 +10723,7 @@ pub const DB = struct {
         if (builtin.is_test) {
             if (test_portable_runtime_batch_prelock_hook) |hook| {
                 hook.entered.store(true, .release);
-                while (!hook.release.load(.acquire)) std.Thread.yield() catch {};
+                while (!hook.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
             }
         }
 
@@ -17237,9 +17244,15 @@ pub const DB = struct {
             const separator = std.mem.indexOfScalar(u8, candidate, '/') orelse return error.InvalidRepairCandidatePath;
             const shadow_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate[0..separator] });
             defer alloc.free(shadow_root);
-            var io_impl = threadedIo();
-            defer io_impl.deinit();
-            try std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_root);
+            if (self.primary_lsm_storage) |storage| {
+                try storage.deleteTree(shadow_root);
+            } else if (comptime builtin.os.tag == .freestanding) {
+                return error.UnsupportedPlatform;
+            } else {
+                var io_impl = threadedIo();
+                defer io_impl.deinit();
+                try std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_root);
+            }
         }
         const old_identity = state.identity;
         const replacement = try index_repair_state.resetForRootGenerationWithIntentsAt(
@@ -30918,7 +30931,7 @@ pub const DB = struct {
     const TargetAdvanceStallGuard = struct {
         db: *DB,
         timeout_ns: u64,
-        last_check_ns: std.atomic.Value(u64) = .init(0),
+        last_check_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
         const recheck_interval_ns: u64 = 250 * std.time.ns_per_ms;
 
@@ -31487,7 +31500,7 @@ pub const DB = struct {
     // may also provide virtual time. Never compare these to platform clocks.
     fn independentMaintenanceNowNs(self: *DB) u64 {
         const io = self.backend_runtime.io() orelse return platform_time.monotonicNs();
-        return @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds));
+        return platform_time.awakeNs(io);
     }
 
     /// Start only after the DB has reached its final address. DB.open returns
@@ -35736,7 +35749,7 @@ pub const DB = struct {
     fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
         // These bytes enter compressed durable tables, so even a diagnostic
         // timestamp can change disk usage and subsequent placement decisions.
-        const now: u64 = @intCast(@max(0, std.Io.Clock.awake.now(index_manager.checkpointIo()).nanoseconds));
+        const now = platform_time.awakeNs(index_manager.checkpointIo());
         if (index_manager.textIndex(index_name)) |entry| {
             // Applied-sequence persistence runs outside the DB apply lock; keep this
             // snapshot cheap and avoid walking full-text segment internals here.
@@ -68479,7 +68492,7 @@ fn snapshotPathExists(io: Io, path: []const u8) !bool {
 fn createSnapshotStagingRoot(alloc: Allocator, io: Io, parent: []const u8, id: []const u8) ![]u8 {
     for (0..64) |_| {
         var entropy: [8]u8 = undefined;
-        try io.randomSecure(&entropy);
+        try @import("antfly_platform").entropy.fill(io, &entropy);
         const nonce = std.fmt.bytesToHex(entropy, .lower);
         const candidate = try std.fmt.allocPrint(alloc, "{s}/.{s}.staging-{s}", .{ parent, id, &nonce });
         errdefer alloc.free(candidate);
@@ -79280,7 +79293,7 @@ test "db portable publication waits for admitted readers and rejects new ones" {
                 return;
             };
             self.returned.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
             self.store.finishPortableImportPublication();
         }
     };
@@ -79298,7 +79311,7 @@ test "db portable publication waits for admitted readers and rejects new ones" {
 
     const close_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!db.core.store.portableImportPublicationInProgress() and monotonicTimeNs() < close_deadline) {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     try std.testing.expect(db.core.store.portableImportPublicationInProgress());
     try std.testing.expect(!publisher.returned.load(.acquire));
@@ -79308,7 +79321,7 @@ test "db portable publication waits for admitted readers and rejects new ones" {
     admitted_open = false;
     const drain_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!publisher.returned.load(.acquire) and monotonicTimeNs() < drain_deadline) {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     try std.testing.expect(publisher.returned.load(.acquire));
     publisher.release.store(true, .release);
@@ -79358,7 +79371,7 @@ test "db portable activation gate revalidates queued and replicated writes" {
 
     const prelock_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     try std.testing.expect(hook.entered.load(.acquire));
 
@@ -79424,7 +79437,7 @@ test "db portable activation gate revalidates queued graph reads" {
 
     const entered_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!reader.entered.load(.acquire) and monotonicTimeNs() < entered_deadline) {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     try std.testing.expect(reader.entered.load(.acquire));
     db.async_context.portable_runtime_activation_pending.store(true, .release);
@@ -79562,7 +79575,7 @@ test "portable activation retry runtime job can be restarted" {
 
         const exit_deadline = monotonicTimeNs() + std.time.ns_per_s;
         while (db.portable_activation_retry_worker_running.load(.acquire) and monotonicTimeNs() < exit_deadline) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
         try std.testing.expect(!db.portable_activation_retry_worker_running.load(.acquire));
     }
@@ -79591,11 +79604,11 @@ test "portable activation retry stop joins the runtime worker final handshake" {
         release_final_lock: *std.atomic.Value(bool),
 
         fn run(ctx: @This()) void {
-            while (!ctx.db.portable_activation_retry_stop.load(.acquire)) std.Thread.yield() catch {};
+            while (!ctx.db.portable_activation_retry_stop.load(.acquire)) @import("antfly_platform").time.yieldNow();
             _ = lockAtomic(&ctx.db.portable_activation_retry_lifecycle_mutex);
             ctx.db.portable_activation_retry_worker_running.store(false, .release);
             ctx.holding_final_lock.store(true, .release);
-            while (!ctx.release_final_lock.load(.acquire)) std.Thread.yield() catch {};
+            while (!ctx.release_final_lock.load(.acquire)) @import("antfly_platform").time.yieldNow();
             ctx.db.portable_activation_retry_lifecycle_mutex.unlock();
         }
     };
@@ -79634,7 +79647,7 @@ test "portable activation retry stop joins the runtime worker final handshake" {
 
     const hold_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!holding_final_lock.load(.acquire) and monotonicTimeNs() < hold_deadline) {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     try std.testing.expect(holding_final_lock.load(.acquire));
     // Give the stopper ample time to observe the published false state. It
@@ -79720,7 +79733,7 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
 
     const pause_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!test_portable_activation_retry_probe_paused.load(.acquire) and monotonicTimeNs() < pause_deadline) {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     try std.testing.expect(test_portable_activation_retry_probe_paused.load(.acquire));
 
@@ -79736,7 +79749,7 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
 
     const stop_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!db.portable_activation_retry_stop.load(.acquire) and monotonicTimeNs() < stop_deadline) {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     try std.testing.expect(db.portable_activation_retry_stop.load(.acquire));
     try std.testing.expect(!close_returned.load(.acquire));
@@ -79786,7 +79799,7 @@ test "portable activation retry uses owner scoped runtime" {
         db.portable_activation_retry_worker_running.load(.acquire)) and
         monotonicTimeNs() < recovery_deadline)
     {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     try std.testing.expect(!db.async_context.portable_runtime_activation_pending.load(.acquire));
     try std.testing.expect(!db.portable_activation_retry_worker_running.load(.acquire));
@@ -105086,8 +105099,8 @@ test "storage.hot_standby db mirrors appended derived replay records into HA str
     }, .{});
     defer primary.close();
 
-    var last_lsn = std.atomic.Value(u64).init(0);
-    var failures = std.atomic.Value(u64).init(0);
+    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+    var failures = @import("antfly_platform").atomic.Value(u64).init(0);
     const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_v1", "mentions", "doc:b");
     defer alloc.free(artifact_key);
     {
@@ -105163,10 +105176,10 @@ test "storage.hot_standby db waits for remote apply before completing derived en
     };
 
     var wait_state = SyncWait{};
-    var last_lsn = std.atomic.Value(u64).init(0);
-    var gate_lsn = std.atomic.Value(u64).init(0);
+    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = std.atomic.Value(u64).init(0);
+    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .identity_namespace = .{ .shard_id = 3, .table_id = 9 },
@@ -105252,8 +105265,8 @@ test "storage.hot_standby db mirrors committed batch mutations into HA stream fo
     }, .{});
     defer standby.close();
 
-    var last_lsn = std.atomic.Value(u64).init(0);
-    var failures = std.atomic.Value(u64).init(0);
+    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+    var failures = @import("antfly_platform").atomic.Value(u64).init(0);
     {
         var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
             .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
@@ -105583,8 +105596,8 @@ test "storage.hot_standby schema json mutation does not reacquire shared barrier
     }, .{});
     defer primary.close();
     var barrier: HAMutationBarrier = .{};
-    var last_lsn = std.atomic.Value(u64).init(0);
-    var failures = std.atomic.Value(u64).init(0);
+    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+    var failures = @import("antfly_platform").atomic.Value(u64).init(0);
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .identity_namespace = .{ .shard_id = 6, .table_id = 12 },
         .ha_async_metadata_mirror = .{
@@ -105672,10 +105685,10 @@ test "storage.hot_standby db evaluates sync commit gate for mirrored batch mutat
     defer primary.close();
     try primary.createSlot("standby-a", 0);
 
-    var last_lsn = std.atomic.Value(u64).init(0);
-    var gate_lsn = std.atomic.Value(u64).init(0);
+    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var degraded = std.atomic.Value(u64).init(0);
+    var degraded = @import("antfly_platform").atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     {
         var db = try DB.open(alloc, std.mem.span(db_path), .{
@@ -105747,10 +105760,10 @@ test "storage.hot_standby db block sync policy waits for standby acknowledgement
     };
 
     var wait_state = SyncWait{};
-    var last_lsn = std.atomic.Value(u64).init(0);
-    var gate_lsn = std.atomic.Value(u64).init(0);
+    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = std.atomic.Value(u64).init(0);
+    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = .{
@@ -105853,7 +105866,7 @@ test "storage.hot_standby synchronous waits pipeline later commits by lsn" {
     };
 
     var wait_state = SyncWait{ .io = io };
-    var last_lsn = std.atomic.Value(u64).init(0);
+    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = .{
@@ -105933,7 +105946,7 @@ test "storage.hot_standby durable outbox recovery does not duplicate an appended
         }
     };
     var wait_state = SyncWait{};
-    var last_lsn = std.atomic.Value(u64).init(0);
+    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
@@ -106069,10 +106082,10 @@ test "storage.hot_standby db session sync wait satisfies remote apply through st
         .apply_ctx = &standby_db,
         .apply_fn = DB.applyHAReplicationRecordCallback,
     };
-    var last_lsn = std.atomic.Value(u64).init(0);
-    var gate_lsn = std.atomic.Value(u64).init(0);
+    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = std.atomic.Value(u64).init(0);
+    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
@@ -106309,10 +106322,10 @@ test "storage.hot_standby db session sync wait remote write acknowledges durable
         .apply_ctx = &apply_failure,
         .apply_fn = ApplyFailure.apply,
     };
-    var last_lsn = std.atomic.Value(u64).init(0);
-    var gate_lsn = std.atomic.Value(u64).init(0);
+    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = std.atomic.Value(u64).init(0);
+    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
@@ -106403,9 +106416,9 @@ test "storage.hot_standby db primary progress sync wait observes reported remote
         .poll_ctx = &remote_ack,
         .poll_fn = RemoteAck.poll,
     };
-    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = std.atomic.Value(u64).init(0);
+    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = .{
@@ -106516,9 +106529,9 @@ test "storage.hot_standby db primary progress sync wait returns would block with
     try primary.createSlot("standby-a", 0);
 
     var wait_state = HAPrimaryProgressSyncWait{ .max_rounds = 1 };
-    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = std.atomic.Value(u64).init(0);
+    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = .{
@@ -106589,8 +106602,8 @@ test "storage.hot_standby pending acknowledgement preserves batch and replay tai
         .sync_wait_ctx = &wait_state,
         .sync_wait_fn = HAPrimaryProgressSyncWait.wait,
     };
-    var batch_lsn = std.atomic.Value(u64).init(0);
-    var replay_lsn = std.atomic.Value(u64).init(0);
+    var batch_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+    var replay_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = blk: {
             var configured = mirror;
@@ -106730,9 +106743,9 @@ test "storage.hot_standby db primary progress sync wait survives primary restart
         try primary.createSlot("standby-a", 0);
 
         var wait_state = HAPrimaryProgressSyncWait{ .max_rounds = 1 };
-        var gate_lsn = std.atomic.Value(u64).init(0);
+        var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
         var gate_action = std.atomic.Value(u8).init(255);
-        var waits = std.atomic.Value(u64).init(0);
+        var waits = @import("antfly_platform").atomic.Value(u64).init(0);
         var db = try DB.open(alloc, std.mem.span(db_path), .{
             .ha_async_batch_mirror = .{
                 .primary = &primary,
@@ -106818,9 +106831,9 @@ test "storage.hot_standby db block sync policy surfaces wait provider errors" {
     };
 
     var wait_state = SyncWait{};
-    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = std.atomic.Value(u64).init(0);
+    var waits = @import("antfly_platform").atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = .{
@@ -106877,9 +106890,9 @@ test "storage.hot_standby db fail-closed sync policy rejects before local batch 
     defer primary.close();
     try primary.createSlot("standby-a", 0);
 
-    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var rejected = std.atomic.Value(u64).init(0);
+    var rejected = @import("antfly_platform").atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .ha_async_batch_mirror = .{
@@ -107069,8 +107082,8 @@ test "storage.hot_standby db mirrors and applies schema metadata mutation record
     var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
     defer standby.close();
 
-    var last_lsn = std.atomic.Value(u64).init(0);
-    var failures = std.atomic.Value(u64).init(0);
+    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+    var failures = @import("antfly_platform").atomic.Value(u64).init(0);
     {
         var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
             .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
@@ -115989,7 +116002,7 @@ test "db completed partial managed admission serves and retires redundant repair
     while (!try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent)) {
         if (monotonicTimeNs() >= publication_deadline) return error.TestUnexpectedResult;
         _ = try db.finalizeDenseProjectionLifecycleForIdle();
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     try std.testing.expect(try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
     const runtime_stats = try db.stats(alloc);
@@ -116047,7 +116060,7 @@ test "db completed generated recovery retires an inactive candidate without an a
     while (!try db.managedAdmissionGenerationIsServiceable(alloc, admitted.intent)) {
         if (monotonicTimeNs() >= deadline) return error.TestUnexpectedResult;
         _ = try db.finalizeDenseProjectionLifecycleForIdle();
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     _ = try db.advanceIndexRepairIntent(alloc, admission, .{});
     const marker_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, cfg.name);
@@ -140335,44 +140348,6 @@ test "source vector migration offline recovers every copy and publication bounda
         defer alloc.free(actual);
         try std.testing.expectEqualSlices(u8, artifact, actual);
     }
-}
-
-test "source vector migration catalog fences configurations topology and stale publication" {
-    const catalog = @import("../../metadata/table_manager.zig");
-    var manager = catalog.TableManager.init(std.testing.allocator);
-    defer manager.deinit();
-    const before: catalog.TableRecord = .{ .table_id = 10, .name = "migrate" };
-    const range: catalog.RangeRecord = .{ .group_id = 101, .table_id = 10, .start_key = "", .end_key = null };
-    try manager.upsertTable(before);
-    try manager.upsertRange(range);
-    var admitted = before;
-    admitted.storage_migration = .{ .request = .{ .job_id = "online", .mode = .online } };
-    try manager.publishVectorMigrationTable(before, admitted);
-    try std.testing.expect(!std.mem.eql(u8, &catalog.tableDefinitionFingerprint(before), &catalog.tableDefinitionFingerprint(admitted)));
-    try manager.upsertTable(admitted);
-    try manager.upsertRange(range); // Normalized range ID is still idempotent.
-    // Restart/projected-catalog installation restores existing admission,
-    // while incremental topology changes remain fenced after reload.
-    try manager.replaceTopology(&.{admitted}, &.{range});
-    _ = try manager.replaceProjectedTopology(&.{admitted}, &.{range});
-    try manager.upsertRange(range);
-    var moved = range;
-    moved.start_key = "m";
-    try std.testing.expectError(error.VectorMigrationActive, manager.upsertRange(moved));
-    try std.testing.expectError(error.VectorMigrationActive, manager.upsertTable(before));
-    var edited = admitted;
-    edited.schema_json = "{\"version\":2}";
-    try std.testing.expectError(error.VectorMigrationActive, manager.upsertTable(edited));
-    try std.testing.expectError(error.VectorMigrationConfigurationChanged, manager.publishVectorMigrationTable(admitted, edited));
-    try std.testing.expectError(error.VectorMigrationActive, manager.requestSplit(.{ .transition_id = 1, .table_id = 10, .source_group_id = 101, .destination_group_id = 102, .split_key = "m" }));
-    var published = admitted;
-    published.storage.dense_embeddings = .vector_store;
-    try manager.publishVectorMigrationTable(admitted, published);
-    try std.testing.expectError(error.TableGenerationChanged, manager.publishVectorMigrationTable(admitted, before));
-    var complete = published;
-    complete.storage_migration = null;
-    try manager.publishVectorMigrationTable(published, complete);
-    try std.testing.expectError(error.UnsupportedVectorMigrationDirection, manager.publishVectorMigrationTable(complete, before));
 }
 
 test "source vector migration offline cancellation retains an idempotency receipt" {

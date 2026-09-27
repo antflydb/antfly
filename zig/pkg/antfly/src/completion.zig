@@ -5,6 +5,12 @@
 // the Elastic License 2.0 at
 //
 //     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 const maintenance = @import("maintenance_commands.zig");
@@ -50,7 +56,6 @@ const lite_subcommands = [_][]const u8{
     "scan",           "query",   "index",  "enrichment", "schema",
     "run-until-idle", "backup",  "export", "snapshot",   "restore",
     "import",         "promote", "check",  "compact",    "vacuum",
-    "serve",
 };
 const serverless_subcommands = [_][]const u8{ "api", "query", "maintenance", "combined" };
 const internal_subcommands = [_][]const u8{"metadata"};

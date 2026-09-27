@@ -11,6 +11,7 @@
 // WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
+
 const std = @import("std");
 const db_mod = @import("db.zig");
 const integrity = @import("relational_integrity.zig");

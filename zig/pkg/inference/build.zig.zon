@@ -18,6 +18,7 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .product_licenses = .{ .path = "../../lib/product_licenses" },
         .onnx_graph = .{ .path = "../../lib/onnx" },
         .tokenizer_build = .{ .path = "../../lib/tokenizer" },
         .build_info = .{ .path = "../../lib/build_info" },
@@ -41,6 +42,8 @@
         },
     },
     .paths = .{
+        "LICENSE",
+        "licenses",
         "build.zig",
         "build.zig.zon",
         "build",

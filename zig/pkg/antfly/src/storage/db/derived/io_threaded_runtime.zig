@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -1462,19 +1462,19 @@ fn stopAndJoinWorker(runtime: *DerivedRuntime, worker: *Worker, io: Io) void {
 const TestThreadedRuntimeCapture = struct {
     require_capture_worker: ?*Worker = null,
     fail_next_begin: bool = false,
-    empty_coverage_checks: std.atomic.Value(u64) = .init(0),
+    empty_coverage_checks: @import("antfly_platform").atomic.Value(u64) = .init(0),
     runtime: ?*DerivedRuntime = null,
-    apply_calls: std.atomic.Value(u64) = .init(0),
-    begin_calls: std.atomic.Value(u64) = .init(0),
-    finish_calls: std.atomic.Value(u64) = .init(0),
-    publish_failures: std.atomic.Value(u64) = .init(0),
-    apply_not_found_failures: std.atomic.Value(u64) = .init(0),
-    resource_budget_failures: std.atomic.Value(u64) = .init(0),
-    persisted_sequence: std.atomic.Value(u64) = .init(0),
-    truncate_calls: std.atomic.Value(u64) = .init(0),
-    truncated_sequence: std.atomic.Value(u64) = .init(0),
-    advanced_sequence: std.atomic.Value(u64) = .init(0),
-    callback_observed_applied_sequence: std.atomic.Value(u64) = .init(0),
+    apply_calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    begin_calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    finish_calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    publish_failures: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    apply_not_found_failures: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    resource_budget_failures: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    persisted_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    truncate_calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    truncated_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    advanced_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    callback_observed_applied_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
     fail_next_forced_persist: std.atomic.Value(bool) = .init(false),
     fail_next_dense_apply_not_found: std.atomic.Value(bool) = .init(false),
     fail_next_apply_resource_budget: std.atomic.Value(bool) = .init(false),

@@ -124,6 +124,8 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
         .ml = wasm_ml_mod,
     });
     wasm_tokenizer_mod.addImport("sentencepiece_proto", wasm_sentencepiece_proto);
+    wasm_tokenizer_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_hf_tokenizer_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_hf_tokenizer_mod.addImport("inference_tokenizer", wasm_tokenizer_mod);
     wasm_lib.root_module.addImport("jinja", wasm_jinja_mod);
     wasm_lib.root_module.addImport("inference_audio", wasm_audio_mod);
@@ -142,6 +144,12 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
 
     const wasm_step = ctx.step("wasm", "Build WASM module for browser inference");
     wasm_step.dependOn(&wasm_install.step);
+    wasm_step.dependOn(ctx.install_apache_licenses(
+        b,
+        b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, ".." })),
+        "antfly-inference-wasm",
+        "share/licenses/antfly-inference-wasm",
+    ));
     if (!is_wasm64) {
         const wasm_compat_install = b.addInstallFile(wasm_lib.getEmittedBin(), "antfly-inference.wasm");
         wasm_step.dependOn(&wasm_compat_install.step);

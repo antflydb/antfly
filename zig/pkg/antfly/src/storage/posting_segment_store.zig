@@ -1,7 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Durable publication for immutable vector posting segments plus a bounded
 //! committed WAL tail.
@@ -1342,21 +1351,23 @@ pub const Store = struct {
     fn readSegmentRetainedFor(self: *Store, descriptor: posting_wal.Checkpoint.Segment) !RetainedSegment {
         const path = try self.segmentPathAlloc(descriptor.generation);
         defer self.alloc.free(path);
-        if (mapSegmentFile(path)) |mapped| {
-            const published_checksum_matches = mapped.len <= max_segment_bytes and (if (descriptor.admission_checksum != 0)
-                (posting_segment.admissionChecksum(mapped) catch 0) == descriptor.admission_checksum
-            else
-                @import("antfly_hash").Crc32.hash(mapped) == descriptor.checksum);
-            if (published_checksum_matches) {
-                if (posting_segment.Reader.init(mapped)) |_| {
-                    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.RANDOM) catch {};
-                    var payload = RetainedSegment{ .mapped = mapped };
-                    errdefer payload.deinit(self.alloc);
-                    return try RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor);
-                } else |_| {}
-            }
-            std.posix.munmap(mapped);
-        } else |_| {}
+        if (comptime builtin.os.tag != .freestanding and builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            if (mapSegmentFile(path)) |mapped| {
+                const published_checksum_matches = mapped.len <= max_segment_bytes and (if (descriptor.admission_checksum != 0)
+                    (posting_segment.admissionChecksum(mapped) catch 0) == descriptor.admission_checksum
+                else
+                    @import("antfly_hash").Crc32.hash(mapped) == descriptor.checksum);
+                if (published_checksum_matches) {
+                    if (posting_segment.Reader.init(mapped)) |_| {
+                        std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.RANDOM) catch {};
+                        var payload = RetainedSegment{ .mapped = mapped };
+                        errdefer payload.deinit(self.alloc);
+                        return try RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor);
+                    } else |_| {}
+                }
+                std.posix.munmap(mapped);
+            } else |_| {}
+        }
         var payload = RetainedSegment{ .heap = try self.readSegmentAllocFor(descriptor) };
         errdefer payload.deinit(self.alloc);
         return try RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor);

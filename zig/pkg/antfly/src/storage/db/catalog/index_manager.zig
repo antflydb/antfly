@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -152,7 +152,7 @@ const repair_shadow_root_prefix = ".repair-shadow-";
 const canonical_algebraic_generation = "canonical";
 const repair_shadow_in_progress_file = ".antfly-repair-shadow-in-progress";
 const repair_shadow_in_progress_magic = "antfly-repair-shadow-in-progress-v1\n";
-var fresh_dense_native_generation_nonce: std.atomic.Value(u64) = .init(1);
+var fresh_dense_native_generation_nonce: @import("antfly_platform").atomic.Value(u64) = .init(1);
 
 const RepairShadowCleanupTestHook = struct {
     context: *anyopaque,
@@ -1263,7 +1263,7 @@ const SharedVectorBlockGeneration = struct {
     opened: vector_block_store_mod.Opened,
     source_snapshot: ?vector_block_store_mod.Opened = null,
     member_bindings: ?*vector_block_store_mod.member_bindings.Cache = null,
-    refs: std.atomic.Value(u64) = .init(1),
+    refs: @import("antfly_platform").atomic.Value(u64) = .init(1),
 
     fn create(alloc: Allocator, opened: vector_block_store_mod.Opened) !*SharedVectorBlockGeneration {
         const generation = try alloc.create(SharedVectorBlockGeneration);
@@ -1382,20 +1382,20 @@ pub const IndexManager = struct {
     // posting state for this same source transaction. Ordinary maintenance
     // must never infer mutation identity from cardinality and a merely newer
     // generation.
-    vector_block_stable_tip_sequence: std.atomic.Value(u64) = .init(0),
+    vector_block_stable_tip_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
     vector_block_stable_tip_index: std.atomic.Value(usize) = .init(0),
     vector_block_generation: ?*SharedVectorBlockGeneration = null,
     /// Wake deferred posting acceleration for same-sequence vector rebuilds
     /// as well as new source writes. No borrowed pointer/ABA identity escapes.
-    vector_block_publication_revision: std.atomic.Value(u64) = .init(1),
+    vector_block_publication_revision: @import("antfly_platform").atomic.Value(u64) = .init(1),
     // Once a source transaction changes dense artifacts, an older immutable
     // base must never receive later coverage-only watermarks. Keeping CURRENT
     // at its last genuinely covered sequence is also the crash-safe dirty
     // marker: restart can prove that a replacement base is required without
     // relying on this process-local bit.
     vector_block_projection_dirty: std.atomic.Value(bool) = .init(false),
-    vector_block_candidate_sequence: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    vector_block_candidate_since_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    vector_block_candidate_sequence: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
+    vector_block_candidate_since_ns: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     /// 0 = idle, 1 = queued/running, 2 = rerun requested while active.
     repair_cleanup_state: std.atomic.Value(u8) = .init(0),
@@ -1407,19 +1407,19 @@ pub const IndexManager = struct {
     // compacting an older schema generation) for CPU, mmap residency, and the
     // shared text-merge resource budget.
     text_backfill_active: std.atomic.Value(u32) = .init(0),
-    next_text_index_instance_id: std.atomic.Value(u64) = .init(1),
+    next_text_index_instance_id: @import("antfly_platform").atomic.Value(u64) = .init(1),
     /// Process-local generation of the extraction plan consumed by writes.
     /// Prepared batches compare this scalar instead of rereading and hashing
     /// the serialized catalog under the DB apply lock.
-    write_plan_generation: std.atomic.Value(u64) = .init(1),
+    write_plan_generation: @import("antfly_platform").atomic.Value(u64) = .init(1),
     write_plan_cache_mutex: std.Io.Mutex = .init,
     /// Non-zero while one request is constructing the immutable plan for a
     /// cold generation. Publication is rare; acquisitions remain lock-free
     /// apart from the short cache pointer fence and never duplicate the owned
     /// catalog clone under a thundering herd.
-    write_plan_build_generation: std.atomic.Value(u64) = .init(0),
+    write_plan_build_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
     write_plan_cache: ?*WritePlanSnapshotEpoch = null,
-    next_dense_capture_incarnation: std.atomic.Value(u64) = .init(1),
+    next_dense_capture_incarnation: @import("antfly_platform").atomic.Value(u64) = .init(1),
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
@@ -1458,7 +1458,7 @@ pub const IndexManager = struct {
     /// A fresh value is assigned on every insertion, including same-name,
     /// same-config recreation, so detached work never derives identity from
     /// mutable record contents. Zero remains reserved as "no incarnation".
-    next_failed_index_load_incarnation_id: std.atomic.Value(u64) = .init(1),
+    next_failed_index_load_incarnation_id: @import("antfly_platform").atomic.Value(u64) = .init(1),
     /// Stable resident retry ring. Every quarantined index is safe to reopen,
     /// even when destructive reconstruction requires operator authorization.
     /// Entries borrow the owned map keys and are updated under catalog_mutex.
@@ -5416,7 +5416,7 @@ pub const IndexManager = struct {
             const projection_ready = entry.index.projectionConfigReady();
 
             // Carry forward user-tunable runtime knobs (the durable regeneration
-            // in api/tables.zig preserves the same set) so a schema/template
+            // in api/local_tables.zig preserves the same set) so a schema/template
             // change does not silently reset planner/adaptive tuning in place.
             new_parsed.value.adaptive = cur.adaptive;
             new_parsed.value.pathfact_policy = cur.pathfact_policy;
@@ -6581,7 +6581,7 @@ pub const IndexManager = struct {
         // Manually configured managers may not own an executor. Their worker
         // sweeps are normally synchronous; retain the established teardown
         // fallback for a structural mutation racing such a sweep.
-        while (self.graph_metric_schedule_pins.load(.acquire) != 0) std.Thread.yield() catch {};
+        while (self.graph_metric_schedule_pins.load(.acquire) != 0) @import("antfly_platform").time.yieldNow();
     }
 
     pub fn deinit(self: *IndexManager) void {
@@ -19209,6 +19209,7 @@ pub const IndexManager = struct {
         self: *IndexManager,
         cfg: types.IndexConfig,
     ) !FreshDenseNativeGeneration {
+        if (builtin.os.tag == .freestanding) return error.DenseNativeV2NotPermitted;
         if (!self.freshDenseNativeV2Permitted(cfg)) return error.DenseNativeV2NotPermitted;
         try fs_paths.createDirPathPortable(self.checkpointIo(), self.base_path);
 
@@ -19294,6 +19295,8 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
         generation: *const FreshDenseNativeGeneration,
     ) void {
+        // Browser indexes never allocate a native filesystem generation.
+        if (builtin.os.tag == .freestanding) return;
         const canonical_path = self.indexPath(cfg.name) catch return;
         defer self.alloc.free(canonical_path);
         self.clearActiveIndexRootPointer(canonical_path) catch {};
@@ -19680,7 +19683,7 @@ pub const IndexManager = struct {
     /// Returns the authenticated physical root currently selected for an
     /// index. Callers that retain this path across a mutation must also hold
     /// the appropriate catalog/structural lease.
-    pub fn activeIndexPath(self: *const IndexManager, name: []const u8) ![]u8 {
+    pub fn activeIndexPath(self: *const IndexManager, name: []const u8) anyerror![]u8 {
         const canonical_path = try self.indexPath(name);
         errdefer self.alloc.free(canonical_path);
         if (try self.readActiveIndexRootPointer(canonical_path, name)) |relative_active_path| {
@@ -30514,7 +30517,7 @@ fn openTextPersistentIndexWithRetry(
     opts: persistent_mod.PersistentIndexOptions,
 ) !persistent_mod.PersistentIndex {
     const max_attempts: usize = 6;
-    const debug_open = std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+    const debug_open = @import("antfly_platform").env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         if (debug_open) {
@@ -30570,7 +30573,7 @@ fn sleepBeforeTextPersistentOpenRetry(attempt: usize) void {
             else => return,
         };
     } else {
-        const spins = 64 * (capped + 1);
+        const spins: usize = 64 * (@as(usize, capped) + 1);
         for (0..spins) |_| std.atomic.spinLoopHint();
     }
 }

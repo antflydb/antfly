@@ -1,8 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the License at https://www.antfly.io/licensing/ELv2-license.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -72,14 +80,14 @@ pub const Observer = struct {
 
     const PeerAction = struct {
         cancellation: *http_common.RequestCancellation,
-        peer_disconnects_total: ?*std.atomic.Value(u64),
-        observer_failures_total: ?*std.atomic.Value(u64),
+        peer_disconnects_total: ?*@import("antfly_platform").atomic.Value(u64),
+        observer_failures_total: ?*@import("antfly_platform").atomic.Value(u64),
     };
 
     const DeadlineAction = struct {
         state: *Deadline,
         expires_at_ns: u64,
-        expirations_total: ?*std.atomic.Value(u64),
+        expirations_total: ?*@import("antfly_platform").atomic.Value(u64),
     };
 
     const ProbeAction = struct {
@@ -133,7 +141,7 @@ pub const Observer = struct {
     active_count: std.atomic.Value(usize) = .init(0),
     active_peer_count: std.atomic.Value(usize) = .init(0),
     active_deadline_count: std.atomic.Value(usize) = .init(0),
-    deadline_expirations_total: std.atomic.Value(u64) = .init(0),
+    deadline_expirations_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
     // One reserved worker for all registrations, independent of request Io.
     scheduling_io: ?std.Io = null,
@@ -219,8 +227,8 @@ pub const Observer = struct {
         self: *Observer,
         fd: std.posix.fd_t,
         cancellation: *http_common.RequestCancellation,
-        peer_disconnects_total: ?*std.atomic.Value(u64),
-        observer_failures_total: ?*std.atomic.Value(u64),
+        peer_disconnects_total: ?*@import("antfly_platform").atomic.Value(u64),
+        observer_failures_total: ?*@import("antfly_platform").atomic.Value(u64),
     ) !Registration {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return .{};
         if (!self.running.load(.acquire) or self.stopping.load(.acquire)) return error.ObserverUnavailable;
@@ -254,7 +262,7 @@ pub const Observer = struct {
         fd: std.posix.fd_t,
         timeout_ms: u32,
         state: *Deadline,
-        expirations_total: ?*std.atomic.Value(u64),
+        expirations_total: ?*@import("antfly_platform").atomic.Value(u64),
     ) !Registration {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding)
             return error.ObserverUnavailable;

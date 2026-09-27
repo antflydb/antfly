@@ -1,6 +1,6 @@
 # Antfly
 
-Antfly is a search-and-inference database written in Zig with zero dependencies. One engine carries full-text (BM25), dense, sparse, and late-interaction vector indexes plus graph traversal over the same table, and the models that chunk, embed, rerank, transcribe, OCR, and extract run inside the process. Embeddings, chunks, entities, and graph edges are generated automatically as you write data, and built-in RAG agents tie it together. The same engine runs as a single `.aflite` file, a single node with a hot standby, a multi-Raft cluster, or serverless over object storage.
+Antfly is a search-and-inference database written in Zig. One engine carries full-text (BM25), dense, sparse, and late-interaction vector indexes plus graph traversal over the same table, and the models that chunk, embed, rerank, transcribe, OCR, and extract run inside the process. Embeddings, chunks, entities, and graph edges are generated automatically as you write data, and built-in RAG agents tie it together. The same engine runs as a single `.aflite` file, a single node with a hot standby, a multi-Raft cluster, or serverless over object storage.
 
 ![Quickstart](https://cdn.antfly.io/quickstart.gif)
 
@@ -24,6 +24,30 @@ docker run -p 8080:8080 ghcr.io/antflydb/antfly:latest standalone --host 0.0.0.0
 That gives you the [Antfarm dashboard](ts/apps/antfarm) at `http://localhost:8080` — playgrounds for search, RAG, knowledge graphs, embeddings, reranking, and more.
 
 See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full walkthrough.
+
+### Lite, inference, or a database server
+
+| Product | How it runs | License |
+|---------|-------------|---------|
+| [Antfly Lite](docs/guides/lite.mdx) | An embedded `.aflite` database through `libantfly`, Zig, Go, Python, Rust, TypeScript, or browser WASM; local file commands through `antfly lite` | [Apache 2.0](LICENSES/Apache-2.0.txt) |
+| [Antfly inference](zig/pkg/inference) | In-process inference, browser WASM (wasm32/wasm64), or the independent `antfly-inference` executable and inference APIs | [Apache 2.0](LICENSES/Apache-2.0.txt) |
+| Antfly database server | `antfly standalone`, distributed clusters, or serverless deployment; database HTTP APIs and the dashboard | [ELv2](LICENSES/Elastic-2.0.txt) |
+
+Build the Apache Lite CLI and native library from source:
+
+```bash
+cd zig
+zig build lite -j1
+./zig-out/bin/antfly lite init app.aflite
+```
+
+The Lite build installs its CLI, `libantfly`, and the C header. To serve that file over HTTP, use the full database server executable:
+
+```bash
+antfly standalone --storage-engine lite --storage-path app.aflite
+```
+
+`lite serve` has been removed. The standalone server uses the same Apache engine under ELv2. See [LICENSING.md](LICENSING.md) for the source boundaries and third-party licenses.
 
 ## Features
 
@@ -100,7 +124,7 @@ SELECT * FROM docs WHERE content @@@ 'fix my computer';
 
 ### Inference Runtime
 
-Antfly inference handles the ML side: embeddings, chunking, reranking, classification, NER, OCR, transcription, generation, and more. It runs under the `antfly inference` CLI and starts automatically in standalone mode, so you don't need to set it up separately.
+Antfly inference handles the ML side: embeddings, chunking, reranking, classification, NER, OCR, transcription, generation, and more. The Apache runtime can run in-process or independently as [`antfly-inference`](zig/pkg/inference). The full database server also exposes `antfly inference` commands and includes inference in standalone mode.
 
 ## Libraries & Tools
 
@@ -114,12 +138,12 @@ Antfly inference handles the ML side: embeddings, chunking, reranking, classific
 
 ## Architecture
 
-Antfly uses a multi-[Raft](https://raft.github.io/raft.pdf) design with separate consensus groups:
+The distributed database server uses a multi-[Raft](https://raft.github.io/raft.pdf) design with separate consensus groups:
 
 - **Metadata raft** — table schemas, shard assignments, cluster topology
 - **Storage rafts** — one per shard, handling data, indexes, and queries
 
-Every dependency is our own: [Raft](zig/pkg/antfly/src/raft), the [LSM](zig/pkg/antfly/src/storage/lsm), an [LMDB-compatible B+tree](zig/pkg/antfly/src/lmdb), the WAL, [full-text search](zig/pkg/antfly/src/search), HTTP/2 and HTTP/3, and the inference runtime. The one vendored input is our [Snowball fork](zig/deps/snowball), used to generate the stemmer tables that are checked in. Because the engine owns the whole process, each of these runs under a deterministic [VOPR](zig/pkg/antfly/src/vopr) simulation harness that injects storage, network, concurrency, and clock faults, in the style of [TigerBeetle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
+Antfly implements [Raft](zig/pkg/antfly/src/raft), an [LSM](zig/pkg/antfly/src/storage/lsm), an [LMDB-compatible B+tree](zig/pkg/antfly/src/lmdb), the WAL, [full-text search](zig/pkg/antfly/src/search), HTTP/2 and HTTP/3, and the inference runtime. Bundled and adapted third-party code, including the [Snowball stemmers](zig/deps/snowball), httpx, and LMDB, retains its original licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Because the engine owns the whole process, each of these runs under a deterministic [VOPR](zig/pkg/antfly/src/vopr) simulation harness that injects storage, network, concurrency, and clock faults, in the style of [TigerBeetle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
 
 End-to-end [chaos tests](zig/e2e/antfly) — inspired by [Jepsen](https://jepsen.io/) — cover node crashes, leader failures, shard splits under load, and cluster scaling. These tests run real multi-node clusters and inject faults to verify that Raft consensus, transactions, and replication behave correctly under failure.
 
@@ -140,4 +164,6 @@ Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-The core server is [Elastic License 2.0 (ELv2)](LICENSE). That means you can use it, modify it, self-host it, and build products on top of it — you just can't offer Antfly itself as a managed service. The in-process Zig embedding package, [`antfly-embedded`](zig/pkg/antfly-embedded), is ELv2 as well. Everything else — the [SDKs](go/pkg/sdk) for Go, TypeScript, Python, and Rust, the public C ABI header [`antfly.h`](zig/pkg/antfly/include/antfly.h), the Antfly Lite bindings for [Go](go/pkg/lite), [Python](py/packages/lite), [Rust](rs/crates/lite), and [TypeScript](ts/packages/lite), [React components](ts/packages/components), the [inference runtime](zig/pkg/inference), [pgaf](rs/crates/pgaf), [docsaf](go/pkg/docsaf), [evalaf](go/pkg/evalaf), and the runnable [examples](examples) — is Apache 2.0. We tried to keep as much as possible under a permissive license.
+The shared embedded engine, Antfly Lite CLI, native `libantfly`, [Zig embedding package](zig/pkg/antfly-embedded), Lite bindings, SDKs, and inference runtime and executable are [Apache 2.0](LICENSES/Apache-2.0.txt).
+
+The standalone database server, database HTTP serving, distributed control, and serverless orchestration are [Elastic License 2.0 (ELv2)](LICENSES/Elastic-2.0.txt). Third-party components retain their original licenses. See [LICENSING.md](LICENSING.md) for the exact scope and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for upstream notices.

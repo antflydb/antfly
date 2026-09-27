@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// Licensed under the Elastic License 2.0 (ELv2).
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Disposable source-location hints. CURRENT and immutable payload identities
 //! remain authoritative. Queries never allocate while holding this mutex.
 const std = @import("std");
@@ -16,8 +28,8 @@ pub const Directory = struct {
     dirty_entries: u64 = 0,
     publications: u64 = 0,
     publication_deferrals: u64 = 0,
-    hits: std.atomic.Value(u64) = .init(0),
-    misses: std.atomic.Value(u64) = .init(0),
+    hits: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    misses: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn create(alloc: std.mem.Allocator) !*Directory {
         const self = try alloc.create(Directory);
@@ -29,7 +41,7 @@ pub const Directory = struct {
         self.alloc.destroy(self);
     }
     fn lock(self: *Directory) void {
-        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
     }
     pub fn get(self: *Directory, digest: []const u8) ?Location {
         if (digest.len != 32 or !self.mutex.tryLock()) return null;

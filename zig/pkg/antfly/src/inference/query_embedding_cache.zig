@@ -1,10 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const cache_budget = @import("../common/cache_budget.zig");
@@ -551,7 +557,7 @@ fn deadlineExpiredAt(now_ns: u64, deadline_ns: ?u64) bool {
 }
 
 const TestCompute = struct {
-    calls: std.atomic.Value(u64) = .init(0),
+    calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
     value: f32,
 
     fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
@@ -611,7 +617,7 @@ test "query embedding cache owns values and serves LRU hits" {
 
 pub fn testConcurrentCoalescing() !void {
     const SlowCompute = struct {
-        calls: std.atomic.Value(u64) = .init(0),
+        calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
         io: std.Io,
 
         fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
@@ -678,7 +684,7 @@ test "query embedding cache coalesces concurrent misses" {
 
 pub fn testInflightAdmissionBound() !void {
     const BlockingCompute = struct {
-        calls: std.atomic.Value(u64) = .init(0),
+        calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
         release: std.atomic.Value(bool) = .init(false),
         io: std.Io,
 
@@ -771,7 +777,7 @@ pub fn testInflightAdmissionBound() !void {
 
 pub fn testDisabledCacheRetainsAdmissionBound() !void {
     const BlockingCompute = struct {
-        calls: std.atomic.Value(u64) = .init(0),
+        calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
         release: std.atomic.Value(bool) = .init(false),
 
         fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {

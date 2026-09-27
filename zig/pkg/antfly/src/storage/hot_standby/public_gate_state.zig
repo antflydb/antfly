@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
-// distributed under the Elastic License 2.0 is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
-// the Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Lock-free public read/write role gates for a live HA data server.
 //!
@@ -40,14 +40,14 @@ pub const Role = enum(u8) {
 
 pub const State = struct {
     role: std.atomic.Value(u8) = .init(@intFromEnum(Role.disabled)),
-    generation: std.atomic.Value(u64) = .init(1),
-    progress_sequence: std.atomic.Value(u64) = .init(0),
-    received_lsn: std.atomic.Value(u64) = .init(0),
-    applied_lsn: std.atomic.Value(u64) = .init(0),
-    safe_read_lsn: std.atomic.Value(u64) = .init(0),
+    generation: @import("antfly_platform").atomic.Value(u64) = .init(1),
+    progress_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    received_lsn: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    applied_lsn: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    safe_read_lsn: @import("antfly_platform").atomic.Value(u64) = .init(0),
     external_authority_required: std.atomic.Value(bool) = .init(false),
     external_authority_granted: std.atomic.Value(bool) = .init(false),
-    external_authority_deadline_ns: std.atomic.Value(u64) = .init(0),
+    external_authority_deadline_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     primary: ?*const primary_mod.Primary = null,
     monotonic_now_fn: *const fn () u64 = platform_time.authorityNs,
 

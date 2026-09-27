@@ -7,10 +7,11 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-# CONDITIONS OF ANY KIND, either express or implied. See the License for the
-# specific language governing permissions and limitations under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Generate allocation-free graph identifier policy implementations.
 
@@ -27,6 +28,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from license_headers import apply_header, group_for, read_header
 
 ROOT = Path(__file__).resolve().parent.parent
 POLICY_PATH = ROOT / "specs/graph_identifier_policy.json"
@@ -696,6 +698,9 @@ components:
 
 
 def write_or_check(path: Path, content: str, check: bool) -> bool:
+    group = group_for(path.relative_to(ROOT).as_posix(), "all")
+    if group and path.suffix != ".yaml":
+        content = apply_header(content, path, read_header(group))
     content = content.rstrip() + "\n"
     if check:
         if not path.exists() or path.read_text(encoding="utf-8") != content:

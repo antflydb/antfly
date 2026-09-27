@@ -13,6 +13,7 @@
 // limitations.
 
 test {
+    _ = @import("storage/portable_wal.zig");
     _ = @import("storage/lite/backend.zig");
     _ = @import("storage/lite/conformance_test.zig");
     _ = @import("storage/lite/docstore.zig");

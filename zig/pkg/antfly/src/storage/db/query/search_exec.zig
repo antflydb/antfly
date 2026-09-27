@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -84,10 +84,10 @@ const default_distributed_sort_shard_window_budget: u32 = 100_000;
 const default_sorted_segment_scan_budget: u64 = 100_000;
 const sorted_segment_deadline_check_interval: u64 = 1024;
 const default_match_all_primary_key_scan_batch_size: usize = 4096;
-var bench_query_profile_counter: std.atomic.Value(u64) = .init(0);
+var bench_query_profile_counter: @import("antfly_platform").atomic.Value(u64) = .init(0);
 const bench_query_profile_unknown = std.math.maxInt(u64);
 const bench_query_profile_disabled = std.math.maxInt(u64) - 1;
-var bench_query_profile_every_cache: std.atomic.Value(u64) = .init(bench_query_profile_unknown);
+var bench_query_profile_every_cache: @import("antfly_platform").atomic.Value(u64) = .init(bench_query_profile_unknown);
 
 pub const SortRejectionDiagnostic = runtime_preflight.SortRejectionDiagnostic;
 pub const resetLastSortRejectionDiagnostic = runtime_preflight.resetLastSortRejectionDiagnostic;
@@ -3563,9 +3563,9 @@ const SortCostModelDecision = struct {
 };
 
 fn applySortCostModelDecision(plan: *SortExecutionPlan, decision: SortCostModelDecision) void {
-    plan.cost_model_live_docs = @intCast(@min(decision.live_docs, @as(usize, std.math.maxInt(u64))));
-    plan.cost_model_candidate_count = @intCast(@min(decision.candidate_count, @as(usize, std.math.maxInt(u64))));
-    plan.cost_model_selective_limit = @intCast(@min(decision.selective_limit, @as(usize, std.math.maxInt(u64))));
+    plan.cost_model_live_docs = @intCast(decision.live_docs);
+    plan.cost_model_candidate_count = @intCast(decision.candidate_count);
+    plan.cost_model_selective_limit = @intCast(decision.selective_limit);
 }
 
 fn sortResultProfile(
@@ -6905,7 +6905,7 @@ fn sortAndPageSearchResultInPlace(
         var profile = SortCollectorProfile{};
         observeSortCandidateSource(if (collect_sort_profile) &profile else null, "existing_hits");
         if (collect_sort_profile) {
-            profile.candidate_count = @intCast(@min(candidate_count, @as(usize, std.math.maxInt(u64))));
+            profile.candidate_count = @intCast(candidate_count);
             profile.window_capacity = 0;
             profile.window_len = 0;
             profile.total_ns = platform_time.monotonicNs() - zero_start_ns;
@@ -7059,7 +7059,7 @@ fn sortAndPageMatchAllCandidatesAlloc(
         var profile = SortCollectorProfile{};
         observeSortCandidateSource(if (collect_sort_profile) &profile else null, "match_all");
         if (collect_sort_profile) {
-            profile.candidate_count = @intCast(@min(candidates.items.len, @as(usize, std.math.maxInt(u64))));
+            profile.candidate_count = @intCast(candidates.items.len);
             profile.window_capacity = 0;
             profile.window_len = 0;
             profile.total_ns = platform_time.monotonicNs() - zero_start_ns;
@@ -7320,7 +7320,7 @@ fn sortAndPageMatchAllCandidateStreamAlloc(
         observeSortCandidateSource(if (collect_sort_profile) &profile else null, matchAllCandidateSourceForConstraints(options.constraints));
         observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, options.constraints);
         if (collect_sort_profile) {
-            profile.candidate_count = @intCast(@min(count_ctx.accepted_count, @as(usize, std.math.maxInt(u64))));
+            profile.candidate_count = @intCast(count_ctx.accepted_count);
             profile.window_capacity = 0;
             profile.window_len = 0;
             profile.total_ns = platform_time.monotonicNs() - count_start_ns;
@@ -7519,7 +7519,7 @@ fn sortAndPageMatchAllIdSeekAlloc(
         observeSortCandidateSource(if (collect_sort_profile) &profile else null, "primary_key");
         observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
         if (collect_sort_profile) {
-            profile.candidate_count = @intCast(@min(count_ctx.accepted_count, @as(usize, std.math.maxInt(u64))));
+            profile.candidate_count = @intCast(count_ctx.accepted_count);
             profile.window_capacity = 0;
             profile.window_len = 0;
             profile.total_ns = platform_time.monotonicNs() - count_start_ns;
@@ -8263,7 +8263,7 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
             if (collect_sort_profile) &zero_profile else null,
         );
         if (collect_sort_profile) {
-            zero_profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
+            zero_profile.candidate_count = @intCast(visible_total);
         }
         zero_profile.total_ns = if (collect_sort_profile) platform_time.monotonicNs() - zero_start_ns else 0;
         if (bench_query_profile) {
@@ -11120,7 +11120,7 @@ fn sortAndPageTextDocValueDocNumsAlloc(
         else
             try visibleTextDocNumCount(alloc, effective_req, snapshot, doc_nums, executor);
         if (collect_sort_profile and activeSortCursor(effective_req).len == 0) {
-            profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
+            profile.candidate_count = @intCast(visible_total);
         }
         if (collect_sort_profile) {
             profile.window_capacity = 0;
@@ -16359,7 +16359,7 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
                 ordinal_to_text_doc_id,
             );
         if (collect_sort_profile and activeSortCursor(effective_req).len == 0) {
-            profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
+            profile.candidate_count = @intCast(visible_total);
         }
         if (collect_sort_profile) {
             profile.window_capacity = 0;

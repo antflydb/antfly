@@ -153,14 +153,14 @@ Applications that configure a remote provider or embed a local runtime mark it a
 
 ## The Same API Over HTTP
 
-For SDKs and local tools, Lite serves the full standalone API:
+For SDKs and local tools, the full standalone database server can serve a Lite file through its HTTP API:
 
 ```bash
-antfly lite serve app.aflite --addr 127.0.0.1:8080
+antfly standalone --storage-engine lite --storage-path app.aflite
 curl http://127.0.0.1:8080/db/v1/status
 ```
 
-This is the same runtime as `antfly standalone --storage-engine lite --storage-path app.aflite`; `lite serve` is a shorter spelling, not a separate protocol. It accepts loopback hosts (`127.0.0.1`, `localhost`, `::1`). For a non-loopback production listener, use the standalone command.
+HTTP serving uses the ELv2 standalone database server. The Apache Lite library and CLI expose in-process APIs and file commands; `lite serve` has been removed. Use the full server binary for the command above.
 
 ## Backups, Snapshots, and Imports
 
@@ -333,7 +333,7 @@ Every handle is safe to share across threads (Python, Rust) or concurrent promis
 
 ## Building from Source
 
-From the `zig` directory, `zig build lite` installs the Lite-only CLI as `zig-out/bin/antfly` together with the `libantfly` library and its C header. It reuses the standalone runtime archives, including the API and inference runtimes that `lite serve` needs, and runs no tests. For the full Antfly CLI with the Lite commands and the C library, use the existing targets:
+From the `zig` directory, `zig build lite` installs the Lite-only CLI as `zig-out/bin/antfly` together with the `libantfly` library and its C header. It links the Apache local engine, enrichment, and inference archives without the database server runtime, and runs no tests. For the full Antfly CLI with the Lite commands and the C library, use the existing targets:
 
 ```bash
 zig build antfly capi

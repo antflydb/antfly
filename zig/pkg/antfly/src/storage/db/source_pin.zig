@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Source-primary pin owner. Admission's prepared record is a durable short
 //! mutation fence; no live recapture is permitted after its pinned receipt.
@@ -152,6 +152,7 @@ fn verifyInventory(alloc: Allocator, io: std.Io, root: []const u8, handle: seal.
 /// Caller holds the DB apply lock. The normal path never exposes prepared
 /// admission to another writer. Restart retries complete this same frozen cut.
 pub fn ensureAssumeApply(db: *DB, scope: ledger.Scope) !void {
+    if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
     const alloc = db.alloc;
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     const progress = try db.onlineSourceStatus(scope);
