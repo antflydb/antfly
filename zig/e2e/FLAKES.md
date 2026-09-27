@@ -2147,6 +2147,151 @@ passed 11 tests. Main's build-cache PVC fix (#895) is included. New executable
 qualification is pending; the earlier 200-case qualification above retains its
 original source and binary provenance.
 
+### 2026-09-27: Completion, acknowledgement, and immutable-view architecture
+
+The performance follow-up keeps the existing durability and admission proofs:
+
+- Apply/read notification epochs are owned by bounded per-group registrations
+  and parked waiters. Unrelated group progress does not wake a registered writer;
+  retirement wakes its group, and nonce/index reuse cannot consume an old result.
+- Follower resolutions join before bounded coordinator acknowledgement commands
+  are formed. Only proven resolutions are acknowledged; proposal acceptance and
+  uncertain delivery leave recovery debt. Commands contain at most 64 members
+  and require durable protocol-13 activation across the applying replica set.
+- A lazily migrated participant/resolution index replaces repeated growing-list
+  rewrites with bounded point updates and a completion-count marker. Membership,
+  legacy resolution evidence, indexed acknowledgements, and the Raft replay marker
+  publish atomically. Legacy single acknowledgements do not initiate migration;
+  cleanup deletes both indexed namespaces and legacy sidecars.
+- Peer and join-planning views have separate content revisions and compact
+  retained transfers. Snapshot owners pin immutable storage under the cache lock;
+  clones run after it is released. Peer publication preserves the independent
+  catalog slot, its age, and observed-head proof. Internal forwarding explicitly
+  reads the retained peer slot; full catalog/identity consumers retain their view.
+- Merge copying reads receiver acceptance from quorum/apply-proven receiver
+  state, rather than a lagging donor-local replica. A local receiver leader uses
+  the admitted transition contract and an exact owner lease; remote reads use
+  the authenticated read boundary.
+- E2E startup overlaps processes within each role stage. Shutdown signals every
+  process in a role before reaping against one shared deadline. Fresh fixture
+  roots, process/listener ownership, role ordering, and failure artifacts remain.
+
+Compatibility targets the actual `v0.2.x` branch (inspected at
+`1dbf5391431469fee7a1f5bfe9c0a844dfb72c07`), whose data-Raft protocol is 2 and
+whose metadata server has the original snapshot routes. Unsupported compact
+transfers fall back to those routes with the same caller budget, cancellation,
+and linearizable/eventual read semantics. Intermediate main implementations
+are not the compatibility target.
+
+The first architecture cohort, source
+`71d73f45539eec4613581bd1dd1e55a5b1d823dc`, executable SHA-256
+`67b05f5fd639e6c9b40785101e8e60bb01baa0a43daa1fa7f5eb8be4145b707c`,
+reproduced two merge failures: a post-merge UNIQUE probe returned
+`500 MetadataSnapshotUnavailable`. Compact peer publication had displaced the
+shared catalog snapshot, and internal forwarding still required that slot.
+Independent retained slots and explicit peer reads fix that cause; the ownership
+regression now verifies both views through publication and invalidation. The
+superseded cohort had six merge passes, two merge failures, one schema pass, and
+63 Autograph passes before both supervisors were intentionally stopped. None
+count toward the corrected executable's qualification.
+
+Native Debug CPU validation passes 174 routing/runtime contracts, 49 real-Raft
+implementation contracts, 50 storage transaction contracts (including migration,
+invalid-batch atomicity, replay and reopen), 96 transaction API contracts, 344 API
+contracts, 133 metadata contracts, and four Python lifecycle contracts. There
+are no failures, skips or allocation leaks in these native buckets. A service
+fixture with a 64 KiB schema serialized 73,826 bytes for the full snapshot,
+6,803 for peers, and 6,804 for planning. The acknowledgement regression packs
+130 eligible follower slots into three bounded commands and preserves debt on
+uncertain delivery. These operation/byte results do not establish latency gains.
+
+The independent-cache executable, source
+`7f76aff44c76b18dc34280e02a158331fa8ba880`, SHA-256
+`69e3b11336c2eca553d68ca5b7bc81a41ae541f9959b9b71427f1c5faf1e8a71`,
+passed 135 merge, 132 schema, 129 cascade, and 200 Autograph cases with no
+failures, errors, or skips before intentional supersession. Review found that
+remote bulk acknowledgements still used the legacy group-batch endpoint,
+which Raft servers disable. Recovery singles could hide this performance gap.
+These counts are not final qualification for the corrected transport.
+
+Bulk acknowledgements now use a private typed transaction endpoint that enters
+the canonical, protocol-gated group write path. v0.2.x's absent-route response
+falls back to its original single-acknowledgement endpoint; unsupported protocol
+activation is rejected before command admission. Invalid requests, lost replies,
+and explicit unknown-outcome headers retain recovery debt. Transport regressions
+cover those distinctions, bounded owned parsing and allocation failure cleanup.
+A live HTTP fixture verifies the typed route while the legacy batch route is
+disabled. No compatibility with intermediate main implementations is required.
+
+The corrected Debug CPU build passed **82/82 steps**, including the live HTTP
+regression, 96 transaction, 344 API, 49 Raft implementation, and 174 runtime
+contracts. It uses native source `b40ffbf1adc14f607bcda0d39bbf9007899d3046`,
+SHA-256 `cc83e2ca917aa949ba99c0d3fd1f0076be58e69538ec22afe977914772efb8cf`.
+This superseded executable passed 41 merge, 40 schema, 40 cascade, and 185
+Autograph cases without failures, errors, or skips before both supervisors were
+intentionally stopped to implement the two remaining performance gaps. These
+counts do not qualify the next executable.
+
+Forwarding now pins the immutable peer generation for routing preflight,
+endpoint lookup, and placement selection. It copies only the selected URI and
+examines only the selected group's placements. Read-health filtering and the
+original forwarding eligibility/order rules remain distinct; retained views
+survive replacement and invalidation. Regression checks verify no catalog
+result clones during warm production preflight or endpoint lookup and preserve
+cancellation, deadlines, and the background reconciliation wake.
+
+Background recovery now batches proven participant resolutions in bounded
+64-member acknowledgement windows through the canonical group write path.
+The typed owner callback is carried through version 66 of the native owner ABI.
+Shared failure ABI 55 preserves explicit protocol rejection and unknown write
+outcomes as distinct append-only statuses across that callback.
+Standalone recovery uses the same atomic indexed acknowledgement operation.
+Only explicit capability rejection selects legacy singles; lost replies retain
+recovery debt, including replies lost after a committed acknowledgement.
+Regressions preserve unresolved followers and the retained coordinator's self
+handoff. The fair-service forwarding fixture runs ready tasks before virtual
+time advancement, rather than making successful service depend on hash order.
+
+The corrected native Debug CPU build passes 73/73 steps, including 174 routing,
+49 Raft implementation, 96 transaction API, 51 storage transaction, and 31
+owner-source contracts. The C callback bridge passes its focused 15/15-step
+build, and the failure registry and released numeric-identity audits pass.
+
+The source `8d4407a2702431c394d364d2dcf44944c648e3cf` executable, SHA-256
+`fcdf2eafc316d8a23ab21944f67958ee8fb7a3b145e7dd99d67cb4b883afc702`,
+passed 50 merge, 48 schema, 44 cascade, and 200 Autograph runs. Cascade had one
+failure: after committed deletion and owner restart, rows were absent but a
+replacement parent returned `UniqueConstraintViolation`. Recovery was stopped;
+Autograph's supervisor exited successfully. These counts do not qualify the
+next executable.
+
+Participant semantic preparation interpreted the old physical claim before
+checking another transaction's unresolved exclusive release intent. A production
+DB regression deterministically reproduced the same false UNIQUE rejection.
+Integrity point and prefix reads now check exclusive intent ownership through
+the existing apply-fenced point probe before interpreting values. The owning
+transaction remains idempotently preparable, and shared parent guards remain
+compatible. Reusable lock-key scratch avoids per-read snapshots or record scans;
+reference upper bounds prevent unrelated successor locks from blocking an empty
+tuple. Commit/abort, shared-guard, reference contention, and prefix-isolation
+regressions protect these distinctions. The first corrected storage transaction
+suite passes 52/52 tests without skips or leaks; broader qualification is pending.
+
+Expanded native Debug CPU validation passes 73/73 build steps, including 83
+storage/integrity contracts, 174 routing, 49 Raft implementation, 96 transaction
+API, and 31 owner-source contracts, without skips or allocation leaks.
+
+Final native Debug CPU qualification used source
+`a6077ffbed792b48c8f2eab84b401724f5513f2e`, executable SHA-256
+`e6279aadb8f36dac25a33a29ccd80ada1580fc2023575a322f9903347caa8ad9`,
+with eight workers × 25 repetitions per recovery selector and two × 100 for
+Autograph. Exact selectors and reproduction commands are unchanged above;
+reports remain separate per executable. The merge, schema, cascade, and
+Autograph selectors each passed **200/200**, with zero failures, errors, or
+skips in all 800 XML reports. Both soak supervisors exited successfully.
+Recovery reports are in `/private/tmp/pr891-architecture-recovery-200-5` and
+Autograph reports are in `/private/tmp/pr891-architecture-autograph-200-5`.
+
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
 
 Scheduled run `36247286560` passed qualification, all five campaigns, and the
