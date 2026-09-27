@@ -53,6 +53,12 @@ pub const Config = struct {
     /// (models/laya/LAYA.md, "Training memory"). Ignored on `backend: cpu`,
     /// where the encoder runs in host memory bounded by `max_host_bytes`.
     max_backend_bytes: usize = 32 * 1024 * 1024 * 1024,
+    /// Also refuse the job when the process-wide admission controller's live
+    /// system-memory check fails. That check keeps serving headroom (a
+    /// quarter of physical memory) on top of the request, so on a 36 GB
+    /// machine it refuses every full Laya fine-tune; it is opt-in for jobs
+    /// that share a large host with serving work.
+    check_live_memory: bool = false,
     /// Train (and export) a tree-packed layout (models/laya/LAYA.md). Null
     /// keeps the source checkpoint's layout; released checkpoints are unpacked.
     packing: ?model.PackingMode = null,
@@ -669,6 +675,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         std.log.err("laya training needs an estimated {d} MiB of device memory, above max_backend_bytes ({d} MiB)", .{ backend_estimate >> 20, c.max_backend_bytes >> 20 });
         return error.LayaBackendMemoryLimitExceeded;
     }
+    if (c.backend == .metal) std.log.info("laya training device memory estimate {d} MiB (max_backend_bytes {d} MiB)", .{ backend_estimate >> 20, c.max_backend_bytes >> 20 });
     if (comptime @import("build_options").enable_metal) if (c.backend == .metal) metal_tensor.resetMemoryStats();
     // `max_host_bytes` is already a generous safety-net ceiling enforced by
     // `budget` (BoundedAllocator), not actual usage, so it is not also
@@ -686,7 +693,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
             .combined_limit_bytes = try addBytes(c.max_host_bytes, if (c.backend == .metal) c.max_backend_bytes else 0),
         },
         .{ .backend_scratch_bytes = backend_estimate },
-        c.backend == .metal,
+        c.backend == .metal and c.check_live_memory,
     );
     defer lease.release();
     const originals = try permanent.alloc(run.Parameter, selected.len);

@@ -1174,9 +1174,12 @@ still open.
 GiB; an initial 24 GiB default refused the standard packed recipe, whose
 estimate is above that and whose measured peak is ~25.9 GB), a
 device/unified-memory ceiling alongside the existing `max_host_bytes`. A
-refusal logs the estimate and the ceiling. The live system-memory check is
-what protects a busy machine: it refuses a job that would not fit in the
-memory available right now.
+refusal logs the estimate and the ceiling, and every Metal job logs its
+estimate. The admission controller's live system-memory check is opt-in
+(`check_live_memory`): it reserves serving headroom of a quarter of physical
+memory on top of the request, so on a 36 GB laptop it refuses every full
+Laya fine-tune (a ~25 GB job would need ~34 GB free). Run one training job at
+a time on a small machine.
 `execute` estimates the run's device need right after selecting trainable
 parameters and before any device weight or optimizer-state allocation (well
 before creating the output directory), and refuses with
