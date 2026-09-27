@@ -105,6 +105,26 @@ pub fn acknowledgeGroupLocalWithRequest(writes: table_writes.TableWriteSource, a
     return writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, req.txn_id, req.participant);
 }
 
+fn validateAcknowledgementMany(req: TxnAcknowledgeManyRequest) !void {
+    try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
+    if (req.restore_staging_scope != null and req.restore_staging_plan_id == null) return error.InvalidTxnRequest;
+    if (req.participants.len == 0 or req.participants.len > 64) return error.InvalidTxnRequest;
+    for (req.participants) |participant| if (parseParticipantRef(participant) == null) return error.InvalidTxnRequest;
+}
+
+pub fn acknowledgeManyGroupLocalWithRequest(writes: table_writes.TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest, cancellation: db_mod.types.CancellationToken) !?void {
+    try validateAcknowledgementMany(req);
+    try cancellation.check();
+    const result = try writes.batchGroupLocal(alloc, group_id, table_name, .{
+        .restore_staging_scope = req.restore_staging_scope,
+        .restore_staging_plan_id = req.restore_staging_plan_id,
+        .sync_level = .write,
+        .transaction = .{ .acknowledge_many = .{ .txn_id = req.txn_id, .participants = req.participants } },
+    });
+    try cancellation.check();
+    return result;
+}
+
 /// Hidden owner resolution retains its authenticated descriptor lookup identity
 /// through the canonical batch route. Ordinary transactions keep their existing
 /// cancellation-aware participant callback and serving topology checks.
@@ -263,7 +283,7 @@ pub const ParticipantWorker = struct {
                     // Acknowledgements are idempotent. Mixed-version hosts retain
                     // the original per-participant path; uncertain errors retain
                     // recovery debt rather than asserting delivery.
-                    error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion, error.InvalidBatchRequest, error.InvalidArgument => break :delivered false,
+                    error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion => break :delivered false,
                     else => return err,
                 };
                 break :delivered true;
@@ -802,22 +822,16 @@ pub const HostedParticipantWorker = struct {
 
     fn acknowledgeManyGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest) !void {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
-        try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
-        const batch: db_mod.types.BatchRequest = .{
-            .restore_staging_scope = req.restore_staging_scope,
-            .restore_staging_plan_id = req.restore_staging_plan_id,
-            .sync_level = .write,
-            .transaction = .{ .acknowledge_many = .{ .txn_id = req.txn_id, .participants = req.participants } },
-        };
+        try validateAcknowledgementMany(req);
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         switch (route) {
-            .local => _ = (try self.writes.batchGroupLocal(alloc, group_id, table_name, batch)) orelse return error.UnknownGroup,
+            .local => _ = (try acknowledgeManyGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .none)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = self.httpClient(alloc);
-                const body = try @import("batch.zig").encodeBatchRequest(alloc, batch);
+                const body = try encodeTxnAcknowledgeManyRequest(alloc, req);
                 defer alloc.free(body);
-                var response = try client.fetchGroupBatch(remote.base_uri, group_id, table_name, body);
+                var response = try client.fetchGroupTxnAcknowledgeMany(remote.base_uri, group_id, table_name, body);
                 response.deinit(alloc);
             },
         }
@@ -2463,6 +2477,19 @@ pub fn encodeTxnAcknowledgeRequest(alloc: std.mem.Allocator, req: TxnAcknowledge
     return out.toOwnedSlice(alloc);
 }
 
+pub fn encodeTxnAcknowledgeManyRequest(alloc: std.mem.Allocator, req: TxnAcknowledgeManyRequest) ![]u8 {
+    try validateAcknowledgementMany(req);
+    const txn_hex = encodeTxnIdHex(req.txn_id);
+    const base = try std.fmt.allocPrint(alloc, "{{\"txn_id\":\"{s}\",\"participants\":{f}", .{ &txn_hex, std.json.fmt(req.participants, .{}) });
+    defer alloc.free(base);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, base);
+    try appendRestoreAuthority(alloc, &out, req.restore_staging_scope, req.restore_staging_plan_id);
+    try out.append(alloc, '}');
+    return out.toOwnedSlice(alloc);
+}
+
 pub fn encodeTxnStatusResponse(alloc: std.mem.Allocator, response: TxnStatusResponse) ![]u8 {
     const status_text = switch (response.status) {
         .pending => "pending",
@@ -2876,6 +2903,40 @@ pub fn parseTxnAcknowledgeRequest(alloc: std.mem.Allocator, body: []const u8) !T
 
 pub fn freeTxnAcknowledgeRequest(alloc: std.mem.Allocator, req: *TxnAcknowledgeRequest) void {
     alloc.free(@constCast(req.participant));
+    req.* = undefined;
+}
+
+pub fn parseTxnAcknowledgeManyRequest(alloc: std.mem.Allocator, body: []const u8) !TxnAcknowledgeManyRequest {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidTxnRequest,
+    };
+    if (obj.get("participant") != null) return error.InvalidTxnRequest;
+    const values = obj.get("participants") orelse return error.InvalidTxnRequest;
+    if (values != .array or values.array.items.len == 0 or values.array.items.len > 64) return error.InvalidTxnRequest;
+    for (values.array.items) |value| if (value != .string or parseParticipantRef(value.string) == null) return error.InvalidTxnRequest;
+    const scope: ?[32]u8 = if (obj.get("restore_staging_scope")) |value| try integrity_wire.parseGenerationSet(value) else null;
+    const plan_id = try parseRestorePlan(obj, scope);
+    if ((scope == null) != (plan_id == null)) return error.InvalidTxnRequest;
+    const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
+    const participants = try alloc.alloc([]const u8, values.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (participants[0..initialized]) |participant| alloc.free(participant);
+        alloc.free(participants);
+    }
+    for (values.array.items, participants) |value, *participant| {
+        participant.* = try alloc.dupe(u8, value.string);
+        initialized += 1;
+    }
+    return .{ .txn_id = txn_id, .participants = participants, .restore_staging_scope = scope, .restore_staging_plan_id = plan_id };
+}
+
+pub fn freeTxnAcknowledgeManyRequest(alloc: std.mem.Allocator, req: *TxnAcknowledgeManyRequest) void {
+    for (req.participants) |participant| alloc.free(participant);
+    alloc.free(req.participants);
     req.* = undefined;
 }
 
@@ -3710,6 +3771,123 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "hosted participant bulk acknowledgements use typed transport and only definite legacy fallback" {
+            const FakeRouter = struct {
+                fn iface() table_router.HostedGroupRouter {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .local_node_id = localNodeId,
+                            .local_status = localStatus,
+                            .group_leader_node_id = groupLeaderNodeId,
+                            .group_node_ids = groupNodeIds,
+                            .node_status = nodeStatus,
+                            .node_base_uri = nodeBaseUri,
+                        },
+                    };
+                }
+
+                fn localNodeId(_: *anyopaque) u64 {
+                    return 99;
+                }
+
+                fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+                    return .absent;
+                }
+
+                fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+                    return 1;
+                }
+
+                fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: table_router.RouteBudget) ![]u64 {
+                    return try alloc.dupe(u64, &.{ 1, 2, 3 });
+                }
+
+                fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
+                    return if (node_id >= 1 and node_id <= 3) .active else .absent;
+                }
+
+                fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+                    return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
+                }
+            };
+            const Executor = struct {
+                status: u16 = 200,
+                unknown: bool = false,
+                transport_failure: bool = false,
+                many: usize = 0,
+                singles: usize = 0,
+                fn iface(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    if (std.mem.endsWith(u8, req.uri, "/txn-acknowledge-many")) {
+                        self.many += 1;
+                        var decoded = try parseTxnAcknowledgeManyRequest(alloc, req.body);
+                        defer freeTxnAcknowledgeManyRequest(alloc, &decoded);
+                        try std.testing.expectEqual(@as(usize, 2), decoded.participants.len);
+                        try std.testing.expectEqualStrings("table2:00000004:docs:8", decoded.participants[0]);
+                        if (self.transport_failure) return error.ConnectionResetByPeer;
+                        if (self.unknown) return http_route_helpers.textResponseWithHeaders(alloc, self.status, "write outcome unknown", &.{.{ .name = internal_batch_forwarding.outcome_header, .value = internal_batch_forwarding.outcome_unknown_v1 }});
+                        return .{ .status = self.status };
+                    }
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, "/txn-acknowledge"));
+                    self.singles += 1;
+                    var decoded = try parseTxnAcknowledgeRequest(alloc, req.body);
+                    defer freeTxnAcknowledgeRequest(alloc, &decoded);
+                    try std.testing.expectEqualStrings(if (self.singles == 1) "table2:00000004:docs:8" else "table2:00000004:docs:9", decoded.participant);
+                    return .{ .status = 200 };
+                }
+            };
+            const req: TxnAcknowledgeManyRequest = .{ .txn_id = @splat(1), .participants = &.{ "table2:00000004:docs:8", "table2:00000004:docs:9" } };
+            for ([_]u16{ 200, 404, 405, 400 }) |status| {
+                var executor: Executor = .{ .status = status };
+                var hosted = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, executor.iface());
+                const result = hosted.worker().acknowledgeManyGroup(std.testing.allocator, 7, "docs", req);
+                if (status == 400) try std.testing.expectError(error.UnexpectedHttpStatus, result) else try result;
+                try std.testing.expectEqual(@as(usize, 1), executor.many);
+                try std.testing.expectEqual(@as(usize, if (status == 404 or status == 405) 2 else 0), executor.singles);
+            }
+            for ([_]u16{ 404, 405, 409 }) |status| {
+                var executor: Executor = .{ .status = status, .unknown = true };
+                var hosted = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, executor.iface());
+                try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, hosted.worker().acknowledgeManyGroup(std.testing.allocator, 7, "docs", req));
+                try std.testing.expectEqual(@as(usize, 1), executor.many);
+                try std.testing.expectEqual(@as(usize, 0), executor.singles);
+            }
+            var executor: Executor = .{ .transport_failure = true };
+            var hosted = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, executor.iface());
+            try std.testing.expectError(error.ConnectionResetByPeer, hosted.worker().acknowledgeManyGroup(std.testing.allocator, 7, "docs", req));
+            try std.testing.expectEqual(@as(usize, 0), executor.singles);
+        }
+
+        test "distributed txn bulk acknowledgement codec owns bounded participant identities and restore authority" {
+            const Harness = struct {
+                fn roundTrip(alloc: std.mem.Allocator) !void {
+                    const ids = [_][]const u8{ "table2:00000004:docs:8", "table2:00000004:docs:9", "table2:00000004:docs:8" };
+                    const encoded = try encodeTxnAcknowledgeManyRequest(alloc, .{ .txn_id = @splat(1), .participants = &ids, .restore_staging_scope = @splat(2), .restore_staging_plan_id = @splat(3) });
+                    defer alloc.free(encoded);
+                    var decoded = try parseTxnAcknowledgeManyRequest(alloc, encoded);
+                    defer freeTxnAcknowledgeManyRequest(alloc, &decoded);
+                    try std.testing.expectEqualSlices(u8, &([_]u8{1} ** 16), &decoded.txn_id);
+                    try std.testing.expectEqual([_]u8{2} ** 32, decoded.restore_staging_scope.?);
+                    try std.testing.expectEqual([_]u8{3} ** 16, decoded.restore_staging_plan_id.?);
+                    for (ids, decoded.participants) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.roundTrip, .{});
+            for ([_][]const u8{ "[]", "[1]", "[\"bad\"]" }) |participants| {
+                const malformed = try std.fmt.allocPrint(std.testing.allocator, "{{\"txn_id\":\"01010101010101010101010101010101\",\"participants\":{s}}}", .{participants});
+                defer std.testing.allocator.free(malformed);
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnAcknowledgeManyRequest(std.testing.allocator, malformed));
+            }
+            const oversized: [65][]const u8 = @splat("table2:00000004:docs:8");
+            try std.testing.expectError(error.InvalidTxnRequest, encodeTxnAcknowledgeManyRequest(std.testing.allocator, .{ .txn_id = @splat(1), .participants = &oversized }));
+            try std.testing.expectError(error.InvalidTxnRequest, parseTxnAcknowledgeManyRequest(std.testing.allocator, "{\"txn_id\":\"01010101010101010101010101010101\",\"participants\":[\"table2:00000004:docs:8\"],\"participant\":\"table2:00000004:docs:8\"}"));
+        }
+
         test "transaction attempt budgets follow the borrowed transport clock" {
             var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
             defer vopr_io.deinit();

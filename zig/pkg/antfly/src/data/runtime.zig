@@ -11386,6 +11386,10 @@ pub const DataServer = struct {
                             }
                         }
                         if (active_protocol_version < required_protocol_version) {
+                            // Bulk ACKs have a compatible single-command path.
+                            // This is a feature rejection before ACK admission,
+                            // never a classification of an accepted write.
+                            if (req.transaction) |transaction| if (transaction == .acknowledge_many) return error.UnsupportedOperation;
                             if (required_protocol_version >= data_raft_batch.merge_copy_attempt_protocol_version)
                                 return error.RaftBatchMergeProtocolUnavailable;
                             if (required_protocol_version >= data_raft_batch.split_delta_predecessor_protocol_version)

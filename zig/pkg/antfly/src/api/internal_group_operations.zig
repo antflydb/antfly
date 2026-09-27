@@ -757,6 +757,22 @@ pub const Operations = struct {
         }) orelse return error.NotFound;
     }
 
+    pub fn txnAcknowledgeMany(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnAcknowledgeManyRequest) Error!void {
+        try request.ensureActive();
+        const writes = self.writes orelse return error.NotFound;
+        _ = (distributed_txn.acknowledgeManyGroupLocalWithRequest(writes, alloc, group_id, table_name, input, request.cancellation) catch |err| switch (err) {
+            error.InvalidTxnRequest, error.RestoreStagingScopeChanged => return error.InvalidArgument,
+            error.InvalidParticipant, error.DecisionConflict => return error.DecisionConflict,
+            error.UnsupportedOperation => return error.Unsupported,
+            error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,
+            error.LeaderUnavailable, error.NotLeader => return error.GroupLeaderUnavailable,
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => return error.Internal,
+        }) orelse return error.NotFound;
+    }
+
     pub fn updateDocumentArtifactChildRangePlacement(
         self: Operations,
         alloc: std.mem.Allocator,

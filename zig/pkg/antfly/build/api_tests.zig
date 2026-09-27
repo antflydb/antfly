@@ -961,6 +961,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed txn propagates one absolute deadline through ambiguous decision recovery",
             "distributed txn participant fanout is bounded and concurrent",
             "distributed txn acknowledgement windows batch only proven followers and preserve recovery debt",
+            "hosted participant bulk acknowledgements use typed transport and only definite legacy fallback",
+            "distributed txn bulk acknowledgement codec owns bounded participant identities and restore authority",
             "distributed txn abort fanout preserves durable ordering contact evidence and bounded recovery",
             "distributed txn coordinator never aborts after durable commit decision",
             "distributed txn coordinator never restarts a transaction id on topology change",

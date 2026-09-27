@@ -1377,6 +1377,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.txn_resolve_suffix, httpx.Handler.bind(self, internalTxnResolve));
         try server.post(table_prefix ++ routes.txn_status_suffix, httpx.Handler.bind(self, internalTxnStatus));
         try server.post(table_prefix ++ routes.txn_acknowledge_suffix, httpx.Handler.bind(self, internalTxnAcknowledge));
+        try server.post(table_prefix ++ routes.txn_acknowledge_many_suffix, httpx.Handler.bind(self, internalTxnAcknowledgeMany));
         try server.post(table_prefix ++ routes.artifact_repair_suffix, httpx.Handler.bind(self, internalArtifactRepairList));
         try server.post(table_prefix ++ routes.artifact_repair_run_suffix, httpx.Handler.bind(self, internalArtifactRepairRun));
         const document_artifact_prefix = table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ ":artifact_name";
@@ -3510,6 +3511,22 @@ pub const AntflyApiHandler = struct {
         defer distributed_txn.freeTxnAcknowledgeRequest(ctx.allocator, &input);
         self.internalGroupOperations().txnAcknowledge(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalTxnErrorResponse(ctx, err, .acknowledge);
+        return ctx.json(struct {}{});
+    }
+
+    fn internalTxnAcknowledgeMany(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
+        var input = distributed_txn.parseTxnAcknowledgeManyRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
+        defer distributed_txn.freeTxnAcknowledgeManyRequest(ctx.allocator, &input);
+        self.internalGroupOperations().txnAcknowledgeMany(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err| {
+            if (err == error.RaftBatchWriteOutcomeUnknown) {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+                return textResponse(ctx, 409, "write outcome unknown");
+            }
+            return internalTxnErrorResponse(ctx, err, .acknowledge);
+        };
         return ctx.json(struct {}{});
     }
 
@@ -9643,6 +9660,28 @@ test "httpx shared registrar keeps root probes and rejects removed data aliases"
 test "httpx internal control routes call typed operations directly" {
     const alloc = std.testing.allocator;
     const Fake = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn writes(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{ .batch = batch, .batch_group_local = groupBatch } };
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedPublicBatch;
+        }
+        fn routed(_: *anyopaque, _: std.mem.Allocator, _: internal_group_operations.RoutedBatchAuthority, _: u64, _: []const u8, _: db_mod.types.BatchRequest, _: internal_batch_forwarding.Context, _: operation_contract.RequestContext) anyerror!?void {
+            return error.TestUnexpectedLegacyForwarding;
+        }
+        fn groupBatch(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.write, req.sync_level);
+            const ack = req.transaction.?.acknowledge_many;
+            try std.testing.expectEqual(@as(usize, 2), ack.participants.len);
+            try std.testing.expectEqualStrings("table2:00000004:docs:8", ack.participants[0]);
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return {};
+        }
+
         fn reads() table_reads.TableReadSource {
             return .{ .ptr = undefined, .vtable = &.{
                 .lookup = publicLookup,
@@ -9692,12 +9731,14 @@ test "httpx internal control routes call typed operations directly" {
     };
 
     var source = AuthStatusSource{};
+    var fake: Fake = .{};
     const service_secret = "httpx-internal-control-test-secret";
     var api_server = ApiHttpServer.init(alloc, .{
         .shard_db_adapter = Fake.shardDb(),
+        .routed_raft_batch_writer = .{ .ptr = &fake, .write_fn = Fake.routed },
         .internal_service_secret = service_secret,
         .internal_service_issuer = "httpx-test",
-    }, source.iface(), Fake.reads(), null);
+    }, source.iface(), Fake.reads(), fake.writes());
     defer api_server.deinit();
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);
@@ -9779,8 +9820,8 @@ test "httpx internal control routes call typed operations directly" {
     defer alloc.free(batch_url);
     var invalid_batch = try requestWithRetry(&client, client_io.io(), .POST, batch_url, "[]", &headers, 20);
     defer invalid_batch.deinit();
-    try std.testing.expectEqual(@as(u16, 400), invalid_batch.status.code);
-    try std.testing.expectEqualStrings("invalid batch request", invalid_batch.body.?);
+    try std.testing.expectEqual(@as(u16, 404), invalid_batch.status.code);
+    try std.testing.expectEqualStrings("legacy raft batch forwarding unsupported", invalid_batch.body.?);
 
     const routed_batch_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/batch-routed-v1", .{base_url});
     defer alloc.free(routed_batch_url);
@@ -9855,7 +9896,20 @@ test "httpx internal control routes call typed operations directly" {
     try std.testing.expectEqual(@as(u16, 400), invalid_repair_run.status.code);
     try std.testing.expectEqualStrings("invalid artifact repair request", invalid_repair_run.body.?);
 
-    inline for (.{ "txn-begin", "txn-prepare", "txn-resolve", "txn-status", "txn-acknowledge" }) |suffix| {
+    const many_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/txn-acknowledge-many", .{base_url});
+    defer alloc.free(many_url);
+    var many = try requestWithRetry(&client, client_io.io(), .POST, many_url, "{\"txn_id\":\"01010101010101010101010101010101\",\"participants\":[\"table2:00000004:docs:8\",\"table2:00000004:docs:9\"]}", &headers, 20);
+    defer many.deinit();
+    try std.testing.expectEqual(@as(u16, 200), many.status.code);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.monotonic));
+    const legacy_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/batch", .{base_url});
+    defer alloc.free(legacy_url);
+    var legacy = try requestWithRetry(&client, client_io.io(), .POST, legacy_url, "{}", &headers, 20);
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(u16, 404), legacy.status.code);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.monotonic));
+
+    inline for (.{ "txn-begin", "txn-prepare", "txn-resolve", "txn-status", "txn-acknowledge", "txn-acknowledge-many" }) |suffix| {
         const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/{s}", .{ base_url, suffix });
         defer alloc.free(url);
         var response = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &headers, 20);
