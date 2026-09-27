@@ -941,7 +941,7 @@ that row, so the training loss is a held-out learning curve.
   of 40-50.
 - Two likely causes:
   - RLCD's Gaussian logit exploration, which already diverged on 77-option
-    Banking77 ([Recommended recipe](#recommended-recipe)). A fifth of Open-Jev
+    Banking77 ([Recommended recipe](#recommended-recipe)). About a third of Open-Jev
     choice questions have 9 or 16 options.
   - The trainer has no learning-rate schedule (no warmup, no decay). A
     constant 2.5e-5 at batch 1 over 21k steps is 50× longer than the runs it
