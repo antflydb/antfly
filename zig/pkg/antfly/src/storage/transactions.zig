@@ -449,6 +449,38 @@ const txn_record_v6_size = 53;
 // TxnManager
 // ============================================================================
 
+/// Apply-fenced semantic reads must not interpret physical bytes protected
+/// by another transaction's unresolved exclusive intent. Shared read guards
+/// remain compatible. Reuse one lock-key buffer and the caller's point probe;
+/// no transaction-record scan or mutable-store snapshot is needed.
+pub const IntentReadGuard = struct {
+    alloc: Allocator,
+    exclude_txn: ?TxnId,
+    lock_key: std.ArrayList(u8) = .empty,
+
+    pub fn init(alloc: Allocator, exclude_txn: ?TxnId) IntentReadGuard {
+        return .{ .alloc = alloc, .exclude_txn = exclude_txn };
+    }
+
+    pub fn deinit(self: *IntentReadGuard) void {
+        self.lock_key.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn check(self: *IntentReadGuard, view: anytype, user_key: []const u8) !void {
+        self.lock_key.clearRetainingCapacity();
+        try self.lock_key.appendSlice(self.alloc, intent_locks_prefix);
+        try self.lock_key.appendSlice(self.alloc, user_key);
+        const owner = view.get(self.lock_key.items) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        if (owner.len != @sizeOf(TxnId)) return TxnError.InvalidTxnRecord;
+        if (self.exclude_txn) |txn| if (std.mem.eql(u8, owner, &txn)) return;
+        return TxnError.IntentConflict;
+    }
+};
+
 pub const TxnManager = struct {
     store: backend_erased.Store,
     owns_store: bool,

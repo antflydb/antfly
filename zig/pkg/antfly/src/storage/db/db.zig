@@ -27165,7 +27165,7 @@ pub const DB = struct {
         var integrity_effects: ?integrity_mod.Effects = null;
         defer if (integrity_effects) |*effects| effects.deinit();
         if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or integrity_catalog != null) {
-            var integrity_read = try integrity_mod.CurrentView.init(self.core.store);
+            var integrity_read = try integrity_mod.CurrentView.initForTransaction(self.core.store, preparation_alloc, txn_id);
             defer integrity_read.deinit();
             // Shadow claims must remain unobservable even to a participant
             // whose stale route happens to name this receiver. Check before
@@ -140691,4 +140691,70 @@ test "db transaction batched acknowledgement migration preserves legacy replay a
     const complete = try db.getUnresolvedTransactionParticipants(alloc, txn);
     defer transactions_mod.freeParticipantList(alloc, complete);
     try std.testing.expectEqual(@as(usize, 0), complete.len);
+}
+
+test "db transaction integrity contention precedes stale claim semantics" {
+    const alloc = std.testing.allocator;
+    for ([_]transactions_mod.TxnStatus{ .committed, .aborted }) |decision| {
+        var directory = try TestDirectory.init("claim-contention");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{
+            .start_optional_runtimes = false,
+            .start_index_workers = false,
+            .identity_namespace = .{ .table_id = 100, .shard_id = 101 },
+        });
+        defer db.close();
+        try db.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        );
+        const integrity = @import("relational_integrity.zig");
+        const catalog_mod = @import("relational_integrity_catalog.zig");
+        const raw = (try db.core.getStoreValue(alloc, catalog_mod.key)).?;
+        defer alloc.free(raw);
+        var catalog = try catalog_mod.decode(alloc, raw);
+        defer catalog.deinit();
+        const generation_set = @import("relational_integrity_activation.zig").generationSet(catalog);
+        var view = db.core.acquireSchemaView().?;
+        defer view.release();
+        var plan = try @import("relational_index_keys.zig").TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
+        defer plan.deinit();
+        var tuple: std.ArrayList(u8) = .empty;
+        defer tuple.deinit(alloc);
+        _ = try plan.appendValues(alloc, &tuple, &.{.{ .integer = 17 }});
+        const address = try integrity.Address.init(catalog.find(.unique, "pk").?.generation, tuple.items);
+        const seed = try db.beginTransactionWithId(@splat(71), 10);
+        try db.writeTransaction(seed, .{
+            .relational_schema_version = 1,
+            .relational_integrity_generation_set = generation_set,
+            .writes = &.{.{ .key = "parent", .value = "{\"id\":17}" }},
+            .integrity_commands = &.{.{ .address = address, .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "parents", .parent_key = "parent", .schema_version = 1 } } }},
+        });
+        try db.commitTransaction(seed, 11);
+        const release = try db.beginTransactionWithId(@splat(72), 12);
+        const release_request: types.TransactionIntentRequest = .{
+            .relational_schema_version = 1,
+            .relational_integrity_generation_set = generation_set,
+            .deletes = &.{"parent"},
+            .integrity_commands = &.{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parents", .parent_key = "parent" } } }},
+        };
+        try db.writeTransaction(release, release_request);
+        // Own intents remain idempotently preparable. Another transaction must
+        // see recoverable contention before decoding the old physical claim.
+        try db.writeTransaction(release, release_request);
+        const candidate = try db.beginTransactionWithId(@splat(73), 13);
+        const replacement: types.TransactionIntentRequest = .{
+            .relational_schema_version = 1,
+            .relational_integrity_generation_set = generation_set,
+            .writes = &.{.{ .key = "replacement", .value = "{\"id\":17}" }},
+            .integrity_commands = &.{.{ .address = address, .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "parents", .parent_key = "replacement", .schema_version = 1 } } }},
+        };
+        try std.testing.expectError(error.IntentConflict, db.writeTransaction(candidate, replacement));
+        try db.resolveTransactionIntents(release, decision, 20);
+        if (decision == .committed) {
+            try db.writeTransaction(candidate, replacement);
+            try db.commitTransaction(candidate, 21);
+        } else {
+            try std.testing.expectError(error.UniqueConstraintViolation, db.writeTransaction(candidate, replacement));
+        }
+    }
 }
