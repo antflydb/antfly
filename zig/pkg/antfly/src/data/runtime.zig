@@ -11790,7 +11790,7 @@ pub const DataServer = struct {
                 .io = self.dataRaftIo(),
             })
         else
-            (try remote_metadata.cachedSnapshot()) orelse return error.MetadataSnapshotUnavailable;
+            (try remote_metadata.cachedPeerSnapshot()) orelse return error.MetadataSnapshotUnavailable;
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
         const store = findSnapshotStoreByNodeId(snapshot.stores, node_id) orelse return null;
         if (store.api_url.len == 0) return null;
@@ -11887,7 +11887,7 @@ pub const DataServer = struct {
                 .io = self.dataRaftIo(),
             })
         else
-            (try remote_metadata.cachedSnapshot()) orelse return error.MetadataSnapshotUnavailable;
+            (try remote_metadata.cachedPeerSnapshot()) orelse return error.MetadataSnapshotUnavailable;
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
 
         var preferred_node_id: ?u64 = null;
@@ -22453,6 +22453,11 @@ const RemoteMetadataSource = struct {
     metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation = null,
     cached_head_at_ms: u64 = 0,
     cached_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
+    cached_snapshot_head: ?antfly.metadata_api.MetadataHead = null,
+    // Compact endpoint observations never replace the catalog/authority view.
+    // Each slot owns at most one immutable snapshot; readers pin its owner.
+    cached_peer_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
+    cached_peer_snapshot_owner: ?*ControlSnapshotOwner = null,
     control_read_generation: ?*ControlReadGeneration = null,
     control_read_generation_at_ms: u64 = 0,
     control_read_refresh_mutex: std.atomic.Mutex = .unlocked,
@@ -22600,6 +22605,7 @@ const RemoteMetadataSource = struct {
         if (self.control_read_generation) |routing| routing.release();
         if (self.diagnostic_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         releaseSnapshot(self.alloc, self.cached_snapshot_owner, self.cached_snapshot);
+        releaseSnapshot(self.alloc, self.cached_peer_snapshot_owner, self.cached_peer_snapshot);
         if (self.cached_routing_snapshot) |snapshot| snapshot.release(self.alloc);
         if (self.authoritative_routing_generation) |generation| generation.release();
         self.alloc.free(self.linearizable_snapshot_unsupported_until_ns);
@@ -22941,6 +22947,11 @@ const RemoteMetadataSource = struct {
         lockAtomic(&self.cache_mutex);
         const retired_planning = self.join_planning_generation;
         self.join_planning_generation = null;
+        const retired_peer_owner = self.cached_peer_snapshot_owner;
+        const retired_peer_snapshot = self.cached_peer_snapshot;
+        self.cached_peer_snapshot_owner = null;
+        self.cached_peer_snapshot = null;
+        self.cached_snapshot_head = null;
         const retired_owner = self.cached_snapshot_owner;
         self.cached_snapshot_owner = null;
         retired_snapshot = self.cached_snapshot;
@@ -22959,6 +22970,7 @@ const RemoteMetadataSource = struct {
         if (retired_planning) |planning| planning.release();
         if (retired_peers) |peers| peers.release();
         releaseSnapshot(self.alloc, retired_owner, retired_snapshot);
+        releaseSnapshot(self.alloc, retired_peer_owner, retired_peer_snapshot);
         if (retired_routing_snapshot) |snapshot| snapshot.release(self.alloc);
     }
 
@@ -23013,6 +23025,11 @@ const RemoteMetadataSource = struct {
             self.cache_mutex.unlock();
             return .superseded;
         }
+        const retired_peer_owner = self.cached_peer_snapshot_owner;
+        const retired_peer_snapshot = self.cached_peer_snapshot;
+        self.cached_peer_snapshot_owner = null;
+        self.cached_peer_snapshot = null;
+        self.cached_snapshot_head = null;
         const retired_owner = self.cached_snapshot_owner;
         self.cached_snapshot_owner = null;
         retired_snapshot = self.cached_snapshot;
@@ -23032,6 +23049,7 @@ const RemoteMetadataSource = struct {
         self.cache_mutex.unlock();
         if (retired_peers) |old| old.release();
         releaseSnapshot(self.alloc, retired_owner, retired_snapshot);
+        releaseSnapshot(self.alloc, retired_peer_owner, retired_peer_snapshot);
         return .published;
     }
 
@@ -23058,7 +23076,7 @@ const RemoteMetadataSource = struct {
     /// catalog-sized copying without blocking invalidation or peer readers.
     fn snapshotResultLocked(self: *RemoteMetadataSource, comptime kind: SnapshotResultKind) !SnapshotResult(kind) {
         if (kind == .snapshot) {
-            if ((self.cached_snapshot.?.peer_view or self.cached_snapshot.?.planning_view)) {
+            if (self.cached_snapshot == null or self.cached_snapshot.?.peer_view or self.cached_snapshot.?.planning_view) {
                 self.cache_mutex.unlock();
                 return error.MetadataSnapshotHeadMismatch;
             }
@@ -23091,7 +23109,7 @@ const RemoteMetadataSource = struct {
         try ensureBudgetActive(budget);
         const now_ms = self.awakeMs();
         try self.lockWithBudget(&self.cache_mutex, budget);
-        if (self.cached_snapshot != null and (kind == .peers or !(self.cached_snapshot.?.peer_view or self.cached_snapshot.?.planning_view))) {
+        if (if (kind == .peers) self.control_read_generation != null else self.cached_snapshot != null and !self.cached_snapshot.?.peer_view and !self.cached_snapshot.?.planning_view) {
             const force_cache_miss = if (@import("builtin").is_test)
                 self.test_faults.force_snapshot_cache_miss
             else
@@ -23136,14 +23154,30 @@ const RemoteMetadataSource = struct {
     }
 
     fn cachedSnapshot(self: *RemoteMetadataSource) !?antfly.metadata_api.AdminSnapshot {
+        return self.cachedSnapshotView(false);
+    }
+
+    fn cachedPeerSnapshot(self: *RemoteMetadataSource) !?antfly.metadata_api.AdminSnapshot {
+        return self.cachedSnapshotView(true);
+    }
+
+    fn cachedSnapshotView(self: *RemoteMetadataSource, comptime peers: bool) !?antfly.metadata_api.AdminSnapshot {
         lockAtomic(&self.cache_mutex);
-        if (self.cached_snapshot == null or (self.cached_snapshot.?.peer_view or self.cached_snapshot.?.planning_view)) {
+        const compact = peers and self.cached_peer_snapshot != null;
+        const snapshot = if (compact) self.cached_peer_snapshot else self.cached_snapshot;
+        if (snapshot == null or (!peers and (snapshot.?.peer_view or snapshot.?.planning_view))) {
             self.cache_mutex.unlock();
             return null;
         }
-        const owner = self.ensureSnapshotOwnerLocked() catch |err| {
-            self.cache_mutex.unlock();
-            return err;
+        const slot = if (compact) &self.cached_peer_snapshot_owner else &self.cached_snapshot_owner;
+        const owner = slot.* orelse owner: {
+            const created = self.alloc.create(ControlSnapshotOwner) catch |err| {
+                self.cache_mutex.unlock();
+                return err;
+            };
+            created.* = .{ .alloc = self.alloc, .snapshot = snapshot.? };
+            slot.* = created;
+            break :owner created;
         };
         owner.retain();
         self.cache_mutex.unlock();
@@ -23181,9 +23215,13 @@ const RemoteMetadataSource = struct {
             }
         }
         const observed_fence_generation = self.snapshot_fence_generation;
+        if (kind == .peers and self.control_read_generation != null and self.cached_head != null and
+            std.meta.eql(self.cached_head.?, head) and now_ms -| self.control_read_generation_at_ms <= metadata_snapshot_cache_ttl_ms)
+            return self.snapshotResultLocked(kind);
         if (self.cached_snapshot) |snapshot| {
             const cached_snapshot_head = snapshotHead(&snapshot);
-            if ((kind == .peers or (!snapshot.peer_view and !snapshot.planning_view)) and self.cached_head != null and
+            if (kind == .snapshot and !snapshot.peer_view and !snapshot.planning_view and
+                (self.cached_snapshot_head == null or std.meta.eql(self.cached_snapshot_head.?, head)) and self.cached_head != null and
                 std.meta.eql(self.cached_head.?, head) and
                 sameMetadataIncarnation(cached_snapshot_head, head) and
                 now_ms -| (if (kind == .peers) self.control_read_generation_at_ms else self.cached_snapshot_at_ms) <= metadata_snapshot_cache_ttl_ms)
@@ -23214,6 +23252,7 @@ const RemoteMetadataSource = struct {
         var fresh_owned = true;
         defer if (fresh_owned) freeAdminSnapshotOwned(self.alloc, &fresh);
 
+        if (incoming.planning_view or (kind == .snapshot and incoming.peer_view)) return error.MetadataSnapshotHeadMismatch;
         const reused_peers: ?*ControlReadGeneration = reuse: {
             if (!incoming.peer_view) break :reuse null;
             try ensureBudgetActive(budget);
@@ -23232,6 +23271,9 @@ const RemoteMetadataSource = struct {
         defer if (!published) peers.release();
         var retired_snapshot: ?antfly.metadata_api.AdminSnapshot = null;
         var retired_owner: ?*ControlSnapshotOwner = null;
+        var retired_peer_snapshot: ?antfly.metadata_api.AdminSnapshot = null;
+        var retired_peer_owner: ?*ControlSnapshotOwner = null;
+        defer releaseSnapshot(self.alloc, retired_peer_owner, retired_peer_snapshot);
         var retired_peers: ?*ControlReadGeneration = null;
         defer releaseSnapshot(self.alloc, retired_owner, retired_snapshot);
         defer if (retired_peers) |old| old.release();
@@ -23241,7 +23283,7 @@ const RemoteMetadataSource = struct {
         // A fenced snapshot or mutation invalidation completed during I/O.
         // Never let the older in-flight request overwrite that transition.
         if (self.snapshot_fence_generation != observed_fence_generation) {
-            if (self.cached_snapshot != null and (kind == .peers or !(self.cached_snapshot.?.peer_view or self.cached_snapshot.?.planning_view))) {
+            if (if (kind == .peers) self.control_read_generation != null else self.cached_snapshot != null and !self.cached_snapshot.?.peer_view and !self.cached_snapshot.?.planning_view) {
                 cache_locked = false;
                 return self.snapshotResultLocked(kind);
             }
@@ -23264,11 +23306,19 @@ const RemoteMetadataSource = struct {
         // establish which peer has the newer catalog. The generation above
         // fences concurrent authoritative reads and mutations. Observations
         // remain non-authoritative for placement changes and name retirement.
-        retired_snapshot = self.cached_snapshot;
-        retired_owner = self.cached_snapshot_owner;
-        self.cached_snapshot_owner = null;
-        self.cached_snapshot = fresh;
-        if (!fresh.peer_view) self.join_planning_valid = false;
+        retired_peer_snapshot = self.cached_peer_snapshot;
+        retired_peer_owner = self.cached_peer_snapshot_owner;
+        self.cached_peer_snapshot_owner = null;
+        self.cached_peer_snapshot = if (fresh.peer_view) fresh else null;
+        if (!fresh.peer_view) {
+            retired_snapshot = self.cached_snapshot;
+            retired_owner = self.cached_snapshot_owner;
+            self.cached_snapshot_owner = null;
+            self.cached_snapshot = fresh;
+            self.cached_snapshot_head = head;
+            self.cached_snapshot_at_ms = now_ms;
+            self.join_planning_valid = false;
+        }
         retired_peers = self.control_read_generation;
         self.control_read_generation = peers;
         self.control_read_generation_at_ms = self.awakeMs();
@@ -23276,7 +23326,6 @@ const RemoteMetadataSource = struct {
         fresh_owned = false;
         self.cached_head = head;
         self.cached_head_at_ms = now_ms;
-        self.cached_snapshot_at_ms = now_ms;
         cache_locked = false;
         return self.snapshotResultLocked(kind);
     }
@@ -41332,6 +41381,35 @@ fn consumerTests() type {
             try std.testing.expect(compact_changed != compact_first);
             lockAtomic(&source.cache_mutex);
             try std.testing.expectError(error.MetadataSnapshotHeadMismatch, source.snapshotResultLocked(.snapshot));
+            try std.testing.expect(source.cached_snapshot == null and source.cached_peer_snapshot != null);
+            var retained_compact = (try source.cachedPeerSnapshot()).?;
+            defer freeAdminSnapshotOwned(alloc, &retained_compact);
+            var catalog = snapshot;
+            var catalog_tables_fixture = [_]antfly.metadata.TableRecord{.{ .table_id = 8, .name = "catalog", .schema_json = "{}" }};
+            var catalog_ranges_fixture = [_]antfly.metadata.RangeRecord{.{ .table_id = 8, .group_id = 77, .start_key = "" }};
+            catalog.tables = &catalog_tables_fixture;
+            catalog.ranges = &catalog_ranges_fixture;
+            var published_catalog = try source.acceptObservedSnapshotResult(.snapshot, try cloneAdminSnapshotOwned(alloc, catalog), compact_head, source.snapshot_fence_generation, source.awakeMs(), null);
+            defer freeAdminSnapshotOwned(alloc, &published_catalog);
+            const catalog_at = source.cached_snapshot_at_ms;
+            const catalog_tables = source.cached_snapshot.?.tables.ptr;
+            const republished = try source.acceptObservedSnapshotResult(.peers, try cloneAdminSnapshotOwned(alloc, compact), compact_head, source.snapshot_fence_generation, source.awakeMs(), null);
+            defer republished.release();
+            // Peer publication preserves catalog storage and its own age/proof.
+            try std.testing.expect(source.cached_snapshot.?.tables.ptr == catalog_tables);
+            try std.testing.expectEqual(catalog_at, source.cached_snapshot_at_ms);
+            var retained_catalog = (try source.cachedSnapshot()).?;
+            defer freeAdminSnapshotOwned(alloc, &retained_catalog);
+            var latest_compact = (try source.cachedPeerSnapshot()).?;
+            defer freeAdminSnapshotOwned(alloc, &latest_compact);
+            try std.testing.expectEqualStrings("{}", retained_catalog.tables[0].schema_json);
+            try std.testing.expectEqual(@as(u64, 77), retained_catalog.ranges[0].group_id);
+            try std.testing.expect(latest_compact.peer_view);
+            source.invalidateCache();
+            try std.testing.expect(source.cached_snapshot == null and source.cached_peer_snapshot == null);
+            try std.testing.expectEqualStrings("{}", retained_catalog.tables[0].schema_json);
+            try std.testing.expectEqualStrings("http://changed", retained_compact.stores[1].api_url);
+            try std.testing.expectEqualStrings("http://changed", latest_compact.stores[1].api_url);
         }
 
         const SnapshotDeadlineTest = struct {
