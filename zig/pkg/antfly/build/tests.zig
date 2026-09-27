@@ -1885,6 +1885,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_runtime_default_filters = [_][]const u8{
         "http host reserves service workers through its runtime and rolls back overcommit",
         "managed raft progress driver advances independently and joins on stop",
+        "managed raft progress driver coalesces request wakes without accelerating ticks",
+        "managed raft progress driver releases source ownership after startup refusal",
         "managed raft progress driver publishes source failure",
         "managed raft progress driver reports a wedged round unhealthy",
         "managed raft progress driver ignores a completed observed generation",
@@ -2361,6 +2363,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "table workflow can drive real metadata service topology and split setup",
             "table workflow can drive placement intents through the real metadata control loop",
             "metadata http service catalog cache is independent from volatile projection traffic",
+            "metadata http service linearizable reads leave elections to the cadence driver",
             "lifecycle listener detach drains callbacks and preserves unrelated listeners",
             "metadata.table mutation routing forwards only to a routable remote leader",
             "metadata http client forwards table create and drop to the internal route",

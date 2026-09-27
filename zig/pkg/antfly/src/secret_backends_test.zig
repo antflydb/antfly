@@ -569,6 +569,34 @@ test "secret backend S3 opening uses refreshable bootstrap credential sources" {
 }
 
 test "secret backend follower API forwards encrypted PUT and DELETE through Raft" {
+    try secretFollowerForwardingCase(false);
+}
+
+test "secret backend follower API reconciles unknown replies without replaying PUT or DELETE" {
+    try secretFollowerForwardingCase(true);
+}
+
+fn secretFollowerForwardingCase(unknown_after_commit: bool) !void {
+    const UnknownWriter = struct {
+        delegate: contract.NativeStore.Writer,
+        puts: std.atomic.Value(usize) = .init(0),
+        deletes: std.atomic.Value(usize) = .init(0),
+        fn writer(self: *@This()) contract.NativeStore.Writer {
+            return .{ .ptr = self, .vtable = &.{ .put = put, .remove_override = remove } };
+        }
+        fn put(raw: *anyopaque, scope: []const u8, key: []const u8, value: []const u8, expected: contract.ExpectedRevision) anyerror!contract.Mutation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.puts.fetchAdd(1, .monotonic);
+            _ = try self.delegate.put(scope, key, value, expected);
+            return error.OutcomeUnknown;
+        }
+        fn remove(raw: *anyopaque, scope: []const u8, key: []const u8, expected: contract.ExpectedRevision) anyerror!contract.Mutation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.deletes.fetchAdd(1, .monotonic);
+            _ = try self.delegate.removeOverride(scope, key, expected);
+            return error.OutcomeUnknown;
+        }
+    };
     const runtime = @import("metadata/runtime.zig");
     const time = @import("antfly_platform").time;
     var tmp = std.testing.tmpDir(.{});
@@ -581,6 +609,7 @@ test "secret backend follower API forwards encrypted PUT and DELETE through Raft
     var facades: [2]secrets.FileStore = undefined;
     var natives: [2]distributed.Store = undefined;
     var keys: [2]TestProvider = .{ .{}, .{} };
+    var unknown_writers: [2]UnknownWriter = undefined;
     var initialized: usize = 0;
     defer for (0..initialized) |i| {
         servers[i].deinit();
@@ -609,7 +638,8 @@ test "secret backend follower API forwards encrypted PUT and DELETE through Raft
         errdefer servers[i].deinit();
         natives[i] = try distributed.Store.init(alloc, std.testing.io, "scope", keys[i].provider(), .{ .service = servers[i].server.svc });
         const handle = natives[i].nativeStore();
-        facades[i].attachNative(handle.source, handle.writer);
+        unknown_writers[i] = .{ .delegate = handle.writer };
+        facades[i].attachNative(handle.source, if (unknown_after_commit) unknown_writers[i].writer() else handle.writer);
         initialized += 1;
     }
     for (0..2) |i| {
@@ -617,32 +647,18 @@ test "secret backend follower API forwards encrypted PUT and DELETE through Raft
         peers[i] = .{ .node_id = i + 1, .raft_url = try servers[i].baseUri(a), .orchestration_url = try servers[i].adminBaseUri(a) };
     }
     for (0..2) |i| try servers[i].bootstrapCluster(1, i + 1, &peers);
-    const Progress = struct {
-        server: *runtime.Server,
-        stop: std.atomic.Value(bool) = .init(false),
-        failed: std.atomic.Value(bool) = .init(false),
-        fn run(self: *@This()) void {
-            while (!self.stop.load(.acquire)) {
-                self.server.runRaftRoundOnly() catch {
-                    self.failed.store(true, .release);
-                    return;
-                };
-                time.sleepNs(100 * std.time.ns_per_ms);
-            }
-        }
-    };
     try servers[0].server.svc.campaignMetadataGroup();
-    // A stalled disk on one node must not stop its peer's consensus progress.
-    // Production owns a separate, 100 ms Raft ticker for every metadata node.
-    var progress = [_]Progress{ .{ .server = &servers[0] }, .{ .server = &servers[1] } };
-    var threads: [2]std.Thread = undefined;
+    // Use the production ownership and wake contract, with an independent
+    // driver for each node. A peer's WAL cannot suspend the whole fixture.
+    const Driver = @import("raft/runtime_loop.zig").ManagedProgressDriver;
+    var progress = [_]Driver{
+        Driver.init(std.testing.io, servers[0].raftProgressSource(), 100 * std.time.ns_per_ms),
+        Driver.init(std.testing.io, servers[1].raftProgressSource(), 100 * std.time.ns_per_ms),
+    };
     var started: usize = 0;
-    defer {
-        for (progress[0..started]) |*driver| driver.stop.store(true, .release);
-        for (threads[0..started]) |thread| thread.join();
-    }
-    for (&progress, &threads) |*driver, *thread| {
-        thread.* = try std.Thread.spawn(.{}, Progress.run, .{driver});
+    defer for (progress[0..started]) |*driver| driver.deinit();
+    for (&progress) |*driver| {
+        try driver.start();
         started += 1;
     }
     const deadline = time.monotonicNs() + 10 * std.time.ns_per_s;
@@ -655,23 +671,36 @@ test "secret backend follower API forwards encrypted PUT and DELETE through Raft
     var put = try executor.executor().execute(alloc, .{ .method = .PUT, .uri = uri, .body = "{\"value\":\"follower-write\"}", .content_type = "application/json", .timeout_ms = 10_000 });
     defer put.deinit(alloc);
     try expectSecretMutationResponse(put, 200);
+    if (unknown_after_commit) try std.testing.expectEqual(@as(u16, 503), put.status);
     var found = try awaitSecretRevision(natives[0].source(), 1);
     defer found.deinit(alloc);
     try std.testing.expect(found.value != null);
     try std.testing.expectEqualStrings("follower-write", found.value.?.secret.bytes);
     // Consensus may elect a different leader while confirming the PUT. Route
     // DELETE through the current follower to retain forwarding coverage.
-    const delete_follower: usize = if (servers[0].server.svc.localMetadataLeadershipTerm() != null) 1 else 0;
-    try std.testing.expect(servers[delete_follower].server.svc.localMetadataLeadershipTerm() == null);
-    try std.testing.expect(servers[1 - delete_follower].server.svc.localMetadataLeadershipTerm() != null);
+    const delete_follower: usize = follower: {
+        const election_deadline = time.monotonicNs() + 10 * std.time.ns_per_s;
+        while (time.monotonicNs() < election_deadline) {
+            const first_leads = servers[0].server.svc.localMetadataLeadershipTerm() != null;
+            const second_leads = servers[1].server.svc.localMetadataLeadershipTerm() != null;
+            if (first_leads != second_leads) break :follower if (first_leads) 1 else 0;
+            time.sleepNs(10 * std.time.ns_per_ms);
+        }
+        return error.SecretTestLeaderUnavailable;
+    };
     const delete_uri = try std.fmt.allocPrint(a, "{s}/db/v1/secrets/token", .{peers[delete_follower].orchestration_url.?});
     var deleted = try executor.executor().execute(alloc, .{ .method = .DELETE, .uri = delete_uri, .timeout_ms = 10_000 });
     defer deleted.deinit(alloc);
     try expectSecretMutationResponse(deleted, 204);
+    if (unknown_after_commit) try std.testing.expectEqual(@as(u16, 503), deleted.status);
     var absent = try awaitSecretRevision(natives[0].source(), 2);
     defer absent.deinit(alloc);
     try std.testing.expect(absent.value == null);
-    for (&progress) |*driver| try std.testing.expect(!driver.failed.load(.acquire));
+    for (&progress) |*driver| try driver.checkFailure();
+    if (unknown_after_commit) {
+        try std.testing.expectEqual(@as(usize, 1), unknown_writers[0].puts.load(.acquire) + unknown_writers[1].puts.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), unknown_writers[0].deletes.load(.acquire) + unknown_writers[1].deletes.load(.acquire));
+    }
 }
 
 fn expectSecretMutationResponse(response: @import("raft/transport/http_common.zig").HttpResponse, success: u16) !void {

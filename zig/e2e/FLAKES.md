@@ -1868,6 +1868,31 @@ cannot establish a complete wait chain. These availability signatures remain
 under investigation; socket-error regression coverage does not by itself prove
 that slow-persistence recovery is fixed.
 
+
+The supplementary FK-cascade loop reproduced admission timeouts on the
+socket-corrected executable (four failures in 40 cases). Native macOS samples
+show metadata HTTP proposal waiters driving Raft WAL persistence inline. A
+request could own a slow Ready round while waiting for its own receipt, and
+compete with the dedicated cadence driver for the runtime lock.
+
+The managed metadata source now registers progress ownership for the driver's
+lifetime. Proposal, ReadIndex, and lifecycle waiters coalesce notifications to
+that owner instead of performing Ready persistence/apply on request threads.
+The driver drains notifications without advancing election time, prioritizes
+scheduled ticks, and releases notification ownership only after its task joins.
+Unmanaged service fixtures retain their request-driven fallback. Startup-refusal
+coverage checks that ownership is released; notification coverage checks that a
+burst of wakes does not accelerate ticks. A real accepted-proposal/ReadIndex
+regression checks that requests leave work pending until the owner drains it.
+The secret HTTP fixture now uses those production drivers, including injected
+post-commit uncertainty with exactly one PUT and DELETE.
+
+Earlier Autograph cohorts passed 200/200 on both baseline and socket-corrected
+binaries. Recovery cohorts run before the ownership change are preliminary
+measurements, not acceptance evidence for the new implementation. The captured
+wait chain identifies an ownership defect; arbitrary slow persistence still
+requires platform-specific qualification, and no deadline was increased.
+
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
 
 Scheduled run `36247286560` passed qualification, all five campaigns, and the
