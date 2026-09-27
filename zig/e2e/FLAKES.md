@@ -2083,7 +2083,43 @@ read consistency is downgraded. Regression checks cover the transient error
 classes, expiry before source admission, cancellation during readiness,
 shorter caller deadlines, and unchanged read-only/validation behavior.
 
-Final executable qualification remains pending.
+Final qualification completed on 2026-09-27 using the frozen macOS arm64
+Debug CPU executable from native source
+`aa638bc6daa86f56baa6afd2082fd6dee87618b5`, SHA-256
+`4d5b223ac21dd2657ca6ca3c43d92f9065caf118bd02490cdb667c7d61387701`.
+All four exact cases passed **200/200 each**, with **zero failures, errors, or
+skips**. Both supervisors exited successfully; the executable hash was unchanged.
+Recovery used eight workers × 25 repetitions per selector; Autograph used two
+workers × 100. Superseded cohorts and diagnostic runs above are excluded.
+
+- FK merge: `test_online_fk_merge_preserves_shadow_claims_and_retained_references[release-reply_loss]` — **200/200**.
+- Schema rewrite: `test_schema_rewrite_recovers_dependency_cohort[publication-coordinator]` — **200/200**.
+- FK cascade: `test_fk_cascade_recovers_claims_references_and_rows[transaction_resolve-owner]` — **200/200**.
+- Autograph: `test_label_routed_autograph_promotes_events_and_entities` — **200/200**.
+
+The final Debug application build passed all 59 steps and all 344 API contracts.
+The focused apply/retirement/peer-refresh and transaction validation passed 19
+contracts; ten real-Raft integration contracts and 100 fresh-process apply-wake
+fixture runs passed. Nine Python claim-verification and seed-helper contracts
+also passed. This native qualification does not replace Linux CI coverage of
+runner-specific persistence timing.
+
+Reproduce from the repository root with the same Debug CPU executable:
+
+```sh
+export ANTFLY_BIN=/absolute/path/to/bin/antfly SKIP_BUILD=1
+ANTFLY_E2E_NATIVE_STACKS=1 ANTFLY_E2E_REGRESSION_WORKERS=8 \
+  ANTFLY_E2E_REGRESSION_REPEATS=25 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/recovery-soak \
+  bash scripts/ci/zig-e2e-regression-loop.sh \
+  'e2e/antfly/test_online_merge_recovery.py::test_online_fk_merge_preserves_shadow_claims_and_retained_references[release-reply_loss]' \
+  'e2e/antfly/test_relational_integrity_recovery.py::test_schema_rewrite_recovers_dependency_cohort[publication-coordinator]' \
+  'e2e/antfly/test_relational_integrity_recovery.py::test_fk_cascade_recovers_claims_references_and_rows[transaction_resolve-owner]'
+ANTFLY_E2E_REGRESSION_WORKERS=2 ANTFLY_E2E_REGRESSION_REPEATS=100 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/autograph-soak \
+  bash scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_autoschema.py::test_label_routed_autograph_promotes_events_and_entities
+```
 
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
 
