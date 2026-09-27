@@ -93,8 +93,8 @@ normalize their outputs with the same policy so regeneration preserves licensing
   checks passed. The ELv2 server built in Debug and served a document over HTTP
   from a database initialized and populated by the Apache Lite CLI.
 - Standalone inference built from that same tree; all 15 CLI tests passed.
-- Apache dependency/header checks cover 1,819 source files, including separately
-  licensed Snowball sources. Thirty-two boundary regression tests, nine header-policy
+- Apache dependency/header checks cover 1,821 source files, including separately
+  licensed Snowball sources. Thirty-two boundary regression tests, ten header-policy
   tests, three qualification provenance tests, six asset/license generation tests,
   and 13 packaging tests passed.
 - Go binding tests passed. Python: 52 passed, 3 skipped, 2 deselected.
@@ -180,3 +180,8 @@ verified byte for byte from an actual Zig package fetch.
 CI builds and exercises the embedded browser database and both wasm32/wasm64
 inference packages. Browser builds retain ReleaseSafe; native product validation
 uses Debug. Omitting WASM debug information is an explicit optional build flag.
+
+The PR integrates the subsequent main updates for storage compilation and
+substring/highlighting support. Highlighting and shared backup-pin control are
+part of the Apache engine source map. Header normalization preserves adjacent
+usage comments, including shebang scripts, with a regression test.

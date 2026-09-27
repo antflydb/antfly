@@ -559,6 +559,54 @@ pub fn positionWithinSlopForScoring(positions: []const u32, expected: u32, slop:
     return positionWithinSlop(positions, expected, slop);
 }
 
+/// Execution diagnostics shared by the automaton-driven dictionary filters.
+pub const AutomatonExecutionStats = struct {
+    /// Terms decoded from the dictionary, matching or not.
+    dictionary_terms_decoded: u64 = 0,
+    /// Dictionary blocks skipped without decoding because their shared
+    /// prefix could not lead to a match.
+    blocks_pruned: u64 = 0,
+    matching_terms: u64 = 0,
+};
+
+/// Union the postings of one dictionary entry into `result`.
+fn unionTermEntry(alloc: Allocator, result: *roaring.RoaringBitmap, entry: inverted.TermIterator.Entry) FilterError!void {
+    switch (entry.result) {
+        .postings => |p| {
+            var bm = try p.docBitmap(alloc);
+            defer bm.deinit();
+            try result.orWith(&bm);
+        },
+        .one_hit => |h| {
+            try result.add(h.doc_num);
+        },
+    }
+}
+
+/// Drain an automaton term iterator into `result`, optionally recording
+/// diagnostics. `accept` gets a final say on each automaton-accepted term.
+fn collectAutomatonTerms(
+    alloc: Allocator,
+    term_iter: *inverted.TermIterator,
+    result: *roaring.RoaringBitmap,
+    context: anytype,
+    comptime accept: fn (@TypeOf(context), []const u8) bool,
+    comptime collect_stats: bool,
+    stats: ?*AutomatonExecutionStats,
+) FilterError!void {
+    while (true) {
+        const next_entry = if (comptime collect_stats)
+            try term_iter.nextWithDecodedCount(&stats.?.dictionary_terms_decoded)
+        else
+            try term_iter.next();
+        const entry = next_entry orelse break;
+        if (!accept(context, entry.term)) continue;
+        if (comptime collect_stats) stats.?.matching_terms += 1;
+        try unionTermEntry(alloc, result, entry);
+    }
+    if (comptime collect_stats) stats.?.blocks_pruned = term_iter.blocks_pruned;
+}
+
 /// Fuzzy match: finds all terms within Levenshtein edit distance via FST automaton search.
 pub const FuzzyFilter = struct {
     field: []const u8,
@@ -567,12 +615,40 @@ pub const FuzzyFilter = struct {
     prefix_len: u8 = 0,
     boost: f32 = 1.0,
 
+    pub const ExecutionStats = AutomatonExecutionStats;
+
     pub fn execute(self: FuzzyFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeInternal(alloc, seg, false, null);
+    }
+
+    pub fn executeWithStats(
+        self: FuzzyFilter,
+        alloc: Allocator,
+        seg: *const index_mod.SegmentEntry,
+        stats: *ExecutionStats,
+    ) FilterError!roaring.RoaringBitmap {
+        stats.* = .{};
+        return self.executeInternal(alloc, seg, true, stats);
+    }
+
+    fn acceptTerm(self: FuzzyFilter, term: []const u8) bool {
+        return fuzzyPrefixMatches(self.term, term, self.prefix_len);
+    }
+
+    fn executeInternal(
+        self: FuzzyFilter,
+        alloc: Allocator,
+        seg: *const index_mod.SegmentEntry,
+        comptime collect_stats: bool,
+        stats: ?*ExecutionStats,
+    ) FilterError!roaring.RoaringBitmap {
         const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
-        // Use Levenshtein automaton with FST.search for efficient traversal.
-        // The automaton prunes non-matching FST branches early.
+        // The Levenshtein automaton drives the dictionary walk: blocks whose
+        // shared prefix is already more than `max_edits` away are skipped
+        // without decoding, and each decoded term only feeds its front-coded
+        // leaf bytes through the DFA.
         var lev = levenshtein.LevenshteinAutomaton{ .term = self.term, .max_distance = self.max_edits, .alloc = alloc };
         defer lev.deinit();
         var term_iter = try inv_reader.fstSearchIterator(lev.automaton());
@@ -580,21 +656,7 @@ pub const FuzzyFilter = struct {
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
-
-        while (try term_iter.next()) |entry| {
-            if (!fuzzyPrefixMatches(self.term, entry.term, self.prefix_len)) continue;
-            switch (entry.result) {
-                .postings => |p| {
-                    var bm = try p.docBitmap(alloc);
-                    defer bm.deinit();
-                    try result.orWith(&bm);
-                },
-                .one_hit => |h| {
-                    try result.add(h.doc_num);
-                },
-            }
-        }
-
+        try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
         return result;
     }
 };
@@ -627,11 +689,38 @@ pub const RegexpFilter = struct {
     pattern: []const u8,
     boost: f32 = 1.0,
 
+    pub const ExecutionStats = AutomatonExecutionStats;
+
     pub fn execute(self: RegexpFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeInternal(alloc, seg, false, null);
+    }
+
+    pub fn executeWithStats(
+        self: RegexpFilter,
+        alloc: Allocator,
+        seg: *const index_mod.SegmentEntry,
+        stats: *ExecutionStats,
+    ) FilterError!roaring.RoaringBitmap {
+        stats.* = .{};
+        return self.executeInternal(alloc, seg, true, stats);
+    }
+
+    fn acceptTerm(_: RegexpFilter, _: []const u8) bool {
+        return true;
+    }
+
+    fn executeInternal(
+        self: RegexpFilter,
+        alloc: Allocator,
+        seg: *const index_mod.SegmentEntry,
+        comptime collect_stats: bool,
+        stats: ?*ExecutionStats,
+    ) FilterError!roaring.RoaringBitmap {
         const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
-        // Compile regex → automaton for efficient FST traversal
+        // Compile regex → automaton; the dictionary walk prunes whole blocks
+        // whose shared prefix cannot reach an accepting state.
         var regex = regex_mod.compile(alloc, self.pattern) catch
             return roaring.RoaringBitmap.init(alloc);
         defer regex.deinit();
@@ -641,20 +730,7 @@ pub const RegexpFilter = struct {
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
-
-        while (try term_iter.next()) |entry| {
-            switch (entry.result) {
-                .postings => |p| {
-                    var bm = try p.docBitmap(alloc);
-                    defer bm.deinit();
-                    try result.orWith(&bm);
-                },
-                .one_hit => |h| {
-                    try result.add(h.doc_num);
-                },
-            }
-        }
-
+        try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
         return result;
     }
 };
@@ -1525,29 +1601,79 @@ pub const WildcardFilter = struct {
     pattern: []const u8,
     boost: f32 = 1.0,
 
+    pub const ExecutionStats = struct {
+        dictionary_terms_decoded: u64 = 0,
+        matching_terms: u64 = 0,
+        /// The pattern had no operators, so it was served by one exact lookup.
+        exact_lookup: bool = false,
+    };
+
     pub fn execute(self: WildcardFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeInternal(alloc, seg, false, null);
+    }
+
+    pub fn executeWithStats(
+        self: WildcardFilter,
+        alloc: Allocator,
+        seg: *const index_mod.SegmentEntry,
+        stats: *ExecutionStats,
+    ) FilterError!roaring.RoaringBitmap {
+        stats.* = .{};
+        return self.executeInternal(alloc, seg, true, stats);
+    }
+
+    fn executeInternal(
+        self: WildcardFilter,
+        alloc: Allocator,
+        seg: *const index_mod.SegmentEntry,
+        comptime collect_stats: bool,
+        stats: ?*ExecutionStats,
+    ) FilterError!roaring.RoaringBitmap {
         const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
-
-        var term_iter = try inv_reader.termIterator();
-        defer term_iter.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
-        while (try term_iter.next()) |entry| {
-            if (wildcardMatch(self.pattern, entry.term)) {
-                switch (entry.result) {
-                    .postings => |p| {
-                        var bm = try p.docBitmap(alloc);
-                        defer bm.deinit();
-                        try result.orWith(&bm);
-                    },
-                    .one_hit => |h| {
-                        try result.add(h.doc_num);
-                    },
-                }
+        // The literal bytes before the first `*` or `?` bound the dictionary
+        // range that can match. A pattern without operators is one exact
+        // lookup; otherwise seek to the literal prefix and stop as soon as
+        // the sorted dictionary leaves it. Only a leading operator still has
+        // to walk the whole dictionary.
+        var plan = try wildcard_mod.searchPlanAlloc(alloc, self.pattern);
+        defer plan.deinit(alloc);
+        const literal_prefix = plan.literal_prefix;
+
+        if (plan.exact) {
+            if (comptime collect_stats) stats.?.exact_lookup = true;
+            if (inv_reader.lookup(literal_prefix)) |lookup| {
+                if (comptime collect_stats) stats.?.matching_terms = 1;
+                try unionTermEntry(alloc, &result, .{ .term = literal_prefix, .result = lookup });
             }
+            return result;
+        }
+
+        var term_iter = if (literal_prefix.len > 0)
+            try inv_reader.rangeTermIterator(literal_prefix, null)
+        else
+            try inv_reader.termIterator();
+        defer term_iter.deinit();
+
+        while (true) {
+            const next_entry = if (comptime collect_stats)
+                try term_iter.nextWithDecodedCount(&stats.?.dictionary_terms_decoded)
+            else
+                try term_iter.next();
+            const entry = next_entry orelse break;
+            if (literal_prefix.len > 0 and !std.mem.startsWith(u8, entry.term, literal_prefix)) {
+                // Terms are sorted, so once a term sorts after the prefix
+                // range no later term can start with the prefix either.
+                if (std.mem.order(u8, entry.term, literal_prefix) == .gt) break;
+                continue;
+            }
+            if (!wildcardMatch(self.pattern, entry.term)) continue;
+            if (comptime collect_stats) stats.?.matching_terms += 1;
+            try unionTermEntry(alloc, &result, entry);
         }
 
         return result;
@@ -2703,6 +2829,206 @@ test "wildcard filter with question mark" {
     try testing.expect(bm.contains(0)); // foo
     try testing.expect(bm.contains(1)); // fao
     try testing.expect(!bm.contains(2)); // fooo — too long
+}
+
+fn buildLargeDictionarySegmentForTest(alloc: Allocator, extra_terms: []const []const u8) ![]u8 {
+    var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
+    defer hits.deinit(alloc);
+    var owned_terms = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_terms.items) |term| alloc.free(term);
+        owned_terms.deinit(alloc);
+    }
+    for (0..4_096) |i| {
+        const term = try std.fmt.allocPrint(alloc, "catalog-{d:0>5}", .{i});
+        owned_terms.append(alloc, term) catch |err| {
+            alloc.free(term);
+            return err;
+        };
+        try hits.append(alloc, .{ .term = term, .freq = 1, .norm = 10 });
+    }
+    for (extra_terms) |term| {
+        try hits.append(alloc, .{ .term = term, .freq = 1, .norm = 10 });
+    }
+    return buildTestSegmentWithTerms(alloc, &.{.{ .terms = hits.items }});
+}
+
+test "wildcard filter seeks by literal prefix in large term dictionary" {
+    const alloc = testing.allocator;
+
+    const seg_bytes = try buildLargeDictionarySegmentForTest(alloc, &.{ "zz-other", "zz-target", "zz-tarpit" });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const seg = &writer.snapshot().segments[0];
+
+    const filter = Filter{ .wildcard = .{ .field = "body", .pattern = "zz-ta*t" } };
+    var stats: WildcardFilter.ExecutionStats = .{};
+    var bm = try filter.wildcard.executeWithStats(alloc, seg, &stats);
+    defer bm.deinit();
+    try testing.expectEqual(@as(usize, 1), bm.cardinality());
+    try testing.expect(bm.contains(0));
+    try testing.expectEqual(@as(u64, 2), stats.matching_terms);
+    try testing.expect(!stats.exact_lookup);
+    // The literal prefix seeks past the thousands of catalog terms; only the
+    // tail of one block plus the zz- range is decoded.
+    try testing.expect(stats.dictionary_terms_decoded < 128);
+
+    // A quoted operator still counts as literal prefix bytes.
+    const escaped = Filter{ .wildcard = .{ .field = "body", .pattern = "zz\\-t*" } };
+    var escaped_stats: WildcardFilter.ExecutionStats = .{};
+    var escaped_bm = try escaped.wildcard.executeWithStats(alloc, seg, &escaped_stats);
+    defer escaped_bm.deinit();
+    try testing.expectEqual(@as(usize, 1), escaped_bm.cardinality());
+    try testing.expectEqual(@as(u64, 2), escaped_stats.matching_terms);
+    try testing.expect(escaped_stats.dictionary_terms_decoded < 128);
+}
+
+test "wildcard filter without operators uses one exact lookup" {
+    const alloc = testing.allocator;
+
+    const seg_bytes = try buildLargeDictionarySegmentForTest(alloc, &.{"zz-target"});
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const seg = &writer.snapshot().segments[0];
+
+    const filter = Filter{ .wildcard = .{ .field = "body", .pattern = "catalog-00042" } };
+    var stats: WildcardFilter.ExecutionStats = .{};
+    var bm = try filter.wildcard.executeWithStats(alloc, seg, &stats);
+    defer bm.deinit();
+    try testing.expectEqual(@as(usize, 1), bm.cardinality());
+    try testing.expect(stats.exact_lookup);
+    try testing.expectEqual(@as(u64, 1), stats.matching_terms);
+    try testing.expectEqual(@as(u64, 0), stats.dictionary_terms_decoded);
+
+    const missing = Filter{ .wildcard = .{ .field = "body", .pattern = "catalog-99999" } };
+    var missing_stats: WildcardFilter.ExecutionStats = .{};
+    var missing_bm = try missing.wildcard.executeWithStats(alloc, seg, &missing_stats);
+    defer missing_bm.deinit();
+    try testing.expectEqual(@as(usize, 0), missing_bm.cardinality());
+    try testing.expect(missing_stats.exact_lookup);
+    try testing.expectEqual(@as(u64, 0), missing_stats.matching_terms);
+}
+
+test "wildcard filter with leading operator still scans the whole dictionary" {
+    const alloc = testing.allocator;
+
+    const seg_bytes = try buildLargeDictionarySegmentForTest(alloc, &.{"zz-target"});
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const seg = &writer.snapshot().segments[0];
+
+    const filter = Filter{ .wildcard = .{ .field = "body", .pattern = "*-target" } };
+    var stats: WildcardFilter.ExecutionStats = .{};
+    var bm = try filter.wildcard.executeWithStats(alloc, seg, &stats);
+    defer bm.deinit();
+    try testing.expectEqual(@as(usize, 1), bm.cardinality());
+    try testing.expectEqual(@as(u64, 1), stats.matching_terms);
+    try testing.expectEqual(@as(u64, 4_097), stats.dictionary_terms_decoded);
+}
+
+test "fuzzy filter prunes dead dictionary prefixes without decoding them" {
+    const alloc = testing.allocator;
+
+    const seg_bytes = try buildLargeDictionarySegmentForTest(alloc, &.{ "schedule", "schedules", "scheduling" });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const seg = &writer.snapshot().segments[0];
+
+    const filter = Filter{ .fuzzy = .{ .field = "body", .term = "schdule", .max_edits = 1 } };
+    var stats: FuzzyFilter.ExecutionStats = .{};
+    var bm = try filter.fuzzy.executeWithStats(alloc, seg, &stats);
+    defer bm.deinit();
+    try testing.expectEqual(@as(usize, 1), bm.cardinality());
+    try testing.expect(bm.contains(0));
+    try testing.expectEqual(@as(u64, 1), stats.matching_terms);
+    // Every catalog block shares a prefix that is already two edits away, so
+    // the walk seeks past all of them instead of decoding 4,096 terms.
+    try testing.expect(stats.blocks_pruned > 0);
+    try testing.expect(stats.dictionary_terms_decoded < 64);
+}
+
+test "fuzzy filter pruning matches the unpruned reference on a mixed dictionary" {
+    const alloc = testing.allocator;
+
+    // Vocabulary chosen so several blocks share prefixes that die at
+    // different depths, including one block that stays alive throughout.
+    var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
+    defer hits.deinit(alloc);
+    var owned_terms = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_terms.items) |term| alloc.free(term);
+        owned_terms.deinit(alloc);
+    }
+    const stems = [_][]const u8{ "hell", "help", "hallo", "jello", "shell", "yellow", "he", "hello" };
+    for (stems) |stem| {
+        for (0..96) |i| {
+            const term = try std.fmt.allocPrint(alloc, "{s}{d:0>3}", .{ stem, i });
+            owned_terms.append(alloc, term) catch |err| {
+                alloc.free(term);
+                return err;
+            };
+            try hits.append(alloc, .{ .term = term, .freq = 1, .norm = 10 });
+        }
+        try hits.append(alloc, .{ .term = stem, .freq = 1, .norm = 10 });
+    }
+    const seg_bytes = try buildTestSegmentWithTerms(alloc, &.{.{ .terms = hits.items }});
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const seg = &writer.snapshot().segments[0];
+    const inv_reader = (try seg.reader.invertedIndex("body")).?;
+
+    for ([_]u8{ 1, 2 }) |max_edits| {
+        var expected: u64 = 0;
+        var term_iter = try inv_reader.termIterator();
+        defer term_iter.deinit();
+        while (try term_iter.next()) |entry| {
+            if (editDistance("hello", entry.term) <= max_edits) expected += 1;
+        }
+
+        const filter = Filter{ .fuzzy = .{ .field = "body", .term = "hello", .max_edits = max_edits } };
+        var stats: FuzzyFilter.ExecutionStats = .{};
+        var bm = try filter.fuzzy.executeWithStats(alloc, seg, &stats);
+        defer bm.deinit();
+        try testing.expectEqual(expected, stats.matching_terms);
+        try testing.expect(expected > 0);
+    }
+}
+
+test "regexp filter prunes dead dictionary prefixes without decoding them" {
+    const alloc = testing.allocator;
+
+    const seg_bytes = try buildLargeDictionarySegmentForTest(alloc, &.{ "schedule", "schedules", "scheduling", "zz-tail" });
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const seg = &writer.snapshot().segments[0];
+
+    const filter = Filter{ .regexp = .{ .field = "body", .pattern = "sched[a-z]+s" } };
+    var stats: RegexpFilter.ExecutionStats = .{};
+    var bm = try filter.regexp.executeWithStats(alloc, seg, &stats);
+    defer bm.deinit();
+    try testing.expectEqual(@as(usize, 1), bm.cardinality());
+    try testing.expect(bm.contains(0));
+    try testing.expectEqual(@as(u64, 1), stats.matching_terms);
+    try testing.expect(stats.blocks_pruned > 0);
+    try testing.expect(stats.dictionary_terms_decoded < 64);
 }
 
 test "doc_id filter finds specific documents" {

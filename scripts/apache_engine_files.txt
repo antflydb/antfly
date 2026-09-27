@@ -353,6 +353,7 @@ zig/pkg/antfly/src/search/analysis.zig
 zig/pkg/antfly/src/search/distributed_stats.zig
 zig/pkg/antfly/src/search/fusion.zig
 zig/pkg/antfly/src/search/geo.zig
+zig/pkg/antfly/src/search/highlight.zig
 zig/pkg/antfly/src/search/levenshtein.zig
 zig/pkg/antfly/src/search/pattern_filter_contract.zig
 zig/pkg/antfly/src/search/query.zig
@@ -428,6 +429,7 @@ zig/pkg/antfly/src/storage/db/apply_rw_lock.zig
 zig/pkg/antfly/src/storage/db/artifact_ids.zig
 zig/pkg/antfly/src/storage/db/backfill_state.zig
 zig/pkg/antfly/src/storage/db/background_text_stats.zig
+zig/pkg/antfly/src/storage/db/backup_pin_control.zig
 zig/pkg/antfly/src/storage/db/batcher.zig
 zig/pkg/antfly/src/storage/db/catalog/enrichment_catalog.zig
 zig/pkg/antfly/src/storage/db/catalog/index_manager.zig

@@ -1333,29 +1333,7 @@ pub const applyLocalTableSchemaJson = physical_local_write.applyLocalTableSchema
 /// Applies the catalog-owned physical table contract when an opaque compiled
 /// storage owner first opens a live group DB. This deliberately performs the
 /// same schema and index reconciliation as the in-module managed writer path.
-pub fn executeBackupPinControl(alloc: std.mem.Allocator, db: *db_mod.DB, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) ![]u8 {
-    try control.ensureActive();
-    const fence = switch (request) {
-        .seal => |value| value.fence,
-        .release => |value| value.fence,
-        .cancel => |value| value,
-    };
-    if (fence.owner_group_id != group_id or fence.role != .backup_snapshot) return error.InvalidBackupFence;
-    switch (request) {
-        .seal => |value| {
-            const handle = try db.sealBackupCohort(value.id, value.fence, control.token());
-            return try std.json.Stringify.valueAlloc(alloc, handle, .{});
-        },
-        .release => |handle| {
-            try db.releaseBackupCohort(handle);
-            return try alloc.dupe(u8, "{}");
-        },
-        .cancel => |value| {
-            try db.cancelBackupCohort(value);
-            return try alloc.dupe(u8, "{}");
-        },
-    }
-}
+pub const executeBackupPinControl = @import("../storage/db/backup_pin_control.zig").execute;
 
 pub fn exportPortableBackupShardWithSeal(
     alloc: std.mem.Allocator,

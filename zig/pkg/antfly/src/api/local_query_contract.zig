@@ -3269,6 +3269,16 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (!req.include_all_fields) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
     }
+    if (req.highlight) |highlight| {
+        try appendJsonFieldName(alloc, &out, &first, "highlight");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, .{
+            .fields = highlight.fields,
+            .fragment_size = highlight.fragment_size,
+            .max_fragments = highlight.max_fragments,
+        }, .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
     if (req.hierarchy_children != null or
         req.hierarchy_grouped_matches or
         req.hierarchy_group_level == .unit)
@@ -4694,6 +4704,7 @@ pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) 
         hit.ancestor_unit_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .unit);
         hit.artifact_ref = try parseRemoteHierarchyArtifactRefAlloc(alloc, item.hierarchy);
         hit.chunk_hits = try parseRemoteHierarchyMatchesAlloc(alloc, item.hierarchy);
+        hit.highlights = try parseRemoteHighlightsAlloc(alloc, item._highlights);
         hits[i] = hit;
         initialized += 1;
     }
@@ -4863,6 +4874,51 @@ pub fn parseRemoteArtifactKind(value: []const u8) !db_mod.types.ArtifactKind {
     if (std.mem.eql(u8, value, "asset")) return .asset;
     if (std.mem.eql(u8, value, "embedding")) return .embedding;
     return error.InvalidQueryRequest;
+}
+
+fn parseRemoteHighlightsAlloc(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.ArrayHashMap([]const metadata_openapi.HighlightFragment),
+) ![]db_mod.types.HighlightedField {
+    const value = maybe_value orelse return &.{};
+    if (value.map.count() == 0) return &.{};
+
+    var out = std.ArrayListUnmanaged(db_mod.types.HighlightedField).empty;
+    errdefer {
+        for (out.items) |*item| db_mod.types.freeHighlightedField(alloc, item);
+        out.deinit(alloc);
+    }
+    var it = value.map.iterator();
+    while (it.next()) |entry| {
+        const field = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(field);
+        var fragments = std.ArrayListUnmanaged(db_mod.types.HighlightFragment).empty;
+        errdefer {
+            for (fragments.items) |*fragment| db_mod.types.freeHighlightFragment(alloc, fragment);
+            fragments.deinit(alloc);
+        }
+        for (entry.value_ptr.*) |fragment| {
+            if (fragment.offset < 0) return error.InvalidQueryRequest;
+            const text = try alloc.dupe(u8, fragment.text);
+            errdefer alloc.free(text);
+            const spans = try alloc.alloc(db_mod.types.HighlightSpan, fragment.spans.len);
+            errdefer alloc.free(spans);
+            for (fragment.spans, spans) |span, *dst| {
+                if (span.start < 0 or span.end < span.start or span.end > @as(i64, @intCast(fragment.text.len))) return error.InvalidQueryRequest;
+                dst.* = .{ .start = @intCast(span.start), .end = @intCast(span.end) };
+            }
+            try fragments.append(alloc, .{
+                .text = text,
+                .offset = std.math.cast(u32, fragment.offset) orelse return error.InvalidQueryRequest,
+                .item = if (fragment.item) |index| (std.math.cast(u32, index) orelse return error.InvalidQueryRequest) else null,
+                .spans = spans,
+            });
+        }
+        // Keep fragments owned by their cleanup until the destination can accept them.
+        try out.ensureUnusedCapacity(alloc, 1);
+        out.appendAssumeCapacity(.{ .field = field, .fragments = try fragments.toOwnedSlice(alloc) });
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 pub fn parseRemoteIndexScoresAlloc(
