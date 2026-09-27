@@ -242,6 +242,8 @@ pub const Graph = struct {
     /// itself; it lives on the consuming node's `output_shape.dtype`.
     pub fn constantDataAs(self: *const Graph, comptime T: type, offset: u32, len: u32) []const T {
         const bytes = self.constant_pool.items[offset..][0 .. len * @sizeOf(T)];
+        // Empty pools need no allocation and therefore have no aligned base.
+        if (bytes.len == 0) return &.{};
         const aligned: [*]align(constant_pool_alignment_bytes) const u8 = @alignCast(bytes.ptr);
         return @as([*]const T, @ptrCast(aligned))[0..len];
     }

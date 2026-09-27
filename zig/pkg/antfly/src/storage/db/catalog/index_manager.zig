@@ -44844,7 +44844,7 @@ fn testPublicDenseSnapshot(native_only: bool) !void {
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
-    const DB = @import("../db.zig").DB;
+    const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
     var resources = resource_manager_mod.ResourceManager.init(.{});
     defer resources.deinit(alloc);
     resources.dense_query_snapshot = true;

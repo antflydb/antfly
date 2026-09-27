@@ -16,6 +16,32 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **Native PDF extraction** — repair demonstrably interleaved horizontal prose
+  columns without changing paint order. Require sustained prose in both columns
+  and preserve ambiguous table row associations. Preserve authored order for
+  overlapping paint sequences, already-grouped columns, and vertically separated
+  layouts. Resolve indirect CCITT decode parameters, accept valid zero-filled
+  Group 3 line markers, and correct PNG compression-buffer ownership.
+- **Durable OCR grounding** — preserve compatible Reader regions as UTF-8 byte
+  spans and page-space boxes, including rotated pages and CropBox offsets.
+  Invalid regions no longer discard valid text or shift later repeated text
+  onto an earlier occurrence.
+- **OCR content retention** — reject partial transcriptions that discard most
+  decoded text while allowing recovery from corrupted glyphs. Preserve signed
+  numeric values, singleton numeric lines, and their full source-row context
+  when combining OCR with embedded text.
+- **Native multistage OCR** — support exact transposed convolution and average
+  pooling, preserve typed constants and dynamic reshape dimensions in native
+  partitioned execution, and correct Paddle image normalization, detector aspect
+  ratio, recognition width/padding, tall-crop
+  rotation, and CTC vocabulary handling. Recognition failures propagate instead
+  of returning partial success.
+- **Reader request memory** — encode large inline-image JSON requests into one
+  exactly sized allocation, avoiding unnecessary working-set failures without
+  increasing production memory limits.
+- **Bounded compatibility rendering** — keep temporary RGBA and PNG compression
+  allocations out of retained-output budgets without increasing memory limits.
+  macOS compatibility-rendered pages remain explicitly marked as such.
 - **Research agent** — `POST /agents/research` plans a question into
   sub-questions, researches them in parallel with the retrieval agent, reflects
   on coverage, and writes a sectioned report whose `[E#]` citations resolve to a

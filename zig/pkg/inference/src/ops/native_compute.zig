@@ -687,6 +687,14 @@ fn shouldUseQuantizedDequantSgemm(
     };
     if (!dequantSgemmSupportedQuant(known)) return false;
     if (quantizedDequantSgemmEnabled()) return true;
+    // Florence's CPU encoder and incremental decoder benefit from BLAS over
+    // cached dense weights. Promotion remains bounded by the dense-cache budget.
+    if (std.mem.startsWith(u8, name, "language_model.model.encoder.") or
+        std.mem.startsWith(u8, name, "language_model.model.decoder.") or
+        std.mem.eql(u8, name, "language_model.model.shared.weight") or
+        std.mem.eql(u8, name, "language_model.lm_head.weight") or
+        std.mem.startsWith(u8, name, "vision_tower.blocks.") or
+        std.mem.eql(u8, name, "image_projection")) return true;
     if (shouldUseGlinerRecognizerDequantSgemm(name, storage.tensor_type)) return true;
     if (shouldUseGlinerEncoderDequantSgemm(name, rows, out_dim, storage.tensor_type)) return true;
     return shouldUseClipClapDequantSgemm(name, rows, out_dim, storage.tensor_type);
@@ -4109,11 +4117,13 @@ fn loadEphemeralQuantizedLazyWeight(
     self: *NativeCompute,
     entry: *LazyWeightEntry,
     name: []const u8,
+    prepare_matrix: bool,
 ) !?CT {
     if (!shouldDegradeQuantBudgetPressure(entry)) return null;
     const tensor_store = self.data.tensor_store orelse return null;
     var storage = (try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref)) orelse return null;
-    try prepareNativeQuantizedStorage(&storage);
+    errdefer storage.deinit();
+    if (prepare_matrix) try prepareNativeQuantizedStorage(&storage);
     return self.makeBufWithOwnedQuantizedStorage(name, entry, storage);
 }
 
@@ -4654,10 +4664,11 @@ pub const vtable_impl = ComputeBackend.VTable{
     .getIo = &getIo,
     .getWeight = &getWeight,
     .acquireWeight = &acquireWeight,
+    .getEmbeddingWeight = &getEmbeddingWeight,
     .prefetchWeightHint = &prefetchWeightHint,
     .drainPrefetchBudget = &drainPrefetchBudget,
     .embeddingLookup = &embeddingLookup,
-    .takeRows = null,
+    .takeRows = &takeRowsOp,
     .linear = &linearOp,
     .linearPlanned = &linearPlannedOp,
     .linearNoBias = &linearNoBiasOp,
@@ -4716,6 +4727,9 @@ pub const vtable_impl = ComputeBackend.VTable{
     .multiply = &multiplyOp,
     .conv1d = &conv1dOp,
     .conv2d = &conv2dOp,
+    .convTranspose = &convTransposeOp,
+    .averagePool = &averagePoolOp,
+
     .rope = &ropeOp,
     .mrope = &mropeOp,
     .visionRope = &visionRopeOp,
@@ -4736,6 +4750,8 @@ pub const vtable_impl = ComputeBackend.VTable{
     .tensorShapeMatches = &tensorShapeMatchesOp,
     .evalTensor = &evalTensorOp,
     .argmaxLastRow = &argmaxLastRowOp,
+    .argmaxRows = &argmaxRowsOp,
+    .argmaxRowsSuppress = &argmaxRowsSuppressOp,
     .sliceLastDim = &sliceLastDimOp,
     // Primitive ops for training
     .subtract = &subtractOp,
@@ -4881,6 +4897,12 @@ fn maybeDiscardMappedWeightAfterUse(self: *NativeCompute, weight: CT) void {
 fn acquireWeightReservation(self: *NativeCompute, name: []const u8, bytes: usize) !?run_memory.Reservation {
     if (self.run_budget == null or name.len == 0 or bytes == 0) return null;
     if (self.weight_reservations.getPtr(name)) |state| {
+        // A gather can precede matrix preparation of the same weight. Charge
+        // the larger shared footprint once before accepting another borrower.
+        if (bytes > state.reservation.bytes) {
+            _ = try self.run_budget.?.tryReserveWeight(.host, bytes - state.reservation.bytes);
+            state.reservation.bytes = bytes;
+        }
         state.count += 1;
         return state.reservation;
     }
@@ -5030,7 +5052,7 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     // key, whose lifetime also covers views after an early handle release.
     const stable_name = self.data.resident_weights.getKey(name) orelse
         self.data.lazy_weights.getKey(name) orelse name;
-    const tensor = try loadWeight(self, stable_name);
+    const tensor = try loadWeight(self, stable_name, true);
     toBuf(tensor).weight_handle_name = owned_name;
     toBuf(tensor).weight_handle_refs = 1;
     self.weight_handles.putAssumeCapacityNoClobber(owned_name, tensor);
@@ -5041,13 +5063,20 @@ fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const stable_name = self.data.resident_weights.getKey(name) orelse
         self.data.lazy_weights.getKey(name) orelse name;
-    return loadWeight(self, stable_name);
+    return loadWeight(self, stable_name, true);
 }
 
-fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
+fn getEmbeddingWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const stable_name = self.data.resident_weights.getKey(name) orelse
+        self.data.lazy_weights.getKey(name) orelse name;
+    return loadWeight(self, stable_name, false);
+}
+
+fn loadWeight(self: *NativeCompute, name: []const u8, prepare_matrix: bool) !CT {
     if (self.data.resident_weights.getPtr(name)) |w| {
         if (w.quantized_storage) |*storage| {
-            try ensurePreparedKBlock(self, storage, null);
+            if (prepare_matrix) try ensurePreparedKBlock(self, storage, null);
             const view = if (w.tensor.data.len > 0)
                 try tensorF32View(self, &w.tensor)
             else
@@ -5076,12 +5105,12 @@ fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
     self.data.prefetch.lock();
     defer self.data.prefetch.unlock();
     if (self.data.lazy_weights.getPtr(name)) |entry| {
-        ensureLazyWeightLoadedLocked(self.data, self.run_budget, entry) catch |err| switch (err) {
+        ensureLazyWeightLoadedForUseLocked(self.data, self.run_budget, entry, prepare_matrix) catch |err| switch (err) {
             error.MemoryBudgetExceeded => {
                 if (self.data.tier_cache) |*tier_cache| {
                     logSharedCacheDenial("get_weight_host_load", tier_cache, name);
                 }
-                if (try loadEphemeralQuantizedLazyWeight(self, entry, name)) |ephemeral_quantized| {
+                if (try loadEphemeralQuantizedLazyWeight(self, entry, name, prepare_matrix)) |ephemeral_quantized| {
                     return ephemeral_quantized;
                 }
                 if (canFallbackDenseBudgetPressure(name, entry)) {
@@ -5092,6 +5121,10 @@ fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
             else => return err,
         };
         const loaded = &(entry.loaded.?);
+        if (prepare_matrix) {
+            if (loaded.quantized_storage) |*storage|
+                try ensurePreparedKBlock(self, storage, &entry.loaded_bytes);
+        }
         const reservation = try acquireWeightReservation(
             self,
             name,
@@ -5101,7 +5134,6 @@ fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
         entry.pin_count += 1;
         errdefer entry.pin_count -= 1;
         if (loaded.quantized_storage) |*storage| {
-            try ensurePreparedKBlock(self, storage, &entry.loaded_bytes);
             const view = if (loaded.tensor.data.len > 0)
                 try tensorF32View(self, &loaded.tensor)
             else
@@ -5197,6 +5229,10 @@ fn prefetchPriority(entry: *LazyWeightEntry) u64 {
 }
 
 pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory.RunBudget, entry: *LazyWeightEntry) !void {
+    return ensureLazyWeightLoadedForUseLocked(data, run_budget, entry, true);
+}
+
+fn ensureLazyWeightLoadedForUseLocked(data: *WeightStore, run_budget: ?*run_memory.RunBudget, entry: *LazyWeightEntry, prepare_matrix: bool) !void {
     const trace = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_LAZY_TRACE");
     const trace_start = platform.time.monotonicNs();
     if (trace) {
@@ -5235,7 +5271,7 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
     if (data.allow_direct_quant) {
         direct_quant_storage = try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref);
         if (direct_quant_storage) |*storage| {
-            expected_bytes = expectedQuantizedStorageLoadBytes(storage);
+            expected_bytes = if (prepare_matrix) expectedQuantizedStorageLoadBytes(storage) else quantizedStorageBudgetBytes(storage);
         }
     }
     if (entry.expert_coord) |coord| {
@@ -5265,7 +5301,7 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
             // representation reported by expectedQuantizedStorageLoadBytes.
             // Rechecking those bytes here would double-charge the same growth
             // and can incorrectly suppress preparation near the cache ceiling.
-            try prepareNativeQuantizedStorage(storage_ref);
+            if (prepare_matrix) try prepareNativeQuantizedStorage(storage_ref);
             entry.loaded = .{
                 .tensor = .{
                     .data = empty_u8[0..],
@@ -9303,6 +9339,22 @@ const prepared_q3_k_panel_values_bytes = 256 * prepared_q3_k_panel_nr;
 const prepared_q3_k_panel_block_bytes = prepared_q3_k_panel_values_offset + prepared_q3_k_panel_values_bytes;
 
 pub fn prepareNativeQuantizedStorage(storage: *QuantizedStorage) !void {
+    // Preparation only adds missing immutable layouts. Stage those additions
+    // until every allocation succeeds: an existing gather may still borrow
+    // the raw storage, and cache accounting must not miss a partial result.
+    var staged = storage.*;
+    errdefer for (staged.prepared.entries, storage.prepared.entries) |current, previous| {
+        if (previous) |existing| {
+            std.debug.assert(current != null and current.?.bytes.ptr == existing.bytes.ptr);
+        } else if (current) |added| {
+            storage.allocator.free(added.bytes);
+        }
+    };
+    try prepareNativeQuantizedStorageInPlace(&staged);
+    storage.prepared = staged.prepared;
+}
+
+fn prepareNativeQuantizedStorageInPlace(storage: *QuantizedStorage) !void {
     const known = switch (storage.tensor_type) {
         .known => |value| value,
         else => return,
@@ -36499,6 +36551,233 @@ fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
     const result = try self.makeBuf(output, true);
     return self.withLogicalShape(result, &.{ @intCast(batch), @intCast(out_channels), @intCast(out_h), @intCast(out_w) });
 }
+fn averagePoolOp(ctx: *anyopaque, input: CT, attrs: *const @import("ml").graph.node.AveragePoolAttrs) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const buf = toBuf(input);
+    const shape = buf.logical_shape orelse
+        if (buf.quantized_storage) |storage| storage.shape else return error.UnsupportedShape;
+    const spatial = attrs.num_spatial;
+    const max_spatial = @import("ml").graph.node.AveragePoolAttrs.max_spatial;
+    if (spatial == 0 or spatial > max_spatial or shape.len != @as(usize, spatial) + 2) return error.UnsupportedShape;
+    if (shape[0] <= 0 or shape[1] <= 0) return error.InvalidInputShape;
+    const planes = std.math.mul(usize, @intCast(shape[0]), @intCast(shape[1])) catch return error.InvalidInputShape;
+    var input_spatial: [max_spatial]usize = .{1} ** max_spatial;
+    var output_spatial: [max_spatial]usize = .{1} ** max_spatial;
+    var input_strides: [max_spatial]usize = .{1} ** max_spatial;
+    var output_strides: [max_spatial]usize = .{1} ** max_spatial;
+    var window_steps: [max_spatial]usize = .{1} ** max_spatial;
+    var pad_before: [max_spatial]usize = .{0} ** max_spatial;
+    var logical_shape: [max_spatial + 2]i64 = .{0} ** (max_spatial + 2);
+    @memcpy(logical_shape[0..shape.len], shape);
+    var input_area: usize = 1;
+    var output_area: usize = 1;
+    var kernel_count: usize = 1;
+    for (0..spatial) |reverse| {
+        const axis = spatial - 1 - reverse;
+        if (shape[axis + 2] <= 0) return error.InvalidInputShape;
+        input_spatial[axis] = @intCast(shape[axis + 2]);
+        const dimension = attrs.spatialOutput(axis, input_spatial[axis]) orelse return error.InvalidInputShape;
+        output_spatial[axis] = dimension.size;
+        pad_before[axis] = dimension.pad_before;
+        logical_shape[axis + 2] = std.math.cast(i64, dimension.size) orelse return error.InvalidInputShape;
+        input_strides[axis] = input_area;
+        output_strides[axis] = output_area;
+        window_steps[axis] = std.math.mul(usize, input_area, attrs.dilations[axis]) catch return error.InvalidInputShape;
+        input_area = std.math.mul(usize, input_area, input_spatial[axis]) catch return error.InvalidInputShape;
+        output_area = std.math.mul(usize, output_area, output_spatial[axis]) catch return error.InvalidInputShape;
+        kernel_count = std.math.mul(usize, kernel_count, attrs.kernel[axis]) catch return error.InvalidInputShape;
+    }
+    const input_elems = std.math.mul(usize, planes, input_area) catch return error.InvalidInputShape;
+    const output_elems = std.math.mul(usize, planes, output_area) catch return error.InvalidInputShape;
+    if (output_elems > 64 * 1024 * 1024) return error.UnsupportedShape;
+    const view = try denseTensorView(self, input);
+    defer if (view.owned) |owned| self.allocator.free(owned);
+    if (view.data.len != input_elems) return error.InvalidInputShape;
+    const output = try self.allocator.alloc(f32, output_elems);
+
+    for (0..output_area) |output_index| {
+        var valid_counts: [max_spatial]usize = .{1} ** max_spatial;
+        var first_positions: [max_spatial]i128 = .{0} ** max_spatial;
+        var valid_count: usize = 1;
+        for (0..spatial) |axis| {
+            const coordinate = (output_index / output_strides[axis]) % output_spatial[axis];
+            const base = @as(i128, @intCast(coordinate)) * attrs.strides[axis] - pad_before[axis];
+            const dilation: i128 = attrs.dilations[axis];
+            const kernel: i128 = attrs.kernel[axis];
+            const first = @min(kernel, @max(0, @divFloor(-base + dilation - 1, dilation)));
+            const end = @min(kernel, @max(0, @divFloor(@as(i128, @intCast(input_spatial[axis])) - 1 - base, dilation) + 1));
+            valid_counts[axis] = @intCast(@max(0, end - first));
+            first_positions[axis] = base + first * dilation;
+            valid_count *= valid_counts[axis];
+        }
+        var window_base: usize = 0;
+        if (valid_count != 0) {
+            for (0..spatial) |axis| window_base += @as(usize, @intCast(first_positions[axis])) * input_strides[axis];
+        }
+        const divisor: f32 = @floatFromInt(if (attrs.count_include_pad) kernel_count else valid_count);
+        for (0..planes) |plane| {
+            var sum: f32 = 0;
+            // Iterate only real input samples, not potentially enormous virtual padding.
+            for (0..valid_count) |sample| {
+                var remaining = sample;
+                var offset = window_base;
+                for (0..spatial) |reverse| {
+                    const axis = spatial - 1 - reverse;
+                    offset += (remaining % valid_counts[axis]) * window_steps[axis];
+                    remaining /= valid_counts[axis];
+                }
+                sum += view.data[plane * input_area + offset];
+            }
+            output[plane * output_area + output_index] = sum / divisor;
+        }
+    }
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, logical_shape[0..shape.len]);
+}
+
+fn convTransposeOp(ctx: *anyopaque, request: *const ops.ConvTransposeRequest) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, request.weight);
+
+    if (request.num_spatial != 1 and request.num_spatial != 2) return error.UnsupportedShape;
+    if (request.batch == 0 or request.in_channels == 0 or request.out_channels == 0 or
+        request.groups == 0 or request.in_channels % request.groups != 0 or
+        request.out_channels % request.groups != 0)
+    {
+        return error.InvalidInputShape;
+    }
+
+    for (0..request.num_spatial) |axis| {
+        const expected = ops.convTransposeOutputDim(
+            request.input_spatial[axis],
+            request.kernel[axis],
+            request.strides[axis],
+            request.padding[axis],
+            request.dilations[axis],
+            request.output_padding[axis],
+        ) orelse return error.InvalidInputShape;
+        if (request.output_spatial[axis] != expected) return error.ShapeMismatch;
+    }
+    if (request.num_spatial == 1 and
+        (request.input_spatial[1] != 1 or request.kernel[1] != 1 or
+            request.output_spatial[1] != 1))
+    {
+        return error.InvalidInputShape;
+    }
+
+    const input_area = std.math.mul(usize, request.input_spatial[0], request.input_spatial[1]) catch return error.InvalidInputShape;
+    const kernel_area = std.math.mul(usize, request.kernel[0], request.kernel[1]) catch return error.InvalidInputShape;
+    const output_area = std.math.mul(usize, request.output_spatial[0], request.output_spatial[1]) catch return error.InvalidInputShape;
+    const input_elems = std.math.mul(
+        usize,
+        std.math.mul(usize, request.batch, request.in_channels) catch return error.InvalidInputShape,
+        input_area,
+    ) catch return error.InvalidInputShape;
+    const out_per_group = request.out_channels / request.groups;
+    const weight_elems = std.math.mul(
+        usize,
+        std.math.mul(usize, request.in_channels, out_per_group) catch return error.InvalidInputShape,
+        kernel_area,
+    ) catch return error.InvalidInputShape;
+    const output_elems = std.math.mul(
+        usize,
+        std.math.mul(usize, request.batch, request.out_channels) catch return error.InvalidInputShape,
+        output_area,
+    ) catch return error.InvalidInputShape;
+
+    const conv_temp_limit_elems: usize = 64 * 1024 * 1024;
+    if (output_elems > conv_temp_limit_elems) {
+        std.log.warn(
+            "convTranspose refusing oversized output batch={d} in_channels={d} out_channels={d} input={d}x{d} kernel={d}x{d} output={d}x{d} groups={d} output_elems={d}",
+            .{
+                request.batch,
+                request.in_channels,
+                request.out_channels,
+                request.input_spatial[0],
+                request.input_spatial[1],
+                request.kernel[0],
+                request.kernel[1],
+                request.output_spatial[0],
+                request.output_spatial[1],
+                request.groups,
+                output_elems,
+            },
+        );
+        return error.UnsupportedShape;
+    }
+    const input_view = try denseTensorView(self, request.input);
+    defer if (input_view.owned) |owned| self.allocator.free(owned);
+    const weight_view = try denseTensorView(self, request.weight);
+    defer if (weight_view.owned) |owned| self.allocator.free(owned);
+    const input_data = input_view.data;
+    const weight_data = weight_view.data;
+    if (input_data.len != input_elems or weight_data.len != weight_elems) return error.InvalidInputShape;
+
+    const output = try self.allocator.alloc(f32, output_elems);
+    @memset(output, 0.0);
+
+    const in_per_group = request.in_channels / request.groups;
+    const horizontal_padding: i32 = if (request.num_spatial == 2) request.padding[1][0] else 0;
+    for (0..request.batch) |batch| {
+        for (0..request.groups) |group| {
+            const input_channel_base = group * in_per_group;
+            const output_channel_base = group * out_per_group;
+            for (0..in_per_group) |input_channel_in_group| {
+                const input_channel = input_channel_base + input_channel_in_group;
+                const input_base = (batch * request.in_channels + input_channel) * input_area;
+                const weight_channel_base = input_channel * out_per_group * kernel_area;
+                for (0..request.input_spatial[0]) |input_y| {
+                    for (0..request.input_spatial[1]) |input_x| {
+                        const input_value = input_data[input_base + input_y * request.input_spatial[1] + input_x];
+                        for (0..request.kernel[0]) |kernel_y| {
+                            const output_y_signed =
+                                @as(i128, @intCast(input_y)) * @as(i128, @intCast(request.strides[0])) -
+                                @as(i128, request.padding[0][0]) +
+                                @as(i128, @intCast(kernel_y)) * @as(i128, @intCast(request.dilations[0]));
+                            if (output_y_signed < 0 or output_y_signed >= @as(i128, @intCast(request.output_spatial[0]))) continue;
+                            const output_y: usize = @intCast(output_y_signed);
+                            for (0..request.kernel[1]) |kernel_x| {
+                                const output_x_signed =
+                                    @as(i128, @intCast(input_x)) * @as(i128, @intCast(request.strides[1])) -
+                                    @as(i128, horizontal_padding) +
+                                    @as(i128, @intCast(kernel_x)) * @as(i128, @intCast(request.dilations[1]));
+                                if (output_x_signed < 0 or output_x_signed >= @as(i128, @intCast(request.output_spatial[1]))) continue;
+                                const output_x: usize = @intCast(output_x_signed);
+                                const kernel_index = kernel_y * request.kernel[1] + kernel_x;
+                                for (0..out_per_group) |output_channel_in_group| {
+                                    const output_channel = output_channel_base + output_channel_in_group;
+                                    const output_base = (batch * request.out_channels + output_channel) * output_area;
+                                    const output_index = output_base + output_y * request.output_spatial[1] + output_x;
+                                    const weight_index = weight_channel_base + output_channel_in_group * kernel_area + kernel_index;
+                                    output[output_index] += input_value * weight_data[weight_index];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    const logical_shape = if (request.num_spatial == 1)
+        [_]i64{
+            @intCast(request.batch),
+            @intCast(request.out_channels),
+            @intCast(request.output_spatial[0]),
+            0,
+        }
+    else
+        [_]i64{
+            @intCast(request.batch),
+            @intCast(request.out_channels),
+            @intCast(request.output_spatial[0]),
+            @intCast(request.output_spatial[1]),
+        };
+    return self.withLogicalShape(result, logical_shape[0 .. request.num_spatial + 2]);
+}
 
 /// Shared RoPE rotation core. Rotates `output` in-place using one position
 /// value per head-sized chunk. `positions[tok]` gives the absolute position
@@ -40442,6 +40721,58 @@ fn splitLastDim3Op(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror
     };
 }
 
+fn takeRowsOp(ctx: *anyopaque, request: *const ops.TakeRowsRequest) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (request.dim == 0 or request.rows != request.row_ids.len) return error.InvalidTensorShape;
+    const input = toBuf(request.input);
+    if (input.quantized_storage != null or (input.source_tensor != null and input.data.len == 0)) return null;
+    if (input.view_strides != null) try materializeViewData(input);
+    const data = input.data;
+    if (data.len % request.dim != 0) return error.InvalidTensorShape;
+    const total_rows = data.len / request.dim;
+    for (request.row_ids) |row| {
+        if (row >= total_rows) return error.InvalidTensorShape;
+    }
+    const count = std.math.mul(usize, request.rows, request.dim) catch return error.InvalidTensorShape;
+    const shape = [_]i64{
+        std.math.cast(i64, request.rows) orelse return error.InvalidTensorShape,
+        std.math.cast(i64, request.dim) orelse return error.InvalidTensorShape,
+    };
+    const output = try self.allocator.alloc(f32, count);
+    const tensor = try self.makeOwnedBuf(output);
+    errdefer freeTensor(ctx, tensor);
+    for (request.row_ids, 0..) |row, index| {
+        @memcpy(output[index * request.dim ..][0..request.dim], data[@as(usize, row) * request.dim ..][0..request.dim]);
+    }
+    return try self.withLogicalShape(tensor, &shape);
+}
+
+test "Florence native row gather preserves row identity and independent storage" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
+    var data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const input = try compute.makeBuf(&data, false);
+    defer freeTensor(&compute, input);
+    const output = (try takeRowsOp(&compute, &.{
+        .input = input,
+        .row_ids = &.{ 2, 0, 2 },
+        .rows = 3,
+        .dim = 2,
+    })).?;
+    defer freeTensor(&compute, output);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 6, 1, 2, 5, 6 }, getData(output));
+    getData(output)[0] = 99;
+    try std.testing.expectEqual(@as(f32, 5), data[4]);
+    try std.testing.expectError(error.InvalidTensorShape, takeRowsOp(&compute, &.{
+        .input = input,
+        .row_ids = &.{3},
+        .rows = 1,
+        .dim = 2,
+    }));
+}
+
 fn concatRows2DOp(ctx: *anyopaque, a: CT, b: CT, rows_a: usize, rows_b: usize, cols: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const a_data = getData(a);
@@ -40660,6 +40991,58 @@ fn argmaxLastRowOp(_: *anyopaque, tensor: CT, rows: usize, dim: usize) anyerror!
     if (data.len != rows * dim) return error.InvalidTensorShape;
     const last_row = data[(rows - 1) * dim ..][0..dim];
     return @intCast(activations_mod.argmax(last_row));
+}
+
+fn argmaxRowsOp(
+    ctx: *anyopaque,
+    tensor: CT,
+    row_start: usize,
+    row_count: usize,
+    dim: usize,
+    allocator: std.mem.Allocator,
+) anyerror!?[]u32 {
+    return argmaxRowsSuppressOp(ctx, tensor, row_start, row_count, dim, &.{}, allocator);
+}
+
+fn argmaxRowsSuppressOp(
+    _: *anyopaque,
+    tensor: CT,
+    row_start: usize,
+    row_count: usize,
+    dim: usize,
+    suppress_token_ids: []const i32,
+    allocator: std.mem.Allocator,
+) anyerror!?[]u32 {
+    if (row_count == 0 or dim == 0) return error.InvalidTensorShape;
+    const row_end = std.math.add(usize, row_start, row_count) catch return error.InvalidTensorShape;
+    const elem_count = std.math.mul(usize, row_end, dim) catch return error.InvalidTensorShape;
+    const data = getData(tensor);
+    if (data.len < elem_count) return error.InvalidTensorShape;
+
+    const tokens = try allocator.alloc(u32, row_count);
+    errdefer allocator.free(tokens);
+    for (tokens, 0..) |*token, row_idx| {
+        const row = data[(row_start + row_idx) * dim ..][0..dim];
+        var best_idx: u32 = 0;
+        var best_val: f32 = -std.math.inf(f32);
+        var found = false;
+        for (row, 0..) |value, idx| {
+            if (found and !(value > best_val)) continue;
+            var suppressed = false;
+            for (suppress_token_ids) |raw| {
+                if (raw >= 0 and @as(usize, @intCast(raw)) == idx) {
+                    suppressed = true;
+                    break;
+                }
+            }
+            if (suppressed) continue;
+            found = true;
+            best_val = value;
+            best_idx = @intCast(idx);
+        }
+        token.* = best_idx;
+    }
+    return tokens;
 }
 
 test "linear q8_0 kernel computes direct matmul" {
@@ -47210,6 +47593,219 @@ test "native Qwen3 quantized-only weight handle preserves shape and lookup witho
         try quant_codec.dequantizeRow(.{ .known = .Q8_0 }, raw, 32, source_row, &expected);
         try std.testing.expectEqualSlices(f32, &expected, getData(result)[output_row * 32 ..][0..32]);
     }
+}
+
+test "native gather matrix preparation failure preserves cache accounting and existing layouts" {
+    const allocator = std.testing.allocator;
+    const dense = [_]f32{1} ** 128;
+    const raw = try quant_codec.quantizeQ8_0FromF32(allocator, &dense);
+    defer allocator.free(raw);
+    const shape = [_]i64{ 4, 32 };
+    const initial_shape = [_]i64{ 2, 64 };
+    var expected_row: [32]f32 = undefined;
+    try quant_codec.dequantizeRow(.{ .known = .Q8_0 }, raw, 32, 0, &expected_row);
+    for ([_]bool{ false, true }) |existing_rows| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{});
+        var storage = QuantizedStorage{
+            .tensor_type = .{ .known = .Q8_0 },
+            .raw_bytes = raw,
+            .shape = &initial_shape,
+            .raw_owned = false,
+            .allocator = failing.allocator(),
+        };
+        defer storage.prepared.deinit(failing.allocator());
+        // Two rows produce row blocks but no four-row panel. Preserve those
+        // already published blocks when a later panel allocation fails.
+        if (existing_rows) try prepareNativeQuantizedStorage(&storage);
+        storage.shape = &shape;
+        const original_rows = storage.preparedBytes(.row_major_blocks);
+        const original_bytes = quantizedStorageBudgetBytes(&storage);
+        var store = WeightStore{
+            .allocator = allocator,
+            .resident_weights = .{},
+            .lazy_weights = .{},
+            .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 4096 }),
+        };
+        defer deinitPrefetchQueue(&store);
+        try store.tier_cache.?.reserve(.host, original_bytes);
+        var compute = NativeCompute.init(allocator, &store, null);
+        defer compute.deinit();
+        var tracked_bytes = original_bytes;
+        failing.fail_index = failing.alloc_index + @as(usize, if (existing_rows) 0 else 1);
+        try std.testing.expectError(error.OutOfMemory, ensurePreparedKBlock(&compute, &storage, &tracked_bytes));
+        try std.testing.expectEqual(original_bytes, quantizedStorageBudgetBytes(&storage));
+        try std.testing.expectEqual(original_bytes, tracked_bytes);
+        try std.testing.expectEqual(original_bytes, store.tier_cache.?.host_bytes);
+        try std.testing.expect(storage.preparedBytes(.panel4) == null);
+        if (original_rows) |rows| {
+            try std.testing.expectEqual(rows.ptr, storage.preparedBytes(.row_major_blocks).?.ptr);
+        } else {
+            try std.testing.expect(storage.preparedBytes(.row_major_blocks) == null);
+        }
+        failing.fail_index = std.math.maxInt(usize);
+        try ensurePreparedKBlock(&compute, &storage, &tracked_bytes);
+        try std.testing.expect(storage.preparedBytes(.panel4) != null);
+        try std.testing.expectEqual(quantizedStorageBudgetBytes(&storage), tracked_bytes);
+        try std.testing.expectEqual(tracked_bytes, store.tier_cache.?.host_bytes);
+        var row: [32]f32 = undefined;
+        try quant_codec.dequantizeRow(storage.tensor_type, storage.raw_bytes, 32, 0, &row);
+        try std.testing.expectEqualSlices(f32, &expected_row, &row);
+    }
+}
+
+test "native gather reservation growth is deduplicated and fails without leaking borrowers" {
+    const allocator = std.testing.allocator;
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitPrefetchQueue(&store);
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 128 });
+    var compute = NativeCompute.init(allocator, &store, &budget);
+    defer compute.deinit();
+    _ = try acquireWeightReservation(&compute, "weight", 32);
+    _ = try acquireWeightReservation(&compute, "weight", 96);
+    try std.testing.expectEqual(@as(usize, 96), budget.host_weight_bytes);
+    try std.testing.expectError(error.MemoryBudgetExceeded, acquireWeightReservation(&compute, "weight", 160));
+    try std.testing.expectEqual(@as(usize, 96), budget.host_weight_bytes);
+    releaseWeightReservation(&compute, "weight");
+    try std.testing.expectEqual(@as(usize, 96), budget.host_weight_bytes);
+    releaseWeightReservation(&compute, "weight");
+    try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 0), compute.weight_reservations.count());
+}
+
+test "native gather weight avoids matrix packing and reserves only raw storage" {
+    const allocator = std.testing.allocator;
+    const name = "cls.output.weight";
+    var dense = [_]f32{0} ** 64;
+    for (&dense, 0..) |*value, index| value.* = @floatFromInt(index);
+    const raw = try quant_codec.quantizeQ8_0FromF32(allocator, &dense);
+    defer allocator.free(raw);
+    const shape = [_]i64{ 2, 32 };
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.resident_weights.deinit(allocator);
+    try store.resident_weights.put(allocator, name, .{
+        .tensor = .{
+            .data = &.{},
+            .shape = &.{},
+            .dtype = .f32,
+            .name = name,
+            .allocator = allocator,
+            .owns_data = false,
+            .owns_shape = false,
+        },
+        .quantized = true,
+        .quantized_storage = .{
+            .tensor_type = .{ .known = .Q8_0 },
+            .raw_bytes = raw,
+            .shape = &shape,
+            .raw_owned = false,
+            .allocator = allocator,
+        },
+    });
+    const weight_bytes = raw.len;
+    const output_bytes = 2 * 32 * @sizeOf(f32);
+    // No capacity exists for matrix packing: a gather needs only raw rows.
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = weight_bytes + output_bytes });
+    const output_estimate = run_memory.Estimate{
+        .prompt_tokens = 0,
+        .retained_tokens = 0,
+        .kv_bytes = 0,
+        .kv_tier = .host,
+        .scratch_bytes = output_bytes,
+        .scratch_tier = .host,
+    };
+    try budget.reserveEstimate(output_estimate);
+    defer budget.releaseEstimate(output_estimate);
+    defer store.resident_weights.getPtr(name).?.quantized_storage.?.prepared.deinit(allocator);
+    var compute = NativeCompute.init(allocator, &store, &budget);
+    defer compute.deinit();
+    const weight = try getEmbeddingWeight(&compute, name);
+    var released = false;
+    defer if (!released) freeTensor(&compute, weight);
+    try std.testing.expectEqual(@as(usize, 0), toBuf(weight).data.len);
+    try std.testing.expectEqualSlices(i64, &shape, toBuf(weight).logical_shape.?);
+    try std.testing.expectEqual(@as(usize, 0), toBuf(weight).quantized_storage.?.prepared.ownedBytes());
+    try std.testing.expectEqual(weight_bytes, budget.host_weight_bytes);
+    try std.testing.expectEqual(output_bytes, budget.host_scratch_bytes);
+    const result = try embeddingLookup(&compute, weight, &.{ 1, 0 }, 2, 32);
+    defer freeTensor(&compute, result);
+    var expected = [_]f32{0} ** 32;
+    for ([_]usize{ 1, 0 }, 0..) |source_row, output_row| {
+        try quant_codec.dequantizeRow(.{ .known = .Q8_0 }, raw, 32, source_row, &expected);
+        try std.testing.expectEqualSlices(f32, &expected, getData(result)[output_row * 32 ..][0..32]);
+    }
+    freeTensor(&compute, weight);
+    released = true;
+    try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
+}
+
+test "native gather lazy handles retain pins and allow later matrix preparation" {
+    const allocator = std.testing.allocator;
+    const name = "embedding.weight";
+    const dense = [_]f32{1} ** 128;
+    const raw = try quant_codec.quantizeQ8_0FromF32(allocator, &dense);
+    defer allocator.free(raw);
+    const shape = [_]i64{ 4, 32 };
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer {
+        deinitPrefetchQueue(&store);
+        store.lazy_weights.getPtr(name).?.loaded.?.quantized_storage.?.prepared.deinit(allocator);
+        store.lazy_weights.deinit(allocator);
+    }
+    try store.lazy_weights.put(allocator, name, .{
+        .tensor_ref = .{ .name = name, .byte_len = raw.len },
+        .loaded = .{
+            .tensor = .{
+                .data = &.{},
+                .shape = &.{},
+                .dtype = .f32,
+                .name = name,
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            },
+            .quantized = true,
+            .quantized_storage = .{
+                .tensor_type = .{ .known = .Q8_0 },
+                .raw_bytes = raw,
+                .shape = &shape,
+                .raw_owned = false,
+                .allocator = allocator,
+            },
+        },
+        .loaded_bytes = raw.len,
+        .active_tier = .host,
+    });
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 4096 });
+    var compute = NativeCompute.init(allocator, &store, &budget);
+    defer compute.deinit();
+    const first = try getEmbeddingWeight(&compute, name);
+    var first_live = true;
+    defer if (first_live) freeTensor(&compute, first);
+    const second = try getEmbeddingWeight(&compute, name);
+    var second_live = true;
+    defer if (second_live) freeTensor(&compute, second);
+    try std.testing.expect(first != second);
+    const entry = store.lazy_weights.getPtr(name).?;
+    try std.testing.expectEqual(@as(usize, 2), entry.pin_count);
+    try std.testing.expectEqual(raw.len, entry.loaded_bytes);
+    try std.testing.expectEqual(@as(usize, 0), entry.loaded.?.quantized_storage.?.prepared.ownedBytes());
+    freeTensor(&compute, first);
+    first_live = false;
+    try std.testing.expectEqual(@as(usize, 1), entry.pin_count);
+    try std.testing.expectEqual(raw.len, budget.host_weight_bytes);
+    const matrix = try acquireWeight(&compute, name);
+    var matrix_live = true;
+    defer if (matrix_live) freeTensor(&compute, matrix);
+    try std.testing.expect(entry.loaded.?.quantized_storage.?.prepared.ownedBytes() > 0);
+    try std.testing.expectEqual(quantizedStorageBudgetBytes(&entry.loaded.?.quantized_storage.?), entry.loaded_bytes);
+    try std.testing.expectEqual(entry.loaded_bytes, budget.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 2), entry.pin_count);
+    freeTensor(&compute, matrix);
+    matrix_live = false;
+    freeTensor(&compute, second);
+    second_live = false;
+    try std.testing.expectEqual(@as(usize, 0), entry.pin_count);
+    try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
 }
 
 test "native typed BF16 lazy weight stays pinned until all handles are freed" {

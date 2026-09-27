@@ -22229,6 +22229,7 @@ fn queryBuilderQueryModesForFieldCapability(capability: storage_schema.FieldCapa
     return switch (capability.field_type) {
         .text, .html => if (capability.searchable) &.{"full_text"} else &.{},
         .search_as_you_type => if (capability.searchable) &.{ "full_text", "autocomplete" } else &.{"autocomplete"},
+        .substring => if (capability.searchable) &.{ "full_text", "substring" } else &.{"substring"},
         .keyword, .link => if (capability.filterable) &.{"exact"} else &.{},
         .numeric, .datetime => if (capability.filterable) &.{ "exact", "range" } else &.{},
         .boolean => if (capability.filterable) &.{"exact"} else &.{},
@@ -24268,7 +24269,7 @@ test "storage migration job observation preserves admitted and unpublished catal
 
 test "storage migration command admission fences delayed starts across handlers" {
     const migration = @import("../common/vector_migration.zig");
-    const Db = @import("../storage/db/db.zig").DB;
+    const Db = @import("antfly_source_root").antfly_sources.physical_db.DB;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -58,7 +58,8 @@ pub fn loadPreprocessorConfigFile(allocator: std.mem.Allocator, path: []const u8
     if (obj.get("resample")) |v| {
         if (jsonValueGetUsize(v)) |parsed_int| {
             config.resample = switch (parsed_int) {
-                3 => .bicubic,
+                // Pillow BICUBIC includes antialiasing when downsampling.
+                3 => .pillow_bicubic,
                 2 => .bilinear,
                 0 => .nearest,
                 else => .bilinear,

@@ -16,7 +16,7 @@
 //! checkpoint through durable 2PC; retries after partial progress are safe.
 const std = @import("std");
 const reads = @import("table_read_source.zig");
-const writes = @import("table_writes.zig");
+const writes = @import("table_write_source.zig");
 const records = @import("../common/topology_records.zig");
 const contract = @import("distributed_txn_contract.zig");
 const activation = @import("../storage/db/relational_integrity_activation_contract.zig");

@@ -19607,7 +19607,11 @@ pub const ProvisionedTableWriteSource = struct {
         var attempted: usize = 0;
         var made_progress = false;
         var lifecycle_transition = false;
-        while (attempted < structural_reconcile_groups_per_quantum) : (attempted += 1) {
+        // A busy group rotates to the tail. Visit each initially pending group
+        // at most once so a small plan cannot repeat the same I/O and append
+        // duplicate observations within one publication quantum.
+        const group_budget = @min(structural_reconcile_groups_per_quantum, request.plan.?.pending_group_indexes.items.len);
+        while (attempted < group_budget) : (attempted += 1) {
             const plan = &request.plan.?;
             const group = plan.currentGroup() orelse {
                 break;
@@ -19650,7 +19654,11 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
 
-        if (made_progress) {
+        if (made_progress or observations.items.len != 0) {
+            // Maintenance may remain pending after an exact resident index has
+            // been installed. Publish its fresh observation without completing
+            // the group: activation visibility must not wait for corpus work.
+            // The ordinary not-before delay still bounds unproductive retries.
             // DB admission and publication are separate boundaries. A Raft
             // transfer between them must not let the predecessor publish an
             // authoritative acknowledgement for the new serving owner.
@@ -19963,7 +19971,7 @@ pub const ProvisionedTableWriteSource = struct {
             const outcome: StructuralReconcileGroupOutcome = switch (observation.result.state) {
                 .complete => .complete,
                 .repair_pending, .restore_repair_pending => .repair_pending,
-                .busy => return .busy,
+                .busy => .busy,
                 .degraded => return error.StorageKernelReconcileDegraded,
             };
             // A successful reconcile is not a publication proof. Observe the
@@ -33738,23 +33746,42 @@ fn consumerTests() type {
             if (comptime !control_only_storage_sources) return error.SkipZigTest;
             const alloc = std.testing.allocator;
             const Fake = struct {
+                const indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}";
                 observed: bool = false,
+                busy: bool = false,
+                calls: usize = 0,
                 fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
                     return error.UnexpectedBatch;
                 }
                 fn reconcile(_: *anyopaque, _: u64, _: []const u8, _: ?[]const u8, _: bool) anyerror!?table_write_source.LocalStructuralReconcileResult {
                     return .{ .state = .complete };
                 }
-                fn observe(ptr: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, target: ?[]const u8, advance: bool, _: db_mod.types.ArtifactRepairRunOptions, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
+                fn observe(ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, target: ?[]const u8, advance: bool, _: db_mod.types.ArtifactRepairRunOptions, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table);
                     try std.testing.expectEqualStrings("vec", target.?);
                     try std.testing.expect(retain and !advance);
+                    self.calls += 1;
+                    var stats: db_mod.types.DBStats = .{};
+                    if (self.observed) {
+                        const expectation = (try targetedIndexExpectationFromCatalog(allocator, indexes_json, "vec")).exact;
+                        stats.index_count = 1;
+                        stats.indexes = try allocator.alloc(db_mod.types.DBIndexStats, 1);
+                        stats.indexes[0] = .{
+                            .name = try allocator.dupe(u8, "vec"),
+                            .kind = .dense_vector,
+                            .coverage_identity_ready = true,
+                            .coverage_generation = expectation.incarnation,
+                            .coverage_config_hash = expectation.config_hash,
+                            .backfill_active = true,
+                            .replay_catch_up_required = true,
+                        };
+                    }
                     return .{
-                        .result = .{ .state = .complete },
+                        .result = .{ .state = if (self.busy) .busy else .complete },
                         .runtime_status = if (self.observed) .{
                             .group_id = group,
-                            .stats = .{},
+                            .stats = stats,
                             .metadata = .{
                                 .lsm_root_generation = table_reads.backend_current_root_generation,
                                 .source = .live_writer_publish,
@@ -33769,7 +33796,9 @@ fn consumerTests() type {
             var fake = Fake{};
             var cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer cache.deinit();
-            var source = ProvisionedTableWriteSource.init("/tmp/unused-owner-structural-observation", table_catalog.emptyCatalogSource());
+            var catalog = StructuralReconcileTestCatalog{ .mode = .stable };
+            catalog.tables[0].indexes_json = Fake.indexes_json;
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-owner-structural-observation", catalog.fencedIface());
             defer source.deinit();
             source.runtime_status_cache = &cache;
             source.local_write_source = .{ .ptr = &fake, .vtable = &.{
@@ -33787,12 +33816,13 @@ fn consumerTests() type {
             try std.testing.expectEqual(.busy, try source.reconcileTableGroupStructureWithRuntime(alloc, 7001, "docs", metadata, &observations));
             try std.testing.expectEqual(@as(usize, 0), observations.items.len);
             fake.observed = true;
+            fake.busy = true;
             source.reserveTargetedStructuralReconcileStatus("docs", "vec");
             defer source.releaseTargetedStructuralReconcileStatus("docs", "vec");
-            try source.bindTargetedStructuralExpectation(alloc, "docs", "vec", "{}", &.{7001});
+            try source.bindTargetedStructuralExpectation(alloc, "docs", "vec", Fake.indexes_json, &.{7001});
             const token = try cache.capturePublicationToken("docs");
             try std.testing.expectError(error.EmptyTargetedIndexObservation, publishStructuralRuntimeObservations(&source, "docs", "vec", token, observations.items, false));
-            try std.testing.expectEqual(.complete, try source.reconcileTableGroupStructureWithRuntime(alloc, 7001, "docs", metadata, &observations));
+            try std.testing.expectEqual(.busy, try source.reconcileTableGroupStructureWithRuntime(alloc, 7001, "docs", metadata, &observations));
             try std.testing.expectEqual(@as(usize, 1), observations.items.len);
             try std.testing.expectEqual(@as(u64, 123), observations.items[0].status.metadata.target_observation_revision);
             try publishStructuralRuntimeObservations(&source, "docs", "vec", token, observations.items, false);
@@ -33800,6 +33830,27 @@ fn consumerTests() type {
             defer published.deinit(alloc);
             try std.testing.expectEqual(@as(usize, 1), published.items.len);
             try std.testing.expectEqual(@as(u64, 7001), published.items[0].group_id);
+            // Publishing installed state does not claim maintenance completed.
+            for (observations.items) |*value| value.deinit(alloc);
+            observations.clearRetainingCapacity();
+            // Exercise the scheduler quantum, not only the collection helper:
+            // the group stays pending, yet exact installed state is published.
+            var request = ProvisionedTableWriteSource.StructuralReconcileRequest{
+                .table_name = try alloc.dupe(u8, "docs"),
+                .index_name = try alloc.dupe(u8, "vec"),
+            };
+            defer request.deinit(alloc);
+            const calls_before = fake.calls;
+            try std.testing.expectEqual(.blocked, try source.reconcileTableStructureStep(alloc, &request));
+            try std.testing.expectEqual(calls_before + 1, fake.calls);
+            try std.testing.expectEqual(@as(usize, 1), request.plan.?.pending_group_indexes.items.len);
+            var pending = (try cache.snapshot(alloc, "docs")).?;
+            defer pending.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), pending.items[0].stats.indexes.len);
+            try std.testing.expect(pending.items[0].stats.indexes[0].backfill_active);
+            try std.testing.expect(pending.items[0].stats.indexes[0].replay_catch_up_required);
+            fake.busy = false;
+            try std.testing.expectEqual(.complete, try source.reconcileTableGroupStructureWithRuntime(alloc, 7001, "docs", metadata, &observations));
         }
 
         test "graph metric group action envelope is typed and versioned" {
@@ -62991,29 +63042,7 @@ pub fn reclaimBackupPinAtGroup(alloc: std.mem.Allocator, runtime: ?*db_mod.backg
     return try alloc.dupe(u8, "{}");
 }
 
-pub fn executeBackupPinControl(alloc: std.mem.Allocator, db: *db_mod.DB, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) ![]u8 {
-    try control.ensureActive();
-    const fence = switch (request) {
-        .seal => |value| value.fence,
-        .release => |value| value.fence,
-        .cancel => |value| value,
-    };
-    if (fence.owner_group_id != group_id or fence.role != .backup_snapshot) return error.InvalidBackupFence;
-    switch (request) {
-        .seal => |value| {
-            const handle = try db.sealBackupCohort(value.id, value.fence, control.token());
-            return try std.json.Stringify.valueAlloc(alloc, handle, .{});
-        },
-        .release => |handle| {
-            try db.releaseBackupCohort(handle);
-            return try alloc.dupe(u8, "{}");
-        },
-        .cancel => |value| {
-            try db.cancelBackupCohort(value);
-            return try alloc.dupe(u8, "{}");
-        },
-    }
-}
+pub const executeBackupPinControl = @import("../storage/db/backup_pin_control.zig").execute;
 
 pub const RestoreTerminalAdmission = local_write_contract.RestoreTerminalAdmission;
 

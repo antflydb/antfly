@@ -270,6 +270,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.enrichment_runtime.test.enrichment runtime graph materializer rejects non-finite mapped weights",
         "storage.db.enrichment.enrichment_runtime.test.enrichment worker chunk cache keys preserve embedded separators",
         "storage.db.enrichment.enrichment_runtime.test.enrichment worker retry delay is exponential and capped",
+        "enrichment inline backoff wakes for teardown before and during wait admission",
         "storage.db.enrichment.enrichment_runtime.test.foreground enrichment catch-up guard has a monotonic deadline",
         "storage.db.enrichment.enrichment_runtime.test.foreground enrichment catch-up treats cancellation as a waiter outcome",
         "storage.db.enrichment.enrichment_runtime.test.isolated enrichment request does not advance when durable parking fails",
@@ -503,6 +504,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "mixed numeric concrete sort keys share one cursor domain",
         "schema boolean doc values back native sort planner",
         "db exact sort resolves mapped geo metadata filters from typed doc values",
+        "highlight",
+        "attachHighlights",
+        "schema-driven dotted path ignores unindexed literal key",
+        "text analysis rejects invalid shingle bounds",
     };
     const lib_db_query_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -516,6 +521,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     addRuntimeTestFilters(b, run_lib_db_query_tests, &lib_db_query_default_filters);
     const lib_db_query_step = b.step("antfly-storage-db-query-test", "Run root-module DB query/indexing tests");
     lib_db_query_step.dependOn(&run_lib_db_query_tests.step);
+
+    const highlight_filters = [_][]const u8{
+        "highlight",
+        "attachHighlights",
+        "schema-driven dotted path ignores unindexed literal key",
+        "text analysis rejects invalid shingle bounds",
+        "document mapper emits mapped keyword subfield",
+    };
+    const highlight_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &highlight_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_highlight_tests = b.addRunArtifact(highlight_tests);
+    addRuntimeTestFilters(b, run_highlight_tests, &highlight_filters);
+    b.step("antfly-storage-highlight-test", "Run source mapping and highlight analysis regressions")
+        .dependOn(&run_highlight_tests.step);
 
     const lib_db_text_query_tests = b.addTest(.{
         .root_module = antfly_test_mod,

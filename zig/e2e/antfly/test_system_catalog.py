@@ -263,6 +263,7 @@ def test_catalog_scope_indexes_and_placement_overrides(stateful_api):
         api.delete("/tablespaces/" + name)
 
 
+@pytest.mark.reuse_antfly_process
 @pytest.mark.parametrize(
     "name",
     [

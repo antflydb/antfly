@@ -698,6 +698,7 @@ pub fn antfly_embedder(model: impl Into<String>) -> types::IndexEmbedderConfig {
 impl Default for types::CreateFullTextIndexRequest {
     fn default() -> Self {
         Self {
+            analysis_config: None,
             artifact_name: None,
             description: None,
             enrichments: Vec::new(),
