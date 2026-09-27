@@ -46,9 +46,10 @@ it (used to compare the two teachers on states both can see) and
 `--compare-laya` to also score records with the actual unpacked Laya
 checkpoint (upstream's own code, which truncates long states exactly as
 serving does) so the two teachers' agreement with gold can be read side by
-side. `--limit`/`--seed` take a bounded, shuffled sample; label log-likelihood
-scoring is O(records) forward passes (one per record, prompt shared across
-its labels via a branched KV cache) rather than O(decisions x labels).
+side. `--limit`/`--seed` take a bounded, shuffled sample. Label log-likelihood
+scoring prefills each case's state once (`--prefill shared`, the default) and
+branches every question, and every multi-token label, off a copy of that KV
+cache, so the state is read once per case rather than once per question.
 """
 
 from __future__ import annotations
@@ -162,41 +163,42 @@ def build_prompt(record: dict) -> str:
     return "\n".join(lines)
 
 
-def score_record(model, tok, mx, cache_mod, record: dict) -> tuple[list[float], list[float], int]:
-    """Each label's raw-sum and length-normalized (average per token)
-    log-likelihood, via one prompt forward pass and one short branched
-    continuation per label (KV cache reused from the prompt; branching does
-    not mutate the shared cache, verified against a from-scratch
-    full-sequence forward on a released Laya fixture prompt). Both scoring
-    conventions come from the same per-token logprobs, so returning both here
-    costs nothing extra."""
-    prompt_ids = tok.apply_chat_template(
+def teacher_prompt_ids(tok, record: dict) -> list[int]:
+    return tok.apply_chat_template(
         [{"role": "user", "content": build_prompt(record)}], add_generation_prompt=True, enable_thinking=False
     )
-    cache = cache_mod.make_prompt_cache(model)
-    logits = model(mx.array([prompt_ids]), cache=cache)
-    mx.eval(logits)
-    last_logprobs = logits[0, -1].astype(mx.float32)
-    last_logprobs = last_logprobs - mx.logsumexp(last_logprobs)
-    saved_state = [c.state for c in cache]
 
-    raw_scores, norm_scores = [], []
-    total_tokens = len(prompt_ids)
+
+def fork_cache(cache_mod, saved_state):
+    """A fresh KV cache holding `saved_state`; extending it leaves the saved
+    arrays untouched, so one prefix can branch many continuations."""
+    fresh = []
+    for k, v in saved_state:
+        c = cache_mod.KVCache()
+        c.state = (k, v)
+        fresh.append(c)
+    return fresh
+
+
+def score_labels(model, tok, mx, cache_mod, saved_state, last_logits, record: dict) -> tuple[list[float], list[float], int]:
+    """Each label's raw-sum and length-normalized (average per token)
+    log-likelihood after the prompt whose cache is `saved_state` and whose
+    final logits are `last_logits`: the first label token is read off the
+    prompt's logits, the rest from one short branched continuation per label.
+    Both conventions come from the same per-token logprobs."""
+    last_logprobs = last_logits.astype(mx.float32)
+    last_logprobs = last_logprobs - mx.logsumexp(last_logprobs)
+    raw_scores, norm_scores, tokens = [], [], 0
     for label in record["labels"]:
         cont_ids = tok.encode(str(label), add_special_tokens=False)
         if not cont_ids:
             raw_scores.append(float("-inf"))
             norm_scores.append(float("-inf"))
             continue
-        total_tokens += len(cont_ids)
+        tokens += len(cont_ids)
         logprob = float(last_logprobs[cont_ids[0]])
         if len(cont_ids) > 1:
-            fresh = []
-            for k, v in saved_state:
-                c = cache_mod.KVCache()
-                c.state = (k, v)
-                fresh.append(c)
-            cont_logits = model(mx.array([cont_ids[:-1]]), cache=fresh)
+            cont_logits = model(mx.array([cont_ids[:-1]]), cache=fork_cache(cache_mod, saved_state))
             mx.eval(cont_logits)
             step_logprobs = cont_logits[0].astype(mx.float32)
             step_logprobs = step_logprobs - mx.logsumexp(step_logprobs, axis=-1, keepdims=True)
@@ -204,7 +206,60 @@ def score_record(model, tok, mx, cache_mod, record: dict) -> tuple[list[float], 
                 logprob += float(step_logprobs[i, next_id])
         raw_scores.append(logprob)
         norm_scores.append(logprob / len(cont_ids))
-    return raw_scores, norm_scores, total_tokens
+    return raw_scores, norm_scores, tokens
+
+
+def shared_prefix_len(all_ids: list[list[int]]) -> int:
+    """Longest token prefix common to every prompt, leaving at least one token
+    of each prompt to run after it (the prompt's last logits come from there)."""
+    if len(all_ids) < 2:
+        return 0
+    limit = min(len(ids) for ids in all_ids) - 1
+    n = 0
+    while n < limit and all(ids[n] == all_ids[0][n] for ids in all_ids):
+        n += 1
+    return n
+
+
+def score_group(model, tok, mx, cache_mod, group: list[dict], share_prefix: bool) -> list[tuple[list[float], list[float], int]]:
+    """Score the records of one case. With `share_prefix`, the prompts' common
+    token prefix (the state: build_prompt puts it before the question and
+    labels) is prefilled once and every question branches off a copy of that
+    cache. The branched result equals prefilling each prompt in two chunks at
+    the same boundary exactly; it differs from a one-chunk prefill only by
+    reduced-precision chunking numerics (LAYA.md, "Teacher throughput").
+    Returns (raw, normalized, tokens computed) per record; the shared prefix's
+    tokens are counted once, on the first record."""
+    all_ids = [teacher_prompt_ids(tok, r) for r in group]
+    prefix = shared_prefix_len(all_ids) if share_prefix else 0
+    base = None
+    if prefix:
+        cache = cache_mod.make_prompt_cache(model)
+        mx.eval(model(mx.array([all_ids[0][:prefix]]), cache=cache))
+        base = [c.state for c in cache]
+    results = []
+    for n, (record, ids) in enumerate(zip(group, all_ids)):
+        cache = fork_cache(cache_mod, base) if prefix else cache_mod.make_prompt_cache(model)
+        logits = model(mx.array([ids[prefix:]]), cache=cache)
+        mx.eval(logits)
+        raw, norm, label_tokens = score_labels(
+            model, tok, mx, cache_mod, [c.state for c in cache], logits[0, -1], record
+        )
+        results.append((raw, norm, len(ids) - prefix + label_tokens + (prefix if n == 0 else 0)))
+    return results
+
+
+def score_records(model, tok, mx, cache_mod, records: list[dict], share_prefix: bool) -> list[tuple[list[float], list[float], int]]:
+    """score_group over `records` grouped by case (`group_id`; a record
+    without one is its own case), returned in input order."""
+    groups: dict = collections.OrderedDict()
+    for n, record in enumerate(records):
+        groups.setdefault(record.get("group_id", ("record", n)), []).append(n)
+    results: list = [None] * len(records)
+    for members in groups.values():
+        for n, result in zip(members, score_group(model, tok, mx, cache_mod, [records[m] for m in members], share_prefix)):
+            results[n] = result
+    return results
 
 
 # --- Calibration and blending (shared shape with prepare_laya_packed_distillation) --------------
@@ -407,6 +462,13 @@ def main():
         help="Label log-likelihood convention. auto (default) fits both on --calibration and keeps "
         "whichever gives lower mean cross-entropy",
     )
+    parser.add_argument(
+        "--prefill",
+        choices=("shared", "per-question"),
+        default="shared",
+        help="shared (default): prefill each case's state once and branch its questions off that cache. "
+        "per-question: prefill every question's whole prompt, as runs before 2026-09-26 did",
+    )
     parser.add_argument("--gold-weight", type=float, default=0.5)
     parser.add_argument("--score-all", action="store_true", help="Score every record, ignoring Laya eligibility")
     parser.add_argument("--compare-laya", action="store_true", help="Also score with the unpacked Laya checkpoint")
@@ -443,14 +505,15 @@ def main():
     model, teacher_tok = mlx_load(args.teacher_model)
     load_seconds = time.time() - t0
 
-    def score(record):
-        return score_record(model, teacher_tok, mx, cache_mod, record)
+    share_prefix = args.prefill == "shared"
+
+    def score(batch):
+        return score_records(model, teacher_tok, mx, cache_mod, batch, share_prefix)
 
     scores_by_mode = {"raw-sum": {}, "length-normalized": {}}
     total_tokens = 0
     t0 = time.time()
-    for i in chosen:
-        raw, norm, tokens = score(records[i])
+    for i, (raw, norm, tokens) in zip(chosen, score([records[i] for i in chosen])):
         scores_by_mode["raw-sum"][i] = raw
         scores_by_mode["length-normalized"][i] = norm
         total_tokens += tokens
@@ -464,8 +527,7 @@ def main():
     elif args.calibration:
         cal_records = load_records(args.calibration)
         cal_scored = {"raw-sum": [], "length-normalized": []}
-        for r in cal_records:
-            raw, norm, _ = score(r)
+        for r, (raw, norm, _) in zip(cal_records, score(cal_records)):
             cal_scored["raw-sum"].append((r["kind"], len(r["labels"]), raw, r["target"]))
             cal_scored["length-normalized"].append((r["kind"], len(r["labels"]), norm, r["target"]))
         fitted = {mode: fit_temperatures_bucketed(cal_scored[mode]) for mode in SCORE_MODES}
@@ -522,8 +584,9 @@ def main():
             "score_all": args.score_all,
             "score_mode": score_mode,
             "temperatures": temperatures,
+            "prefill": args.prefill,
             "seconds_per_decision": score_seconds / max(1, len(chosen)),
-            "prompt_tokens": total_tokens,
+            "computed_tokens": total_tokens,
             "load_seconds": load_seconds,
         }
         if calibration_report:
@@ -547,6 +610,7 @@ def main():
             "gold_weight": args.gold_weight,
             "score_mode": score_mode,
             "temperatures": temperatures,
+            "prefill": args.prefill,
             "source_sha256": digest(args.records),
             "teacher_model": str(args.teacher_model),
             "teacher_config_sha256": digest(args.teacher_model / "config.json"),

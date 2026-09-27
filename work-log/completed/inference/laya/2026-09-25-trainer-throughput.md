@@ -546,3 +546,6 @@ M4 Max 36 GB, MLX, `scripts/laya/benchmark_laya_teacher.py`.
   14B 0.534 s/decision, accuracy 0.645, soft CE 1.032 (T 14.6); uniform soft CE 1.212; argmax agreement 0.672.
 - Cascade 4B → 14B by 4B calibrated top probability: threshold 0.5 escalates 27%, accuracy 0.582; 0.6: 53%, 0.617;
   0.7: 70%, 0.630; 0.8: 90%, 0.637; 0.9: 99%, 0.645.
+- `prepare_laya_longcontext_teacher.py --score-all` on `td/s0-eval.jsonl` (760 decisions, no calibration):
+  `--prefill shared` 0.650 s/decision, 109,893 tokens, accuracy 0.6461, soft CE 5.755, ECE 0.321;
+  `--prefill per-question` 1.304 s/decision, 266,593 tokens, accuracy 0.6447, soft CE 5.759, ECE 0.318.

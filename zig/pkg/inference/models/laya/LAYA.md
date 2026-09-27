@@ -1825,7 +1825,8 @@ uv run --script scripts/laya/prepare_laya_longcontext_teacher.py \
     --output distilled-eval-long.jsonl --metrics-output eval-long-metrics.json
 ```
 
-`--score-all` scores every record regardless of Laya eligibility (used for the
+`--prefill shared` (the default) reads each case's state once; `--prefill
+per-question` restores the original per-question prompts. `--score-all` scores every record regardless of Laya eligibility (used for the
 short-state comparison above); `--temperatures <prior output>.json` reuses a
 fitted score mode and temperatures instead of recalibrating; `--score-mode
 {raw-sum,length-normalized}` overrides the automatic choice. The
@@ -1875,12 +1876,16 @@ once there is compute headroom.
 
 **Estimated wall-clock for 200k decisions:**
 - About 2.5 days per-question on this laptop.
-- About 1.2-1.6 days with shared-state prefill.
+- About 1.5 days with shared-state prefill (0.65 s/decision, measured in the script).
 - Hours on one datacenter GPU.
 
 **Recommendation.**
-1. Adopt shared-state prefill in `prepare_laya_longcontext_teacher.py`. It is
-   exact and free.
+1. Adopt shared-state prefill in `prepare_laya_longcontext_teacher.py`. Done:
+   `--prefill shared` is now the default, and `--prefill per-question`
+   reproduces earlier runs. Over all 760 decisions of `td/s0-eval.jsonl`
+   (`--score-all`, uncalibrated), the script took 0.650 vs 1.304 s/decision
+   (**2.0×**) and computed 109,893 vs 266,593 tokens. Accuracy was 0.646 vs
+   0.645, and soft CE 5.755 vs 5.759.
 2. Keep the 14B teacher.
 3. For the 10^5-decision run, move labelling to a rented GPU running the same
    model behind a prefix-caching server. This is the only lever that reaches
