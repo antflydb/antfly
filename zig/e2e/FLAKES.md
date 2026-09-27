@@ -1951,6 +1951,12 @@ already sent. A deterministic VoprIo regression admits eight callers through a
 single-grant lane and checks deadline expiry, cancellation and lease recovery.
 Final qualification of this correction is pending.
 
+Review also moved protocol-activation lock release to the end of proposal
+admission. If leadership changes during preflight, the forwarding path must not
+hold that local coordination lock while waiting for capacity or a peer reply.
+The initial Debug qualification was stopped to include this cleanup; its partial
+counts are not acceptance evidence.
+
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
 
 Scheduled run `36247286560` passed qualification, all five campaigns, and the

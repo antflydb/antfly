@@ -11304,6 +11304,14 @@ pub const DataServer = struct {
                 admission.deinit();
                 routed_write_admission = null;
             }
+            // The activation lock orders protocol preflight through proposal
+            // acceptance. A leadership change can send this iteration down
+            // the forwarding path instead; release it before either waiting
+            // for transport capacity or awaiting the peer's reply.
+            if (protocol_activation_lock_owned) {
+                protocol_activation_entry.?.activation_mutex.unlock();
+                protocol_activation_lock_owned = false;
+            }
 
             if (retry_for_leader_preflight) {
                 if (self.dataRaftMonotonicNs() >= deadline_ns) return error.LeaderUnavailable;
@@ -11311,12 +11319,6 @@ pub const DataServer = struct {
             }
 
             if (target_index) |index| {
-                // The protocol activation singleflight is an ownership lock,
-                // so release it before allowing a lifecycle hook to suspend.
-                if (protocol_activation_lock_owned) {
-                    protocol_activation_entry.?.activation_mutex.unlock();
-                    protocol_activation_lock_owned = false;
-                }
                 self.reachDataRequestLifecycle(.{
                     .phase = .proposal_accepted,
                     .group_id = group_id,
