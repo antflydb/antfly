@@ -22345,6 +22345,12 @@ const RemoteMetadataSource = struct {
     control_read_generation: ?*ControlReadGeneration = null,
     control_read_generation_at_ms: u64 = 0,
     control_read_refresh_mutex: std.atomic.Mutex = .unlocked,
+    // Bounded across peer-view replacement; routing changes bypass cooldown.
+    control_read_miss_refresh: ?struct {
+        invalidation: u64,
+        routing: ?antfly.metadata_api.CatalogRoutingChangeToken,
+        finished_at_ns: u64,
+    } = null,
     diagnostic_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
     diagnostic_snapshot_at_ms: u64 = 0,
     diagnostic_snapshot_generation: u64 = 0,
@@ -23031,7 +23037,13 @@ const RemoteMetadataSource = struct {
         return self.acceptObservedSnapshotResult(.snapshot, incoming, head, observed_fence_generation, now_ms, null);
     }
 
+    const SnapshotPublication = union(enum) { cached, miss_refresh: ?antfly.metadata_api.MetadataHead };
+
     fn acceptObservedSnapshotResult(self: *RemoteMetadataSource, comptime kind: SnapshotResultKind, incoming: antfly.metadata_api.AdminSnapshot, head: antfly.metadata_api.MetadataHead, observed_fence_generation: u64, now_ms: u64, budget: ?antfly.metadata_http_client.RequestBudget) !SnapshotResult(kind) {
+        return self.publishObservedSnapshotResult(kind, incoming, head, observed_fence_generation, now_ms, budget, .cached);
+    }
+
+    fn publishObservedSnapshotResult(self: *RemoteMetadataSource, comptime kind: SnapshotResultKind, incoming: antfly.metadata_api.AdminSnapshot, head: antfly.metadata_api.MetadataHead, observed_fence_generation: u64, now_ms: u64, budget: ?antfly.metadata_http_client.RequestBudget, publication: SnapshotPublication) !SnapshotResult(kind) {
         var fresh = incoming;
         var fresh_owned = true;
         defer if (fresh_owned) freeAdminSnapshotOwned(self.alloc, &fresh);
@@ -23054,8 +23066,18 @@ const RemoteMetadataSource = struct {
             if (self.cached_snapshot != null) return self.snapshotResultLocked(kind);
             return error.MetadataSnapshotHeadMismatch;
         }
-        if (self.cached_head) |current_head| {
-            if (!std.meta.eql(current_head, head)) return error.MetadataSnapshotHeadMismatch;
+        switch (publication) {
+            .cached => if (self.cached_head) |current_head| {
+                if (!std.meta.eql(current_head, head)) return error.MetadataSnapshotHeadMismatch;
+            },
+            .miss_refresh => |observed_head| {
+                // Retain the usable cache during I/O; replace only the head
+                // captured before this fetch, with authoritative fences intact.
+                if (!std.meta.eql(self.cached_head, observed_head) and
+                    !std.meta.eql(self.cached_head, @as(?antfly.metadata_api.MetadataHead, head)))
+                    return error.MetadataSnapshotHeadMismatch;
+                self.snapshot_fence_generation +%= 1;
+            },
         }
         // Lifecycle counters are process-local, so their numeric order cannot
         // establish which peer has the newer catalog. The generation above
@@ -23728,23 +23750,53 @@ const RemoteMetadataSource = struct {
                 return retained;
             }
         }
-        const retired_snapshot = self.cached_snapshot;
-        const retired_peers = self.control_read_generation;
-        self.cached_snapshot = null;
-        self.control_read_generation = null;
-        self.cached_head = null;
-        self.cached_head_at_ms = 0;
-        self.snapshot_fence_generation +%= 1;
-        self.snapshot_invalidation_generation +%= 1;
-        self.cache_mutex.unlock();
-        if (retired_peers) |peers| peers.release();
-        if (retired_snapshot) |value| {
-            var snapshot = value;
-            freeAdminSnapshotOwned(self.alloc, &snapshot);
+        const invalidation = self.snapshot_invalidation_generation;
+        const routing = if (self.cached_routing_snapshot) |entry|
+            antfly.metadata_api.CatalogRoutingChangeToken.fromSnapshot(entry.snapshot)
+        else
+            null;
+        if (self.control_read_miss_refresh) |recent| {
+            if (recent.invalidation == invalidation and std.meta.eql(recent.routing, routing) and
+                self.awakeNs() -| recent.finished_at_ns < metadata_snapshot_cache_ttl_ms * std.time.ns_per_ms)
+            {
+                const retained = if (self.control_read_generation) |current| current.retain() else null;
+                self.cache_mutex.unlock();
+                return retained orelse error.StorageReadTemporarilyUnavailable;
+            }
         }
-        // Keep the compact routing cache: only the stale endpoint/placement
-        // generation is invalidated, and the caller keeps its original budget.
-        return self.fetchSnapshotResult(.peers, budget);
+        self.control_read_miss_refresh = .{ .invalidation = invalidation, .routing = routing, .finished_at_ns = self.awakeNs() };
+        self.cache_mutex.unlock();
+        defer {
+            // Failures also back off; slow I/O does not consume its cooldown.
+            lockAtomic(&self.cache_mutex);
+            if (self.control_read_miss_refresh) |*recent| recent.finished_at_ns = self.awakeNs();
+            self.cache_mutex.unlock();
+        }
+        // Ordinary readers keep warm immutable views throughout this capture.
+        // No cache invalidation or TTL extension precedes successful publication.
+        try self.lockWithBudget(&self.snapshot_refresh_mutex, budget);
+        defer self.snapshot_refresh_mutex.unlock();
+        while (true) {
+            try ensureBudgetActive(budget);
+            try self.lockWithBudget(&self.cache_mutex, budget);
+            const fence = self.snapshot_fence_generation;
+            const observed_head = self.cached_head;
+            const injected_error = if (@import("builtin").is_test) self.test_faults.fetch_head_error else null;
+            self.cache_mutex.unlock();
+            if (injected_error) |err| return err;
+            const head = self.fetchRemoteHead(budget) catch |err| {
+                if (err == error.MetadataSnapshotHeadMismatch) continue;
+                return err;
+            };
+            const incoming = self.fetchSnapshotRemoteWithBudget(head, budget) catch |err| {
+                if (err == error.MetadataSnapshotHeadMismatch) continue;
+                return err;
+            };
+            return self.publishObservedSnapshotResult(.peers, incoming, head, fence, self.awakeMs(), budget, .{ .miss_refresh = observed_head }) catch |err| {
+                if (err == error.MetadataSnapshotHeadMismatch) continue;
+                return err;
+            };
+        }
     }
 
     fn remoteAcquireJoinPlanning(ptr: *anyopaque, caller: antfly.public_api.table_router.RouteBudget) !?*antfly.public_api.join_planning.Generation {
@@ -40722,8 +40774,11 @@ fn consumerTests() type {
             source.test_faults.fetch_head_error = error.ConnectionRefused;
             // A missing route forces a fresh head even inside the cache TTL.
             try std.testing.expectError(error.ConnectionRefused, source.refreshControlReadGenerationAfterMiss(observed, .{}));
-            try std.testing.expect(source.control_read_generation == null);
-            // Active readers retain the old immutable view across retirement.
+            try std.testing.expect(source.control_read_generation == observed);
+            const healthy = try source.acquireControlReadGeneration(.{});
+            try std.testing.expect(healthy == observed);
+            healthy.release();
+            // Active readers retain the old immutable view across replacement.
             try std.testing.expectEqual(@as(usize, 0), observed.groups.count());
             try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, try source.acceptLinearizableSnapshot(try cloneAdminSnapshotOwned(alloc, snapshot), source.beginLinearizableSnapshot()));
             const shared = try source.refreshControlReadGenerationAfterMiss(observed, .{});
@@ -40734,6 +40789,126 @@ fn consumerTests() type {
             defer second.release();
             try std.testing.expect(second == shared);
             // Both callers reuse publication despite the injected fetch error.
+        }
+
+        test "system catalog read peer miss refresh bounds retries and preserves warm routes on failure" {
+            const alloc = std.testing.allocator;
+            const vopr = @import("vopr");
+            var clock = try vopr.vopr_io.VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+            defer clock.deinit();
+            var stores = [_]antfly.metadata.StoreRecord{.{ .store_id = 10, .node_id = 1, .api_url = "http://healthy", .role = "data", .health_class = "healthy", .live = true }};
+            var intents = [_]antfly.raft.PlacementIntent{.{ .store_id = 10, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 }, .serving_state = .serving }};
+            const snapshot: antfly.metadata_api.AdminSnapshot = .{
+                .status = .{ .metadata_group_id = 9, .metadata_incarnation = "11111111111111111111111111111111".*, .metadata_epoch = 8, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &stores,
+                .placement_intents = &intents,
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+                .merged_group_statuses = &.{},
+            };
+            const Fake = struct {
+                snapshot: antfly.metadata_api.AdminSnapshot,
+                source: ?*RemoteMetadataSource = null,
+                head_calls: usize = 0,
+                captures: usize = 0,
+                fail: bool = false,
+                supersede: bool = false,
+                fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (request.method == .GET and std.mem.endsWith(u8, request.uri, @import("../metadata/http_routes.zig").Routes.head)) {
+                        self.head_calls += 1;
+                        if (self.fail) return error.ConnectionRefused;
+                        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, RemoteMetadataSource.snapshotHead(&self.snapshot), .{}) };
+                    }
+                    if (request.method != .POST or !std.mem.endsWith(u8, request.uri, @import("../metadata/snapshot_transfer.zig").path)) return error.UnexpectedMissRefreshRequest;
+                    var parsed = try std.json.parseFromSlice(@import("../metadata/snapshot_transfer.zig").Request, a, request.body, .{});
+                    defer parsed.deinit();
+                    if (parsed.value.release) return .{ .status = 204 };
+                    try std.testing.expect(parsed.value.control and !parsed.value.linearizable);
+                    self.captures += 1;
+                    // A concurrent ordinary reader can still use the healthy
+                    // cache while this miss is capturing its replacement.
+                    const source = self.source.?;
+                    const warm = try source.acquireControlReadGeneration(.{});
+                    defer warm.release();
+                    try std.testing.expect(warm.readable(77, 1));
+                    if (self.supersede) {
+                        source.invalidateCache();
+                        var newer = self.snapshot;
+                        newer.status.metadata_epoch = 99;
+                        try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, try source.acceptLinearizableSnapshot(try cloneAdminSnapshotOwned(source.alloc, newer), source.beginLinearizableSnapshot()));
+                    }
+                    const body = try std.json.Stringify.valueAlloc(a, self.snapshot, .{});
+                    errdefer a.free(body);
+                    var response: antfly.common.http.HttpResponse = .{ .status = 200, .body = body };
+                    response.headers = try a.alloc(antfly.common.http.Header, 2);
+                    @memset(response.headers, .{ .name = &.{}, .value = &.{} });
+                    errdefer {
+                        response.body = &.{};
+                        response.deinit(a);
+                    }
+                    response.headers[0].name = try a.dupe(u8, "X-Antfly-Snapshot-Token");
+                    response.headers[0].value = try a.dupe(u8, "2");
+                    response.headers[1].name = try a.dupe(u8, "X-Antfly-Snapshot-Bytes");
+                    response.headers[1].value = try std.fmt.allocPrint(a, "{d}", .{body.len});
+                    return response;
+                }
+            };
+            var fake = Fake{ .snapshot = snapshot };
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, clock.io());
+            defer source.deinit();
+            fake.source = &source;
+            try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, try source.acceptLinearizableSnapshot(try cloneAdminSnapshotOwned(alloc, snapshot), source.beginLinearizableSnapshot()));
+            const original = try source.acquireControlReadGeneration(.{});
+            defer original.release();
+            fake.fail = true;
+            try std.testing.expectError(error.ConnectionRefused, source.refreshControlReadGenerationAfterMiss(original, .{}));
+            const failed_head_calls = fake.head_calls;
+            try std.testing.expect(failed_head_calls > 0);
+            const warm = try source.acquireControlReadGeneration(.{});
+            try std.testing.expect(warm == original and warm.readable(77, 1));
+            warm.release();
+            for (0..100) |_| {
+                const reused = try source.refreshControlReadGenerationAfterMiss(original, .{});
+                reused.release();
+            }
+            try std.testing.expectEqual(failed_head_calls, fake.head_calls);
+            // Cooldown expiry allows a successful staged capture. Advance the
+            // borrowed clock, then republish to keep the warm route's TTL live.
+            try clock.advance(std.time.ns_per_s);
+            try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, try source.acceptLinearizableSnapshot(try cloneAdminSnapshotOwned(alloc, snapshot), source.beginLinearizableSnapshot()));
+            fake.fail = false;
+            const current = try source.acquireControlReadGeneration(.{});
+            defer current.release();
+            const refreshed = try source.refreshControlReadGenerationAfterMiss(current, .{});
+            defer refreshed.release();
+            try std.testing.expect(refreshed != current and original.readable(77, 1));
+            for (0..100) |_| {
+                const reused = try source.refreshControlReadGenerationAfterMiss(refreshed, .{});
+                try std.testing.expect(reused == refreshed);
+                reused.release();
+            }
+            try std.testing.expectEqual(failed_head_calls + 1, fake.head_calls);
+            try std.testing.expectEqual(@as(usize, 1), fake.captures);
+            // A real compact routing revision bypasses cooldown immediately.
+            source.cached_routing_snapshot = try RemoteMetadataSource.RoutingSnapshotCacheEntry.create(alloc, .{ .metadata_group_id = 9, .metadata_incarnation = snapshot.status.metadata_incarnation, .catalog_revision = 2, .tables = &.{}, .ranges = &.{} });
+            const revised = try source.refreshControlReadGenerationAfterMiss(refreshed, .{});
+            defer revised.release();
+            try std.testing.expectEqual(@as(usize, 2), fake.captures);
+            // Concurrent invalidation/publication wins over the in-flight
+            // observation; the older capture cannot overwrite its epoch.
+            try clock.advance(std.time.ns_per_s);
+            try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, try source.acceptLinearizableSnapshot(try cloneAdminSnapshotOwned(alloc, snapshot), source.beginLinearizableSnapshot()));
+            const before = try source.acquireControlReadGeneration(.{});
+            defer before.release();
+            fake.supersede = true;
+            const latest = try source.refreshControlReadGenerationAfterMiss(before, .{});
+            defer latest.release();
+            try std.testing.expectEqual(@as(u64, 99), source.cached_snapshot.?.status.metadata_epoch);
+            try std.testing.expect(latest == source.control_read_generation);
+            try clock.ensureNoCapabilityViolation();
         }
 
         test "system catalog read peer routing retains healthy relocation views across publication and invalidation" {

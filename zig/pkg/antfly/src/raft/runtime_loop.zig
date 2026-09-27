@@ -221,12 +221,17 @@ pub const ManagedProgressDriver = struct {
         self.wake_event.set(self.io);
     }
 
+    fn prepareProgressTurn(self: *ManagedProgressDriver) bool {
+        // Reset before observing stop. A stop preceding reset remains visible
+        // in stop_event; a later stop leaves wake_event set for the wait.
+        // Progress debt likewise survives reset in progress_requested.
+        self.wake_event.reset();
+        return !self.stop_event.isSet();
+    }
+
     fn run(self: *ManagedProgressDriver) void {
         var next_tick_ns: u64 = 0;
-        while (!self.stop_event.isSet()) {
-            // Clear before checking the debt: a concurrent notify is either
-            // consumed below or leaves the event set for the subsequent wait.
-            self.wake_event.reset();
+        while (self.prepareProgressTurn()) {
             const started_ns = platform_time.monotonicNs();
             const tick_due = started_ns >= next_tick_ns;
             const requested = self.progress_requested.swap(false, .acq_rel);
@@ -901,4 +906,24 @@ test "managed raft progress driver releases source ownership after startup refus
     try std.testing.expect(probe.wake == null);
     try std.testing.expectEqual(@as(usize, 1), probe.releases);
     try std.testing.expectEqual(@as(usize, 0), probe.ticks.load(.acquire));
+}
+
+test "managed raft progress driver retains stop across wake reset" {
+    var driver = ManagedProgressDriver.init(std.testing.io, undefined, 60 * std.time.ns_per_s);
+    // Reproduce stop after the previous turn's stop observation but before
+    // reset. No clock advancement or watchdog is needed to prove the race.
+    driver.stop_event.set(driver.io);
+    driver.wake_event.set(driver.io);
+    try std.testing.expect(!driver.prepareProgressTurn());
+    try std.testing.expect(!driver.wake_event.isSet());
+    driver.stop_event.reset();
+    driver.progress_requested.store(true, .release);
+    driver.wake_event.set(driver.io);
+    try std.testing.expect(driver.prepareProgressTurn());
+    try std.testing.expect(driver.progress_requested.swap(false, .acq_rel));
+    // A stop after the reset is retained for the next wait instead.
+    driver.stop_event.set(driver.io);
+    driver.wake_event.set(driver.io);
+    try std.testing.expect(driver.wake_event.isSet());
+    try std.testing.expect(!driver.prepareProgressTurn());
 }

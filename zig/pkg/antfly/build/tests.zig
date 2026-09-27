@@ -1886,6 +1886,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "http host reserves service workers through its runtime and rolls back overcommit",
         "managed raft progress driver advances independently and joins on stop",
         "managed raft progress driver coalesces request wakes without accelerating ticks",
+        "managed raft progress driver retains stop across wake reset",
         "managed raft progress driver releases source ownership after startup refusal",
         "managed raft progress driver publishes source failure",
         "managed raft progress driver reports a wedged round unhealthy",

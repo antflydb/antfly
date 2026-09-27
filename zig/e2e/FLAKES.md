@@ -2121,6 +2121,32 @@ ANTFLY_E2E_REGRESSION_WORKERS=2 ANTFLY_E2E_REGRESSION_REPEATS=100 \
   e2e/antfly/test_autoschema.py::test_label_routed_autograph_promotes_events_and_entities
 ```
 
+
+### 2026-09-27: Review follow-up
+
+A fresh review found a progress-driver stop/reset race and three regression
+tests absent from the normal test inventories. The driver now resets its wake
+before checking the persistent stop signal; a deterministic interleaving test
+covers both stop orderings and retained progress debt. The apply-waiter,
+peer-refresh, abort, shutdown, and repeated-miss contracts are all included in
+the default buckets.
+
+Route-miss refresh now stages a replacement while retaining the usable immutable
+peer cache. Failure leaves its contents and TTL unchanged; successful publication
+checks the original snapshot fence and head before replacing it atomically.
+Concurrent invalidation/publication wins over an older capture. One bounded
+miss-refresh record coalesces sequential unresolved misses across peer-view
+replacement, including failures. Its cooldown uses the borrowed clock, begins
+at completion, and is bypassed by compact routing revision or mutation
+invalidation. It preserves every caller's deadline and cancellation.
+
+Debug validation passes six focused peer-cache/apply contracts, 13 transaction
+contracts, 33 managed-progress contracts, and six Ready-continuation contracts.
+The final application/data build passed 55/55 steps; the merged CI scope checks
+passed 11 tests. Main's build-cache PVC fix (#895) is included. New executable
+qualification is pending; the earlier 200-case qualification above retains its
+original source and binary provenance.
+
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
 
 Scheduled run `36247286560` passed qualification, all five campaigns, and the
