@@ -8384,27 +8384,32 @@ pub const DB = struct {
                 else => return err,
             };
             defer transactions_mod.freeParticipantList(self.alloc, unresolved);
+            var acknowledged: [64][]const u8 = undefined;
+            var acknowledged_count: usize = 0;
             for (unresolved) |participant| {
                 recovery_stats.notification_attempts += 1;
-                if (config.local_participant) |local| {
-                    if (std.mem.eql(u8, local, participant)) {
-                        self.markTransactionParticipantResolved(txn.txn_id, participant) catch |err| switch (err) {
-                            transactions_mod.TxnError.TxnNotFound => {},
-                            else => return err,
-                        };
-                        recovery_stats.notification_successes += 1;
-                        continue;
-                    }
-                }
-                resolve_participant(resolver_ctx, txn.txn_id, participant, txn.status, txn.commit_version) catch {
+                const is_local = if (config.local_participant) |local| std.mem.eql(u8, local, participant) else false;
+                if (!is_local) resolve_participant(resolver_ctx, txn.txn_id, participant, txn.status, txn.commit_version) catch {
                     recovery_stats.notification_failures += 1;
                     continue;
                 };
-                self.markTransactionParticipantResolved(txn.txn_id, participant) catch |err| switch (err) {
+                acknowledged[acknowledged_count] = participant;
+                acknowledged_count += 1;
+                if (acknowledged_count == acknowledged.len) {
+                    self.markTransactionParticipantsResolved(txn.txn_id, acknowledged[0..acknowledged_count]) catch |err| switch (err) {
+                        transactions_mod.TxnError.TxnNotFound => {},
+                        else => return err,
+                    };
+                    recovery_stats.notification_successes += acknowledged_count;
+                    acknowledged_count = 0;
+                }
+            }
+            if (acknowledged_count != 0) {
+                self.markTransactionParticipantsResolved(txn.txn_id, acknowledged[0..acknowledged_count]) catch |err| switch (err) {
                     transactions_mod.TxnError.TxnNotFound => {},
                     else => return err,
                 };
-                recovery_stats.notification_successes += 1;
+                recovery_stats.notification_successes += acknowledged_count;
             }
         }
 

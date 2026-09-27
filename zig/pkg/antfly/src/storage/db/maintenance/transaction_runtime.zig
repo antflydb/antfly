@@ -30,6 +30,48 @@ const background_runtime_mod = @import("../../background_runtime.zig");
 
 pub const Config = @import("../transaction_recovery_contract.zig").Config;
 
+const AcknowledgementWindow = struct {
+    members: [64][]const u8 = undefined,
+    count: usize = 0,
+
+    fn flush(self: *@This(), manager: *transactions_mod.TxnManager, config: Config, txn_id: transactions_mod.TxnId, owner: ?[]const u8, summary: anytype) !bool {
+        if (self.count == 0) return true;
+        const participants = self.members[0..self.count];
+        defer self.count = 0;
+        if (!config.replicated_metadata) {
+            try manager.markParticipantsResolvedExtraBatch(txn_id, participants, .{});
+            summary.notification_successes += participants.len;
+            return true;
+        }
+        if (config.acknowledge_participants_fn) |many| {
+            const delivered = delivered: {
+                many(config.resolver_ctx.?, txn_id, owner.?, participants) catch |err| {
+                    if (err == error.UnsupportedOperation or err == error.UnsupportedRaftBatchProtocolVersion) break :delivered false;
+                    // Even if a subset committed, no delivery was proven for
+                    // this window. Durable resolution remains safe to retry.
+                    summary.notification_failures += participants.len;
+                    return false;
+                };
+                break :delivered true;
+            };
+            if (delivered) {
+                summary.notification_successes += participants.len;
+                return true;
+            }
+        }
+        var complete = true;
+        for (participants) |participant| {
+            config.acknowledge_participant_fn.?(config.resolver_ctx.?, txn_id, owner.?, participant) catch {
+                summary.notification_failures += 1;
+                complete = false;
+                continue;
+            };
+            summary.notification_successes += 1;
+        }
+        return complete;
+    }
+};
+
 pub const default_lease_key = "\x00\x00__metadata__:transaction_recovery_lease";
 
 pub const Runtime = if (builtin.os.tag == .freestanding) struct {
@@ -438,6 +480,7 @@ fn runRecoveryPageWithConfig(
         var all_resolved = local_effects_resolved;
         const retained_cutoff = now_ns -| config.retained_terminal_ns;
 
+        var acknowledgements: AcknowledgementWindow = .{};
         for (unresolved) |participant| {
             // Retained coordinators use their self-acknowledgement as the
             // durable handoff from the API session registry. Recovery must not
@@ -456,20 +499,13 @@ fn runRecoveryPageWithConfig(
                 all_resolved = false;
                 continue;
             };
-            if (config.replicated_metadata) {
-                config.acknowledge_participant_fn.?(
-                    config.resolver_ctx.?,
-                    txn.txn_id,
-                    owner_participant.?,
-                    participant,
-                ) catch {
-                    summary.notification_failures += 1;
-                    all_resolved = false;
-                    continue;
-                };
-            } else try manager.markParticipantResolved(txn.txn_id, participant);
-            summary.notification_successes += 1;
+            acknowledgements.members[acknowledgements.count] = participant;
+            acknowledgements.count += 1;
+            if (acknowledgements.count == acknowledgements.members.len) {
+                if (!try acknowledgements.flush(&manager, config, txn.txn_id, owner_participant, &summary)) all_resolved = false;
+            }
         }
+        if (!try acknowledgements.flush(&manager, config, txn.txn_id, owner_participant, &summary)) all_resolved = false;
         if (config.replicated_metadata and all_resolved) {
             const cutoff = now_ns -| config.cutoff_ns;
             if (txn.finalized_at < (if (txn.retain_terminal) retained_cutoff else cutoff)) {
@@ -1067,4 +1103,91 @@ test "transaction recovery executes production pass on borrowed VoprIo" {
     }
     try std.testing.expect(lifecycle_ok);
     try vopr_io.ensureNoCapabilityViolation();
+}
+
+test "replicated recovery batches proven followers preserves uncertain debt and retains self handoff" {
+    const alloc = std.testing.allocator;
+    const Recorder = struct {
+        const Mode = enum { success, unsupported, unknown, committed_reply_loss };
+        manager: *transactions_mod.TxnManager,
+        mode: Mode,
+        batches: usize = 0,
+        singles: usize = 0,
+        cleanups: usize = 0,
+        fn owns(_: *anyopaque, owner: []const u8) bool {
+            return std.mem.eql(u8, owner, "owner");
+        }
+        fn resolve(_: *anyopaque, _: transactions_mod.TxnId, participant: []const u8, _: transactions_mod.TxnStatus, _: u64) !void {
+            if (std.mem.eql(u8, participant, "failed")) return error.GroupLeaderUnavailable;
+        }
+        fn single(ptr: *anyopaque, txn: transactions_mod.TxnId, owner: []const u8, participant: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("owner", owner);
+            self.singles += 1;
+            try self.manager.markParticipantResolved(txn, participant);
+        }
+        fn many(ptr: *anyopaque, txn: transactions_mod.TxnId, owner: []const u8, participants: []const []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batches += 1;
+            try std.testing.expectEqualStrings("owner", owner);
+            try std.testing.expect(participants.len > 0 and participants.len <= 64);
+            for (participants) |participant| try std.testing.expect(!std.mem.eql(u8, participant, "failed") and !std.mem.eql(u8, participant, "owner"));
+            switch (self.mode) {
+                .unsupported => return error.UnsupportedOperation,
+                .unknown => return error.RaftBatchWriteOutcomeUnknown,
+                .committed_reply_loss => {
+                    try self.manager.markParticipantsResolvedExtraBatch(txn, participants, .{});
+                    return error.RaftBatchWriteOutcomeUnknown;
+                },
+                .success => try self.manager.markParticipantsResolvedExtraBatch(txn, participants, .{}),
+            }
+        }
+        fn cleanup(ptr: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: u64, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.cleanups += 1;
+        }
+    };
+    var participants: [132][]const u8 = undefined;
+    participants[0] = "owner";
+    participants[1] = "failed";
+    var initialized: usize = 2;
+    defer for (participants[2..initialized]) |participant| alloc.free(participant);
+    for (participants[2..], 0..) |*participant, i| {
+        participant.* = try std.fmt.allocPrint(alloc, "member-{d}", .{i});
+        initialized += 1;
+    }
+    for ([_]Recorder.Mode{ .success, .unsupported, .unknown, .committed_reply_loss }) |mode| {
+        var backend = mem_backend.Backend.init(alloc, .{});
+        defer backend.close();
+        var runtime_store = try backend.runtimeStore(alloc, .{});
+        defer runtime_store.deinit();
+        var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+        defer manager.deinit();
+        const txn: transactions_mod.TxnId = @splat(37);
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(txn, 1000, 1000, &participants, true, true);
+        try manager.resolveIntents(txn, .committed, 2000);
+        var recorder: Recorder = .{ .manager = &manager, .mode = mode };
+        var clock: platform_clock.ManualClock = .{};
+        clock.setRealtimeNs(5000);
+        const stats = try recoverOnce(alloc, &runtime_store, .{
+            .enabled = true,
+            .clock = clock.clock(),
+            .cutoff_ns = 3000,
+            .resolver_ctx = &recorder,
+            .replicated_metadata = true,
+            .owns_recovery_fn = Recorder.owns,
+            .resolve_participant_fn = Recorder.resolve,
+            .acknowledge_participant_fn = Recorder.single,
+            .acknowledge_participants_fn = Recorder.many,
+            .cleanup_transaction_fn = Recorder.cleanup,
+        });
+        try std.testing.expectEqual(@as(usize, 3), recorder.batches);
+        try std.testing.expectEqual(@as(usize, if (mode == .unsupported) 130 else 0), recorder.singles);
+        try std.testing.expectEqual(@as(usize, 0), recorder.cleanups);
+        try std.testing.expectEqual(@as(u64, if (mode == .unknown or mode == .committed_reply_loss) 131 else 1), stats.notification_failures);
+        const unresolved = try manager.getUnresolvedParticipants(alloc, txn);
+        defer transactions_mod.freeParticipantList(alloc, unresolved);
+        try std.testing.expectEqual(@as(usize, if (mode == .unknown) 132 else 2), unresolved.len);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try manager.getTransactionStatus(txn));
+    }
 }

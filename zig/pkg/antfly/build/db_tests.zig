@@ -638,6 +638,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "transaction participant batch",
             "transaction recovery delegates stale coordinator abort to replicated resolver",
             "replicated recovery is coordinator-owned and acknowledges through hooks",
+            "replicated recovery batches proven followers preserves uncertain debt and retains self handoff",
             "transaction recovery drains terminal HA outbox without remaining intents",
             "non-replicated transaction recovery honors the per-run page limit",
             "retained terminal transactions honor the extended retry cutoff",

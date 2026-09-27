@@ -11779,6 +11779,18 @@ pub const DataServer = struct {
         }
     }
 
+    fn acquireDataForwardingPeers(self: *DataServer, route: DataRaftBatchRoute, deadline_ns: u64) !?*ControlReadGeneration {
+        const remote = self.remote_metadata orelse return null;
+        if (route.discovery.mayRefreshCatalog()) return try remote.acquireControlReadGeneration(.{
+            .clock = antfly.public_api.table_catalog.RoutingBudget.initIo(deadline_ns, self.dataRaftIo()),
+            .cancellation = if (route.cancellation) |signal| signal.token() else null,
+        });
+        const budget: antfly.metadata_http_client.RequestBudget = .{ .deadline_ns = deadline_ns, .io = self.dataRaftIo(), .cancellation = route.cancellation };
+        try remote.lockWithBudget(&remote.cache_mutex, budget);
+        defer remote.cache_mutex.unlock();
+        return if (remote.control_read_generation) |peers| peers.retain() else error.MetadataSnapshotUnavailable;
+    }
+
     fn dataApiUriForNode(
         self: *DataServer,
         alloc: std.mem.Allocator,
@@ -11786,19 +11798,9 @@ pub const DataServer = struct {
         route: DataRaftBatchRoute,
         deadline_ns: u64,
     ) !?[]u8 {
-        const remote_metadata = self.remote_metadata orelse return null;
-        var snapshot = if (route.discovery.mayRefreshCatalog())
-            try remote_metadata.fetchSnapshotWithBudget(.{
-                .deadline_ns = deadline_ns,
-                .cancellation = route.cancellation,
-                .io = self.dataRaftIo(),
-            })
-        else
-            (try remote_metadata.cachedPeerSnapshot()) orelse return error.MetadataSnapshotUnavailable;
-        defer freeAdminSnapshotOwned(self.alloc, &snapshot);
-        const store = findSnapshotStoreByNodeId(snapshot.stores, node_id) orelse return null;
-        if (store.api_url.len == 0) return null;
-        return try alloc.dupe(u8, store.api_url);
+        const peers = (try self.acquireDataForwardingPeers(route, deadline_ns)) orelse return null;
+        defer peers.release();
+        return peers.forwardingUri(alloc, node_id);
     }
 
     fn logRaftBatchLeaderTimeout(self: *DataServer, group_id: u64) void {
@@ -11882,38 +11884,13 @@ pub const DataServer = struct {
         request_campaign_consumed: bool,
         last_target_node_id: *?u64,
     ) !bool {
-        const remote_metadata = self.remote_metadata orelse return false;
         _ = self.data_raft orelse return false;
-        var snapshot = if (route.discovery.mayRefreshCatalog())
-            try remote_metadata.fetchSnapshotWithBudget(.{
-                .deadline_ns = deadline_ns,
-                .cancellation = route.cancellation,
-                .io = self.dataRaftIo(),
-            })
-        else
-            (try remote_metadata.cachedPeerSnapshot()) orelse return error.MetadataSnapshotUnavailable;
-        defer freeAdminSnapshotOwned(self.alloc, &snapshot);
-
-        var preferred_node_id: ?u64 = null;
-        if (findMergedSnapshotGroupStatus(snapshot.merged_group_statuses, group_id)) |status| {
-            if (status.leader_known and status.leader_store_id != 0) {
-                if (findSnapshotStore(snapshot.stores, status.leader_store_id)) |store| {
-                    preferred_node_id = store.node_id;
-                }
-            }
-        }
-        const target_node_id = remoteRaftBatchPlacementNode(
-            group_id,
-            local_node_id,
-            preferred_node_id,
-            snapshot.placement_intents,
-            allow_local_placement_source,
-            last_target_node_id.*,
-        ) orelse return false;
+        const peers = (try self.acquireDataForwardingPeers(route, deadline_ns)) orelse return false;
+        defer peers.release();
+        const target_node_id = peers.placementTarget(group_id, local_node_id, allow_local_placement_source, last_target_node_id.*) orelse return false;
         last_target_node_id.* = target_node_id;
-
-        const target_store = findSnapshotStoreByNodeId(snapshot.stores, target_node_id) orelse return false;
-        if (target_store.api_url.len == 0) return false;
+        const base_uri = (try peers.forwardingUri(alloc, target_node_id)) orelse return false;
+        defer alloc.free(base_uri);
 
         var forward_lane = try self.acquireDataRaftForwardLaneUntil(group_id, deadline_ns, route);
         defer forward_lane.release();
@@ -11943,7 +11920,7 @@ pub const DataServer = struct {
             .table_name = table_name,
         });
         var response = client.fetchGroupBatchWithForwarding(
-            target_store.api_url,
+            base_uri,
             group_id,
             table_name,
             body,
@@ -17288,12 +17265,11 @@ pub const DataServer = struct {
     ) !void {
         if (self.data_raft == null) return;
         const remote_metadata = self.remote_metadata orelse return;
-        var snapshot = try remote_metadata.fetchSnapshotWithBudget(.{
-            .deadline_ns = deadline_ns,
-            .cancellation = cancellation,
-            .io = self.dataRaftIo(),
+        const peers = try remote_metadata.acquireControlReadGeneration(.{
+            .clock = antfly.public_api.table_catalog.RoutingBudget.initIo(deadline_ns, self.dataRaftIo()),
+            .cancellation = if (cancellation) |signal| signal.token() else null,
         });
-        defer freeAdminSnapshotOwned(self.alloc, &snapshot);
+        defer peers.release();
         self.requestDataRaftMetadataSync();
     }
 
@@ -22256,6 +22232,10 @@ const ControlReadGeneration = struct {
     const Group = struct {
         nodes: std.ArrayListUnmanaged(u64) = .empty,
         leader: ?u64 = null,
+        forward_leader: ?u64 = null,
+        forward_leader_seen: bool = false,
+        placement_nodes: std.ArrayListUnmanaged(u64) = .empty,
+        forward_candidates: std.ArrayListUnmanaged(u64) = .empty,
         serving_node: ?u64 = null,
         multiple_serving: bool = false,
     };
@@ -22264,6 +22244,7 @@ const ControlReadGeneration = struct {
     revision: ?[32]u8 = null,
     nodes: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
     groups: std.AutoHashMapUnmanaged(u64, Group) = .empty,
+    forwarding_nodes: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
 
     fn create(alloc: std.mem.Allocator, snapshot: antfly.metadata_api.AdminSnapshot) !*ControlReadGeneration {
         return createWithBudget(alloc, snapshot, .{});
@@ -22277,8 +22258,20 @@ const ControlReadGeneration = struct {
         self.revision = if (snapshot.peer_view) try @import("../metadata/peer_view.zig").revision(alloc, snapshot) else null;
         var store_nodes: std.AutoHashMapUnmanaged(u64, u64) = .empty;
         defer store_nodes.deinit(alloc);
+        var forwarding_store_nodes: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+        defer forwarding_store_nodes.deinit(alloc);
         for (snapshot.stores, 0..) |store, i| {
             if (i % 64 == 0) try budget.check();
+            // Forwarding retains the original first-record endpoint semantics,
+            // including unhealthy/empty endpoints. Read routing remains healthy-only.
+            if (!forwarding_store_nodes.contains(store.store_id)) try forwarding_store_nodes.put(alloc, store.store_id, store.node_id);
+            if (!self.forwarding_nodes.contains(store.node_id)) {
+                const forwarding_url = try alloc.dupe(u8, store.api_url);
+                self.forwarding_nodes.put(alloc, store.node_id, forwarding_url) catch |err| {
+                    alloc.free(forwarding_url);
+                    return err;
+                };
+            }
             if (!store.live or !std.mem.eql(u8, store.health_class, "healthy") or store.api_url.len == 0) continue;
             const url = try alloc.dupe(u8, store.api_url);
             const entry = self.nodes.getOrPut(alloc, store.node_id) catch |err| {
@@ -22293,6 +22286,8 @@ const ControlReadGeneration = struct {
             if (i % 64 == 0) try budget.check();
             const entry = try self.groups.getOrPut(alloc, intent.record.group_id);
             if (!entry.found_existing) entry.value_ptr.* = .{};
+            try appendUniqueNodeId(alloc, &entry.value_ptr.placement_nodes, intent.record.local_node_id);
+            if (antfly.raft.placementMayLeadMembershipTransition(intent)) try appendUniqueNodeId(alloc, &entry.value_ptr.forward_candidates, intent.record.local_node_id);
             if (intent.serving_state == .serving) {
                 const group = entry.value_ptr;
                 if (group.serving_node) |node| {
@@ -22313,8 +22308,12 @@ const ControlReadGeneration = struct {
         }
         for (snapshot.merged_group_statuses, 0..) |status, i| {
             if (i % 64 == 0) try budget.check();
-            if (!status.leader_known or status.leader_store_id == 0) continue;
             const group = self.groups.getPtr(status.group_id) orelse continue;
+            if (!group.forward_leader_seen) {
+                group.forward_leader_seen = true;
+                if (status.leader_known and status.leader_store_id != 0) group.forward_leader = forwarding_store_nodes.get(status.leader_store_id);
+            }
+            if (!status.leader_known or status.leader_store_id == 0) continue;
             group.leader = store_nodes.get(status.leader_store_id);
         }
         try budget.check();
@@ -22331,8 +22330,15 @@ const ControlReadGeneration = struct {
         var nodes = self.nodes.valueIterator();
         while (nodes.next()) |url| self.alloc.free(url.*);
         self.nodes.deinit(self.alloc);
+        var forwarding_nodes = self.forwarding_nodes.valueIterator();
+        while (forwarding_nodes.next()) |url| self.alloc.free(url.*);
+        self.forwarding_nodes.deinit(self.alloc);
         var groups = self.groups.valueIterator();
-        while (groups.next()) |group| group.nodes.deinit(self.alloc);
+        while (groups.next()) |group| {
+            group.nodes.deinit(self.alloc);
+            group.placement_nodes.deinit(self.alloc);
+            group.forward_candidates.deinit(self.alloc);
+        }
         self.groups.deinit(self.alloc);
         self.alloc.destroy(self);
     }
@@ -22340,6 +22346,30 @@ const ControlReadGeneration = struct {
     fn readable(self: *const ControlReadGeneration, group_id: u64, node_id: u64) bool {
         const group = self.groups.get(group_id) orelse return false;
         return std.mem.indexOfScalar(u64, group.nodes.items, node_id) != null;
+    }
+
+    fn forwardingUri(self: *const ControlReadGeneration, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+        const url = self.forwarding_nodes.get(node_id) orelse return null;
+        if (url.len == 0) return null;
+        return try alloc.dupe(u8, url);
+    }
+
+    fn placementTarget(self: *const ControlReadGeneration, group_id: u64, local_node_id: u64, allow_local: bool, previous: ?u64) ?u64 {
+        const group = self.groups.get(group_id) orelse return null;
+        if (!allow_local and std.mem.indexOfScalar(u64, group.placement_nodes.items, local_node_id) != null) return null;
+        var fallback: ?u64 = null;
+        var successor: ?u64 = null;
+        var preferred: ?u64 = null;
+        for (group.forward_candidates.items) |node_id| {
+            if (node_id == local_node_id) continue;
+            if (group.forward_leader == node_id) preferred = node_id;
+            if (fallback == null or node_id < fallback.?) fallback = node_id;
+            if (previous) |prior| if (node_id > prior and (successor == null or node_id < successor.?)) {
+                successor = node_id;
+            };
+        }
+        if (preferred != null and preferred != previous) return preferred;
+        return successor orelse fallback;
     }
 
     fn nodeUri(self: *const ControlReadGeneration, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
@@ -41290,6 +41320,15 @@ fn consumerTests() type {
                         peers.readable(77, intent.record.local_node_id),
                     );
                     try std.testing.expect((try peers.nodeUri(alloc, 3)) == null);
+                    // Forwarding eligibility differs from read eligibility.
+                    // Compare every relocation state and rotation against the
+                    // original per-inventory rule using only the indexed group.
+                    for ([_]u64{ 0, 1, 2, 3 }) |local| for ([_]?u64{ null, 1, 2, 3 }) |previous| for ([_]bool{ false, true }) |allow_local| {
+                        try std.testing.expectEqual(DataServer.remoteRaftBatchPlacementNode(77, local, 2, &intents, allow_local, previous), peers.placementTarget(77, local, allow_local, previous));
+                    };
+                    const forwarding_uri = (try peers.forwardingUri(alloc, 3)).?;
+                    defer alloc.free(forwarding_uri);
+                    try std.testing.expectEqualStrings("http://dead", forwarding_uri);
                 }
             }
             intents[1].serving_state = .serving;
@@ -41324,6 +41363,30 @@ fn consumerTests() type {
             second_reader.release();
             var server: DataServer = undefined;
             server.data_raft = null;
+            server.backend_runtime = null;
+            server.remote_metadata = &source;
+            const forwarding_clone_count = source.test_faults.snapshot_result_clones;
+            // The production preflight only needs peer freshness and a control
+            // wake. A host sentinel is never dereferenced by this path.
+            var host_sentinel: antfly.raft.ManagedHttpHostService = undefined;
+            server.data_raft = &host_sentinel;
+            server.data_raft_metadata_sync_requested = .init(false);
+            try server.refreshDataRaftMetadataForBatchWithBudget(source.awakeNs() + std.time.ns_per_s, null);
+            try std.testing.expect(server.data_raft_metadata_sync_requested.load(.acquire));
+            try std.testing.expectEqual(forwarding_clone_count, source.test_faults.snapshot_result_clones);
+            server.data_raft_metadata_sync_requested.store(false, .release);
+            try std.testing.expectError(error.Timeout, server.refreshDataRaftMetadataForBatchWithBudget(0, null));
+            var canceled_preflight: antfly.raft.transport.http_common.RequestCancellation = .{};
+            canceled_preflight.cancel();
+            try std.testing.expectError(error.Cancelled, server.refreshDataRaftMetadataForBatchWithBudget(source.awakeNs() + std.time.ns_per_s, &canceled_preflight));
+            try std.testing.expect(!server.data_raft_metadata_sync_requested.load(.acquire));
+            server.data_raft = null;
+            for ([_]DataRaftMutationDiscovery{ .catalog, .cached }) |discovery| {
+                const endpoint = (try server.dataApiUriForNode(alloc, 2, .{ .discovery = discovery }, source.awakeNs() + std.time.ns_per_s)).?;
+                defer alloc.free(endpoint);
+                try std.testing.expectEqualStrings("http://new", endpoint);
+                try std.testing.expectEqual(forwarding_clone_count, source.test_faults.snapshot_result_clones);
+            }
             var pinned: DataServer.PinnedReadPeerRouter = .{ .server = &server, .peers = retained };
             var route = (try antfly.public_api.table_router.resolveGroupRoute(alloc, undefined, pinned.router(), 77, .prefer_leader)).?;
             defer route.deinit(alloc);
@@ -41347,6 +41410,10 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("http://restarted", latest.nodes.get(2).?);
             try std.testing.expectEqualStrings("http://new", retained.nodes.get(2).?);
             source.invalidateCache();
+            const pinned_forwarding_uri = (try retained.forwardingUri(alloc, 2)).?;
+            defer alloc.free(pinned_forwarding_uri);
+            try std.testing.expectEqualStrings("http://new", pinned_forwarding_uri);
+
             try std.testing.expect(source.control_read_generation == null);
             try std.testing.expectEqualStrings("http://restarted", latest.nodes.get(2).?);
             const clone_count = source.test_faults.snapshot_result_clones;
@@ -51243,7 +51310,18 @@ fn implementationTests() type {
                     try virtual_io.scheduler().enumerateReady(&enabled, alloc);
                     try enabled.canonicalize();
                     if (enabled.items.items.len == 0) return error.VoprForwardAdmissionDeadlock;
-                    try virtual_io.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+                    // This is a fair-service assertion, not an adversarial
+                    // campaign: run ready tasks before advancing time. Hash
+                    // ordering can otherwise let virtual time pass a caller's
+                    // deadline while the lease-release task is still runnable.
+                    var next = enabled.items.items[0].id;
+                    for (enabled.items.items) |candidate| {
+                        if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
+                            next = candidate.id;
+                            break;
+                        }
+                    }
+                    try virtual_io.scheduler().executeReady(next, &events, alloc);
                 }
                 try std.testing.expectEqual(@as(usize, 0), active);
                 for (workers[0..worker_count]) |worker| {
