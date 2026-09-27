@@ -1,0 +1,1650 @@
+{
+  "version": 1,
+  "source": "CI run 36260644890; ordinary process-result gaps (includes adjacent teardown), recovery pytest phase totals. Seed estimates only; subsequent runs use measured phase totals.",
+  "tests": {
+    "e2e/antfly/test_aggregations.py::test_aggregation_full_result_budget": {
+      "seconds": 2.043,
+      "samples": 1
+    },
+    "e2e/antfly/test_aggregations.py::test_aggregation_pages_cover_all_matches[1]": {
+      "seconds": 1.993,
+      "samples": 1
+    },
+    "e2e/antfly/test_aggregations.py::test_aggregation_pages_cover_all_matches[3]": {
+      "seconds": 3.684,
+      "samples": 1
+    },
+    "e2e/antfly/test_aggregations.py::test_aggregations_remain_exact_during_concurrent_inserts": {
+      "seconds": 8.172,
+      "samples": 1
+    },
+    "e2e/antfly/test_aggregations.py::test_hybrid_aggregation_domain[1]": {
+      "seconds": 9.399,
+      "samples": 1
+    },
+    "e2e/antfly/test_aggregations.py::test_hybrid_aggregation_domain[3]": {
+      "seconds": 6.234,
+      "samples": 1
+    },
+    "e2e/antfly/test_aggregations.py::test_vector_aggregation_budget_counts_windows_not_index": {
+      "seconds": 7.206,
+      "samples": 1
+    },
+    "e2e/antfly/test_artifacts.py::test_adding_artifact_embedding_index_preserves_populated_full_text_across_restarts": {
+      "seconds": 6.997,
+      "samples": 1
+    },
+    "e2e/antfly/test_artifacts.py::test_artifact_backed_chunk_embeddings_are_semantic_searchable": {
+      "seconds": 4.433,
+      "samples": 1
+    },
+    "e2e/antfly/test_artifacts.py::test_artifact_backed_embedding_table_provisions_atomically": {
+      "seconds": 6.347,
+      "samples": 1
+    },
+    "e2e/antfly/test_artifacts.py::test_artifact_coverage_terminal_outcomes_by_policy_after_restart": {
+      "seconds": 17.831,
+      "samples": 1
+    },
+    "e2e/antfly/test_artifacts.py::test_artifact_full_text_chunks_remain_with_parents_across_three_shards": {
+      "seconds": 3.88,
+      "samples": 1
+    },
+    "e2e/antfly/test_artifacts.py::test_document_artifact_manifest_and_reprocess_job_e2e": {
+      "seconds": 3.078,
+      "samples": 1
+    },
+    "e2e/antfly/test_artifacts.py::test_embedding_producer_registry_rejects_orphans_and_owner_mismatches": {
+      "seconds": 6.67,
+      "samples": 1
+    },
+    "e2e/antfly/test_artifacts.py::test_executable_embedding_artifact_producer_survives_restart[primary_lsm]": {
+      "seconds": 4.706,
+      "samples": 1
+    },
+    "e2e/antfly/test_artifacts.py::test_executable_embedding_artifact_producer_survives_restart[vector_store]": {
+      "seconds": 6.392,
+      "samples": 1
+    },
+    "e2e/antfly/test_artifacts.py::test_pdf_auto_ocr_only_renders_pages_without_usable_embedded_text_e2e": {
+      "seconds": 2.481,
+      "samples": 1
+    },
+    "e2e/antfly/test_artifacts.py::test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e": {
+      "seconds": 2.342,
+      "samples": 1
+    },
+    "e2e/antfly/test_auth.py::test_standalone_auth_api_keys_follow_owner_permissions": {
+      "seconds": 7.732,
+      "samples": 1
+    },
+    "e2e/antfly/test_auth.py::test_standalone_auth_defaults_to_local_admin_user": {
+      "seconds": 6.058,
+      "samples": 1
+    },
+    "e2e/antfly/test_auth.py::test_standalone_auth_enforces_row_filters_on_lookup_and_scan": {
+      "seconds": 7.367,
+      "samples": 1
+    },
+    "e2e/antfly/test_auth.py::test_standalone_auth_user_and_api_key_flow": {
+      "seconds": 6.605,
+      "samples": 1
+    },
+    "e2e/antfly/test_auth.py::test_stateful_auth_defaults_to_local_admin_user": {
+      "seconds": 1.51,
+      "samples": 1
+    },
+    "e2e/antfly/test_auth.py::test_stateful_auth_enforces_row_filters_on_lookup_and_scan": {
+      "seconds": 3.043,
+      "samples": 1
+    },
+    "e2e/antfly/test_auth.py::test_stateful_auth_enforces_table_permissions": {
+      "seconds": 3.217,
+      "samples": 1
+    },
+    "e2e/antfly/test_auth.py::test_system_catalog_exact_star_grant_is_not_global": {
+      "seconds": 10.231,
+      "samples": 1
+    },
+    "e2e/antfly/test_auth.py::test_system_catalog_scoped_permissions_and_row_filters[auth_api]": {
+      "seconds": 9.722,
+      "samples": 1
+    },
+    "e2e/antfly/test_auth.py::test_system_catalog_scoped_permissions_and_row_filters[stateful_auth_api]": {
+      "seconds": 5.279,
+      "samples": 1
+    },
+    "e2e/antfly/test_autoschema.py::test_label_routed_autograph_promotes_events_and_entities": {
+      "seconds": 11.026,
+      "samples": 1
+    },
+    "e2e/antfly/test_autoschema.py::test_overlapping_labeled_resolvers_rejected_at_admission": {
+      "seconds": 5.578,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_backup_restore_request_validation": {
+      "seconds": 1.366,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_cluster_backup_restore_round_trip": {
+      "seconds": 9.698,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_cluster_restore_modes": {
+      "seconds": 10.515,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_cluster_restore_modes_with_concurrent_observers": {
+      "seconds": 13.14,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_list_backups_empty_location": {
+      "seconds": 1.045,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_partial_cluster_backup_is_not_published_and_can_retry[native]": {
+      "seconds": 11.028,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_partial_cluster_backup_is_not_published_and_can_retry[portable]": {
+      "seconds": 10.91,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_restore_missing_backup_returns_bad_request": {
+      "seconds": 1.739,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_table_backup_restore_round_trip": {
+      "seconds": 5.641,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_table_backup_restore_round_trip_managed_chunked_semantic[native]": {
+      "seconds": 11.976,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_table_backup_restore_round_trip_managed_chunked_semantic[portable]": {
+      "seconds": 11.692,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_three_by_three_automatically_admits_online_document_merge[None]": {
+      "seconds": 60.01,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_three_by_three_automatically_admits_online_document_merge[True]": {
+      "seconds": 54.21,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_three_by_three_cluster_backup_restore_through_metadata_public_api": {
+      "seconds": 79.0,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_three_by_three_mixed_relational_restore_survives_coordinator_and_owner_crash[native]": {
+      "seconds": 118.2,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_three_by_three_mixed_relational_restore_survives_coordinator_and_owner_crash[portable]": {
+      "seconds": 148.0,
+      "samples": 1
+    },
+    "e2e/antfly/test_backup_restore.py::test_three_by_three_online_merge_explicitly_disabled[False]": {
+      "seconds": 39.69,
+      "samples": 1
+    },
+    "e2e/antfly/test_catalog_resilience.py::test_catalog_protocol_activation_survives_leader_failure": {
+      "seconds": 11.176,
+      "samples": 1
+    },
+    "e2e/antfly/test_catalog_resilience.py::test_concurrent_tenant_schema_migrations_preserve_documents": {
+      "seconds": 37.052,
+      "samples": 1
+    },
+    "e2e/antfly/test_catalog_resilience.py::test_large_inventory_uses_bounded_control_and_diagnostic_transfers": {
+      "seconds": 34.398,
+      "samples": 1
+    },
+    "e2e/antfly/test_catalog_resilience.py::test_report_baseline_fragments_large_group_and_batches_neighbors": {
+      "seconds": 16.062,
+      "samples": 1
+    },
+    "e2e/antfly/test_catalog_resilience.py::test_report_baseline_resumes_after_leader_failure_and_keeps_partial_inventory_invisible": {
+      "seconds": 13.019,
+      "samples": 1
+    },
+    "e2e/antfly/test_catalog_resilience.py::test_schema_progress_batches_validate_apply_and_replay": {
+      "seconds": 6.359,
+      "samples": 1
+    },
+    "e2e/antfly/test_catalog_resilience.py::test_skewed_schema_migrations_keep_foreground_traffic_available": {
+      "seconds": 47.003,
+      "samples": 1
+    },
+    "e2e/antfly/test_catalog_resilience.py::test_telemetry_batches_do_not_issue_raft_read_barriers": {
+      "seconds": 6.335,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_catalog_cli_keeps_scope_separate_from_literal_table_name": {
+      "seconds": 1.545,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_cli_index_wait_survives_retry_exhaustion_and_restart": {
+      "seconds": 69.827,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_cli_inline_create_load_wait_query_image_and_rag_pipeline": {
+      "seconds": 17.529,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_client_commands_reject_unknown_options_before_network_work[args0]": {
+      "seconds": 0.276,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_client_commands_reject_unknown_options_before_network_work[args1]": {
+      "seconds": 0.278,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_client_commands_reject_unknown_options_before_network_work[args2]": {
+      "seconds": 0.324,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_client_commands_reject_unknown_options_before_network_work[args3]": {
+      "seconds": 0.29,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_client_commands_reject_unknown_options_before_network_work[args4]": {
+      "seconds": 0.328,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_insert_lookup_delete": {
+      "seconds": 0.883,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_internal_metadata_status": {
+      "seconds": 0.274,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_query_full_text_search": {
+      "seconds": 0.367,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_semantic_preflight_reports_missing_selected_index": {
+      "seconds": 0.286,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_semantic_query_requires_table_before_network_work": {
+      "seconds": 1.185,
+      "samples": 1
+    },
+    "e2e/antfly/test_cli.py::test_table_create_list_get_drop": {
+      "seconds": 1.328,
+      "samples": 1
+    },
+    "e2e/antfly/test_distributed_status.py::test_non_host_api_reports_remote_index_status_from_metadata_heartbeat": {
+      "seconds": 3.952,
+      "samples": 1
+    },
+    "e2e/antfly/test_e2e_scheduler.py::TestFixtureResourceClassScope::test_first_method_uses_class_group": {
+      "seconds": 0.284,
+      "samples": 1
+    },
+    "e2e/antfly/test_e2e_scheduler.py::TestFixtureResourceClassScope::test_second_method_uses_same_class_group": {
+      "seconds": 0.385,
+      "samples": 1
+    },
+    "e2e/antfly/test_e2e_scheduler.py::test_fixture_resource_declaration_is_applied_to_consuming_test": {
+      "seconds": 0.496,
+      "samples": 1
+    },
+    "e2e/antfly/test_e2e_scheduler.py::test_fixture_resource_declaration_preserves_fixture_scope": {
+      "seconds": 0.472,
+      "samples": 1
+    },
+    "e2e/antfly/test_e2e_scheduler.py::test_real_class_scoped_fixture_outside_class_uses_test_group": {
+      "seconds": 0.472,
+      "samples": 1
+    },
+    "e2e/antfly/test_e2e_scheduler.py::test_real_effective_parameter_scope_is_used[None]": {
+      "seconds": 0.453,
+      "samples": 1
+    },
+    "e2e/antfly/test_exact_sort.py::test_public_exact_sort_declares_native_coverage_and_shorthand_fields_are_actionable": {
+      "seconds": 3.555,
+      "samples": 1
+    },
+    "e2e/antfly/test_graph.py::test_graph_neighbors_traverse_and_shortest_path": {
+      "seconds": 0.294,
+      "samples": 1
+    },
+    "e2e/antfly/test_graph.py::test_multi_batch_graph_push_preserves_boundary_error_and_existing_edges": {
+      "seconds": 1.405,
+      "samples": 1
+    },
+    "e2e/antfly/test_graph.py::test_serverless_filtered_pagerank_uses_selected_topology": {
+      "seconds": 2.56,
+      "samples": 1
+    },
+    "e2e/antfly/test_graph.py::test_serverless_graph_pattern_optional_inequality_and_antijoin": {
+      "seconds": 0.438,
+      "samples": 1
+    },
+    "e2e/antfly/test_graph.py::test_serverless_graph_pattern_two_hop_and_documents": {
+      "seconds": 0.295,
+      "samples": 1
+    },
+    "e2e/antfly/test_graph.py::test_stateful_graph_conjunctive_optional_negative_and_aggregates": {
+      "seconds": 1.402,
+      "samples": 1
+    },
+    "e2e/antfly/test_graph.py::test_stateful_graph_field_edges_extract_and_update": {
+      "seconds": 2.093,
+      "samples": 1
+    },
+    "e2e/antfly/test_graph.py::test_stateful_graph_lsqb_q1_q9_exact_conformance": {
+      "seconds": 3.414,
+      "samples": 1
+    },
+    "e2e/antfly/test_graph.py::test_stateful_graph_neighbors_traverse_and_shortest_path": {
+      "seconds": 2.198,
+      "samples": 1
+    },
+    "e2e/antfly/test_graph.py::test_stateful_graph_pattern_diamond_and_edge_type_filter": {
+      "seconds": 1.217,
+      "samples": 1
+    },
+    "e2e/antfly/test_graph.py::test_stateful_graph_pattern_max_results_limit": {
+      "seconds": 2.884,
+      "samples": 1
+    },
+    "e2e/antfly/test_graph.py::test_stateful_graph_pattern_two_hop_and_documents": {
+      "seconds": 1.507,
+      "samples": 1
+    },
+    "e2e/antfly/test_graph.py::test_stateful_graph_pattern_variable_length_and_cycle": {
+      "seconds": 1.251,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_concurrent_insert_delete_publications_match_search_results": {
+      "seconds": 4.939,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_missing_table_index_list_fails_without_status_retry_delay": {
+      "seconds": 5.273,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_mutable_table_chunker_full_text_index_persists_chunks": {
+      "seconds": 3.345,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_mutable_table_chunker_without_full_text_index_does_not_persist_chunks": {
+      "seconds": 3.601,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_ready_index_status_uses_current_milestones_and_v020_fallback": {
+      "seconds": 0.001,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_serverless_build_status_reports_head_actions_for_text_only_updates": {
+      "seconds": 0.352,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_serverless_chunked_dense_index_reports_chunk_embeddings_blocker": {
+      "seconds": 0.437,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_serverless_chunker_full_text_index_reports_publication_status": {
+      "seconds": 0.723,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_serverless_named_embedding_indexes_report_publication_actions": {
+      "seconds": 0.494,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_serverless_same_name_dense_index_update_republishes_head": {
+      "seconds": 0.546,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_serverless_schema_migration_republishes_versioned_full_text_indexes": {
+      "seconds": 0.484,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_back_to_back_external_embedding_indexes_admit_immediate_batch": {
+      "seconds": 5.459,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_drop_tables_with_pending_enrichment_preserves_unrelated_owner": {
+      "seconds": 5.296,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_query": {
+      "seconds": 4.292,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_managed_algebraic_generation_rebuild_catches_up_and_reopens": {
+      "seconds": 9.659,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrichment_without_recreate": {
+      "seconds": 4.699,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_managed_embeddings_backfill_resumes_after_process_restart": {
+      "seconds": 6.932,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_artifact": {
+      "seconds": 6.837,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited_enrichment": {
+      "seconds": 7.579,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_managed_embeddings_provider_pacing_avoids_rate_limit_bursts[completion]": {
+      "seconds": 4.338,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_managed_embeddings_provider_pacing_avoids_rate_limit_bursts[legacy]": {
+      "seconds": 4.231,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables": {
+      "seconds": 5.507,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_managed_embeddings_replay_tail_converges_without_probe_write": {
+      "seconds": 7.334,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_after_rate_limit": {
+      "seconds": 15.484,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_table_accepts_public_full_text_create_index": {
+      "seconds": 1.055,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_table_cleans_document_full_text_inline_enrichments_on_index_delete": {
+      "seconds": 2.274,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_stateful_table_registers_public_artifact_enrichment_for_default_full_text": {
+      "seconds": 1.715,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_table_chunker_full_text_index_routes_template_chunks[serverless]": {
+      "seconds": 60.329,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_table_chunker_full_text_index_routes_template_chunks[stateful]": {
+      "seconds": 4.489,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_table_create_table_preserves_user_full_text_index_entries[serverless]": {
+      "seconds": 0.263,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_table_create_table_preserves_user_full_text_index_entries[stateful]": {
+      "seconds": 0.695,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_table_create_table_reserves_full_text_index_names[serverless]": {
+      "seconds": 0.27,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_table_create_table_reserves_full_text_index_names[stateful]": {
+      "seconds": 0.262,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_table_index_lifecycle[serverless]": {
+      "seconds": 1.586,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_table_index_lifecycle[stateful]": {
+      "seconds": 0.79,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_table_rejects_non_go_full_text_chunk_config[serverless]": {
+      "seconds": 0.264,
+      "samples": 1
+    },
+    "e2e/antfly/test_index_lifecycle.py::test_table_rejects_non_go_full_text_chunk_config[stateful]": {
+      "seconds": 0.278,
+      "samples": 1
+    },
+    "e2e/antfly/test_joins.py::test_distributed_join_still_works_after_standalone_restart": {
+      "seconds": 6.973,
+      "samples": 1
+    },
+    "e2e/antfly/test_joins.py::test_distributed_right_join_returns_unmatched_right_rows": {
+      "seconds": 5.004,
+      "samples": 1
+    },
+    "e2e/antfly/test_joins.py::test_distributed_shuffle_join_uses_antfly_to_antfly_execution": {
+      "seconds": 5.883,
+      "samples": 1
+    },
+    "e2e/antfly/test_linear_merge.py::test_linear_merge_is_idempotent_for_unchanged_docs": {
+      "seconds": 1.613,
+      "samples": 1
+    },
+    "e2e/antfly/test_metadata_mutation_discovery.py::test_backup_restore_discovers_leader_past_stalled_topology": {
+      "seconds": 66.75,
+      "samples": 1
+    },
+    "e2e/antfly/test_metadata_mutation_discovery.py::test_catalog_mutations_do_not_wait_for_diagnostic_status[all]": {
+      "seconds": 7.87,
+      "samples": 1
+    },
+    "e2e/antfly/test_online_merge_recovery.py::test_online_fk_merge_preserves_shadow_claims_and_retained_references[release-reply_loss]": {
+      "seconds": 226.49,
+      "samples": 1
+    },
+    "e2e/antfly/test_online_merge_recovery.py::test_online_fk_merge_preserves_shadow_claims_and_retained_references[snapshot-child_owner]": {
+      "seconds": 353.78,
+      "samples": 1
+    },
+    "e2e/antfly/test_online_merge_recovery.py::test_online_fk_merge_preserves_shadow_claims_and_retained_references[snapshot-owner]": {
+      "seconds": 295.75,
+      "samples": 1
+    },
+    "e2e/antfly/test_online_merge_recovery.py::test_online_merge_recovers_after_owner_link_outage_and_crash[finalize-owner]": {
+      "seconds": 66.56,
+      "samples": 1
+    },
+    "e2e/antfly/test_online_merge_recovery.py::test_online_merge_recovers_after_owner_link_outage_and_crash[publication-coordinator]": {
+      "seconds": 60.59,
+      "samples": 1
+    },
+    "e2e/antfly/test_online_merge_recovery.py::test_online_merge_recovers_after_owner_link_outage_and_crash[release-coordinator]": {
+      "seconds": 56.09,
+      "samples": 1
+    },
+    "e2e/antfly/test_online_merge_recovery.py::test_online_merge_recovers_after_owner_link_outage_and_crash[release-reply_loss]": {
+      "seconds": 64.61,
+      "samples": 1
+    },
+    "e2e/antfly/test_online_merge_recovery.py::test_online_merge_recovers_after_owner_link_outage_and_crash[snapshot-owner]": {
+      "seconds": 88.82,
+      "samples": 1
+    },
+    "e2e/antfly/test_online_merge_recovery.py::test_online_merge_recovers_after_owner_link_outage_and_crash[snapshot-raft_quorum]": {
+      "seconds": 58.69,
+      "samples": 1
+    },
+    "e2e/antfly/test_query_deadlines.py::test_graph_timeout_budget_survives_worker_and_catalog[1]": {
+      "seconds": 2.463,
+      "samples": 1
+    },
+    "e2e/antfly/test_query_deadlines.py::test_graph_timeout_budget_survives_worker_and_catalog[3]": {
+      "seconds": 4.377,
+      "samples": 1
+    },
+    "e2e/antfly/test_query_deadlines.py::test_join_timeout_budget_survives_coordinator_and_workers": {
+      "seconds": 4.693,
+      "samples": 1
+    },
+    "e2e/antfly/test_query_deadlines.py::test_query_timeout_budget_survives_routing[1]": {
+      "seconds": 1.77,
+      "samples": 1
+    },
+    "e2e/antfly/test_query_deadlines.py::test_query_timeout_budget_survives_routing[2]": {
+      "seconds": 1.888,
+      "samples": 1
+    },
+    "e2e/antfly/test_query_deadlines.py::test_semantic_timeout_budget_survives_embedding_cache": {
+      "seconds": 3.367,
+      "samples": 1
+    },
+    "e2e/antfly/test_query_results.py::test_query_empty_projection_omits_stored_source[1]": {
+      "seconds": 0.673,
+      "samples": 1
+    },
+    "e2e/antfly/test_query_results.py::test_query_empty_projection_omits_stored_source[2]": {
+      "seconds": 1.083,
+      "samples": 1
+    },
+    "e2e/antfly/test_query_results.py::test_query_pruning_is_independent_of_shard_count[1]": {
+      "seconds": 1.736,
+      "samples": 1
+    },
+    "e2e/antfly/test_query_results.py::test_query_pruning_is_independent_of_shard_count[2]": {
+      "seconds": 1.148,
+      "samples": 1
+    },
+    "e2e/antfly/test_query_string.py::test_bleve_query_string_full_text_and_filter": {
+      "seconds": 0.762,
+      "samples": 1
+    },
+    "e2e/antfly/test_query_string.py::test_direct_full_text_match_and_prefix": {
+      "seconds": 0.722,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_inline_managed_index_create_load_ready_query_pipeline": {
+      "seconds": 2.353,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_live_index_activation_preempts_an_active_enrichment_quantum": {
+      "seconds": 1.897,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_progressive_index_is_semantically_queryable_before_full_coverage": {
+      "seconds": 13.768,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_progressive_publication_remains_queryable_across_process_restart": {
+      "seconds": 16.085,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_hybrid_quickstart_pipeline": {
+      "seconds": 2.463,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_hybrid_quickstart_supports_weighted_merge_and_template_reranking": {
+      "seconds": 2.471,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_managed_antfly_chunked_semantic_full_index_pipeline": {
+      "seconds": 2.568,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_managed_chunked_semantic_full_index_pipeline": {
+      "seconds": 3.021,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_managed_semantic_full_index_pipeline": {
+      "seconds": 3.639,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_managed_semantic_hybrid_quickstart_pipeline": {
+      "seconds": 2.355,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_quickstart_default_field_searches_dynamic_strings[analyzed-match]": {
+      "seconds": 1.032,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_quickstart_default_field_searches_dynamic_strings[match]": {
+      "seconds": 0.966,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_quickstart_default_field_searches_dynamic_strings[prefix]": {
+      "seconds": 0.888,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_quickstart_default_field_searches_dynamic_strings[query-string]": {
+      "seconds": 1.717,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_quickstart_default_field_searches_dynamic_strings[term]": {
+      "seconds": 0.724,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_quickstart_query_string_boolean_controls": {
+      "seconds": 3.005,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_quickstart_rag_stream_requires_evidence": {
+      "seconds": 0.933,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_public_search_fields_projection": {
+      "seconds": 0.43,
+      "samples": 1
+    },
+    "e2e/antfly/test_quickstart.py::test_text_quickstart_and_document_artifact": {
+      "seconds": 0.277,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_exact_numbers_across_mutation_and_session[-9223372036854775808.0--9223372036854775808-False]": {
+      "seconds": 7.261,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_exact_numbers_across_mutation_and_session[-9223372036854775808.0--9223372036854775808-True]": {
+      "seconds": 7.236,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_exact_numbers_across_mutation_and_session[9007199254740993.0-9007199254740993-False]": {
+      "seconds": 7.372,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_exact_numbers_across_mutation_and_session[9007199254740993.0-9007199254740993-True]": {
+      "seconds": 7.282,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_exact_numbers_across_mutation_and_session[9223372036854775807e0-9223372036854775807-False]": {
+      "seconds": 7.222,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_exact_numbers_across_mutation_and_session[9223372036854775807e0-9223372036854775807-True]": {
+      "seconds": 7.338,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_fk_binding_preserves_exact_schema_defaults[-9223372036854775808.0-False]": {
+      "seconds": 7.298,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_fk_binding_preserves_exact_schema_defaults[-9223372036854775808.0-True]": {
+      "seconds": 7.247,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_fk_binding_preserves_exact_schema_defaults[9007199254740993.0-False]": {
+      "seconds": 7.276,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_fk_binding_preserves_exact_schema_defaults[9007199254740993.0-True]": {
+      "seconds": 7.46,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_fk_binding_preserves_exact_schema_defaults[9223372036854775807e0-False]": {
+      "seconds": 7.243,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_fk_binding_preserves_exact_schema_defaults[9223372036854775807e0-True]": {
+      "seconds": 7.359,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_session_authorizes_effects_not_private_witnesses[cascade-None]": {
+      "seconds": 8.007,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_session_authorizes_effects_not_private_witnesses[cascade-read]": {
+      "seconds": 7.843,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_session_authorizes_effects_not_private_witnesses[cascade-write]": {
+      "seconds": 8.25,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_session_authorizes_effects_not_private_witnesses[no_action-None]": {
+      "seconds": 8.247,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_session_authorizes_effects_not_private_witnesses[no_action-read]": {
+      "seconds": 8.476,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_boundaries.py::test_relational_session_authorizes_effects_not_private_witnesses[no_action-write]": {
+      "seconds": 7.99,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_recovery.py::test_fk_cascade_recovers_claims_references_and_rows[transaction_resolve-owner]": {
+      "seconds": 75.16,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_recovery.py::test_fk_cascade_recovers_claims_references_and_rows[transaction_resolve-reply_loss]": {
+      "seconds": 78.21,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_recovery.py::test_schema_rewrite_recovers_dependency_cohort[publication-coordinator]": {
+      "seconds": 218.16,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_recovery.py::test_schema_rewrite_recovers_dependency_cohort[publication-reply_loss]": {
+      "seconds": 211.14,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_cascade_and_unrelated_child_update_same_statement": {
+      "seconds": 8.178,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_conflicting_cascade_has_client_conflict_status[False]": {
+      "seconds": 8.783,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_conflicting_cascade_has_client_conflict_status[True]": {
+      "seconds": 8.519,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_equivalent_cascades[False]": {
+      "seconds": 9.153,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_equivalent_cascades[True]": {
+      "seconds": 8.804,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_equivalent_datetime_cascades[False]": {
+      "seconds": 8.39,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_equivalent_datetime_cascades[True]": {
+      "seconds": 8.649,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_self_referencing_cascade_preserves_unchanged_fk": {
+      "seconds": 6.929,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_session_delete_then_reinsert_keeps_live_observation": {
+      "seconds": 1.891,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_session_rechecks_renamed_resource_authority[False]": {
+      "seconds": 7.684,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_session_rechecks_renamed_resource_authority[True]": {
+      "seconds": 7.881,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_session_snapshot_not_disclosed_after_rename": {
+      "seconds": 7.186,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_staged_cascade_rejects_concurrent_child_edit[False]": {
+      "seconds": 2.514,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_integrity_regressions.py::test_staged_cascade_rejects_concurrent_child_edit[True]": {
+      "seconds": 3.239,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_lifecycle.py::test_cascade_session_keeps_logical_authorization[admin]": {
+      "seconds": 8.363,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_lifecycle.py::test_cascade_session_keeps_logical_authorization[both]": {
+      "seconds": 8.827,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_lifecycle.py::test_cascade_session_keeps_logical_authorization[parent_only]": {
+      "seconds": 8.052,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_lifecycle.py::test_check_only_activation_repair_and_retry": {
+      "seconds": 4.073,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_lifecycle.py::test_constraint_retirement_completes_and_survives_restart[False]": {
+      "seconds": 11.425,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_lifecycle.py::test_constraint_retirement_completes_and_survives_restart[True]": {
+      "seconds": 11.012,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_lifecycle.py::test_retirement_preserves_exact_schema_numbers[1.0-1-True]": {
+      "seconds": 1.552,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_lifecycle.py::test_retirement_preserves_exact_schema_numbers[1.0-1.0-True]": {
+      "seconds": 2.138,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_lifecycle.py::test_retirement_preserves_exact_schema_numbers[9007199254740993.0-9007199254740992.0-False]": {
+      "seconds": 1.627,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_lifecycle.py::test_retirement_preserves_exact_schema_numbers[9007199254740993.0-90071992547409930e-1-True]": {
+      "seconds": 1.616,
+      "samples": 1
+    },
+    "e2e/antfly/test_relational_sessions.py::test_constrained_sessions_defer_reject_and_rollback_across_owners": {
+      "seconds": 88.76,
+      "samples": 1
+    },
+    "e2e/antfly/test_resolution.py::test_multinode_autograph_deleted_target_does_not_fail_surviving_graph": {
+      "seconds": 17.06,
+      "samples": 1
+    },
+    "e2e/antfly/test_resolution.py::test_multinode_autograph_recovers_after_data_restart": {
+      "seconds": 22.187,
+      "samples": 1
+    },
+    "e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities[exact_key]": {
+      "seconds": 17.051,
+      "samples": 1
+    },
+    "e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities[prefix]": {
+      "seconds": 10.851,
+      "samples": 1
+    },
+    "e2e/antfly/test_resolution.py::test_multinode_exact_candidates_follow_redirects_across_entity_shards": {
+      "seconds": 24.116,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_bounded_agentic_can_decompose_queries[match-text]": {
+      "seconds": 0.867,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_bounded_agentic_can_decompose_queries[query-syntax]": {
+      "seconds": 0.84,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_bounded_agentic_can_fallback_after_a_weak_first_pass": {
+      "seconds": 2.732,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_bounded_agentic_can_fallback_after_a_weak_multi_hit_first_pass": {
+      "seconds": 2.087,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_bounded_agentic_can_fallback_after_an_empty_first_pass": {
+      "seconds": 1.001,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_bounded_agentic_can_probe_ambiguous_candidates": {
+      "seconds": 2.776,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_bounded_agentic_mode": {
+      "seconds": 1.689,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_bounded_agentic_selects_best_query": {
+      "seconds": 0.765,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_can_ask_to_broaden_after_a_user_selected_query_misses": {
+      "seconds": 0.764,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_can_require_clarification_and_continue": {
+      "seconds": 0.953,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_classification_can_decompose_queries": {
+      "seconds": 0.861,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_classification_confidence_followup": {
+      "seconds": 0.773,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_generation_step": {
+      "seconds": 1.038,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_inline_eval_step": {
+      "seconds": 1.027,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_pipeline_query": {
+      "seconds": 1.747,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_rejects_tree_search_without_start_nodes_or_seed_hits": {
+      "seconds": 0.957,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_semantic_and_hybrid_queries": {
+      "seconds": 2.947,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_streaming_clarification_sse": {
+      "seconds": 0.899,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_streaming_decompose_progress": {
+      "seconds": 1.194,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_streaming_error_sse": {
+      "seconds": 0.33,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_streaming_eval_sse": {
+      "seconds": 1.026,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_streaming_fallback_progress": {
+      "seconds": 1.043,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_streaming_probe_progress": {
+      "seconds": 2.388,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_streaming_sse": {
+      "seconds": 0.83,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_streaming_tree_progress": {
+      "seconds": 1.897,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_tree_search_from_roots": {
+      "seconds": 2.328,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_tree_search_generation": {
+      "seconds": 1.926,
+      "samples": 1
+    },
+    "e2e/antfly/test_retrieval.py::test_retrieval_agent_tree_search_pipeline": {
+      "seconds": 1.511,
+      "samples": 1
+    },
+    "e2e/antfly/test_scaling.py::test_autoscaling_adds_data_node_and_assigns_placements": {
+      "seconds": 11.747,
+      "samples": 1
+    },
+    "e2e/antfly/test_scaling.py::test_autoscaling_drains_data_node_and_replaces_placements": {
+      "seconds": 17.945,
+      "samples": 1
+    },
+    "e2e/antfly/test_scaling.py::test_autoscaling_drains_stops_and_finalizes_data_node_without_losing_reads": {
+      "seconds": 16.769,
+      "samples": 1
+    },
+    "e2e/antfly/test_scaling.py::test_autoscaling_finalizes_shard_split_from_size_threshold": {
+      "seconds": 15.7,
+      "samples": 1
+    },
+    "e2e/antfly/test_scaling.py::test_autoscaling_node_churn_keeps_reads_available": {
+      "seconds": 16.366,
+      "samples": 1
+    },
+    "e2e/antfly/test_scaling.py::test_multinode_cluster_uses_configured_multi_metadata_discovery_and_data_raft_urls": {
+      "seconds": 11.481,
+      "samples": 1
+    },
+    "e2e/antfly/test_scaling.py::test_node_shutdown_before_store_registration_is_durable": {
+      "seconds": 0.776,
+      "samples": 1
+    },
+    "e2e/antfly/test_scaling.py::test_node_shutdown_cancellation_clears_node_and_store_drain_intent": {
+      "seconds": 1.044,
+      "samples": 1
+    },
+    "e2e/antfly/test_scaling.py::test_node_shutdown_preserves_drain_intent_across_healthy_status": {
+      "seconds": 0.995,
+      "samples": 1
+    },
+    "e2e/antfly/test_schema_indexing.py::test_additional_properties_false_rejects_undeclared_fields": {
+      "seconds": 0.87,
+      "samples": 1
+    },
+    "e2e/antfly/test_schema_indexing.py::test_explicit_declarations_win_over_dynamic_indexing[infer_types-True-True]": {
+      "seconds": 0.678,
+      "samples": 1
+    },
+    "e2e/antfly/test_schema_indexing.py::test_explicit_declarations_win_over_dynamic_indexing[true-True-False]": {
+      "seconds": 0.806,
+      "samples": 1
+    },
+    "e2e/antfly/test_schema_indexing.py::test_explicit_declarations_win_over_dynamic_indexing[unset-None-False]": {
+      "seconds": 1.537,
+      "samples": 1
+    },
+    "e2e/antfly/test_schema_migration.py::test_schema_migration_full_text_rebuild": {
+      "seconds": 5.2,
+      "samples": 1
+    },
+    "e2e/antfly/test_secrets.py::test_distributed_secret_follower_failover_revocation_and_outage": {
+      "seconds": 9.192,
+      "samples": 1
+    },
+    "e2e/antfly/test_secrets.py::test_secret_runtime_rotation_restart_and_fallback[distributed]": {
+      "seconds": 9.084,
+      "samples": 1
+    },
+    "e2e/antfly/test_secrets.py::test_secret_runtime_rotation_restart_and_fallback[serverless]": {
+      "seconds": 8.248,
+      "samples": 1
+    },
+    "e2e/antfly/test_secrets.py::test_secret_runtime_rotation_restart_and_fallback[standalone]": {
+      "seconds": 4.546,
+      "samples": 1
+    },
+    "e2e/antfly/test_secrets.py::test_serverless_secret_admin_auth_and_concurrent_writers": {
+      "seconds": 1.578,
+      "samples": 1
+    },
+    "e2e/antfly/test_sparse.py::test_managed_sparse_hybrid_query_with_antfly_embeddings": {
+      "seconds": 3.246,
+      "samples": 1
+    },
+    "e2e/antfly/test_sparse.py::test_named_embedding_queries_use_requested_indexes[serverless]": {
+      "seconds": 0.511,
+      "samples": 1
+    },
+    "e2e/antfly/test_sparse.py::test_named_embedding_queries_use_requested_indexes[stateful]": {
+      "seconds": 5.192,
+      "samples": 1
+    },
+    "e2e/antfly/test_sparse.py::test_semantic_query_embedding_template_supports_remote_text[serverless]": {
+      "seconds": 30.18,
+      "samples": 1
+    },
+    "e2e/antfly/test_sparse.py::test_semantic_query_embedding_template_supports_remote_text[stateful]": {
+      "seconds": 3.683,
+      "samples": 1
+    },
+    "e2e/antfly/test_sparse.py::test_sparse_hybrid_query_rejects_invalid_reranker_config": {
+      "seconds": 1.918,
+      "samples": 1
+    },
+    "e2e/antfly/test_sparse.py::test_sparse_hybrid_query_rejects_invalid_reranker_provider": {
+      "seconds": 2.032,
+      "samples": 1
+    },
+    "e2e/antfly/test_sparse.py::test_sparse_hybrid_query_supports_reranker_and_pruner": {
+      "seconds": 1.812,
+      "samples": 1
+    },
+    "e2e/antfly/test_sparse.py::test_sparse_import_and_hybrid_query_with_external_embeddings": {
+      "seconds": 5.063,
+      "samples": 1
+    },
+    "e2e/antfly/test_standalone_lifecycle.py::test_standalone_drop_drains_pending_enrichment_work": {
+      "seconds": 5.314,
+      "samples": 1
+    },
+    "e2e/antfly/test_standby.py::test_forced_promotion_receipt_records_lossy_runtime_evidence": {
+      "seconds": 1.081,
+      "samples": 1
+    },
+    "e2e/antfly/test_standby.py::test_standby_streams_public_writes_restarts_and_rejects_writes": {
+      "seconds": 9.352,
+      "samples": 1
+    },
+    "e2e/antfly/test_standby_empty_bootstrap.py::test_catalog_authority_survives_crash_and_obsolete_json": {
+      "seconds": 7.303,
+      "samples": 1
+    },
+    "e2e/antfly/test_standby_empty_bootstrap.py::test_catalog_remote_apply_outage_recovers_without_primary_restart": {
+      "seconds": 23.936,
+      "samples": 1
+    },
+    "e2e/antfly/test_standby_empty_bootstrap.py::test_empty_seed_artifact_bootstrap_and_restart": {
+      "seconds": 3.225,
+      "samples": 1
+    },
+    "e2e/antfly/test_standby_empty_bootstrap.py::test_empty_seed_then_first_table_replication_and_fenced_promotion": {
+      "seconds": 13.969,
+      "samples": 1
+    },
+    "e2e/antfly/test_standby_replication_startup.py::test_standby_reconciles_withheld_write_ack_without_replay": {
+      "seconds": 13.088,
+      "samples": 1
+    },
+    "e2e/antfly/test_standby_replication_startup.py::test_standby_waits_for_delayed_first_replication": {
+      "seconds": 10.995,
+      "samples": 1
+    },
+    "e2e/antfly/test_sync_levels.py::test_serverless_enrichment_sync_level_is_accepted_for_managed_materialization": {
+      "seconds": 0.617,
+      "samples": 1
+    },
+    "e2e/antfly/test_sync_levels.py::test_table_full_text_sync_level_makes_text_search_visible[serverless]": {
+      "seconds": 0.304,
+      "samples": 1
+    },
+    "e2e/antfly/test_sync_levels.py::test_table_full_text_sync_level_makes_text_search_visible[stateful]": {
+      "seconds": 1.852,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_cluster_backup_retains_scope_and_literal_names": {
+      "seconds": 9.416,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_concurrent_reads_follow_rename_and_deletion": {
+      "seconds": 2.536,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_constraint_drop_rejection_preserves_durable_identity[False]": {
+      "seconds": 3.738,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_constraint_drop_rejection_preserves_durable_identity[True]": {
+      "seconds": 3.658,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_ddl_burst_recovers_exact_resource_identities": {
+      "seconds": 4.85,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_failures_use_shared_error_contract": {
+      "seconds": 1.192,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_graph_metric_actions_follow_identity_after_rename": {
+      "seconds": 2.145,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_literal_table_names[*]": {
+      "seconds": 3.804,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_literal_table_names[9events]": {
+      "seconds": 1.657,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_literal_table_names[sales/archive]": {
+      "seconds": 1.918,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_literal_table_names[table:legacy]": {
+      "seconds": 1.607,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_literal_table_names[tenant.public.events]": {
+      "seconds": 1.902,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_literal_table_names[xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]": {
+      "seconds": 1.963,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_mutation_results_keep_resource_and_binding_identities": {
+      "seconds": 1.472,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_pagination_preserves_scope_order_and_detects_ddl": {
+      "seconds": 5.141,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_relational_rows_keep_scope_and_identity_after_rename": {
+      "seconds": 4.448,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_rename_restart_and_placement": {
+      "seconds": 3.74,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_restore_to_qualified_destination[False]": {
+      "seconds": 6.86,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_restore_to_qualified_destination[True]": {
+      "seconds": 5.945,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_scope_indexes_and_placement_overrides": {
+      "seconds": 6.856,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_scoped_join_keeps_literal_lookalikes_separate[1]": {
+      "seconds": 3.53,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_scoped_join_keeps_literal_lookalikes_separate[8]": {
+      "seconds": 11.421,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_transaction_session_keeps_bound_identity_through_rename": {
+      "seconds": 3.37,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_catalog_write_validation_refreshes_after_schema_change": {
+      "seconds": 4.358,
+      "samples": 1
+    },
+    "e2e/antfly/test_system_catalog.py::test_concurrent_catalog_drop_never_reclassifies_private_tables": {
+      "seconds": 24.167,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_multi_batch_abort_on_invalid_table": {
+      "seconds": 3.954,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_multi_batch_commit": {
+      "seconds": 3.993,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_multi_batch_mixed_ops": {
+      "seconds": 4.039,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_multi_batch_transforms": {
+      "seconds": 4.327,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_multi_key_batch_update_preserves_balance_sum": {
+      "seconds": 3.065,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_multi_shard_batch_commit": {
+      "seconds": 3.21,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_multi_shard_batch_timeout_converges_to_one_terminal_state": {
+      "seconds": 2.964,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_multi_shard_transaction_recovery_health": {
+      "seconds": 5.202,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_occ_basic_read_modify_write": {
+      "seconds": 2.711,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_occ_concurrent_rmw_only_one_commits": {
+      "seconds": 2.448,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_occ_conflict_detection": {
+      "seconds": 2.633,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_occ_cross_table_read_modify_write": {
+      "seconds": 4.14,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_occ_lost_update_protection": {
+      "seconds": 2.774,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_occ_transform_commit": {
+      "seconds": 2.726,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_session_explicit_read_write_commit": {
+      "seconds": 2.855,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_session_mixed_read_write_delete_commit": {
+      "seconds": 3.556,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_session_stage_delete_abort": {
+      "seconds": 2.435,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_session_stage_delete_commit": {
+      "seconds": 2.812,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_session_stage_read_version_conflict": {
+      "seconds": 2.562,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_session_stage_transform_commit": {
+      "seconds": 2.676,
+      "samples": 1
+    },
+    "e2e/antfly/test_transactions.py::test_session_transform_savepoint_rollback": {
+      "seconds": 3.067,
+      "samples": 1
+    },
+    "e2e/antfly/test_transforms.py::test_serverless_table_transforms_follow_latest_then_published": {
+      "seconds": 0.546,
+      "samples": 1
+    },
+    "e2e/antfly/test_transforms.py::test_transform_concurrent_max_updates": {
+      "seconds": 1.125,
+      "samples": 1
+    },
+    "e2e/antfly/test_transforms.py::test_transform_inc_atomic_counter": {
+      "seconds": 1.5,
+      "samples": 1
+    },
+    "e2e/antfly/test_transforms.py::test_transform_max_keeps_latest_value": {
+      "seconds": 1.694,
+      "samples": 1
+    },
+    "e2e/antfly/test_transforms.py::test_transform_min_keeps_lowest_value_and_upserts": {
+      "seconds": 0.601,
+      "samples": 1
+    },
+    "e2e/antfly/test_transforms.py::test_transform_multiple_operators": {
+      "seconds": 1.097,
+      "samples": 1
+    },
+    "e2e/antfly/test_transforms.py::test_transform_upsert_with_max": {
+      "seconds": 0.612,
+      "samples": 1
+    },
+    "e2e/antfly/test_transforms.py::test_unsupported_transform_is_rejected_without_partial_mutation[$currentDate]": {
+      "seconds": 1.399,
+      "samples": 1
+    },
+    "e2e/antfly/test_transforms.py::test_unsupported_transform_is_rejected_without_partial_mutation[$mul]": {
+      "seconds": 1.111,
+      "samples": 1
+    },
+    "e2e/antfly/test_transforms.py::test_unsupported_transform_is_rejected_without_partial_mutation[$pop]": {
+      "seconds": 1.638,
+      "samples": 1
+    },
+    "e2e/antfly/test_transforms.py::test_unsupported_transform_is_rejected_without_partial_mutation[$pull]": {
+      "seconds": 0.968,
+      "samples": 1
+    },
+    "e2e/antfly/test_transforms.py::test_unsupported_transform_is_rejected_without_partial_mutation[$push]": {
+      "seconds": 1.015,
+      "samples": 1
+    },
+    "e2e/antfly/test_transforms.py::test_unsupported_transform_is_rejected_without_partial_mutation[$rename]": {
+      "seconds": 0.586,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_migration.py::test_cancelled_vector_migration_allows_backup_without_restart[native]": {
+      "seconds": 11.488,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_migration.py::test_cancelled_vector_migration_allows_backup_without_restart[portable]": {
+      "seconds": 11.019,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_migration.py::test_offline_vector_migration_cancels_before_copy_fence": {
+      "seconds": 3.202,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_migration.py::test_offline_vector_migration_lock_resume_catalog_and_native_queries": {
+      "seconds": 8.535,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_migration.py::test_online_vector_migration_cancellation_reopens_inline_authority": {
+      "seconds": 10.096,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_migration.py::test_online_vector_migration_cancels_rejected_admission": {
+      "seconds": 4.764,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_migration.py::test_online_vector_migration_page_receipt_survives_process_crash[backfill]": {
+      "seconds": 6.308,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_migration.py::test_online_vector_migration_page_receipt_survives_process_crash[reclaiming]": {
+      "seconds": 6.708,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_migration.py::test_online_vector_migration_restart_concurrent_models_and_rebuild": {
+      "seconds": 17.602,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_migration.py::test_online_vector_migration_skips_large_documents_after_publication": {
+      "seconds": 6.913,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_migration.py::test_vector_migration_preserves_native_ann_neighbors[offline]": {
+      "seconds": 22.847,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_migration.py::test_vector_migration_preserves_native_ann_neighbors[online]": {
+      "seconds": 17.238,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_migration.py::test_vector_migration_preserves_native_ann_neighbors[restart]": {
+      "seconds": 14.719,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_store.py::test_vector_source_models_updates_deletes_and_restart[None]": {
+      "seconds": 11.65,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_store.py::test_vector_source_models_updates_deletes_and_restart[primary_lsm]": {
+      "seconds": 5.21,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_store.py::test_vector_source_models_updates_deletes_and_restart[vector_store]": {
+      "seconds": 10.567,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_store.py::test_vector_source_rejects_unsupported_table_configuration[payload0]": {
+      "seconds": 0.791,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_store.py::test_vector_source_rejects_unsupported_table_configuration[payload1]": {
+      "seconds": 1.043,
+      "samples": 1
+    },
+    "e2e/antfly/test_vector_store.py::test_vector_source_rejects_unsupported_table_configuration[payload2]": {
+      "seconds": 0.798,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_and_database_results_share_context_budget": {
+      "seconds": 0.933,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_cli_supports_web_only_named_connection": {
+      "seconds": 0.443,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_connection_cannot_be_redirected_by_request": {
+      "seconds": 0.436,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_connection_rejects_policy_expansion[override0]": {
+      "seconds": 0.428,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_connection_rejects_policy_expansion[override1]": {
+      "seconds": 0.423,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_connection_rejects_policy_expansion[override2]": {
+      "seconds": 0.419,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_connection_rejects_policy_expansion[override3]": {
+      "seconds": 0.407,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_connection_rejects_policy_expansion[override4]": {
+      "seconds": 0.425,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_deadline_is_bounded": {
+      "seconds": 0.897,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_failure_never_becomes_grounded_answer[exa-200-True]": {
+      "seconds": 0.835,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_failure_never_becomes_grounded_answer[exa-302-False]": {
+      "seconds": 0.436,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_failure_never_becomes_grounded_answer[exa-401-False]": {
+      "seconds": 0.435,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_failure_never_becomes_grounded_answer[exa-429-False]": {
+      "seconds": 0.432,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_failure_never_becomes_grounded_answer[exa-500-False]": {
+      "seconds": 0.528,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_failure_never_becomes_grounded_answer[tavily-200-True]": {
+      "seconds": 0.434,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_failure_never_becomes_grounded_answer[tavily-302-False]": {
+      "seconds": 0.528,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_failure_never_becomes_grounded_answer[tavily-401-False]": {
+      "seconds": 0.415,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_failure_never_becomes_grounded_answer[tavily-429-False]": {
+      "seconds": 0.43,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_failure_never_becomes_grounded_answer[tavily-500-False]": {
+      "seconds": 0.404,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_mixed_database_and_step_level_configuration": {
+      "seconds": 0.873,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_rejects_conflicting_configuration_scopes": {
+      "seconds": 0.507,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_repeated_searches_share_context_budget[False-1]": {
+      "seconds": 0.429,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_repeated_searches_share_context_budget[False-3]": {
+      "seconds": 0.533,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_repeated_searches_share_context_budget[True-1]": {
+      "seconds": 0.43,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_repeated_searches_share_context_budget[True-3]": {
+      "seconds": 0.535,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_web_only_returns_sources_and_tool_history[False]": {
+      "seconds": 0.532,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_exa_web_only_returns_sources_and_tool_history[True]": {
+      "seconds": 0.548,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_pruned_documents_preserve_summary_evidence[False-False]": {
+      "seconds": 1.142,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_pruned_documents_preserve_summary_evidence[False-True]": {
+      "seconds": 0.996,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_pruned_documents_preserve_summary_evidence[True-False]": {
+      "seconds": 1.002,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_pruned_documents_preserve_summary_evidence[True-True]": {
+      "seconds": 1.049,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_tavily_connection_policy[override0-400-tavily]": {
+      "seconds": 0.527,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_tavily_connection_policy[override1-403-tavily]": {
+      "seconds": 0.401,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_tavily_connection_policy[override2-403-tavily]": {
+      "seconds": 0.422,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_tavily_connection_policy[override3-403-tavily]": {
+      "seconds": 0.568,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_tavily_connection_policy[override4-403-tavily]": {
+      "seconds": 0.527,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_tavily_live_search[False-tavily-live]": {
+      "seconds": 0.011,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_tavily_live_search[True-tavily-live]": {
+      "seconds": 0.01,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_tavily_sources_and_wire_contract[False-tavily]": {
+      "seconds": 0.434,
+      "samples": 1
+    },
+    "e2e/antfly/test_web_search.py::test_tavily_sources_and_wire_contract[True-tavily]": {
+      "seconds": 0.412,
+      "samples": 1
+    }
+  }
+}

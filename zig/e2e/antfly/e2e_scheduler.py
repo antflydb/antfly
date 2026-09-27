@@ -1142,6 +1142,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
 
 _duration_history: DurationHistory | None = None
 _duration_report_totals: dict[str, float] = {}
+_duration_phase_totals: dict[str, dict[str, float]] = {}
 _executed_duration_nodeids: set[str] = set()
 
 
@@ -1172,7 +1173,11 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    global _duration_history, _duration_report_totals, _executed_duration_nodeids
+    global \
+        _duration_history, \
+        _duration_report_totals, \
+        _duration_phase_totals, \
+        _executed_duration_nodeids
     slots = int(config.getoption("e2e_process_slots"))
     if slots < 1:
         raise pytest.UsageError("--e2e-process-slots must be a positive integer")
@@ -1189,6 +1194,7 @@ def pytest_configure(config: pytest.Config) -> None:
     if not hasattr(config, "workerinput"):
         _duration_history = DurationHistory(Path(config.getoption("e2e_duration_file")))
         _duration_report_totals = {}
+        _duration_phase_totals = {}
         _executed_duration_nodeids = set()
 
 
@@ -1214,6 +1220,8 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     nodeid = normalize_nodeid(report.nodeid)
     duration = max(0.0, float(report.duration))
     if math.isfinite(duration):
+        phases = _duration_phase_totals.setdefault(nodeid, {})
+        phases[report.when] = phases.get(report.when, 0.0) + duration
         _duration_report_totals[nodeid] = (
             _duration_report_totals.get(nodeid, 0.0) + duration
         )
@@ -1236,6 +1244,24 @@ def pytest_sessionfinish(session: pytest.Session) -> None:
         # Setup and teardown are material E2E costs, but only retain their total
         # when the test reached a real call phase. Environment-dependent skips
         # and setup failures must not train expensive full-CI tests toward zero.
+        if report_dir := os.environ.get("ANTFLY_E2E_REPORT_DIR"):
+            report_path = Path(report_dir) / "phase-durations.json"
+            try:
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text(
+                    json.dumps(
+                        {"version": 1, "tests": _duration_phase_totals},
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            except OSError as exc:
+                reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+                if reporter is not None:
+                    reporter.write_line(
+                        f"warning: could not retain E2E phase durations: {exc}"
+                    )
         _flush_duration_reports()
         error = _duration_history.save()
         if error is not None:

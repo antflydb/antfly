@@ -1727,3 +1727,43 @@ def test_completed_worker_removal_immediately_reuses_released_process_slot(
     assert scheduler.workqueue == {}
     assert scheduler._persistent_processes == {clean: {"runtime_b"}}
     assert scheduler._reserved_process_slots() == 1
+
+
+def test_ci_phase_report_retains_fixture_costs_and_skipped_setup(tmp_path, monkeypatch):
+    import e2e_scheduler as scheduler
+
+    monkeypatch.setenv("ANTFLY_E2E_REPORT_DIR", str(tmp_path / "reports"))
+    monkeypatch.setattr(
+        scheduler, "_duration_history", DurationHistory(tmp_path / "durations.json")
+    )
+    monkeypatch.setattr(scheduler, "_duration_report_totals", {})
+    monkeypatch.setattr(scheduler, "_duration_phase_totals", {})
+    monkeypatch.setattr(scheduler, "_executed_duration_nodeids", set())
+    for when, seconds in [("setup", 2), ("call", 3), ("teardown", 4)]:
+        scheduler.pytest_runtest_logreport(
+            SimpleNamespace(
+                nodeid="test_a.py::test_pass@g",
+                when=when,
+                duration=seconds,
+                skipped=False,
+            )
+        )
+    scheduler.pytest_runtest_logreport(
+        SimpleNamespace(
+            nodeid="test_a.py::test_skip@g", when="setup", duration=5, skipped=True
+        )
+    )
+    session = SimpleNamespace(
+        config=SimpleNamespace(pluginmanager=SimpleNamespace(get_plugin=lambda _: None))
+    )
+    scheduler.pytest_sessionfinish(session)
+    phases = json.loads((tmp_path / "reports/phase-durations.json").read_text())
+    assert phases["tests"]["test_a.py::test_pass"] == {
+        "setup": 2,
+        "call": 3,
+        "teardown": 4,
+    }
+    assert phases["tests"]["test_a.py::test_skip"] == {"setup": 5}
+    history = DurationHistory(tmp_path / "durations.json")
+    assert history.estimate("test_a.py::test_pass", process_owned=True) == 9
+    assert "test_a.py::test_skip" not in history.tests
