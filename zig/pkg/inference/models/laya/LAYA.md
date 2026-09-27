@@ -803,6 +803,29 @@ up exact trunk reuse across question sets) or to keep question-mode packing
 for cost-sensitive uses and route accuracy-sensitive decisions to the
 unpacked layout.
 
+**A question-aware trunk recovers most of it.** With
+`packing.trunk_sees: "questions"` the state tokens attend to their whole tree
+(the state and every question branch about it); branches still see only
+their ancestors, and different states in one call stay isolated. Same recipe,
+three seeds:
+
+| Layout | Seed 42 | Seed 43 | Seed 44 | Mean | SD | Soft CE | ECE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Packed, trunk sees state only | 0.434 | 0.461 | 0.455 | 0.450 | 0.014 | 1.129 | 0.049 |
+| Packed, trunk sees its questions | 0.516 | 0.579 | 0.566 | 0.554 | 0.033 | 1.031 | 0.060 |
+| Unpacked | 0.599 | 0.628 | 0.637 | 0.621 | 0.020 | 0.983 | 0.088 |
+
+That closes about 60% of the gap (0.104 of 0.171) with the same packed token
+count. The cost: the trunk depends on the question set, so the state cache
+cannot reuse it across requests with different questions, and questions
+about one state can influence each other through the trunk (a decision may
+change when another question is added). The remaining 0.07 is plausibly
+that interference plus the per-question fusion the unpacked layout gets. A
+per-question view of the state in the upper layers (lower layers shared and
+cached, question-specific fusion above) would keep isolation and is the next
+candidate. Peak footprint 26.0 GB; the device estimate (31.5 GB) is
+conservative.
+
 **Caveats.**
 
 - **Upstream checkpoint:** it is far ahead because it trained on all 1,200
@@ -1772,7 +1795,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 
 | Step | Retraining | Status | Gate |
 | --- | --- | --- | --- |
-| 0. Qualify packed accuracy | fine-tune | question mode **fails** the gate: 0.450 packed vs 0.621 unpacked over three seeds at equal budget (0.471 vs 0.671 on a larger recipe). Candidate mode: Banking77 0.819 mean over two seeds with soft CE | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
+| 0. Qualify packed accuracy | fine-tune | question mode **fails** the gate: 0.450 packed vs 0.621 unpacked over three seeds at equal budget (0.471 vs 0.671 on a larger recipe); distillation does not help (0.451); a question-aware trunk (`trunk_sees: "questions"`) reaches 0.554. Candidate mode: Banking77 0.819 mean over two seeds with soft CE | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
 | 1a. State cache across rows and requests | no | done (CPU and Metal) | Exact against the full row and the oracle; follow-up questions skip trunk projections and feed-forward work |
 | 1b. Segment attention | no | done (CPU and Metal); multi-row batching done (CPU and Metal, question and candidate modes) | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call: exact against running each row alone, isolated by construction; not yet composed with the trunk cache |
 | 1c. Metal and CUDA packed kernels | no | Metal: fused kernels not pursued (encoder GPU work dominates; device scoring gave 2–4% and was reverted after a race). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |

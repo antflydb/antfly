@@ -524,3 +524,12 @@ students (packed question, RLCD, 1 epoch, s0-train-distilled):
   per type (42/43/44): choice 0.368/0.364/0.360  score 0.424/0.362/0.408  noul 0.614/0.596/0.614
 reference: packed on gold 0.450 (0.434/0.461/0.455); unpacked on gold 0.621 (0.599/0.628/0.637)
 ```
+
+## Question-aware trunk (2026-09-26)
+
+`"packing":"question","trunk_sees_questions":true`, step-0 recipe, RLCD, 1 epoch, Metal:
+
+```
+seed 42 acc 0.516 train 709 s   seed 43 acc 0.579 train 545 s   seed 44 acc 0.566 train 569 s
+mean 0.554 sd 0.033 soft_ce 1.031 ece 0.060   peak footprint 26.0 GB each; device estimate 31527 MiB
+```
