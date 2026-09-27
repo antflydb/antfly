@@ -178,6 +178,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft native snapshot requires an install completion receipt",
         "data raft read safety barrier rejects pre-restart responses for both read paths",
         "data raft ticker advances consensus independently of control rounds",
+        "local raft admission leaves global metadata refresh to control",
         "data raft stable placement refreshes changed peer transport endpoints",
         "raft batch round trips table batch payload",
         "raft batch round trips deterministic transaction begin",

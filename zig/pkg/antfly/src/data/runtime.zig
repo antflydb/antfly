@@ -10931,7 +10931,7 @@ pub const DataServer = struct {
             .table_name = table_name,
         });
         if (route.discovery.mayRefreshCatalog()) {
-            self.refreshDataRaftMetadataForBatchWithBudget(deadline_ns, route.cancellation) catch |err| switch (err) {
+            self.refreshDataRaftMetadataForBatchGroupWithBudget(group_id, deadline_ns, route.cancellation) catch |err| switch (err) {
                 error.Timeout => return error.LeaderUnavailable,
                 else => return err,
             };
@@ -17004,6 +17004,26 @@ pub const DataServer = struct {
         var it = retired.valueIterator();
         while (it.next()) |name| self.alloc.free(name.*);
         retired.deinit(self.alloc);
+    }
+
+    fn refreshDataRaftMetadataForBatchGroupWithBudget(
+        self: *DataServer,
+        group_id: u64,
+        deadline_ns: u64,
+        cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
+    ) !void {
+        if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        if (self.dataRaftMonotonicNs() >= deadline_ns) return error.Timeout;
+        // An admitted local leader already has a durable replica and transport
+        // configuration. A fresh global control snapshot is not a write fence:
+        // unrelated store reports can keep superseding its paged generation.
+        // Let control converge in the background; proposal admission still
+        // checks the transaction/range fence and rechecks local leadership.
+        if (self.localDataRaftLeaderReady(group_id)) {
+            self.requestDataRaftMetadataSync();
+            return;
+        }
+        try self.refreshDataRaftMetadataForBatchWithBudget(deadline_ns, cancellation);
     }
 
     /// Refresh only the immutable routing snapshot on an API request thread.
@@ -34043,6 +34063,85 @@ fn consumerTests() type {
             server.requestDataRaftMetadataSync();
             try std.testing.expect(server.data_raft_metadata_sync_requested.swap(false, .acq_rel));
             try std.testing.expect(!server.data_raft_metadata_sync_requested.swap(false, .acq_rel));
+        }
+
+        test "local raft admission leaves global metadata refresh to control" {
+            const alloc = std.testing.allocator;
+
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+
+            const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-local-admission", .{tmp.sub_path});
+            defer alloc.free(replica_root);
+
+            const Metadata = struct {
+                calls: usize = 0,
+                fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    return error.Timeout;
+                }
+            };
+            var metadata: Metadata = .{};
+            const executor: antfly.common.http.RequestExecutor = .{ .ptr = &metadata, .vtable = &.{ .execute = Metadata.execute } };
+            var server = try DataServer.initFromMetadataApiUrl(alloc, .{
+                .metadata_request_executors = &.{executor},
+                .replica_root_dir = replica_root,
+                .store_registration = .{
+                    .node_id = 1,
+                    .store_id = 1,
+                    .api_url = "http://127.0.0.1:1",
+                },
+            }, "http://127.0.0.1:2");
+            defer server.deinit();
+
+            const snapshot = antfly.metadata_api.AdminSnapshot{
+                .status = .{ .metadata_group_id = 9, .metadata_epoch = 17, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{.{
+                    .store_id = 1,
+                    .node_id = 1,
+                    .role = "data",
+                    .live = true,
+                    .health_class = "healthy",
+                    .api_url = "http://127.0.0.1:1",
+                    .raft_url = "http://127.0.0.1:2",
+                }})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{.{
+                    .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 },
+                    .store_id = 1,
+                    .peer_node_ids = &.{1},
+                }})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+            try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
+            try std.testing.expect(server.localDataRaftLeaderReady(77));
+            const deadline = server.dataRaftMonotonicNs() + 100 * std.time.ns_per_ms;
+            try server.refreshDataRaftMetadataForBatchGroupWithBudget(77, deadline, null);
+            try std.testing.expectEqual(@as(usize, 0), metadata.calls);
+            try std.testing.expect(server.data_raft_metadata_sync_requested.load(.acquire));
+
+            var cancellation = antfly.raft.transport.http_common.RequestCancellation{};
+            cancellation.cancel();
+            try std.testing.expectError(error.Cancelled, server.refreshDataRaftMetadataForBatchGroupWithBudget(77, deadline, &cancellation));
+            try std.testing.expectError(error.Timeout, server.refreshDataRaftMetadataForBatchGroupWithBudget(77, 0, null));
+            try std.testing.expectEqual(@as(usize, 0), metadata.calls);
+
+            // A missing replica cannot use the local fast path. Discovery
+            // still observes its caller's budget and the unavailable authority.
+            try std.testing.expectError(error.Timeout, server.refreshDataRaftMetadataForBatchGroupWithBudget(88, deadline, null));
+            try std.testing.expect(metadata.calls > 0);
         }
 
         test "data raft ticker advances consensus independently of control rounds" {

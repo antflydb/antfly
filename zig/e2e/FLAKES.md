@@ -1893,6 +1893,29 @@ measurements, not acceptance evidence for the new implementation. The captured
 wait chain identifies an ownership defect; arbitrary slow persistence still
 requires platform-specific qualification, and no deadline was increased.
 
+
+The ownership-only smoke run passed 8/8 FK merge and 8/8 schema rewrite but
+failed one of eight FK-cascade cases during replacement-parent deletion. This
+is not final recovery acceptance. The frozen ownership build (SHA-256
+`e42f143fbbb3c4dc1dd6234482167f54205b57e84160bd1bd32443856bb1d479`)
+passed label-routed Autograph **200/200**. Its interrupted recovery qualification
+had 16 passing FK merge, eight schema rewrite, and eight FK cascade cases; these
+counts are preliminary and do not replace the requested 200-case cohorts.
+
+The local 2PC admission path also performed a full control-snapshot refresh
+before checking an already-hosted leader. Those snapshots are fenced by the
+changing metadata epoch, including unrelated store reports. That refresh is not
+a transaction or range admission fence, yet a timeout becomes
+`LeaderUnavailable` before the data group is even inspected. Local admission
+now leaves this global refresh to control when local Raft leadership is
+confirmed; missing replicas still use bounded discovery. Proposal admission
+retains its topology fence, storage descriptor validation, and leadership
+recheck. Cancellation and expired budgets cannot take the fast path. A real
+single-node Raft regression injects metadata transport timeouts and checks that
+local routing avoids that transport while missing-group discovery still fails.
+The earlier failure logs alone do not identify which pre-admission phase timed
+out; the complete recovery fix requires fresh soak qualification.
+
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
 
 Scheduled run `36247286560` passed qualification, all five campaigns, and the
