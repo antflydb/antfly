@@ -376,7 +376,7 @@ compaction+int8, compaction+`polar4`, and `turbo3`. See Open work.
 > **Relocated:** The chronological `polar4`/`turbo3` implementation log that
 > previously lived here (261 lines, including the retired MLX-era
 > acceleration path) is preserved verbatim in
-> [work-log/completed/inference/turboquant-history.md](../../../work-log/completed/inference/turboquant-history.md).
+> [docs/design/inference/history/turboquant-history.md](../../../docs/design/inference/history/turboquant-history.md).
 > Durable decisions from it are in Architecture and Open work above.
 
 ## Open work

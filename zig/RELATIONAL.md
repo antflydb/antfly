@@ -456,7 +456,7 @@ allocation for dense nested-predicate scans by indexing only visited
 containers; and that leased point-projection reads avoid most of the
 full-row-copy cost without weakening verification once checks are scoped to
 the touched group. Archived measurements are in
-[work-log/completed/relational/benchmarks.md](../work-log/completed/relational/benchmarks.md).
+[docs/design/relational/history/benchmarks.md](../docs/design/relational/history/benchmarks.md).
 
 ### LSM ownership and physical amplification
 
@@ -513,7 +513,7 @@ payload family writes and retains far less data than first-byte-only
 partitioning, motivating the domain-aware compaction boundaries above, though
 those historical numbers predate domain-aware input selection; archived
 measurements are in
-[work-log/completed/relational/benchmarks.md](../work-log/completed/relational/benchmarks.md).
+[docs/design/relational/history/benchmarks.md](../docs/design/relational/history/benchmarks.md).
 
 ### Shared LSM read versions and bounded column batches
 
@@ -598,7 +598,7 @@ mutable-snapshot root removes most snapshot-setup copying cost and roughly
 halves narrow single-row write latency, and that the 50% tombstone-density GC
 trigger avoids a substantial share of eager-GC SST writes while retaining
 somewhat more settled bytes; archived measurements are in
-[work-log/completed/relational/benchmarks.md](../work-log/completed/relational/benchmarks.md).
+[docs/design/relational/history/benchmarks.md](../docs/design/relational/history/benchmarks.md).
 
 Reproduce the narrow-write measurement with:
 
@@ -627,13 +627,13 @@ and batched-projection changes cut metadata-churn SST bytes, point-read
 latency, and snapshot-copy bytes by roughly an order of magnitude versus the
 prior baseline, though not by an equivalent end-to-end throughput multiplier;
 archived measurements are in
-[work-log/completed/relational/benchmarks.md](../work-log/completed/relational/benchmarks.md).
+[docs/design/relational/history/benchmarks.md](../docs/design/relational/history/benchmarks.md).
 
 A native-file churn comparison showed domain-aware compaction selection cuts
 cumulative SST bytes written by about 22% relative to the previous output-only
 partitioning, at the cost of higher pinned peak disk usage and no measurable
 foreground-latency improvement in that fixture; archived measurements are in
-[work-log/completed/relational/benchmarks.md](../work-log/completed/relational/benchmarks.md).
+[docs/design/relational/history/benchmarks.md](../docs/design/relational/history/benchmarks.md).
 
 Reproduce with `zig build lib-storage-test -Doptimize=ReleaseFast --` and filters
 `'relational columnar production LSM'`, `'lsm payload family isolation'`, and
@@ -654,7 +654,7 @@ A payload-scan benchmark showed the decoded-block cache eliminates almost all
 repeated payload decodes and materially cuts scan latency when scanned rows
 share a value, with no benefit when every scanned value is distinct; archived
 measurements are in
-[work-log/completed/relational/benchmarks.md](../work-log/completed/relational/benchmarks.md).
+[docs/design/relational/history/benchmarks.md](../docs/design/relational/history/benchmarks.md).
 
 Scan planning is metadata-first. Access-path admission happens before predicate
 payload decoding, and dirty markers remove replaced/deleted base candidates
@@ -1094,7 +1094,7 @@ and off-lock-projection costs small and roughly constant as lower-level SST
 count grows into the hundreds of thousands, at the cost of proportionally
 larger shared directory memory, while leaving prior physical-churn write
 behavior unchanged; archived measurements are in
-[work-log/completed/relational/benchmarks.md](../work-log/completed/relational/benchmarks.md).
+[docs/design/relational/history/benchmarks.md](../docs/design/relational/history/benchmarks.md).
 
 ## Related docs
 

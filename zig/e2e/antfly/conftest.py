@@ -160,7 +160,7 @@ SERVER_LOG_DIAGNOSTIC_MARKER = "\nserver logs:\n"
 # Distributed binaries fail fast without an isolated internal RPC identity.
 # Every subprocess launched by this pytest tree inherits this test-only key;
 # production deployments must provision their own random credential as
-# documented in docs/secrets.md.
+# documented in docs/reference/secrets.md.
 os.environ.setdefault(
     "ANTFLY_INTERNAL_SERVICE_SECRET",
     "antfly-e2e-dedicated-internal-service-secret-v1",

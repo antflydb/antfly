@@ -53,22 +53,22 @@ antfly standalone --storage-engine lite --storage-path app.aflite
 
 - **Hybrid search** — full-text (BM25), dense vectors ([RaBitQ](https://arxiv.org/abs/2405.12497)-compressed with [SPFresh](https://arxiv.org/abs/2410.14452)-style updates), sparse vectors ([SPLADE](https://arxiv.org/abs/2107.05720)), and [late interaction](https://arxiv.org/abs/2004.12832) (ColQwen2), fused with [reciprocal rank](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf) or relative score fusion in one query
 - **Full-text search** — Lucene-style segments with [highlighting](zig/pkg/antfly/src/search/highlight.zig), geo, regex, wildcard, and fuzzy queries, plus English and ten [Snowball](https://snowballstem.org/) stemmer languages
-- **RAG agents** — built-in [retrieval-augmented generation](zig/pkg/antfly/src/api/retrieval_agent.zig) with streaming, multi-turn chat, tool calling (graph traversal, plus web search through an Exa connection), confidence scoring, and [TOON](docs/toon-format.md) document rendering to cut prompt tokens
+- **RAG agents** — built-in [retrieval-augmented generation](zig/pkg/antfly/src/api/retrieval_agent.zig) with streaming, multi-turn chat, tool calling (graph traversal, plus web search through an Exa connection), confidence scoring, and [TOON](docs/reference/toon-format.md) document rendering to cut prompt tokens
 - **Query-builder agent** — turns a natural-language question into a structured Antfly query, with [evaluation metrics](go/pkg/evalaf) to measure retrieval quality
 - **Graph indexes** — automatic relationship extraction and [graph traversal](zig/pkg/antfly/src/graph) over your data
 - **Multimodal** — index and search [images, audio, and video](docs/guides/multimodal.mdx) with CLIP, CLAP, and vision-language models
 - **Reranking** — cross-encoder reranking with score-based pruning to cut the noise
 - **Aggregations** — stats, terms facets, histogram, date histogram, range, and geo-distance [aggregations](zig/pkg/antfly/src/search/aggregation.zig) for analytics
 - **Transactions** — ACID transactions at the shard level with distributed coordination
-- **Document TTL** — automatic [document expiration](docs/ttl-example.md) so you don't have to clean up yourself
+- **Document TTL** — automatic [document expiration](docs/guides/ttl-example.md) so you don't have to clean up yourself
 - **PostgreSQL CDC** — [mirror a Postgres table](docs/guides/cdc-replication.mdx) into Antfly over logical replication, every insert, update, and delete included
 - **CLI** — one `antfly` binary for the server, tables, queries, backups, auth, and the [model registry](docs/guides/inference.mdx) (`antfly inference pull owner/model`)
-- **Secrets** — reference credentials as [`${secret:...}` keystore entries or env vars](docs/secrets.md) instead of putting them in config
-- **Object storage** — the [serverless engine](docs/s3-storage.md) keeps artifacts, manifests, WAL, and catalog state in S3-compatible storage (S3, MinIO, R2) or Google Cloud Storage
+- **Secrets** — reference credentials as [`${secret:...}` keystore entries or env vars](docs/reference/secrets.md) instead of putting them in config
+- **Object storage** — the [serverless engine](docs/reference/s3-storage.md) keeps artifacts, manifests, WAL, and catalog state in S3-compatible storage (S3, MinIO, R2) or Google Cloud Storage
 - **CPU, Metal, and CUDA** — native kernels for [inference](zig/pkg/inference) and vector search: SIMD on x86 and ARM, Metal on Apple silicon, and [CUDA](zig/pkg/inference/CUDA.md) with a kernel JIT
 - **Distributed** — multi-Raft consensus, key-range sharding and replication, online shard splits (automatic size-based split and merge is opt-in), cross-shard transactions, horizontal scaling
 - **Runs anywhere** — [Antfly Lite](docs/guides/lite.mdx) as a single `.aflite` file, a single node with a [hot standby](zig/pkg/antfly/src/storage/hot_standby), a Raft cluster, or [serverless](zig/pkg/antfly/src/serverless) over object storage
-- **Embeddable** — a [C API](zig/pkg/antfly/src/capi) (`libantfly`), [Lite bindings](docs/sdks.mdx#embedded-lite-binding) for [Go](go/pkg/lite), [Python](py/packages/lite), [Rust](rs/crates/lite), and [TypeScript](ts/packages/lite), and an in-browser [WASM build](zig/pkg/antfly-embedded/WASM.md) so the engine runs in-process, in unit tests, or on the edge
+- **Embeddable** — a [C API](zig/pkg/antfly/src/capi) (`libantfly`), [Lite bindings](docs/reference/sdks.mdx#embedded-lite-binding) for [Go](go/pkg/lite), [Python](py/packages/lite), [Rust](rs/crates/lite), and [TypeScript](ts/packages/lite), and an in-browser [WASM build](zig/pkg/antfly-embedded/WASM.md) so the engine runs in-process, in unit tests, or on the edge
 - **Extensions** — run your own code inside the engine with the [Wasmtime extension runtime](zig/pkg/antfly/src/extensions)
 - **Enrichment pipelines** — [configurable pipelines](zig/pkg/antfly/src/storage/db/enrichment) per index for embeddings, summaries, graph edges, and custom computed fields
 - **Bring your own models** — Ollama, OpenAI, OpenRouter, Cohere, Bedrock, Gemini, Vertex AI, or run models locally with Antfly inference (GGUF, safetensors, and ONNX)
@@ -90,7 +90,8 @@ antfly standalone --storage-engine lite --storage-path app.aflite
 
 - [Quickstart](docs/guides/quickstart.mdx), [Document Engine](docs/guides/document-engine.mdx), and [Hybrid Search](docs/guides/hybrid-search.mdx)
 - [Multimodal](docs/guides/multimodal.mdx), [Artifact Indexes](docs/guides/artifact-indexes.mdx), and [Inference](docs/guides/inference.mdx) with the [supported models](docs/guides/supported-models.mdx)
-- [Antfly Lite](docs/guides/lite.mdx), [Architecture](docs/architecture.mdx), and [Object storage](docs/s3-storage.md)
+- [Documentation index](docs/README.md)
+- [Antfly Lite](docs/guides/lite.mdx), [Architecture](docs/architecture.mdx), and [Object storage](docs/reference/s3-storage.md)
 - End-to-end guides: [support answer agent](docs/guides/support-answer-agent.mdx), [site search and answers](docs/guides/site-search-and-answers.mdx), [ticket routing](docs/guides/ticket-routing.mdx), [coding copilot retrieval](docs/guides/coding-copilot-retrieval.mdx)
 - Runnable [examples](examples): Lite in Go, image search, memoryaf, Pinecone migration, Postgres sync
 
