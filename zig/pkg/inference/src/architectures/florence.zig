@@ -4099,11 +4099,7 @@ fn logFlorenceProfileStageLayerOp(phase: []const u8, stage: usize, layer: usize,
 }
 
 fn nowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
-        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
-        else => return 0,
-    }
+    return @import("antfly_platform").time.monotonicNs();
 }
 
 fn nsToMs(ns: u64) f64 {

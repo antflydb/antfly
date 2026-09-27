@@ -167,12 +167,12 @@ pub const Registry = struct {
     /// suspending the current std.Io task. Replacement flips banks, then waits
     /// only for the old load-and-retain windows; returned SchemaViews own epoch
     /// references and never delay publication or reclamation admission.
-    acquisition_generation: std.atomic.Value(u64) = .init(0),
+    acquisition_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
     acquisition_readers: [acquisition_bank_count][acquisition_stripe_count]AcquisitionStripe =
         [_][acquisition_stripe_count]AcquisitionStripe{
             [_]AcquisitionStripe{.{}} ** acquisition_stripe_count,
         } ** acquisition_bank_count,
-    namespace_generation: std.atomic.Value(u64) = .init(0),
+    namespace_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
     pending_publications: usize = 0,
     historical_clock: u64 = 0,
     historical_admission: Admission = .{},

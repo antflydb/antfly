@@ -1902,8 +1902,8 @@ pub const ResolutionRuntime = struct {
     /// Optional name embedder, injected by the db from the enrichment config;
     /// used to backfill mention name embeddings for cosine/ann blocking.
     embedder: ?embedder_mod.DenseEmbedder,
-    applied_sequence: std.atomic.Value(u64),
-    target_sequence: std.atomic.Value(u64),
+    applied_sequence: @import("antfly_platform").atomic.Value(u64),
+    target_sequence: @import("antfly_platform").atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
     /// The catalog transaction owns durability; this flag is only a wake hint.

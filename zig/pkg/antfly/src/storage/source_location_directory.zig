@@ -16,8 +16,8 @@ pub const Directory = struct {
     dirty_entries: u64 = 0,
     publications: u64 = 0,
     publication_deferrals: u64 = 0,
-    hits: std.atomic.Value(u64) = .init(0),
-    misses: std.atomic.Value(u64) = .init(0),
+    hits: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    misses: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn create(alloc: std.mem.Allocator) !*Directory {
         const self = try alloc.create(Directory);
@@ -29,7 +29,7 @@ pub const Directory = struct {
         self.alloc.destroy(self);
     }
     fn lock(self: *Directory) void {
-        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
     }
     pub fn get(self: *Directory, digest: []const u8) ?Location {
         if (digest.len != 32 or !self.mutex.tryLock()) return null;

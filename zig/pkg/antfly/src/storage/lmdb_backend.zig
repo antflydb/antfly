@@ -436,7 +436,7 @@ pub const Backend = struct {
     }
 };
 
-var test_nonce: std.atomic.Value(u64) = .init(0);
+var test_nonce: @import("antfly_platform").atomic.Value(u64) = .init(0);
 
 fn nowNs() u64 {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});

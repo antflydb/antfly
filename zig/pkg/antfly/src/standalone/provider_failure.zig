@@ -8,7 +8,7 @@ const bridge = @import("inference_bridge.zig");
 const diagnostics = @import("../runtime_private_error_diagnostics.zig");
 
 const operation_slots = @intFromEnum(bridge.ProviderOperation.classify_texts) + 1;
-var overflow_counts = [_]std.atomic.Value(u64){.init(0)} ** operation_slots;
+var overflow_counts = [_]@import("antfly_platform").atomic.Value(u64){.init(0)} ** operation_slots;
 var failures = [_]diagnostics.Diagnostic{.{}} ** diagnostics.slots_count;
 
 fn shouldLog(count: u64) bool {

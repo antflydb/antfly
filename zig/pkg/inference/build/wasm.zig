@@ -124,6 +124,8 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
         .ml = wasm_ml_mod,
     });
     wasm_tokenizer_mod.addImport("sentencepiece_proto", wasm_sentencepiece_proto);
+    wasm_tokenizer_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_hf_tokenizer_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_hf_tokenizer_mod.addImport("inference_tokenizer", wasm_tokenizer_mod);
     wasm_lib.root_module.addImport("jinja", wasm_jinja_mod);
     wasm_lib.root_module.addImport("inference_audio", wasm_audio_mod);

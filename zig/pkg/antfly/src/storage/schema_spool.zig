@@ -50,7 +50,7 @@ pub const Spool = struct {
         errdefer impl.deinit();
         const io = impl.io();
         var random: [16]u8 = undefined;
-        try io.randomSecure(&random);
+        try @import("antfly_platform").entropy.fill(io, &random);
         const directory = platform.env.getenv("TMPDIR") orelse platform.env.getenv("TEMP") orelse "/tmp";
         const path = try std.fmt.allocPrint(self.alloc, "{s}/antfly-schema-{x}.tmp", .{ directory, random });
         errdefer self.alloc.free(path);
