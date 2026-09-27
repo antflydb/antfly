@@ -261,22 +261,10 @@ fn executeNativePlannedNode(
             const name = graph.parameterName(n);
             break :blk try cb.getWeight(name);
         },
-        .constant => |attrs| blk: {
-            const constant = try graph.constantDataAsF32(
-                graph.allocator,
-                n.output_shape.dtype,
-                attrs.data_offset,
-                attrs.data_len,
-            );
-            defer constant.deinit(graph.allocator);
-            if (n.output_shape.rank() > 1) {
-                var shape_buf: [8]i32 = undefined;
-                const rank = n.output_shape.rank();
-                for (0..rank) |ax| shape_buf[ax] = @intCast(n.output_shape.dim(@intCast(ax)));
-                break :blk try cb.fromFloat32Shape(constant.data, shape_buf[0..rank]);
-            }
-            break :blk try cb.fromFloat32(constant.data);
-        },
+        // Constants are control data as well as activations. Use the shared
+        // typed materialization path so scalar/vector shapes, exact integer
+        // payloads, and strict-integer policy match interpreted execution.
+        .constant => try interpreter.executeNode(graph, cb, values, node_id, exec_state),
         .fused_linear => |attrs| blk: {
             const plan = nativeOperatorPlanForLinear(graph, values, node_id, partition_plan, attrs.rows, attrs.in_dim, attrs.out_dim) orelse {
                 if (native_compute.nativeTensorHasQuantizedStorage(valueAt(values, inputs[1]))) return null;
@@ -1056,4 +1044,66 @@ test "native partition executor owned lifecycle deinitializes cleanly" {
     const exec = try NativePartitionExecutor.create(allocator, &g, &cb);
     const pe = exec.partitionExecutor();
     pe.deinitExecutor();
+}
+
+test "native planned constants preserve integer precision dtype and scalar vector matrix empty shapes" {
+    const allocator = std.testing.allocator;
+    var store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitEmptyNativeWeightStore(&store, allocator);
+    var compute = native_compute.NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    inline for (.{ i32, i64, f32 }) |T| {
+        const dtype: ml.graph.DType = @field(ml.graph.DType, @typeName(T));
+        const large: T = if (T == i32) 16777217 else if (T == i64) 9007199254740993 else 1.25;
+        const data = [_]T{ large, -large };
+        const shapes = [_][]const i64{ &.{}, &.{2}, &.{ 1, 2 }, &.{ 2, 0, 3 } };
+        for (shapes, 0..) |shape, index| {
+            var graph = Graph.init(allocator);
+            defer graph.deinit();
+            var builder = ml.graph.Builder.init(&graph);
+            const bytes = std.mem.sliceAsBytes(data[0..if (index == 0) 1 else if (index == 3) 0 else 2]);
+            const node = try builder.tensorConstBytes(bytes, ml.graph.Shape.init(dtype, shape));
+            var state = interpreter.ExecState{ .attention_layer = 0, .options = .{} };
+            var values = [_]?CT{};
+            const tensor = (try executeNativePlannedNode(allocator, &graph, &cb, &values, node, null, &state)).?;
+            defer cb.free(tensor);
+            const actual_shape = try cb.tensorShape(tensor, allocator);
+            defer allocator.free(actual_shape);
+            try std.testing.expectEqualSlices(i64, shape, actual_shape);
+            if (T == f32) {
+                const actual = try cb.toFloat32(tensor, allocator);
+                defer allocator.free(actual);
+                try std.testing.expectEqualSlices(f32, data[0 .. bytes.len / @sizeOf(T)], actual);
+            } else {
+                const exported = (try cb.exportTensorData(tensor, allocator)).?;
+                defer allocator.free(exported.payload.bytes);
+                try std.testing.expectEqualStrings(@tagName(dtype), @tagName(exported.dtype));
+                try std.testing.expectEqualSlices(u8, bytes, exported.payload.bytes);
+            }
+        }
+    }
+}
+
+test "native planned constants honor strict integer policy" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const wide = try builder.tensorConstBytes(std.mem.sliceAsBytes(&[_]i64{9007199254740993}), ml.graph.Shape.init(.i64, &.{1}));
+    const supported = try builder.tensorConstBytes(std.mem.sliceAsBytes(&[_]i32{16777217}), ml.graph.Shape.init(.i32, &.{1}));
+    var store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitEmptyNativeWeightStore(&store, allocator);
+    var compute = native_compute.NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    var state = interpreter.ExecState{ .attention_layer = 0, .options = .{ .strict_integer_constants = true } };
+    var values = [_]?CT{};
+    try std.testing.expectError(error.UnsupportedIntegerTensor, executeNativePlannedNode(allocator, &graph, &cb, &values, wide, null, &state));
+    const tensor = (try executeNativePlannedNode(allocator, &graph, &cb, &values, supported, null, &state)).?;
+    defer cb.free(tensor);
+    const exported = (try cb.exportTensorData(tensor, allocator)).?;
+    defer allocator.free(exported.payload.bytes);
+    try std.testing.expectEqual(.i32, exported.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i32{16777217}), exported.payload.bytes);
 }
