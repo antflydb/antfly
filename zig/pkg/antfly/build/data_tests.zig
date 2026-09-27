@@ -194,6 +194,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft batch protocol cache reuses only short lived negative evidence",
         "raft batch protocol activation is reusable only in its accepted leader term",
         "raft batch protocol activation cleanup preserves in flight references",
+        "data raft forwarding admission waits within the borrowed deadline and cancellation",
         "data raft retry clock and sleep borrow VoprIo",
         "DataServer LSM maintenance cost port composes and heals on borrowed VoprIo",
         "production DataServer replicated merge actions run on VoprIo",

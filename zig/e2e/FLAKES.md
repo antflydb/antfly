@@ -1916,6 +1916,41 @@ local routing avoids that transport while missing-group discovery still fails.
 The earlier failure logs alone do not identify which pre-admission phase timed
 out; the complete recovery fix requires fresh soak qualification.
 
+The local-refresh executable (SHA-256
+`6b2eebd45f0b5e45afb53eb612eb69a5ac903adc4038e3c75fb5714b1496936b`)
+passed Autograph **200/200**, but one of the first 16 FK-cascade cases again
+failed on replacement-parent deletion. The retained root is
+`antfly-zig-metadata-backup-e2e-v0ey4zpw`: all three metadata members reported
+term 1 and commit index 1123, with one leader and two followers. This recurrence
+does not establish an election stall. The interrupted recovery run is not
+acceptance evidence; phase-specific prepare/admission diagnostics are being
+used to identify the remaining failure before another full qualification.
+
+The phase-diagnostic executable (`6e2c20e4139ded7cc6ee65adac5281751e6d8a642bbf8734cce499c57ca08166`)
+passed a separate 40-case cascade loop, then reproduced the same late deletion
+failure in the eight-worker mixed-load run (`worker-2-case-3`, retained root
+`antfly-zig-metadata-backup-e2e-mc7lh7jr`). The interrupted cohort is not
+qualification. No instrumented metadata-refresh, protocol-marker or protocol
+preflight failure appeared. Native stacks identify the local participant worker,
+concurrent prepare forwarding, and abort delivery; forwarding admission needs
+its own phase diagnostic before attributing the failure to capacity pressure.
+
+The Debug diagnostic executable (`5c86d5d44d0c2ab76f20320df6320c0d07613973cc585436a535fb530ae1ff67`)
+reproduced two late cascade failures in the first sixteen cases. Both traces
+pair `phase=forward_capacity err=RequestForwardCapacityUnavailable` with
+participant `prepare` returning `LeaderUnavailable`. Retained roots include
+`antfly-zig-metadata-backup-e2e-z7w_2h8n` and
+`antfly-zig-metadata-backup-e2e-c0bw1z84`. This identifies local fan-out admission
+pressure, not missing Raft leadership, as the repeated abort trigger.
+
+Raft batch forwarding now parks before transport when its bounded forwarding
+lane cannot reserve the complete HTTP task graph. Admission retains the same
+absolute routing deadline, borrowed clock, cancellation and retirement-aware
+capacity accounting. It neither increases worker limits nor retries a mutation
+already sent. A deterministic VoprIo regression admits eight callers through a
+single-grant lane and checks deadline expiry, cancellation and lease recovery.
+Final qualification of this correction is pending.
+
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
 
 Scheduled run `36247286560` passed qualification, all five campaigns, and the

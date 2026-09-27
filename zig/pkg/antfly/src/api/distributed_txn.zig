@@ -431,6 +431,7 @@ pub const HostedParticipantWorker = struct {
         switch (route) {
             .local => {
                 const result = self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, try self.localPreDecisionContext(deadline_ns)) catch |err| {
+                    std.log.warn("transaction prepare candidate failed group_id={} node_id={} phase=local err={s}", .{ group_id, attempted_node_id, @errorName(err) });
                     if (!isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_prepare_group_local_with_pre_decision_context != null)) return err;
                     return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline_ns);
                 };
@@ -452,6 +453,7 @@ pub const HostedParticipantWorker = struct {
                     budget.client_timeout_ms,
                     budget.server_budget_ms,
                 ) catch |err| {
+                    std.log.warn("transaction prepare candidate failed group_id={} node_id={} phase=remote err={s}", .{ group_id, attempted_node_id, @errorName(err) });
                     if (!shouldTryAnotherPreDecisionAttempt(err, &delivery_tracker)) return err;
                     return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, body, deadline_ns);
                 };

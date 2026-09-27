@@ -10656,9 +10656,46 @@ pub const DataServer = struct {
         return runtime.acquireRequestForwardLane() catch |err| switch (err) {
             // This request has not entered transport. Report safe admission
             // failure through the existing leader-unavailable classification.
-            error.RequestForwardCapacityUnavailable => error.LeaderUnavailable,
+            error.RequestForwardCapacityUnavailable => blk: {
+                std.log.warn("data raft pre-admission failed phase=forward_capacity err={s}", .{@errorName(err)});
+                break :blk error.LeaderUnavailable;
+            },
             else => err,
         };
+    }
+
+    fn acquireDataRaftForwardLaneUntil(
+        self: *DataServer,
+        group_id: u64,
+        deadline_ns: u64,
+        route: DataRaftBatchRoute,
+    ) !backend_runtime_mod.BackendRuntime.RequestForwardLaneLease {
+        const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+        // Participant fan-out can exceed the forwarding lane's instantaneous
+        // capacity. Admission pressure is local, not evidence that a group has
+        // no leader. Park the already-admitted caller before entering transport
+        // instead of aborting its transaction and replaying all its Raft work.
+        // Keep the same absolute routing budget and the executor's full-task
+        // reservations, including tasks still retiring after their lease ends.
+        while (true) {
+            try ensureDataRaftBatchRouteActive(route);
+            const now_ns = self.dataRaftMonotonicNs();
+            if (now_ns >= deadline_ns) {
+                std.log.warn("data raft pre-admission failed group_id={} phase=forward_capacity err=Timeout", .{group_id});
+                return error.LeaderUnavailable;
+            }
+            var lane = runtime.acquireRequestForwardLane() catch |err| {
+                if (err != error.RequestForwardCapacityUnavailable) return err;
+                try self.sleepDataRaftRetry(@min(deadline_ns - now_ns, data_raft_batch_leader_retry_sleep_ns));
+                continue;
+            };
+            errdefer lane.release();
+            // First-use executor initialization can consume budget too. Never
+            // hand transport a grant after cancellation or deadline expiry.
+            try ensureDataRaftBatchRouteActive(route);
+            if (self.dataRaftMonotonicNs() >= deadline_ns) return error.LeaderUnavailable;
+            return lane;
+        }
     }
 
     fn distributedReadExecutor(self: *DataServer) !antfly.common.http.RequestExecutor {
@@ -10931,9 +10968,12 @@ pub const DataServer = struct {
             .table_name = table_name,
         });
         if (route.discovery.mayRefreshCatalog()) {
-            self.refreshDataRaftMetadataForBatchGroupWithBudget(group_id, deadline_ns, route.cancellation) catch |err| switch (err) {
-                error.Timeout => return error.LeaderUnavailable,
-                else => return err,
+            self.refreshDataRaftMetadataForBatchGroupWithBudget(group_id, deadline_ns, route.cancellation) catch |err| {
+                std.log.warn("data raft pre-admission failed group_id={} phase=metadata_refresh err={s}", .{ group_id, @errorName(err) });
+                return switch (err) {
+                    error.Timeout => error.LeaderUnavailable,
+                    else => err,
+                };
             };
         } else if (raft.host.http_host.host.raftStatus(group_id) == null and self.remote_metadata != null) {
             // A forwarded request must never wait behind durable topology
@@ -10972,8 +11012,10 @@ pub const DataServer = struct {
                     // ambiguous write outcome: returning the latter would
                     // falsely tell ingress that this mutation may have
                     // committed and suppress safe routing fallback.
-                    const source_store = self.localTransitionApplyStore() orelse
+                    const source_store = self.localTransitionApplyStore() orelse {
+                        std.log.warn("data raft pre-admission failed group_id={} phase=transition_store err=unavailable", .{group_id});
                         return error.LeaderUnavailable;
+                    };
                     if (try source_store.currentMergeSourceState(alloc, group_id)) |merge_source| {
                         if (merge_source.phase == .finalized) return error.MergeSourceFenced;
                     }
@@ -10984,27 +11026,30 @@ pub const DataServer = struct {
                     protocol_preflight.activatable_version = activation_entry.protocol_version.load(.acquire);
                 } else if (activation_entry.activation_mutex.tryLock()) {
                     protocol_activation_lock_owned = true;
-                    const durable_version = self.durableDataRaftBatchProtocolVersion(group_id) catch |err| switch (err) {
-                        // These states are retryable, but marker state is
-                        // unknown. Return before proposing instead of silently
-                        // degrading an activated group to legacy encoding.
-                        error.ApplyStoreGroupRetired => {
-                            // Exact reconciliation normally removes this map
-                            // entry. If this request recreated it after that
-                            // cleanup, retire its map reference immediately so
-                            // stable metadata rounds remain allocation-free.
-                            self.unlinkDataRaftProtocolActivationEntry(group_id, activation_entry);
-                            return error.LeaderUnavailable;
-                        },
-                        error.SplitSourceProjectionNotReady,
-                        error.ApplyStoreShuttingDown,
-                        error.ApplyStoreOwnerCachePinned,
-                        error.ResourceBudgetExceeded,
-                        => return error.LeaderUnavailable,
-                        // Corruption, unsupported protocol floors, and storage
-                        // I/O failures are correctness failures and must retain
-                        // their identity for diagnostics.
-                        else => return err,
+                    const durable_version = self.durableDataRaftBatchProtocolVersion(group_id) catch |err| {
+                        std.log.warn("data raft pre-admission failed group_id={} phase=protocol_marker err={s}", .{ group_id, @errorName(err) });
+                        switch (err) {
+                            // These states are retryable, but marker state is
+                            // unknown. Return before proposing instead of silently
+                            // degrading an activated group to legacy encoding.
+                            error.ApplyStoreGroupRetired => {
+                                // Exact reconciliation normally removes this map
+                                // entry. If this request recreated it after that
+                                // cleanup, retire its map reference immediately so
+                                // stable metadata rounds remain allocation-free.
+                                self.unlinkDataRaftProtocolActivationEntry(group_id, activation_entry);
+                                return error.LeaderUnavailable;
+                            },
+                            error.SplitSourceProjectionNotReady,
+                            error.ApplyStoreShuttingDown,
+                            error.ApplyStoreOwnerCachePinned,
+                            error.ResourceBudgetExceeded,
+                            => return error.LeaderUnavailable,
+                            // Corruption, unsupported protocol floors, and storage
+                            // I/O failures are correctness failures and must retain
+                            // their identity for diagnostics.
+                            else => return err,
+                        }
                     };
                     if (durable_version >= required_protocol_version) {
                         activation_entry.protocol_version.store(durable_version, .release);
@@ -11046,7 +11091,10 @@ pub const DataServer = struct {
                     }
                 }
                 try ensureDataRaftBatchRouteActive(route);
-                if (self.dataRaftMonotonicNs() >= deadline_ns) return error.LeaderUnavailable;
+                if (self.dataRaftMonotonicNs() >= deadline_ns) {
+                    std.log.warn("data raft pre-admission failed group_id={} phase=protocol_preflight err=Timeout", .{group_id});
+                    return error.LeaderUnavailable;
+                }
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 if (req.restore_staging_scope) |scope| {
                     if (comptime linked_storage) {
@@ -11057,7 +11105,10 @@ pub const DataServer = struct {
                     // Preserve the remaining duration in the catalog's own
                     // clock domain; both sides may borrow simulated I/O.
                     const admission_now_ns = self.dataRaftMonotonicNs();
-                    if (admission_now_ns >= deadline_ns) return error.LeaderUnavailable;
+                    if (admission_now_ns >= deadline_ns) {
+                        std.log.warn("data raft pre-admission failed group_id={} phase=range_admission err=Timeout", .{group_id});
+                        return error.LeaderUnavailable;
+                    }
                     const admission_deadline_ns = admission_source.catalog.budget(null).nowNs() +|
                         (deadline_ns - admission_now_ns);
                     routed_write_admission = try admission_source.acquireRoutedWriteAdmission(
@@ -11441,7 +11492,7 @@ pub const DataServer = struct {
                                 // executor here escapes VoprIo and gives this
                                 // request a different clock/socket owner than
                                 // the Raft process that selected the route.
-                                var forward_lane = try self.acquireDataRaftForwardLane();
+                                var forward_lane = try self.acquireDataRaftForwardLaneUntil(group_id, deadline_ns, route);
                                 defer forward_lane.release();
                                 var executor = antfly.common.http.IoHttpExecutor.init(
                                     alloc,
@@ -11679,7 +11730,7 @@ pub const DataServer = struct {
         const target_store = findSnapshotStoreByNodeId(snapshot.stores, target_node_id) orelse return false;
         if (target_store.api_url.len == 0) return false;
 
-        var forward_lane = try self.acquireDataRaftForwardLane();
+        var forward_lane = try self.acquireDataRaftForwardLaneUntil(group_id, deadline_ns, route);
         defer forward_lane.release();
         var executor = antfly.common.http.IoHttpExecutor.init(
             alloc,
@@ -50211,6 +50262,117 @@ fn implementationTests() type {
             try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_slot_received_lsn{slot=\"standby-a\"} 0\n") != null);
             try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_slot_status_code{slot=\"standby-a\"} 2\n") != null);
             try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_mirror_failures_total 0\n") != null);
+        }
+
+        test "data raft forwarding admission waits within the borrowed deadline and cancellation" {
+            const vopr = @import("vopr");
+            const alloc = std.testing.allocator;
+            const Mode = enum { fanout, deadline, cancellation, expired };
+            for ([_]Mode{ .fanout, .deadline, .cancellation, .expired }) |mode| {
+                var virtual_io = try vopr.vopr_io.VoprIo.init(.{
+                    .required = .of(&.{ .clock_read, .sleep, .task_scheduling }),
+                });
+                defer virtual_io.deinit();
+                const io = virtual_io.io();
+                var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+                    .backend = .manual,
+                    .lane_limits = .{ .request_forward = @import("../common/threaded_io_limits.zig").request_forward_workers_per_request },
+                    .borrowed_io = .{ .general = io, .control = io, .request_forward = io },
+                });
+                defer runtime.deinit();
+                var server: DataServer = undefined;
+                server.backend_runtime = runtime.ptr();
+                var held = try runtime.ptr().acquireRequestForwardLane();
+                defer held.release();
+                try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.ptr().acquireRequestForwardLane());
+                try std.testing.expectError(error.LeaderUnavailable, server.acquireDataRaftForwardLane());
+                var cancellation: antfly.raft.transport.http_common.RequestCancellation = .{};
+                var active: usize = 0;
+                var peak_active: usize = 0;
+                const Worker = struct {
+                    server: *DataServer,
+                    deadline_ns: u64,
+                    cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
+                    active: *usize,
+                    peak_active: *usize,
+                    entered_transport: bool = false,
+                    failure: ?anyerror = null,
+
+                    fn run(self: *@This()) void {
+                        var lane = self.server.acquireDataRaftForwardLaneUntil(7, self.deadline_ns, .{ .discovery = .cached, .cancellation = self.cancellation }) catch |err| {
+                            self.failure = err;
+                            return;
+                        };
+                        defer lane.release();
+                        self.entered_transport = true;
+                        self.active.* += 1;
+                        defer self.active.* -= 1;
+                        self.peak_active.* = @max(self.peak_active.*, self.active.*);
+                        self.server.sleepDataRaftRetry(5 * std.time.ns_per_ms) catch |err| {
+                            self.failure = err;
+                        };
+                    }
+                };
+                var workers: [8]Worker = undefined;
+                const worker_count: usize = if (mode == .fanout) workers.len else 1;
+                for (workers[0..worker_count]) |*worker| {
+                    worker.* = .{
+                        .server = &server,
+                        .deadline_ns = switch (mode) {
+                            .fanout, .cancellation => 5 * std.time.ns_per_s,
+                            .deadline => 120 * std.time.ns_per_ms,
+                            .expired => 0,
+                        },
+                        .cancellation = if (mode == .cancellation) &cancellation else null,
+                        .active = &active,
+                        .peak_active = &peak_active,
+                    };
+                    _ = io.async(Worker.run, .{worker});
+                }
+                if (mode == .fanout) {
+                    _ = io.async(struct {
+                        fn release(s: *DataServer, lease: *backend_runtime_mod.BackendRuntime.RequestForwardLaneLease) void {
+                            s.sleepDataRaftRetry(75 * std.time.ns_per_ms) catch unreachable;
+                            lease.release();
+                        }
+                    }.release, .{ &server, &held });
+                } else if (mode == .cancellation) {
+                    _ = io.async(struct {
+                        fn cancel(s: *DataServer, token: *antfly.raft.transport.http_common.RequestCancellation) void {
+                            s.sleepDataRaftRetry(10 * std.time.ns_per_ms) catch unreachable;
+                            token.cancel();
+                        }
+                    }.cancel, .{ &server, &cancellation });
+                }
+                var enabled: vopr.transition.List = .{};
+                defer enabled.deinit(alloc);
+                var events: vopr.event.Sink = .{};
+                defer events.deinit(alloc);
+                while (!virtual_io.scheduler().quiescent()) {
+                    enabled.items.clearRetainingCapacity();
+                    try virtual_io.scheduler().enumerateReady(&enabled, alloc);
+                    try enabled.canonicalize();
+                    if (enabled.items.items.len == 0) return error.VoprForwardAdmissionDeadlock;
+                    try virtual_io.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+                }
+                try std.testing.expectEqual(@as(usize, 0), active);
+                for (workers[0..worker_count]) |worker| {
+                    if (mode == .fanout) {
+                        try std.testing.expect(worker.failure == null);
+                        try std.testing.expect(worker.entered_transport);
+                    } else {
+                        try std.testing.expectEqual(if (mode == .cancellation) error.Cancelled else error.LeaderUnavailable, worker.failure.?);
+                        try std.testing.expect(!worker.entered_transport);
+                    }
+                }
+                if (mode == .fanout) try std.testing.expectEqual(@as(usize, 1), peak_active);
+                if (mode == .deadline) try std.testing.expectEqual(@as(u64, 120 * std.time.ns_per_ms), server.dataRaftMonotonicNs());
+                if (mode == .expired) try std.testing.expectEqual(@as(u64, 0), server.dataRaftMonotonicNs());
+                held.release();
+                var recovered = try runtime.ptr().acquireRequestForwardLane();
+                recovered.release();
+                try virtual_io.ensureNoCapabilityViolation();
+            }
         }
 
         test "data raft retry clock and sleep borrow VoprIo" {
