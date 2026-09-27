@@ -18,7 +18,7 @@
 // entity/relation extraction feeding a graph index (the "autograph" pattern).
 //
 // It dogfoods the docs cleanup itself: design docs (zig/*.md, zig/pkg/**/*.md,
-// zig/lib/**/*.md, docs/design/**) and work-log entries (work-log/**/*.md) are
+// zig/lib/**/*.md, docs/design/**) and topic history (docs/**/history/**/*.md) are
 // ingested as distinct document kinds, so `dogfood query` and `dogfood entity`
 // can be used to sanity-check that the split reads sensibly end to end.
 package main
@@ -96,7 +96,7 @@ Usage:
 func runIngestCmd(args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
 	dbPath := fs.String("db", "dogfood.aflite", "Antfly Lite database path")
-	repoRoot := fs.String("repo", "../..", "repository root to ingest design docs and work-log from")
+	repoRoot := fs.String("repo", "../..", "repository root to ingest design docs, plans, and history from")
 	reset := fs.Bool("reset", false, "remove the existing Lite database before ingesting")
 	inferenceURL := fs.String("inference-url", defaultInferenceURL, "optional remote antfly inference server (e.g. http://127.0.0.1:8090); empty runs inference in-process")
 	embedModel := fs.String("embed-model", defaultEmbedModel, "Antfly inference embedding model for chunk_vectors")

@@ -78,7 +78,7 @@ RELEASE_FILES = {
     "scripts/publish-zig-runtime-dev.sh",
     "scripts/test_install_download_markers.sh",
     "scripts/test_quickstart_docs.py",
-    "docs/cli-packaging.md",
+    "docs/reference/cli-packaging.md",
     "docs/guides/quickstart.mdx",
     "RELEASE.md",
     "zig/Dockerfile.runtime",

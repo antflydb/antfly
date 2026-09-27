@@ -90,7 +90,7 @@ runs rather than proven runtime-status contract bugs.
 > **Relocated:** The dated 2026-05-01 E2E observation notes (30 lines,
 > including specific failing test names and counters) that previously lived
 > here are preserved verbatim in
-> [work-log/completed/status/dated-e2e-observations-2026-05.md](../work-log/completed/status/dated-e2e-observations-2026-05.md).
+> [docs/operations/status/history/dated-e2e-observations-2026-05.md](../docs/operations/status/history/dated-e2e-observations-2026-05.md).
 
 ### Missing Shards Are Not First-Class
 

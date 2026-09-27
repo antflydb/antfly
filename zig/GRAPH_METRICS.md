@@ -942,7 +942,7 @@ Roadmap summary:
 
 ### Distributed Execution Roadmap
 
-> **Relocated:** The detailed per-phase implementation logs and the eight successive restatements of the remaining distributed-execution roadmap that previously lived here (4811 lines) are preserved verbatim in [work-log/completed/graph-metrics/roadmap-restatements.md](../work-log/completed/graph-metrics/roadmap-restatements.md). Durable decisions from them are folded into the table below and into Resolved Design Defaults.
+> **Relocated:** The detailed per-phase implementation logs and the eight successive restatements of the remaining distributed-execution roadmap that previously lived here (4811 lines) are preserved verbatim in [docs/design/graph-metrics/history/roadmap-restatements.md](../docs/design/graph-metrics/history/roadmap-restatements.md). Durable decisions from them are folded into the table below and into Resolved Design Defaults.
 
 Standing product contract (holds across every phase below):
 

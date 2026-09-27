@@ -23,12 +23,12 @@ Antfly Lite database (`.aflite`) and builds a small knowledge graph over them:
   depth-2, both-direction traversal of the knowledge graph starting from the
   matched documents.
 
-This dogfoods the docs cleanup itself: every ingested row is tagged
-`kind: "design"` (design docs under `zig/*.md`, `zig/pkg/**/*.md`,
-`zig/lib/**/*.md`, `docs/design/**`) or `kind: "work-log"`
-(`work-log/**/*.md`), so `dogfood query` and `dogfood entity` can be used to
-sanity-check that the split between durable design docs and point-in-time
-work-log entries reads sensibly end to end.
+Every ingested row is tagged `kind: "design"` for living subsystem docs,
+`kind: "plan"` for `docs/plans/`, or `kind: "work-log"` for records under
+`docs/**/history/`. The historical kind value remains compatible with existing
+queries. The corpus includes Zig subsystem docs, `docs/design/`, plans, and
+operations/reference history. Use `dogfood query` and `dogfood entity` to check
+that durable decisions and dated evidence remain distinguishable.
 
 ## Prerequisites
 

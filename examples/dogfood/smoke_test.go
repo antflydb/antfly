@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -198,5 +199,44 @@ func TestEntityKeyCandidates(t *testing.T) {
 	candidates := entityKeyCandidates("metadata server")
 	if len(candidates) != 1 || candidates[0] != "entity/metadata_server" {
 		t.Fatalf("expected the label-free entity key, got %v", candidates)
+	}
+}
+
+// TestDocumentationCorpus verifies that the consolidated paths still ingest
+// living docs, proposed work, and historical evidence with distinct kinds.
+func TestDocumentationCorpus(t *testing.T) {
+	repo := t.TempDir()
+	fixtures := map[string]string{
+		"zig/DB.md":              "design",
+		"docs/design/storage.md": "design",
+		"docs/design/inference/history/qualification.md":     "work-log",
+		"docs/operations/http-runtime/history/checkpoint.md": "work-log",
+		"docs/reference/licensing/history/validation.md":     "work-log",
+		"docs/plans/operator.md":                             "plan",
+	}
+	for path := range fixtures {
+		full := filepath.Join(repo, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("# Fixture\n\nDocumentation body.\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sections, err := collectDocSections(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := make(map[string]string)
+	for _, section := range sections {
+		found[section.Source] = section.Kind
+	}
+	if len(found) != len(fixtures) {
+		t.Fatalf("ingested %d paths, want %d: %v", len(found), len(fixtures), found)
+	}
+	for path, kind := range fixtures {
+		if found[path] != kind {
+			t.Errorf("%s: kind = %q, want %q", path, found[path], kind)
+		}
 	}
 }
