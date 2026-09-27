@@ -31,7 +31,10 @@
 /// shadow-interval publication, and supports retained-source staged rewrites.
 /// Version 12 binds retained source Scope v2 to an explicit Raft/native
 /// authority. Older decoders must not reinterpret its clock or pin identity.
-pub const batch_protocol_version: u16 = 12;
+/// Version 13 batches coordinator acknowledgements. All applying replicas
+/// must cross the durable activation barrier before this command is admitted.
+pub const batch_protocol_version: u16 = 13;
+pub const batch_acknowledge_many_protocol_version: u16 = 13;
 pub const batch_timestamp_protocol_version: u16 = 1;
 pub const batch_activation_barrier_protocol_version: u16 = 2;
 pub const batch_merge_transition_protocol_version: u16 = 3;

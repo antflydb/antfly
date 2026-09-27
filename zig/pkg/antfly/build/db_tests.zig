@@ -635,6 +635,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.db.test.db batch enforces optimistic version predicates",
             "coordinator recovery durably aborts a stale prepared transaction",
             "idempotent begin upgrades a legacy transaction coordinator role",
+            "transaction participant batch",
             "transaction recovery delegates stale coordinator abort to replicated resolver",
             "replicated recovery is coordinator-owned and acknowledges through hooks",
             "transaction recovery drains terminal HA outbox without remaining intents",

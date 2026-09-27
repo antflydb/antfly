@@ -2328,6 +2328,12 @@ pub const DBCore = struct {
         try manager.markParticipantResolvedExtraBatch(txn_id, participant, extra_batch);
     }
 
+    pub fn markTransactionParticipantsResolvedExtraBatch(self: *DBCore, txn_id: transactions_mod.TxnId, participants: []const []const u8, extra_batch: transactions_mod.MutationExtraBatch) !void {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.markParticipantsResolvedExtraBatch(txn_id, participants, extra_batch);
+    }
+
     pub fn cleanupTransactionMetadataIfEligible(
         self: *DBCore,
         txn_id: transactions_mod.TxnId,

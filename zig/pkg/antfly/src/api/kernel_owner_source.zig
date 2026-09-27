@@ -4419,7 +4419,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn restoreDescriptorUseForBatch(req: db_types.BatchRequest) RestoreDescriptorUse {
         if (req.transaction) |txn| switch (txn) {
-            .resolve, .acknowledge, .cleanup => return .resolve,
+            .resolve, .acknowledge, .acknowledge_many, .cleanup => return .resolve,
             else => {},
         };
         return .mutate;
@@ -4434,7 +4434,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             return self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation });
         }
         if (req.transaction) |txn| switch (txn) {
-            .resolve, .acknowledge => if (try self.acquireHiddenTransactionOwner(group_id, table_name)) |lease| return lease,
+            .resolve, .acknowledge, .acknowledge_many => if (try self.acquireHiddenTransactionOwner(group_id, table_name)) |lease| return lease,
             else => {},
         };
         return self.acquire(group_id, table_name);

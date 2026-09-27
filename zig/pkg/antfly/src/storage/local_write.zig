@@ -491,6 +491,13 @@ pub fn applyReplicatedTransactionMutationInternal(
             transactions_mod.TxnError.TxnNotFound => {},
             else => return err,
         },
+        .acknowledge_many => |ack| (if (raft_entry) |entry|
+            db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(ack.txn_id, ack.participants, entry)
+        else
+            db.markTransactionParticipantsResolved(ack.txn_id, ack.participants)) catch |err| switch (err) {
+            transactions_mod.TxnError.TxnNotFound => {},
+            else => return err,
+        },
         .cleanup => |cleanup| {
             if (raft_entry) |entry|
                 _ = try db.cleanupReplicatedTransactionAtRaftEntry(

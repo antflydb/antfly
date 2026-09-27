@@ -505,6 +505,10 @@ pub const Operations = struct {
                     return error.InvalidArgument,
                 .acknowledge => |acknowledge| if (distributed_txn.parseParticipantRef(acknowledge.participant) == null)
                     return error.InvalidArgument,
+                .acknowledge_many => |ack| {
+                    if (ack.participants.len == 0 or ack.participants.len > 64) return error.InvalidArgument;
+                    for (ack.participants) |participant| if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidArgument;
+                },
                 .cleanup => {},
             }
             break :transaction .transaction;

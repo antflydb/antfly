@@ -10464,6 +10464,66 @@ pub const MetadataHttpService = struct {
         };
     }
 
+    pub fn planningSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
+        var inputs = try self.captureTransitionReadinessInputs();
+        defer inputs.deinit(self.alloc);
+        var snapshot: metadata_api.AdminSnapshot = .{
+            .planning_view = true,
+            .status = try self.metadataStatus(),
+            .tables = &.{},
+            .ranges = &.{},
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+        };
+        errdefer self.freeAdminSnapshot(&snapshot);
+        const lease = lease: {
+            self.lockComponents();
+            defer self.unlockComponents();
+            self.catalog_projection_reader.lock();
+            defer self.catalog_projection_reader.unlock();
+            break :lease try self.catalog_projection_reader.validationLeaseLocked(self.alloc, self.metadata_group_id, self.catalogProjectionSource());
+        };
+        var catalog = lease;
+        defer catalog.deinit();
+        const source = catalog.snapshot();
+        var tables: std.ArrayListUnmanaged(metadata_table_manager.TableRecord) = .empty;
+        errdefer {
+            for (tables.items) |table| metadata_table_manager.freeTable(self.alloc, table);
+            tables.deinit(self.alloc);
+        }
+        try tables.ensureTotalCapacity(self.alloc, source.tables.len);
+        for (source.tables) |table| tables.appendAssumeCapacity(try metadata_table_manager.cloneTable(self.alloc, .{ .table_id = table.table_id, .name = table.name }));
+        snapshot.tables = try tables.toOwnedSlice(self.alloc);
+        // Ownership transferred; an error later must not free the table array twice.
+        tables = .empty;
+        snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, source.ranges);
+        snapshot.merged_group_statuses = try metadata_state.mergeHealthyGroupStatuses(self.alloc, snapshot.tables, snapshot.ranges, inputs.placement_intents, &.{}, inputs.stores, &.{}, &.{}, &.{}, &.{});
+        return snapshot;
+    }
+
+    pub fn peerSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
+        var inputs = try self.captureTransitionReadinessInputs();
+        defer inputs.deinit(self.alloc);
+        var snapshot: metadata_api.AdminSnapshot = .{
+            .peer_view = true,
+            .status = try self.metadataStatus(),
+            .tables = &.{},
+            .ranges = &.{},
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+        };
+        errdefer self.freeAdminSnapshot(&snapshot);
+        snapshot.stores = try cloneProjectedStoresOwned(self.alloc, inputs.stores);
+        snapshot.placement_intents = try cloneProjectedPlacementIntentsOwned(self.alloc, inputs.placement_intents);
+        snapshot.merged_group_statuses = try metadata_state.mergeHealthyGroupStatuses(self.alloc, &.{}, &.{}, snapshot.placement_intents, &.{}, snapshot.stores, &.{}, &.{}, &.{}, &.{});
+        snapshot.peer_view_revision = try @import("peer_view.zig").revision(self.alloc, snapshot);
+        return snapshot;
+    }
+
     pub fn controlSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
         return self.buildAdminSnapshot(false);
     }
@@ -20622,6 +20682,36 @@ test "metadata http service catalog cache is independent from volatile projectio
     try std.testing.expectEqual(live_raft.votes_granted, fallback_status.metadata_raft_votes_granted);
     try std.testing.expectEqual(live_raft.votes_rejected, fallback_status.metadata_raft_votes_rejected);
     try std.testing.expectEqual(live_raft.votes_unknown, fallback_status.metadata_raft_votes_unknown);
+
+    var large_schema: [65536]u8 = @splat(' ');
+    large_schema[0] = '{';
+    large_schema[1] = '}';
+    const table_receipt = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_table = .{ .table_id = 777, .name = "compact-view", .schema_json = &large_schema } });
+    try svc.waitForTransitionApplied(table_receipt);
+    const range_receipt = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_range = .{ .group_id = 77701, .table_id = 777, .start_key = "" } });
+    try svc.waitForTransitionApplied(range_receipt);
+    var full_view = try svc.controlSnapshot();
+    defer svc.freeAdminSnapshot(&full_view);
+    try std.testing.expectEqual(@as(usize, 1), full_view.tables.len);
+    var peers_view = try svc.peerSnapshot();
+    defer svc.freeAdminSnapshot(&peers_view);
+    var planning_view = try svc.planningSnapshot();
+    defer svc.freeAdminSnapshot(&planning_view);
+    try std.testing.expect(peers_view.peer_view and planning_view.planning_view);
+    try std.testing.expectEqual(@as(usize, 0), peers_view.tables.len);
+    try std.testing.expectEqual(@as(usize, 0), peers_view.ranges.len);
+    try std.testing.expectEqual(@as(usize, 1), planning_view.tables.len);
+    try std.testing.expectEqual(@as(usize, 0), planning_view.tables[0].schema_json.len);
+    try std.testing.expectEqual(@as(u64, 77701), planning_view.ranges[0].group_id);
+    const full_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, full_view, .{});
+    defer std.testing.allocator.free(full_bytes);
+    const peers_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, peers_view, .{});
+    defer std.testing.allocator.free(peers_bytes);
+    const planning_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, planning_view, .{});
+    defer std.testing.allocator.free(planning_bytes);
+    try std.testing.expect(peers_bytes.len * 10 < full_bytes.len);
+    try std.testing.expect(planning_bytes.len * 10 < full_bytes.len);
+    std.debug.print("compact-view bytes full={d} peers={d} planning={d}\n", .{ full_bytes.len, peers_bytes.len, planning_bytes.len });
 
     // Teardown closes callback admission permanently. A concurrent catalog
     // reader must observe cancellation instead of silently proceeding after

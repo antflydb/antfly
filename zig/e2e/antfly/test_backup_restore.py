@@ -1164,8 +1164,24 @@ class ThreeByThreeBackupCluster:
             )
             self.metadata_procs.append(proc)
 
-        for url in self.metadata_admin_urls:
-            if not wait_for_server(url, path="/metadata/v1/status", timeout=30.0):
+        metadata_processes = [
+            (f"metadata-{i + 1}", proc) for i, proc in enumerate(self.metadata_procs)
+        ]
+
+        def metadata_ready(url):
+            return wait_for_server(
+                url,
+                path="/metadata/v1/status",
+                timeout=30.0,
+                processes=metadata_processes,
+            )
+
+        for url, live in zip(
+            self.metadata_admin_urls,
+            self._metadata_probe_executor.map(metadata_ready, self.metadata_admin_urls),
+            strict=True,
+        ):
+            if not live:
                 raise RuntimeError(
                     f"metadata server failed to start at {url}\n{self.debug_logs()}"
                 )
@@ -1192,9 +1208,24 @@ class ThreeByThreeBackupCluster:
                 ),
             )
             self.data_procs.append(proc)
-            if not wait_for_server(data_api_url, timeout=30.0):
+        # Every process starts before readiness joins. Preserve fresh roots and
+        # per-node leases while overlapping independent open/listener work.
+        processes = [(f"data-{i + 4}", proc) for i, proc in enumerate(self.data_procs)]
+        processes.extend(
+            (f"metadata-{i + 1}", proc) for i, proc in enumerate(self.metadata_procs)
+        )
+
+        def ready(url):
+            return wait_for_server(url, timeout=30.0, processes=processes)
+
+        for url, live in zip(
+            self.data_api_urls,
+            self._metadata_probe_executor.map(ready, self.data_api_urls),
+            strict=True,
+        ):
+            if not live:
                 raise RuntimeError(
-                    f"data server failed to start at {data_api_url}\n{self.debug_logs()}"
+                    f"data server failed to start at {url}\n{self.debug_logs()}"
                 )
 
         if not wait_until(
@@ -1612,26 +1643,24 @@ class ThreeByThreeBackupCluster:
         if not self._metadata_probe_executor_shutdown:
             self._metadata_probe_executor.shutdown(wait=True, cancel_futures=True)
             self._metadata_probe_executor_shutdown = True
-        self.port_reservations.close()
-        for proc in reversed(self.data_procs):
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-        self.data_procs = []
+        from process_lifecycle import stop_processes
 
-        for proc in reversed(self.metadata_procs):
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-        self.metadata_procs = []
+        # Data nodes finish before metadata stops. Within each role all nodes
+        # are signalled first; listener leases remain held until every exit.
+        failures = []
+        for attribute in ("data_procs", "metadata_procs"):
+            try:
+                stop_processes(list(reversed(getattr(self, attribute))))
+            except Exception as error:
+                failures.append(error)
+            else:
+                setattr(self, attribute, [])
+        if failures:
+            # Keep ownership, logs, roots and listener leases for unreaped
+            # processes. Still attempt both role stages before reporting.
+            maybe_preserve_tempdir(self.tempdir, failed=True)
+            raise ExceptionGroup("cluster shutdown failed", failures)
+        self.port_reservations.close()
 
         for handle in [*self.data_log_files, *self.metadata_log_files]:
             if not handle.closed:

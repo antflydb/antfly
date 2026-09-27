@@ -83,6 +83,8 @@ const max_read_guards_per_transaction = 65_536;
 const schema_leases_prefix = "\x00\x00__txn_schema_leases__:";
 const records_prefix = "\x00\x00__txn_records__:";
 const participants_prefix = "\x00\x00__txn_participants__:";
+const participant_index_prefix = "\x00\x00__txn_participant_index_v1__:";
+const resolved_index_prefix = "\x00\x00__txn_resolved_index_v1__:";
 const resolved_participants_prefix = "\x00\x00__txn_resolved_participants__:";
 const ha_batch_outbox_prefix = "\x00\x00__txn_ha_batch_outbox__:";
 const ha_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
@@ -1368,6 +1370,22 @@ pub const TxnManager = struct {
                 const txn_id = record_entry.key[records_prefix.len..][0..16].*;
                 const participant_key = makeSidecarKey(participants_prefix, txn_id);
                 const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
+                const index_key = makeSidecarKey(participant_index_prefix, txn_id);
+                if (read.get(&index_key)) |raw_index| {
+                    const indexed = try ParticipantIndex.decode(raw_index);
+                    const legacy = read.get(&resolved_key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (legacy != null) {
+                        const members = try resolvedParticipantsInRead(self.alloc, &read, txn_id);
+                        defer freeParticipantList(self.alloc, members);
+                        if (members.len > indexed.enlisted) return error.InvalidTxnRecord;
+                        if (members.len != indexed.enlisted) return true;
+                    } else if (indexed.resolved != indexed.enlisted) return true;
+                    entry = try cursor.next();
+                    continue;
+                } else |err| if (err != error.NotFound) return err;
                 const participant_count = try participantListCountInRead(&read, &participant_key);
                 const resolved_count = try participantListCountInRead(&read, &resolved_key);
                 if (resolved_count > participant_count) return TxnError.InvalidTxnRecord;
@@ -1444,6 +1462,8 @@ pub const TxnManager = struct {
         participant: []const u8,
         extra_batch: MutationExtraBatch,
     ) !void {
+        const index_key = makeSidecarKey(participant_index_prefix, txn_id);
+        if (try self.keyExists(&index_key)) return self.markParticipantsResolvedExtraBatch(txn_id, &.{participant}, extra_batch);
         // A replicated acknowledgement can be retried after the coordinator
         // has already cleaned the transaction. Do not recreate an orphaned
         // resolved-participants sidecar in that case, and reject corrupt
@@ -1492,34 +1512,125 @@ pub const TxnManager = struct {
         try self.applyBatch(writes.items, extra_batch.deletes, null);
     }
 
+    pub fn markParticipantsResolvedExtraBatch(self: *TxnManager, txn_id: TxnId, acknowledgements: []const []const u8, extra_batch: MutationExtraBatch) !void {
+        if (acknowledgements.len == 0 or acknowledgements.len > 64) return error.InvalidParticipant;
+        _ = try self.loadTransactionRecord(txn_id);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const index_key = makeSidecarKey(participant_index_prefix, txn_id);
+        const raw = self.getAlloc(scratch, &index_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        var indexed = if (raw) |bytes| try ParticipantIndex.decode(bytes) else ParticipantIndex{};
+        var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
+        var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
+        var enlisted: std.StringHashMapUnmanaged(void) = .empty;
+        if (raw == null) {
+            const participants = try self.getParticipants(scratch, txn_id);
+            for (participants) |participant| {
+                const member = try enlisted.getOrPut(scratch, participant);
+                if (member.found_existing) continue;
+                indexed.enlisted += 1;
+                const key = try scratch.dupe(u8, &makeParticipantIndexKey(participant_index_prefix, txn_id, participant));
+                try writes.append(scratch, .{ .key = key, .value = participant });
+            }
+        }
+        // Validate every member before any mutation. The immutable membership
+        // index replaces repeated cohort-sized decode and membership scans.
+        for (acknowledgements) |participant| {
+            if (raw == null) {
+                if (!enlisted.contains(participant)) return error.InvalidParticipant;
+            } else {
+                const key = makeParticipantIndexKey(participant_index_prefix, txn_id, participant);
+                const member = self.getAlloc(scratch, &key) catch |err| switch (err) {
+                    error.NotFound => return error.InvalidParticipant,
+                    else => return err,
+                };
+                if (!std.mem.eql(u8, member, participant)) return error.InvalidTxnRecord;
+            }
+        }
+        var resolved: std.StringHashMapUnmanaged(void) = .empty;
+        // A local resolution may atomically have used the legacy sidecar.
+        // Absorb it once, preserving all independently durable evidence.
+        const legacy_key = makeSidecarKey(resolved_participants_prefix, txn_id);
+        const legacy_members = try self.loadParticipantSet(scratch, resolved_participants_prefix, txn_id);
+        for (legacy_members) |participant| {
+            if (raw == null) {
+                if (!enlisted.contains(participant)) return error.InvalidTxnRecord;
+            } else {
+                const member_key = makeParticipantIndexKey(participant_index_prefix, txn_id, participant);
+                const member = self.getAlloc(scratch, &member_key) catch |err| switch (err) {
+                    error.NotFound => return error.InvalidTxnRecord,
+                    else => return err,
+                };
+                if (!std.mem.eql(u8, member, participant)) return error.InvalidTxnRecord;
+            }
+            try resolved.put(scratch, participant, {});
+        }
+        for (acknowledgements) |participant| try resolved.put(scratch, participant, {});
+        var members = resolved.keyIterator();
+        while (members.next()) |participant| {
+            const key = makeParticipantIndexKey(resolved_index_prefix, txn_id, participant.*);
+            const existing = self.getAlloc(scratch, &key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (existing) |value| {
+                if (!std.mem.eql(u8, value, participant.*)) return error.InvalidTxnRecord;
+            } else {
+                indexed.resolved += 1;
+                try writes.append(scratch, .{ .key = try scratch.dupe(u8, &key), .value = participant.* });
+            }
+        }
+        if (indexed.resolved > indexed.enlisted) return error.InvalidTxnRecord;
+        var encoded: [17]u8 = undefined;
+        indexed.encode(&encoded);
+        try writes.append(scratch, .{ .key = &index_key, .value = &encoded });
+        try writes.appendSlice(scratch, extra_batch.writes);
+        try deletes.append(scratch, &legacy_key);
+        try deletes.appendSlice(scratch, extra_batch.deletes);
+        // Membership migration, resolution entries, count proof and the Raft
+        // replay marker publish in one storage batch. No growing list rewrite.
+        try self.applyBatch(writes.items, deletes.items, null);
+    }
+
     pub fn getParticipants(self: *TxnManager, alloc: Allocator, txn_id: TxnId) ![][]u8 {
         return try self.loadParticipantSet(alloc, participants_prefix, txn_id);
     }
 
     pub fn getResolvedParticipants(self: *TxnManager, alloc: Allocator, txn_id: TxnId) ![][]u8 {
-        return try self.loadParticipantSet(alloc, resolved_participants_prefix, txn_id);
+        const index_key = makeSidecarKey(participant_index_prefix, txn_id);
+        if (!(try self.keyExists(&index_key))) return self.loadParticipantSet(alloc, resolved_participants_prefix, txn_id);
+        var read = try self.store.beginRead();
+        defer read.abort();
+        return resolvedParticipantsInRead(alloc, &read, txn_id);
     }
 
     pub fn getUnresolvedParticipants(self: *TxnManager, alloc: Allocator, txn_id: TxnId) ![][]u8 {
         const participants = try self.getParticipants(alloc, txn_id);
-        errdefer freeParticipantList(alloc, participants);
+        defer freeParticipantList(alloc, participants);
         const resolved = try self.getResolvedParticipants(alloc, txn_id);
         defer freeParticipantList(alloc, resolved);
 
+        var resolved_set: std.StringHashMapUnmanaged(void) = .empty;
+        defer resolved_set.deinit(alloc);
+        for (resolved) |participant| try resolved_set.put(alloc, participant, {});
         var unresolved = std.ArrayListUnmanaged([]u8).empty;
         errdefer {
             for (unresolved.items) |entry| alloc.free(entry);
             unresolved.deinit(alloc);
         }
 
-        outer: for (participants) |participant| {
-            for (resolved) |done| {
-                if (std.mem.eql(u8, participant, done)) continue :outer;
+        try unresolved.ensureTotalCapacity(alloc, participants.len);
+        for (participants) |participant| {
+            if (resolved_set.contains(participant)) {
+                continue;
             }
-            try unresolved.append(alloc, try alloc.dupe(u8, participant));
+            unresolved.appendAssumeCapacity(try alloc.dupe(u8, participant));
         }
 
-        freeParticipantList(alloc, participants);
         return try unresolved.toOwnedSlice(alloc);
     }
 
@@ -2223,6 +2334,14 @@ pub const TxnManager = struct {
         try deletes.append(self.alloc, &admission_key);
         try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &ha_batch_key, &ha_replay_key, &intent_keys_key, &schema_lease_key });
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
+        const member_prefix = makeSidecarKey(participant_index_prefix, txn_id);
+        const resolution_prefix = makeSidecarKey(resolved_index_prefix, txn_id);
+        const members = try self.scanPrefix(self.alloc, &member_prefix);
+        defer backend_scan.freeResults(self.alloc, members);
+        const resolutions = try self.scanPrefix(self.alloc, &resolution_prefix);
+        defer backend_scan.freeResults(self.alloc, resolutions);
+        for (members) |member| try deletes.append(self.alloc, member.key);
+        for (resolutions) |resolution| try deletes.append(self.alloc, resolution.key);
         try self.applyBatch(extra_batch.writes, deletes.items, null);
     }
 
@@ -2459,6 +2578,76 @@ fn makeSidecarKey(comptime prefix: []const u8, txn_id: TxnId) [prefix.len + 16]u
     @memcpy(key_buf[0..prefix.len], prefix);
     @memcpy(key_buf[prefix.len..], &txn_id);
     return key_buf;
+}
+
+const ParticipantIndex = struct {
+    enlisted: u64 = 0,
+    resolved: u64 = 0,
+    fn decode(bytes: []const u8) !ParticipantIndex {
+        if (bytes.len != 17 or bytes[0] != 1) return error.InvalidTxnRecord;
+        const result: ParticipantIndex = .{ .enlisted = std.mem.readInt(u64, bytes[1..9], .little), .resolved = std.mem.readInt(u64, bytes[9..17], .little) };
+        if (result.resolved > result.enlisted) return error.InvalidTxnRecord;
+        return result;
+    }
+    fn encode(self: ParticipantIndex, bytes: *[17]u8) void {
+        bytes[0] = 1;
+        std.mem.writeInt(u64, bytes[1..9], self.enlisted, .little);
+        std.mem.writeInt(u64, bytes[9..17], self.resolved, .little);
+    }
+};
+
+fn makeParticipantIndexKey(comptime prefix: []const u8, txn_id: TxnId, participant: []const u8) [prefix.len + 16 + 32]u8 {
+    var key: [prefix.len + 16 + 32]u8 = undefined;
+    @memcpy(key[0..prefix.len], prefix);
+    @memcpy(key[prefix.len..][0..16], &txn_id);
+    std.crypto.hash.sha2.Sha256.hash(participant, key[prefix.len + 16 ..][0..32], .{});
+    return key;
+}
+
+fn resolvedParticipantsInRead(alloc: Allocator, read: *backend_erased.ReadTxn, txn_id: TxnId) ![][]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    const legacy_key = makeSidecarKey(resolved_participants_prefix, txn_id);
+    const legacy = read.get(&legacy_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (legacy) |bytes| for (try decodeParticipantList(scratch, bytes)) |name| try names.put(scratch, name, {});
+    const prefix = makeSidecarKey(resolved_index_prefix, txn_id);
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var entry = try cursor.seekAtOrAfter(&prefix);
+    var count: u64 = 0;
+    while (entry) |row| {
+        if (!std.mem.startsWith(u8, row.key, &prefix)) break;
+        const expected = makeParticipantIndexKey(resolved_index_prefix, txn_id, row.value);
+        if (row.value.len == 0 or !std.mem.eql(u8, row.key, &expected)) return error.InvalidTxnRecord;
+        try names.put(scratch, try scratch.dupe(u8, row.value), {});
+        count += 1;
+        entry = try cursor.next();
+    }
+    const marker_key = makeSidecarKey(participant_index_prefix, txn_id);
+    const indexed = try ParticipantIndex.decode(try read.get(&marker_key));
+    if (count != indexed.resolved or names.count() > indexed.enlisted) return error.InvalidTxnRecord;
+    const result = try alloc.alloc([]u8, names.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |name| alloc.free(name);
+        alloc.free(result);
+    }
+    var it = names.keyIterator();
+    for (result) |*name| {
+        name.* = try alloc.dupe(u8, it.next().?.*);
+        initialized += 1;
+    }
+    std.mem.sort([]u8, result, {}, struct {
+        fn less(_: void, a: []u8, b: []u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.less);
+    return result;
 }
 
 fn readHasPrefix(read: *backend_erased.ReadTxn, prefix: []const u8) !bool {
@@ -4305,4 +4494,63 @@ test "retained terminal transactions honor the extended retry cutoff" {
     const resolved = try mgr.getResolvedParticipants(alloc, txn_id);
     defer freeParticipantList(alloc, resolved);
     try std.testing.expectEqual(@as(usize, 0), resolved.len);
+}
+
+test "transaction participant batch migrates legacy evidence atomically and cleans indexed membership" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var mgr = try TxnManager.init(alloc, &runtime);
+    defer mgr.deinit();
+    const txn: TxnId = @splat(41);
+    try mgr.initTransactionWithParticipants(txn, 100, &.{ "a", "b", "c" });
+    try mgr.markParticipantResolved(txn, "a");
+    try std.testing.expectError(error.InvalidParticipant, mgr.markParticipantsResolvedExtraBatch(txn, &.{ "b", "absent" }, .{}));
+    const index_key = makeSidecarKey(participant_index_prefix, txn);
+    try std.testing.expect(!(try mgr.keyExists(&index_key)));
+    try mgr.markParticipantsResolvedExtraBatch(txn, &.{ "b", "b" }, .{});
+    const first = try mgr.getResolvedParticipants(alloc, txn);
+    defer freeParticipantList(alloc, first);
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    try std.testing.expectEqualStrings("a", first[0]);
+    try std.testing.expectEqualStrings("b", first[1]);
+    try mgr.markParticipantsResolvedExtraBatch(txn, &.{ "b", "c" }, .{});
+    try mgr.markParticipantResolved(txn, "c");
+    const unresolved = try mgr.getUnresolvedParticipants(alloc, txn);
+    defer freeParticipantList(alloc, unresolved);
+    try std.testing.expectEqual(@as(usize, 0), unresolved.len);
+    const bytes = try mgr.getAlloc(alloc, &index_key);
+    defer alloc.free(bytes);
+    const index = try ParticipantIndex.decode(bytes);
+    try std.testing.expectEqual(@as(u64, 3), index.enlisted);
+    try std.testing.expectEqual(@as(u64, 3), index.resolved);
+    try mgr.deleteTransactionMetadata(txn);
+    try std.testing.expect(!(try mgr.keyExists(&index_key)));
+    const resolutions = try mgr.scanPrefix(alloc, &makeSidecarKey(resolved_index_prefix, txn));
+    defer backend_scan.freeResults(alloc, resolutions);
+    try std.testing.expectEqual(@as(usize, 0), resolutions.len);
+    try std.testing.expectError(error.TxnNotFound, mgr.markParticipantsResolvedExtraBatch(txn, &.{"a"}, .{}));
+}
+
+test "transaction participant batch releases migration allocations on every failure" {
+    const Check = struct {
+        fn run(failing: Allocator) !void {
+            const alloc = std.testing.allocator;
+            var backend = mem_backend.Backend.init(alloc, .{});
+            defer backend.close();
+            var runtime = try backend.runtimeStore(alloc, .{});
+            defer runtime.deinit();
+            var mgr = try TxnManager.init(alloc, &runtime);
+            defer mgr.deinit();
+            const txn: TxnId = @splat(42);
+            try mgr.initTransactionWithParticipants(txn, 100, &.{ "a", "b", "c" });
+            try mgr.markParticipantResolved(txn, "a");
+            mgr.alloc = failing;
+            defer mgr.alloc = alloc;
+            try mgr.markParticipantsResolvedExtraBatch(txn, &.{ "b", "c" }, .{});
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

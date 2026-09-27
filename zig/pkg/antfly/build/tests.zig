@@ -2376,6 +2376,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "metadata http client preserves unrecognized server outcomes for forwarded table mutations",
             "metadata http client does not replay unmarked table mutation rejection proof",
             "metadata http client round-trips server endpoints",
+            "metadata http client v0.2 snapshot fallback preserves proof budget and cancellation",
             "stamped definition replacement falls back to v0.2 text route",
             "definition replacement does not replay an ambiguous admitted request",
             "routed table mutation",

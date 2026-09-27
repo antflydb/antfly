@@ -81,6 +81,13 @@ pub const TxnAcknowledgeRequest = struct {
     restore_staging_plan_id: ?[16]u8 = null,
 };
 
+pub const TxnAcknowledgeManyRequest = struct {
+    txn_id: db_mod.types.TxnId,
+    participants: []const []const u8,
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
+};
+
 pub fn acknowledgeGroupLocalWithRequest(writes: table_writes.TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest, cancellation: db_mod.types.CancellationToken) !?void {
     try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
     if (req.restore_staging_scope != null) {
@@ -165,6 +172,7 @@ pub const ParticipantWorker = struct {
             table_name: []const u8,
             req: TxnAcknowledgeRequest,
         ) anyerror!void = null,
+        acknowledge_many_group: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest) anyerror!void = null,
         resolve_group_with_cancellation: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -246,6 +254,23 @@ pub const ParticipantWorker = struct {
     pub fn acknowledgeGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
         const acknowledge = self.vtable.acknowledge_group orelse return;
         try acknowledge(self.ptr, alloc, group_id, table_name, req);
+    }
+    pub fn acknowledgeManyGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest) !void {
+        if (req.participants.len == 0 or req.participants.len > 64) return error.InvalidTxnRequest;
+        if (self.vtable.acknowledge_many_group) |callback| {
+            const delivered = delivered: {
+                callback(self.ptr, alloc, group_id, table_name, req) catch |err| switch (err) {
+                    // Acknowledgements are idempotent. Mixed-version hosts retain
+                    // the original per-participant path; uncertain errors retain
+                    // recovery debt rather than asserting delivery.
+                    error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion, error.InvalidBatchRequest, error.InvalidArgument => break :delivered false,
+                    else => return err,
+                };
+                break :delivered true;
+            };
+            if (delivered) return;
+        }
+        for (req.participants) |participant| try self.acknowledgeGroup(alloc, group_id, table_name, .{ .txn_id = req.txn_id, .participant = participant, .restore_staging_scope = req.restore_staging_scope, .restore_staging_plan_id = req.restore_staging_plan_id });
     }
 };
 
@@ -352,6 +377,7 @@ pub const HostedParticipantWorker = struct {
                 .status_group_scoped = statusGroupScoped,
                 .status_group_until = statusGroupUntil,
                 .acknowledge_group = acknowledgeGroup,
+                .acknowledge_many_group = acknowledgeManyGroup,
             },
         };
     }
@@ -774,6 +800,29 @@ pub const HostedParticipantWorker = struct {
         };
     }
 
+    fn acknowledgeManyGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
+        const batch: db_mod.types.BatchRequest = .{
+            .restore_staging_scope = req.restore_staging_scope,
+            .restore_staging_plan_id = req.restore_staging_plan_id,
+            .sync_level = .write,
+            .transaction = .{ .acknowledge_many = .{ .txn_id = req.txn_id, .participants = req.participants } },
+        };
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => _ = (try self.writes.batchGroupLocal(alloc, group_id, table_name, batch)) orelse return error.UnknownGroup,
+            .remote => |remote| {
+                var client = self.httpClient(alloc);
+                const body = try @import("batch.zig").encodeBatchRequest(alloc, batch);
+                defer alloc.free(body);
+                var response = try client.fetchGroupBatch(remote.base_uri, group_id, table_name, body);
+                response.deinit(alloc);
+            },
+        }
+    }
+
     fn acknowledgeGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
@@ -1014,6 +1063,7 @@ pub const ExecuteOptions = struct {
 const ParticipantFanoutSlot = struct {
     err: ?anyerror = null,
     acknowledgement_err: ?anyerror = null,
+    acknowledgement_ready: bool = false,
     /// Begin failures other than a definite routing miss may have applied
     /// before their response failed and therefore require an abort delivery.
     may_have_transaction_state: bool = false,
@@ -1973,15 +2023,9 @@ const ResolveFollowerFanoutTask = struct {
             slot.propagation_pending = true;
             return;
         }
-        worker.acknowledgeGroup(arena.allocator(), coordinator.group_id, coordinator.table_name, .{
-            .restore_staging_scope = coordinator.restore_staging_scope,
-            .restore_staging_plan_id = coordinator.restore_staging_plan_id,
-            .txn_id = txn_id,
-            .participant = participant_id,
-        }) catch |err| {
-            slot.acknowledgement_err = err;
-            slot.propagation_pending = true;
-        };
+        slot.acknowledgement_ready = true;
+        _ = coordinator;
+        _ = participant_id;
     }
 };
 
@@ -2045,6 +2089,7 @@ fn runResolveFollowerFanout(
                 &slots[i],
             );
         }
+        acknowledgeFollowerWindow(worker, txn_id, participants, participant_ids, slots, start, end, true);
     }
 }
 
@@ -3200,18 +3245,42 @@ const AbortFollowerFanoutTask = struct {
                 return;
             }
         };
-        // Never acknowledge uncertain delivery. The coordinator's durable
-        // cohort remains recovery authority for failures in either step.
-        worker.acknowledgeGroup(arena.allocator(), coordinator.group_id, coordinator.table_name, .{
-            .restore_staging_scope = coordinator.restore_staging_scope,
-            .restore_staging_plan_id = coordinator.restore_staging_plan_id,
-            .txn_id = txn_id,
-            .participant = participant_id,
-        }) catch |err| {
-            slot.acknowledgement_err = err;
-        };
+        // Join the independently proven resolutions before constructing a
+        // bounded coordinator command. Failed followers retain recovery debt.
+        slot.acknowledgement_ready = true;
+        _ = coordinator;
+        _ = participant_id;
     }
 };
+
+fn acknowledgeFollowerWindow(worker: ParticipantWorker, txn_id: db_mod.types.TxnId, participants: []const ParticipantTxn, participant_ids: []const []const u8, slots: []ParticipantFanoutSlot, start: usize, end: usize, committed: bool) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var ids: [64][]const u8 = undefined;
+    var indexes: [64]usize = undefined;
+    var count: usize = 0;
+    for (start..end) |i| {
+        if (!slots[i].acknowledgement_ready) continue;
+        ids[count] = participant_ids[i];
+        indexes[count] = i;
+        count += 1;
+        if (count == ids.len) {
+            worker.acknowledgeManyGroup(arena.allocator(), participants[0].group_id, participants[0].table_name, .{ .txn_id = txn_id, .participants = ids[0..count], .restore_staging_scope = participants[0].restore_staging_scope, .restore_staging_plan_id = participants[0].restore_staging_plan_id }) catch |err| {
+                for (indexes[0..count]) |index| {
+                    slots[index].acknowledgement_err = err;
+                    if (committed) slots[index].propagation_pending = true;
+                }
+            };
+            count = 0;
+        }
+    }
+    if (count != 0) worker.acknowledgeManyGroup(arena.allocator(), participants[0].group_id, participants[0].table_name, .{ .txn_id = txn_id, .participants = ids[0..count], .restore_staging_scope = participants[0].restore_staging_scope, .restore_staging_plan_id = participants[0].restore_staging_plan_id }) catch |err| {
+        for (indexes[0..count]) |index| {
+            slots[index].acknowledgement_err = err;
+            if (committed) slots[index].propagation_pending = true;
+        }
+    };
+}
 
 fn runAbortFollowerFanout(
     worker: ParticipantWorker,
@@ -3242,6 +3311,7 @@ fn runAbortFollowerFanout(
             }
         }
         if (options.fanout_io) |io| awaitFanout(&group, io);
+        acknowledgeFollowerWindow(worker, txn_id, participants, participant_ids, slots, start, end, false);
     }
     for (slots[1..], 1..) |slot, i| {
         if (slot.err) |err| std.log.warn("transaction abort delivery failed table={s} group_id={} err={s}", .{ participants[i].table_name, participants[i].group_id, @errorName(err) });
@@ -3351,6 +3421,55 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!@import("builtin").is_test or @import("storage_source_options").control_only) return struct {};
     const Suite = struct {
+        test "distributed txn acknowledgement windows batch only proven followers and preserve recovery debt" {
+            const Recorder = struct {
+                batches: usize = 0,
+                singles: usize = 0,
+                members: usize = 0,
+                failure: ?anyerror = null,
+                fn worker(self: *@This()) ParticipantWorker {
+                    return .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status, .acknowledge_group = single, .acknowledge_many_group = many } };
+                }
+                fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+                fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+                fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {}
+                fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+                    return .pending;
+                }
+                fn single(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnAcknowledgeRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.singles += 1;
+                }
+                fn many(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnAcknowledgeManyRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.batches += 1;
+                    try std.testing.expect(req.participants.len <= 64);
+                    for (req.participants) |id| try std.testing.expect(!std.mem.eql(u8, id, "excluded"));
+                    if (self.failure) |err| return err;
+                    self.members += req.participants.len;
+                }
+            };
+            var recorder: Recorder = .{};
+            const participants: [132]ParticipantTxn = @splat(.{ .table_name = "docs", .group_id = 7, .topology_epoch = 1 });
+            var ids: [132][]const u8 = @splat("eligible");
+            ids[2] = "excluded";
+            var slots: [132]ParticipantFanoutSlot = @splat(.{ .acknowledgement_ready = true });
+            slots[2] = .{ .err = error.GroupLeaderUnavailable };
+            const txn: db_mod.types.TxnId = @splat(1);
+            acknowledgeFollowerWindow(recorder.worker(), txn, &participants, &ids, &slots, 1, slots.len, true);
+            try std.testing.expectEqual(@as(usize, 3), recorder.batches);
+            try std.testing.expectEqual(@as(usize, 130), recorder.members);
+            try std.testing.expectEqual(@as(usize, 0), recorder.singles);
+            recorder.failure = error.ConnectionRefused;
+            acknowledgeFollowerWindow(recorder.worker(), txn, &participants, &ids, &slots, 1, 4, true);
+            try std.testing.expectEqual(@as(?anyerror, error.ConnectionRefused), slots[1].acknowledgement_err);
+            try std.testing.expect(slots[1].propagation_pending and slots[3].propagation_pending);
+            try std.testing.expect(slots[2].acknowledgement_err == null);
+            try std.testing.expectEqual(@as(usize, 0), recorder.singles);
+            recorder.failure = error.UnsupportedOperation;
+            try recorder.worker().acknowledgeManyGroup(std.testing.allocator, 7, "docs", .{ .txn_id = txn, .participants = &.{ "one", "two" } });
+            try std.testing.expectEqual(@as(usize, 2), recorder.singles);
+        }
         test "distributed txn prepare preserves exact content observations" {
             const alloc = std.testing.allocator;
             const encoded = try encodeTxnPrepareRequest(alloc, .{
