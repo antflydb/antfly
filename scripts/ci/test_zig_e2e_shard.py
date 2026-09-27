@@ -138,6 +138,51 @@ class ShardTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "multiple lanes"):
                 merge(baseline, [observations[0], observations[0]])
 
+    def test_history_merge_migrates_prefixed_seed_and_measured_keys(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            baseline = root / "base.json"
+            lane = root / "lane.json"
+            baseline.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "tests": {
+                            "e2e/antfly/test_a.py::test_case[a@b]": {
+                                "seconds": 350,
+                                "samples": 1,
+                            },
+                            "test_a.py::test_case[a@b]": {"seconds": 300, "samples": 2},
+                        },
+                    }
+                )
+            )
+            lane.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "tests": {
+                            "e2e/antfly/test_a.py::test_case[a@b]": {
+                                "seconds": 350,
+                                "samples": 1,
+                            },
+                            "test_a.py::test_case[a@b]": {"seconds": 240, "samples": 3},
+                        },
+                    }
+                )
+            )
+            result = merge(baseline, [lane])
+            self.assertEqual(
+                result["tests"],
+                {
+                    "test_a.py::test_case[a@b]": {"seconds": 240, "samples": 3},
+                },
+            )
+            self.assertEqual(
+                shards.canonical_nodeid("e2e/antfly/test_a.py::test_case[a@b]@group"),
+                "test_a.py::test_case[a@b]",
+            )
+
     def test_summary_includes_setup_and_teardown_for_each_group(self):
         plan = shards.balance_records(
             [("a", "shared", "ordinary", 1), ("b", "shared", "ordinary", 1)]
@@ -169,6 +214,16 @@ class ShardTests(unittest.TestCase):
         self.assertIn("ANTFLY_E2E_SHARD_PLAN=", base)
         self.assertIn("if: always()", base)
         self.assertNotIn("Run low-FD", base)
+        low_fd = workflow.split("  e2e-base-low-fd:\n", 1)[1].split("  e2e-base:\n", 1)[
+            0
+        ]
+        self.assertIn(
+            "Retain failed low-FD server logs and cluster diagnostics", low_fd
+        )
+        self.assertIn("if: failure()", low_fd)
+        self.assertIn("/native-stacks.txt", low_fd)
+        self.assertIn("/failure-diagnostics.json", low_fd)
+        self.assertIn("*.log", low_fd)
         gate = workflow.split("  e2e-base:\n")[1].split("  e2e-full-build:\n")[0]
         self.assertIn("e2e-base-plan, e2e-base-tests, e2e-base-low-fd]", gate)
         self.assertIn('test "$LOW_FD_RESULT" = "success"', gate)

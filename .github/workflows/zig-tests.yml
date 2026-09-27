@@ -1692,6 +1692,22 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      - name: Retain failed low-FD server logs and cluster diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: antfly-low-fd-server-logs-${{ github.run_attempt }}
+          path: |
+            ${{ env.TMPDIR }}/antfly-zig-standalone-e2e-*/server.log
+            ${{ env.TMPDIR }}/antfly-zig-scaling-e2e-*/*.log
+            ${{ env.TMPDIR }}/antfly-zig-scaling-e2e-*/failure-diagnostics.json
+            ${{ env.TMPDIR }}/antfly-zig-scaling-e2e-*/native-stacks.txt
+            ${{ env.TMPDIR }}/antfly-zig-metadata-backup-e2e-*/*.log
+            ${{ env.TMPDIR }}/antfly-zig-metadata-backup-e2e-*/failure-diagnostics.json
+            ${{ env.TMPDIR }}/antfly-zig-metadata-backup-e2e-*/native-stacks.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
   e2e-base:
     if: >-
       ${{ !cancelled() &&

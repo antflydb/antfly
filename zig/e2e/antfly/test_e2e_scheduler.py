@@ -676,6 +676,36 @@ def test_shared_group_uses_strictest_resource_policy_for_every_item() -> None:
     )
 
 
+def test_duration_history_migrates_seed_and_measured_aliases(tmp_path: Path) -> None:
+    path = tmp_path / "durations.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tests": {
+                    "e2e/antfly/test_a.py::test_case[a@b]": {
+                        "seconds": 353.78,
+                        "samples": 1,
+                    },
+                    "test_a.py::test_case[a@b]": {"seconds": 300, "samples": 2},
+                    "e2e/antfly/test_b.py::test_seed": {"seconds": 200, "samples": 1},
+                },
+            }
+        )
+    )
+    history = DurationHistory(path)
+    assert history.estimate("test_b.py::test_seed", process_owned=True) == 200
+    assert (
+        history.estimate("test_a.py::test_case[a@b]@group", process_owned=True) == 300
+    )
+    history.observe("e2e/antfly/test_a.py::test_case[a@b]@group", 100)
+    assert history.save() is None
+    assert DurationHistory(path).tests == {
+        "test_a.py::test_case[a@b]": {"seconds": 240, "samples": 3},
+        "test_b.py::test_seed": {"seconds": 200, "samples": 1},
+    }
+
+
 def test_duration_history_round_trips_and_smooths_observations(tmp_path: Path) -> None:
     path = tmp_path / "durations.json"
     history = DurationHistory(path)

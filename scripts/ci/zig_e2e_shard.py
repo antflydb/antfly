@@ -27,7 +27,9 @@ SEED = Path(__file__).with_name("antfly_e2e_durations.json")
 
 
 def canonical_nodeid(nodeid):
-    path, separator, test = nodeid.split("@", 1)[0].partition("::")
+    if nodeid.rfind("@") > nodeid.rfind("]"):
+        nodeid = nodeid.rsplit("@", 1)[0]
+    path, separator, test = nodeid.partition("::")
     return path.replace("\\", "/").rsplit("/", 1)[-1] + separator + test
 
 
@@ -38,20 +40,39 @@ def shard_for_item(item):
 
 
 def load_history(path):
+    return {
+        node: entry["seconds"] for node, entry in load_history_entries(path).items()
+    }
+
+
+def load_history_entries(path):
     data = json.loads(Path(path).read_text())
     if data.get("version") != 1 or not isinstance(data.get("tests"), dict):
         raise ValueError(f"invalid E2E duration history: {path}")
     result = {}
     for node, entry in data["tests"].items():
+        if not isinstance(node, str) or not isinstance(entry, dict):
+            raise TypeError(f"invalid E2E duration entry: {path}")
         value = entry.get("seconds")
+        samples = entry.get("samples")
         if (
             isinstance(value, bool)
             or not isinstance(value, (int, float))
             or not math.isfinite(value)
             or value < 0
+            or isinstance(samples, bool)
+            or not isinstance(samples, int)
+            or samples < 1
         ):
             raise ValueError(f"invalid E2E duration for {node}")
-        result[canonical_nodeid(node)] = value
+        normalized = canonical_nodeid(node)
+        previous = result.get(normalized)
+        if previous is not None and (
+            samples < previous["samples"]
+            or (samples == previous["samples"] and node != normalized)
+        ):
+            continue
+        result[normalized] = {"seconds": value, "samples": samples}
     return result
 
 

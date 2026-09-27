@@ -6,17 +6,16 @@ import argparse
 import json
 from pathlib import Path
 
-from zig_e2e_shard import load_history
+from zig_e2e_shard import load_history_entries
 
 
 def merge(baseline, observations):
-    load_history(baseline)
     result = json.loads(Path(baseline).read_text())
-    original = dict(result["tests"])
+    original = load_history_entries(baseline)
+    result["tests"] = dict(original)
     seen = set()
     for path in sorted(observations):
-        load_history(path)
-        for node, entry in json.loads(Path(path).read_text())["tests"].items():
+        for node, entry in load_history_entries(path).items():
             # Each lane starts from the same baseline; unchanged entries aren't
             # observations and must not overwrite another lane's new sample.
             if entry.get("samples", 0) <= original.get(node, {}).get("samples", 0):
