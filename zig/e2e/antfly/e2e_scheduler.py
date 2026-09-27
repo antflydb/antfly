@@ -126,6 +126,12 @@ def normalize_nodeid(nodeid: str) -> str:
     return nodeid
 
 
+def duration_nodeid(nodeid: str) -> str:
+    """Use the same history key from the repository, Zig, or pytest root."""
+    path, separator, test = normalize_nodeid(nodeid).partition("::")
+    return path.replace("\\", "/").rsplit("/", 1)[-1] + separator + test
+
+
 def _safe_group_name(prefix: str, identity: str) -> str:
     readable = re.sub(r"[^A-Za-z0-9_.-]+", "-", identity).strip("-")[-80:]
     digest = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:10]
@@ -473,19 +479,28 @@ class DurationHistory:
                 continue
             if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
                 continue
-            self.tests[nodeid] = {
+            normalized = duration_nodeid(nodeid)
+            previous = self.tests.get(normalized)
+            # Migrate caches containing both prefixed seeds and measured keys.
+            # Prefer the most sampled entry, then the already canonical key.
+            if previous is not None and (
+                samples < previous["samples"]
+                or (samples == previous["samples"] and nodeid != normalized)
+            ):
+                continue
+            self.tests[normalized] = {
                 "seconds": normalized_seconds,
                 "samples": samples,
             }
 
     def estimate(self, nodeid: str, *, process_owned: bool) -> float:
-        entry = self.tests.get(normalize_nodeid(nodeid))
+        entry = self.tests.get(duration_nodeid(nodeid))
         if entry is not None:
             return float(entry["seconds"])
         return DEFAULT_PROCESS_SECONDS if process_owned else DEFAULT_LIGHT_SECONDS
 
     def observe(self, nodeid: str, duration: float) -> None:
-        normalized = normalize_nodeid(nodeid)
+        normalized = duration_nodeid(nodeid)
         self.observed[normalized] = self.observed.get(normalized, 0.0) + max(
             0.0, duration
         )
@@ -1143,6 +1158,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
 _duration_history: DurationHistory | None = None
 _failure_reporter = None
 _duration_report_totals: dict[str, float] = {}
+_duration_phase_totals: dict[str, dict[str, float]] = {}
 _executed_duration_nodeids: set[str] = set()
 
 
@@ -1173,9 +1189,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    global _duration_history, _duration_report_totals, _executed_duration_nodeids
     global _failure_reporter
     _failure_reporter = None
+    global \
+        _duration_history, \
+        _duration_report_totals, \
+        _duration_phase_totals, \
+        _executed_duration_nodeids
     slots = int(config.getoption("e2e_process_slots"))
     if slots < 1:
         raise pytest.UsageError("--e2e-process-slots must be a positive integer")
@@ -1192,6 +1212,7 @@ def pytest_configure(config: pytest.Config) -> None:
     if not hasattr(config, "workerinput"):
         _duration_history = DurationHistory(Path(config.getoption("e2e_duration_file")))
         _duration_report_totals = {}
+        _duration_phase_totals = {}
         _executed_duration_nodeids = set()
 
 
@@ -1232,6 +1253,8 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     nodeid = normalize_nodeid(report.nodeid)
     duration = max(0.0, float(report.duration))
     if math.isfinite(duration):
+        phases = _duration_phase_totals.setdefault(nodeid, {})
+        phases[report.when] = phases.get(report.when, 0.0) + duration
         _duration_report_totals[nodeid] = (
             _duration_report_totals.get(nodeid, 0.0) + duration
         )
@@ -1254,6 +1277,24 @@ def pytest_sessionfinish(session: pytest.Session) -> None:
         # Setup and teardown are material E2E costs, but only retain their total
         # when the test reached a real call phase. Environment-dependent skips
         # and setup failures must not train expensive full-CI tests toward zero.
+        if report_dir := os.environ.get("ANTFLY_E2E_REPORT_DIR"):
+            report_path = Path(report_dir) / "phase-durations.json"
+            try:
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text(
+                    json.dumps(
+                        {"version": 1, "tests": _duration_phase_totals},
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            except OSError as exc:
+                reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+                if reporter is not None:
+                    reporter.write_line(
+                        f"warning: could not retain E2E phase durations: {exc}"
+                    )
         _flush_duration_reports()
         error = _duration_history.save()
         if error is not None:
