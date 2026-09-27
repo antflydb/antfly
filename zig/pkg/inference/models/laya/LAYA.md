@@ -946,10 +946,40 @@ that row, so the training loss is a held-out learning curve.
   - The trainer has no learning-rate schedule (no warmup, no decay). A
     constant 2.5e-5 at batch 1 over 21k steps is 50× longer than the runs it
     was tuned on.
-- Next: the same run with `"objective": "soft_ce"`, evaluated on both `s0-eval`
-  and a 2,002-decision sample of Open-Jev's validation split. The Open-Jev
-  score separates "did not learn" from "learned but did not transfer to our
-  domains".
+**Result: soft CE, seed 42 — Open-Jev learned, our eval unchanged.** The same
+run with `"objective": "soft_ce"`. Train time 7.2 h, peak 27.4 GB.
+- It trained stably. Mean CE per 2,000 steps: 1.11, 0.97, 0.90, 0.90, 0.82,
+  0.83, 0.85, 0.83, 0.79, 0.74, 0.77. The 95th-percentile gradient norm was
+  33-85 (RLCD: 385-4,400).
+- Open-Jev validation: a 2,002-decision sample of the validation split, whole
+  cases, converted the same way.
+- Label prior: the most common gold answer in train for the same kind and
+  label set.
+
+| Eval | Model | Overall | choice | score | noul | Soft CE | ECE |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `s0-eval` (760) | Packed, `s0-train` only (3 seeds) | 0.450 ± 0.014 | | | | ~1.12 | |
+| `s0-eval` (760) | **Packed, Open-Jev mix, soft CE** | **0.464** | 0.390 | 0.401 | 0.623 | 1.115 | 0.025 |
+| `s0-eval` (760) | Unpacked, `s0-train` only (3 seeds) | 0.621 ± 0.020 | | | | | |
+| Open-Jev val (2,002) | Label prior | 0.600 | 0.466 | 0.300 | 0.750 | | |
+| Open-Jev val (2,002) | Uniform | | | | | 0.973 | |
+| Open-Jev val (2,002) | **Packed, Open-Jev mix, soft CE** | **0.664** | 0.512 | 0.529 | 0.790 | 0.769 | 0.060 |
+
+**Reading.**
+- 33× more data, most of it from other domains, neither helped nor hurt our
+  eval: 0.464 is within one standard deviation of 0.450.
+- The model did learn Open-Jev, but only modestly: +0.064 over the label prior,
+  and soft CE 0.77 against 0.97 for a uniform guess. For scale, MoJev reports
+  93.2% on its own eval after one epoch over 205k rows, though that is a
+  different base model and a different eval.
+- So this run cannot separate "the packed encoder learns slowly" from "this
+  recipe learns slowly". Candidates:
+  - no learning-rate schedule;
+  - batch 1;
+  - a released encoder whose trunk learned to depend on seeing the question.
+- The deciding control is an unpacked run on the same mix, evaluated on Open-Jev
+  validation. If unpacked learns Open-Jev much better, the layout is the
+  bottleneck. If not, the recipe is.
 
 ### Candidate mode on Banking77 (step 0b)
 
@@ -1983,7 +2013,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 
 | Step | Retraining | Status | Gate |
 | --- | --- | --- | --- |
-| 0. Qualify packed accuracy | fine-tune | question mode **fails** the gate: 0.450 packed vs 0.621 unpacked over three seeds at equal budget (0.471 vs 0.671 on a larger recipe); distillation does not help (0.451); a question-aware trunk (`trunk_sees: "questions"`) reaches 0.554. Candidate mode: Banking77 0.819 mean over two seeds with soft CE | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
+| 0. Qualify packed accuracy | fine-tune | question mode **fails** the gate: 0.450 packed vs 0.621 unpacked over three seeds at equal budget (0.471 vs 0.671 on a larger recipe); distillation does not help (0.451); a question-aware trunk (`trunk_sees: "questions"`) reaches 0.554. 33× more data (Open-Jev, soft CE) leaves it at 0.464 Candidate mode: Banking77 0.819 mean over two seeds with soft CE | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
 | 1a. State cache across rows and requests | no | done (CPU and Metal) | Exact against the full row and the oracle; follow-up questions skip trunk projections and feed-forward work |
 | 1b. Segment attention | no | done (CPU and Metal); multi-row batching done (CPU and Metal, question and candidate modes) | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call: exact against running each row alone, isolated by construction; not yet composed with the trunk cache |
 | 1c. Metal and CUDA packed kernels | no | Metal: fused kernels not pursued (encoder GPU work dominates; device scoring gave 2–4% and was reverted after a race). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |

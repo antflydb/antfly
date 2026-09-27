@@ -560,3 +560,11 @@ Train 23,897 s, 20,990 steps, peak footprint 27.4 GB.
 Mean CE per 2,000 steps: 1.492 1.283 1.408 1.601 1.652 1.852 1.816 1.502 1.596 1.454 1.522 (uniform 1.078).
 Grad norm p50/p95 per 2,000 steps: 31.5/498, 20.5/871, 18.1/541, 17.0/569, 12.3/545, 15.3/758, 14.0/385,
 13.0/666, 13.2/1419, 13.7/3114, 17.9/4419. Weights deleted after eval before an Open-Jev eval could run.
+
+Soft CE rerun `ojce42` (same mix and config, `"objective":"soft_ce"`): train 25,973 s, peak 27.4 GB.
+Mean CE / grad norm p50 / p95 per 2,000 steps: 1.106/3.4/85.1, 0.972/4.4/52.4, 0.904/3.1/39.8, 0.900/2.9/38.5,
+0.816/2.7/35.9, 0.832/2.7/42.8, 0.847/2.6/36.9, 0.826/1.8/34.0, 0.789/1.8/35.1, 0.737/1.7/33.1, 0.774/1.7/37.9.
+`s0-eval`: overall 0.464, choice 0.390, score 0.401, noul 0.623, soft CE 1.115, ECE 0.025.
+`openjev-val-2k.jsonl` (2,002 decisions, whole cases, seed 7 sample of converted validation, 3,001 converted):
+overall 0.664, choice 0.512, score 0.529, noul 0.790, soft CE 0.769, ECE 0.060.
+Label-prior baseline (train argmax by kind and label set): 0.600 (choice 0.466, score 0.300, noul 0.750); uniform CE 0.973.
