@@ -8,18 +8,20 @@
 //! fastest early descent, and the trunk collapses. Fitting the neck first, as
 //! the ridge regression from the student's routed states onto the teacher's,
 //! gives the trunk an informative target from its first update. The fit runs
-//! the frozen student forward on the CPU over the first rows of the training
-//! set, with an identity neck so the routed outputs are the trunk's states.
+//! the frozen student's encoder forward (on the job's GPU when it trains on
+//! Metal) over the first rows of the training set, with an identity neck so the
+//! routed outputs are the trunk's states.
 const std = @import("std");
 const model = @import("../../models/gliner_boundary.zig");
 const native = @import("../../ops/native_compute.zig");
 const processor = @import("../../pipelines/gliner_boundary_processor.zig");
-const schema_mod = @import("../../pipelines/extraction_schema.zig");
-const targets = @import("boundary_targets.zig");
 const data = @import("boundary_dataset.zig");
-const step = @import("boundary_train_step.zig");
+const encoder_graph = @import("boundary_encoder_graph.zig");
+const backend_mod = @import("boundary_training_backend.zig");
+const ops = @import("../../ops/ops.zig");
+const ml = @import("ml").graph;
+const interpreter = @import("../../graph/interpreter.zig");
 const distillation = @import("boundary_distillation.zig");
-const regex = @import("../../pipelines/extraction_regex.zig");
 const Control = @import("../../execution_control.zig").InferenceExecutionControl;
 const Allocator = std.mem.Allocator;
 
@@ -188,31 +190,64 @@ pub const Source = struct {
     tokenizer: @import("inference_tokenizer").Tokenizer,
     processor: processor.Options,
     batch_size: u32,
-    capacities: step.Capacities = .{},
-    limits: step.Limits = .{},
-    regex: regex.ContextOptions = .{},
+    /// Where the forward passes run; a Metal job fits on the GPU.
+    execution: @import("../seeded_gradient_trainer.zig").Execution = .native,
+    encoder_limits: encoder_graph.Limits = .{},
 };
 
-/// Runs the frozen student over the first `options.rows` training rows and
-/// returns the fitted neck. Every weight resolves from `source.store`.
+/// Uploaded weights, reused across batches (graphs differ per layout; names do not).
+const WeightCache = struct {
+    map: std.StringHashMapUnmanaged(ops.CT) = .empty,
+
+    fn get(self: *WeightCache, a: Allocator, cb: *const ops.ComputeBackend, store: *native.WeightStore, name: []const u8, shape: ml.Shape) !ops.CT {
+        if (self.map.get(name)) |value| return value;
+        const entry = store.resident_weights.get(name) orelse return error.MissingBoundaryNeckFitWeight;
+        const values = entry.tensor.asFloat32();
+        if (values.len != shape.numElements().?) return error.BoundaryDistillationShapeMismatch;
+        var dims: [8]i32 = undefined;
+        for (shape.dims[0..shape.rank_], dims[0..shape.rank_]) |size, *out| out.* = @intCast(size);
+        const value = try cb.fromFloat32Shape(values, dims[0..shape.rank_]);
+        errdefer cb.free(value);
+        // Names borrow from a batch's graph; the cache outlives it.
+        const key = try a.dupe(u8, name);
+        errdefer a.free(key);
+        try self.map.put(a, key, value);
+        return value;
+    }
+
+    fn deinit(self: *WeightCache, a: Allocator, cb: *const ops.ComputeBackend) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            cb.free(entry.value_ptr.*);
+            a.free(entry.key_ptr.*);
+        }
+        self.map.deinit(a);
+    }
+};
+
+/// Runs the frozen student's encoder (with its identity neck) forward over the
+/// first `options.rows` training rows and returns the fitted neck. Weights
+/// resolve from `source.store`; no training graph, targets or optimizer run.
 pub fn fit(a: Allocator, source: Source, teacher: distillation.Teacher, options: Options, control: ?Control) !Fitted {
     if (source.config.neck != .linear or options.rows == 0 or source.batch_size == 0) return error.InvalidBoundaryNeckFit;
     const hidden = source.config.encoder.hidden_size;
     var accumulator = try Accumulator.init(a, hidden);
     defer accumulator.deinit();
-    var compute = native.NativeCompute.init(a, source.store, null);
-    defer compute.deinit();
-    const cb = compute.computeBackend();
-    const Collect = struct {
-        fn observe(raw: *anyopaque, width: usize, groups: []const distillation.Group) !void {
-            const self: *Accumulator = @ptrCast(@alignCast(raw));
-            if (width != self.hidden) return error.BoundaryDistillationShapeMismatch;
-            try self.add(groups);
-        }
+    var native_compute: ?native.NativeCompute = null;
+    defer if (native_compute) |*value| value.deinit();
+    var metal_compute: ?backend_mod.ScratchMetal = null;
+    defer if (metal_compute) |*value| value.deinit();
+    const cb = if (source.execution == .resident_metal) blk: {
+        metal_compute = try backend_mod.ScratchMetal.init(a);
+        break :blk metal_compute.?.computeBackend();
+    } else blk: {
+        native_compute = native.NativeCompute.init(a, source.store, null);
+        break :blk native_compute.?.computeBackend();
     };
+    var weights = WeightCache{};
+    defer weights.deinit(a, &cb);
     const rows = @min(@as(usize, options.rows), source.dataset.index.len);
     var start: usize = 0;
-    var microbatch: u64 = 0;
     while (start < rows) : (start += source.batch_size) {
         if (control) |c| try c.check();
         const count = @min(@as(usize, source.batch_size), rows - start);
@@ -222,46 +257,70 @@ pub fn fit(a: Allocator, source: Source, teacher: distillation.Teacher, options:
         const samples = try scratch.alloc(data.Sample, count);
         var made: usize = 0;
         defer for (samples[0..made]) |*sample| sample.deinit();
-        const schemas = try scratch.alloc(*const schema_mod.CompiledSchema, count);
-        const annotations = try scratch.alloc(targets.Annotations, count);
         const items = try scratch.alloc(processor.Item, count);
-        for (samples, schemas, annotations, items, 0..) |*sample, *compiled, *annotation, *item, offset| {
+        for (samples, items, 0..) |*sample, *item, offset| {
             sample.* = try source.dataset.sample(start + offset, control, null);
             made += 1;
-            compiled.* = &sample.schema;
-            annotation.* = sample.annotations;
             item.* = .{ .text = sample.row.text, .schema = &sample.schema };
         }
-        var options_with_control = source.processor;
-        options_with_control.control = control;
-        var prepared = try processor.prepare(a, source.tokenizer, items, options_with_control);
+        var processor_options = source.processor;
+        processor_options.control = control;
+        var prepared = try processor.prepare(a, source.tokenizer, items, processor_options);
         defer prepared.deinit();
         var states = try teacher.encode(teacher.ptr, a, items, &prepared, control);
         defer states.deinit();
-        // Target compilation validates declared extraction validators, as in
-        // the trainer's plans.
-        var validators = regex.Context.init(a, source.regex);
-        defer validators.deinit();
-        validators.options.compile_options.control = control;
-        validators.options.match_options.control = control;
-        for (schemas) |compiled| {
-            for (compiled.schema.entities) |entity| for (entity.validators) |validator| try regex.Context.validateCompile(&validators, validator);
-            for (compiled.schema.structures) |structure| for (structure.fields) |field| for (field.validators) |validator| try regex.Context.validateCompile(&validators, validator);
+        const layout = try encoder_graph.layoutFromPrepared(&source.config, &prepared, source.encoder_limits);
+        var graph = ml.Graph.init(a);
+        defer graph.deinit();
+        var builder = ml.Builder.init(&graph);
+        var built = try encoder_graph.buildWithProfile(&builder, &source.config, layout, .eval, .materialized_v1, source.encoder_limits);
+        defer built.deinit();
+        const routed = [_]struct { distillation.Route, ml.NodeId, []const f32, []const bool }{
+            .{ .text, built.nodes.text, states.text, prepared.text_word_mask },
+            .{ .queries, built.nodes.queries, states.queries, prepared.query_marker_mask },
+            .{ .classifications, built.nodes.classifications, states.classifications, prepared.cls_marker_mask },
+            .{ .parents, built.nodes.parents, states.parents, prepared.parent_marker_mask },
+        };
+        for (routed) |entry| if (entry[1] != ml.null_node) try graph.markOutput(entry[1]);
+        var inputs = std.ArrayListUnmanaged(interpreter.RuntimeInput).empty;
+        var owned = std.ArrayListUnmanaged(ops.CT).empty;
+        defer {
+            for (owned.items) |value| cb.free(value);
+            owned.deinit(a);
+            inputs.deinit(a);
         }
-        var limits = source.limits;
-        limits.targets.regex_context = &validators;
-        limits.targets.validate_value_fn = regex.Context.validateValue;
-        var plan = try step.buildWithObjectives(a, source.config, &prepared, schemas, source.capacities, .training, .materialized_v1, .retained_v1, .{}, .{ .heads = false, .distillation = true }, limits);
-        defer plan.deinit();
-        try plan.finalize(&.{}, .{ .allow_no_gradients = true });
-        var result = try plan.run(&cb, &.{}, &prepared, schemas, annotations, .{
-            .identity = .{ .binding = @splat(0), .optimizer_step = 0, .microbatch = microbatch },
-            .replay = .{ .seed = 0, .micro_batch = microbatch },
-            .progress = .{ .optimizer_step = 0, .total_optimizer_steps = 1 },
-            .distillation = .{ .text = states.text, .queries = states.queries, .classifications = states.classifications, .parents = states.parents, .observer = .{ .ptr = &accumulator, .observe = Collect.observe } },
-        }, control);
-        result.deinit(&cb);
-        microbatch += 1;
+        var bound = try encoder_graph.bindPrepared(a, &built, &source.config, &prepared, .{ .seed = 0, .micro_batch = start });
+        defer bound.deinit();
+        for (bound.bindings) |binding| {
+            var dims: [8]i32 = undefined;
+            for (binding.shape.dims[0..binding.shape.rank_], dims[0..binding.shape.rank_]) |size, *out| out.* = @intCast(size);
+            const value = switch (binding.values) {
+                .f32 => |values| try cb.fromFloat32Shape(values, dims[0..binding.shape.rank_]),
+                .i32 => |values| (try cb.fromInt32Shape(values, dims[0..binding.shape.rank_])) orelse return error.UnsupportedBoundaryNeckFitBackend,
+            };
+            owned.append(a, value) catch |err| {
+                cb.free(value);
+                return err;
+            };
+            try inputs.append(a, .{ .node_id = binding.node, .value = value });
+        }
+        for (graph.parameters.items) |id| {
+            const node = graph.node(id);
+            const name = graph.parameterName(node);
+            if (std.mem.startsWith(u8, name, "__")) continue;
+            try inputs.append(a, .{ .node_id = id, .value = try weights.get(a, &cb, source.store, name, node.output_shape) });
+        }
+        var result = try interpreter.execute(a, &graph, &cb, .{ .runtime_inputs = inputs.items, .strict_integer_constants = true });
+        defer result.deinit(&cb);
+        var groups = std.ArrayListUnmanaged(distillation.Group).empty;
+        var output: usize = 0;
+        for (routed) |entry| {
+            if (entry[1] == ml.null_node) continue;
+            const values = try cb.toFloat32(result.outputs[output], scratch);
+            output += 1;
+            try groups.append(scratch, .{ .route = entry[0], .student = values, .teacher = entry[2], .valid = entry[3] });
+        }
+        try accumulator.add(groups.items);
     }
     return accumulator.solve(a, options.ridge);
 }

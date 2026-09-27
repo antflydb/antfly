@@ -436,9 +436,7 @@ pub const Trainer = struct {
         const w = weight_index orelse return error.InvalidBoundaryNeckFit;
         const b = bias_index orelse return error.InvalidBoundaryNeckFit;
         try neck_fit.requireIdentity(parameters[w].values, parameters[b].values, h);
-        var limits = self.options.limits.step;
-        limits.targets.allow_unsupervised = true;
-        var fitted = try neck_fit.fit(self.host_budget.allocator(), .{ .store = store, .config = config, .dataset = self.dataset, .tokenizer = self.tokenizer, .processor = self.options.processor, .batch_size = self.options.run.batch_size, .capacities = self.options.capacities, .limits = limits, .regex = self.options.regex }, value.teacher, value.fit, control);
+        var fitted = try neck_fit.fit(self.host_budget.allocator(), .{ .store = store, .config = config, .dataset = self.dataset, .tokenizer = self.tokenizer, .processor = self.options.processor, .batch_size = self.options.run.batch_size, .execution = self.options.execution, .encoder_limits = self.options.limits.step.encoder }, value.teacher, value.fit, control);
         defer fitted.deinit();
         std.log.info("Antenna neck fit: rows={d} explained_variance={d:.4}", .{ fitted.rows, fitted.r2 });
         parameters[w].values = try scratch.dupe(f32, fitted.weight);

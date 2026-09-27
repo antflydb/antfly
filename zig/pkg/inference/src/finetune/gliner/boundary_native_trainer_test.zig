@@ -1000,3 +1000,30 @@ test "resident Metal ModernBERT encoder nodes match the interpreter" {
     }
     try std.testing.expect(!failed);
 }
+
+test "boundary native trainer fits the same neck on Metal as on the CPU" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fixture: NeckedFixture = undefined;
+    try fixture.init(a, true);
+    defer fixture.deinit();
+    var teacher = SyntheticTeacher{ .hidden = fixture.config.encoder.hidden_size };
+    var necks: [2][]f32 = undefined;
+    for ([_]controller.Execution{ .native, .resident_metal }, &necks) |execution, *out| {
+        var options = NeckedFixture.options(teacher.teacher(1));
+        options.execution = execution;
+        options.distillation.?.fit = .{ .rows = 5 };
+        var owner = try trainer.Trainer.init(a, &fixture.store, fixture.tokenizer.tokenizer(), fixture.source, fixture.config, &fixture.samples, fixture.parameters.items, options, null);
+        defer owner.deinit();
+        try owner.optimizer.ensureHostState(null);
+        out.* = for (owner.optimizer.owner.regular_params.items) |slot| {
+            if (std.mem.eql(u8, slot.name, "gliner_neck.weight")) break try a.dupe(f32, slot.weights);
+        } else return error.TestUnexpectedResult;
+    }
+    defer for (necks) |values| a.free(values);
+    var worst: f32 = 0;
+    for (necks[0], necks[1]) |cpu, metal| worst = @max(worst, @abs(cpu - metal));
+    std.debug.print("neck fit CPU vs Metal: max difference {d}\n", .{worst});
+    try std.testing.expect(worst < 1e-3);
+}
