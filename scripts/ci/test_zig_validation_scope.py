@@ -15,10 +15,12 @@
 """Exercise the Zig workflow's actual Git path filter against tracked inputs."""
 
 import json
+import os
 import re
 import shlex
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -64,6 +66,9 @@ class ZigValidationScopeTests(unittest.TestCase):
                 "needs.changes.outputs.trace_validate": "true",
                 "needs.changes.outputs.e2e": "true",
                 "needs.e2e-base-build.result": "success" if pr else "skipped",
+                "needs.e2e-base-plan.result": "success"
+                if pr and not full
+                else "skipped",
                 "needs.e2e-full-build.result": "skipped" if pr else "success",
             }
             values.update(overrides)
@@ -93,7 +98,13 @@ class ZigValidationScopeTests(unittest.TestCase):
             "e2e-full",
             "arm64-codec",
         ]
-        base_jobs = ["zig-base-tests", "zig-base", "e2e-base-tests", "e2e-base"]
+        base_jobs = [
+            "zig-base-tests",
+            "zig-base",
+            "e2e-base-plan",
+            "e2e-base-tests",
+            "e2e-base",
+        ]
         for job in full_jobs:
             with self.subTest(job=job):
                 self.assertTrue(selected(job, full=True))
@@ -108,6 +119,12 @@ class ZigValidationScopeTests(unittest.TestCase):
             self.assertTrue(selected(job))
             self.assertFalse(selected(job, full=True))
         self.assertTrue(selected("e2e-base-build", full=True))
+        self.assertTrue(selected("e2e-base-low-fd"))
+        self.assertTrue(selected("e2e-base-low-fd", full=True))
+        self.assertFalse(selected("e2e-base-low-fd", pr="", event="push"))
+        self.assertFalse(
+            selected("e2e-base-tests", **{"needs.e2e-base-plan.result": "failure"})
+        )
         self.assertFalse(selected("e2e-full-build", full=True))
         self.assertTrue(selected("e2e-full-build", pr="", event="push"))
         self.assertFalse(
@@ -117,6 +134,36 @@ class ZigValidationScopeTests(unittest.TestCase):
                 **{"needs.e2e-base-build.result": "failure"},
             )
         )
+
+        # Evaluate the actual aggregate shell, including independent low-FD
+        # coverage. Full validation must not hide a failed specialized lane.
+        aggregate = blocks["e2e-full"]
+        self.assertIn("e2e-base-low-fd]", aggregate)
+        self.assertIn("LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}", aggregate)
+        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1])
+        for build, tests, low_fd, required, success in (
+            ("success", "success", "success", "true", True),
+            ("success", "success", "failure", "true", False),
+            ("success", "success", "skipped", "true", False),
+            ("success", "success", "skipped", "false", True),
+            ("failure", "success", "success", "true", False),
+            ("success", "failure", "success", "true", False),
+        ):
+            with self.subTest(
+                build=build, tests=tests, low_fd=low_fd, required=required
+            ):
+                result = subprocess.run(
+                    ["bash", "-c", command],
+                    env={
+                        **os.environ,
+                        "BUILD_RESULT": build,
+                        "TEST_RESULT": tests,
+                        "LOW_FD_RESULT": low_fd,
+                        "REQUIRE_LOW_FD": required,
+                    },
+                    capture_output=True,
+                )
+                self.assertEqual(result.returncode == 0, success, result.stderr)
 
     def test_codegen_and_laya_inputs_select_zig_validation(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()

@@ -1358,7 +1358,7 @@ jobs:
 
   e2e-base-plan:
     if: >-
-      ${{ !cancelled() && success() && needs.admission.result == 'success' &&
+      ${{ !cancelled() && success() && !inputs.full_validation && needs.admission.result == 'success' &&
       inputs.pr_number != '' && github.run_attempt == 1 && needs.changes.outputs.e2e == 'true' }}
     name: e2e-base / plan
     needs: [admission, changes]
@@ -2086,13 +2086,19 @@ jobs:
       github.event_name == 'workflow_dispatch') ||
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full
-    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-full-tests]
+    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-full-tests, e2e-base-low-fd]
     runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify full E2E suites
         env:
           BUILD_RESULT: ${{ inputs.full_validation && needs.e2e-base-build.result || needs.e2e-full-build.result }}
           TEST_RESULT: ${{ needs.e2e-full-tests.result }}
+          LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}
+          REQUIRE_LOW_FD: ${{ inputs.full_validation && inputs.pr_number != '' }}
         run: |
+          set -euo pipefail
           test "$BUILD_RESULT" = "success"
           test "$TEST_RESULT" = "success"
+          if [[ "$REQUIRE_LOW_FD" == "true" ]]; then
+            test "$LOW_FD_RESULT" = "success"
+          fi

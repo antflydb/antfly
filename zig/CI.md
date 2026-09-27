@@ -64,7 +64,9 @@ selects the bounded `smoke` scope.
 Add `ci:full` and `ci:soak` before posting `/ci run <full head SHA>` to run both
 complete suites on the approved revision. Labels alone never start tests.
 Full PR E2E uses one ReleaseSafe build shared with the packaging smoke checks;
-base E2E shards and the separate full E2E build are omitted. Selecting both
+base E2E planning, base shards, and the separate full E2E build are omitted.
+The isolated low-FD regressions still run and contribute to the full E2E
+result. Selecting both
 `ci:vopr` and `ci:soak` runs one full campaign, including qualification.
 
 Normal Antfly CI includes policy tests, SDK checks, and the existing Zig PR/base
