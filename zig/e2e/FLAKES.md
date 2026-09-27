@@ -1979,6 +1979,21 @@ regressions pass in Debug. The tests cover queue debt at registration, bounded
 drain rearming, retired callbacks, snapshots, and unchanged election time.
 Fresh soak qualification remains pending.
 
+The metadata inbound-wake executable (`43881588d74759e64e75638c74b8ee4bd182d5e1d108706a591d4158f3a48684`)
+passed the two-worker schema comparison **4/4**, with case durations of
+113–118 seconds. Owner-operation traces still cluster around 200 ms because
+the data Raft runtime retains its periodic-only progress source. The data
+driver now borrows the same host notification, with a separate Ready-only
+turn that never ticks. Accepted proposals, ReadIndex requests, campaigns and
+configuration changes notify after admission; peer batches and snapshots
+notify after enqueue. Notifications coalesce on the existing reserved driver
+and keep the original cadence and per-turn scheduling bounds. Manual hosts
+skip notification locking when no driver is registered. The real DataServer
+fixture covers ReadIndex wakes, callback retirement, and unchanged election
+time. Debug validation passes the 61-step native build, all 132 metadata
+contracts, ten data cadence/forwarding/protocol/read-barrier contracts, and the
+focused host regressions. New frozen-binary qualification is pending.
+
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
 
 Scheduled run `36247286560` passed qualification, all five campaigns, and the

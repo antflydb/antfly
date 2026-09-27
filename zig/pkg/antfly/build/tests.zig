@@ -4410,6 +4410,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
     raft_runtime_test_step.dependOn(&run_raft_ready_continuation_tests.step);
 
+    const raft_host_progress_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "raft integration module compiles", "host drops stale inbound", "host queues live snapshot" },
+    });
+    b.step("antfly-raft-host-progress-test", "Run host progress notification and bounded inbound drain regressions").dependOn(&b.addRunArtifact(raft_host_progress_tests).step);
+
     const raft_restore_test_step = b.step("antfly-raft-restore-test", "Run focused Raft restore authority and restart tests");
     raft_restore_test_step.dependOn(&run_raft_restore_tests.step);
 

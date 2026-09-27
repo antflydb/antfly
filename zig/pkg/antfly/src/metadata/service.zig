@@ -9667,11 +9667,11 @@ pub const MetadataHttpService = struct {
     pub fn registerManagedProgressOwner(self: *MetadataHttpService, wake: @import("../raft/runtime_loop.zig").ProgressWake) !void {
         try self.proposal_progress_driver.registerManagedOwner(wake);
         errdefer self.proposal_progress_driver.releaseManagedOwner();
-        try self.raft.host.http_host.host.registerInboundProgressWake(.{ .ptr = wake.ptr, .notify_fn = wake.notify_fn });
+        try self.raft.host.http_host.host.registerProgressWake(.{ .ptr = wake.ptr, .notify_fn = wake.notify_fn });
     }
 
     pub fn releaseManagedProgressOwner(self: *MetadataHttpService) void {
-        self.raft.host.http_host.host.releaseInboundProgressWake();
+        self.raft.host.http_host.host.releaseProgressWake();
         self.proposal_progress_driver.releaseManagedOwner();
     }
 

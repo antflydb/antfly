@@ -410,31 +410,43 @@ pub const Host = struct {
     pending_inbound: std.ArrayListUnmanaged(PendingInboundMessage) = .empty,
     /// Borrowed notification only; the callback must not reenter the host.
     /// The inbound mutex protects registration, invocation, and removal so
-    /// an HTTP worker cannot notify a retired progress driver.
-    inbound_progress_wake: ?InboundProgressWake = null,
+    /// a producer cannot notify a retired progress driver.
+    progress_wake: ?ProgressWake = null,
+    progress_wake_registered: std.atomic.Value(bool) = .init(false),
 
-    pub const InboundProgressWake = struct {
+    pub const ProgressWake = struct {
         ptr: *anyopaque,
         notify_fn: *const fn (*anyopaque) void,
     };
 
-    pub fn registerInboundProgressWake(self: *Host, wake: InboundProgressWake) !void {
+    pub fn registerProgressWake(self: *Host, wake: ProgressWake) !void {
         self.lockInbound();
         defer self.inbound_mutex.unlock(self.deps.io);
-        if (self.inbound_progress_wake != null) return error.RaftInboundProgressAlreadyOwned;
-        self.inbound_progress_wake = wake;
+        if (self.progress_wake != null) return error.RaftProgressAlreadyOwned;
+        self.progress_wake = wake;
+        self.progress_wake_registered.store(true, .release);
         // Messages accepted before registration are already progress debt.
         if (self.pending_inbound.items.len != 0) wake.notify_fn(wake.ptr);
     }
 
-    pub fn releaseInboundProgressWake(self: *Host) void {
+    pub fn releaseProgressWake(self: *Host) void {
         self.lockInbound();
         defer self.inbound_mutex.unlock(self.deps.io);
-        self.inbound_progress_wake = null;
+        self.progress_wake = null;
+        self.progress_wake_registered.store(false, .release);
     }
 
-    fn notifyInboundProgressLocked(self: *Host) void {
-        if (self.inbound_progress_wake) |wake| wake.notify_fn(wake.ptr);
+    fn notifyProgressLocked(self: *Host) void {
+        if (self.progress_wake) |wake| wake.notify_fn(wake.ptr);
+    }
+
+    fn notifyProgress(self: *Host) void {
+        // Manual/deterministic hosts retain their existing proposal path.
+        // The mutex is needed only to fence a registered callback's lifetime.
+        if (!self.progress_wake_registered.load(.acquire)) return;
+        self.lockInbound();
+        defer self.inbound_mutex.unlock(self.deps.io);
+        self.notifyProgressLocked();
     }
 
     pub fn init(alloc: std.mem.Allocator, cfg: HostConfig, deps: HostDeps) Host {
@@ -1072,7 +1084,7 @@ pub const Host = struct {
             self.metrics.inbound_message_enqueues += pending.items.len;
             self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
             pending.clearRetainingCapacity();
-            self.notifyInboundProgressLocked();
+            self.notifyProgressLocked();
         }
     }
 
@@ -1107,7 +1119,7 @@ pub const Host = struct {
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
         // Bounded drains retain their scheduling limit, but must not leave
         // the remaining queue asleep until the next election tick.
-        if (self.pending_inbound.items.len != 0) self.notifyInboundProgressLocked();
+        if (self.pending_inbound.items.len != 0) self.notifyProgressLocked();
         self.inbound_mutex.unlock(self.deps.io);
 
         var drained: usize = 0;
@@ -1137,14 +1149,17 @@ pub const Host = struct {
 
     pub fn campaignGroup(self: *Host, group_id: u64) !void {
         self.runtime_host.campaignGroup(group_id) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn propose(self: *Host, group_id: u64, data: []const u8) !void {
         self.runtime_host.propose(group_id, data) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn proposeWithReceipt(self: *Host, group_id: u64, data: []const u8, accepted_index: *?u64) !void {
         self.runtime_host.proposeWithReceipt(group_id, data, accepted_index) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn proposeBatchWithReceipt(
@@ -1160,6 +1175,7 @@ pub const Host = struct {
             accepted_first_index,
             accepted_last_index,
         ) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn prepareProposalReceiptTracking(self: *Host, group_id: u64) !void {
@@ -1224,7 +1240,7 @@ pub const Host = struct {
         });
         self.metrics.inbound_message_enqueues += 1;
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
-        self.notifyInboundProgressLocked();
+        self.notifyProgressLocked();
     }
 
     pub fn admitSnapshotUpload(self: *Host, admission: transport.http_server.SnapshotUploadAdmission) !void {
@@ -1243,14 +1259,17 @@ pub const Host = struct {
 
     pub fn readIndex(self: *Host, group_id: u64, request_ctx: []const u8) !void {
         self.runtime_host.readIndex(group_id, request_ctx) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn proposeConfChange(self: *Host, group_id: u64, conf_change: raft_engine.core.ConfChange) !void {
         self.runtime_host.proposeConfChange(group_id, conf_change) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn proposeConfChangeV2(self: *Host, group_id: u64, conf_change: raft_engine.core.ConfChangeV2) !void {
         self.runtime_host.proposeConfChangeV2(group_id, conf_change) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn raftStatus(self: *Host, group_id: u64) ?raft_engine.core.Status {
@@ -2129,8 +2148,8 @@ test "host queues live snapshot uploads for runtime round" {
 
     const voters = try std.testing.allocator.dupe(u64, &[_]u64{1});
     const data = try std.testing.allocator.dupe(u8, "queued-snapshot");
-    try host.registerInboundProgressWake(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify });
-    defer host.releaseInboundProgressWake();
+    try host.registerProgressWake(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify });
+    defer host.releaseProgressWake();
     try std.testing.expectEqual(@as(usize, 0), wake_probe.calls);
     try host.handleSnapshotUpload(.{
         .group_id = 41,
@@ -2268,10 +2287,10 @@ test "host drops stale inbound peer batch groups without leaking pending storage
     try std.testing.expectEqual(@as(usize, 2), host.metrics.inbound_message_enqueues);
     try std.testing.expectEqual(@as(usize, 2), host.metrics.pending_inbound_messages);
 
-    try host.registerInboundProgressWake(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify });
-    defer host.releaseInboundProgressWake();
+    try host.registerProgressWake(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify });
+    defer host.releaseProgressWake();
     try std.testing.expectEqual(@as(usize, 1), wake_probe.calls);
-    try std.testing.expectError(error.RaftInboundProgressAlreadyOwned, host.registerInboundProgressWake(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify }));
+    try std.testing.expectError(error.RaftProgressAlreadyOwned, host.registerProgressWake(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify }));
 
     _ = try host.runRoundBounded(1, 1, 1);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_drains);

@@ -8256,7 +8256,34 @@ pub const DataServer = struct {
         return .{
             .ptr = self,
             .run_once = runRaftProgressOnce,
+            .run_progress_once = runRaftReadyProgressOnce,
+            .acquire_owner = acquireRaftProgressOwner,
+            .release_owner = releaseRaftProgressOwner,
         };
+    }
+
+    fn acquireRaftProgressOwner(ptr: *anyopaque, wake: antfly.raft.ProgressWake) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.data_raft_mutex);
+        defer self.data_raft_mutex.unlock();
+        const raft = self.data_raft orelse return;
+        try raft.host.http_host.host.registerProgressWake(.{ .ptr = wake.ptr, .notify_fn = wake.notify_fn });
+    }
+
+    fn releaseRaftProgressOwner(ptr: *anyopaque) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.data_raft_mutex);
+        defer self.data_raft_mutex.unlock();
+        if (self.data_raft) |raft| raft.host.http_host.host.releaseProgressWake();
+    }
+
+    fn runRaftReadyProgressOnce(ptr: *anyopaque) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const raft = self.data_raft orelse return;
+        if (self.work_cost_port) |port| try port.charge(.raft_round, 1);
+        lockAtomic(&self.data_raft_mutex);
+        defer self.data_raft_mutex.unlock();
+        raft.runRaftProgressOnly() catch |err| try handleRaftProgressError(err);
     }
 
     fn raftQuarantineAdminSource(self: *DataServer) antfly.public_api.http_server.RaftQuarantineAdminSource {
@@ -34311,6 +34338,29 @@ fn consumerTests() type {
                 try std.testing.expectEqual(@as(usize, 3), probe.calls);
                 try std.testing.expect(server.data_raft_mutex.tryLock());
                 server.data_raft_mutex.unlock();
+            }
+
+            {
+                const WakeProbe = struct {
+                    calls: usize = 0,
+                    fn notify(raw: *anyopaque) void {
+                        const self: *@This() = @ptrCast(@alignCast(raw));
+                        self.calls += 1;
+                    }
+                };
+                var wake: WakeProbe = .{};
+                const source = server.raftProgressSource();
+                try source.acquire_owner.?(source.ptr, .{ .ptr = &wake, .notify_fn = WakeProbe.notify });
+                defer source.release_owner.?(source.ptr);
+                const before = data_raft.host.http_host.host.runtime_host.virtualTimeMs();
+                try data_raft.requestReadIndex(77, "data progress wake regression");
+                try std.testing.expectEqual(@as(usize, 1), wake.calls);
+                try source.run_progress_once.?(source.ptr);
+                try std.testing.expectEqual(before, data_raft.host.http_host.host.runtime_host.virtualTimeMs());
+                source.release_owner.?(source.ptr);
+                const retired_calls = wake.calls;
+                try data_raft.requestReadIndex(77, "retired data progress wake regression");
+                try std.testing.expectEqual(retired_calls, wake.calls);
             }
 
             // Simulate leadership loss after durable topology convergence. An
