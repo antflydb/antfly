@@ -9666,9 +9666,12 @@ pub const MetadataHttpService = struct {
     /// only coalesce wakeups; they cannot inherit persistence or tick work.
     pub fn registerManagedProgressOwner(self: *MetadataHttpService, wake: @import("../raft/runtime_loop.zig").ProgressWake) !void {
         try self.proposal_progress_driver.registerManagedOwner(wake);
+        errdefer self.proposal_progress_driver.releaseManagedOwner();
+        try self.raft.host.http_host.host.registerInboundProgressWake(.{ .ptr = wake.ptr, .notify_fn = wake.notify_fn });
     }
 
     pub fn releaseManagedProgressOwner(self: *MetadataHttpService) void {
+        self.raft.host.http_host.host.releaseInboundProgressWake();
         self.proposal_progress_driver.releaseManagedOwner();
     }
 
@@ -20779,6 +20782,34 @@ test "metadata http service linearizable reads leave elections to the cadence dr
     }
     try svc.waitForTransitionApplied(receipt);
     try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+    // A peer response must wake the same owner without request-side progress
+    // or waiting for an election tick. Removing ownership fences callbacks.
+    const inbound_before = wake_probe.calls;
+    const host = svc.raft.host.http_host.host;
+    const response = raft_engine.core.Message{
+        .msg_type = .heartbeat_response,
+        .from = 1,
+        .to = 1,
+        .term = host.raftStatus(2910).?.hard.current_term,
+    };
+    const inbound = raft_engine.runtime.transport_iface.PeerBatch{
+        .peer_id = 1,
+        .groups = &.{.{ .group_id = 2910, .messages = &.{response} }},
+    };
+    try host.enqueueInboundBatch(inbound);
+    try std.testing.expectEqual(inbound_before + 1, wake_probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), host.metrics.pending_inbound_messages);
+    try std.testing.expectEqual(before_read, host.runtime_host.virtualTimeMs());
+    try svc.runManagedRaftProgressOnly();
+    svc.releaseManagedProgressOwner();
+    const retired_calls = wake_probe.calls;
+    try host.enqueueInboundBatch(inbound);
+    try std.testing.expectEqual(retired_calls, wake_probe.calls);
+    // Registering again discovers debt accepted while no owner existed.
+    try svc.registerManagedProgressOwner(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify });
+    try std.testing.expectEqual(retired_calls + 1, wake_probe.calls);
+    try svc.runManagedRaftProgressOnly();
+    try std.testing.expectEqual(before_read, host.runtime_host.virtualTimeMs());
 }
 
 test "metadata http projected clone helpers clean up on allocation failure" {

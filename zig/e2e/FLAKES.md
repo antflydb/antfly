@@ -1957,6 +1957,28 @@ hold that local coordination lock while waiting for capacity or a peer reply.
 The initial Debug qualification was stopped to include this cleanup; its partial
 counts are not acceptance evidence.
 
+The Debug executable from `d1f371f3346b18bc0fc817c4b609ca7c67ac81d0`
+(SHA-256 `d1e3453b09ef3f4113a37c30a03884c0b533ef87c30ba1b27c12fd10e19ac6c0`)
+passed label-routed Autograph **200/200**. The mixed recovery cohort stopped
+after **32 FK merge passes, 26 cascade passes, and 24 schema-rewrite passes
+with 8 schema-rewrite failures**; it does not qualify recovery. All schema
+failures occurred on the fourth schema repetition. Retained status observations
+show a same-term metadata quorum, while logs show slow persistence/apply and
+the job still running. The smaller two-worker schema-only Debug investigation
+passed four cases, taking 146–160 seconds each.
+
+Live leader samples show restore workers repeatedly awaiting ReadIndex and
+checkpoint barriers. Request-side wakes alone leave incoming Raft replies
+waiting for the periodic tick on otherwise idle peers. The host now notifies
+the registered progress owner after accepting an inbound batch or snapshot,
+and rearms progress when a bounded drain leaves messages queued. Notifications
+do not step Raft or advance election time. Registration discovers existing
+queue debt; removal synchronizes with callbacks before the driver is destroyed.
+All 132 metadata-service tests and the focused inbound queue/snapshot host
+regressions pass in Debug. The tests cover queue debt at registration, bounded
+drain rearming, retired callbacks, snapshots, and unchanged election time.
+Fresh soak qualification remains pending.
+
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
 
 Scheduled run `36247286560` passed qualification, all five campaigns, and the

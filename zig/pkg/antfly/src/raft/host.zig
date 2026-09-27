@@ -408,6 +408,34 @@ pub const Host = struct {
     admission_conflicts: std.AutoHashMapUnmanaged(u64, raft_engine.runtime.group.ReplicaAdmissionConflict) = .empty,
     inbound_mutex: std.Io.Mutex = .init,
     pending_inbound: std.ArrayListUnmanaged(PendingInboundMessage) = .empty,
+    /// Borrowed notification only; the callback must not reenter the host.
+    /// The inbound mutex protects registration, invocation, and removal so
+    /// an HTTP worker cannot notify a retired progress driver.
+    inbound_progress_wake: ?InboundProgressWake = null,
+
+    pub const InboundProgressWake = struct {
+        ptr: *anyopaque,
+        notify_fn: *const fn (*anyopaque) void,
+    };
+
+    pub fn registerInboundProgressWake(self: *Host, wake: InboundProgressWake) !void {
+        self.lockInbound();
+        defer self.inbound_mutex.unlock(self.deps.io);
+        if (self.inbound_progress_wake != null) return error.RaftInboundProgressAlreadyOwned;
+        self.inbound_progress_wake = wake;
+        // Messages accepted before registration are already progress debt.
+        if (self.pending_inbound.items.len != 0) wake.notify_fn(wake.ptr);
+    }
+
+    pub fn releaseInboundProgressWake(self: *Host) void {
+        self.lockInbound();
+        defer self.inbound_mutex.unlock(self.deps.io);
+        self.inbound_progress_wake = null;
+    }
+
+    fn notifyInboundProgressLocked(self: *Host) void {
+        if (self.inbound_progress_wake) |wake| wake.notify_fn(wake.ptr);
+    }
 
     pub fn init(alloc: std.mem.Allocator, cfg: HostConfig, deps: HostDeps) Host {
         var runtime_cfg = cfg.runtime;
@@ -1044,6 +1072,7 @@ pub const Host = struct {
             self.metrics.inbound_message_enqueues += pending.items.len;
             self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
             pending.clearRetainingCapacity();
+            self.notifyInboundProgressLocked();
         }
     }
 
@@ -1076,6 +1105,9 @@ pub const Host = struct {
             }
         }
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
+        // Bounded drains retain their scheduling limit, but must not leave
+        // the remaining queue asleep until the next election tick.
+        if (self.pending_inbound.items.len != 0) self.notifyInboundProgressLocked();
         self.inbound_mutex.unlock(self.deps.io);
 
         var drained: usize = 0;
@@ -1192,6 +1224,7 @@ pub const Host = struct {
         });
         self.metrics.inbound_message_enqueues += 1;
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
+        self.notifyInboundProgressLocked();
     }
 
     pub fn admitSnapshotUpload(self: *Host, admission: transport.http_server.SnapshotUploadAdmission) !void {
@@ -2027,6 +2060,14 @@ test "host rejects live snapshot uploads addressed to another node" {
 }
 
 test "host queues live snapshot uploads for runtime round" {
+    const WakeProbe = struct {
+        calls: usize = 0,
+        fn notify(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var wake_probe: WakeProbe = .{};
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -2088,6 +2129,9 @@ test "host queues live snapshot uploads for runtime round" {
 
     const voters = try std.testing.allocator.dupe(u64, &[_]u64{1});
     const data = try std.testing.allocator.dupe(u8, "queued-snapshot");
+    try host.registerInboundProgressWake(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify });
+    defer host.releaseInboundProgressWake();
+    try std.testing.expectEqual(@as(usize, 0), wake_probe.calls);
     try host.handleSnapshotUpload(.{
         .group_id = 41,
         .from = 2,
@@ -2106,6 +2150,7 @@ test "host queues live snapshot uploads for runtime round" {
     try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_enqueues);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.pending_inbound_messages);
     try std.testing.expectEqual(@as(usize, "queued-snapshot".len), host.metricsSnapshot().pending_inbound_snapshot_bytes);
+    try std.testing.expectEqual(@as(usize, 1), wake_probe.calls);
     try std.testing.expectEqual(@as(usize, 0), host.metrics.inbound_message_drains);
     try std.testing.expectError(error.SnapshotAdmissionBackpressure, host.admitSnapshotUpload(.{
         .group_id = 41,
@@ -2121,6 +2166,14 @@ test "host queues live snapshot uploads for runtime round" {
 }
 
 test "host drops stale inbound peer batch groups without leaking pending storage" {
+    const WakeProbe = struct {
+        calls: usize = 0,
+        fn notify(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var wake_probe: WakeProbe = .{};
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -2215,13 +2268,20 @@ test "host drops stale inbound peer batch groups without leaking pending storage
     try std.testing.expectEqual(@as(usize, 2), host.metrics.inbound_message_enqueues);
     try std.testing.expectEqual(@as(usize, 2), host.metrics.pending_inbound_messages);
 
+    try host.registerInboundProgressWake(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify });
+    defer host.releaseInboundProgressWake();
+    try std.testing.expectEqual(@as(usize, 1), wake_probe.calls);
+    try std.testing.expectError(error.RaftInboundProgressAlreadyOwned, host.registerInboundProgressWake(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify }));
+
     _ = try host.runRoundBounded(1, 1, 1);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_drains);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.pending_inbound_messages);
+    try std.testing.expectEqual(@as(usize, 2), wake_probe.calls);
 
     _ = try host.runRoundBounded(1, 1, 1);
     try std.testing.expectEqual(@as(usize, 2), host.metrics.inbound_message_drains);
     try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_messages);
+    try std.testing.expectEqual(@as(usize, 2), wake_probe.calls);
 
     // A single poisoned group must not terminate the shared progress driver.
     try host.campaignGroup(41);
