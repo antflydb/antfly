@@ -837,6 +837,52 @@ conservative.
 - **Candidate mode:** not yet qualified. Its target, Banking77, is still to
   run.
 
+### How Jev likely closes this gap (research, 2026-09-26)
+
+TypeSafe has not published Jev's architecture. Everything public, though,
+suggests that Jev reaches its accuracy **without** letting the state see the
+questions. That is our default packed layout, so the gap above is most likely
+about training, not the mask.
+
+- **Isolation is a product promise.** TypeSafe says every question is
+  "evaluated in parallel and in isolation against the same state"
+  ([launch post](https://typesafe.ai/blog/introducing-system-one-models-and-jev)).
+  A question-aware state (`trunk_sees: "questions"`) breaks that promise:
+  adding a question can change another question's answer.
+- **The reproductions mask the state to itself.** MoJev/Jevre's mask
+  ([source](https://github.com/MoLeMo-Lab/mojev),
+  [card](https://huggingface.co/di-zhang-fdu/jevre)) allows only
+  `state → state` attention inside the state, bidirectional and never toward
+  the questions. Its docstring gives the reason: spans that see each other
+  lose "independent decisions, exact permutation invariance". The
+  [RLCD explainer](https://di-zhang-llm.github.io/blog/what-is-rlcd-the-secret-behind-jev/)
+  describes the same visibility.
+- **They train at 150-200k rows, in the target layout, from an LLM.**
+  - MoJev fine-tunes all of Qwen3.5-0.8B on 205,084 rows for one epoch.
+  - [Open-Jev](https://zefan-cai.github.io/open-jev/story/) trains LoRA on
+    Qwen 2B-27B over 148,639 rows and reports 85.3% on JevBench (Jev: 86.6%).
+  - Causal pretraining never let the state attend forward, so for these
+    models a question-blind state is the natural one.
+- **Their heads differ from Laya's.**
+  - MoJev mean-pools the state, question and candidate spans. It scores each
+    candidate by a rank-512 bilinear product of a state-plus-question vector
+    and a candidate vector, trained with a Plackett-Luce ranking loss plus a
+    Brier calibration loss.
+  - Open-Jev puts a scalar head on the last token.
+  - Laya uses a two-layer transformer head over option marker tokens.
+
+**Inference (ours).** Laya's released encoder was trained unpacked, with the
+state *after* the question and attending to it: the reverse of Jev's order. The
+packed fine-tunes ask it to unlearn that dependence in 400-915 cases. More data
+helped a little (packed 0.450 → 0.471 going from 400 to 915 cases), but the
+reproductions use about 200× more rows.
+
+**Next experiment.** Train the default, question-blind packed layout at scale
+on teacher-labelled synthetic cases. This keeps the state cache and question
+isolation, and tests the scale hypothesis directly. A MoJev-style pooled
+bilinear head is an optional ablation. Teacher throughput sets the cost of this
+experiment; see [Teacher throughput](#teacher-throughput).
+
 ### Candidate mode on Banking77 (step 0b)
 
 Measured 2026-09-26. `scripts/laya/prepare_laya_banking77.sh` downloads
@@ -1788,6 +1834,75 @@ long-context-teacher-labelled long-state dataset (585 native records — 585 =
 rest pass through gold unchanged) is at
 `.tmp/laya/distilled-longcontext-teacher.jsonl` in the producing worktree, for
 step 2c to pick up.
+
+### Teacher throughput
+
+The question: how far can the teacher's labelling rate be pushed? The scaled
+packed experiment needs about 10^5 decisions, like the Jev reproductions.
+
+**Setup.**
+- Machine: Apple M4 Max, 36 GB, MLX (mlx-lm 0.28 or later).
+- Benchmark: `scripts/laya/benchmark_laya_teacher.py`.
+- Throughput: 12 cases / 60 decisions from `td/s0-train.jsonl`.
+- Quality: all 760 decisions of `td/s0-eval.jsonl` against gold.
+- The benchmark does not include `prepare_laya_longcontext_teacher.py`'s
+  bookkeeping or its `--compare-laya` pass.
+
+**Where the time goes.**
+- The teacher is compute-bound on prefill: about 280-320 tok/s for
+  Qwen3-14B-4bit.
+- Batching does nothing. Measured at length 256, rates were flat from batch 1
+  to batch 16: 325, 283, 271 and 322 tok/s.
+- Label continuations are negligible. The prompt forward is essentially the
+  whole cost.
+- The per-question prompt averages 297 tokens, and the state is 206 of them.
+  The teacher re-reads the state once per question.
+
+| Lever | Speed | Quality | Verdict |
+| --- | ---: | --- | --- |
+| Shared-state prefill: prefill the case's common prefix (the state) once, then fork the KV cache per question | **1.5-1.9×** (0.96-1.07 → 0.52-0.70 s/decision); 2.25× fewer tokens | Exact. The forked cache matches a two-chunk prefill of the same prompt bit for bit (difference 0.0). Both differ from a one-chunk prefill by up to 0.062 in label probability (1 argmax flip in 60, a near tie): bf16/4-bit chunking numerics, not the fork | **adopt** |
+| Batching several prompts per forward | none on Metal | — | reject here |
+| Smaller teacher (Qwen3-4B-4bit) | 3.3× (0.167 vs 0.534 s/decision, shared prefill) | Accuracy 0.514 vs 0.645 (14B); soft CE 1.117 vs 1.032 (uniform 1.212); agrees with the 14B on 67% of argmaxes. Below the unpacked student it would teach (0.621) | **reject** |
+| 4B → 14B cascade (escalate when the 4B's calibrated top probability is below a threshold) | 1.7× at threshold 0.5, 1.2× at 0.6 (the 4B pass runs on every decision) | 0.582 (27% escalated), 0.617 (53%), 0.630 (70%) vs 0.645 | reject: every saving costs accuracy |
+| Teacher only where Laya cannot see the state; Laya teacher elsewhere | ~5× fewer teacher calls (16-21% of decisions are invisible to Laya, [above](#how-much-of-the-dataset-is-actually-invisible-to-laya)) | Short states then get Laya-teacher targets, and distilling those did not help (0.451 vs 0.450) | only if quality allows |
+| Datacenter GPU with prefix caching (for example vLLM with automatic prefix caching) | estimated ≥30× over this laptop | Same teacher, same targets | **the order-of-magnitude lever** |
+
+The GPU row is an estimate, not a measurement. Prefill on a laptop GPU is
+compute-bound, and a datacenter accelerator has well over 10× the
+bf16/int8 matmul throughput. Serving stacks with automatic prefix caching get
+the shared-state saving for free, and they batch across cases, which pays off
+once there is compute headroom.
+
+**Estimated wall-clock for 200k decisions:**
+- About 2.5 days per-question on this laptop.
+- About 1.2-1.6 days with shared-state prefill.
+- Hours on one datacenter GPU.
+
+**Recommendation.**
+1. Adopt shared-state prefill in `prepare_laya_longcontext_teacher.py`. It is
+   exact and free.
+2. Keep the 14B teacher.
+3. For the 10^5-decision run, move labelling to a rented GPU running the same
+   model behind a prefix-caching server. This is the only lever that reaches
+   an order of magnitude without giving up label quality.
+
+Stacking the lossy levers (the 4B cascade, Laya-only short states) would reach
+about 8-10× on this laptop. The table shows what that costs in accuracy.
+
+The 14B teacher is only 0.024 above the unpacked student on short states
+(0.645 vs 0.621), so for short states the teacher's value is calibration and
+scale, not accuracy. It is decisively better on long states (0.767 vs 0.291).
+
+Reproduce:
+
+```bash
+uv run --script scripts/laya/benchmark_laya_teacher.py .tmp/laya/qwen3-14b-4bit td/s0-train.jsonl --cases 12
+uv run --script scripts/laya/benchmark_laya_teacher.py .tmp/laya/qwen3-14b-4bit td/s0-eval.jsonl --score-output tacc-14b.jsonl
+```
+
+Accuracy is the argmax of the raw label scores against the argmax of `target`.
+Soft CE uses one temperature fit on even rows and evaluated on odd rows
+(4B: T = 18.2; 14B: T = 14.6).
 
 ## Roadmap
 

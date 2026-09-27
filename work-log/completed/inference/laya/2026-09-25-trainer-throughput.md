@@ -533,3 +533,16 @@ reference: packed on gold 0.450 (0.434/0.461/0.455); unpacked on gold 0.621 (0.5
 seed 42 acc 0.516 train 709 s   seed 43 acc 0.579 train 545 s   seed 44 acc 0.566 train 569 s
 mean 0.554 sd 0.033 soft_ce 1.031 ece 0.060   peak footprint 26.0 GB each; device estimate 31527 MiB
 ```
+
+## Teacher throughput (2026-09-26)
+
+M4 Max 36 GB, MLX, `scripts/laya/benchmark_laya_teacher.py`.
+
+- Qwen3-14B-4bit, 12 cases / 60 decisions of `td/s0-train.jsonl`:
+  `{"per_question_s_per_decision": 0.957, "per_question_tokens": 17807, "shared_s_per_decision": 0.518, "shared_tokens": 7915, "speedup": 1.85, "mean_shared_prefix_tokens": 206, "prefill_tok_per_s": 310, "max_prob_diff": 0.0622, "split_max_prob_diff": 0.0622, "fork_vs_split_max_prob_diff": 0.0, "argmax_agree": "59/60", "prefill_tok_per_s_by_batch_len256": {"1": 325, "4": 283, "8": 271, "16": 322}}`
+  Two earlier runs: speedup 1.51 and ~1.9.
+- Qwen3-4B-4bit, same: per-question 0.325 s/decision, shared 0.197, 912 tok/s, batching flat (885-941).
+- `td/s0-eval.jsonl`, 760 decisions, shared prefill: 4B 0.167 s/decision, accuracy 0.514, soft CE 1.117 (T 18.2);
+  14B 0.534 s/decision, accuracy 0.645, soft CE 1.032 (T 14.6); uniform soft CE 1.212; argmax agreement 0.672.
+- Cascade 4B → 14B by 4B calibrated top probability: threshold 0.5 escalates 27%, accuracy 0.582; 0.6: 53%, 0.617;
+  0.7: 70%, 0.630; 0.8: 90%, 0.637; 0.9: 99%, 0.645.
