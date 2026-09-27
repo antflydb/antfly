@@ -1267,15 +1267,7 @@ fn executeMultiTableCommitOnce(
             if (trace_writer) |tw| {
                 tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
             }
-            if (begun_count > 0) abortParticipants(
-                alloc,
-                worker,
-                txn_id,
-                commit_version,
-                participants.items,
-                participant_ids,
-                if (options.retain_terminal) participants.items.len else begun_count,
-            ) catch {};
+            if (begun_count > 0) abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, if (options.retain_terminal) participants.items.len else begun_count, fanout_slots, options) catch {};
         }
     }
 
@@ -1339,15 +1331,7 @@ fn executeMultiTableCommitOnce(
             // prepared followers in an earlier execution: only fresh IDs can
             // use this invocation's contact evidence to elide phase two.
             abort_on_error = false;
-            try abortParticipants(
-                alloc,
-                worker,
-                txn_id,
-                commit_version,
-                participants.items,
-                participant_ids,
-                if (options.retain_terminal) participants.items.len else 1,
-            );
+            try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, if (options.retain_terminal) participants.items.len else 1, fanout_slots, options);
             std.log.warn("transaction begin failed table={s} group_id={} err={s}", .{
                 participant.table_name, participant.group_id, @errorName(err),
             });
@@ -1391,6 +1375,7 @@ fn executeMultiTableCommitOnce(
                 participant_ids,
                 fanout_slots,
                 options.retain_terminal,
+                options,
             );
             return switch (failure) {
                 error.UnknownGroup, error.PreDecisionNotProposed => .{ .conflict = participantUnavailableConflict(participants.items[participant_index], .begin) },
@@ -1411,7 +1396,7 @@ fn executeMultiTableCommitOnce(
                         tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
                     }
                     abort_on_error = false;
-                    try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                    try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                     return .{ .conflict = participantConflict(participant, err) };
                 },
                 error.UnknownGroup,
@@ -1424,7 +1409,7 @@ fn executeMultiTableCommitOnce(
                     // decision may an ephemeral caller start a fresh attempt.
                     // Failure to prove abort still propagates unchanged.
                     abort_on_error = false;
-                    try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                    try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                     return .{ .conflict = participantUnavailableConflict(participant, .prepare) };
                 },
                 else => {
@@ -1432,7 +1417,7 @@ fn executeMultiTableCommitOnce(
                         participant.table_name, participant.group_id, @errorName(err),
                     });
                     abort_on_error = false;
-                    try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                    try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                     return err;
                 },
             }
@@ -1454,7 +1439,7 @@ fn executeMultiTableCommitOnce(
             if (already_checked) continue;
             table_catalog.validateTransactionTopologyEpoch(alloc, catalog, participant.table_name, participant.topology_epoch) catch |err| {
                 abort_on_error = false;
-                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                 return err;
             };
         }
@@ -1501,7 +1486,7 @@ fn executeMultiTableCommitOnce(
                     });
                 }
                 abort_on_error = false;
-                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                 return .{ .conflict = participantDecisionConflict(participant, .resolve) };
             },
             error.TxnNotFound, error.InvalidTxnRecord => {
@@ -1517,7 +1502,7 @@ fn executeMultiTableCommitOnce(
                 // The decision participant has no durable transaction record,
                 // so no commit decision exists yet.
                 abort_on_error = false;
-                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                 return .{ .conflict = participantTornStateConflict(participant, .resolve) };
             },
             else => {
@@ -1568,7 +1553,7 @@ fn executeMultiTableCommitOnce(
                     },
                     .aborted => {
                         abort_on_error = false;
-                        try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                        try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                         return .{ .conflict = participantDecisionConflict(participant, .resolve) };
                     },
                 }
@@ -3102,6 +3087,23 @@ fn abortParticipants(
     participant_ids: []const []const u8,
     attempted_count: usize,
 ) !void {
+    const slots = try alloc.alloc(ParticipantFanoutSlot, participants.len);
+    defer alloc.free(slots);
+    for (slots) |*slot| slot.reset();
+    return abortParticipantsWithOptions(alloc, worker, txn_id, timestamp, participants, participant_ids, attempted_count, slots, .{});
+}
+
+fn abortParticipantsWithOptions(
+    alloc: std.mem.Allocator,
+    worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    timestamp: u64,
+    participants: []const ParticipantTxn,
+    participant_ids: []const []const u8,
+    attempted_count: usize,
+    slots: []ParticipantFanoutSlot,
+    options: ExecuteOptions,
+) !void {
     if (participants.len == 0) return;
     std.debug.assert(participant_ids.len == participants.len);
     std.debug.assert(attempted_count > 0 and attempted_count <= participants.len);
@@ -3131,47 +3133,8 @@ fn abortParticipants(
         if (status != .aborted) return error.AbortDecisionNotDurable;
     };
 
-    // Once the coordinator decision is durable, follower delivery is
-    // idempotent recovery work and must not contradict that decision.
-    for (participants[1..], 1..) |participant, participant_index| {
-        if (participant_index < attempted_count) {
-            worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
-                .restore_staging_scope = participant.restore_staging_scope,
-                .restore_staging_plan_id = participant.restore_staging_plan_id,
-                .txn_id = txn_id,
-                .status = .aborted,
-                .commit_version = timestamp,
-                // An acknowledgement removes the participant from durable
-                // recovery, so phase two must be committed/applied first.
-                .sync_level = .write,
-            }) catch |err| {
-                // Continue notifying later participants. The durable
-                // coordinator record remains authoritative and recovery will
-                // retry any unavailable attempted participant.
-                std.log.warn("transaction abort delivery failed table={s} group_id={} err={s}", .{
-                    participant.table_name,
-                    participant.group_id,
-                    @errorName(err),
-                });
-                continue;
-            };
-        }
-        // Participants beyond attempted_count were never contacted. They have
-        // no transaction state or intents and are safe to acknowledge directly
-        // after the coordinator's abort decision is durable.
-        worker.acknowledgeGroup(alloc, coordinator.group_id, coordinator.table_name, .{
-            .restore_staging_scope = coordinator.restore_staging_scope,
-            .restore_staging_plan_id = coordinator.restore_staging_plan_id,
-            .txn_id = txn_id,
-            .participant = participant_ids[participant_index],
-        }) catch |err| {
-            std.log.warn("transaction abort acknowledgement deferred table={s} group_id={} err={s}", .{
-                participant.table_name,
-                participant.group_id,
-                @errorName(err),
-            });
-        };
-    }
+    // The coordinator decision must be durable before any independent cleanup.
+    runAbortFollowerFanout(worker, txn_id, timestamp, participants, participant_ids, attempted_count, false, slots, options);
 }
 
 fn abortParticipantsWithContactMask(
@@ -3181,15 +3144,16 @@ fn abortParticipantsWithContactMask(
     timestamp: u64,
     participants: []const ParticipantTxn,
     participant_ids: []const []const u8,
-    slots: []const ParticipantFanoutSlot,
+    slots: []ParticipantFanoutSlot,
     retained: bool,
+    options: ExecuteOptions,
 ) !void {
     if (participants.len == 0) return;
     std.debug.assert(participant_ids.len == participants.len and slots.len == participants.len);
     // Contact evidence is invocation-local, not transaction-local. In a
     // retained replay even a definitely unproposed BEGIN can have old intents.
     // Resolve the entire durable cohort; unavailable followers remain enlisted.
-    if (retained) return abortParticipants(alloc, worker, txn_id, timestamp, participants, participant_ids, participants.len);
+    if (retained) return abortParticipantsWithOptions(alloc, worker, txn_id, timestamp, participants, participant_ids, participants.len, slots, options);
 
     const coordinator = participants[0];
     worker.resolveGroup(alloc, coordinator.group_id, coordinator.table_name, .{
@@ -3205,41 +3169,83 @@ fn abortParticipantsWithContactMask(
         if (status != .aborted) return error.AbortDecisionNotDurable;
     };
 
-    for (participants[1..], 1..) |participant, participant_index| {
-        if (slots[participant_index].may_have_transaction_state) {
-            worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
-                .restore_staging_scope = participant.restore_staging_scope,
-                .restore_staging_plan_id = participant.restore_staging_plan_id,
-                .txn_id = txn_id,
-                .status = .aborted,
-                .commit_version = timestamp,
-                .sync_level = .write,
-            }) catch |err| {
-                // An explicitly missing record proves the failed begin did not
-                // create participant state. Other failures remain enlisted so
-                // durable coordinator recovery can redeliver the abort.
-                if (err != error.TxnNotFound) {
-                    std.log.warn("transaction abort delivery failed table={s} group_id={} err={s}", .{
-                        participant.table_name,
-                        participant.group_id,
-                        @errorName(err),
-                    });
-                    continue;
-                }
-            };
-        }
-        worker.acknowledgeGroup(alloc, coordinator.group_id, coordinator.table_name, .{
+    runAbortFollowerFanout(worker, txn_id, timestamp, participants, participant_ids, null, true, slots, options);
+}
+
+const AbortFollowerFanoutTask = struct {
+    fn run(
+        worker: ParticipantWorker,
+        coordinator: *const ParticipantTxn,
+        participant: *const ParticipantTxn,
+        participant_id: []const u8,
+        txn_id: db_mod.types.TxnId,
+        timestamp: u64,
+        resolve: bool,
+        allow_missing_state: bool,
+        slot: *ParticipantFanoutSlot,
+    ) void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        slot.reset();
+        if (resolve) worker.resolveGroup(arena.allocator(), participant.group_id, participant.table_name, .{
+            .restore_staging_scope = participant.restore_staging_scope,
+            .restore_staging_plan_id = participant.restore_staging_plan_id,
+            .txn_id = txn_id,
+            .status = .aborted,
+            .commit_version = timestamp,
+            .sync_level = .write,
+        }) catch |err| {
+            if (!allow_missing_state or err != error.TxnNotFound) {
+                slot.err = err;
+                return;
+            }
+        };
+        // Never acknowledge uncertain delivery. The coordinator's durable
+        // cohort remains recovery authority for failures in either step.
+        worker.acknowledgeGroup(arena.allocator(), coordinator.group_id, coordinator.table_name, .{
             .restore_staging_scope = coordinator.restore_staging_scope,
             .restore_staging_plan_id = coordinator.restore_staging_plan_id,
             .txn_id = txn_id,
-            .participant = participant_ids[participant_index],
+            .participant = participant_id,
         }) catch |err| {
-            std.log.warn("transaction abort acknowledgement deferred table={s} group_id={} err={s}", .{
-                participant.table_name,
-                participant.group_id,
-                @errorName(err),
-            });
+            slot.acknowledgement_err = err;
         };
+    }
+};
+
+fn runAbortFollowerFanout(
+    worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    timestamp: u64,
+    participants: []const ParticipantTxn,
+    participant_ids: []const []const u8,
+    attempted_count: ?usize,
+    allow_missing_state: bool,
+    slots: []ParticipantFanoutSlot,
+    options: ExecuteOptions,
+) void {
+    std.debug.assert(participants.len == participant_ids.len and participants.len == slots.len);
+    if (participants.len <= 1) return;
+    const width = fanoutWidth(options, participants.len - 1);
+    var start: usize = 1;
+    while (start < participants.len) : (start += width) {
+        const end = @min(start + width, participants.len);
+        var group: std.Io.Group = .init;
+        for (start..end) |i| {
+            // Copy contact evidence before the worker resets its result slot.
+            const resolve = if (attempted_count) |count| i < count else slots[i].may_have_transaction_state;
+            if (options.fanout_io) |io| {
+                group.concurrent(io, AbortFollowerFanoutTask.run, .{ worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i] }) catch
+                    AbortFollowerFanoutTask.run(worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i]);
+            } else {
+                AbortFollowerFanoutTask.run(worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i]);
+            }
+        }
+        if (options.fanout_io) |io| awaitFanout(&group, io);
+    }
+    for (slots[1..], 1..) |slot, i| {
+        if (slot.err) |err| std.log.warn("transaction abort delivery failed table={s} group_id={} err={s}", .{ participants[i].table_name, participants[i].group_id, @errorName(err) });
+        if (slot.acknowledgement_err) |err| std.log.warn("transaction abort acknowledgement deferred table={s} group_id={} err={s}", .{ participants[0].table_name, participants[0].group_id, @errorName(err) });
     }
 }
 
@@ -4559,6 +4565,125 @@ fn consumerTests() type {
                 ),
             );
             try std.testing.expectEqual(@as(usize, 1), local_probe.calls);
+        }
+
+        test "distributed txn abort fanout preserves durable ordering contact evidence and bounded recovery" {
+            const vopr = @import("vopr");
+            const alloc = std.testing.allocator;
+            const Mode = enum { normal, lost_coordinator_reply, unconfirmed_coordinator, contact_mask, retained };
+            for ([_]Mode{ .normal, .lost_coordinator_reply, .unconfirmed_coordinator, .contact_mask, .retained }) |mode| {
+                var sim = try vopr.vopr_io.VoprIo.init(.{ .required = .of(&.{ .clock_read, .sleep, .task_scheduling, .synchronization }) });
+                defer sim.deinit();
+                const participants = [_]ParticipantTxn{
+                    .{ .table_name = "docs", .group_id = 1001, .topology_epoch = 1 },
+                    .{ .table_name = "docs", .group_id = 1002, .topology_epoch = 1 },
+                    .{ .table_name = "docs", .group_id = 1003, .topology_epoch = 1 },
+                    .{ .table_name = "docs", .group_id = 1004, .topology_epoch = 1 },
+                    .{ .table_name = "docs", .group_id = 1005, .topology_epoch = 1 },
+                };
+                const ids = [_][]const u8{ "1", "2", "3", "4", "5" };
+                var slots: [5]ParticipantFanoutSlot = @splat(.{ .may_have_transaction_state = true });
+                slots[1].may_have_transaction_state = false;
+                const Recorder = struct {
+                    io: std.Io,
+                    mode: Mode,
+                    participants: []const ParticipantTxn,
+                    ids: []const []const u8,
+                    slots: []ParticipantFanoutSlot,
+                    durable_coordinator: bool = false,
+                    active: usize = 0,
+                    peak: usize = 0,
+                    invoked: [5]bool = @splat(false),
+                    resolved: [5]bool = @splat(false),
+                    acknowledged: [5]bool = @splat(false),
+                    failure: ?anyerror = null,
+                    fn worker(self: *@This()) ParticipantWorker {
+                        return .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status, .acknowledge_group = acknowledge } };
+                    }
+                    fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+                    fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+                    fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, req: TxnResolveRequest) !void {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, req.status);
+                        try std.testing.expectEqual(db_mod.types.SyncLevel.write, req.sync_level);
+                        const i: usize = @intCast(group - 1001);
+                        self.invoked[i] = true;
+                        if (i == 0) {
+                            try self.io.sleep(.fromMilliseconds(5), .awake);
+                            if (self.mode == .unconfirmed_coordinator) return error.Timeout;
+                            self.durable_coordinator = true;
+                            if (self.mode == .lost_coordinator_reply) return error.Timeout;
+                            return;
+                        }
+                        try std.testing.expect(self.durable_coordinator);
+                        self.active += 1;
+                        defer self.active -= 1;
+                        self.peak = @max(self.peak, self.active);
+                        try self.io.sleep(.fromMilliseconds(2), .awake);
+                        if (i == 2) {
+                            if (self.mode == .contact_mask) {
+                                self.resolved[i] = true; // Definitely no participant state.
+                                return error.TxnNotFound;
+                            }
+                            return error.LeaderUnavailable;
+                        }
+                        self.resolved[i] = true;
+                    }
+                    fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        return if (self.durable_coordinator) .aborted else .pending;
+                    }
+                    fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, req: TxnAcknowledgeRequest) !void {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        try std.testing.expectEqual(@as(u64, 1001), group);
+                        try std.testing.expect(self.durable_coordinator);
+                        const i: usize = req.participant[0] - '1';
+                        if (!(self.mode == .contact_mask and i == 1)) try std.testing.expect(self.resolved[i]);
+                        if (i == 4) return error.TestAckLost;
+                        self.acknowledged[i] = true;
+                    }
+                    fn run(self: *@This()) void {
+                        const txn_id = parseTxnIdHex("00112233445566778899aabbccddeeff") catch unreachable;
+                        const options: ExecuteOptions = .{ .fanout_io = self.io, .max_parallel_participants = 2 };
+                        if (self.mode == .contact_mask or self.mode == .retained) {
+                            abortParticipantsWithContactMask(alloc, self.worker(), txn_id, 77, self.participants, self.ids, self.slots, self.mode == .retained, options) catch |err| {
+                                self.failure = err;
+                            };
+                        } else {
+                            abortParticipantsWithOptions(alloc, self.worker(), txn_id, 77, self.participants, self.ids, self.participants.len, self.slots, options) catch |err| {
+                                self.failure = err;
+                            };
+                        }
+                    }
+                };
+                var recorder = Recorder{ .io = sim.io(), .mode = mode, .participants = &participants, .ids = &ids, .slots = &slots };
+                _ = sim.io().async(Recorder.run, .{&recorder});
+                var enabled: vopr.transition.List = .{};
+                defer enabled.deinit(alloc);
+                var events: vopr.event.Sink = .{};
+                defer events.deinit(alloc);
+                while (!sim.scheduler().quiescent()) {
+                    enabled.items.clearRetainingCapacity();
+                    try sim.scheduler().enumerateReady(&enabled, alloc);
+                    try enabled.canonicalize();
+                    if (enabled.items.items.len == 0) return error.VoprAbortFanoutDeadlock;
+                    try sim.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+                }
+                if (mode == .unconfirmed_coordinator) {
+                    try std.testing.expectEqual(@as(?anyerror, error.AbortDecisionNotDurable), recorder.failure);
+                    try std.testing.expectEqual(@as(usize, 0), recorder.peak);
+                    for (recorder.invoked[1..]) |invoked| try std.testing.expect(!invoked);
+                } else {
+                    try std.testing.expectEqual(@as(?anyerror, null), recorder.failure);
+                    try std.testing.expectEqual(@as(usize, 2), recorder.peak);
+                    try std.testing.expectEqual(mode != .contact_mask, recorder.invoked[1]);
+                    try std.testing.expectEqual(mode == .contact_mask, recorder.acknowledged[2]);
+                    try std.testing.expect(recorder.acknowledged[1] and recorder.acknowledged[3]);
+                    try std.testing.expect(!recorder.acknowledged[4]);
+                    try std.testing.expectEqual(@as(?anyerror, error.TestAckLost), slots[4].acknowledgement_err);
+                }
+                try sim.ensureNoCapabilityViolation();
+            }
         }
 
         test "distributed txn participant fanout is bounded and concurrent" {

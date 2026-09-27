@@ -1384,9 +1384,17 @@ const RaftTableApplyStateMachine = struct {
     };
 
     const ApplyOutcomeWaiter = struct {
+        nonce: u64,
         expected_term: u64,
         outcome: ApplyOutcome = .pending,
     };
+
+    const ApplyOutcomeToken = struct {
+        group_id: u64,
+        index: u64,
+        nonce: u64,
+    };
+    const max_apply_outcome_waiters: usize = 8192;
 
     const ReadBarrierWaiter = struct {
         group_id: u64,
@@ -1417,6 +1425,9 @@ const RaftTableApplyStateMachine = struct {
     // The map is therefore bounded by live synchronous proposals rather than
     // by Raft history or an eviction policy that could lose an outcome.
     apply_outcomes: std.AutoHashMapUnmanaged(ApplyFailureKey, ApplyOutcomeWaiter) = .empty,
+    next_apply_outcome_nonce: u64 = 1,
+    apply_outcome_wake_epoch: std.atomic.Value(u32) = .init(0),
+    apply_outcome_io: std.Io = std.Options.debug_io,
     // ReadIndex is asynchronous: enqueuing it is not a read barrier. This
     // shared tracker owns the request identity and waits until the matching
     // ReadState has crossed this exact replica's state-machine apply boundary.
@@ -1453,6 +1464,7 @@ const RaftTableApplyStateMachine = struct {
             .alloc = alloc,
             .write_source = write_source,
             .read_barriers = .init(alloc, incarnation),
+            .apply_outcome_io = if (backend_runtime) |runtime| runtime.controlIo() orelse io else io,
         };
     }
 
@@ -1868,6 +1880,7 @@ const RaftTableApplyStateMachine = struct {
         }
 
         const existing = self.applied_indexes.get(group_id) orelse 0;
+        const wake_outcomes = self.apply_outcomes.count() != 0 and applied_index > existing;
         if (applied_index > existing) {
             if (@import("builtin").is_test and self.test_faults.applied_index_publication_failure_once) {
                 self.test_faults.applied_index_publication_failure_once = false;
@@ -1879,6 +1892,9 @@ const RaftTableApplyStateMachine = struct {
         }
         const visible_applied_index = @max(existing, applied_index);
         self.applied_mutex.unlock();
+        // Apply publication is already authoritative. A later read-tracker
+        // allocation failure must not leave its confirmed writer asleep.
+        if (wake_outcomes) self.notifyApplyOutcomeWaiters();
         try self.read_barriers.noteApplied(group_id, visible_applied_index);
         self.notifyReadBarrierWaiters();
     }
@@ -1889,15 +1905,73 @@ const RaftTableApplyStateMachine = struct {
         index: u64,
         expected_term: u64,
     ) !void {
+        _ = try self.registerApplyOutcomeToken(group_id, index, expected_term);
+    }
+
+    fn registerApplyOutcomeToken(
+        self: *RaftTableApplyStateMachine,
+        group_id: u64,
+        index: u64,
+        expected_term: u64,
+    ) !ApplyOutcomeToken {
         lockAtomic(&self.applied_mutex);
         defer self.applied_mutex.unlock();
         const key = ApplyFailureKey{ .group_id = group_id, .index = index };
+        if (self.apply_outcomes.contains(key)) return error.DuplicateRaftApplyOutcomeWaiter;
+        if (self.apply_outcomes.count() >= max_apply_outcome_waiters) return error.ResourceBudgetExceeded;
+        if (self.next_apply_outcome_nonce == 0) return error.AppliedReadIdentityExhausted;
         const result = try self.apply_outcomes.getOrPut(self.alloc, key);
         if (result.found_existing) return error.DuplicateRaftApplyOutcomeWaiter;
         // Applied-index advancement alone is insufficient: a snapshot can
         // cover a command this process never executed. Exact entry publication
         // transitions this waiter to success or a typed deterministic failure.
-        result.value_ptr.* = .{ .expected_term = expected_term };
+        const nonce = self.next_apply_outcome_nonce;
+        self.next_apply_outcome_nonce +%= 1;
+        result.value_ptr.* = .{ .nonce = nonce, .expected_term = expected_term };
+        return .{ .group_id = group_id, .index = index, .nonce = nonce };
+    }
+
+    fn notifyApplyOutcomeWaiters(self: *RaftTableApplyStateMachine) void {
+        _ = self.apply_outcome_wake_epoch.fetchAdd(1, .release);
+        std.Io.futexWake(self.apply_outcome_io, u32, &self.apply_outcome_wake_epoch.raw, std.math.maxInt(u32));
+    }
+
+    fn applyOutcomeReady(self: *RaftTableApplyStateMachine, token: ApplyOutcomeToken) !bool {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        const waiter = self.apply_outcomes.get(.{ .group_id = token.group_id, .index = token.index }) orelse return error.UnknownGroup;
+        if (waiter.nonce != token.nonce) return error.UnknownGroup;
+        // A typed failure can be recorded before durable apply publication.
+        // Keep the watermark proof as well as the exact registration identity.
+        return (self.applied_indexes.get(token.group_id) orelse 0) >= token.index;
+    }
+
+    fn waitApplyOutcome(self: *RaftTableApplyStateMachine, token: ApplyOutcomeToken, deadline_ns: u64) !void {
+        while (true) {
+            const observed = self.apply_outcome_wake_epoch.load(.acquire);
+            if (try self.applyOutcomeReady(token)) return;
+            const now_ns: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, self.apply_outcome_io).nanoseconds));
+            if (now_ns >= deadline_ns) return error.Timeout;
+            // Epoch-before-state closes completion-before-parking races.
+            // The token also fences retirement followed by index reuse.
+            try std.Io.futexWaitTimeout(self.apply_outcome_io, u32, &self.apply_outcome_wake_epoch.raw, observed, .{
+                .duration = .{ .clock = .awake, .raw = .fromNanoseconds(@intCast(deadline_ns - now_ns)) },
+            });
+        }
+    }
+
+    fn takeRegisteredApplyOutcome(self: *RaftTableApplyStateMachine, token: ApplyOutcomeToken) ?ApplyOutcome {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        const key = ApplyFailureKey{ .group_id = token.group_id, .index = token.index };
+        const waiter = self.apply_outcomes.get(key) orelse return null;
+        if (waiter.nonce != token.nonce) return null;
+        _ = self.apply_outcomes.remove(key);
+        return waiter.outcome;
+    }
+
+    fn cancelRegisteredApplyOutcome(self: *RaftTableApplyStateMachine, token: ApplyOutcomeToken) void {
+        _ = self.takeRegisteredApplyOutcome(token);
     }
 
     fn recordApplyFailure(
@@ -1944,6 +2018,7 @@ const RaftTableApplyStateMachine = struct {
             if (entry.value_ptr.group_id == group_id) entry.value_ptr.retired = true;
         }
         self.applied_mutex.unlock();
+        self.notifyApplyOutcomeWaiters();
         self.notifyReadBarrierWaiters();
         self.read_barriers.retireGroup(group_id);
     }
@@ -11161,7 +11236,7 @@ pub const DataServer = struct {
             var local_status_missing = false;
             var local_status_is_voter = false;
             var retry_for_leader_preflight = false;
-            var outcome_waiter_index: ?u64 = null;
+            var outcome_waiter_token: ?RaftTableApplyStateMachine.ApplyOutcomeToken = null;
 
             {
                 lockAtomic(&self.data_raft_mutex);
@@ -11284,11 +11359,10 @@ pub const DataServer = struct {
                             // registering here guarantees that even a
                             // single-node commit cannot publish its outcome
                             // before the waiter exists.
-                            apply_sm.registerApplyOutcomeWaiter(group_id, index, proposal_term) catch |err| {
+                            outcome_waiter_token = apply_sm.registerApplyOutcomeToken(group_id, index, proposal_term) catch |err| {
                                 std.log.warn("data raft batch outcome waiter failed group_id={} index={} term={} err={s}", .{ group_id, index, proposal_term, @errorName(err) });
                                 return error.RaftBatchWriteOutcomeUnknown;
                             };
-                            outcome_waiter_index = index;
                         }
                     }
                 } else {
@@ -11346,17 +11420,17 @@ pub const DataServer = struct {
             }
 
             if (target_index) |index| {
+                defer if (outcome_waiter_token) |token|
+                    if (self.data_raft_apply) |apply_sm|
+                        apply_sm.cancelRegisteredApplyOutcome(token);
                 self.reachDataRequestLifecycle(.{
                     .phase = .proposal_accepted,
                     .group_id = group_id,
                     .log_index = index,
                     .table_name = table_name,
                 }) catch return error.RaftBatchWriteOutcomeUnknown;
-                defer if (outcome_waiter_index) |waiter_index|
-                    if (self.data_raft_apply) |apply_sm|
-                        apply_sm.cancelApplyOutcomeWaiter(group_id, waiter_index);
                 if (proposal_req.sync_level != .propose) {
-                    self.waitForLocalRaftBatchApply(group_id, index, deadline_ns) catch |err| {
+                    self.waitForLocalRaftBatchApply(outcome_waiter_token.?, deadline_ns) catch |err| {
                         std.log.warn("data raft batch outcome unknown after proposal group_id={} index={} phase=apply_wait err={s}", .{
                             group_id,
                             index,
@@ -11377,11 +11451,11 @@ pub const DataServer = struct {
                     }) catch return error.RaftBatchWriteOutcomeUnknown;
                     const apply_sm = self.data_raft_apply orelse
                         return error.RaftBatchWriteOutcomeUnknown;
-                    const outcome = apply_sm.takeApplyOutcome(group_id, index) orelse {
+                    const outcome = apply_sm.takeRegisteredApplyOutcome(outcome_waiter_token.?) orelse {
                         std.log.warn("data raft batch outcome missing group_id={} index={}", .{ group_id, index });
                         return error.RaftBatchWriteOutcomeUnknown;
                     };
-                    outcome_waiter_index = null;
+                    outcome_waiter_token = null;
                     switch (outcome) {
                         .succeeded => {},
                         .failed => |failure| return failure.toError(),
@@ -12013,22 +12087,15 @@ pub const DataServer = struct {
 
     fn waitForLocalRaftBatchApply(
         self: *DataServer,
-        group_id: u64,
-        target_index: u64,
+        token: RaftTableApplyStateMachine.ApplyOutcomeToken,
         deadline_ns: u64,
     ) !void {
         const apply_sm = self.data_raft_apply orelse return error.UnsupportedOperation;
-        while (apply_sm.appliedIndex(group_id) < target_index) {
-            if (self.dataRaftMonotonicNs() >= deadline_ns) {
-                self.logRaftBatchApplyTimeout(group_id, target_index, apply_sm.appliedIndex(group_id));
-                return error.LeaderUnavailable;
-            }
-            // The dedicated ticker owns transport-driving Raft rounds. Running
-            // one here can block on peer I/O while holding data_raft_mutex,
-            // preventing the ticker from committing the entry this request is
-            // waiting for and defeating this deadline.
-            try self.sleepDataRaftBatchLeaderRetry();
-        }
+        apply_sm.waitApplyOutcome(token, deadline_ns) catch |err| {
+            if (err == error.Timeout)
+                self.logRaftBatchApplyTimeout(token.group_id, token.index, apply_sm.appliedIndex(token.group_id));
+            return err;
+        };
     }
 
     fn logRaftBatchApplyTimeout(self: *DataServer, group_id: u64, target_index: u64, applied_index: u64) void {
@@ -33701,6 +33768,99 @@ fn consumerTests() type {
             try std.testing.expect(!apply_sm.apply_outcomes.contains(.{ .group_id = retired_group_id, .index = 9 }));
             try std.testing.expectEqual(@as(usize, 1), apply_sm.apply_outcomes.count());
             try std.testing.expectEqual(.pending, apply_sm.apply_outcomes.get(.{ .group_id = active_group_id, .index = 12 }).?.outcome);
+        }
+
+        test "data raft apply completion notifications fence reuse deadlines and bounded ownership" {
+            const vopr = @import("vopr");
+            const alloc = std.testing.allocator;
+            const Mode = enum { before_wait, completion, unrelated_wake, retirement, reuse, deadline, cancellation };
+            for ([_]Mode{ .before_wait, .completion, .unrelated_wake, .retirement, .reuse, .deadline, .cancellation }) |mode| {
+                var sim = try vopr.vopr_io.VoprIo.init(.{ .required = .of(&.{ .clock_read, .sleep, .task_scheduling, .synchronization }) });
+                defer sim.deinit();
+                var sm: RaftTableApplyStateMachine = .{
+                    .alloc = alloc,
+                    .write_source = undefined,
+                    .read_barriers = .init(alloc, 1),
+                    .apply_outcome_io = sim.io(),
+                };
+                defer sm.applied_indexes.deinit(alloc);
+                defer sm.apply_outcomes.deinit(alloc);
+                defer sm.read_barriers.deinit();
+                defer sm.read_barrier_waiters.deinit(alloc);
+                const token = try sm.registerApplyOutcomeToken(7, 1, 2);
+                const Worker = struct {
+                    sm: *RaftTableApplyStateMachine,
+                    token: RaftTableApplyStateMachine.ApplyOutcomeToken,
+                    mode: Mode,
+                    failure: ?anyerror = null,
+                    completed_ns: i96 = -1,
+                    replacement: ?RaftTableApplyStateMachine.ApplyOutcomeToken = null,
+                    future: ?*std.Io.Future(void) = null,
+                    fn wait(self: *@This()) void {
+                        self.sm.waitApplyOutcome(self.token, 100 * std.time.ns_per_ms) catch |err| {
+                            self.failure = err;
+                        };
+                        self.completed_ns = std.Io.Clock.now(.awake, self.sm.apply_outcome_io).nanoseconds;
+                    }
+                    fn publish(self: *@This()) !void {
+                        if (self.mode == .unrelated_wake) {
+                            try self.sm.apply_outcome_io.sleep(.fromMilliseconds(3), .awake);
+                            self.sm.notifyApplyOutcomeWaiters();
+                            try self.sm.apply_outcome_io.sleep(.fromMilliseconds(4), .awake);
+                        } else try self.sm.apply_outcome_io.sleep(.fromMilliseconds(7), .awake);
+                        if (self.mode == .cancellation) {
+                            self.future.?.cancel(self.sm.apply_outcome_io);
+                            return;
+                        }
+                        if (self.mode == .retirement or self.mode == .reuse) {
+                            RaftTableApplyStateMachine.retireGroup(self.sm, 7);
+                            if (self.mode == .reuse) self.replacement = try self.sm.registerApplyOutcomeToken(7, 1, 2) else return;
+                        }
+                        try self.sm.publishAppliedReady(7, 0, &.{.{ .term = 2, .index = 1, .entry_type = .normal, .data = &.{} }}, 1);
+                    }
+                };
+                var worker = Worker{ .sm = &sm, .token = token, .mode = mode };
+                if (mode == .before_wait) try sm.publishAppliedReady(7, 0, &.{.{ .term = 2, .index = 1, .entry_type = .normal, .data = &.{} }}, 1);
+                var waiter = sim.io().async(Worker.wait, .{&worker});
+                worker.future = &waiter;
+                if (mode != .before_wait and mode != .deadline) _ = sim.io().async(Worker.publish, .{&worker});
+                var enabled: vopr.transition.List = .{};
+                defer enabled.deinit(alloc);
+                var events: vopr.event.Sink = .{};
+                defer events.deinit(alloc);
+                while (!sim.scheduler().quiescent()) {
+                    enabled.items.clearRetainingCapacity();
+                    try sim.scheduler().enumerateReady(&enabled, alloc);
+                    try enabled.canonicalize();
+                    if (enabled.items.items.len == 0) return error.VoprApplyWaitDeadlock;
+                    try sim.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+                }
+                const expected: ?anyerror = switch (mode) {
+                    .retirement, .reuse => error.UnknownGroup,
+                    .deadline => error.Timeout,
+                    .cancellation => error.Canceled,
+                    else => null,
+                };
+                try std.testing.expectEqual(expected, worker.failure);
+                try std.testing.expectEqual(@as(i96, switch (mode) {
+                    .before_wait => 0,
+                    .deadline => 100 * std.time.ns_per_ms,
+                    else => 7 * std.time.ns_per_ms,
+                }), worker.completed_ns);
+                sm.cancelRegisteredApplyOutcome(token);
+                if (worker.replacement) |replacement| {
+                    try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ApplyOutcome, .succeeded), sm.takeRegisteredApplyOutcome(replacement));
+                }
+                try std.testing.expectEqual(@as(usize, 0), sm.apply_outcomes.count());
+                try sim.ensureNoCapabilityViolation();
+            }
+            // Admission exhaustion preserves every existing registration.
+            var sm: RaftTableApplyStateMachine = .{ .alloc = alloc, .write_source = undefined, .read_barriers = .init(alloc, 1) };
+            defer sm.apply_outcomes.deinit(alloc);
+            defer sm.read_barriers.deinit();
+            for (0..RaftTableApplyStateMachine.max_apply_outcome_waiters) |i| _ = try sm.registerApplyOutcomeToken(7, i + 1, 2);
+            try std.testing.expectError(error.ResourceBudgetExceeded, sm.registerApplyOutcomeToken(8, 1, 2));
+            try std.testing.expectEqual(@as(usize, RaftTableApplyStateMachine.max_apply_outcome_waiters), sm.apply_outcomes.count());
         }
 
         test "data raft apply records transaction conflicts without stopping replica progress" {

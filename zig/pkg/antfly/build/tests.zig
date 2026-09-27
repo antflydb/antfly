@@ -2864,6 +2864,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const vopr_registry_test_step = b.step("vopr-registry-test", "Record and exact-replay every context-free VOPR scenario through the CLI registry");
     vopr_registry_test_step.dependOn(&run_vopr_cli_registry_tests.step);
 
+    const abort_regression_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"distributed txn"},
+    });
+    const abort_regression_step = b.step("antfly-transaction-abort-test", "Run transaction coordinator and bounded abort regressions");
+    abort_regression_step.dependOn(&b.addRunArtifact(abort_regression_tests).step);
+
     const transaction_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"transaction VOPR exactly replays and emits a formal sidecar"},

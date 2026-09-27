@@ -1992,7 +1992,55 @@ skip notification locking when no driver is registered. The real DataServer
 fixture covers ReadIndex wakes, callback retirement, and unchanged election
 time. Debug validation passes the 61-step native build, all 132 metadata
 contracts, ten data cadence/forwarding/protocol/read-barrier contracts, and the
-focused host regressions. New frozen-binary qualification is pending.
+focused host regressions. The frozen macOS arm64 Debug CPU executable
+`c2fd237c241b287795dc7659ed93daf2da48772f62d0ec0a7d65017228acc1d1`
+passed **200/200 each** for FK merge `release-reply_loss`, schema rewrite
+`publication-coordinator`, FK cascade `transaction_resolve-owner`, and
+label-routed Autograph, with zero failures, errors, or skips. The three recovery
+selectors used four workers × 50 repetitions; Autograph used two × 100.
+These qualify the event-driven Raft progress changes before the subsequent
+apply-waiter and verification improvements below.
+
+The small-data FK merge case still averaged 45.2 seconds. A diagnostic breakdown
+found 5.7 seconds startup, 2.3 teardown, about 9.9 table setup/seed, 6.6 merge and
+row verification, 16.8 exhaustive constraint rejection, and 0.5 final cascade.
+Native samples show participant preparation rejecting claims during Raft apply,
+followed by durable abort cleanup. Requests poll applied indexes every 50 ms;
+remote transaction steps averaged 56–62 ms, repeating that delay across the
+protocol. Abort follower resolution and acknowledgment were also serial.
+
+Three paired diagnostic runs preserved every individual claim check, using
+independent candidate keys and sessions: one-worker verification took 15.198,
+14.615 and 13.711 seconds; three workers took 8.367, 9.301 and 9.262 seconds.
+These are phase timings alongside the recovery cohort, rather than a controlled
+end-to-end benchmark. Diagnostic runs are excluded from all 200-case counts.
+
+Apply completion now wakes request waiters through the borrowed Raft I/O clock
+and synchronization provider. Registrations have unique tokens, an 8,192-entry
+admission bound, and exact applied-index and term outcome proofs. Epoch/state
+rechecks close lost wakeups; group retirement wakes old requests, and index
+reuse cannot make an old request consume or cancel a replacement registration.
+Confirmed apply publication wakes writers before later fallible read-tracker
+work. Request cleanup also covers failure immediately after proposal admission.
+No request thread executes Raft progress, and deadlines or ambiguous-write
+classification are unchanged.
+
+Abort cleanup retains the mandatory durable coordinator-first edge. Followers
+resolve and then acknowledge through existing bounded participant fanout and
+preallocated coordination slots, with isolated task arenas. Uncertain resolution
+or acknowledgment retains durable recovery debt; fresh-ID contact evidence and
+retained-ID full-cohort recovery retain their distinct rules. The E2E helper
+checks every UNIQUE claim with three bounded workers, distinct candidate keys,
+and independent sessions, joining all workers before the final cascade.
+
+Debug validation passes the 58-step native build, three apply/retirement tests,
+13 transaction tests, and ten real-Raft cadence/forwarding/protocol/read-safety
+contracts. The deterministic tests cover prompt completion, already-complete
+work, unrelated wakes, deadlines, cancellation, group reuse, capacity exhaustion,
+coordinator reply loss, unconfirmed abort decisions, contact masks, retained
+cohorts, failed resolution, and failed acknowledgments. Nine Python verification
+and seed-helper contracts, Ruff lint/format, and diff checks pass. Qualification
+of the new frozen executable is pending.
 
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
 
