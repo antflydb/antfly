@@ -12,6 +12,9 @@ description: "Automatically stream INSERT, UPDATE, and DELETE changes from Postg
 
 Antfly has built-in **Change Data Capture (CDC)** that streams real-time changes from PostgreSQL tables into Antfly documents using [logical replication](https://www.postgresql.org/docs/current/logical-replication.html). No external daemon or sync process required — just add a `replication_sources` block when creating a table.
 
+For authenticated deployments, set `ANTFLY_ADMIN_PASSWORD` to the provisioned
+administrator password; see [secure deployment](https://github.com/antflydb/antfly/blob/v0.2.x/docs/auth.md#secure-deployment).
+
 ## Architecture
 
 ```
@@ -74,7 +77,7 @@ CREATE TABLE users (
 
 ```bash
 curl -X POST http://localhost:8080/db/v1/table \
-  -u admin:admin \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "users",
@@ -100,7 +103,7 @@ INSERT INTO users (id, name, email, score) VALUES ('user-1', 'Alice', 'alice@exa
 
 ```bash
 # Check it appears in Antfly
-curl -s http://localhost:8080/db/v1/table/users/key/user-1 -u admin:admin | jq .
+curl -s http://localhost:8080/db/v1/table/users/key/user-1 -u "admin:${ANTFLY_ADMIN_PASSWORD}" | jq .
 ```
 
 ## Configuration Reference
@@ -186,7 +189,7 @@ Never put credentials directly in the DSN. Use a protected Antfly secret-store f
 ```bash
 # Store the DSN as a secret
 curl -X PUT http://localhost:8080/db/v1/secrets/pg_dsn \
-  -u admin:admin \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{"value": "postgres://user:pass@pg-host:5432/mydb?sslmode=require"}'
 ```

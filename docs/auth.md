@@ -4,6 +4,69 @@ This document describes the intended Antfly data-plane authorization model. It
 is provider-neutral: Antfly can receive principal context from an embedded auth
 module, a trusted gateway, a managed control plane, or a self-hosted deployment.
 
+## Secure Deployment
+
+Local quickstarts disable authentication and bind to loopback. Docker examples
+listen on `0.0.0.0` inside the container but publish host ports on `127.0.0.1`.
+Keep ports private until authentication and TLS termination are configured.
+
+Enable built-in authentication with `--auth true` or `"enable_auth": true` in
+the config file. On first startup, provide a unique administrator password
+through `ANTFLY_BOOTSTRAP_ADMIN_PASSWORD` (12 to 72 bytes):
+
+```sh
+export ANTFLY_BOOTSTRAP_ADMIN_PASSWORD="$(openssl rand -base64 24)"
+# Save this password securely before removing the environment variable.
+antfly standalone --auth true
+```
+
+For Docker, forward the variable without placing its value in arguments:
+
+```sh
+docker run -p 127.0.0.1:8080:8080 \
+  --env ANTFLY_BOOTSTRAP_ADMIN_PASSWORD \
+  -v antfly-data:/antflydb \
+  ghcr.io/antflydb/antfly:latest \
+  standalone --host 0.0.0.0 --data-dir /antflydb --auth true
+```
+
+The administrator username is `admin`. The password is stored as a hash and
+is not logged. Existing non-default credentials are preserved on later starts,
+even if the variable changes. Rotate credentials through the authenticated
+user-management API. Bootstrap is local to each node, not a cluster-wide
+password update.
+
+An auth-enabled instance with legacy `admin:admin` credentials refuses to start
+until a valid bootstrap password replaces that known default. HA primary and
+standby startup does not rewrite credentials from a portable seed; rotate
+legacy credentials before capturing a replacement HA seed.
+
+Built-in authentication also applies to MCP tools on `/mcp/v1` on the public
+port. CORS is a browser access policy, not authentication. Omitted or empty
+`allowed_origins` lists deny cross-origin access; `"*"` requires explicit
+opt-in and cannot be combined with credentialed CORS.
+
+### Local files in remote templates
+
+Remote helpers such as `remoteText`, `remotePDF`, and `remoteMedia` deny
+`file://` unless `remote_content.security.allowed_paths` explicitly includes
+the target. Omitted and empty path lists deny local file access. To permit an
+intentional ingestion directory:
+
+```json
+{
+  "remote_content": {
+    "security": {
+      "allowed_paths": ["/srv/antfly/ingest"]
+    }
+  }
+}
+```
+
+Use a dedicated directory containing only files authorized callers may read.
+Canonical path checks reject sibling-prefix and symlink escapes. Private-IP
+blocking for HTTP downloads does not authorize local file access.
+
 ## Goals
 
 Antfly should enforce authorization at the data-plane boundary where queries are

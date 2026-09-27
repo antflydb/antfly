@@ -5501,7 +5501,7 @@ const SimAuthManager = struct {
         );
         errdefer self.manager.deinit();
 
-        try usermgr.ensureDefaultAdminUser(&self.manager);
+        try usermgr.ensureDefaultAdminUser(&self.manager, "vopr-bootstrap-password");
         return self;
     }
 
@@ -6776,7 +6776,7 @@ test "metadata http cluster simulation seeds default admin for auth-enabled publ
     try public_api.initLeaderBackedWithAuthInPlace(sim_alloc, &cluster, roots, &auth_managers);
     defer public_api.deinit();
 
-    const admin_auth = try encodeBasicAuthorization(std.heap.page_allocator, "admin", "admin");
+    const admin_auth = try encodeBasicAuthorization(std.heap.page_allocator, "admin", "vopr-bootstrap-password");
     defer std.heap.page_allocator.free(admin_auth);
 
     for (public_api.api_base_uris) |base_uri| {
