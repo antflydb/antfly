@@ -587,10 +587,21 @@ different sizes; see the report for caveats).
   After 14,000 steps (two hours on the Studio) the student, read through
   gliner2.5-base's own heads, scores 0.662 / 0.378 classification and
   0.449 / 0.364 NER F1 (in-domain / held-out; gliner2.5-base 0.728 / 0.483
-  and 0.543 / 0.515). Next: a native feature-distillation objective, a larger
-  and more diverse text pool, then task distillation on top.
+  and 0.543 / 0.515). Task fine-tuning on the pilot rows then lifts it to
+  0.742 / 0.345 and 0.675 / 0.477, past released gliner2.5-base in-domain.
   Details:
   [work-log/completed/inference/antenna/2026-09-25-pilot.md](../../../../../work-log/completed/inference/antenna/2026-09-25-pilot.md).
+- **Native (Zig):** the GLiNER neck (decision 9), feature-distillation jobs
+  with a frozen DeBERTa teacher on the CPU, and a closed-form neck fit on the
+  job's backend are implemented and tested. A resident Metal bug (transposed
+  right operands of `dot_general` ran untransposed, corrupting ModernBERT
+  attention scores) invalidated every earlier native ModernBERT Metal result;
+  after the fix, native task fine-tuning matches upstream's trainer from the
+  same checkpoint (0.743 / 0.345 and 0.684 / 0.511 against 0.741 / 0.353 and
+  0.673 / 0.482). Details:
+  [work-log/completed/inference/antenna/2026-09-26-native-distillation.md](../../../../../work-log/completed/inference/antenna/2026-09-26-native-distillation.md).
+  `scripts/antenna/distill_pool.py --wikipedia` adds encyclopedic passages to
+  the text pool for held-out breadth.
 
 ### Step 2: fused ModernBERT training attention (done)
 
