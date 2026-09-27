@@ -2065,6 +2065,24 @@ absence fencing. The apply-wake latency fixture drains runnable work before
 advancing virtual time; advancing directly to a deadline while a wake remains
 runnable models starvation rather than polling delay.
 
+The peer-refresh executable
+`639ab9d341010b152581aace463785660355c76b2609d35db8f8a06958a9102a`
+passed Autograph **200/200**, with 82 FK-merge, 80 schema-rewrite, and 79 cascade
+passes before a schema post-publication read returned 503 "group leader
+unavailable". The stopped cohort contains one schema failure and is superseded.
+Public point-read readiness previously retried storage installation races but
+returned leadership and group-activation races immediately. These read-only
+failures now use the same bounded readiness policy, resolving a fresh fenced
+route and obtaining a new quorum/apply proof for each attempt. The caller and
+lookup deadlines are intersected in the retry clock and propagated to each
+source attempt; both cancellation tokens remain active. Ordinary successful
+reads retain their caller budget; the five-second local readiness ceiling only
+applies after a transient failure. Read-only servers fail fast, and authoritative
+absence and validation errors remain final. No mutation is replayed and no
+read consistency is downgraded. Regression checks cover the transient error
+classes, expiry before source admission, cancellation during readiness,
+shorter caller deadlines, and unchanged read-only/validation behavior.
+
 Final executable qualification remains pending.
 
 ## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
