@@ -549,3 +549,14 @@ M4 Max 36 GB, MLX, `scripts/laya/benchmark_laya_teacher.py`.
 - `prepare_laya_longcontext_teacher.py --score-all` on `td/s0-eval.jsonl` (760 decisions, no calibration):
   `--prefill shared` 0.650 s/decision, 109,893 tokens, accuracy 0.6461, soft CE 5.755, ECE 0.321;
   `--prefill per-question` 1.304 s/decision, 266,593 tokens, accuracy 0.6447, soft CE 5.759, ECE 0.318.
+
+## Open-Jev scale run (2026-09-27)
+
+`td/oj-mix.jsonl` = `openjev-train.jsonl` (64,450; converter drops: excluded source 4,206, state does not fit 10,460)
++ `s0-train.jsonl` (2,000). Config `td/oj42.json`: rlcd, seed 42, epochs 1, batch 1, `max_packed_len` 704.
+Probe estimates: 2,048 → 137,698 MiB; 1,024 → 47,846; 768 → 34,343; 704 → 31,527; 640 → 28,936.
+Train 23,897 s, 20,990 steps, peak footprint 27.4 GB.
+`s0-eval`: overall 0.375, choice 0.329, score 0.273, noul 0.557, soft CE 1.270, ECE 0.062.
+Mean CE per 2,000 steps: 1.492 1.283 1.408 1.601 1.652 1.852 1.816 1.502 1.596 1.454 1.522 (uniform 1.078).
+Grad norm p50/p95 per 2,000 steps: 31.5/498, 20.5/871, 18.1/541, 17.0/569, 12.3/545, 15.3/758, 14.0/385,
+13.0/666, 13.2/1419, 13.7/3114, 17.9/4419. Weights deleted after eval before an Open-Jev eval could run.

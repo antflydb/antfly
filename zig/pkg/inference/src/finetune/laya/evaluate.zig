@@ -134,7 +134,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Report {
     const tokenizer = try hf.HfTokenizer.loadFromBytes(gpa, try files.readFileFromDir(a, options.model_dir, "tokenizer.json"));
     const tok = tokenizer.tokenizer();
     defer tok.deinitTokenizer();
-    const bytes = try files.readFileMax(a, options.records_file, 64 * 1024 * 1024);
+    const bytes = try files.readFileMax(a, options.records_file, data.max_file_bytes);
     var tasks: std.ArrayListUnmanaged(pipeline.Task) = .empty;
     var targets: std.ArrayListUnmanaged([]const f32) = .empty;
     var lines = std.mem.splitScalar(u8, bytes, '\n');

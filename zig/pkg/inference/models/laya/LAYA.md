@@ -883,6 +883,74 @@ isolation, and tests the scale hypothesis directly. A MoJev-style pooled
 bilinear head is an optional ablation. Teacher throughput sets the cost of this
 experiment; see [Teacher throughput](#teacher-throughput).
 
+### Scaling packed training on Open-Jev (2026-09-27)
+
+This is the test of the scale hypothesis above. It trains the default,
+question-blind packed layout on public rule-labelled data, so no teacher is
+needed.
+
+**Data.** [Open-Jev](https://huggingface.co/datasets/ZefanCai/Open-Jev),
+`release-v2-redistributable` train split (79,116 records, CC0), was converted
+with `scripts/laya/prepare_laya_openjev.py`.
+- Excluded `customer-control-v1` (4,206 records). Open-Jev notes that its
+  question descriptions come from TypeSafe documentation without a verified
+  license.
+- Dropped 10,460 records whose whole state does not fit Laya's 512-token
+  sequence.
+- No record overlaps our splits by group, ID or state text.
+- Kept 64,450 decisions:
+  - painting-geometry: 23,552
+  - snake: 12,508
+  - vizdoom: 6,354
+  - reasoning: 5,442
+  - workflow controls (the domains closest to our eval): 11,956
+  - tic-tac-toe, platformer and runner games: 4,638
+- Mixed with our 2,000 `s0-train` decisions: 66,450 in total, 33× the step-0
+  budget.
+
+**Run.** The step-0 recipe (RLCD, encoder learning rate 2.5e-5, constant, batch
+1, one epoch, seed 42) with `max_packed_len` 704.
+- At the default 2,048, the admission estimate was 137 GB. Open-Jev states
+  carry up to 51 questions, and dense attention memory grows with the square
+  of the longest row. At 704 those states split into more rows that each
+  repeat the trunk, which is exact.
+- Estimate 31.5 GB, measured peak 27.4 GB.
+- 20,990 packed rows in 6.6 h (1.14 s/step).
+- The loader caps were raised to 1 GiB per file and 1M records. Memory stays
+  bounded by `max_host_bytes`.
+
+**Result: RLCD, seed 42 — worse on every question type.**
+
+| Run | Decisions | Overall | choice | score | noul | Soft CE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Packed, `s0-train` only (3 seeds) | 2,000 | 0.450 | | | | |
+| Packed, seed 43 | 2,000 | 0.461 | 0.368 | 0.414 | 0.614 | 1.121 |
+| **Packed, Open-Jev mix, RLCD** | 66,450 | **0.375** | 0.329 | 0.273 | 0.557 | 1.270 |
+| Unpacked (3 seeds) | 2,000 | 0.621 | | | | |
+
+**Diagnosis: the run did not learn, so the result says nothing about scale
+yet.** With one epoch, each step's loss is measured before the model has seen
+that row, so the training loss is a held-out learning curve.
+- Mean CE per 2,000 steps: 1.49, 1.28, 1.41, 1.60, 1.65, 1.85, 1.82, 1.50, 1.60,
+  1.45, 1.52.
+- A uniform guess over the mix scores 1.08. The model never beat it, and the
+  loss peaked mid-run.
+- The 95th-percentile gradient norm rose from about 500 to 4,400 by the end.
+  Clipping to norm 1 kept updates bounded, but the loss still drifted upward.
+- The step-0 runs, 400 steps each, stayed near 1.1 with 95th-percentile norms
+  of 40-50.
+- Two likely causes:
+  - RLCD's Gaussian logit exploration, which already diverged on 77-option
+    Banking77 ([Recommended recipe](#recommended-recipe)). A fifth of Open-Jev
+    choice questions have 9 or 16 options.
+  - The trainer has no learning-rate schedule (no warmup, no decay). A
+    constant 2.5e-5 at batch 1 over 21k steps is 50× longer than the runs it
+    was tuned on.
+- Next: the same run with `"objective": "soft_ce"`, evaluated on both `s0-eval`
+  and a 2,002-decision sample of Open-Jev's validation split. The Open-Jev
+  score separates "did not learn" from "learned but did not transfer to our
+  domains".
+
 ### Candidate mode on Banking77 (step 0b)
 
 Measured 2026-09-26. `scripts/laya/prepare_laya_banking77.sh` downloads

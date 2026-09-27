@@ -51,13 +51,19 @@ pub fn validate(r: Record) !void {
     if (r.kind == .noul and (!std.mem.eql(u8, r.labels[0], "false") or !std.mem.eql(u8, r.labels[1], "true"))) return error.InvalidLayaTrainingRecord;
 }
 
+/// Sanity caps on one split. Memory is bounded separately by the caller's
+/// arena (`max_host_bytes`); these only reject an obviously wrong input.
+/// Sized for public typed-decision corpora (Open-Jev, 10^5 records).
+pub const max_file_bytes = 1024 * 1024 * 1024;
+pub const max_records = 1_000_000;
+
 /// The dataset and tokenized sequences belong to the caller's bounded arena.
 /// With tree packing, every record that shares a group and state text becomes
 /// one question of the same packed example (pipelines/laya_tree.zig). `seed`
 /// only matters when `cfg.packing.two_stage` is enabled: it drives the
 /// deterministic negative sampling in `addStageTwo`.
 pub fn load(a: std.mem.Allocator, path: []const u8, tok: Tokenizer, cfg: model.Config, seed: u64) !Dataset {
-    const bytes = try files.readFileMax(a, path, 64 * 1024 * 1024);
+    const bytes = try files.readFileMax(a, path, max_file_bytes);
     var records: std.ArrayListUnmanaged(Record) = .empty;
     var examples: std.ArrayListUnmanaged(training.Example) = .empty;
     var placements: std.ArrayListUnmanaged(Placement) = .empty;
@@ -66,7 +72,7 @@ pub fn load(a: std.mem.Allocator, path: []const u8, tok: Tokenizer, cfg: model.C
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0) continue;
-        if (records.items.len >= 100000) return error.LayaDatasetLimitExceeded;
+        if (records.items.len >= max_records) return error.LayaDatasetLimitExceeded;
         const parsed = try std.json.parseFromSlice(Record, a, line, .{ .allocate = .alloc_always });
         const record = parsed.value;
         try validate(record);
