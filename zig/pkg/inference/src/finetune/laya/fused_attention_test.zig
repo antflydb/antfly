@@ -583,10 +583,9 @@ test "fused segment attention runs on the Metal device kernels without dropout a
         const actual = try segmentOp(a, &metal_cb, attrs, qkv, control, d_out);
         defer for (actual) |values| a.free(values);
         const after = @import("../../backends/metal_tensor.zig").memoryStatsSnapshot();
-        // segmentOp downloads its two results; the host bridge also downloads its inputs.
-        const result_bytes: u64 = (tokens * heads * head_dim + 3 * tokens * heads * head_dim) * 4;
-        const downloaded = after.host_mirror_download_bytes - before.host_mirror_download_bytes;
-        if (case.device) try std.testing.expect(downloaded <= result_bytes) else try std.testing.expect(downloaded > result_bytes);
+        // Device kernels leave both results on the device, so reading them
+        // back takes two transfers; the host bridge returns host tensors.
+        try std.testing.expectEqual(@as(u64, if (case.device) 2 else 0), after.to_host_device_calls - before.to_host_device_calls);
         for (expected, actual) |want, got| {
             try std.testing.expectEqual(want.len, got.len);
             for (want, got) |w, g| try std.testing.expectApproxEqAbs(w, g, 2e-4);
