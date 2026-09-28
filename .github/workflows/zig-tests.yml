@@ -1227,8 +1227,8 @@ jobs:
           # /tmp counts toward the runner pod's 10 GiB ephemeral-storage limit.
           echo "TMPDIR=$ANTFLY_BUILD_CACHE_TMPDIR" >> "$GITHUB_ENV"
 
-      # Each shard gets its own runner and PVC. The runtime shard keeps the
-      # complete cache-contract suite; the storage shard balances the slow
+      # Each shard gets its own runner and PVC. The runtime shard runs the
+      # remaining runtime cache contracts; the storage shard balances the slow
       # host-generator contract with linked fixtures and storage ownership.
       - name: Test runtime compilation and cache contracts
         if: matrix.shard == 'runtime'
