@@ -213,7 +213,7 @@ SOURCE_MODULES = {
     "jinja": ("zig/lib/jinja/src/jinja.zig",),
     "kernel_error_identity": ("zig/pkg/antfly/src/runtime_failure_identity.zig",),
     "kernel_owner_abi": ("zig/pkg/antfly/src/storage/kernel_owner_abi.zig",),
-    "lmdb_engine": ("zig/pkg/antfly/src/lmdb/root.zig",),
+    "lmdb_engine": ("zig/lib/lmdb/src/root.zig",),
     "local_query_client": ("zig/pkg/antfly/src/storage/local_query_client.zig",),
     "metal_jit_identity": ("zig/pkg/inference/tools/jit_identity.zig",),
     "ml": ("zig/lib/ml/src/root.zig",),

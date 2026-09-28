@@ -62,8 +62,9 @@ The work has two related objectives:
   independently testable commands or modes even when some are co-generated.
 - The public C API is the `capi` build target and `libantfly` shared library.
   It must not retain unrelated server or runtime roots.
-- LSM is the production backend. LMDB remains available only for tests,
-  fixtures, conversion, and legacy compatibility while needed.
+- LSM is the production backend. The public Zig package, embedded library,
+  WASM bundle, and linked runtime disable LMDB. The standalone Zig LMDB port
+  and vendored C oracle remain available to explicit test/benchmark fixtures.
 - Runtime boundaries are coarse. They never cross per record, posting, edge,
   LMDB operation, or vector candidate.
 - Allocation ownership, cancellation, deadlines, operation state, callbacks,

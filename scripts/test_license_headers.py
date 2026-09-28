@@ -37,6 +37,14 @@ class LicenseHeaderTests(unittest.TestCase):
         self.assertEqual(
             policy.group_for("zig/pkg/inference/src/main.zig", "all"), "apache"
         )
+        self.assertEqual(
+            policy.group_for("zig/lib/lmdb/src/root.zig", "all"), "apache"
+        )
+        self.assertIsNone(policy.group_for("zig/deps/lmdb/mdb.c", "all"))
+        self.assertEqual(
+            (policy.ROOT / "zig/lib/lmdb/LICENSE").read_bytes(),
+            (policy.ROOT / "LICENSES/Apache-2.0.txt").read_bytes(),
+        )
 
     def test_preserves_shebang_and_is_idempotent(self):
         source = "#!/usr/bin/env python3\nprint('hello')\n"
@@ -122,7 +130,7 @@ class LicenseHeaderTests(unittest.TestCase):
     def test_complete_upstream_notice_and_bundle_are_required(self):
         names = (
             "zig/lib/hash/src/sha256.zig",
-            "zig/lib/lmdb/mdb.c",
+            "zig/deps/lmdb/mdb.c",
             "zig/pkg/inference/src/ops/cuda/artifacts/gliner25_training_math.cu",
             "zig/pkg/inference/src/pipelines/extraction_assignment.zig",
             "zig/pkg/inference/licenses/scipy-rectangular-lsap.txt",

@@ -40,10 +40,6 @@ const hbc_backend = @import("hbc_backend.zig");
 const posting_segment_store_mod = @import("posting_segment_store.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const apply_rw_lock_mod = @import("db/apply_rw_lock.zig");
-const supports_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
-const lmdb = if (supports_lmdb) @import("lmdb.zig") else struct {
-    pub const Error = error{NotFound};
-};
 const lsm_backend = @import("lsm_backend/mod.zig");
 const platform_time = @import("antfly_platform").time;
 const vec = @import("antfly_vector").vector;
@@ -188,7 +184,7 @@ fn nowNsI128() i128 {
 }
 
 fn isNotFound(err: anyerror) bool {
-    return err == error.NotFound or (supports_lmdb and err == lmdb.Error.NotFound);
+    return err == error.NotFound;
 }
 
 // ============================================================================
@@ -5226,7 +5222,6 @@ pub const HBCIndex = struct {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.root_dir,
             .native => |backend| backend.root_dir,
-            .lmdb => null,
         };
     }
 
@@ -5907,35 +5902,35 @@ pub const HBCIndex = struct {
     pub fn snapshotLsmWriteStats(self: *const HBCIndex) ?LsmWriteStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotWriteStats(),
-            .lmdb, .native => null,
+            .native => null,
         };
     }
 
     pub fn snapshotLsmMaintenanceStats(self: *const HBCIndex) ?LsmMaintenanceStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
-            .lmdb, .native => null,
+            .native => null,
         };
     }
 
     pub fn snapshotLsmOpenStats(self: *const HBCIndex) ?LsmOpenStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotOpenStats(),
-            .lmdb, .native => null,
+            .native => null,
         };
     }
 
     pub fn checkpointLsmWalAfterDurableBoundary(self: *HBCIndex) !void {
         switch (self.env_owner) {
             .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
-            .lmdb, .native => {},
+            .native => {},
         }
     }
 
     pub fn pinNativeCheckpoint(self: *HBCIndex) !lsm_backend.Backend.NativeCheckpoint {
         return switch (self.env_owner) {
             .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
-            .lmdb, .native => error.Unsupported,
+            .native => error.Unsupported,
         };
     }
 
@@ -6004,42 +5999,42 @@ pub const HBCIndex = struct {
     pub fn snapshotLsmNativeStorageStats(self: *const HBCIndex) ?lsm_backend.NativeStorageStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),
-            .lmdb, .native => null,
+            .native => null,
         };
     }
 
     pub fn lsmMaintenanceScore(self: *const HBCIndex) u64 {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.maintenanceScore(),
-            .lmdb, .native => 0,
+            .native => 0,
         };
     }
 
     pub fn lsmMaintenanceDebtHint(self: *const HBCIndex) u64 {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.maintenanceDebtHint(),
-            .lmdb, .native => 0,
+            .native => 0,
         };
     }
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const HBCIndex) ?u64 {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
-            .lmdb, .native => null,
+            .native => null,
         };
     }
 
     pub fn refreshLsmMaintenanceDebtHint(self: *HBCIndex) void {
         switch (self.env_owner) {
             .lsm => |handle| handle.backend.refreshMaintenanceDebtHint(),
-            .lmdb, .native => {},
+            .native => {},
         }
     }
 
     pub fn runLsmMaintenanceStep(self: *HBCIndex) !bool {
         return switch (self.env_owner) {
             .lsm => |handle| try handle.backend.runMaintenanceStep(),
-            .lmdb, .native => false,
+            .native => false,
         };
     }
 
@@ -6058,7 +6053,7 @@ pub const HBCIndex = struct {
                 }
                 break :blk try handle.backend.runMaintenanceStepBestEffort();
             },
-            .lmdb, .native => false,
+            .native => false,
         };
     }
 
@@ -6092,7 +6087,6 @@ pub const HBCIndex = struct {
     fn writeSessionFinishNeedsExplicitDurableSync(self: *const HBCIndex) bool {
         if (self.nativeHbcAuthoritative()) return false;
         return switch (self.env_owner) {
-            .lmdb => self.config.no_sync or self.config.no_meta_sync,
             .lsm => |handle| handle.backend.options.backend.durability != .full,
             .native => false,
         };
@@ -6104,7 +6098,7 @@ pub const HBCIndex = struct {
         }
         if (!self.nativeHbcAuthoritative()) switch (self.env_owner) {
             .lsm => |handle| handle.backend.beginBulkIngestSession() catch |err| return err,
-            .lmdb, .native => {},
+            .native => {},
         };
         const opening_outermost = self.write_session_depth == 0;
         if (opening_outermost) {
@@ -6130,7 +6124,7 @@ pub const HBCIndex = struct {
                 self.write_session_kind = null;
                 switch (self.env_owner) {
                     .lsm => |handle| handle.backend.abortBulkIngestSession(),
-                    .lmdb, .native => {},
+                    .native => {},
                 }
                 return err;
             };
@@ -6254,7 +6248,7 @@ pub const HBCIndex = struct {
                 }
                 return err;
             },
-            .lmdb, .native => {},
+            .native => {},
         };
         if (finishing_outermost and expected_kind == .streaming_replay) self.endStreamingSplitVectorWorkspace();
         self.write_session_depth -= 1;
@@ -6298,7 +6292,7 @@ pub const HBCIndex = struct {
         if (self.write_session_depth == 0 or self.write_session_kind != expected_kind) return;
         if (!self.nativeHbcAuthoritative()) switch (self.env_owner) {
             .lsm => |handle| handle.backend.abortBulkIngestSession(),
-            .lmdb, .native => {},
+            .native => {},
         };
         self.write_session_depth -= 1;
         if (self.write_session_depth == 0) {
@@ -9489,7 +9483,6 @@ pub const HBCIndex = struct {
                 .root_dir = handle.backend.root_dir orelse return error.MissingStorageRoot,
             },
             .native => |backend| .{ .storage = backend.storage, .root_dir = backend.root_dir },
-            .lmdb => return error.UnsupportedStorageBackend,
         };
         const posting_root = try std.fs.path.join(self.alloc, &.{ location.root_dir, "posting-segments" });
         defer self.alloc.free(posting_root);
@@ -9503,7 +9496,6 @@ pub const HBCIndex = struct {
                 .root_dir = handle.backend.root_dir orelse return error.MissingStorageRoot,
             },
             .native => |backend| .{ .storage = backend.storage, .root_dir = backend.root_dir },
-            .lmdb => return error.UnsupportedStorageBackend,
         };
         const posting_root = try std.fs.path.join(self.alloc, &.{ location.root_dir, "posting-segments" });
         defer self.alloc.free(posting_root);
@@ -13757,7 +13749,7 @@ pub const HBCIndex = struct {
     fn runtimeBatchMode(self: *const HBCIndex, in_bulk_session: bool) vectorindex_store.BatchMode {
         return switch (self.env_owner) {
             .lsm => |handle| hbcRuntimeBatchMode(in_bulk_session, handle.backend.options.direct_bulk_ingest),
-            .lmdb, .native => hbcRuntimeBatchMode(in_bulk_session, null),
+            .native => hbcRuntimeBatchMode(in_bulk_session, null),
         };
     }
 
@@ -29254,42 +29246,6 @@ test "streaming replay finish establishes durability for relaxed backend" {
     var read = try reopened.beginReadTxn();
     defer read.abort();
     try std.testing.expectError(error.NotFound, read.get(.meta, bulk_publish_state_key));
-}
-
-test "streaming replay finish establishes explicit durability for lmdb no_sync" {
-    if (!supports_lmdb) return error.SkipZigTest;
-    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
-    defer allocator_state.deinit();
-    const alloc = allocator_state.allocator();
-    var path: TestPath = .{};
-    const tmp_path = path.init();
-    defer path.cleanup();
-    const config: HBCConfig = .{
-        .dims = 2,
-        .storage_backend = .lmdb,
-        .no_sync = true,
-        .no_meta_sync = true,
-    };
-    var idx = try HBCIndex.open(alloc, tmp_path, config);
-    try idx.beginStreamingReplaySession();
-    try idx.batchInsertWithMetadataOptions(&.{
-        .{ .vector_id = 1, .vector = &[_]f32{ 1, 0 }, .metadata = "doc:1" },
-    }, .{
-        .assume_absent_ids = true,
-        .bulk_ingest = true,
-    });
-    // The logical LMDB commit runs with no_sync, so the streaming finish must
-    // perform the explicit forced sync before a caller can publish its applied
-    // sequence.
-    try idx.finishStreamingReplaySessionWithOptions(.{});
-    idx.close();
-
-    var reopened = try HBCIndex.open(alloc, tmp_path, config);
-    defer reopened.close();
-    try std.testing.expectEqual(@as(u64, 1), reopened.stats().active_count);
-    const metadata = (try reopened.getMetadata(1)) orelse return error.TestUnexpectedResult;
-    defer alloc.free(metadata);
-    try std.testing.expectEqualStrings("doc:1", metadata);
 }
 
 test "interrupted bulk publication remains quarantined" {

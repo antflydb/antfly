@@ -231,7 +231,6 @@ fn parseQuerySource(raw: []const u8) ?Config.QuerySource {
 }
 
 fn parseStorageBackend(raw: []const u8) ?hbc.StorageBackend {
-    if (std.mem.eql(u8, raw, "lmdb")) return .lmdb;
     if (std.mem.eql(u8, raw, "lsm")) return .lsm;
     return null;
 }

@@ -8,19 +8,19 @@
   "zig/lib/httpx/src/tls/client_compat.zig": {
     "file": "LICENSES/third-party/Zig-TLS-MIT.txt"
   },
-  "zig/lib/lmdb/LICENSE": {
+  "zig/deps/lmdb/LICENSE": {
     "file": "LICENSES/third-party/OpenLDAP-2.8.txt"
   },
-  "zig/lib/lmdb/lmdb.h": {
+  "zig/deps/lmdb/lmdb.h": {
     "file": "LICENSES/third-party/LMDB-lmdb-h-notice.txt"
   },
-  "zig/lib/lmdb/mdb.c": {
+  "zig/deps/lmdb/mdb.c": {
     "file": "LICENSES/third-party/LMDB-mdb-c-notice.txt"
   },
-  "zig/lib/lmdb/midl.c": {
+  "zig/deps/lmdb/midl.c": {
     "file": "LICENSES/third-party/LMDB-midl-c-notice.txt"
   },
-  "zig/lib/lmdb/midl.h": {
+  "zig/deps/lmdb/midl.h": {
     "file": "LICENSES/third-party/LMDB-midl-h-notice.txt"
   },
   "zig/lib/pdf/fonts/roboto/COPYRIGHT.txt": {

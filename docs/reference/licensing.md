@@ -10,7 +10,9 @@ The shared local database engine, embedded Lite APIs, native `libantfly`,
 file-oriented Lite CLI, browser client and WebGPU shaders, language bindings,
 and inference implementation and executable are Apache-2.0. Original licenses
 remain in effect for third-party material, including bundled Snowball, httpx,
-and LMDB implementations.
+and the C LMDB oracle. The standalone Zig LMDB-compatible library under
+`zig/lib/lmdb` is Apache-2.0; its upstream C test oracle under `zig/deps/lmdb`
+retains the OpenLDAP Public License 2.8.
 
 The standalone database server, database HTTP serving, distributed control,
 cluster metadata service, placement, replication orchestration, and serverless

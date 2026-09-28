@@ -129,13 +129,13 @@ pub fn main(init: std.process.Init) !void {
 fn destinationSpec(mode: []const u8) !DestinationSpec {
     if (std.mem.eql(u8, mode, "differential")) {
         return .{
-            .root_dir = "pkg/antfly/src/storage/lmdb_sim_fixtures",
+            .root_dir = "lib/lmdb/fixtures",
             .category = "differential",
         };
     }
     if (std.mem.eql(u8, mode, "crash")) {
         return .{
-            .root_dir = "pkg/antfly/src/storage/lmdb_sim_fixtures",
+            .root_dir = "lib/lmdb/fixtures",
             .category = "crash",
         };
     }

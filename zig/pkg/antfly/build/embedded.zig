@@ -22,7 +22,6 @@ pub fn configureModule(
     mod: *std.Build.Module,
     build_options: *std.Build.Step.Options,
     lite_options: *std.Build.Module,
-    lmdb_engine_mod: *std.Build.Module,
     json_mod: *std.Build.Module,
     public_openapi_mod: *std.Build.Module,
     query_openapi_mod: *std.Build.Module,
@@ -50,7 +49,6 @@ pub fn configureModule(
     storage_boundary.configure(mod, false, false);
     mod.addOptions("build_options", build_options);
     mod.addImport("antfly_lite_options", lite_options);
-    mod.addImport("lmdb_engine", lmdb_engine_mod);
     mod.addImport("antfly-json", json_mod);
     mod.addImport("antfly_public_openapi", public_openapi_mod);
     mod.addImport("antfly_query_openapi", query_openapi_mod);
@@ -124,7 +122,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const strip = options.strip;
     const link_libc = options.antfly_imports.platform_link_libc;
     const build_options = options.antfly_imports.build_options;
-    const lmdb_engine_mod = options.lmdb_engine;
     const httpx_mod = options.antfly_imports.httpx;
     const structlog_mod = options.antfly_imports.structlog;
     const public_openapi_mod = options.antfly_imports.public_openapi;
@@ -159,7 +156,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const embedded_deps = .{
         build_options,
         antfly_imports.lite_options,
-        lmdb_engine_mod,
         json_mod,
         public_openapi_mod,
         query_openapi_mod,

@@ -49,8 +49,9 @@ cover both binding and Apache native engine code, while third-party components
 retain their original terms.
 
 `THIRD_PARTY_NOTICES.md` records separately licensed adaptations and data,
-including the BSD Snowball stemmers, MIT httpx, and OpenLDAP-licensed LMDB
-implementation. Generated Snowball sources retain their upstream license and
+including the BSD Snowball stemmers, MIT httpx, and the OpenLDAP-licensed C LMDB
+test oracle in `zig/deps/lmdb`. The standalone Zig LMDB-compatible library in
+`zig/lib/lmdb` is Apache-2.0. Generated Snowball sources retain their upstream license and
 are deliberately excluded from the first-party Apache source list.
 Model weights, tokenizer assets, datasets, GPU drivers, and optional external
 runtime libraries retain their own licenses; they are not relicensed by an

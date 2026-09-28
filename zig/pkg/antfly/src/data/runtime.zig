@@ -3089,8 +3089,6 @@ fn writeFullTextMemoryMetrics(writer: *std.Io.Writer, stats: antfly.db.TextMemor
     try health_metrics.appendPromMetric(writer, "antfly_full_text_typed_doc_values_bytes", "gauge", "Full-text typed doc-value bytes", stats.typed_doc_values_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_doc_ordinals_bytes", "gauge", "Full-text doc ordinal bytes", stats.doc_ordinals_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_section_index_bytes", "gauge", "Full-text section index bytes", stats.section_index_bytes);
-    try health_metrics.appendPromMetric(writer, "antfly_full_text_configured_lmdb_main_map_bytes", "gauge", "Configured LMDB main map bytes for full-text indexes", stats.configured_lmdb_main_map_bytes);
-    try health_metrics.appendPromMetric(writer, "antfly_full_text_configured_lmdb_wal_map_bytes", "gauge", "Configured LMDB WAL map bytes for full-text indexes", stats.configured_lmdb_wal_map_bytes);
 }
 
 fn writeTextMergeMetrics(writer: *std.Io.Writer, stats: antfly.db.types.TextMergeStats) !void {
@@ -6114,7 +6112,7 @@ pub const DataServer = struct {
         defer if (owned_research_job_store_path) |path| self.alloc.free(path);
         // Only filesystem builds can use the legacy LMDB registry. Standalone
         // lifecycle jobs already belong to the durable metadata owner.
-        if (comptime build_options.lmdb_enabled) {
+        if (comptime @import("builtin").is_test) {
             if (api_server_cfg.restore_job_store_path == null and
                 api_server_cfg.restore_job_store == null and
                 api_server_cfg.session_store_path == null and
@@ -50147,7 +50145,6 @@ fn implementationTests() type {
                 .inverted_postings_bytes = 2048,
                 .inverted_postings_payload_bytes = 128,
                 .inverted_skip_bytes = 32,
-                .configured_lmdb_main_map_bytes = 8192,
             });
             const full_text_output = writer.buffered();
             try std.testing.expect(std.mem.indexOf(u8, full_text_output, "antfly_full_text_segment_bytes 4096") != null);

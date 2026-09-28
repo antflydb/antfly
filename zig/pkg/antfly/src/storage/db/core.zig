@@ -1823,20 +1823,12 @@ pub const DBCore = struct {
         try self.index_manager.fenceGraphSplitRange(split_key, original_range_end);
     }
 
-    pub fn splitRightStoreToDir(self: *DBCore, split_lower: []const u8, dest_dir: []const u8) !bool {
-        return self.store.splitRightToDir(split_lower, dest_dir) catch |err| switch (err) {
-            error.Incompatible => false,
-            error.Unsupported => false,
-            else => return err,
-        };
+    pub fn splitRightStoreToDir(_: *DBCore, _: []const u8, _: []const u8) !bool {
+        return false;
     }
 
-    pub fn rewriteLeftStoreInPlace(self: *DBCore, split_lower: []const u8) !bool {
-        return self.store.rewriteLeftInPlace(split_lower) catch |err| switch (err) {
-            error.Incompatible => false,
-            error.Unsupported => false,
-            else => return err,
-        };
+    pub fn rewriteLeftStoreInPlace(_: *DBCore, _: []const u8) !bool {
+        return false;
     }
 
     pub fn collectSplitIndexHandoffs(
@@ -2876,7 +2868,7 @@ pub fn changeJournalOpenOptionsForPrimaryKind(
 ) change_journal_mod.OpenOptions {
     const backend: change_journal_mod.StorageBackend = backend_override orelse switch (primary_backend_kind) {
         .mem, .lsm_memory => .lsm_memory,
-        .lmdb, .lsm => .lsm,
+        .lsm => .lsm,
     };
     return .{
         .map_size = map_size,
@@ -2967,7 +2959,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     const path_copy = try alloc.dupe(u8, path);
     owned_path = path_copy;
     const applied_sequence_checkpoint_path = if (external_derived_checkpoints) switch (primary_backend_kind) {
-        .lmdb, .lsm => try apply_state.checkpointPathAlloc(alloc, path),
+        .lsm => try apply_state.checkpointPathAlloc(alloc, path),
         .mem, .lsm_memory => null,
     } else null;
     owned_applied_sequence_checkpoint_path = applied_sequence_checkpoint_path;
@@ -2981,7 +2973,7 @@ pub fn openCoreResourcesFromPrimaryStore(
             .storage = storage,
         };
     } else switch (primary_backend_kind) {
-        .lmdb, .lsm => checkpoint_blk: {
+        .lsm => checkpoint_blk: {
             const checkpoint_path = try index_repair_state.checkpointPathAlloc(alloc, path);
             errdefer alloc.free(checkpoint_path);
             break :checkpoint_blk IndexRepairCheckpoint{

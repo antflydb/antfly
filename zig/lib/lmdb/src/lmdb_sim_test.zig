@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const zig_lmdb = @import("lmdb_engine");
-const sim_fixture = @import("sim_fixture.zig");
+const sim_fixture = @import("storage_sim_fixture");
 const lmdb_sim_fixture = @import("lmdb_sim_fixture.zig");
 const c = @cImport(@cInclude("lmdb.h"));
 var lmdb_sim_tmp_nonce: u64 = 0;
@@ -593,7 +593,7 @@ pub fn namespace(comptime Api: type) type {
         }
 
         pub fn runReplayFixtures(allocator: std.mem.Allocator) !void {
-            var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly/src/storage/lmdb_sim_fixtures", .{ .iterate = true }) catch |err| switch (err) {
+            var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "lib/lmdb/fixtures", .{ .iterate = true }) catch |err| switch (err) {
                 error.FileNotFound => return,
                 else => return err,
             };
@@ -1160,7 +1160,7 @@ pub fn namespace(comptime Api: type) type {
         }
 
         fn replayFixtureFile(allocator: std.mem.Allocator, name: []const u8) !void {
-            const path = try std.fmt.allocPrint(allocator, "pkg/antfly/src/storage/lmdb_sim_fixtures/{s}", .{name});
+            const path = try std.fmt.allocPrint(allocator, "lib/lmdb/fixtures/{s}", .{name});
             defer allocator.free(path);
 
             const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(64 * 1024));

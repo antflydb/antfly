@@ -307,7 +307,7 @@ SOFTWARE.
 
 ## LMDB
 
-The LMDB-derived implementation under `zig/lib/lmdb` retains the OpenLDAP Public License 2.8.
+The upstream C LMDB test oracle under `zig/deps/lmdb` retains the OpenLDAP Public License 2.8. The independent Zig LMDB-compatible library under `zig/lib/lmdb` is Apache-2.0.
 The applicable implementation notices, including its ISC-licensed ancestry, are:
 
 ```text

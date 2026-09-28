@@ -359,7 +359,9 @@ def check_preserved_notices(selected_group: str) -> list[str]:
     bundle = ROOT / "THIRD_PARTY_NOTICES.md"
     bundle_text = normalized_notice(bundle.read_text()) if bundle.is_file() else ""
     for name, definition in PRESERVED_NOTICES.items():
-        if group_for(name, selected_group) is None:
+        # The repository-wide check must cover vendored sources outside the
+        # first-party Apache and ELv2 trees as well.
+        if selected_group != "all" and group_for(name, selected_group) is None:
             continue
         canonical = ROOT / definition["file"]
         if not canonical.is_file() or not canonical.read_text().strip():

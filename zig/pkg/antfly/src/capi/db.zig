@@ -16847,7 +16847,7 @@ fn hiddenRestoreJson(alloc: std.mem.Allocator, db: *db_mod.DB, request: *const k
 
 fn captureOwnerSeedSnapshot(alloc: std.mem.Allocator, db: *db_mod.DB, request: *const kernel_owner_abi.HiddenRestoreRequest) !void {
     switch (db.primary_backend) {
-        .lmdb, .lsm => {},
+        .lsm => {},
         .mem, .lsm_memory => return error.HASeedSnapshotUnsupportedBackend,
     }
     const token = request.snapshot_token.slice();
