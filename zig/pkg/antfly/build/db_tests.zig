@@ -636,6 +636,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "coordinator recovery durably aborts a stale prepared transaction",
             "idempotent begin upgrades a legacy transaction coordinator role",
             "transaction participant batch",
+            "transaction trace retains every key",
             "transaction recovery delegates stale coordinator abort to replicated resolver",
             "replicated recovery is coordinator-owned and acknowledges through hooks",
             "replicated recovery batches proven followers preserves uncertain debt and retains self handoff",

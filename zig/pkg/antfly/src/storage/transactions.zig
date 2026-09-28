@@ -2468,87 +2468,12 @@ pub const TxnManager = struct {
 
     fn traceWriteIntentSuccess(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent, predicates: []const VersionPredicate) void {
         const tw = self.trace_writer orelse return;
-        var write_keys_buf: [32][]const u8 = undefined;
-        var delete_keys_buf: [32][]const u8 = undefined;
-        var predicate_keys_buf: [32][]const u8 = undefined;
-        var wk: usize = 0;
-        var dk: usize = 0;
-        for (intents) |intent| {
-            if (intent.value != null) {
-                if (wk < write_keys_buf.len) {
-                    write_keys_buf[wk] = intent.key;
-                    wk += 1;
-                }
-            } else {
-                if (dk < delete_keys_buf.len) {
-                    delete_keys_buf[dk] = intent.key;
-                    dk += 1;
-                }
-            }
-        }
-        // TLA+ TxnReadSet = predicateKeys; include write keys since
-        // checkIntentConflicts checks intents on write keys too.
-        var pk: usize = 0;
-        for (predicates) |pred| {
-            if (pk < predicate_keys_buf.len) {
-                predicate_keys_buf[pk] = pred.key;
-                pk += 1;
-            }
-        }
-        for (intents) |intent| {
-            if (pk < predicate_keys_buf.len) {
-                predicate_keys_buf[pk] = intent.key;
-                pk += 1;
-            }
-        }
-        tw.traceEvent(&.{
-            .name = "WriteIntentOnShard",
-            .txn_id = txn_id,
-            .shard_id = self.shard_id,
-            .write_keys = write_keys_buf[0..wk],
-            .delete_keys = delete_keys_buf[0..dk],
-            .predicate_keys = predicate_keys_buf[0..pk],
-        });
+        emitWriteIntentTrace(self.alloc, tw, txn_id, self.shard_id, "WriteIntentOnShard", intents, predicates, null);
     }
 
     fn traceWriteIntentFails(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent, reason: []const u8) void {
         const tw = self.trace_writer orelse return;
-        var write_keys_buf: [32][]const u8 = undefined;
-        var delete_keys_buf: [32][]const u8 = undefined;
-        var predicate_keys_buf: [32][]const u8 = undefined;
-        var wk: usize = 0;
-        var dk: usize = 0;
-        for (intents) |intent| {
-            if (intent.value != null) {
-                if (wk < write_keys_buf.len) {
-                    write_keys_buf[wk] = intent.key;
-                    wk += 1;
-                }
-            } else {
-                if (dk < delete_keys_buf.len) {
-                    delete_keys_buf[dk] = intent.key;
-                    dk += 1;
-                }
-            }
-        }
-        // Include write keys as predicateKeys so TLA+ NoConflictingIntents
-        // can detect intent conflicts on those keys.
-        var pk: usize = 0;
-        for (intents) |intent| {
-            if (pk < predicate_keys_buf.len) {
-                predicate_keys_buf[pk] = intent.key;
-                pk += 1;
-            }
-        }
-        tw.traceEvent(&.{
-            .name = "WriteIntentFails",
-            .txn_id = txn_id,
-            .shard_id = self.shard_id,
-            .write_keys = write_keys_buf[0..wk],
-            .delete_keys = delete_keys_buf[0..dk],
-            .predicate_keys = predicate_keys_buf[0..pk],
-            .reason = reason,
-        });
+        emitWriteIntentTrace(self.alloc, tw, txn_id, self.shard_id, "WriteIntentFails", intents, &.{}, reason);
     }
 
     fn readTimestamp(self: *TxnManager, key: []const u8) !?u64 {
@@ -2563,6 +2488,102 @@ pub const TxnManager = struct {
         return std.mem.readInt(u64, val[0..8], .little);
     }
 };
+
+fn emitWriteIntentTrace(
+    alloc: std.mem.Allocator,
+    tw: tracing.AntflyTraceWriter,
+    txn_id: TxnId,
+    shard_id: []const u8,
+    name: []const u8,
+    intents: []const WriteIntent,
+    predicates: []const VersionPredicate,
+    reason: ?[]const u8,
+) void {
+    // Trace evidence must be complete. Failing the trace-enabled run is safer
+    // than silently validating a transaction with omitted keys.
+    var write_count: usize = 0;
+    for (intents) |intent| {
+        if (intent.value != null) write_count += 1;
+    }
+    const predicate_count = std.math.add(usize, intents.len, predicates.len) catch @panic("transaction trace key count overflow");
+    const total = std.math.add(usize, intents.len, predicate_count) catch @panic("transaction trace key count overflow");
+    const keys = alloc.alloc([]const u8, total) catch @panic("out of memory collecting transaction trace keys");
+    defer alloc.free(keys);
+    const write_keys = keys[0..write_count];
+    const delete_keys = keys[write_count..intents.len];
+    const predicate_keys = keys[intents.len..];
+    var wk: usize = 0;
+    var dk: usize = 0;
+    for (intents) |intent| {
+        if (intent.value != null) {
+            write_keys[wk] = intent.key;
+            wk += 1;
+        } else {
+            delete_keys[dk] = intent.key;
+            dk += 1;
+        }
+    }
+    // TLA+ TxnReadSet also includes write keys because admission checks them
+    // for conflicting intents. Keep every explicit predicate and intent key.
+    var pk: usize = 0;
+    for (predicates) |predicate| {
+        predicate_keys[pk] = predicate.key;
+        pk += 1;
+    }
+    for (intents) |intent| {
+        predicate_keys[pk] = intent.key;
+        pk += 1;
+    }
+    tw.traceEvent(&.{
+        .name = name,
+        .txn_id = txn_id,
+        .shard_id = shard_id,
+        .write_keys = write_keys,
+        .delete_keys = delete_keys,
+        .predicate_keys = predicate_keys,
+        .reason = reason,
+    });
+}
+
+test "transaction trace retains every key beyond the former 32-key limit" {
+    const Capture = struct {
+        write_count: usize = 0,
+        delete_count: usize = 0,
+        predicate_count: usize = 0,
+        last_predicate: []const u8 = "",
+
+        fn onTrace(ptr: *anyopaque, event: *const tracing.AntflyTracingEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.write_count = event.write_keys.len;
+            self.delete_count = event.delete_keys.len;
+            self.predicate_count = event.predicate_keys.len;
+            self.last_predicate = event.predicate_keys[event.predicate_keys.len - 1];
+        }
+    };
+    var capture = Capture{};
+    const writer = tracing.AntflyTraceWriter{
+        .ptr = &capture,
+        .vtable = &.{ .trace_event = Capture.onTrace },
+    };
+    var key_buffers: [65][16]u8 = undefined;
+    var intents: [65]WriteIntent = undefined;
+    for (&intents, 0..) |*intent, index| {
+        const key = try std.fmt.bufPrint(&key_buffers[index], "key-{d}", .{index});
+        intent.* = .{ .key = key, .value = if (index % 2 == 0) "value" else null };
+    }
+    var predicates: [5]VersionPredicate = undefined;
+    for (&predicates, 0..) |*predicate, index| predicate.* = .{ .key = intents[index].key };
+
+    emitWriteIntentTrace(std.testing.allocator, writer, @splat(0x42), "local", "WriteIntentOnShard", &intents, &predicates, null);
+    try std.testing.expectEqual(@as(usize, 33), capture.write_count);
+    try std.testing.expectEqual(@as(usize, 32), capture.delete_count);
+    try std.testing.expectEqual(@as(usize, 70), capture.predicate_count);
+    try std.testing.expectEqualStrings("key-64", capture.last_predicate);
+
+    emitWriteIntentTrace(std.testing.allocator, writer, @splat(0x42), "local", "WriteIntentFails", &intents, &.{}, "IntentConflict");
+    try std.testing.expectEqual(@as(usize, 65), capture.predicate_count);
+    try std.testing.expectEqualStrings("key-64", capture.last_predicate);
+}
 
 const RuntimeStoreHandle = struct {
     store: backend_erased.Store,
