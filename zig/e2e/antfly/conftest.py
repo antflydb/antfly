@@ -48,10 +48,11 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 from urllib.parse import quote, unquote, urlparse
 
 import pytest
@@ -323,15 +324,21 @@ def wait_for_server(
     *,
     allow_unauthorized: bool = False,
     processes: list[tuple[str, subprocess.Popen[Any]]] | None = None,
+    listener_ready: Callable[[], bool] | None = None,
 ) -> bool:
     deadline = time.monotonic() + timeout
     consecutive_successes = 0
     while time.monotonic() < deadline:
         if _dead_process_statuses(processes):
             return False
+        if listener_ready is not None and not listener_ready():
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            continue
         try:
             request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
             resp = requests.get(f"{url}{path}", timeout=request_timeout)
+            if _dead_process_statuses(processes):
+                return False
             if resp.ok:
                 consecutive_successes += 1
                 if consecutive_successes >= 2:
@@ -810,6 +817,13 @@ def _server_processes(server_ref: Any) -> list[tuple[str, subprocess.Popen[Any]]
     return processes
 
 
+def _log_contains_since(path: Path, offset: int, message: str) -> bool:
+    """Read only this process incarnation's startup output."""
+    with path.open("rb") as log:
+        log.seek(offset)
+        return message.encode() in log.read()
+
+
 def _read_log_tail(path: Path, *, limit: int = 200000) -> str:
     if not path.exists():
         return ""
@@ -881,7 +895,7 @@ class AntflyServer:
         except BaseException:
             self.stop()
             raise
-        if not wait_for_server(self.url):
+        if not wait_for_server(self.url, processes=[("server", self.proc)]):
             self.stop()
             out = _read_log_tail(self.log_path)
             raise RuntimeError(f"Server failed to start at {self.url}\n{out}")
@@ -937,7 +951,7 @@ class PublicAntflyServer:
         except BaseException:
             self.stop()
             raise
-        if not wait_for_server(self.url):
+        if not wait_for_server(self.url, processes=[("server", self.proc)]):
             self.stop()
             out = _read_log_tail(self.log_path)
             raise RuntimeError(
@@ -975,7 +989,7 @@ class PublicAntflyServer:
                 cwd=self.root,
             ),
         )
-        if not wait_for_server(self.url):
+        if not wait_for_server(self.url, processes=[("server", self.proc)]):
             out = _read_log_tail(self.log_path)
             self.stop()
             raise RuntimeError(
@@ -1379,6 +1393,7 @@ class StandaloneAntflyServer:
     def _start_process(self, *, truncate_logs: bool) -> None:
         if truncate_logs:
             self.log_file = self.log_path.open("w")
+        log_start = self.log_path.stat().st_size
         command = _standalone_stateful_command(
             self.binary, host=self.host, port=self.port, root=self.root
         )
@@ -1391,7 +1406,15 @@ class StandaloneAntflyServer:
                 cwd=self.root,
             ),
         )
-        if not wait_for_server(self.api_url):
+        if not wait_for_server(
+            self.api_url,
+            processes=[("server", self.proc)],
+            listener_ready=lambda: _log_contains_since(
+                self.log_path,
+                log_start,
+                f"standalone public api listening on {self.url}",
+            ),
+        ):
             self.stop()
             out = _read_log_tail(self.log_path)
             raise RuntimeError(

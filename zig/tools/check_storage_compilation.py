@@ -88,6 +88,7 @@ def measured_build(
     """Sample concurrent RSS; wait4 accounts CPU for the entire waited tree."""
     started = time.monotonic()
     peak_tree = peak_process = samples = 0
+    min_disk_free = shutil.disk_usage(cwd).free
     timed_out = False
     last_report = started
     with tempfile.TemporaryFile(mode="w+") as output:
@@ -119,12 +120,14 @@ def measured_build(
                 tree, largest = tree_rss(snapshot, process.pid)
                 peak_tree = max(peak_tree, tree)
                 peak_process = max(peak_process, largest)
+                min_disk_free = min(min_disk_free, shutil.disk_usage(cwd).free)
                 samples += 1
                 if now - last_report >= 30:
                     current = {
                         "wall_seconds": round(now - started, 3),
                         "peak_build_tree_rss_bytes": peak_tree,
                         "peak_process_rss_bytes": peak_process,
+                        "min_disk_free_bytes": min_disk_free,
                         "rss_samples": samples,
                     }
                     print(f"compilation progress: {current}", flush=True)
@@ -151,6 +154,7 @@ def measured_build(
                 "peak_process_rss_bytes": peak_process,
                 "rss_samples": samples,
                 "rss_sample_interval_seconds": 0.25,
+                "min_disk_free_bytes": min(min_disk_free, shutil.disk_usage(cwd).free),
                 "timed_out": timed_out,
             },
         )
@@ -184,7 +188,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zig", default="zig")
     parser.add_argument("--jobs", type=int, default=2)
-    parser.add_argument("--global-cache-dir")
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
     records = []
@@ -275,6 +278,9 @@ def main() -> None:
         # file contents only, not symlink resolution or compiler source paths.
         for _, relative, _, _ in cases:
             own(root, f"zig/pkg/antfly/src/{relative}")
+        local_cache = work / "cache"
+        global_cache = work / "global-cache"
+        global_cache.mkdir()
 
         def build(label: str) -> dict[str, str]:
             print(f"{label}: compiling production artifacts", flush=True)
@@ -292,12 +298,17 @@ def main() -> None:
                 "--color",
                 "off",
                 "--cache-dir",
-                str(work / "cache"),
+                str(local_cache),
+                "--global-cache-dir",
+                str(global_cache),
             ]
-            if args.global_cache_dir:
-                arguments += ["--global-cache-dir", args.global_cache_dir]
             command = bounded_build_command(args.zig, arguments)
-            record = {"case": label, "status": "running", "command": command}
+            record = {
+                "case": label,
+                "status": "running",
+                "command": command,
+                "disk_free_before_bytes": shutil.disk_usage(work).free,
+            }
             records.append(record)
             publish()
 
@@ -321,6 +332,7 @@ def main() -> None:
             record.update(
                 {
                     **measurements,
+                    "disk_free_after_bytes": shutil.disk_usage(work).free,
                     "status": "failed" if returncode else "completed",
                     "returncode": returncode,
                     "artifacts": states,
@@ -357,7 +369,29 @@ def main() -> None:
         build("cold")
         warm = build("warm")
         assert all(warm[name] == "cached" for name in ARCHIVES | CONSUMERS), warm
+
+        def restart_cache(reason: str) -> None:
+            # Remove Zig's objects and manifests together. A manifest retained
+            # without its output can produce a false cache hit. The source
+            # overlay stays at the same path with earlier edits still applied.
+            for directory in (local_cache, global_cache):
+                if directory.exists():
+                    shutil.rmtree(directory)
+            global_cache.mkdir()
+            build(f"{reason} cold")
+            warmed = build(f"{reason} warm")
+            assert all(warmed[name] == "cached" for name in ARCHIVES | CONSUMERS), (
+                warmed
+            )
+
         for label, relative, rebuilt, cached in cases:
+            # The final contract mutation rebuilds more production artifacts
+            # than any other case. Give it a fresh cache before that peak. An
+            # earlier rollover also keeps a long mutation series below the PVC.
+            if label == "storage contract" or shutil.disk_usage(work).free < 12 * (
+                1 << 30
+            ):
+                restart_cache(label)
             path = own(root, f"zig/pkg/antfly/src/{relative}")
             # Keep earlier edits in this private overlay. Restoring one would
             # itself invalidate Zig's most recent manifest and confound the

@@ -73,7 +73,8 @@ pub const AntflyNdjsonTraceWriter = struct {
         try w.writeAll("{\"tag\":\"antfly-trace\",\"event\":{");
 
         // name
-        try w.print("\"name\":\"{s}\"", .{event.name});
+        try w.writeAll("\"name\":");
+        try writeByteString(w, event.name);
 
         // txnId (hex)
         try w.writeAll(",\"txnId\":\"");
@@ -81,7 +82,8 @@ pub const AntflyNdjsonTraceWriter = struct {
         try w.writeAll("\"");
 
         // shardId (always present, may be empty)
-        try w.print(",\"shardId\":\"{s}\"", .{event.shard_id});
+        try w.writeAll(",\"shardId\":");
+        try writeByteString(w, event.shard_id);
 
         // state object — always emit for write-intent events so TLA+ spec
         // can access fields unconditionally; for other events, only when non-empty
@@ -119,7 +121,8 @@ pub const AntflyNdjsonTraceWriter = struct {
             }
             if (event.reason) |reason| {
                 if (!first) try w.writeAll(",");
-                try w.print("\"reason\":\"{s}\"", .{reason});
+                try w.writeAll("\"reason\":");
+                try writeByteString(w, reason);
             }
 
             try w.writeAll("}");
@@ -139,19 +142,23 @@ fn writeStringArray(w: *std.Io.Writer, items: []const []const u8) !void {
     try w.writeAll("[");
     for (items, 0..) |item, i| {
         if (i > 0) try w.writeAll(",");
-        try w.writeAll("\"");
-        // Escape JSON special characters
-        for (item) |c| {
-            switch (c) {
-                '"' => try w.writeAll("\\\""),
-                '\\' => try w.writeAll("\\\\"),
-                '\n' => try w.writeAll("\\n"),
-                else => try w.writeByte(c),
-            }
-        }
-        try w.writeAll("\"");
+        try writeByteString(w, item);
     }
     try w.writeAll("]");
+}
+
+/// Transaction keys are opaque bytes, including private keys with embedded
+/// digests. Map each non-printable or non-ASCII byte to its Latin-1 JSON escape:
+/// this is injective for byte strings and keeps every trace line valid UTF-8.
+fn writeByteString(w: *std.Io.Writer, bytes: []const u8) !void {
+    try w.writeByte('"');
+    for (bytes) |byte| switch (byte) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        0x20...0x21, 0x23...0x5b, 0x5d...0x7e => try w.writeByte(byte),
+        else => try w.print("\\u00{x:0>2}", .{byte}),
+    };
+    try w.writeByte('"');
 }
 
 test "antfly trace writer emits valid ndjson" {
@@ -178,4 +185,28 @@ test "antfly trace writer emits valid ndjson" {
     try std.testing.expect(std.mem.indexOf(u8, output, "\"name\":\"WriteIntentOnShard\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"shardId\":\"42\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"writeKeys\":[\"key1\",\"key2\"]") != null);
+}
+
+test "antfly trace writer preserves opaque keys as valid single-line JSON" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var trace_writer = AntflyNdjsonTraceWriter{ .writer = &out.writer };
+    const binary_key = "\x00\x01\x0a\x0d\x1f\x7f\x80\xff\"\\";
+    const event: AntflyTracingEvent = .{
+        .name = "WriteIntentOnShard",
+        .txn_id = @splat(0x47),
+        .shard_id = "local",
+        .write_keys = &.{ "parent", binary_key },
+        .predicate_keys = &.{binary_key},
+        .reason = binary_key,
+    };
+    trace_writer.traceWriter().traceEvent(&event);
+    const output = out.written();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, output, "\\u0000\\u0001\\u000a\\u000d\\u001f\\u007f\\u0080\\u00ff\\\"\\\\") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output, .{});
+    defer parsed.deinit();
+    const state = parsed.value.object.get("event").?.object.get("state").?.object;
+    try std.testing.expectEqualStrings("parent", state.get("writeKeys").?.array.items[0].string);
+    try std.testing.expectEqualStrings(state.get("writeKeys").?.array.items[1].string, state.get("predicateKeys").?.array.items[0].string);
 }

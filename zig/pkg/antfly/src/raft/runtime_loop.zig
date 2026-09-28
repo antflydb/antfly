@@ -20,9 +20,23 @@ const metadata_view = @import("metadata_view.zig");
 const service = @import("service.zig");
 const reconciler = @import("reconciler.zig");
 
+/// Borrowed only while the driver's source owns its progress lane.
+pub const ProgressWake = struct {
+    ptr: *anyopaque,
+    notify_fn: *const fn (*anyopaque) void,
+
+    pub fn notify(self: ProgressWake) void {
+        self.notify_fn(self.ptr);
+    }
+};
+
 pub const ProgressSource = struct {
     ptr: *anyopaque,
     run_once: *const fn (ptr: *anyopaque) anyerror!void,
+    /// On-demand Ready processing must not advance election/heartbeat time.
+    run_progress_once: ?*const fn (*anyopaque) anyerror!void = null,
+    acquire_owner: ?*const fn (*anyopaque, ProgressWake) anyerror!void = null,
+    release_owner: ?*const fn (*anyopaque) void = null,
 
     pub fn runOnce(self: ProgressSource) !void {
         return try self.run_once(self.ptr);
@@ -74,6 +88,9 @@ pub const ManagedProgressDriver = struct {
     future: ?std.Io.Future(void) = null,
     state: State = .initialized,
     stop_event: std.Io.Event = .unset,
+    wake_event: std.Io.Event = .unset,
+    progress_requested: std.atomic.Value(bool) = .init(false),
+    source_owned: bool = false,
     failure_event: std.Io.Event = .unset,
     failed: std.atomic.Value(bool) = .init(false),
     /// Even generations are idle; odd generations identify one active round.
@@ -115,6 +132,10 @@ pub const ManagedProgressDriver = struct {
         if (self.state != .initialized) return error.AlreadyStarted;
         if (self.interval_ns == 0) return error.InvalidInterval;
         if (comptime builtin.single_threaded) return error.UnsupportedPlatform;
+        if ((self.source.acquire_owner == null) != (self.source.release_owner == null))
+            return error.InvalidProgressOwnership;
+        if (self.source.acquire_owner != null and self.source.run_progress_once == null)
+            return error.InvalidProgressOwnership;
 
         if (self.scheduling_io == null) self.progress_io = std.Io.Threaded.init(std.heap.page_allocator, .{
             .async_limit = .nothing,
@@ -124,6 +145,11 @@ pub const ManagedProgressDriver = struct {
             if (self.progress_io) |*owned| owned.deinit();
             self.progress_io = null;
         }
+        if (self.source.acquire_owner) |acquire| {
+            try acquire(self.source.ptr, .{ .ptr = self, .notify_fn = requestProgress });
+            self.source_owned = true;
+        }
+        errdefer self.releaseSourceOwnership();
         self.future = try self.schedulingIo().concurrent(run, .{self});
         self.state = .running;
     }
@@ -169,8 +195,10 @@ pub const ManagedProgressDriver = struct {
     pub fn stop(self: *ManagedProgressDriver) void {
         if (self.state != .running) return;
         self.stop_event.set(self.io);
+        self.wake_event.set(self.io);
         if (self.future) |*future| future.await(self.schedulingIo());
         self.future = null;
+        self.releaseSourceOwnership();
         if (self.progress_io) |*owned| owned.deinit();
         self.progress_io = null;
         self.state = .stopped;
@@ -181,33 +209,59 @@ pub const ManagedProgressDriver = struct {
         self.* = undefined;
     }
 
+    fn releaseSourceOwnership(self: *ManagedProgressDriver) void {
+        if (!self.source_owned) return;
+        self.source.release_owner.?(self.source.ptr);
+        self.source_owned = false;
+    }
+
+    fn requestProgress(raw: *anyopaque) void {
+        const self: *ManagedProgressDriver = @ptrCast(@alignCast(raw));
+        self.progress_requested.store(true, .release);
+        self.wake_event.set(self.io);
+    }
+
+    fn prepareProgressTurn(self: *ManagedProgressDriver) bool {
+        // Reset before observing stop. A stop preceding reset remains visible
+        // in stop_event; a later stop leaves wake_event set for the wait.
+        // Progress debt likewise survives reset in progress_requested.
+        self.wake_event.reset();
+        return !self.stop_event.isSet();
+    }
+
     fn run(self: *ManagedProgressDriver) void {
-        while (!self.stop_event.isSet()) {
+        var next_tick_ns: u64 = 0;
+        while (self.prepareProgressTurn()) {
             const started_ns = platform_time.monotonicNs();
-            self.round_started_ns.store(started_ns, .release);
-            _ = self.round_generation.fetchAdd(1, .acq_rel);
-            self.source.runOnce() catch |err| {
-                self.publishFailure(err);
-                return;
-            };
-            const completed_ns = platform_time.monotonicNs();
-            _ = self.round_generation.fetchAdd(1, .release);
-            const elapsed_ns = completed_ns -| started_ns;
-            if (elapsed_ns < self.interval_ns) {
-                self.stop_event.waitTimeout(self.io, .{
-                    .duration = .{
-                        .raw = std.Io.Duration.fromNanoseconds(self.interval_ns - elapsed_ns),
-                        .clock = .awake,
-                    },
-                }) catch |err| switch (err) {
-                    error.Timeout => continue,
-                    error.Canceled => {
-                        if (self.stop_event.isSet()) return;
-                        self.publishFailure(err);
-                        return;
-                    },
+            const tick_due = started_ns >= next_tick_ns;
+            const requested = self.progress_requested.swap(false, .acq_rel);
+            if (tick_due or (requested and self.source.run_progress_once != null)) {
+                self.round_started_ns.store(started_ns, .release);
+                _ = self.round_generation.fetchAdd(1, .acq_rel);
+                const result = if (tick_due) self.source.runOnce() else self.source.run_progress_once.?(self.source.ptr);
+                result catch |err| {
+                    self.publishFailure(err);
+                    return;
                 };
+                _ = self.round_generation.fetchAdd(1, .release);
+                // A long durable round must not synthesize catch-up ticks.
+                // Request wakes never move this cadence deadline.
+                if (tick_due) next_tick_ns = started_ns +| self.interval_ns;
+                continue;
             }
+            self.wake_event.waitTimeout(self.io, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromNanoseconds(next_tick_ns - started_ns),
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => {
+                    if (self.stop_event.isSet()) return;
+                    self.publishFailure(err);
+                    return;
+                },
+            };
         }
     }
 
@@ -773,4 +827,103 @@ test "runtime loop module compiles" {
     _ = MemoryUpdateSource;
     _ = ManagedHostRuntime;
     _ = ManagedHttpHostRuntime;
+}
+
+const ProgressOwnershipProbe = struct {
+    owned: std.atomic.Value(bool) = .init(false),
+    ticks: std.atomic.Value(usize) = .init(0),
+    drains: std.atomic.Value(usize) = .init(0),
+    releases: usize = 0,
+    wake: ?ProgressWake = null,
+
+    fn source(self: *@This()) ProgressSource {
+        return .{ .ptr = self, .run_once = tick, .run_progress_once = drain, .acquire_owner = acquire, .release_owner = release };
+    }
+    fn acquire(raw: *anyopaque, wake: ProgressWake) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.owned.swap(true, .acq_rel)) return error.AlreadyOwned;
+        self.wake = wake;
+    }
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.wake = null;
+        self.releases += 1;
+        self.owned.store(false, .release);
+    }
+    fn tick(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.owned.load(.acquire)) return error.ProgressWithoutOwner;
+        _ = self.ticks.fetchAdd(1, .release);
+    }
+    fn drain(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.owned.load(.acquire)) return error.ProgressWithoutOwner;
+        _ = self.drains.fetchAdd(1, .release);
+    }
+};
+
+test "managed raft progress driver coalesces request wakes without accelerating ticks" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var probe = ProgressOwnershipProbe{};
+    var driver = ManagedProgressDriver.init(io, probe.source(), 60 * std.time.ns_per_s);
+    defer driver.deinit();
+    try driver.start();
+    var deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (probe.ticks.load(.acquire) == 0) {
+        try driver.checkFailure();
+        if (platform_time.monotonicNs() >= deadline) return error.ProgressDidNotStart;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    for (0..1_000) |_| probe.wake.?.notify();
+    deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (probe.drains.load(.acquire) == 0) {
+        try driver.checkFailure();
+        if (platform_time.monotonicNs() >= deadline) return error.ProgressWakeLost;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.ticks.load(.acquire));
+    driver.stop();
+    try std.testing.expect(!probe.owned.load(.acquire));
+    try std.testing.expect(probe.wake == null);
+    try std.testing.expectEqual(@as(usize, 1), probe.releases);
+    driver.stop();
+    try std.testing.expectEqual(@as(usize, 1), probe.releases);
+}
+
+test "managed raft progress driver releases source ownership after startup refusal" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer io_impl.deinit();
+    var probe = ProgressOwnershipProbe{};
+    var driver = ManagedProgressDriver.init(io_impl.io(), probe.source(), std.time.ns_per_ms);
+    driver.scheduling_io = io_impl.io();
+    defer driver.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, driver.start());
+    try std.testing.expect(!probe.owned.load(.acquire));
+    try std.testing.expect(probe.wake == null);
+    try std.testing.expectEqual(@as(usize, 1), probe.releases);
+    try std.testing.expectEqual(@as(usize, 0), probe.ticks.load(.acquire));
+}
+
+test "managed raft progress driver retains stop across wake reset" {
+    var driver = ManagedProgressDriver.init(std.testing.io, undefined, 60 * std.time.ns_per_s);
+    // Reproduce stop after the previous turn's stop observation but before
+    // reset. No clock advancement or watchdog is needed to prove the race.
+    driver.stop_event.set(driver.io);
+    driver.wake_event.set(driver.io);
+    try std.testing.expect(!driver.prepareProgressTurn());
+    try std.testing.expect(!driver.wake_event.isSet());
+    driver.stop_event.reset();
+    driver.progress_requested.store(true, .release);
+    driver.wake_event.set(driver.io);
+    try std.testing.expect(driver.prepareProgressTurn());
+    try std.testing.expect(driver.progress_requested.swap(false, .acq_rel));
+    // A stop after the reset is retained for the next wait instead.
+    driver.stop_event.set(driver.io);
+    driver.wake_event.set(driver.io);
+    try std.testing.expect(driver.wake_event.isSet());
+    try std.testing.expect(!driver.prepareProgressTurn());
 }

@@ -850,6 +850,49 @@ def test_duration_reports_exclude_skips_but_keep_full_executed_protocol(
     assert e2e_scheduler_module._executed_duration_nodeids == set()
 
 
+def test_failed_report_flushes_diagnostic_before_session_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = sys.modules[DurationHistory.__module__]
+    output: list[object] = []
+    reporter = SimpleNamespace(
+        write_sep=lambda separator, title: output.append(title),
+        write_line=lambda line: output.append(line),
+        flush=lambda: output.append("flushed"),
+    )
+    monkeypatch.setattr(module, "_failure_reporter", reporter)
+    monkeypatch.setattr(module, "_duration_history", None)
+    report = SimpleNamespace(
+        nodeid="test_autoschema.py::test_failed@group",
+        when="call",
+        failed=True,
+        longreprtext="assertion and server diagnostics",
+    )
+    module.pytest_runtest_logreport(report)
+    assert output == [
+        "Immediate E2E failure: test_autoschema.py::test_failed@group (call)",
+        "assertion and server diagnostics",
+        "flushed",
+    ]
+    assert report.failed is True
+
+
+@pytest.mark.parametrize("worker", [False, True])
+def test_only_controller_emits_immediate_failure_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, worker: bool
+) -> None:
+    module = sys.modules[DurationHistory.__module__]
+    reporter = object()
+    config = SimpleNamespace(
+        pluginmanager=SimpleNamespace(get_plugin=lambda name: reporter),
+    )
+    if worker:
+        config.workerinput = {}
+    monkeypatch.setattr(module, "_failure_reporter", None)
+    module.pytest_sessionstart(SimpleNamespace(config=config))
+    assert module._failure_reporter is (None if worker else reporter)
+
+
 def test_scheduler_prefers_longest_eligible_work_without_exceeding_process_slots(
     tmp_path: Path,
 ) -> None:

@@ -277,7 +277,9 @@ class StandaloneAuthServer:
         except BaseException:
             self.stop()
             raise
-        if not wait_for_server(self.api_url, allow_unauthorized=True):
+        if not wait_for_server(
+            self.api_url, allow_unauthorized=True, processes=[("server", self.proc)]
+        ):
             self.stop()
             out = _read_log_tail(self.log_path)
             raise RuntimeError(

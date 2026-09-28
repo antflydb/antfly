@@ -828,11 +828,30 @@ pub const Server = struct {
         self.refreshMetadataRaftStorageDiagnostics();
     }
 
-    fn raftProgressSource(self: *Server) antfly.raft.ProgressSource {
+    pub fn raftProgressSource(self: *Server) antfly.raft.ProgressSource {
         return .{
             .ptr = self,
             .run_once = runRaftProgressOnce,
+            .run_progress_once = runRaftReadyProgressOnce,
+            .acquire_owner = acquireRaftProgressOwner,
+            .release_owner = releaseRaftProgressOwner,
         };
+    }
+
+    fn acquireRaftProgressOwner(ptr: *anyopaque, wake: antfly.raft.ProgressWake) !void {
+        const self: *Server = @ptrCast(@alignCast(ptr));
+        try self.server.svc.registerManagedProgressOwner(wake);
+    }
+
+    fn releaseRaftProgressOwner(ptr: *anyopaque) void {
+        const self: *Server = @ptrCast(@alignCast(ptr));
+        self.server.svc.releaseManagedProgressOwner();
+    }
+
+    fn runRaftReadyProgressOnce(ptr: *anyopaque) !void {
+        const self: *Server = @ptrCast(@alignCast(ptr));
+        try self.server.svc.runManagedRaftProgressOnly();
+        self.refreshMetadataRaftStorageDiagnostics();
     }
 
     fn runRaftProgressOnce(ptr: *anyopaque) !void {

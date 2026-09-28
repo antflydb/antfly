@@ -1157,6 +1157,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
 
 _duration_history: DurationHistory | None = None
 _DURATION_OWNER_PID = "ANTFLY_E2E_DURATION_OWNER_PID"
+_failure_reporter = None
 _duration_report_totals: dict[str, float] = {}
 _duration_phase_totals: dict[str, dict[str, float]] = {}
 _executed_duration_nodeids: set[str] = set()
@@ -1189,6 +1190,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    global _failure_reporter
+    _failure_reporter = None
     global \
         _duration_history, \
         _duration_report_totals, \
@@ -1224,6 +1227,12 @@ def pytest_configure(config: pytest.Config) -> None:
         _executed_duration_nodeids = set()
 
 
+def pytest_sessionstart(session: pytest.Session) -> None:
+    global _failure_reporter
+    if not hasattr(session.config, "workerinput"):
+        _failure_reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     groups = _consolidate_scheduling_groups([scheduling_group(item) for item in items])
@@ -1241,6 +1250,15 @@ def pytest_xdist_make_scheduler(
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    # Long suites can be cancelled after a failed case but before pytest's
+    # final summary or artifact upload. Emit its diagnostic when the controller
+    # receives it, preserving the normal report and exit status unchanged.
+    if getattr(report, "failed", False) and _failure_reporter is not None:
+        _failure_reporter.write_sep(
+            "=", f"Immediate E2E failure: {report.nodeid} ({report.when})"
+        )
+        _failure_reporter.write_line(report.longreprtext)
+        _failure_reporter.flush()
     if _duration_history is None:
         return
     nodeid = normalize_nodeid(report.nodeid)
