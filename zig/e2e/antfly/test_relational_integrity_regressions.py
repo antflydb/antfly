@@ -105,9 +105,9 @@ def test_session_rechecks_renamed_resource_authority(auth_api, authorized_after_
         json={"inserts": {"control": {"x": 1}}},
         timeout=30,
     )
-    assert denied.status_code in (
-        (200, 201) if authorized_after_rename else (403,)
-    ), denied.text
+    assert denied.status_code in ((200, 201) if authorized_after_rename else (403,)), (
+        denied.text
+    )
     committed = api.request_raw(
         "POST", "/transactions/" + tx + "/commit", json={}, timeout=30
     )
