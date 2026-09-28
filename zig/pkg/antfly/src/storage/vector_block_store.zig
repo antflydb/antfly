@@ -116,17 +116,21 @@ pub const RetainedBlock = struct {
                 @memcpy(out, bytes_value[offset..][0..out.len]);
             },
             .mapped => |value| {
-                var read_len: usize = 0;
-                while (read_len < out.len) {
-                    const rc = std.posix.system.pread(value.fd, out.ptr + read_len, out.len - read_len, @intCast(offset + read_len));
-                    switch (std.posix.errno(rc)) {
-                        .SUCCESS => {
-                            const n: usize = @intCast(rc);
-                            if (n == 0) return error.EndOfStream;
-                            read_len += n;
-                        },
-                        .INTR => continue,
-                        else => |err| return std.posix.unexpectedErrno(err),
+                if (comptime builtin.os.tag == .freestanding) {
+                    return error.UnsupportedPlatform;
+                } else {
+                    var read_len: usize = 0;
+                    while (read_len < out.len) {
+                        const rc = std.posix.system.pread(value.fd, out.ptr + read_len, out.len - read_len, @intCast(offset + read_len));
+                        switch (std.posix.errno(rc)) {
+                            .SUCCESS => {
+                                const n: usize = @intCast(rc);
+                                if (n == 0) return error.EndOfStream;
+                                read_len += n;
+                            },
+                            .INTR => continue,
+                            else => |err| return std.posix.unexpectedErrno(err),
+                        }
                     }
                 }
             },
