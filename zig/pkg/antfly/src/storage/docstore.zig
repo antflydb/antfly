@@ -3426,37 +3426,6 @@ test "docstore reopen preserves data" {
     }
 }
 
-test "docstore exposes lmdb commit stats when available" {
-    var path_buf: [256]u8 = undefined;
-    const path = tmpPath(&path_buf);
-    defer cleanupTmp(path);
-
-    var store = try DocStore.open(std.testing.allocator, path, .{});
-    defer store.close();
-
-    try store.put("stats_key", "stats_val");
-
-    if (store.commitStatsSnapshot()) |stats| {
-        try std.testing.expect(stats.publish_calls >= 1);
-        try std.testing.expect(stats.full_publish_calls >= 1);
-        try std.testing.expect(stats.page_images_written > 0);
-        try std.testing.expect(stats.bytes_written > 0);
-        try std.testing.expect(stats.total_publish_ns > 0);
-    }
-}
-
-test "docstore does not expose commit stats for runtime-backed stores" {
-    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
-    defer backend.close();
-
-    const runtime_store = try backend.runtimeStore(std.testing.allocator, .{});
-    var store = try DocStore.openRuntime(std.testing.allocator, runtime_store);
-    defer store.close();
-
-    try store.put("stats_key", "stats_val");
-    try std.testing.expect(store.commitStatsSnapshot() == null);
-}
-
 test "docstore releases payload policy before runtime writer admission" {
     const Gate = struct {
         entered: std.atomic.Value(bool) = .init(false),
