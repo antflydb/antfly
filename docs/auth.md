@@ -6,6 +6,77 @@ planned. The model is provider-neutral: Antfly can receive principal context
 from its built-in user manager, a trusted gateway, a managed control plane, or
 a self-hosted deployment.
 
+## Secure Deployment
+
+Local quickstarts disable authentication and bind to loopback. Docker examples
+keep the application listening on `0.0.0.0` inside the container but publish
+host ports on `127.0.0.1`. Do not remove that host binding until you have
+configured authentication and TLS termination at a trusted reverse proxy.
+Metrics and auxiliary development services should also remain private.
+
+To enable built-in authentication, use `--auth true` or `"enable_auth": true`
+in the config file. On first startup, supply a unique administrator password
+through `ANTFLY_BOOTSTRAP_ADMIN_PASSWORD` (12 to 72 bytes). For example:
+
+```sh
+export ANTFLY_BOOTSTRAP_ADMIN_PASSWORD="$(openssl rand -base64 24)"
+# Save the generated password securely before removing the environment variable.
+antfly standalone --auth true
+```
+
+For Docker, forward the variable without putting its value in command arguments:
+
+```sh
+docker run -p 127.0.0.1:8080:8080 \
+  --env ANTFLY_BOOTSTRAP_ADMIN_PASSWORD \
+  -v antfly-data:/antflydb \
+  ghcr.io/antflydb/antfly:latest \
+  standalone --host 0.0.0.0 --data-dir /antflydb --auth true
+```
+
+The administrator username is `admin`. The password is stored as a hash;
+Antfly never logs it. The bootstrap variable can be removed after successful
+initialization. Subsequent startups preserve an existing non-default password,
+even if the variable changes; use the authenticated user-management API to
+rotate credentials. Configure each node's local auth store as appropriate for
+your distributed deployment; bootstrap is not a cluster-wide password update.
+
+**Upgrade from legacy defaults:** an auth-enabled instance with the old
+`admin:admin` credential refuses to start without a valid bootstrap password.
+Supplying the variable replaces that known default while preserving permissions.
+HA primary and standby startup never rewrites credentials from a portable seed;
+rotate legacy credentials before capturing a replacement HA seed.
+
+Built-in authentication also applies to MCP tools on `/mcp/v1`, served on the
+same public port. A separately configured trusted-principal gateway is another
+supported authentication boundary. CORS is a browser access policy, not an
+authentication mechanism: enabling CORS without `allowed_origins` grants no
+cross-origin access. Configure exact trusted origins; `"*"` requires explicit
+opt-in and cannot be combined with credentialed CORS.
+
+### Local files in remote templates
+
+`remoteText`, `remotePDF`, `remoteMedia`, and other file download callers deny
+`file://` unless `remote_content.security.allowed_paths` explicitly allows
+the target. Omitted and empty path lists deny local file access. To permit an
+intentional ingestion directory:
+
+```json
+{
+  "remote_content": {
+    "security": {
+      "allowed_paths": ["/srv/antfly/ingest"]
+    }
+  }
+}
+```
+
+Use a dedicated directory containing only data that authorized callers may
+read. Canonical path checks reject sibling-prefix and symlink escapes. An
+allowlist grants access to readable files beneath it; authentication alone does
+not make arbitrary local paths appropriate template inputs. Private-IP blocking
+continues to protect HTTP downloads and does not authorize local files.
+
 ## Current Implementation
 
 ### Credentials
