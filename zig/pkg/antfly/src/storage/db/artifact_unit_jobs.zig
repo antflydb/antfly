@@ -469,9 +469,12 @@ pub const Retirement = struct {
     /// retirements therefore share current counters without rewinding cursors.
     pub fn stage(self: *const Retirement, txn: anytype, root: u128) !bool {
         if (root == 0 or root != self.root) return error.DurableRootIncarnationUnavailable;
+        const raw = txn.get(&self.key) catch |err| if (err == error.NotFound) return false else return err;
+        // A lost reply may be retried after the parent head or catalog has
+        // advanced. An absent, root-bound job is already retired; it needs no
+        // old acceptance proof and must not resurrect scheduling metadata.
         if (!std.meta.eql(self.catalog_stamp, try catalogStamp(txn))) return error.ArtifactCatalogDrift;
         try self.resolution.requireCurrent(txn);
-        const raw = txn.get(&self.key) catch |err| if (err == error.NotFound) return false else return err;
         if (raw.len != self.bytes or !std.mem.eql(u8, raw[raw.len - 32 ..], &self.checksum)) return error.EnrichmentSourceChanged;
         var state = (try metadata(txn, self.selected)) orelse return error.ArtifactCatalogCorrupt;
         const document = self.document_scope;

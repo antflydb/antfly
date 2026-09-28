@@ -1887,7 +1887,53 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             try writer.put(&keys.raft_document_applied_entry_key, &marker);
             try writer.commit();
         }
-        for (wake_admission.jobs) |job| {
+        // A lost retirement reply remains idempotent after a newer accepted
+        // parent generation has invalidated the old receipt's proof.
+        try std.testing.expect(!try db.retireArtifactUnitJob(&obsolete_job));
+        for (wake_admission.jobs, 0..) |job, ordinal| {
+            if (ordinal == 0) {
+                var checkpoint = blk: {
+                    var reader = try db.core.store.beginReadTxn();
+                    defer reader.abort();
+                    break :blk .{
+                        .document = (try unit_jobs.prepareDocumentTurn(&reader, db.root_incarnation, "doc")).?,
+                        .work = try unit_jobs.prepareTurn(alloc, &reader, db.root_incarnation, wake_admission.selected, .{ .visits = 1 }),
+                        .retirement = (try unit_jobs.prepareRetirement(alloc, &reader, db.root_incarnation, job.key, retirement_plan.plan())).?,
+                    };
+                };
+                defer checkpoint.work.deinit();
+                defer checkpoint.retirement.deinit();
+                try db.finishArtifactUnitWorkPage(&checkpoint.document, &checkpoint.work, &.{&checkpoint.retirement});
+                var checked = try db.core.store.beginReadTxn();
+                defer checked.abort();
+                try std.testing.expectError(error.NotFound, checked.get(&job.key));
+                try std.testing.expectEqual(checkpoint.document.expected_revision + 1, (try unit_jobs.prepareDocumentTurn(&checked, db.root_incarnation, "doc")).?.expected_revision);
+                continue;
+            }
+            if (ordinal == 1) {
+                var stale = blk: {
+                    var reader = try db.core.store.beginReadTxn();
+                    defer reader.abort();
+                    break :blk .{
+                        .work = try unit_jobs.prepareTurn(alloc, &reader, db.root_incarnation, wake_admission.selected, .{ .visits = 1 }),
+                        .retirement = (try unit_jobs.prepareRetirement(alloc, &reader, db.root_incarnation, job.key, retirement_plan.plan())).?,
+                    };
+                };
+                defer stale.work.deinit();
+                defer stale.retirement.deinit();
+                try db.advanceArtifactUnitWorkTurn(&stale.work);
+                var next_turn = blk: {
+                    var reader = try db.core.store.beginReadTxn();
+                    defer reader.abort();
+                    break :blk try unit_jobs.prepareTurn(alloc, &reader, db.root_incarnation, wake_admission.selected, .{ .visits = 1 });
+                };
+                defer next_turn.deinit();
+                try db.advanceArtifactUnitWorkTurn(&next_turn);
+                try std.testing.expectError(error.EnrichmentSourceChanged, db.finishArtifactUnitWorkPage(null, &stale.work, &.{&stale.retirement}));
+                var checked = try db.core.store.beginReadTxn();
+                defer checked.abort();
+                _ = try checked.get(&job.key);
+            }
             var finished = blk: {
                 var reader = try db.core.store.beginReadTxn();
                 defer reader.abort();

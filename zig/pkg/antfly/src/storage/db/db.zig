@@ -35963,11 +35963,29 @@ pub const DB = struct {
     /// attempt. A refused/canceled child may advance only the document cursor;
     /// neither cursor acknowledges a producer result or releases job headroom.
     pub fn finishArtifactUnitWorkTurn(self: *DB, document: ?*const @import("artifact_unit_jobs.zig").DocumentTurn, work: ?*const @import("artifact_unit_jobs.zig").WorkTurn) !void {
+        return self.finishArtifactUnitWorkPage(document, work, &.{});
+    }
+
+    /// One durable worker checkpoint: fair continuations and receiver-verified
+    /// receipts commit together. A callback outcome alone cannot enter this
+    /// list; every retirement carries its own current accepted-result fence.
+    pub fn finishArtifactUnitWorkPage(self: *DB, document: ?*const @import("artifact_unit_jobs.zig").DocumentTurn, work: ?*const @import("artifact_unit_jobs.zig").WorkTurn, retirements: []const *const @import("artifact_unit_jobs.zig").Retirement) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (document == null and work == null) return error.InvalidBatchRequest;
+        if (document == null and work == null and retirements.len == 0) return error.InvalidBatchRequest;
+        if (retirements.len > 128) return error.InvalidBatchRequest;
         if (document) |selected| if (work) |turn| {
             if (selected.selected == null or !std.mem.eql(u8, &selected.selected.?, &turn.selected)) return error.InvalidBatchRequest;
         };
+        for (retirements) |retirement| {
+            if (retirement.root != self.root_incarnation) return error.DurableRootIncarnationUnavailable;
+            if (!std.mem.eql(u8, &retirement.selected, &retirements[0].selected) or
+                !std.mem.eql(u8, &retirement.document_scope, &retirements[0].document_scope)) return error.InvalidBatchRequest;
+            if (work) |turn| if (!std.mem.eql(u8, &retirement.selected, &turn.selected)) return error.InvalidBatchRequest;
+            if (document) |turn| {
+                if (turn.selected == null or !std.mem.eql(u8, &retirement.selected, &turn.selected.?) or
+                    !std.mem.eql(u8, &retirement.document_scope, &turn.document)) return error.InvalidBatchRequest;
+            }
+        }
         var ctx = self.batchContext();
         var ha_mutation = acquireHAMutationSharedContext(&ctx);
         defer if (ha_mutation) |*lease| lease.release();
@@ -35980,6 +35998,7 @@ pub const DB = struct {
         errdefer writer.abort();
         if (work) |turn| _ = try turn.stage(&writer, self.root_incarnation);
         if (document) |turn| try turn.stage(&writer, self.root_incarnation);
+        for (retirements) |retirement| _ = try retirement.stage(&writer, self.root_incarnation);
         try writer.commit();
     }
 

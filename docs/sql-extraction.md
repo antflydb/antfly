@@ -2158,6 +2158,13 @@ following mechanisms are installed behind that gate:
   admission, current-key retirement, joint-cursor reopen, concurrent count
   preservation, drained/refilled generation fencing, last-child cleanup,
   directory corruption rejection, and obsolete-root GC.
+- The local worker checkpoint can now commit both fair continuations and up to
+  128 receiver-verified receipt retirements in one store transaction. A stale
+  cursor aborts the whole page without dropping jobs. A duplicate retirement
+  returns after an absent-job point read, even if a later parent generation
+  has invalidated the old receipt; present jobs still require the current
+  catalog, authority, and accepted-result fences. Callback selection and
+  execution remain the activation boundary.
 - Persisted unit encoding now lives in a shared typed payload contract rather
   than the runtime implementation. Ordered unit chunk callbacks decode through
   that contract once, bind document/producer/unit identity, reject provenance
