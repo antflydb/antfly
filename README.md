@@ -18,8 +18,10 @@ brew install antflydb/taps/antfly
 make build && ./antfly standalone
 
 # Or run with Docker
-docker run -p 8080:8080 ghcr.io/antflydb/antfly:latest standalone --host 0.0.0.0
+docker run -p 127.0.0.1:8080:8080 ghcr.io/antflydb/antfly:latest standalone --host 0.0.0.0
 ```
+
+These quickstarts run without authentication and are intended for local development. Keep Docker ports bound to loopback. Before allowing remote access, [enable authentication and provision a unique admin password](docs/auth.md#secure-deployment), then configure TLS at a reverse proxy.
 
 That gives you the [Antfarm dashboard](ts/apps/antfarm) at `http://localhost:8080` — playgrounds for search, RAG, knowledge graphs, embeddings, reranking, and more.
 
