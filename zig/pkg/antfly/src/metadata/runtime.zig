@@ -1196,7 +1196,10 @@ pub fn runFromIterator(
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
         errdefer if (user_manager) |*manager| manager.deinit();
-        try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
+        antfly.usermgr.ensureDefaultAdminUser(&user_manager.?, init.environ_map.get("ANTFLY_BOOTSTRAP_ADMIN_PASSWORD")) catch |err| {
+            std.log.err("auth bootstrap failed: set ANTFLY_BOOTSTRAP_ADMIN_PASSWORD to a unique password of 12 to 72 bytes for a new admin or to replace legacy admin:admin credentials", .{});
+            return err;
+        };
     }
     defer if (comptime !linked_storage) if (auth_backend) |*backend| backend.close();
     defer if (auth_runtime) |*runtime| runtime.deinit();
@@ -1218,6 +1221,9 @@ pub fn runFromIterator(
     defer freeMetadataClusterPeers(alloc, cluster_peers);
     const listener = resolveRaftListener(cli, if (loaded_config) |*cfg| cfg else null);
     const admin_listener = resolveAdminListener(cli, if (loaded_config) |*cfg| cfg else null, local_node_id, listener.bind_host);
+    // Internal-service credentials protect RPC routes, not the public API
+    // exposed by the same admin listener.
+    antfly.common.listener_security.warnIfUnauthenticated("metadata admin", admin_listener.bind_host, admin_listener.bind_port, effective_auth_enabled);
 
     var native_keys: @import("../common/secret_keyring.zig").Keyring = undefined;
     var native_secrets: ?@import("secret_store.zig").Store = null;

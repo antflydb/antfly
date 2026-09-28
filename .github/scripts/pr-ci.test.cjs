@@ -614,3 +614,41 @@ test('PR orchestrator limits all called suites to read-only GitHub caches', () =
     }
   }
 });
+
+test('full and soak labels require fresh approval and preserve suite admission', async t => {
+  for (const [label, suite] of [['ci:full', 'full'], ['ci:soak', 'soak']]) {
+    await t.test(label, async () => {
+      const f = fixture();
+      f.pr.labels = [{name: label}];
+      f.context.payload.issue.labels = structuredClone(f.pr.labels);
+      f.context.eventName = 'pull_request_target';
+      f.context.payload.action = 'labeled';
+      f.context.payload.label = {name: label};
+      await f.call();
+      assert.equal(f.dispatches.length, 0);
+      f.context.eventName = 'issue_comment';
+      f.context.payload.action = 'created';
+      await f.call();
+      f.env.CHECK_ID = f.dispatches[0].inputs.check_id;
+      await f.call('admit');
+      assert.ok(JSON.parse(f.outputs.suites).includes(suite));
+      f.env.SUITE = suite;
+      await f.call('verify');
+      f.pr.labels = [];
+      await assert.rejects(f.call('verify'), /selected suites changed/);
+    });
+  }
+});
+
+test('PR result maps expanded suites to their single execution job', () => {
+  const workflow = fs.readFileSync(path.resolve(__dirname, '../workflows/pr-ci.yml'), 'utf8');
+  const script = workflow.split('const needs = JSON.parse(process.env.RESULTS);')[1].split('\n  publish:')[0];
+  const check = new Function('process', `const needs = JSON.parse(process.env.RESULTS);${script}`);
+  const results = {approve: {result: 'success', outputs: {suites: JSON.stringify(['zig', 'full', 'vopr', 'soak'])}}, zig: {result: 'success'}, vopr: {result: 'success'}};
+  check({env: {RESULTS: JSON.stringify(results)}});
+  for (const job of ['zig', 'vopr']) {
+    for (const result of ['failure', 'skipped', 'cancelled']) {
+      assert.throws(() => check({env: {RESULTS: JSON.stringify({...results, [job]: {result}})}}), /did not pass/);
+    }
+  }
+});

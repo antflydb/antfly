@@ -25,7 +25,9 @@ auth_api = auth.auth_api
 @pytest.mark.parametrize("mixed_spelling", [False, True])
 def test_equivalent_cascades(auth_api, mixed_spelling):
     api = auth_api
-    api.s.headers["Authorization"] = auth._basic_auth("admin", "admin")
+    api.s.headers["Authorization"] = auth._basic_auth(
+        "admin", auth.AUTH_BOOTSTRAP_PASSWORD
+    )
     for table in ["p1", "p2", "child"]:
         schema = _schema()
         schema["document_schemas"]["row"]["schema"]["properties"]["id"] = {
@@ -76,7 +78,7 @@ def test_equivalent_cascades(auth_api, mixed_spelling):
 @pytest.mark.parametrize("authorized_after_rename", [False, True])
 def test_session_rechecks_renamed_resource_authority(auth_api, authorized_after_rename):
     api = auth_api
-    admin = auth._basic_auth("admin", "admin")
+    admin = auth._basic_auth("admin", auth.AUTH_BOOTSTRAP_PASSWORD)
     writer = auth._basic_auth("writer", "writer")
     api.s.headers["Authorization"] = admin
     api.create_table("public_rows")
@@ -139,7 +141,7 @@ def test_session_rechecks_renamed_resource_authority(auth_api, authorized_after_
 
 def test_session_snapshot_not_disclosed_after_rename(auth_api):
     api = auth_api
-    admin = auth._basic_auth("admin", "admin")
+    admin = auth._basic_auth("admin", auth.AUTH_BOOTSTRAP_PASSWORD)
     writer = auth._basic_auth("reader", "reader")
     api.s.headers["Authorization"] = admin
     api.create_table("public_rows")
@@ -188,7 +190,9 @@ def test_session_snapshot_not_disclosed_after_rename(auth_api):
 @pytest.mark.parametrize("mixed_spelling", [False, True])
 def test_equivalent_datetime_cascades(auth_api, mixed_spelling):
     api = auth_api
-    api.s.headers["Authorization"] = auth._basic_auth("admin", "admin")
+    api.s.headers["Authorization"] = auth._basic_auth(
+        "admin", auth.AUTH_BOOTSTRAP_PASSWORD
+    )
     for table in ["p1", "p2", "child"]:
         schema = _schema()
         schema["document_schemas"]["row"]["schema"]["properties"]["id"] = {
@@ -229,9 +233,11 @@ def test_equivalent_datetime_cascades(auth_api, mixed_spelling):
                 "p2": {
                     "inserts": {
                         "row": {
-                            "id": "2026-01-02T00:00:00.000Z"
-                            if mixed_spelling
-                            else "2026-01-02T00:00:00Z"
+                            "id": (
+                                "2026-01-02T00:00:00.000Z"
+                                if mixed_spelling
+                                else "2026-01-02T00:00:00Z"
+                            )
                         }
                     }
                 },
@@ -250,7 +256,9 @@ def test_equivalent_datetime_cascades(auth_api, mixed_spelling):
 @pytest.mark.parametrize("explicit_child", [False, True])
 def test_conflicting_cascade_has_client_conflict_status(auth_api, explicit_child):
     api = auth_api
-    api.s.headers["Authorization"] = auth._basic_auth("admin", "admin")
+    api.s.headers["Authorization"] = auth._basic_auth(
+        "admin", auth.AUTH_BOOTSTRAP_PASSWORD
+    )
     for table in ["p1", "p2", "child"]:
         schema = _schema()
         schema["document_schemas"]["row"]["schema"]["properties"]["id"] = {
@@ -321,7 +329,9 @@ def _cascade_pair(api):
 
 def test_self_referencing_cascade_preserves_unchanged_fk(auth_api):
     api = auth_api
-    api.s.headers["Authorization"] = auth._basic_auth("admin", "admin")
+    api.s.headers["Authorization"] = auth._basic_auth(
+        "admin", auth.AUTH_BOOTSTRAP_PASSWORD
+    )
     schema = _schema()
     schema["document_schemas"]["row"]["schema"]["properties"]["parent_id"] = {
         "type": "integer",
@@ -345,7 +355,9 @@ def test_self_referencing_cascade_preserves_unchanged_fk(auth_api):
 
 def test_cascade_and_unrelated_child_update_same_statement(auth_api):
     api = auth_api
-    api.s.headers["Authorization"] = auth._basic_auth("admin", "admin")
+    api.s.headers["Authorization"] = auth._basic_auth(
+        "admin", auth.AUTH_BOOTSTRAP_PASSWORD
+    )
     _cascade_pair(api)
     tx = api.post("/transactions/begin", {"sync_level": "write"})["transaction_id"]
     resource = f"/transactions/{tx}"

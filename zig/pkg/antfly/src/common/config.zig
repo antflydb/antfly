@@ -391,6 +391,7 @@ pub const Config = struct {
 
     pub const CorsConfig = struct {
         enabled: ?bool = null,
+        /// Omitted or empty origins deny cross-origin access; "*" is explicit opt-in.
         allowed_origins: ?[]const []u8 = null,
         allowed_methods: ?[]const []u8 = null,
         allowed_headers: ?[]const []u8 = null,

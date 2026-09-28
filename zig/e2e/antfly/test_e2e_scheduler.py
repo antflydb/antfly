@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -132,6 +133,27 @@ def test_process_worker_configuration_rejects_non_positive_values() -> None:
         match="--e2e-process-workers must be a positive integer",
     ):
         pytest_configure(config)  # type: ignore[arg-type]
+
+
+def test_nested_pytest_does_not_publish_parent_duration_history(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import e2e_scheduler as scheduler
+
+    duration_file = tmp_path / "durations.json"
+    options = {"e2e_process_slots": 2, "e2e_duration_file": str(duration_file)}
+    config = SimpleNamespace(
+        getoption=lambda name, default=None: options.get(name, default)
+    )
+    monkeypatch.setenv(scheduler._DURATION_OWNER_PID, str(os.getpid() + 1))
+    pytest_configure(config)  # type: ignore[arg-type]
+    assert scheduler._duration_history is None
+
+    monkeypatch.delenv(scheduler._DURATION_OWNER_PID)
+    pytest_configure(config)  # type: ignore[arg-type]
+    assert scheduler._duration_history is not None
+    assert os.environ[scheduler._DURATION_OWNER_PID] == str(os.getpid())
+    monkeypatch.setattr(scheduler, "_duration_history", None)
 
 
 def test_one_process_worker_allows_mixed_group_and_parallel_light_work(

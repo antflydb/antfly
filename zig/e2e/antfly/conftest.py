@@ -144,6 +144,7 @@ def annotate_metadata_table_names(
 
 
 E2E_BACKUP_CONNECTION = "e2e-backups"
+AUTH_BOOTSTRAP_PASSWORD = "e2e-bootstrap-password"
 ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
 INFERENCE_PUBLIC_API_ROOT = "/ai/v1"
@@ -1239,6 +1240,14 @@ class StatefulAntflyServer:
             (self.port, self.data_raft_port),
             lambda: subprocess.Popen(
                 data_command,
+                env=(
+                    {
+                        **os.environ,
+                        "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+                    }
+                    if self.auth_enabled
+                    else None
+                ),
                 stdout=self.data_log_file,
                 stderr=subprocess.STDOUT,
                 cwd=self.root,
@@ -3615,9 +3624,11 @@ def backup_api(request: pytest.FixtureRequest):
             # snapshots preserve source-vector reference closure.
             payload: dict[str, object] = {
                 "num_shards": num_shards,
-                "storage": storage
-                if storage is not None
-                else {"dense_embeddings": "primary_lsm"},
+                "storage": (
+                    storage
+                    if storage is not None
+                    else {"dense_embeddings": "primary_lsm"}
+                ),
             }
             if description is not None:
                 payload["description"] = description

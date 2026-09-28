@@ -152,7 +152,7 @@ Use the Linux container image or WSL2. Native Windows archives are not published
   </TabsContent>
 
   <TabsContent value="docker">
-Run a single node with Docker Compose, with the public API on port 8080 and data persisted in a named volume:
+Run a local development node with Docker Compose, with the public API on loopback port 8080 and data persisted in a named volume:
 
 ```yaml
 services:
@@ -160,7 +160,7 @@ services:
     image: ghcr.io/antflydb/antfly:latest
     command: ["standalone", "--host", "0.0.0.0", "--data-dir", "/antflydb"]
     ports:
-      - "8080:8080" # Public API
+      - "127.0.0.1:8080:8080" # Public API, local access only
     volumes:
       - antfly-data:/antflydb
     restart: always
@@ -168,6 +168,8 @@ services:
 volumes:
   antfly-data:
 ```
+
+This example disables authentication. Before publishing the port for remote access, configure authentication and TLS as described in [secure deployment](https://github.com/antflydb/antfly/blob/main/docs/auth.md#secure-deployment).
 
 Antfly Inference runs inside the same process, so no separate model server is needed. Pull models with `docker exec <container> antfly inference pull <model>`.
   </TabsContent>
