@@ -1359,6 +1359,7 @@ class ReleasePromotionTests(unittest.TestCase):
             extras.mkdir()
             source.mkdir()
             (archives / "antfly_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(b"native")
+            (archives / "antfly-lite_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(b"lite")
             (archives / "antfly-inference_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(b"inference")
             (extras / "antfly-cli-0.2.1.tgz").write_bytes(b"npm")
             (extras / "cli-snapshot.json").write_text(
@@ -1458,18 +1459,23 @@ class ReleasePromotionTests(unittest.TestCase):
             )
             kinds = {artifact["kind"] for artifact in ledger["artifacts"]}
             self.assertIn("runtime-archive", kinds)
-            inference_archive = "antfly-inference_0.2.1_Linux_x86_64_gnu.tar.gz"
-            self.assertIn(
-                inference_archive,
+            runtime_names = {
+                artifact["name"]
+                for artifact in ledger["artifacts"]
+                if artifact["kind"] == "runtime-archive"
+            }
+            self.assertEqual(
+                runtime_names,
                 {
-                    artifact["name"]
-                    for artifact in ledger["artifacts"]
-                    if artifact["kind"] == "runtime-archive"
+                    "antfly_0.2.1_Linux_x86_64_gnu.tar.gz",
+                    "antfly-lite_0.2.1_Linux_x86_64_gnu.tar.gz",
+                    "antfly-inference_0.2.1_Linux_x86_64_gnu.tar.gz",
                 },
             )
-            self.assertIn(
-                inference_archive,
-                (output / "antfly_zig_checksums.txt").read_text(),
+            checksums = (output / "antfly_zig_checksums.txt").read_text()
+            self.assertEqual(
+                {line.split("  ", 1)[1] for line in checksums.splitlines()},
+                runtime_names,
             )
             self.assertIn("npm-package", kinds)
             self.assertIn("cli-manifest", kinds)
@@ -1478,16 +1484,21 @@ class ReleasePromotionTests(unittest.TestCase):
             scopes = {artifact["scope"] for artifact in ledger["artifacts"]}
             self.assertEqual(scopes, {"runtime", "cli", "support"})
 
-            (archives / inference_archive).unlink()
-            missing_archive_argv = argv.copy()
-            missing_archive_argv[missing_archive_argv.index(str(output))] = str(
-                root / "missing-output"
-            )
-            with (
-                mock.patch.object(sys, "argv", missing_archive_argv),
-                self.assertRaisesRegex(SystemExit, "missing matching inference"),
-            ):
-                payload.main()
+            for product in ("antfly-lite", "antfly-inference"):
+                missing_archive = archives / f"{product}_0.2.1_Linux_x86_64_gnu.tar.gz"
+                contents = missing_archive.read_bytes()
+                missing_archive.unlink()
+                missing_archive_argv = argv.copy()
+                missing_archive_argv[missing_archive_argv.index(str(output))] = str(
+                    root / f"missing-{product}-output"
+                )
+                with (
+                    self.subTest(missing=product),
+                    mock.patch.object(sys, "argv", missing_archive_argv),
+                    self.assertRaisesRegex(SystemExit, f"missing matching {product}"),
+                ):
+                    payload.main()
+                missing_archive.write_bytes(contents)
 
             verifier = load_module(
                 "verify_release_ledger_test", "verify_release_ledger.py"
