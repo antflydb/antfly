@@ -30,10 +30,10 @@ from pathlib import Path
 from release_channels import normalize_release_version, python_version_from_release
 
 NPM_PACKAGES = {
-    "@antfly/lite": "antfly-lite",
-    "@antfly/lite-darwin-arm64": "antfly-lite-darwin-arm64",
-    "@antfly/lite-linux-arm64": "antfly-lite-linux-arm64",
-    "@antfly/lite-linux-x64": "antfly-lite-linux-x64",
+    "@antfly/embedded": "antfly-embedded",
+    "@antfly/embedded-darwin-arm64": "antfly-embedded-darwin-arm64",
+    "@antfly/embedded-linux-arm64": "antfly-embedded-linux-arm64",
+    "@antfly/embedded-linux-x64": "antfly-embedded-linux-x64",
 }
 
 
@@ -71,7 +71,7 @@ def expected_names(version: str) -> set[str]:
     names = {f"{stem}-{version}.tgz" for stem in NPM_PACKAGES.values()}
     py_version = python_version_from_release(version)
     names.update(
-        f"antfly_lite-{py_version}-py3-none-{platform}.whl"
+        f"antfly_embedded-{py_version}-py3-none-{platform}.whl"
         for platform in (
             "manylinux_2_28_x86_64",
             "manylinux_2_28_aarch64",
@@ -102,7 +102,7 @@ def build(
                 raise ValueError(f"unexpected npm package: {source}")
         else:
             name, package_version = wheel_identity(source)
-            if name != "antfly-lite" or package_version != python_version_from_release(
+            if name != "antfly-embedded" or package_version != python_version_from_release(
                 version
             ):
                 raise ValueError(f"unexpected wheel: {source}")
@@ -156,7 +156,7 @@ def verify(snapshot_dir: Path, version: str, commit: str) -> None:
                 raise ValueError(f"Lite npm package identity differs: {path}")
         else:
             if wheel_identity(path) != (
-                "antfly-lite",
+                "antfly-embedded",
                 python_version_from_release(version),
             ):
                 raise ValueError(f"Lite wheel identity differs: {path}")

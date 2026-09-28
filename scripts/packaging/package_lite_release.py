@@ -89,7 +89,7 @@ def extract_lite_archive(
 def populate_npm_package(platform: Platform, extracted: Path, version: str) -> Path:
     assert platform.npm_package_dir is not None
     package_dir = (
-        ROOT / "ts" / "packages" / platform.npm_package_dir.replace("cli-", "lite-")
+        ROOT / "ts" / "packages" / platform.npm_package_dir.replace("cli-", "embedded-")
     )
     manifest = package_dir / "package.json"
     if json.loads(manifest.read_text())["license"] != "Apache-2.0":
@@ -123,9 +123,9 @@ def write_wheel(
 ) -> Path:
     assert platform.wheel_platform is not None
     tag = f"py3-none-{platform.wheel_platform}"
-    dist_info = f"antfly_lite-{version}.dist-info"
-    wheel_path = out_dir / f"antfly_lite-{version}-{tag}.whl"
-    source = ROOT / "py" / "packages" / "lite" / "src" / "antfly_lite"
+    dist_info = f"antfly_embedded-{version}.dist-info"
+    wheel_path = out_dir / f"antfly_embedded-{version}-{tag}.whl"
+    source = ROOT / "py" / "packages" / "embedded" / "src" / "antfly_embedded"
     records: list[tuple[str, str, str]] = []
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -146,28 +146,28 @@ def write_wheel(
 
     metadata = Message()
     metadata["Metadata-Version"] = "2.3"
-    metadata["Name"] = "antfly-lite"
+    metadata["Name"] = "antfly-embedded"
     metadata["Version"] = version
-    metadata["Summary"] = "Apache-2.0 embedded Antfly Lite and Inference"
+    metadata["Summary"] = "Apache-2.0 embedded Antfly databases and inference"
     metadata["License-Expression"] = "Apache-2.0"
     metadata["Requires-Python"] = project_requires_python(
-        ROOT / "py" / "packages" / "lite" / "pyproject.toml"
+        ROOT / "py" / "packages" / "embedded" / "pyproject.toml"
     )
     wheel = f"Wheel-Version: 1.0\nGenerator: package_lite_release.py\nRoot-Is-Purelib: false\nTag: {tag}\n"
-    entry_points = "[console_scripts]\nantfly-lite = antfly_lite._cli:lite_main\nantfly-inference = antfly_lite._cli:inference_main\n"
+    entry_points = "[console_scripts]\nantfly-lite = antfly_embedded._cli:lite_main\nantfly-inference = antfly_embedded._cli:inference_main\n"
 
     with zipfile.ZipFile(wheel_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for item in sorted(source.rglob("*")):
             if item.is_file() and "__pycache__" not in item.parts:
                 add_bytes(
                     archive,
-                    f"antfly_lite/{item.relative_to(source).as_posix()}",
+                    f"antfly_embedded/{item.relative_to(source).as_posix()}",
                     item.read_bytes(),
                 )
         for binary in ("antfly-lite", "antfly-inference"):
             add_bytes(
                 archive,
-                f"antfly_lite/_bin/{binary}",
+                f"antfly_embedded/_bin/{binary}",
                 (extracted / binary).read_bytes(),
                 0o755,
             )
@@ -175,12 +175,12 @@ def write_wheel(
             if item.is_file():
                 add_bytes(
                     archive,
-                    f"antfly_lite/_lib/{item.relative_to(extracted / 'lib').as_posix()}",
+                    f"antfly_embedded/_lib/{item.relative_to(extracted / 'lib').as_posix()}",
                     item.read_bytes(),
                 )
         add_bytes(
             archive,
-            "antfly_lite/_lib/antfly-inference",
+            "antfly_embedded/_lib/antfly-inference",
             (extracted / "antfly-inference").read_bytes(),
             0o755,
         )
@@ -211,10 +211,10 @@ def main() -> int:
     version = normalize_release_version(args.version)
     python_version = python_version_from_release(version)
     update_pyproject_version(
-        ROOT / "py" / "packages" / "lite" / "pyproject.toml", python_version
+        ROOT / "py" / "packages" / "embedded" / "pyproject.toml", python_version
     )
     update_json_version(
-        ROOT / "ts" / "packages" / "lite" / "package.json", version, optional_deps=True
+        ROOT / "ts" / "packages" / "embedded" / "package.json", version, optional_deps=True
     )
     for platform in PACKAGE_PLATFORMS:
         with tempfile.TemporaryDirectory() as raw:

@@ -21,7 +21,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/antflydb/antfly/go/pkg/lite"
+	"github.com/antflydb/antfly/go/pkg/embedded"
 )
 
 const schemaJSON = `{"version":1,"default_type":"note","document_schemas":{"note":{"schema":{"type":"object","required":["title","body"],"additionalProperties":true}}}}`
@@ -31,7 +31,7 @@ var indexes = [][]byte{
 	[]byte(`{"name":"note_embedding_v1","kind":"dense_vector","config_json":"{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}"}`),
 }
 
-var documents = []lite.WriteIntent{
+var documents = []embedded.WriteIntent{
 	{
 		Key: "note:local-first",
 		Value: []byte(`{
@@ -114,18 +114,18 @@ func removeIfExists(path string) {
 	}
 }
 
-func openOrCreateLite(path string) (*lite.DB, bool, error) {
+func openOrCreateLite(path string) (*embedded.DB, bool, error) {
 	if _, err := os.Stat(path); err == nil {
-		db, openErr := lite.Open(path)
+		db, openErr := embedded.Open(path)
 		return db, false, openErr
 	} else if !os.IsNotExist(err) {
 		return nil, false, err
 	}
-	db, err := lite.Create(path)
+	db, err := embedded.Create(path)
 	return db, true, err
 }
 
-func mustSearch(db *lite.DB, request []byte) []byte {
+func mustSearch(db *embedded.DB, request []byte) []byte {
 	result, err := db.SearchJSON(request)
 	if err != nil {
 		log.Fatalf("search %s: %v", request, err)

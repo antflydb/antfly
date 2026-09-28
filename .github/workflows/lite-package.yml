@@ -65,15 +65,15 @@ jobs:
       - name: Build and check TypeScript binding
         working-directory: ts
         run: |
-          pnpm --filter @antfly/lite typecheck
-          pnpm --filter @antfly/lite test
-          pnpm --filter @antfly/lite build
+          pnpm --filter @antfly/embedded typecheck
+          pnpm --filter @antfly/embedded test
+          pnpm --filter @antfly/embedded build
 
       - name: Pack Apache npm packages
         run: |
           set -euo pipefail
           mkdir -p dist/lite-packages/npm
-          for name in lite-darwin-arm64 lite-linux-arm64 lite-linux-x64 lite; do
+          for name in embedded-darwin-arm64 embedded-linux-arm64 embedded-linux-x64 embedded; do
             npm pack --pack-destination dist/lite-packages/npm "./ts/packages/$name"
           done
           python scripts/packaging/verify_lite_release.py \
@@ -97,6 +97,6 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: antfly-lite-package-snapshot
+          name: antfly-embedded-package-snapshot
           path: dist/lite-snapshot/
           if-no-files-found: error

@@ -4,8 +4,8 @@ Antfly has separate packages for SDKs and CLI installation:
 
 - Python SDK: `antfly-sdk`
 - TypeScript SDK: `@antfly/sdk`
-- Antfly Lite bindings: Go `github.com/antflydb/antfly/go/pkg/lite`, Python
-  `antfly-lite`, Rust `antfly-lite`, and TypeScript `@antfly/lite`
+- Embedded bindings: Go `github.com/antflydb/antfly/go/pkg/embedded`, Python
+  `antfly-embedded`, Rust `antfly-embedded`, and TypeScript `@antfly/embedded`
 - Python CLI installer: `antfly-cli`
 - npm CLI installer: `@antfly/cli`
 
@@ -32,7 +32,7 @@ that library and include `include/antfly.h`.
 The Python, npm, and Homebrew CLI installer packages preserve the same Lite C
 ABI files from the native archive. Consumers that need embedded Lite can install
 one of those packages or unpack the native runtime archive, then point their
-language binding at the packaged `libantfly` library. The Go `lite`
+language binding at the packaged `libantfly` library. The Go `embedded`
 module carries a matching header copy for standalone builds, but the release
 packages and archives also keep `include/antfly.h` available for direct C
 consumers.

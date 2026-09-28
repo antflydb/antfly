@@ -16,23 +16,24 @@ Antfly provides type-safe client libraries for Go, TypeScript, Python, and Rust.
 | Python | `antfly-sdk` | [PyPI](https://pypi.org/project/antfly-sdk/) | [GitHub](https://github.com/antflydb/antfly/tree/main/py/packages/sdk) |
 | Rust | `antfly-sdk` | Not yet published; use a git dependency | [GitHub](https://github.com/antflydb/antfly/tree/main/rs/crates/sdk) |
 
-## Embedded Lite Binding
+## Embedded Bindings
 
-Antfly Lite embeds Antfly directly in an application process with a live
-`.aflite` database file. Each Lite binding wraps the same `libantfly` C ABI
-and passes the same shared conformance cases:
+The embedded packages wrap one `libantfly` C ABI. They open `.aflite` files or
+single-node directory databases, and expose inference without opening a
+database. Each language binding passes the shared conformance cases:
 
 | Language | Package | Source |
 |----------|---------|--------|
-| Go | `github.com/antflydb/antfly/go/pkg/lite` | [`go/pkg/lite`](https://github.com/antflydb/antfly/tree/main/go/pkg/lite) |
-| Python | `antfly-lite` (import `antfly_lite`) | [`py/packages/lite`](https://github.com/antflydb/antfly/tree/main/py/packages/lite) |
-| Rust | `antfly-lite` | [`rs/crates/lite`](https://github.com/antflydb/antfly/tree/main/rs/crates/lite) |
-| TypeScript (Node) | `@antfly/lite` | [`ts/packages/lite`](https://github.com/antflydb/antfly/tree/main/ts/packages/lite) |
+| Go | `github.com/antflydb/antfly/go/pkg/embedded` | [`go/pkg/embedded`](https://github.com/antflydb/antfly/tree/main/go/pkg/embedded) |
+| Python | `antfly-embedded` (import `antfly_embedded`) | [`py/packages/embedded`](https://github.com/antflydb/antfly/tree/main/py/packages/embedded) |
+| Rust | `antfly-embedded` | [`rs/crates/embedded`](https://github.com/antflydb/antfly/tree/main/rs/crates/embedded) |
+| TypeScript (Node) | `@antfly/embedded` | [`ts/packages/embedded`](https://github.com/antflydb/antfly/tree/main/ts/packages/embedded) |
 
-The Lite bindings are separate from the network SDKs: use an SDK for a
-running Antfly service and a Lite binding for embedded local databases.
-Every binding needs the platform's `libantfly` library, which the Antfly CLI
-packages and release archives ship in `lib/`.
+Use an SDK to connect to a running Antfly service; use an embedded binding for
+local databases or in-process inference. Python and npm platform packages
+include `libantfly`; direct C and Go/Rust consumers can use the Apache Lite
+release archive. The `.aflite` storage format and `antfly-lite` CLI keep their
+Lite names.
 
 See the [Antfly Lite guide](/docs/guides/lite) for CLI and embedded
 examples, plus backup, restore, and promotion between Lite and a running

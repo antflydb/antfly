@@ -38,10 +38,10 @@ class ClassifyValidationTests(unittest.TestCase):
 
     def test_lite_binding_changes_run_the_sdk_suite(self) -> None:
         for path in (
-            "go/pkg/lite/lite_cgo.go",
-            "py/packages/lite/src/antfly_lite/_database.py",
-            "rs/crates/lite/src/lib.rs",
-            "rs/crates/lite-sys/src/lib.rs",
+            "go/pkg/embedded/lite_cgo.go",
+            "py/packages/embedded/src/antfly_embedded/_database.py",
+            "rs/crates/embedded/src/lib.rs",
+            "rs/crates/embedded-sys/src/lib.rs",
             "zig/pkg/antfly/capi-conformance/cases/open_modes.json",
         ):
             with self.subTest(path=path):

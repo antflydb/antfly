@@ -73,35 +73,35 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
 
         wheel_path = (
             wheel_dir
-            / f"antfly_lite-{python_version}-py3-none-{platform.wheel_platform}.whl"
+            / f"antfly_embedded-{python_version}-py3-none-{platform.wheel_platform}.whl"
         )
         with zipfile.ZipFile(wheel_path) as wheel:
             require(
-                wheel.read(f"antfly_lite/_lib/{lib_name}") == library,
+                wheel.read(f"antfly_embedded/_lib/{lib_name}") == library,
                 f"library mismatch: {wheel_path}",
             )
             require(
-                wheel.read("antfly_lite/_lib/antfly-inference") == worker,
+                wheel.read("antfly_embedded/_lib/antfly-inference") == worker,
                 f"worker mismatch: {wheel_path}",
             )
             require(
-                wheel.read("antfly_lite/_bin/antfly-lite") == lite,
+                wheel.read("antfly_embedded/_bin/antfly-lite") == lite,
                 f"Lite executable mismatch: {wheel_path}",
             )
             require(
-                wheel.read(f"antfly_lite-{python_version}.dist-info/LICENSE") == apache,
+                wheel.read(f"antfly_embedded-{python_version}.dist-info/LICENSE") == apache,
                 f"wrong wheel license: {wheel_path}",
             )
             require(
                 wheel.read(
-                    f"antfly_lite-{python_version}.dist-info/LICENSES/Apache-2.0.txt"
+                    f"antfly_embedded-{python_version}.dist-info/LICENSES/Apache-2.0.txt"
                 )
                 == apache,
                 f"wrong wheel license bundle: {wheel_path}",
             )
             require(
                 b"License-Expression: Apache-2.0"
-                in wheel.read(f"antfly_lite-{python_version}.dist-info/METADATA"),
+                in wheel.read(f"antfly_embedded-{python_version}.dist-info/METADATA"),
                 f"wrong wheel metadata: {wheel_path}",
             )
             require(
@@ -109,7 +109,7 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
                 f"server package in {wheel_path}",
             )
 
-        package_name = platform.npm_package_dir.replace("cli-", "lite-")
+        package_name = platform.npm_package_dir.replace("cli-", "embedded-")
         npm_path = npm_dir / f"antfly-{package_name}-{version}.tgz"
         with tarfile.open(npm_path, "r:gz") as npm:
 
@@ -145,17 +145,17 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
                 f"wrong npm license bundle: {npm_path}",
             )
 
-    selector = npm_dir / f"antfly-lite-{version}.tgz"
+    selector = npm_dir / f"antfly-embedded-{version}.tgz"
     with tarfile.open(selector, "r:gz") as npm:
         member = npm.extractfile("package/package.json")
         require(member is not None, f"missing package.json in {selector}")
         manifest = json.load(member)
         require(
-            manifest["name"] == "@antfly/lite" and manifest["license"] == "Apache-2.0",
+            manifest["name"] == "@antfly/embedded" and manifest["license"] == "Apache-2.0",
             f"wrong Lite selector: {selector}",
         )
         expected = {
-            f"@antfly/lite-{name}"
+            f"@antfly/embedded-{name}"
             for name in ("darwin-arm64", "linux-arm64", "linux-x64")
         }
         require(

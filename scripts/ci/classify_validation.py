@@ -42,10 +42,10 @@ SDK_PREFIXES = (
     "rs/crates/sdk/",
     "specs/openapi/",
     # Embedded Lite bindings and the conformance cases they all run.
-    "go/pkg/lite/",
-    "py/packages/lite/",
-    "rs/crates/lite/",
-    "rs/crates/lite-sys/",
+    "go/pkg/embedded/",
+    "py/packages/embedded/",
+    "rs/crates/embedded/",
+    "rs/crates/embedded-sys/",
     "zig/pkg/antfly/capi-conformance/",
 )
 SDK_FILES = {
@@ -91,7 +91,7 @@ FORMAT_INFRASTRUCTURE = {
     "scripts/format.sh",
     "py/packages/sdk/pyproject.toml",
     "py/packages/sdk/uv.lock",
-    "py/packages/lite/pyproject.toml",
+    "py/packages/embedded/pyproject.toml",
     "ts/biome.json",
     "ts/package.json",
     "ts/pnpm-lock.yaml",

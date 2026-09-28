@@ -381,7 +381,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "-count=1",
         "./...",
     });
-    run_lite_go_tests.setCwd(b.path("../go/pkg/lite"));
+    run_lite_go_tests.setCwd(b.path("../go/pkg/embedded"));
     run_lite_go_tests.step.dependOn(&install_libantfly.step);
     run_lite_go_tests.step.dependOn(&install_capi_header.step);
     const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantfly");
@@ -401,7 +401,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "pytest",
         "-q",
     });
-    run_lite_py_tests.setCwd(b.path("../py/packages/lite"));
+    run_lite_py_tests.setCwd(b.path("../py/packages/embedded"));
     run_lite_py_tests.step.dependOn(&install_libantfly.step);
     const lite_py_test_step = b.step("lite-py-test", "Run Python Antfly Lite binding tests against libantfly");
     lite_py_test_step.dependOn(&run_lite_py_tests.step);
@@ -432,7 +432,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "run",
         "test",
     });
-    run_lite_ts_tests.setCwd(b.path("../ts/packages/lite"));
+    run_lite_ts_tests.setCwd(b.path("../ts/packages/embedded"));
     run_lite_ts_tests.step.dependOn(&install_libantfly.step);
     const lite_ts_test_step = b.step("lite-ts-test", "Run TypeScript Antfly Lite binding tests against libantfly (needs pnpm install in ts/)");
     lite_ts_test_step.dependOn(&run_lite_ts_tests.step);

@@ -56,21 +56,21 @@ class LitePackagingTests(unittest.TestCase):
             root = Path(raw)
             archives = root / "archives"
             archives.mkdir()
-            source = ROOT / "py/packages/lite"
-            shutil.copytree(source / "src", root / "py/packages/lite/src")
-            (root / "py/packages/lite/pyproject.toml").write_bytes(
+            source = ROOT / "py/packages/embedded"
+            shutil.copytree(source / "src", root / "py/packages/embedded/src")
+            (root / "py/packages/embedded/pyproject.toml").write_bytes(
                 (source / "pyproject.toml").read_bytes()
             )
             (root / "LICENSES").mkdir()
             apache = (ROOT / "LICENSES/Apache-2.0.txt").read_bytes()
             (root / "LICENSES/Apache-2.0.txt").write_bytes(apache)
             shutil.copytree(
-                ROOT / "ts/packages/lite",
-                root / "ts/packages/lite",
+                ROOT / "ts/packages/embedded",
+                root / "ts/packages/embedded",
                 ignore=shutil.ignore_patterns("node_modules", "dist"),
             )
             for platform in package.PACKAGE_PLATFORMS:
-                suffix = platform.npm_package_dir.replace("cli-", "lite-")
+                suffix = platform.npm_package_dir.replace("cli-", "embedded-")
                 shutil.copytree(
                     ROOT / "ts/packages" / suffix, root / "ts/packages" / suffix
                 )
@@ -115,7 +115,7 @@ class LitePackagingTests(unittest.TestCase):
                 self.assertEqual(0, package.main())
 
             for platform in package.PACKAGE_PLATFORMS:
-                suffix = platform.npm_package_dir.replace("cli-", "lite-")
+                suffix = platform.npm_package_dir.replace("cli-", "embedded-")
                 npm = root / "ts/packages" / suffix
                 self.assertEqual(
                     "1.2.3", json.loads((npm / "package.json").read_text())["version"]
@@ -128,20 +128,20 @@ class LitePackagingTests(unittest.TestCase):
                 wheel = (
                     root
                     / "out/python"
-                    / f"antfly_lite-1.2.3-py3-none-{platform.wheel_platform}.whl"
+                    / f"antfly_embedded-1.2.3-py3-none-{platform.wheel_platform}.whl"
                 )
                 with zipfile.ZipFile(wheel) as archive:
                     names = set(archive.namelist())
-                    self.assertIn("antfly_lite/_lib/antfly-inference", names)
+                    self.assertIn("antfly_embedded/_lib/antfly-inference", names)
                     self.assertIn(
-                        "antfly_lite/_lib/" + package.lite_library_name(platform), names
+                        "antfly_embedded/_lib/" + package.lite_library_name(platform), names
                     )
-                    self.assertIn("antfly_lite/_bin/antfly-lite", names)
+                    self.assertIn("antfly_embedded/_bin/antfly-lite", names)
                     self.assertIn(
-                        "antfly_lite-1.2.3.dist-info/LICENSES/third-party/example.txt",
+                        "antfly_embedded-1.2.3.dist-info/LICENSES/third-party/example.txt",
                         names,
                     )
-                    metadata = archive.read("antfly_lite-1.2.3.dist-info/METADATA")
+                    metadata = archive.read("antfly_embedded-1.2.3.dist-info/METADATA")
                     self.assertIn(b"License-Expression: Apache-2.0", metadata)
 
             if sys.version_info >= (3, 11):
@@ -149,7 +149,7 @@ class LitePackagingTests(unittest.TestCase):
                 wheel = (
                     root
                     / "out/python"
-                    / "antfly_lite-1.2.3-py3-none-manylinux_2_28_x86_64.whl"
+                    / "antfly_embedded-1.2.3-py3-none-manylinux_2_28_x86_64.whl"
                 )
                 subprocess.run(
                     [
@@ -174,7 +174,7 @@ class LitePackagingTests(unittest.TestCase):
                     "_bin/antfly-inference",
                     "_lib/antfly-inference",
                 ):
-                    installed = install_dir / "antfly_lite" / location
+                    installed = install_dir / "antfly_embedded" / location
                     self.assertTrue(
                         os.access(installed, os.X_OK),
                         f"{installed}: {oct(installed.stat().st_mode & 0o777)}",
@@ -183,10 +183,10 @@ class LitePackagingTests(unittest.TestCase):
             npm_dir = root / "out/npm"
             npm_dir.mkdir()
             for name in (
-                "lite-darwin-arm64",
-                "lite-linux-arm64",
-                "lite-linux-x64",
-                "lite",
+                "embedded-darwin-arm64",
+                "embedded-linux-arm64",
+                "embedded-linux-x64",
+                "embedded",
             ):
                 subprocess.run(
                     [

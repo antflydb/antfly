@@ -23,8 +23,8 @@ GOWORK=off go run . --reset --db demo.aflite --backup demo.afb
 ```
 
 `--reset` removes the demo files before running so the example exercises
-`lite.Create`. Without `--reset`, the example reopens `demo.aflite` with
-`lite.Open`.
+`embedded.Create`. Without `--reset`, the example reopens `demo.aflite` with
+`embedded.Open`.
 
 The generated files have different meanings:
 
