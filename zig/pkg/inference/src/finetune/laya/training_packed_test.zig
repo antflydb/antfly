@@ -83,7 +83,7 @@ test "laya packed training graph matches packed serving logits, alone and in a p
     var words = synthetic.WordTokenizer{};
     const tok = words.tokenizer();
     // `fuse_layers` 3 fuses the head and the top encoder layer.
-    for ([_][]const u8{ "{\"mode\":\"question\"}", "{\"mode\":\"candidate\"}", "{\"mode\":\"question\",\"fuse_layers\":3}" }) |packing| for ([_]bool{ false, true }) |use_fused_attention| {
+    for ([_][]const u8{ "{\"mode\":\"question\"}", "{\"mode\":\"candidate\"}", "{\"mode\":\"question\",\"fuse_layers\":3}", "{\"mode\":\"question\",\"question_first\":true}", "{\"mode\":\"candidate\",\"question_first\":true}" }) |packing| for ([_]bool{ false, true }) |use_fused_attention| {
         try synthetic.writeModel(a, std.testing.io, dir, packing, 128, 719);
         const config = try modern.parseConfig(scratch, try files.readFileFromDir(scratch, dir, "config.json"));
         const laya = config.laya.?;

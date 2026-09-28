@@ -403,6 +403,13 @@ pub fn build(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, text: []co
     return rows.toOwnedSlice(a);
 }
 
+/// First logical position of a `question_first` trunk of `trunk` tokens:
+/// after the largest question branch (`head_max_len` plus its three special
+/// tokens) when that fits `max_len`, otherwise as far right as fits.
+pub fn trunkOffset(cfg: model.Config, trunk: usize) usize {
+    return @min(cfg.head_max_len + 3, cfg.max_len -| trunk);
+}
+
 fn emit(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, state: []const i32, branches: []const Branch, total: usize, style: BranchStyle) !Row {
     const special = tok.specialTokens();
     var width: usize = 2;
@@ -426,10 +433,15 @@ fn emit(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, state: []const 
     const question_index = try scratch.alloc(usize, branches.len);
     @memset(markers, -1);
     parents[0] = -1;
+    // `packing.question_first`: branches take positions from 0, as questions
+    // do in the unpacked layout, and the trunk sits after the question budget
+    // (`trunkOffset`), which depends only on the state's length.
+    const trunk_start: i64 = if (cfg.packing.question_first) @intCast(trunkOffset(cfg, state.len + 2)) else 0;
+    w.position = trunk_start;
     w.put(special.cls_id, 0, trunk_kind);
     for (state) |id| w.put(id, 0, trunk_kind);
     w.put(special.sep_id, 0, trunk_kind);
-    const trunk_end: i64 = @intCast(w.at);
+    const trunk_end: i64 = if (cfg.packing.question_first) 0 else @intCast(w.at);
     var segment: usize = 1;
     for (branches, 0..) |branch, qi| {
         const t = branch.tokens;

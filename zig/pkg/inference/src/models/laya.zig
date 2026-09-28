@@ -74,6 +74,11 @@ pub const Packing = struct {
     /// so `fuse_layers` K gives questions K-1 layers of question-aware state
     /// and must be at least 2.
     fuse_layers: u32 = 0,
+    /// Question-first positions (LAYA.md): every branch starts at logical
+    /// position 0, as the question does in the unpacked layout, and the trunk
+    /// starts after the question budget (`laya_tree.trunkOffset`). Only
+    /// positions change; visibility does not.
+    question_first: bool = false,
 
     pub fn enabled(self: Packing) bool {
         return self.mode != .none;
@@ -176,13 +181,13 @@ fn parsePacking(value: std.json.Value, max_len: usize) !Packing {
     if (value != .object) return error.InvalidLayaConfig;
     var out = Packing{};
     for (value.object.keys()) |key| {
-        if (!std.mem.eql(u8, key, "mode") and !std.mem.eql(u8, key, "max_packed_len") and !std.mem.eql(u8, key, "two_stage") and !std.mem.eql(u8, key, "trunk_sees") and !std.mem.eql(u8, key, "fuse_layers")) return error.InvalidLayaConfig;
+        if (!std.mem.eql(u8, key, "mode") and !std.mem.eql(u8, key, "max_packed_len") and !std.mem.eql(u8, key, "two_stage") and !std.mem.eql(u8, key, "trunk_sees") and !std.mem.eql(u8, key, "fuse_layers") and !std.mem.eql(u8, key, "question_first")) return error.InvalidLayaConfig;
     }
     const mode = value.object.get("mode") orelse return error.InvalidLayaConfig;
     if (mode != .string) return error.InvalidLayaConfig;
     out.mode = std.meta.stringToEnum(PackingMode, mode.string) orelse return error.InvalidLayaConfig;
     if (out.mode == .none) {
-        if (value.object.get("two_stage") != null or value.object.get("trunk_sees") != null or value.object.get("fuse_layers") != null) return error.InvalidLayaConfig;
+        if (value.object.get("two_stage") != null or value.object.get("trunk_sees") != null or value.object.get("fuse_layers") != null or value.object.get("question_first") != null) return error.InvalidLayaConfig;
         return out;
     }
     out.max_packed_len = @min(4 * max_len, max_packed_len_limit);
@@ -207,6 +212,10 @@ fn parsePacking(value: std.json.Value, max_len: usize) !Packing {
         // nothing left to fuse.
         if (v != .integer or v.integer < 2 or v.integer > max_fuse_layers or out.mode != .question or out.trunk_sees_questions) return error.InvalidLayaConfig;
         out.fuse_layers = @intCast(v.integer);
+    }
+    if (value.object.get("question_first")) |v| {
+        if (v != .bool) return error.InvalidLayaConfig;
+        out.question_first = v.bool;
     }
     return out;
 }
@@ -255,6 +264,9 @@ test "laya packing config defaults, bounds, and rejects unknown fields" {
         .{ .json = "{\"packing\":{\"mode\":\"candidate\",\"fuse_layers\":2}}", .mode = null },
         .{ .json = "{\"packing\":{\"mode\":\"none\",\"fuse_layers\":2}}", .mode = null },
         .{ .json = "{\"packing\":{\"mode\":\"question\",\"fuse_layers\":2,\"trunk_sees\":\"questions\"}}", .mode = null },
+        .{ .json = "{\"packing\":{\"mode\":\"question\",\"question_first\":true}}", .mode = .question, .len = 2048 },
+        .{ .json = "{\"packing\":{\"mode\":\"question\",\"question_first\":1}}", .mode = null },
+        .{ .json = "{\"packing\":{\"mode\":\"none\",\"question_first\":true}}", .mode = null },
     };
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, a, case.json, .{});

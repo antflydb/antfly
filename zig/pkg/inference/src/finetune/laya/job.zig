@@ -71,6 +71,9 @@ pub const Config = struct {
     /// question over its own copy of the state. Requires `packing:
     /// .question`; 0 disables, otherwise at least 2 (see `model.Packing`).
     fuse_layers: u32 = 0,
+    /// Question-first positions (`packing.question_first`). Requires
+    /// `packing`.
+    question_first: bool = false,
     /// Two-stage choice (roadmap 2b): only valid with `packing: .candidate`.
     /// Set to also train, alongside the ordinary candidate rows, one joint
     /// (question-style) row per eligible `choice` record over a sampled
@@ -137,6 +140,7 @@ pub fn validate(c: Config) !void {
     if (c.stop_after_microbatches == 0) return error.InvalidLayaJob;
     if (c.max_packed_len != null and (c.packing == null or c.packing.? == .none)) return error.InvalidLayaJob;
     if (c.trunk_sees_questions and (c.packing == null or c.packing.? == .none)) return error.InvalidLayaJob;
+    if (c.question_first and (c.packing orelse .none) == .none) return error.InvalidLayaJob;
     if (c.fuse_layers > 0 and ((c.packing orelse .none) != .question or c.trunk_sees_questions or c.fuse_layers < 2 or c.fuse_layers > model.max_fuse_layers)) return error.InvalidLayaJob;
     _ = try resolveLora(c.lora);
     if (c.two_stage_top_k) |k| {
@@ -152,7 +156,7 @@ fn packing(c: Config, source: model.Config) !model.Packing {
     const length: usize = c.max_packed_len orelse @min(4 * source.max_len, model.max_packed_len_limit);
     if (length < source.max_len or length > model.max_packed_len_limit) return error.InvalidLayaJob;
     const two_stage: model.TwoStage = if (c.two_stage_top_k) |k| .{ .top_k = k, .mass_cutoff = c.two_stage_mass_cutoff orelse 0 } else .{};
-    return .{ .mode = mode, .max_packed_len = length, .two_stage = two_stage, .trunk_sees_questions = c.trunk_sees_questions, .fuse_layers = c.fuse_layers };
+    return .{ .mode = mode, .max_packed_len = length, .two_stage = two_stage, .trunk_sees_questions = c.trunk_sees_questions, .fuse_layers = c.fuse_layers, .question_first = c.question_first };
 }
 
 fn path(a: std.mem.Allocator, dir: []const u8, name: []const u8) ![]const u8 {
@@ -311,6 +315,7 @@ fn packingConfigJson(a: std.mem.Allocator, layout: model.Packing) !std.json.Valu
     }
     if (layout.trunk_sees_questions) try object.put(a, "trunk_sees", .{ .string = "questions" });
     if (layout.fuse_layers > 0) try object.put(a, "fuse_layers", .{ .integer = layout.fuse_layers });
+    if (layout.question_first) try object.put(a, "question_first", .{ .bool = true });
     return .{ .object = object };
 }
 

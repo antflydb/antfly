@@ -326,6 +326,54 @@ test "laya packed questions are isolated and share one exact trunk encoding" {
     }
 }
 
+// Question-first positions (`packing.question_first`, LAYA.md): branches
+// start at position 0 and the trunk after the question budget; questions stay
+// isolated, and a cache-enabled forward (which cannot reuse this trunk yet)
+// matches the uncached one exactly.
+test "laya question-first positions put every question before the state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    for ([_][]const u8{ "{\"mode\":\"question\",\"question_first\":true}", "{\"mode\":\"candidate\",\"question_first\":true}" }) |packing| {
+        var fixture = try Fixture.init(std.testing.allocator, packing);
+        defer fixture.deinit(std.testing.allocator);
+        const all = (try tree.build(a, tok, fixture.cfg, state_text, &questions, null))[0];
+        var trunk: usize = 0;
+        while (all.segments[trunk] == 0) trunk += 1;
+        const offset: i64 = @intCast(tree.trunkOffset(fixture.cfg, trunk));
+        for (0..trunk) |i| try std.testing.expectEqual(offset + @as(i64, @intCast(i)), all.positions[i]);
+        for (all.anchors) |anchor| try std.testing.expectEqual(@as(i64, 0), all.positions[@intCast(anchor)]);
+        for (all.positions[trunk..]) |p| try std.testing.expect(p < offset);
+        const together = try runRow(a, &fixture, all);
+        var worst: f32 = 0;
+        for (questions, 0..) |q, qi| {
+            const single = try runRow(a, &fixture, (try tree.build(a, tok, fixture.cfg, state_text, &.{q}, null))[0]);
+            worst = @max(worst, try maxError(single[0][0..q.labels.len], together[0][qi * all.width ..][0..q.labels.len]));
+        }
+        try std.testing.expect(worst < 1e-5);
+        var cache = @import("../architectures/laya_trunk_cache.zig").Cache.init(std.testing.allocator, 64 << 20);
+        cache.min_tokens = 1;
+        defer cache.deinit();
+        const cb = try factory.getComputeBackend(fixture.session, a);
+        defer cb.deinit();
+        const cached = try packed_arch.forwardRow(&cb, a, fixture.encoder, fixture.cfg, all, &cache);
+        defer {
+            for (cached) |*output| output.deinit();
+            a.free(cached);
+        }
+        const cache_error = try maxError(together[0], cached[0].asFloat32());
+        std.debug.print("Laya question-first {s}: isolation max error={d}, cached vs uncached={d}\n", .{ packing, worst, cache_error });
+        try std.testing.expect(cache_error < 1e-6);
+        // Moving the questions ahead of the state changes the model's view.
+        var plain_cfg = fixture.cfg;
+        plain_cfg.packing.question_first = false;
+        const plain = try runRow(a, &fixture, (try tree.build(a, tok, plain_cfg, state_text, &questions, null))[0]);
+        try std.testing.expect(try maxError(plain[0], together[0]) > 1e-4);
+    }
+}
+
 // Per-question upper layers (`packing.fuse_layers`, LAYA.md): one tree per
 // question, so questions stay isolated; fusing the whole stack is exactly the
 // question-aware trunk on each question alone; fusing changes the model.
