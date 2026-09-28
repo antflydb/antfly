@@ -2146,7 +2146,7 @@ fn createGpuHostedSessionWithTaskOverride(
     var eager_dense = false;
     const resident_weight_bytes_override: usize = 0;
     const budget_policy = if (a4b_inference) |config|
-        a4bGpuHostedBudgetPolicy(config)
+        a4bGpuHostedBudgetPolicy(config, 0)
     else
         gpuHostedBudgetPolicy(backend_type, model_weight_bytes, mf, arch_config, quant_mode);
     // Boundary artifacts have an exact per-tensor precision contract. Keep
@@ -5199,15 +5199,19 @@ const GpuHostedBudgetPolicy = struct {
     prefer_f32_dense_tensors: bool,
 };
 
-fn a4bGpuHostedBudgetPolicy(config: backend_contracts.A4bInferenceConfig) GpuHostedBudgetPolicy {
+fn a4bGpuHostedBudgetPolicy(
+    config: backend_contracts.A4bInferenceConfig,
+    cuda_peak_host_bytes: usize,
+) GpuHostedBudgetPolicy {
     const budget: usize = @intCast(config.memory_budget_bytes);
     const kv: usize = @intCast(config.kv_budget_bytes);
     const scratch: usize = @intCast(config.safety_reserve_bytes);
     const weights = budget -| kv -| scratch;
     return .{
         .budget_floor = .{
+            .host_limit_bytes = cuda_peak_host_bytes,
             .backend_limit_bytes = budget,
-            .combined_limit_bytes = budget,
+            .combined_limit_bytes = budget +| cuda_peak_host_bytes,
             .kv_limit_bytes = kv,
             .scratch_limit_bytes = scratch,
         },
@@ -5370,7 +5374,7 @@ pub fn widenBudgetLimitsForModelPath(
     // heuristics so a cold request can reserve the model's real CUDA budget.
     if (backend_type == .cuda) {
         if (try resolveCudaA4bInferenceConfigForModelListing(allocator, model_path, mf, null)) |config| {
-            return widenLimits(limits, a4bGpuHostedBudgetPolicy(config).budget_floor);
+            return widenLimits(limits, a4bGpuHostedBudgetPolicy(config, @intCast(model_weight_bytes)).budget_floor);
         }
     }
 
@@ -9813,6 +9817,19 @@ test "large multimodal gemma gpu_hosted budget floor widens dense limits" {
     try std.testing.expect(floor.host_limit_bytes >= 2 * 1024 * 1024 * 1024);
     try std.testing.expect(floor.backend_limit_bytes >= 6 * 1024 * 1024 * 1024);
     try std.testing.expect(floor.combined_limit_bytes >= floor.backend_limit_bytes);
+}
+
+test "CUDA A4B hosted admission includes temporary encoded artifact bytes" {
+    const config = try backend_contracts.buildCudaA4bInferenceConfig(
+        null,
+        backend_contracts.qualified_a4b_geometries[0],
+    );
+    const encoded_artifact_bytes = 4 * 1024 * 1024 * 1024;
+    const floor = a4bGpuHostedBudgetPolicy(config, encoded_artifact_bytes).budget_floor;
+    const backend_budget = @as(usize, @intCast(config.memory_budget_bytes));
+    try std.testing.expectEqual(encoded_artifact_bytes, floor.host_limit_bytes);
+    try std.testing.expectEqual(backend_budget, floor.backend_limit_bytes);
+    try std.testing.expectEqual(backend_budget + encoded_artifact_bytes, floor.combined_limit_bytes);
 }
 
 test "Qwen3-VL reranker BF16 budget covers mapped and backend weight domains" {
