@@ -29,6 +29,10 @@ pub const Lane = struct {
         group: std.Io.Group = .init,
         job: background_runtime.Job,
         finished: bool = false,
+        // A canceller/awaiter owns the group until it has returned from the
+        // VoprIo yield. A different fiber must not reap its completed child
+        // and free the group while that owner is still parked.
+        finalizing: bool = false,
 
         fn run(self: *Entry) std.Io.Cancelable!void {
             defer {
@@ -63,6 +67,8 @@ pub const Lane = struct {
     pub fn deinit(self: *Lane) void {
         while (self.entries.items.len != 0) {
             const entry = self.entries.items[self.entries.items.len - 1];
+            std.debug.assert(!entry.finalizing);
+            entry.finalizing = true;
             entry.group.cancel(self.io);
             self.removeAndDestroyEntry(entry);
         }
@@ -118,6 +124,7 @@ pub const Lane = struct {
     fn drainOwner(ptr: *anyopaque, owner_id: u64) void {
         const self: *Lane = @ptrCast(@alignCast(ptr));
         while (self.findOwnerEntry(owner_id)) |entry| {
+            entry.finalizing = true;
             entry.group.await(self.io) catch |err| switch (err) {
                 error.Canceled => {},
             };
@@ -132,6 +139,7 @@ pub const Lane = struct {
             std.debug.panic("failed to close VOPR durable-job owner: {s}", .{@errorName(err)});
         };
         while (self.findOwnerEntry(owner_id)) |entry| {
+            entry.finalizing = true;
             entry.group.cancel(self.io);
             self.removeAndDestroyEntry(entry);
         }
@@ -162,7 +170,7 @@ pub const Lane = struct {
         var index: usize = 0;
         while (index < self.entries.items.len and reaped < max_jobs) {
             const entry = self.entries.items[index];
-            if (!entry.finished) {
+            if (!entry.finished or entry.finalizing) {
                 index += 1;
                 continue;
             }
@@ -177,7 +185,7 @@ pub const Lane = struct {
 
     fn findOwnerEntry(self: *Lane, owner_id: u64) ?*Entry {
         for (self.entries.items) |entry|
-            if (entry.job.owner_id == owner_id) return entry;
+            if (entry.job.owner_id == owner_id and !entry.finalizing) return entry;
         return null;
     }
 
@@ -294,6 +302,87 @@ test "VOPR durable job owner close cancels queued work exactly once" {
     }));
     // A failed submission leaves ownership with the caller.
     try std.testing.expectEqual(@as(usize, 1), context.deinits);
+}
+
+test "VOPR durable job poll cannot reap a group while its canceller is parked" {
+    const Context = struct {
+        io: std.Io,
+        lane: *Lane,
+        entered: bool = false,
+        cleaned: bool = false,
+        closing: bool = false,
+        closed: bool = false,
+
+        fn run(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered = true;
+            const forever: std.Io.Timeout = .none;
+            try forever.sleep(self.io);
+        }
+
+        fn deinitJob(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.cleaned = true;
+        }
+
+        fn close(self: *@This()) void {
+            self.closing = true;
+            self.lane.lane().closeOwner(7);
+            self.closed = true;
+        }
+    };
+
+    var runtime = try vopr.vopr_io.VoprIo.init(.{ .task_allocator = std.testing.allocator });
+    defer runtime.deinit();
+    var adapter = Lane.init(std.testing.allocator, runtime.io());
+    defer adapter.deinit();
+    var context = Context{ .io = runtime.io(), .lane = &adapter };
+    try adapter.lane().submit(.{
+        .owner_id = 7,
+        .class = .cleanup,
+        .ptr = &context,
+        .run = Context.run,
+        .deinit = Context.deinitJob,
+    });
+
+    var transitions: vopr.transition.List = .{};
+    defer transitions.deinit(std.testing.allocator);
+    var sink: vopr.event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    const scheduler = runtime.scheduler();
+    try scheduler.enumerateReady(&transitions, std.testing.allocator);
+    try transitions.canonicalize();
+    try std.testing.expectEqual(@as(usize, 1), transitions.items.items.len);
+    try scheduler.executeReady(transitions.items.items[0].id, &sink, std.testing.allocator);
+    try std.testing.expect(context.entered);
+    try std.testing.expect(!context.cleaned);
+
+    var closer: std.Io.Group = .init;
+    closer.async(runtime.io(), Context.close, .{&context});
+    for (0..32) |_| {
+        if (context.closing and context.cleaned) break;
+        transitions.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&transitions, std.testing.allocator);
+        try transitions.canonicalize();
+        try std.testing.expect(transitions.items.items.len != 0);
+        try scheduler.executeReady(transitions.items.items[0].id, &sink, std.testing.allocator);
+    } else return error.VoprIoCancellationDidNotDrain;
+
+    try std.testing.expect(!context.closed);
+    try std.testing.expectEqual(@as(usize, 0), try adapter.lane().poll(1));
+    for (0..32) |_| {
+        if (context.closed) break;
+        transitions.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&transitions, std.testing.allocator);
+        try transitions.canonicalize();
+        try std.testing.expect(transitions.items.items.len != 0);
+        try scheduler.executeReady(transitions.items.items[0].id, &sink, std.testing.allocator);
+    } else return error.VoprIoCancellationDidNotDrain;
+
+    try std.testing.expect(context.cleaned);
+    try std.testing.expectEqual(@as(usize, 0), adapter.stats().pending_jobs);
+    closer.cancel(runtime.io());
+    try runtime.ensureNoCapabilityViolation();
 }
 
 test "VOPR durable job owner uses production pause close and reopen protocol" {
