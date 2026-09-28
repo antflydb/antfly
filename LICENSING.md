@@ -41,11 +41,12 @@ to build and host their own services using that engine.
 
 ## Distributions and third-party material
 
-Apache Lite archives must contain the Apache LICENSE, the source license list,
-this licensing map, and relevant third-party notices. Full server archives
-retain the ELv2 LICENSE and also carry the Apache license for their shared engine
-and native library. Language binding licenses cover both binding and Apache
-native engine code, while third-party components retain their original terms.
+Apache Lite archives contain the Apache LICENSE, the source license list,
+and relevant third-party notices. This file is the repository's mixed-license
+map. Full server archives retain the ELv2 LICENSE and also carry the Apache
+license for their shared engine and native library. Language binding licenses
+cover both binding and Apache native engine code, while third-party components
+retain their original terms.
 
 `THIRD_PARTY_NOTICES.md` records separately licensed adaptations and data,
 including the BSD Snowball stemmers, MIT httpx, and OpenLDAP-licensed LMDB
