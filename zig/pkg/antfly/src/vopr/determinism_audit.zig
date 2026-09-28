@@ -106,7 +106,7 @@ const replayable_sources = [_]Source{
         .bytes = region(@embedFile("../raft/transport/http_snapshot.zig"), "    fn nextSnapshotSendSleepMs(", "    fn snapshotRetryDelayMs("),
     },
     .{ .path = "storage/lsm_vopr.zig", .bytes = @embedFile("../storage/lsm_vopr.zig") },
-    .{ .path = "storage/lmdb_vopr.zig", .bytes = @embedFile("../storage/lmdb_vopr.zig") },
+    .{ .path = "lib/lmdb/src/lmdb_vopr.zig", .bytes = @embedFile("../../../../lib/lmdb/src/lmdb_vopr.zig") },
     .{ .path = "storage/hot_standby/vopr.zig", .bytes = @embedFile("../storage/hot_standby/vopr.zig") },
     .{ .path = "storage/wal_vopr.zig", .bytes = @embedFile("../storage/wal_vopr.zig") },
     .{ .path = "storage/persistent_vopr.zig", .bytes = @embedFile("../storage/persistent_vopr.zig") },
