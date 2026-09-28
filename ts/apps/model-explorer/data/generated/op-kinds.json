@@ -240,6 +240,13 @@
    }
   },
   {
+   "name": "average_pool",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig"
+   }
+  },
+  {
    "name": "convert_dtype",
    "group": "primitive",
    "source": {
