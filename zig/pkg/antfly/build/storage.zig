@@ -121,7 +121,13 @@ pub fn makeLmdbModule(
         .optimize = optimize,
     });
     mod.addImport("antfly_source_root", mod);
-    mod.addOptions("build_options", build_options);
+    if (std.mem.startsWith(u8, root_path, "lib/lmdb/")) {
+        // The wrapper and engine must share one options module: Zig rejects
+        // importing the same generated options source as two distinct modules.
+        mod.addImport("build_options", lmdb_engine_mod.import_table.get("build_options").?);
+    } else {
+        mod.addOptions("build_options", build_options);
+    }
     mod.addImport("lmdb_engine", lmdb_engine_mod);
     mod.addImport("storage_sim_fixture", b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage/sim_fixture.zig"),
