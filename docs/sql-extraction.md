@@ -2197,7 +2197,9 @@ following mechanisms are installed behind that gate:
 - Persisted unit encoding now lives in a shared typed payload contract rather
   than the runtime implementation. Ordered unit chunk callbacks decode through
   that contract once, bind document/producer/unit identity, reject provenance
-  overrides of identity/text and conflicting mirrored metadata, and verify the
+  overrides of identity/text, conflicting mirrored metadata, and route
+  contradictions (a local route has no remote owner; a committed remote route
+  has one), and verify the
   current logical unit fingerprint before invoking a provider. Transcript/text
   ranges and document offsets are checked against the unit body. Owned decoded
   slices survive release of the raw input; preparation no longer constructs a

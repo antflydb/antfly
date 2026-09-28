@@ -10,6 +10,15 @@ pub const Route = struct {
     range_id: []const u8,
     route_status: []const u8 = "local_committed",
     owner_group_id: u64 = 0,
+
+    pub fn validate(self: Route) !void {
+        if (self.range_id.len == 0 or self.owner_group_id > std.math.maxInt(i64)) return error.InvalidDocumentExtractionManifest;
+        if (std.mem.eql(u8, self.route_status, "local_committed")) {
+            if (self.owner_group_id != 0) return error.InvalidDocumentExtractionManifest;
+        } else if (std.mem.eql(u8, self.route_status, "remote_committed")) {
+            if (self.owner_group_id == 0) return error.InvalidDocumentExtractionManifest;
+        } else return error.InvalidDocumentExtractionManifest;
+    }
 };
 pub const Identity = struct {
     document: []const u8,
@@ -126,7 +135,7 @@ pub fn decodeAlloc(alloc: Allocator, raw: []const u8, expected: Identity) !Owned
         .route_status = try string(object, "_artifact_route_status"),
         .owner_group_id = try decodeField(u64, owned, object.get("_artifact_owner_group_id") orelse return error.InvalidDocumentExtractionManifest),
     };
-    if (route.range_id.len == 0 or route.route_status.len == 0 or route.owner_group_id > std.math.maxInt(i64)) return error.InvalidDocumentExtractionManifest;
+    try route.validate();
     return .{ .arena = arena, .unit = unit, .fingerprint = fingerprint, .route = route };
 }
 
@@ -173,6 +182,7 @@ fn validateCoordinates(unit: extraction.Unit) !void {
 }
 
 pub fn encodeAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8, unit: extraction.Unit, unit_fingerprint: []const u8, source_url: []const u8, content_type: []const u8, route: Route) ![]u8 {
+    try route.validate();
     const owner_group_id = std.math.cast(i64, route.owner_group_id) orelse return error.InvalidDocumentExtractionManifest;
     const confidence = unit.ocr_confidence orelse unit.transcript_confidence;
     return std.json.Stringify.valueAlloc(alloc, .{
@@ -308,7 +318,7 @@ test "ordered artifact inventory typed unit payload owns fields and authenticate
     const identity: Identity = .{ .document = "doc", .producer = "units", .unit = unit.unit_id };
     const fingerprint = try fingerprints.fingerprintAlloc(alloc, unit);
     defer alloc.free(fingerprint);
-    const raw = try encodeAlloc(alloc, identity.document, identity.producer, unit, fingerprint, "input", "text/plain", .{ .range_id = "range:0", .owner_group_id = 9 });
+    const raw = try encodeAlloc(alloc, identity.document, identity.producer, unit, fingerprint, "input", "text/plain", .{ .range_id = "range:0", .route_status = "remote_committed", .owner_group_id = 9 });
     defer alloc.free(raw);
     var parsed = try decodeAlloc(alloc, raw, identity);
     defer parsed.deinit();
@@ -342,7 +352,7 @@ test "ordered artifact inventory typed unit payload owns fields and authenticate
     wrong = identity;
     wrong.fingerprint = "other";
     try std.testing.expectError(error.InvalidDocumentExtractionManifest, decodeAlloc(alloc, raw, wrong));
-    for (0..9) |variant| {
+    for (0..12) |variant| {
         var json = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
         defer json.deinit();
         const owned = json.arena.allocator();
@@ -356,12 +366,17 @@ test "ordered artifact inventory typed unit payload owns fields and authenticate
             6 => try json.value.object.put(owned, "_artifact_unit_fingerprint", .{ .string = "unversioned" }),
             7 => try json.value.object.getPtr("provenance").?.object.getPtr("format_provenance").?.object.put(owned, "page_number", .{ .integer = 8 }),
             8 => try json.value.object.put(owned, "confidence", .{ .float = 0.1 }),
+            9 => try json.value.object.put(owned, "_artifact_owner_group_id", .{ .integer = 0 }),
+            10 => try json.value.object.put(owned, "_artifact_route_status", .{ .string = "local_committed" }),
+            11 => try json.value.object.put(owned, "_artifact_route_status", .{ .string = "transferring" }),
             else => unreachable,
         }
         const invalid = try std.json.Stringify.valueAlloc(alloc, json.value, .{});
         defer alloc.free(invalid);
         try std.testing.expectError(error.InvalidDocumentExtractionManifest, decodeAlloc(alloc, invalid, identity));
     }
+    try std.testing.expectError(error.InvalidDocumentExtractionManifest, encodeAlloc(alloc, identity.document, identity.producer, unit, fingerprint, "input", "text/plain", .{ .range_id = "range:0", .owner_group_id = 9 }));
+    try std.testing.expectError(error.InvalidDocumentExtractionManifest, encodeAlloc(alloc, identity.document, identity.producer, unit, fingerprint, "input", "text/plain", .{ .range_id = "range:0", .route_status = "remote_committed" }));
 }
 
 test "ordered artifact inventory typed unit payload validates offsets before accepting a matching fingerprint" {
