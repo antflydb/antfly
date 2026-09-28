@@ -1914,6 +1914,18 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             break :blk (try unit_jobs.prepareDocumentTurn(&reader, db.root_incarnation, "doc")).?.expected_revision;
         };
         {
+            const original = runtime.artifact_publication_dispatcher;
+            defer runtime.artifact_publication_dispatcher = original;
+            runtime.artifact_publication_dispatcher = null;
+            try std.testing.expectError(error.ArtifactPublicationPending, @import("enrichment/enrichment_runtime.zig").servicePendingArtifactUnitJobs(runtime, "doc", .{}));
+        }
+        {
+            const original = runtime.artifact_unit_turn_commit;
+            defer runtime.artifact_unit_turn_commit = original;
+            runtime.artifact_unit_turn_commit = null;
+            try std.testing.expectError(error.ArtifactPublicationPending, @import("enrichment/enrichment_runtime.zig").servicePendingArtifactUnitJobs(runtime, "doc", .{}));
+        }
+        {
             const original = runtime.artifact_unit_turn_commit;
             defer runtime.artifact_unit_turn_commit = original;
             const Refuse = struct {

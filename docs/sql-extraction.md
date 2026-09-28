@@ -2187,8 +2187,10 @@ following mechanisms are installed behind that gate:
   a stable DB-owned context commits both fair cursors under the ordinary HA,
   snapshot, and apply gates. The replay remains pending while the document has
   any queued jobs, including on a wrap turn, and receiver-verified maintenance
-  retires them. A restart fixture checks the document-only wake and refusal of
-  the durable turn commit without cursor advancement or job loss. This wires
+  retires them. Missing dispatch or durable-turn infrastructure also fails
+  closed while an outbox exists. A restart fixture checks the document-only
+  wake, unavailable hooks, and refusal of the durable turn commit without
+  cursor advancement or job loss. This wires
   local callbacks but does not complete remote child placement, large staged
   outputs, all-required stream closure, or the distributed activation fault
   matrix.

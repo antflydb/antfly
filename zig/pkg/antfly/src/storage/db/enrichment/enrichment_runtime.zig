@@ -11155,8 +11155,7 @@ test "prepared document cache prepares unrelated PDF keys concurrently" {
 /// both the physical read and compiled plan before any provider invocation.
 pub fn servicePendingArtifactUnitJobs(runtime: *EnrichmentRuntime, document: []const u8, guard: ForegroundCatchUpGuard) !void {
     const store = runtime.artifact_store orelse return;
-    const commit = runtime.artifact_unit_turn_commit orelse return;
-    if (runtime.artifact_publication_dispatcher == null or runtime.config.root_incarnation == 0) return;
+    if (runtime.config.root_incarnation == 0) return;
     const unit_jobs = @import("../artifact_unit_jobs.zig");
     var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
         resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
@@ -11174,6 +11173,9 @@ pub fn servicePendingArtifactUnitJobs(runtime: *EnrichmentRuntime, document: []c
         defer read.abort();
         document_turn = try unit_jobs.prepareDocumentTurn(&read, runtime.config.root_incarnation, document);
         const selected = (document_turn orelse return).selected;
+        // Once a durable outbox exists, missing execution infrastructure must
+        // never let the ordinary generated replay advance past its wake.
+        if (runtime.artifact_publication_dispatcher == null or runtime.artifact_unit_turn_commit == null) return error.ArtifactPublicationPending;
         if (selected) |scope| {
             work = unit_jobs.prepareTurn(work_alloc, &read, runtime.config.root_incarnation, scope, .{ .visits = 4 }) catch |err| {
                 if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
@@ -11194,6 +11196,7 @@ pub fn servicePendingArtifactUnitJobs(runtime: *EnrichmentRuntime, document: []c
             }
         }
     }
+    const commit = runtime.artifact_unit_turn_commit.?;
     var first_error: ?anyerror = null;
     if (work) |*turn| {
         for (turn.page.items) |item| {
