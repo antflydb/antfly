@@ -5362,6 +5362,18 @@ pub fn widenBudgetLimitsForModelPath(
     defer mf.deinit();
 
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
+
+    // Qualified Gemma 4 E4B is a CUDA A4B MoE model. Its request-time load
+    // admission is governed by the same fixed 16 GiB envelope used by session
+    // construction, but the generic GPU-hosted policy intentionally excludes
+    // MoE models. Resolve that policy before falling back to architecture-size
+    // heuristics so a cold request can reserve the model's real CUDA budget.
+    if (backend_type == .cuda) {
+        if (try resolveCudaA4bInferenceConfigForModelListing(allocator, model_path, mf, null)) |config| {
+            return widenLimits(limits, a4bGpuHostedBudgetPolicy(config).budget_floor);
+        }
+    }
+
     const arch_config = try detectArchitecture(allocator, model_path, mf);
     const policy = gpuHostedBudgetPolicy(backend_type, model_weight_bytes, mf, arch_config, quant_mode);
 
