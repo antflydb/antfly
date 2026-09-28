@@ -22135,7 +22135,10 @@ pub fn runFromIterator(
         // This seeds only the local auth store and must remain auth-gated.
         // Raft-backed metadata writes during metadata bootstrap can block
         // clustered startup before raft listeners are running.
-        try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
+        antfly.usermgr.ensureDefaultAdminUser(&user_manager.?, init.environ_map.get("ANTFLY_BOOTSTRAP_ADMIN_PASSWORD")) catch |err| {
+            std.log.err("auth bootstrap failed: set ANTFLY_BOOTSTRAP_ADMIN_PASSWORD to a unique password of 12 to 72 bytes for a new admin or to replace legacy admin:admin credentials", .{});
+            return err;
+        };
     }
     defer if (user_manager) |*manager| manager.deinit();
     defer if (auth_runtime) |*runtime| runtime.deinit();
@@ -22147,6 +22150,7 @@ pub fn runFromIterator(
     );
     defer if (trusted_principal_issuer) |value| alloc.free(value);
 
+    antfly.common.listener_security.warnIfUnauthenticated("data", cli.bind_host orelse "127.0.0.1", cli.bind_port orelse 0, effective_auth_enabled);
     var data_server = try DataServer.initFromMetadataApiUrls(alloc, .{
         .bind_host = cli.bind_host orelse "127.0.0.1",
         .bind_port = cli.bind_port orelse 0,

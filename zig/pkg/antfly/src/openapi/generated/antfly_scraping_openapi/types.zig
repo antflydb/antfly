@@ -3,7 +3,7 @@
 
 const std = @import("std");
 
-/// Low-level content download policy. In the generic scraper, omitted `allowed_hosts` and `allowed_paths` fields do not restrict those sources; explicit empty lists deny them. Consumers may merge this object over a stricter baseline before downloading. Antfly inference does so: omitted or empty inference policies, and omitted inference allowlists, deny HTTP(S), file, and S3 content until explicit allowlists are configured. Do not assume omission has identical policy semantics across consumers.
+/// Low-level content download policy. File downloads always require an explicit nonempty `allowed_paths` list. In the generic scraper, omitted `allowed_hosts` for HTTP(S) and `allowed_paths` for S3 do not restrict those sources; explicit empty lists deny them. Consumers may merge this object over a stricter baseline before downloading. Antfly inference does so: omitted or empty inference policies, and omitted inference allowlists, deny HTTP(S), file, and S3 content until explicit allowlists are configured. Do not assume omission has identical policy semantics across consumers.
 pub const ContentSecurityConfig = struct {
     /// Whitelist for HTTP(S) downloads. With block_private_ips enabled (the default), IP literals and every address resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address. Set block_private_ips to false only to opt into private or special destinations. The generic scraper treats omission as unrestricted subject to that policy and an explicit empty list as deny-all; Antfly inference requires an explicit allowlist.
     allowed_hosts: ?[]const []const u8 = null,
@@ -17,7 +17,7 @@ pub const ContentSecurityConfig = struct {
     download_timeout_seconds: ?i64 = null,
     /// Maximum source-image width or height enforced for accepted inference image inputs, including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Images are rejected rather than resized. Batch generation rejects multimodal content before fetch; non-inference scraping consumers do not enforce this setting.
     max_image_dimension: ?i64 = null,
-    /// Whitelist of allowed path prefixes for file:// and s3:// URLs. The generic scraper treats omission as unrestricted and an explicit empty list as deny-all. Consumers may impose stricter defaults; Antfly inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
+    /// Whitelist of allowed path prefixes for file:// and s3:// URLs. File downloads require an explicit nonempty path allowlist; omission and an empty list deny local file access. For S3 the generic scraper treats omission as unrestricted and an empty list as deny-all; Antfly inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
     allowed_paths: ?[]const []const u8 = null,
     /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
     user_agent: ?[]const u8 = null,

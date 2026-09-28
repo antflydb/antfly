@@ -63,6 +63,7 @@ pytest_plugins = ("e2e_scheduler",)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
 E2E_BACKUP_CONNECTION = "e2e-backups"
+AUTH_BOOTSTRAP_PASSWORD = "e2e-bootstrap-password"
 ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
 INFERENCE_PUBLIC_API_ROOT = "/ai/v1"
@@ -1152,6 +1153,14 @@ class StatefulAntflyServer:
             (self.port, self.data_raft_port),
             lambda: subprocess.Popen(
                 data_command,
+                env=(
+                    {
+                        **os.environ,
+                        "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+                    }
+                    if self.auth_enabled
+                    else None
+                ),
                 stdout=self.data_log_file,
                 stderr=subprocess.STDOUT,
                 cwd=self.root,

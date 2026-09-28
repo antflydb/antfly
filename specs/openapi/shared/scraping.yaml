@@ -8,9 +8,10 @@ components:
     ContentSecurityConfig:
       type: object
       description: |
-        Low-level content download policy. In the generic scraper, omitted
-        `allowed_hosts` and `allowed_paths` fields do not restrict those sources;
-        explicit empty lists deny them. Consumers may merge this object over a
+        Low-level content download policy. File downloads always require an
+        explicit nonempty `allowed_paths` list. In the generic scraper, omitted
+        `allowed_hosts` for HTTP(S) and `allowed_paths` for S3 do not restrict
+        those sources; explicit empty lists deny them. Consumers may merge this object over a
         stricter baseline before downloading. Antfly inference does so: omitted
         or empty inference policies, and omitted inference allowlists, deny
         HTTP(S), file, and S3 content until explicit allowlists are configured.
@@ -52,7 +53,7 @@ components:
           minimum: 1
         allowed_paths:
           type: array
-          description: "Whitelist of allowed path prefixes for file:// and s3:// URLs. The generic scraper treats omission as unrestricted and an explicit empty list as deny-all. Consumers may impose stricter defaults; Antfly inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/)."
+          description: "Whitelist of allowed path prefixes for file:// and s3:// URLs. File downloads require an explicit nonempty path allowlist; omission and an empty list deny local file access. For S3 the generic scraper treats omission as unrestricted and an empty list as deny-all; Antfly inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/)."
           items:
             type: string
           example:

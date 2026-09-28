@@ -13,6 +13,7 @@
 // limitations.
 
 pub const provider_registry = @import("provider_registry.zig");
+pub const listener_security = @import("listener_security.zig");
 pub const config = @import("config.zig");
 pub const http = @import("http/mod.zig");
 pub const audio_runtime = @import("audio_runtime.zig");

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import signal
 import subprocess
@@ -27,12 +28,12 @@ from pathlib import Path
 
 import pytest
 import requests
-
 from conftest import (
+    AUTH_BOOTSTRAP_PASSWORD,
     DEFAULT_ANTFLY_BIN,
     StatefulAntflyServer,
-    _standalone_stateful_command,
     _read_log_tail,
+    _standalone_stateful_command,
     antfly_public_api_url,
     lookup_key_path,
     maybe_preserve_tempdir,
@@ -49,7 +50,7 @@ AUTH_SETUP_RETRY_TIMEOUT_SECONDS = 30.0
 
 
 def _basic_auth(username: str, password: str) -> str:
-    raw = f"{username}:{password}".encode("utf-8")
+    raw = f"{username}:{password}".encode()
     return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
@@ -72,7 +73,7 @@ def _wait_for_admin_auth(
     deadline = time.monotonic() + timeout
     session = requests.Session()
     session.headers["Connection"] = "close"
-    session.headers["Authorization"] = _basic_auth("admin", "admin")
+    session.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     while time.monotonic() < deadline:
         try:
             request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
@@ -98,7 +99,7 @@ def _wait_until(predicate, timeout: float = 30.0, interval: float = 0.25):
     return None
 
 
-def _try_lookup(api: "AuthApi", table_name: str, key: str):
+def _try_lookup(api: AuthApi, table_name: str, key: str):
     try:
         return api.lookup_key(table_name, key)
     except requests.HTTPError as err:
@@ -111,7 +112,7 @@ def _try_lookup(api: "AuthApi", table_name: str, key: str):
 
 class AuthApi:
     def __init__(
-        self, base_url: str, server_ref: "StandaloneAuthServer | SplitAuthServer"
+        self, base_url: str, server_ref: StandaloneAuthServer | SplitAuthServer
     ):
         self.url = base_url.rstrip("/")
         self.auth_url = self._auth_url_from_db_url(self.url)
@@ -264,6 +265,10 @@ class StandaloneAuthServer:
                 (port,),
                 lambda: subprocess.Popen(
                     command,
+                    env={
+                        **os.environ,
+                        "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+                    },
                     stdout=self.log_file,
                     stderr=subprocess.STDOUT,
                     cwd=root,
@@ -367,11 +372,17 @@ def stateful_auth_api():
         server.stop()
 
 
-def test_standalone_auth_defaults_to_local_admin_user(auth_api: AuthApi):
+def test_standalone_auth_uses_configured_admin_password(auth_api: AuthApi):
+    rejected = auth_api.s.get(
+        f"{auth_api.auth_url}/me",
+        headers={"Authorization": _basic_auth("admin", "admin")},
+        timeout=30,
+    )
+    assert rejected.status_code == 401
     response = auth_api.s.get(f"{auth_api.url}/status", timeout=30)
     assert response.status_code == 401
 
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     me = auth_api.get("/auth/v1/me")
     assert me["username"] == "admin"
     assert any(
@@ -383,7 +394,7 @@ def test_standalone_auth_defaults_to_local_admin_user(auth_api: AuthApi):
 
 
 def test_standalone_auth_user_and_api_key_flow(auth_api: AuthApi):
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
 
     created = auth_api.post(
         "/auth/v1/users/alice",
@@ -429,7 +440,7 @@ def test_standalone_auth_user_and_api_key_flow(auth_api: AuthApi):
 
 
 def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     auth_api.create_table("docs")
     auth_api.batch_write(
         "docs",
@@ -473,7 +484,7 @@ def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
     tables = auth_api.get("/tables")
     assert any(table["name"] == "docs" for table in tables)
 
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     read_only_key = auth_api.post(
         "/auth/v1/users/alice/api-keys",
         {
@@ -505,7 +516,7 @@ def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
     tables_resp = auth_api.s.get(f"{auth_api.url}/tables", timeout=30)
     assert tables_resp.status_code == 403
 
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     escalated = auth_api.s.post(
         f"{auth_api.auth_url}/users/alice/api-keys",
         json={
@@ -527,7 +538,7 @@ def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
     invalid = auth_api.s.get(f"{auth_api.url}/status", timeout=30)
     assert invalid.status_code == 401
 
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     keys = auth_api.get("/auth/v1/users/alice/api-keys")
     assert len(keys) == 2
     auth_api.delete(f"/auth/v1/users/alice/api-keys/{full_key['key_id']}")
@@ -539,14 +550,14 @@ def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
     auth_api.s.headers["Authorization"] = f"ApiKey {read_only_key['encoded']}"
     assert auth_api.get("/status")["auth_enabled"] is True
 
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     remaining = auth_api.get("/auth/v1/users/alice/api-keys")
     assert len(remaining) == 1
     assert remaining[0]["key_id"] == read_only_key["key_id"]
 
 
 def test_standalone_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthApi):
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     auth_api.create_table("docs")
     auth_api.batch_write(
         "docs",
@@ -612,7 +623,9 @@ def test_stateful_auth_defaults_to_local_admin_user(stateful_auth_api: AuthApi):
     response = stateful_auth_api.s.get(f"{stateful_auth_api.url}/status", timeout=30)
     assert response.status_code == 401
 
-    stateful_auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    stateful_auth_api.s.headers["Authorization"] = _basic_auth(
+        "admin", AUTH_BOOTSTRAP_PASSWORD
+    )
     me = stateful_auth_api.get("/auth/v1/me")
     assert me["username"] == "admin"
     assert any(
@@ -624,7 +637,9 @@ def test_stateful_auth_defaults_to_local_admin_user(stateful_auth_api: AuthApi):
 
 
 def test_stateful_auth_enforces_table_permissions(stateful_auth_api: AuthApi):
-    stateful_auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    stateful_auth_api.s.headers["Authorization"] = _basic_auth(
+        "admin", AUTH_BOOTSTRAP_PASSWORD
+    )
     stateful_auth_api.create_table("docs")
     stateful_auth_api.batch_write(
         "docs",
@@ -675,7 +690,9 @@ def test_stateful_auth_enforces_table_permissions(stateful_auth_api: AuthApi):
 def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(
     stateful_auth_api: AuthApi,
 ):
-    stateful_auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    stateful_auth_api.s.headers["Authorization"] = _basic_auth(
+        "admin", AUTH_BOOTSTRAP_PASSWORD
+    )
     stateful_auth_api.create_table("docs")
     stateful_auth_api.batch_write(
         "docs",

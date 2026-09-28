@@ -197,8 +197,7 @@ services:
     image: ghcr.io/antflydb/antfly:latest
     command: ["standalone"]
     ports:
-      - "8080:8080" # Public API port
-      - "9090:9090" # MCP port
+      - "127.0.0.1:8080:8080" # Public API and MCP, local access only
     volumes:
       - ./antfly-data:/antflydb
       - ./config.json:/config.json
@@ -212,7 +211,7 @@ services:
   ollama:
     image: ollama/ollama:latest
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ./ollama-data:/root/.ollama
       - ./entrypoint.sh:/entrypoint.sh
@@ -235,5 +234,9 @@ volumes:
 
 ### Run `docker-compose up -d`
 </Steps>
+
+This example runs without authentication. Before publishing its ports for
+remote access, follow [secure deployment](https://github.com/antflydb/antfly/blob/v0.2.x/docs/auth.md#secure-deployment)
+and configure TLS termination.
   </TabsContent>
 </PlatformTabs>

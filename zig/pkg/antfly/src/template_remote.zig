@@ -493,6 +493,7 @@ fn credentialName(ctx: hbs.HelperContext) !?[]const u8 {
 fn formatRemoteFetchErrorDirective(alloc: Allocator, err: anyerror) ![]const u8 {
     return switch (err) {
         error.StreamTooLong => try template_mod.formatErrorDirective(alloc, 413, @errorName(err)),
+        error.PathNotAllowed => try template_mod.formatErrorDirective(alloc, 403, @errorName(err)),
         error.HttpCredentialNotFoundOrOutOfScope,
         error.UnsupportedRemoteContentCredential,
         error.CredentialDestinationNotAllowed,
@@ -2025,6 +2026,22 @@ test "template remote enforces one aggregate byte budget across helpers" {
             .{ .remote_content = &remote_content },
         ),
     );
+}
+
+test "template remote helpers deny local files without an explicit allowlist" {
+    const alloc = std.testing.allocator;
+    const doc = "{\"url\":\"file:///not-opened-without-an-allowlist.txt\"}";
+    var cfg = scraping.RemoteContentConfig{ .security = .{ .block_private_ips = true } };
+    defer cfg.deinit(alloc);
+    for ([_][]const u8{ "{{remoteText url=url}}", "{{remotePDF url=url}}", "{{remoteMedia url=url}}" }) |source| {
+        try std.testing.expectError(RenderError.PermanentPromptFailure, renderJsonToValidatedTextWithConfig(alloc, source, doc, .{}));
+        try std.testing.expectError(RenderError.PermanentPromptFailure, renderJsonToValidatedTextWithConfig(alloc, source, doc, .{ .remote_content = &cfg, .io = std.testing.io }));
+        try std.testing.expectError(RenderError.PermanentPromptFailure, renderJsonToValidatedTextWithConfig(alloc, source, doc, .{
+            .remote_content = &cfg,
+            .io = std.testing.io,
+            .deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_s,
+        }));
+    }
 }
 
 test "template remote media limit skips later fetches without changing the default" {
