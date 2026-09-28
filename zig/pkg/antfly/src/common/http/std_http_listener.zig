@@ -82,6 +82,15 @@ fn isRequestCancellation(err: anyerror) bool {
     return err == error.Cancelled or err == error.Canceled;
 }
 
+fn isRequestPeerDisconnect(err: anyerror, stream_err: ?anyerror) bool {
+    // std.http writes through an Io.Writer, which erases socket failures as
+    // WriteFailed. Only treat that error as a disconnect when the underlying
+    // stream writer proves the peer closed; allocation and other write errors
+    // must still reach the handler-error log.
+    const cause = if (err == error.WriteFailed) stream_err orelse return false else err;
+    return cause == error.ConnectionResetByPeer or cause == error.SocketUnconnected;
+}
+
 pub const StdHttpListenerConfig = struct {
     /// Dedicated capabilities borrowed until stop; neither may share request capacity.
     accept_io: ?std.Io = null,
@@ -595,7 +604,7 @@ pub const StdHttpListener = struct {
             // the peer has gone away or the owning I/O task is being torn
             // down. Do not turn disconnect storms into error-log storms or
             // spend work attempting a 500 on a connection that cannot use it.
-            if (isRequestCancellation(err)) return;
+            if (isRequestCancellation(err) or isRequestPeerDisconnect(err, stream_writer.err)) return;
             if (self.stopping.load(.acquire)) {
                 std.log.warn("http request canceled during listener stop method={s} target={s} err={s}", .{
                     request_method,
@@ -1164,6 +1173,12 @@ test "std http listener classifies request cancellation as expected termination"
     try std.testing.expect(isRequestCancellation(error.Canceled));
     try std.testing.expect(!isRequestCancellation(error.Timeout));
     try std.testing.expect(!isRequestCancellation(error.Unexpected));
+    try std.testing.expect(isRequestPeerDisconnect(error.WriteFailed, error.ConnectionResetByPeer));
+    try std.testing.expect(isRequestPeerDisconnect(error.WriteFailed, error.SocketUnconnected));
+    try std.testing.expect(isRequestPeerDisconnect(error.ConnectionResetByPeer, null));
+    try std.testing.expect(!isRequestPeerDisconnect(error.WriteFailed, null));
+    try std.testing.expect(!isRequestPeerDisconnect(error.WriteFailed, error.SystemResources));
+    try std.testing.expect(!isRequestPeerDisconnect(error.Unexpected, error.ConnectionResetByPeer));
 }
 
 test "std http listener and executor round-trip raft batch route" {
