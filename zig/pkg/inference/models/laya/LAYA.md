@@ -1026,6 +1026,36 @@ and unpacked were trained on the same 16,009-decision subset (`td/oj16k.jsonl`:
 - The question-aware trunk (0.554) remains the best packed result, at the cost
   of isolation.
 
+**Per-question upper layers (2026-09-28).** `packing.fuse_layers` K runs the
+top K layers of the encoder-plus-head stack once per question, over that
+question's own copy of the state.
+- In those layers the state copy also attends to its question.
+- Questions stay isolated: every tree holds one question.
+- The layers below stay question-blind and identical across questions, so
+  they remain cacheable.
+- The top layer's state output is never read, so K must be at least 2.
+- Fusing the whole stack reproduces the question-aware trunk exactly on each
+  question (`laya_packed_test.zig`).
+- Setup: same 16k subset and recipe as the layout control. The released
+  stack is 28 encoder layers plus 2 head layers.
+
+| Layout, 16k subset | Open-Jev val | `s0-eval` | Train rows | Train time |
+| --- | ---: | ---: | ---: | ---: |
+| Packed | 0.607 | 0.463 | 5,319 | 1.6 h |
+| Fused, K = 10 (head + top 8 encoder layers) | 0.601 | 0.457 | 8,858 | 3.0 h |
+| Unpacked | 0.701 | 0.607 | 16,009 decisions | 4.6 h |
+
+Fusing the top 10 layers buys nothing on either eval. Per kind, K = 10 scores:
+- Open-Jev val: choice 0.441, score 0.363, noul 0.755; soft CE 0.830.
+- `s0-eval`: choice 0.395, score 0.398, noul 0.596; soft CE 1.112.
+
+Its training loss started higher than packed (1.10 vs 0.94 over the first
+fifth) and ended similar (0.90 vs 0.89). The upper layers had to adapt to
+states that suddenly see a question placed *after* them. The released weights
+learned the reverse order (question first).
+
+Next: K = 30, the whole stack, which bounds what this family can reach.
+
 ### Candidate mode on Banking77 (step 0b)
 
 Measured 2026-09-26. `scripts/laya/prepare_laya_banking77.sh` downloads
