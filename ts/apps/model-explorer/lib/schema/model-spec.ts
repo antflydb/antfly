@@ -160,19 +160,13 @@ export const ModelSpec = z.object({
     prefill: PhaseGraph.optional(),
   }),
   sankey: SankeySpec.optional(),
-  sources: z.object({
-    gitCommit: z.string(),
-    generatedAt: z.string(),
-  }),
 });
 export type ModelSpec = z.infer<typeof ModelSpec>;
 
 export const Manifest = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),
-  gitCommit: z.string(),
-  generatedAt: z.string(),
-  /** e.g. "https://github.com/antflydb/antfly/blob" — links become `${base}/${commit}/${path}#L${line}` */
-  permalinkBase: z.string().optional(),
+  /** e.g. "https://github.com/antflydb/antfly/blob/main" — links become `${base}/${path}` */
+  permalinkBase: z.string(),
   models: z.array(ModelId),
   counts: z.record(z.string(), z.number()).default({}),
 });

@@ -3,7 +3,7 @@
 import { parseAsStringLiteral, useQueryState } from "nuqs";
 import { Suspense } from "react";
 import { CodeLink } from "@/components/code/code-link";
-import { type ClientSnippet, SnippetProvider } from "@/components/code/snippet-context";
+import { SourceLinkProvider } from "@/components/code/source-link-context";
 import { ChoiceGroup } from "@/components/primitives/choice-group";
 import { KernelTimelineFrame } from "@/components/viz/kernel-timeline-frame";
 import { L } from "@/lib/links";
@@ -11,8 +11,6 @@ import type { FrameScenario } from "@/lib/schema";
 
 interface TimelineProps {
   frames: { q40: FrameScenario; q80: FrameScenario };
-  snippets: Record<string, ClientSnippet>;
-  gitCommit: string;
   permalinkBase?: string;
 }
 
@@ -24,7 +22,7 @@ export function TimelineClient(props: TimelineProps) {
   );
 }
 
-function TimelineInner({ frames, snippets, gitCommit, permalinkBase }: TimelineProps) {
+function TimelineInner({ frames, permalinkBase }: TimelineProps) {
   const [frame, setFrame] = useQueryState(
     "frame",
     parseAsStringLiteral(["q40", "q80"] as const).withDefault("q40")
@@ -33,7 +31,7 @@ function TimelineInner({ frames, snippets, gitCommit, permalinkBase }: TimelineP
   const isQ40 = frame !== "q80";
 
   return (
-    <SnippetProvider snippets={snippets} gitCommit={gitCommit} permalinkBase={permalinkBase}>
+    <SourceLinkProvider permalinkBase={permalinkBase}>
       <div className="mx-auto max-w-6xl space-y-8 px-4 py-8">
         <header className="max-w-3xl">
           <h1 className="text-3xl font-bold tracking-tight">Frame timeline</h1>
@@ -122,6 +120,6 @@ function TimelineInner({ frames, snippets, gitCommit, permalinkBase }: TimelineP
           bytes moved.
         </p>
       </div>
-    </SnippetProvider>
+    </SourceLinkProvider>
   );
 }

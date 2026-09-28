@@ -590,6 +590,19 @@ test "persisted float16 projection metadata bounds adversarial scores" {
     }
 }
 
+// WASM represents f16 lanes as i16 in Zig 0.16 LLVM codegen. Widen each
+// scalar lane before packing f32 SIMD so the compiler never emits an invalid
+// vector fpext from i16. Native targets keep their vector conversion.
+fn widenF16x8(values: [8]f16) @Vector(8, f32) {
+    const builtin = @import("builtin");
+    if (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64) {
+        var widened: [8]f32 = undefined;
+        inline for (0..8) |lane| widened[lane] = @floatCast(values[lane]);
+        return widened;
+    }
+    return @floatCast(@as(@Vector(8, f16), values));
+}
+
 fn distanceToQueryF16Metric(
     query: []const f32,
     query_measure: f32,
@@ -599,7 +612,6 @@ fn distanceToQueryF16Metric(
 ) f32 {
     std.debug.assert(query.len == candidate.len);
     std.debug.assert(std.math.isFinite(candidate_scale) and candidate_scale > 0);
-    const SimdF16 = @Vector(8, f16);
     const SimdF32 = @Vector(8, f32);
     const scale_vec: SimdF32 = @splat(candidate_scale);
     var sum0: SimdF32 = @splat(0);
@@ -617,10 +629,10 @@ fn distanceToQueryF16Metric(
         const q1: SimdF32 = query[i + 8 ..][0..8].*;
         const q2: SimdF32 = query[i + 16 ..][0..8].*;
         const q3: SimdF32 = query[i + 24 ..][0..8].*;
-        const c0: SimdF32 = @as(SimdF32, @floatCast(@as(SimdF16, candidate[i..][0..8].*))) * scale_vec;
-        const c1: SimdF32 = @as(SimdF32, @floatCast(@as(SimdF16, candidate[i + 8 ..][0..8].*))) * scale_vec;
-        const c2: SimdF32 = @as(SimdF32, @floatCast(@as(SimdF16, candidate[i + 16 ..][0..8].*))) * scale_vec;
-        const c3: SimdF32 = @as(SimdF32, @floatCast(@as(SimdF16, candidate[i + 24 ..][0..8].*))) * scale_vec;
+        const c0: SimdF32 = widenF16x8(candidate[i..][0..8].*) * scale_vec;
+        const c1: SimdF32 = widenF16x8(candidate[i + 8 ..][0..8].*) * scale_vec;
+        const c2: SimdF32 = widenF16x8(candidate[i + 16 ..][0..8].*) * scale_vec;
+        const c3: SimdF32 = widenF16x8(candidate[i + 24 ..][0..8].*) * scale_vec;
         switch (metric) {
             .l2_squared => {
                 const d0 = q0 - c0;

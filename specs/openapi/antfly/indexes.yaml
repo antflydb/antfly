@@ -186,10 +186,17 @@ components:
         source: { $ref: "#/components/schemas/GraphArtifactProducerSourceConfig" }
         content_type: { type: string }
         execution: { $ref: "#/components/schemas/ExecutionPolicy" }
+        producer:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+          description: "Write-only producer configuration. Cannot be combined with producer_json."
         producer_json:
           type: object
           additionalProperties: true
           writeOnly: true
+          deprecated: true
+          x-deprecated-reason: "Use the producer field."
           description: "Write-only producer configuration; it may contain credentials and is never returned."
     GraphTemplateValue:
       description: "A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item."
@@ -298,7 +305,13 @@ components:
             resolver (label-routed tables, e.g. event mentions to an events
             table).
         type_must_match: { type: boolean, default: true }
-        scorer_json: { type: string }
+        scorer:
+          $ref: "#/components/schemas/GraphResolverScorerConfig"
+          description: "Typed matcher scorer. Cannot be combined with scorer_json."
+        scorer_json:
+          type: string
+          deprecated: true
+          x-deprecated-reason: "Use the scorer field."
         candidate_search:
           type: string
           enum: ["", exact_key, prefix, ann]
@@ -324,6 +337,48 @@ components:
             withheld. The cheap post-extraction junk filter for
             score-carrying extractors; 0 (the default) admits everything.
         config_generation: { type: integer, format: uint64, minimum: 0 }
+    GraphResolverScorerConfig:
+      type: object
+      required: [comparisons]
+      additionalProperties: false
+      properties:
+        comparisons:
+          type: array
+          items: { $ref: "#/components/schemas/GraphResolverScorerComparison" }
+        combine:
+          type: object
+          additionalProperties: false
+          properties:
+            bias: { type: number, format: double }
+        decision:
+          type: object
+          additionalProperties: false
+          properties:
+            match: { type: number, format: double }
+            review: { type: number, format: double }
+    GraphResolverScorerComparison:
+      type: object
+      required: [name, left, right, levels]
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        left: { type: string }
+        right: { type: string }
+        levels:
+          type: array
+          items: { $ref: "#/components/schemas/GraphResolverScorerLevel" }
+    GraphResolverScorerLevel:
+      type: object
+      required: [weight]
+      additionalProperties: false
+      properties:
+        when:
+          type: string
+          description: "Matcher condition, such as 'exact' or 'jaro_winkler >= 0.9'."
+        else:
+          type: boolean
+          description: "Catch-all level when no previous condition matched."
+        weight: { type: number, format: double }
     CreateAlgebraicIndexRequest:
       description: "Create a schema-derived algebraic index."
       allOf:
@@ -492,7 +547,11 @@ components:
           description: "Optional stable model/token-space identifier asserted for this embedding artifact."
         chunk_size: { type: integer, minimum: 0 }
         chunk_overlap: { type: integer, minimum: 0 }
-        chunker_json: { type: string }
+        chunker: { $ref: "chunking.yaml#/components/schemas/ChunkerConfig" }
+        chunker_json:
+          type: string
+          deprecated: true
+          x-deprecated-reason: "Use the typed chunker field."
         full_text_index: { type: boolean, default: false }
         content_type: { type: string }
         neighbor_context: { $ref: "#/components/schemas/EnrichmentNeighborContextConfig" }
@@ -545,6 +604,7 @@ components:
           items: { $ref: "#/components/schemas/FullTextArtifactIndexSource" }
         mem_only: { type: boolean }
         field: { type: string }
+        analysis_config: { $ref: "#/components/schemas/TextAnalysisConfig" }
     CreatedGraphIndexConfig:
       type: object
       description: "Credential-free normalized graph configuration returned after creation."
@@ -728,10 +788,15 @@ components:
           type: integer
           minimum: 0
           description: "Chunk overlap for chunk enrichments."
+        chunker:
+          $ref: "chunking.yaml#/components/schemas/ChunkerConfig"
+          description: "Chunker configuration for chunk enrichments. Cannot be combined with chunker_json."
         chunker_json:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Serialized chunker configuration for chunk enrichments."
+          deprecated: true
+          x-deprecated-reason: "Use the typed chunker field."
+          description: "Legacy serialized chunker configuration for chunk enrichments. Cannot be combined with chunker."
         full_text_index:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -741,10 +806,17 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Produced asset content type for asset enrichments."
+        producer:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+          description: "Write-only producer configuration. Cannot be combined with producer_json or transcriber."
         producer_json:
           x-go-type-skip-optional-pointer: true
           type: string
           writeOnly: true
+          deprecated: true
+          x-deprecated-reason: "Use the producer field."
           description: "Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded."
         neighbor_context:
           $ref: "#/components/schemas/EnrichmentNeighborContextConfig"
@@ -889,6 +961,87 @@ components:
           type: string
           minLength: 1
           description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
+        analysis_config:
+          $ref: "#/components/schemas/TextAnalysisConfig"
+    TextAnalysisConfig:
+      type: object
+      description: |
+        Custom text analysis for a full-text index. Component maps are keyed
+        by the name that analyzers and `field_analyzers` reference. Built-in
+        analyzers (`standard`, `simple`, `keyword`, `html`, `search_as_you_type`,
+        `substring`, and the language analyzers such as `german`) are always
+        available without declaring them.
+
+        Example: split camelCase identifiers and match them as substrings.
+
+        ```json
+        {
+          "analysis_config": {
+            "field_analyzers": {"symbol": "code"},
+            "token_filters": {
+              "tails": {"type": "suffix", "config": {"min": 3, "max": 24}}
+            },
+            "analyzers": {
+              "code": {
+                "type": "custom",
+                "config": {
+                  "tokenizer": "whitespace",
+                  "token_filters": ["camel_case", "unique", "tails"]
+                }
+              }
+            }
+          }
+        }
+        ```
+      properties:
+        field_analyzers:
+          type: object
+          additionalProperties:
+            type: string
+          description: "Map of indexed field name to analyzer name. Overrides the analyzer derived from the table schema for that field."
+        char_filters:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named character filters. Types: `html_strip` (alias `html`), `ascii_fold`, `zero_width_non_joiner`."
+        tokenizers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named tokenizers. Types: `unicode` (alias `unicode_words`), `whitespace`, `keyword`, `character`, `ngram` (`config.min`, `config.max`), `edge_ngram` (`config.min`, `config.max`, `config.side` of `front` or `back`)."
+        token_filters:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named token filters. Types: `lowercase` (alias `to_lower`), `stop_words` (alias `stop`; optional `config.language`), `stemmer` (optional `config.language`), `ngram` and `edge_ngram` (`config.min`, `config.max`), `shingle` (`config.min`, `config.max`, `config.separator` of `space` or `none`), `suffix` (`config.min`, `config.max`; emits every suffix of each token so prefix queries answer containment), `length` (`config.min`, `config.max`), `truncate` (`config.length`), `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`. Languages: english, german, french, spanish, italian, portuguese, dutch, swedish, norwegian, danish, finnish."
+        analyzers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named analyzers of type `custom`. `config.tokenizer` names a built-in or declared tokenizer; `config.char_filters` and `config.token_filters` list built-in or declared component names in application order. Configuration-free filters (`lowercase`, `stop_words`, `stemmer`, `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`, `suffix`) can be listed by name without declaring them."
+        default_datetime_parser:
+          type: string
+          description: "Name of the date-time parser applied to datetime fields without a field-specific parser."
+        field_date_time_parsers:
+          type: object
+          additionalProperties:
+            type: string
+          description: "Map of field name to date-time parser name."
+        date_time_parsers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TextAnalysisComponent"
+          description: "Named date-time parsers. Type `sanitizedgo` accepts `config.layouts`, a list of Go reference-time layouts tried in order."
+    TextAnalysisComponent:
+      type: object
+      required: [type]
+      description: "One named analysis component: its type and type-specific configuration."
+      properties:
+        type:
+          type: string
+        config:
+          type: object
+          additionalProperties: true
     AlgebraicIndexConfig:
       type: object
       description: "Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned."
@@ -2681,6 +2834,7 @@ components:
       type: string
       enum:
         - search_as_you_type
+        - substring
         - keyword
         - text
         - html

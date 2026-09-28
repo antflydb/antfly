@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -119,6 +120,79 @@ def test_process_slot_configuration_rejects_non_positive_values(slots: int) -> N
         match="--e2e-process-slots must be a positive integer",
     ):
         pytest_configure(config)  # type: ignore[arg-type]
+
+
+def test_process_worker_configuration_rejects_non_positive_values() -> None:
+    options = {"e2e_process_slots": 2, "e2e_process_workers": 0}
+    config = SimpleNamespace(
+        getoption=lambda name, default=None: options.get(name, default)
+    )
+
+    with pytest.raises(
+        pytest.UsageError,
+        match="--e2e-process-workers must be a positive integer",
+    ):
+        pytest_configure(config)  # type: ignore[arg-type]
+
+
+def test_nested_pytest_does_not_publish_parent_duration_history(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import e2e_scheduler as scheduler
+
+    duration_file = tmp_path / "durations.json"
+    options = {"e2e_process_slots": 2, "e2e_duration_file": str(duration_file)}
+    config = SimpleNamespace(
+        getoption=lambda name, default=None: options.get(name, default)
+    )
+    monkeypatch.setenv(scheduler._DURATION_OWNER_PID, str(os.getpid() + 1))
+    pytest_configure(config)  # type: ignore[arg-type]
+    assert scheduler._duration_history is None
+
+    monkeypatch.delenv(scheduler._DURATION_OWNER_PID)
+    pytest_configure(config)  # type: ignore[arg-type]
+    assert scheduler._duration_history is not None
+    assert os.environ[scheduler._DURATION_OWNER_PID] == str(os.getpid())
+    monkeypatch.setattr(scheduler, "_duration_history", None)
+
+
+def test_one_process_worker_allows_mixed_group_and_parallel_light_work(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 2
+    scheduler.process_workers = 1
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    owner = FakeWorker()
+    other = FakeWorker()
+    persistent_scope = (
+        f"{PERSISTENT_PROCESS_GROUP_PREFIX}serverless_runtime--module--owner"
+    )
+    mixed_scope = f"{MIXED_PROCESS_GROUP_PREFIX}serverless_runtime--module--mixed"
+    stateful_scope = f"{PROCESS_GROUP_PREFIX}test--stateful"
+    light_scope = "light--test--pending"
+    scheduler.assigned_work = {
+        owner: {persistent_scope: {"test_owner.py::test_started": True}},
+        other: {},
+    }
+    scheduler._persistent_processes = {owner: {"serverless_runtime"}}
+    scheduler.workqueue = OrderedDict(
+        {
+            mixed_scope: {"test_mixed.py::test_both": False},
+            stateful_scope: {"test_stateful.py::test_run": False},
+            light_scope: {"test_light.py::test_run": False},
+        }
+    )
+
+    assert scheduler._next_eligible_scope(owner) == mixed_scope
+    assert scheduler._next_eligible_scope(other) == light_scope
+    scheduler.workqueue = OrderedDict(
+        {stateful_scope: {"test_stateful.py::test_run": False}}
+    )
+    assert scheduler._retire_unused_session_worker(owner) is False
+    assert owner.shutting_down is False
+    scheduler._persistent_processes.clear()
+    assert scheduler._next_eligible_scope(other) == stateful_scope
 
 
 def test_parallel_configuration_rejects_incompatible_distribution_mode() -> None:
@@ -624,6 +698,36 @@ def test_shared_group_uses_strictest_resource_policy_for_every_item() -> None:
     )
 
 
+def test_duration_history_migrates_seed_and_measured_aliases(tmp_path: Path) -> None:
+    path = tmp_path / "durations.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tests": {
+                    "e2e/antfly/test_a.py::test_case[a@b]": {
+                        "seconds": 353.78,
+                        "samples": 1,
+                    },
+                    "test_a.py::test_case[a@b]": {"seconds": 300, "samples": 2},
+                    "e2e/antfly/test_b.py::test_seed": {"seconds": 200, "samples": 1},
+                },
+            }
+        )
+    )
+    history = DurationHistory(path)
+    assert history.estimate("test_b.py::test_seed", process_owned=True) == 200
+    assert (
+        history.estimate("test_a.py::test_case[a@b]@group", process_owned=True) == 300
+    )
+    history.observe("e2e/antfly/test_a.py::test_case[a@b]@group", 100)
+    assert history.save() is None
+    assert DurationHistory(path).tests == {
+        "test_a.py::test_case[a@b]": {"seconds": 240, "samples": 3},
+        "test_b.py::test_seed": {"seconds": 200, "samples": 1},
+    }
+
+
 def test_duration_history_round_trips_and_smooths_observations(tmp_path: Path) -> None:
     path = tmp_path / "durations.json"
     history = DurationHistory(path)
@@ -744,6 +848,49 @@ def test_duration_reports_exclude_skips_but_keep_full_executed_protocol(
     assert history.observed == {"test_real.py::test_executed": 8.0}
     assert e2e_scheduler_module._duration_report_totals == {}
     assert e2e_scheduler_module._executed_duration_nodeids == set()
+
+
+def test_failed_report_flushes_diagnostic_before_session_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = sys.modules[DurationHistory.__module__]
+    output: list[object] = []
+    reporter = SimpleNamespace(
+        write_sep=lambda separator, title: output.append(title),
+        write_line=lambda line: output.append(line),
+        flush=lambda: output.append("flushed"),
+    )
+    monkeypatch.setattr(module, "_failure_reporter", reporter)
+    monkeypatch.setattr(module, "_duration_history", None)
+    report = SimpleNamespace(
+        nodeid="test_autoschema.py::test_failed@group",
+        when="call",
+        failed=True,
+        longreprtext="assertion and server diagnostics",
+    )
+    module.pytest_runtest_logreport(report)
+    assert output == [
+        "Immediate E2E failure: test_autoschema.py::test_failed@group (call)",
+        "assertion and server diagnostics",
+        "flushed",
+    ]
+    assert report.failed is True
+
+
+@pytest.mark.parametrize("worker", [False, True])
+def test_only_controller_emits_immediate_failure_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, worker: bool
+) -> None:
+    module = sys.modules[DurationHistory.__module__]
+    reporter = object()
+    config = SimpleNamespace(
+        pluginmanager=SimpleNamespace(get_plugin=lambda name: reporter),
+    )
+    if worker:
+        config.workerinput = {}
+    monkeypatch.setattr(module, "_failure_reporter", None)
+    module.pytest_sessionstart(SimpleNamespace(config=config))
+    assert module._failure_reporter is (None if worker else reporter)
 
 
 def test_scheduler_prefers_longest_eligible_work_without_exceeding_process_slots(
@@ -1675,3 +1822,43 @@ def test_completed_worker_removal_immediately_reuses_released_process_slot(
     assert scheduler.workqueue == {}
     assert scheduler._persistent_processes == {clean: {"runtime_b"}}
     assert scheduler._reserved_process_slots() == 1
+
+
+def test_ci_phase_report_retains_fixture_costs_and_skipped_setup(tmp_path, monkeypatch):
+    import e2e_scheduler as scheduler
+
+    monkeypatch.setenv("ANTFLY_E2E_REPORT_DIR", str(tmp_path / "reports"))
+    monkeypatch.setattr(
+        scheduler, "_duration_history", DurationHistory(tmp_path / "durations.json")
+    )
+    monkeypatch.setattr(scheduler, "_duration_report_totals", {})
+    monkeypatch.setattr(scheduler, "_duration_phase_totals", {})
+    monkeypatch.setattr(scheduler, "_executed_duration_nodeids", set())
+    for when, seconds in [("setup", 2), ("call", 3), ("teardown", 4)]:
+        scheduler.pytest_runtest_logreport(
+            SimpleNamespace(
+                nodeid="test_a.py::test_pass@g",
+                when=when,
+                duration=seconds,
+                skipped=False,
+            )
+        )
+    scheduler.pytest_runtest_logreport(
+        SimpleNamespace(
+            nodeid="test_a.py::test_skip@g", when="setup", duration=5, skipped=True
+        )
+    )
+    session = SimpleNamespace(
+        config=SimpleNamespace(pluginmanager=SimpleNamespace(get_plugin=lambda _: None))
+    )
+    scheduler.pytest_sessionfinish(session)
+    phases = json.loads((tmp_path / "reports/phase-durations.json").read_text())
+    assert phases["tests"]["test_a.py::test_pass"] == {
+        "setup": 2,
+        "call": 3,
+        "teardown": 4,
+    }
+    assert phases["tests"]["test_a.py::test_skip"] == {"setup": 5}
+    history = DurationHistory(tmp_path / "durations.json")
+    assert history.estimate("test_a.py::test_pass", process_owned=True) == 9
+    assert "test_a.py::test_skip" not in history.tests

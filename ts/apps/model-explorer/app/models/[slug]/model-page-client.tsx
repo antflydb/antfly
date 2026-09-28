@@ -3,7 +3,7 @@
 import { Button } from "@antfly/design-system";
 import { ArrowRight } from "lucide-react";
 import Link from "next/link";
-import { type ClientSnippet, SnippetProvider } from "@/components/code/snippet-context";
+import { SourceLinkProvider } from "@/components/code/source-link-context";
 import { SpineStrip, type SpineStageId } from "@/components/spine-strip";
 import { getChapters, type KernelCensus } from "@/content/registry";
 import type { FrameScenario, KernelRoute, ModelSpec } from "@/lib/schema";
@@ -69,16 +69,12 @@ export function ModelPageClient({
   routes,
   frames,
   kernelCensus,
-  snippets,
-  gitCommit,
   permalinkBase,
 }: {
   spec: ModelSpec;
   routes: KernelRoute[];
   frames: ModelFrames;
   kernelCensus: KernelCensus;
-  snippets: Record<string, ClientSnippet>;
-  gitCommit: string;
   permalinkBase?: string;
 }) {
   const Chapters = getChapters(spec.id);
@@ -87,7 +83,7 @@ export function ModelPageClient({
   ];
 
   return (
-    <SnippetProvider snippets={snippets} gitCommit={gitCommit} permalinkBase={permalinkBase}>
+    <SourceLinkProvider permalinkBase={permalinkBase}>
       <div>
         <header className="border-b bg-muted/20">
           <div className="mx-auto max-w-7xl px-4 py-10">
@@ -155,6 +151,6 @@ export function ModelPageClient({
         </header>
         <Chapters spec={spec} routes={routes} frames={frames} kernelCensus={kernelCensus} />
       </div>
-    </SnippetProvider>
+    </SourceLinkProvider>
   );
 }

@@ -16,6 +16,50 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **Native PDF extraction** — repair demonstrably interleaved horizontal prose
+  columns without changing paint order. Require sustained prose in both columns
+  and preserve ambiguous table row associations. Preserve authored order for
+  overlapping paint sequences, already-grouped columns, and vertically separated
+  layouts. Resolve indirect CCITT decode parameters, accept valid zero-filled
+  Group 3 line markers, and correct PNG compression-buffer ownership.
+- **Durable OCR grounding** — preserve compatible Reader regions as UTF-8 byte
+  spans and page-space boxes, including rotated pages and CropBox offsets.
+  Invalid regions no longer discard valid text or shift later repeated text
+  onto an earlier occurrence.
+- **OCR content retention** — reject partial transcriptions that discard most
+  decoded text while allowing recovery from corrupted glyphs. Preserve signed
+  numeric values, singleton numeric lines, and their full source-row context
+  when combining OCR with embedded text.
+- **Native multistage OCR** — support exact transposed convolution and average
+  pooling, preserve typed constants and dynamic reshape dimensions in native
+  partitioned execution, and correct Paddle image normalization, detector aspect
+  ratio, recognition width/padding, tall-crop
+  rotation, and CTC vocabulary handling. Recognition failures propagate instead
+  of returning partial success.
+- **Reader request memory** — encode large inline-image JSON requests into one
+  exactly sized allocation, avoiding unnecessary working-set failures without
+  increasing production memory limits.
+- **Bounded compatibility rendering** — keep temporary RGBA and PNG compression
+  allocations out of retained-output budgets without increasing memory limits.
+  macOS compatibility-rendered pages remain explicitly marked as such.
+- **Research agent** — `POST /agents/research` plans a question into
+  sub-questions, researches them in parallel with the retrieval agent, reflects
+  on coverage, and writes a sectioned report whose `[E#]` citations resolve to a
+  deduplicated evidence registry. Unresolvable citation markers are removed and
+  reported, and an optional verify step checks cited statements against their
+  evidence. Every limit is declared in `budget` and is cumulative across
+  resumes; `research_state` carries a run forward. Durable jobs
+  (`/agents/research/jobs`, with `advance` and `cancel`) checkpoint after every
+  phase, are scoped to the authenticated user, and survive restarts in local
+  standalone mode. Available from the CLI (`antfly agents research`, `--job`),
+  the Go and TypeScript SDKs, `@antfly/components` (`useResearchStream`,
+  `ResearchReport`), evalaf, and as the A2A `research` skill.
+- **Retrieval agent `fetch` tool** — agents can read full web pages. Fetch is
+  opt-in and admits only URLs returned by `web_search` in the same run or on
+  `fetch_config.allowed_hosts`; private addresses are always blocked. Tool
+  results are budgeted in estimated tokens instead of bytes, and every model
+  round checks the request deadline and cancellation.
+
 - **One rerank endpoint for text and images** — `POST /ai/v1/rerank` takes
   `documents`, where each entry is a string or an array of text and image
   content parts, the same format generation and embedding use. Documents with

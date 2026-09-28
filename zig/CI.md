@@ -50,6 +50,9 @@ approval and PR worker jobs reject subsequent run attempts.
 | --- | --- | --- |
 | Antfly | `ci:scale-tests` | Corpus-scale full-text correctness, over 1M chunks |
 | Antfly | `ci:gpu` | L4 Spot CUDA build and smoke canary |
+| Antfly | `ci:full` | Full Zig and inference/Antfly E2E suites, replacing PR/base tests |
+| Antfly | `ci:vopr` | VOPR build and qualification without the soak campaign |
+| Antfly | `ci:soak` | Full VOPR soak campaign, including build and qualification |
 | Antfly | `ci:darwin-release` | Darwin ARM64 ReleaseFast archive diagnostic |
 | Colony | `benchmark-preview` | Website benchmark preview build and publication |
 
@@ -57,6 +60,14 @@ For example, add `ci:gpu` and `ci:scale-tests`, then post one approval comment t
 run normal CI plus both optional suites. GPU `inference-e2e` remains an explicit
 manual default-branch option in **Zig Inference L4 Spot Canary**. The PR label
 selects the bounded `smoke` scope.
+
+Add `ci:full` and `ci:soak` before posting `/ci run <full head SHA>` to run both
+complete suites on the approved revision. Labels alone never start tests.
+Full PR E2E uses one ReleaseSafe build shared with the packaging smoke checks;
+base E2E planning, base shards, and the separate full E2E build are omitted.
+The isolated low-FD regressions still run and contribute to the full E2E
+result. Selecting both
+`ci:vopr` and `ci:soak` runs one full campaign, including qualification.
 
 Normal Antfly CI includes policy tests, SDK checks, and the existing Zig PR/base
 validation. SDK and Zig workflows retain their change classification. Proxy and

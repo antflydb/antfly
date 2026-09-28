@@ -238,11 +238,13 @@ test "codec transport host retries failed sends and refreshes peer endpoints" {
         .endpoints = &.{.{ .protocol = .http3, .address = "https://old", .metadata = "" }},
     });
 
+    var context = "read-index".*;
     const msg = core.Message{
         .msg_type = .heartbeat,
         .from = 1,
         .to = 2,
         .term = 5,
+        .context = &context,
     };
     try host.transport().sendMessages(21, (&[_]core.Message{msg})[0..]);
     try std.testing.expectEqual(@as(usize, 0), driver.sent.items.len);
@@ -456,7 +458,8 @@ test "codec transport retry compaction preserves delayed and failed survivor ord
     defer driver.deinit();
     var host = runtime.CodecTransportHost.init(std.testing.allocator, runtime.BinaryCodec.codec(), driver.driver(), .{});
     defer host.deinit();
-    const message = [_]core.Message{.{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 7 }};
+    var context = "read-index".*;
+    const message = [_]core.Message{.{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 7, .context = &context }};
     var groups: [4]runtime.transport_iface.GroupMessageBatch = undefined;
     for (&groups, 41..) |*group, id| {
         group.* = .{ .group_id = id, .messages = &message };
@@ -477,4 +480,79 @@ test "codec transport retry compaction preserves delayed and failed survivor ord
     try std.testing.expectEqual(@as(usize, 0), host.pendingRetryCount());
     try std.testing.expectEqual(@as(usize, 0), host.pending_retry_bytes);
     try std.testing.expectEqual(@as(usize, 4), driver.sent.items.len);
+}
+
+test "failed context-free heartbeat is not retried after a newer heartbeat" {
+    var driver = RecordingFrameDriver{ .alloc = std.testing.allocator, .failures_remaining = 1 };
+    defer driver.deinit();
+    var host = runtime.CodecTransportHost.init(std.testing.allocator, runtime.BinaryCodec.codec(), driver.driver(), .{});
+    defer host.deinit();
+    try host.transport().addPeer(41, .{ .node_id = 2, .endpoints = &.{.{ .protocol = .http1, .address = "http://peer" }} });
+
+    const old = [_]core.Message{.{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 7 }};
+    const current = [_]core.Message{.{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 8 }};
+    try host.transport().sendMessages(41, &old);
+    try std.testing.expectEqual(@as(usize, 0), host.pendingRetryCount());
+    try host.transport().sendMessages(41, &current);
+    for (0..8) |_| try host.transport().advanceRound();
+    try std.testing.expectEqual(@as(usize, 1), driver.sent.items.len);
+    const decoded = try host.codec.decodeFrame(std.testing.allocator, .{ .bytes = driver.sent.items[0].bytes, .media_type = driver.sent.items[0].media_type });
+    defer host.codec.freeDecoded(std.testing.allocator, decoded);
+    try std.testing.expectEqual(@as(u64, 8), decoded.raft_peer_batch.groups[0].messages[0].term);
+}
+
+test "asynchronous mixed-bundle failure retries read-index work but not stale heartbeat" {
+    const AsyncDriver = struct {
+        alloc: std.mem.Allocator,
+        failed: ?runtime.frame_driver_iface.FailedFrame = null,
+        calls: usize = 0,
+        retried_group: ?u64 = null,
+
+        fn send(ptr: *anyopaque, req: runtime.frame_driver_iface.SendFrameRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) {
+                self.failed = .{
+                    .alloc = self.alloc,
+                    .source_id = req.source_id,
+                    .peer_id = req.peer_id,
+                    .frame = .{
+                        .bytes = try self.alloc.dupe(u8, req.frame.bytes),
+                        .media_type = try self.alloc.dupe(u8, req.frame.media_type),
+                    },
+                    .attempt = req.attempt,
+                    .replaceable_heartbeat = req.replaceable_heartbeat,
+                };
+            } else if (req.attempt > 1) {
+                try std.testing.expectEqualSlices(u64, &.{42}, req.group_ids);
+                self.retried_group = req.group_ids[0];
+            }
+        }
+
+        fn poll(ptr: *anyopaque) ?runtime.frame_driver_iface.FailedFrame {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const failed = self.failed;
+            self.failed = null;
+            return failed;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var driver: AsyncDriver = .{ .alloc = alloc };
+    defer if (driver.failed) |*failed| failed.deinit();
+    var host = runtime.CodecTransportHost.init(alloc, runtime.BinaryCodec.codec(), .{ .ptr = &driver, .vtable = &.{ .send_frame = AsyncDriver.send, .poll_failed_frame = AsyncDriver.poll } }, .{});
+    defer host.deinit();
+    for ([_]u64{ 41, 42 }) |group_id| try host.transport().addPeer(group_id, .{ .node_id = 2, .endpoints = &.{.{ .protocol = .http1, .address = "http://peer" }} });
+    const stale = [_]core.Message{.{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 7 }};
+    var context = "read-index".*;
+    const read_index = [_]core.Message{.{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 7, .context = &context }};
+    const current = [_]core.Message{.{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 8 }};
+    try host.transport().sendPeerBatches(&.{.{ .peer_id = 2, .groups = &.{
+        .{ .group_id = 41, .messages = &stale },
+        .{ .group_id = 42, .messages = &read_index },
+    } }});
+    try host.transport().sendMessages(41, &current);
+    for (0..8) |_| try host.transport().advanceRound();
+    try std.testing.expectEqual(@as(usize, 3), driver.calls);
+    try std.testing.expectEqual(@as(?u64, 42), driver.retried_group);
+    try std.testing.expectEqual(@as(usize, 0), host.pendingRetryCount());
 }

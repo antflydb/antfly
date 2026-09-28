@@ -18,7 +18,6 @@ const rawComparisonSamples: PerfSample[] = [
     context: "16.03 ms/tok · 176 GB/s effective · 64.7% of bandwidth",
     source: {
       path: PERF_PLAN,
-      anchor: "Circus, E4B Q4_0, single prompt, 64 tokens, temp 0, serial:",
     },
   },
   {

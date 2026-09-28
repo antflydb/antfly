@@ -74,6 +74,27 @@ else
   )
 fi
 
+# Collect every selector before compilation or parallel worker admission. A
+# renamed/missing test is a configuration error, not a flake to repeat all day.
+if [[ "${ANTFLY_E2E_REGRESSION_COLLECTED:-0}" != "1" ]]; then
+  for project in e2e/antfly e2e/inference; do
+    selectors=()
+    for test_name in "${tests[@]}"; do
+      case_project=e2e/antfly
+      if [[ "$test_name" == e2e/inference/* ]]; then case_project=e2e/inference; fi
+      if [[ "$case_project" == "$project" ]]; then selectors+=("$test_name"); fi
+    done
+    if ((${#selectors[@]} > 0)); then
+      (
+        cd "$repo_root/zig"
+        python3 "$script_dir/run_e2e_case.py" \
+          uv run --project "$project" pytest --collect-only -q "${selectors[@]}"
+      ) || exit "$?"
+    fi
+  done
+fi
+export ANTFLY_E2E_REGRESSION_COLLECTED=1
+
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   (
     cd "$repo_root/zig"
@@ -168,9 +189,23 @@ failures=0
 preserved_failures=0
 worker_id="${ANTFLY_E2E_REGRESSION_WORKER_ID:-1}"
 report_dir="${ANTFLY_E2E_REGRESSION_REPORT_DIR:-}"
-if [[ -n "$report_dir" ]]; then
+temporary_report_dir=0
+if [[ -z "$report_dir" ]]; then
+  report_dir="$(mktemp -d "${TMPDIR:-/tmp}/antfly-e2e-regression-reports.XXXXXX")"
+  temporary_report_dir=1
+else
   mkdir -p "$report_dir"
 fi
+cleanup_reports() {
+  if ((temporary_report_dir == 1)); then
+    if ((failures == 0)); then
+      rm -rf -- "$report_dir"
+    else
+      printf 'Preserving E2E regression reports: %s\n' "$report_dir" >&2
+    fi
+  fi
+}
+trap cleanup_reports EXIT
 case_number=0
 active_case=""
 # Signal the supervisor, which owns pytest and every server in its session.
@@ -193,18 +228,21 @@ for ((iteration = 1; iteration <= repeats; iteration++)); do
     fi
     case_number=$((case_number + 1))
     report_args=()
-    if [[ -n "$report_dir" ]]; then
-      report_path="$report_dir/worker-$worker_id-case-$case_number.xml"
-      # Never accept stale evidence from another invocation.
-      if [[ -e "$report_path" ]]; then
-        echo "regression report already exists: $report_path" >&2
-        exit 2
-      fi
-      report_args=("--junitxml=$report_path")
+    report_path="$report_dir/worker-$worker_id-case-$case_number.xml"
+    # Never accept stale evidence from another invocation.
+    if [[ -e "$report_path" ]]; then
+      echo "regression report already exists: $report_path" >&2
+      exit 2
     fi
+    report_args=("--junitxml=$report_path")
+    case_project=e2e/antfly
+    if [[ "$test_name" == e2e/inference/* ]]; then
+      case_project=e2e/inference
+    fi
+    ANTFLY_INFERENCE_SERVER_LOG_DIR="$report_dir" \
     ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE="$preserve_root" \
       python3 "$script_dir/run_e2e_case.py" \
-      uv run --project e2e/antfly pytest -q -s --durations=10 ${report_args[@]+"${report_args[@]}"} "$test_name" &
+      uv run --project "$case_project" pytest -q -s --durations=10 ${report_args[@]+"${report_args[@]}"} "$test_name" &
     active_case=$!
     if wait "$active_case"; then
       status=0
@@ -212,7 +250,7 @@ for ((iteration = 1; iteration <= repeats; iteration++)); do
       status=$?
     fi
     active_case=""
-    if ((status == 0)) && [[ -n "$report_dir" ]]; then
+    if ((status == 0)); then
       if ! python3 - "$report_path" <<'PYREPORT'
 import sys
 import xml.etree.ElementTree as ET

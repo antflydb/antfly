@@ -321,6 +321,31 @@ fn nullCtAliases(values: []?CT, needle: CT) void {
     }
 }
 
+/// Return true when another graph value aliases `needle` and is still needed
+/// after `current_node`. Backends may return one stable borrowed handle for
+/// multiple parameter nodes (CUDA resident/tied weights do this). Releasing
+/// one node's last use must not clear that later alias merely because the
+/// opaque CT pointers compare equal.
+fn hasFutureParameterCtAlias(
+    graph: *const Graph,
+    values: []const ?CT,
+    last_use: []const u32,
+    needle: CT,
+    releasing_id: NodeId,
+    current_node: usize,
+) bool {
+    if (graph.node(releasing_id).op != .parameter) return false;
+    // Search only graph parameters. A whole-values scan at every release is
+    // quadratic in the full Gemma graph; the aliasing contract at issue is
+    // specifically backend weight handles, while view/output aliases are
+    // handled by cloneOutputIfAliasedInputWouldBeFreedFast above.
+    for (graph.parameters.items) |other_id| {
+        if (other_id == releasing_id or values[other_id] != needle) continue;
+        if (last_use[other_id] > current_node) return true;
+    }
+    return false;
+}
+
 fn graphExecTraceEnabled() bool {
     const value = platform.env.getenv("TERMITE_GRAPH_EXEC_TRACE") orelse return false;
     return value.len > 0 and !std.mem.eql(u8, value, "0") and !std.ascii.eqlIgnoreCase(value, "false");
@@ -847,6 +872,17 @@ pub fn execute(
                             values[input_id] = null;
                             continue;
                         }
+                    }
+                    // `getWeight` may return a stable backend-owned handle for
+                    // duplicate parameter nodes (notably Gemma's tied input
+                    // embedding and LM head on CUDA). Topological sorting puts
+                    // both parameters before their consumers, so clearing all
+                    // equal CTs at the embedding's last use used to erase the
+                    // still-live LM-head binding. Defer the backend release to
+                    // the final live alias instead.
+                    if (hasFutureParameterCtAlias(graph, values, last_use, ct, input_id, i)) {
+                        values[input_id] = null;
+                        continue;
                     }
                     // Clear every alias before releasing the handle. Keeping
                     // raw addresses of already-freed handles is ABA-unsafe:
@@ -1733,6 +1769,13 @@ fn positiveResolvedDim(actual: ?[]const i64, shape: Shape, axis: usize) !usize {
     }
     return positiveShapeDim(shape, axis);
 }
+fn declaredShapeDimMatches(shape: Shape, axis: usize, actual: usize) bool {
+    if (axis >= shape.rank()) return false;
+    const declared = shape.dim(@intCast(axis));
+    if (declared < 0) return true;
+    const concrete = std.math.cast(usize, declared) orelse return false;
+    return concrete == actual;
+}
 
 /// For shape-tracking backends (MLX), reshape a tensor to its declared
 /// shape when the declared shape is fully concrete, the actual rank differs,
@@ -1748,7 +1791,7 @@ fn ensureDeclaredShape(cb: *const ComputeBackend, val: CT, declared: Shape) ?CT 
         if (dims[d] <= 0) return null;
     }
     if (cb.tensorShapeMatches(val, dims[0..rank]) catch null) |matches| {
-        return if (matches) null else cb.primReshape(val, dims[0..rank]) catch null;
+        if (matches) return null;
     }
     const actual = cb.tensorShape(val, std.heap.page_allocator) catch {
         return cb.primReshape(val, dims[0..rank]) catch null;
@@ -2643,6 +2686,36 @@ pub fn executeNode(
                 if (try cb.multiplyConsumeLeft(V.get(ins[0]), V.get(ins[1]))) |consumed| return consumed;
             }
             return cb.multiply(V.get(ins[0]), V.get(ins[1]));
+        },
+
+        .fused_selected_tied_head_logits => |attrs| {
+            if (!attrs.frozen_weight) return error.UnsupportedPrimitiveOp;
+            var output_shape_buf: [8]i64 = undefined;
+            const output_shape = fillShapeDims(graph, node_id, &output_shape_buf);
+            return cb.selectedTiedHeadLogits(&.{
+                .hidden = V.get(ins[0]),
+                .weight = V.get(ins[1]),
+                .token_ids = V.get(ins[2]),
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .frozen_weight = attrs.frozen_weight,
+                .output_shape = output_shape,
+            });
+        },
+
+        .fused_selected_tied_head_backward => |attrs| {
+            if (!attrs.frozen_weight) return error.UnsupportedPrimitiveOp;
+            var hidden_shape_buf: [8]i64 = undefined;
+            const hidden_shape = fillShapeDims(graph, node_id, &hidden_shape_buf);
+            return cb.selectedTiedHeadBackward(&.{
+                .weight = V.get(ins[0]),
+                .token_ids = V.get(ins[1]),
+                .upstream = V.get(ins[2]),
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .frozen_weight = attrs.frozen_weight,
+                .hidden_shape = hidden_shape,
+            });
         },
 
         .fused_masked_bce_with_logits_loss => |attrs| {
@@ -4179,15 +4252,102 @@ pub fn executeNode(
                 else => return V.get(ins[0]),
             }
         },
+        .average_pool => |attrs| return cb.averagePool(V.get(ins[0]), &attrs),
         .conv_general => |attrs| {
             const input_shape = graph.node(ins[0]).output_shape;
             const weight_shape = graph.node(ins[1]).output_shape;
             const input_actual = cb.tensorShape(V.get(ins[0]), std.heap.page_allocator) catch null;
             defer if (input_actual) |shape| std.heap.page_allocator.free(shape);
+            if (attrs.transposed) {
+                if (cb.kind() != .native) return error.UnsupportedPrimitiveOp;
+                const output_shape = graph.node(node_id).output_shape;
+                if (input_shape.dtype != .f32 or weight_shape.dtype != .f32 or output_shape.dtype != .f32) {
+                    return error.UnsupportedPrimitiveOp;
+                }
+                if (attrs.num_spatial != 1 and attrs.num_spatial != 2) return error.UnsupportedShape;
+
+                const expected_rank: u8 = attrs.num_spatial + 2;
+                const expected_rank_usize: usize = expected_rank;
+                if (input_shape.rank() != expected_rank or weight_shape.rank() != expected_rank or
+                    output_shape.rank() != expected_rank)
+                {
+                    return error.UnsupportedShape;
+                }
+                if (input_actual) |dims| {
+                    if (dims.len != expected_rank_usize) return error.UnsupportedShape;
+                }
+
+                const weight_actual = cb.tensorShape(V.get(ins[1]), std.heap.page_allocator) catch null;
+                defer if (weight_actual) |shape| std.heap.page_allocator.free(shape);
+                if (weight_actual) |dims| {
+                    if (dims.len != expected_rank_usize) return error.UnsupportedShape;
+                }
+
+                const batch = try positiveResolvedDim(input_actual, input_shape, 0);
+                const in_channels = try positiveResolvedDim(input_actual, input_shape, 1);
+                const weight_in_channels = try positiveResolvedDim(weight_actual, weight_shape, 0);
+                if (weight_in_channels != in_channels) return error.UnsupportedShape;
+
+                const groups = std.math.cast(usize, attrs.groups) orelse return error.UnsupportedShape;
+                if (groups == 0 or in_channels % groups != 0) return error.UnsupportedShape;
+                const out_channels_per_group = try positiveResolvedDim(weight_actual, weight_shape, 1);
+                const out_channels = std.math.mul(usize, out_channels_per_group, groups) catch return error.UnsupportedShape;
+                if (!declaredShapeDimMatches(output_shape, 0, batch) or
+                    !declaredShapeDimMatches(output_shape, 1, out_channels))
+                {
+                    return error.UnsupportedShape;
+                }
+
+                var input_spatial: [2]usize = .{ 1, 1 };
+                var kernel: [2]usize = .{ 1, 1 };
+                var strides: [2]usize = .{ 1, 1 };
+                var padding: [2][2]i32 = .{ .{ 0, 0 }, .{ 0, 0 } };
+                var dilations: [2]usize = .{ 1, 1 };
+                var output_padding: [2]usize = .{ 0, 0 };
+                var output_spatial: [2]usize = .{ 1, 1 };
+                for (0..attrs.num_spatial) |axis| {
+                    input_spatial[axis] = try positiveResolvedDim(input_actual, input_shape, axis + 2);
+                    kernel[axis] = try positiveResolvedDim(weight_actual, weight_shape, axis + 2);
+                    strides[axis] = std.math.cast(usize, attrs.strides[axis]) orelse return error.UnsupportedShape;
+                    padding[axis] = attrs.padding[axis];
+                    dilations[axis] = std.math.cast(usize, attrs.dilations[axis]) orelse return error.UnsupportedShape;
+                    output_padding[axis] = std.math.cast(usize, attrs.output_padding[axis]) orelse return error.UnsupportedShape;
+                    output_spatial[axis] = ops_mod.convTransposeOutputDim(
+                        input_spatial[axis],
+                        kernel[axis],
+                        strides[axis],
+                        padding[axis],
+                        dilations[axis],
+                        output_padding[axis],
+                    ) orelse return error.UnsupportedShape;
+                    if (!declaredShapeDimMatches(output_shape, axis + 2, output_spatial[axis])) {
+                        return error.UnsupportedShape;
+                    }
+                }
+
+                const result = try cb.convTranspose(&.{
+                    .input = V.get(ins[0]),
+                    .weight = V.get(ins[1]),
+                    .batch = batch,
+                    .in_channels = in_channels,
+                    .out_channels = out_channels,
+                    .input_spatial = input_spatial,
+                    .kernel = kernel,
+                    .strides = strides,
+                    .padding = padding,
+                    .dilations = dilations,
+                    .output_padding = output_padding,
+                    .output_spatial = output_spatial,
+                    .groups = groups,
+                    .num_spatial = attrs.num_spatial,
+                });
+                return result orelse error.UnsupportedPrimitiveOp;
+            }
 
             if (attrs.num_spatial == 1 and attrs.groups == 1 and
                 input_shape.rank() == 3 and weight_shape.rank() == 3 and
-                attrs.padding[0][0] == attrs.padding[0][1])
+                attrs.padding[0][0] == attrs.padding[0][1] and
+                attrs.dilations[0] > 0 and attrs.output_padding[0] == 0)
             {
                 const batch = try positiveResolvedDim(input_actual, input_shape, 0);
                 const in_channels = try positiveResolvedDim(input_actual, input_shape, 1);
@@ -4255,7 +4415,9 @@ pub fn executeNode(
             if (attrs.num_spatial == 2 and
                 input_shape.rank() == 4 and weight_shape.rank() == 4 and
                 attrs.padding[0][0] == attrs.padding[0][1] and
-                attrs.padding[1][0] == attrs.padding[1][1])
+                attrs.padding[1][0] == attrs.padding[1][1] and
+                attrs.dilations[0] == 1 and attrs.dilations[1] == 1 and
+                attrs.output_padding[0] == 0 and attrs.output_padding[1] == 0)
             {
                 const batch = try positiveResolvedDim(input_actual, input_shape, 0);
                 const in_channels = try positiveResolvedDim(input_actual, input_shape, 1);
@@ -4590,6 +4752,7 @@ const TestBuf = struct {
     data: []f32,
     allocator: std.mem.Allocator,
     owned: bool,
+    destroy_header: bool = true,
 };
 
 fn testToBuf(ct: CT) *TestBuf {
@@ -4603,6 +4766,10 @@ fn testGetData(ct: CT) []f32 {
 const TestCompute = struct {
     allocator: std.mem.Allocator,
     weights: std.StringHashMapUnmanaged([]f32),
+    /// Model CUDA resident weights expose stable backend-owned CT handles.
+    /// Tests opt into the same aliasing contract with this embedded header.
+    return_shared_weight_handle: bool = false,
+    shared_weight_handle: ?TestBuf = null,
 
     /// Attention layer indices received via gqaPagedAttention dispatch.
     /// Used to verify the interpreter auto-increments layer_index.
@@ -4663,6 +4830,7 @@ const TestCompute = struct {
 
     fn freeTensor(_: *anyopaque, tensor: CT) void {
         const b = testToBuf(tensor);
+        if (!b.destroy_header) return;
         if (b.owned) b.allocator.free(b.data);
         b.allocator.destroy(b);
     }
@@ -4670,6 +4838,18 @@ const TestCompute = struct {
     fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
         const self = fromCtx(ctx);
         const data = self.weights.get(name) orelse return error.MissingWeight;
+        if (self.return_shared_weight_handle) {
+            if (self.shared_weight_handle == null) {
+                self.shared_weight_handle = .{
+                    .data = data,
+                    .allocator = self.allocator,
+                    .owned = false,
+                    .destroy_header = false,
+                };
+            }
+            if (self.shared_weight_handle) |*shared| return @ptrCast(shared);
+            unreachable;
+        }
         return self.makeBuf(data, false); // borrowed
     }
 
@@ -5378,6 +5558,45 @@ test "runtime shape tensors preserve distinct ONNX reshape layouts" {
     try std.testing.expectEqualSlices(i64, &.{ 1, 16, 1 }, column_shape);
 }
 
+test "native transpose preserves runtime shape over stale concrete hints" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("x", Shape.init(.f32, &.{12}));
+    const target = try builder.parameter("target", Shape.init(.i64, &.{4}));
+    const hint = Shape.init(.f32, &.{ 1, 1, 1, 3 });
+    const reshaped = try graph.addNode(.{
+        .op = .{ .reshape = .{ .new_shape = hint, .runtime_shape = true } },
+        .output_shape = hint,
+        .inputs = .{ input, target, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const transposed = try builder.transpose(reshaped, &.{ 0, 3, 1, 2 });
+    try graph.markOutput(transposed);
+
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    var backend = compute.computeBackend();
+    const values = try backend.fromFloat32Shape(&.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 }, &.{12});
+    defer backend.free(values);
+    const dimensions = try backend.fromFloat32Shape(&.{ 1, 1, 4, 3 }, &.{4});
+    defer backend.free(dimensions);
+    const inputs = [_]RuntimeInput{
+        .{ .node_id = input, .value = values },
+        .{ .node_id = target, .value = dimensions },
+    };
+    var result = try execute(allocator, &graph, &backend, .{ .runtime_inputs = &inputs });
+    defer result.deinit(&backend);
+    const shape = try backend.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3, 1, 4 }, shape);
+    const actual = try backend.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11 }, actual);
+}
+
 test "resolveRuntimeReshapeDims preserves runtime batch for exported singleton reshape" {
     var out: [8]i64 = undefined;
     const resolved = resolveRuntimeReshapeDims(
@@ -6020,6 +6239,151 @@ test "MoE round-trip: trace grouped path → interpret with live routing" {
 const native_mod = if (build_options.enable_native) @import("../ops/native_compute.zig") else struct {};
 const NativeCompute = if (build_options.enable_native) native_mod.NativeCompute else opaque {};
 const WeightStore = if (build_options.enable_native) native_mod.WeightStore else opaque {};
+fn expectNativeConvolution(
+    attrs: ml.graph.node.ConvAttrs,
+    input_declared: Shape,
+    weight_declared: Shape,
+    output_declared: Shape,
+    input_data: []const f32,
+    input_actual_shape: []const i32,
+    weight_data: []const f32,
+    weight_actual_shape: []const i32,
+    expected: []const f32,
+    expected_shape: []const i64,
+) !void {
+    if (!build_options.enable_native) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", input_declared);
+    const weight = try builder.parameter("weight", weight_declared);
+    const output = try graph.addNode(.{
+        .op = .{ .conv_general = attrs },
+        .output_shape = output_declared,
+        .inputs = .{ input, weight, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try graph.markOutput(output);
+
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
+    var backend = compute.computeBackend();
+
+    const input_tensor = try backend.fromFloat32Shape(input_data, input_actual_shape);
+    defer backend.free(input_tensor);
+    const weight_tensor = try backend.fromFloat32Shape(weight_data, weight_actual_shape);
+    defer backend.free(weight_tensor);
+    const runtime_inputs = [_]RuntimeInput{
+        .{ .node_id = input, .value = input_tensor },
+        .{ .node_id = weight, .value = weight_tensor },
+    };
+
+    var result = try execute(allocator, &graph, &backend, .{ .runtime_inputs = &runtime_inputs });
+    defer result.deinit(&backend);
+    const actual = try backend.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, expected, actual);
+
+    const actual_shape = try backend.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, expected_shape, actual_shape);
+}
+
+test "native ConvTranspose 1d executes scatter-add with asymmetric kernel" {
+    var attrs: ml.graph.node.ConvAttrs = .{};
+    attrs.transposed = true;
+    attrs.num_spatial = 1;
+
+    try expectNativeConvolution(
+        attrs,
+        Shape.init(.f32, &.{ -1, 1, -1 }),
+        Shape.init(.f32, &.{ 1, 1, 3 }),
+        Shape.init(.f32, &.{ 1, 1, -1 }),
+        &.{ 1, 2 },
+        &.{ 1, 1, 2 },
+        &.{ 1, 2, 4 },
+        &.{ 1, 1, 3 },
+        &.{ 1, 4, 8, 8 },
+        &.{ 1, 1, 4 },
+    );
+}
+
+test "native ConvTranspose 1d stride two handles overlap and non-overlap" {
+    var attrs: ml.graph.node.ConvAttrs = .{};
+    attrs.transposed = true;
+    attrs.num_spatial = 1;
+    attrs.strides[0] = 2;
+
+    try expectNativeConvolution(
+        attrs,
+        Shape.init(.f32, &.{ 1, 1, 2 }),
+        Shape.init(.f32, &.{ 1, 1, 3 }),
+        Shape.init(.f32, &.{ 1, 1, 5 }),
+        &.{ 1, 2 },
+        &.{ 1, 1, 2 },
+        &.{ 1, 1, 1 },
+        &.{ 1, 1, 3 },
+        &.{ 1, 1, 3, 2, 2 },
+        &.{ 1, 1, 5 },
+    );
+    try expectNativeConvolution(
+        attrs,
+        Shape.init(.f32, &.{ 1, 1, 2 }),
+        Shape.init(.f32, &.{ 1, 1, 2 }),
+        Shape.init(.f32, &.{ 1, 1, 4 }),
+        &.{ 1, 2 },
+        &.{ 1, 1, 2 },
+        &.{ 1, 1 },
+        &.{ 1, 1, 2 },
+        &.{ 1, 1, 2, 2 },
+        &.{ 1, 1, 4 },
+    );
+}
+
+test "native ConvTranspose 2d executes groups dilation signed pads and output padding" {
+    var attrs: ml.graph.node.ConvAttrs = .{};
+    attrs.transposed = true;
+    attrs.num_spatial = 2;
+    attrs.groups = 2;
+    attrs.strides = .{ 2, 2, 1, 1 };
+    attrs.padding = .{ .{ -1, 1 }, .{ 0, 1 }, .{ 0, 0 }, .{ 0, 0 } };
+    attrs.dilations = .{ 2, 1, 1, 1 };
+    attrs.output_padding = .{ 1, 1, 0, 0 };
+
+    try expectNativeConvolution(
+        attrs,
+        Shape.init(.f32, &.{ 1, 2, 2, 2 }),
+        Shape.init(.f32, &.{ 2, 1, 2, 1 }),
+        Shape.init(.f32, &.{ 1, 2, 6, 3 }),
+        &.{
+            1, 2,
+            3, 4,
+            5, 6,
+            7, 8,
+        },
+        &.{ 1, 2, 2, 2 },
+        &.{ 1, 10, 2, -1 },
+        &.{ 2, 1, 2, 1 },
+        &.{
+            0,  0, 0,
+            1,  0, 2,
+            0,  0, 0,
+            13, 0, 24,
+            0,  0, 0,
+            30, 0, 40,
+            0,  0, 0,
+            10, 0, 12,
+            0,  0, 0,
+            9,  0, 10,
+            0,  0, 0,
+            -7, 0, -8,
+        },
+        &.{ 1, 2, 6, 3 },
+    );
+}
 
 test "interpreter cancellation releases owned intermediates and preserves borrowed inputs" {
     const Control = struct {
@@ -6096,6 +6460,38 @@ test "native interpreter does not donate a reshape view before a future sibling 
     const original_data = try cb_val.toFloat32(x_ct, allocator);
     defer allocator.free(original_data);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, original_data);
+}
+
+test "execute preserves a tied resident weight handle until its final parameter use" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = ml.graph.Builder.init(&g);
+
+    // Topological graph sorting places all parameter nodes before compute.
+    // CUDA returns the same backend-owned CT for these tied names, matching
+    // Gemma's input embedding and LM-head relationship.
+    const embed_weight = try bld.parameter("model.embed_tokens.weight", Shape.init(.f32, &.{ 2, 2 }));
+    const lm_head_weight = try bld.parameter("lm_head.tied.weight", Shape.init(.f32, &.{ 2, 2 }));
+    const x = try bld.tensorConst(&.{ 3.0, 4.0 }, Shape.init(.f32, &.{ 1, 2 }));
+    const embedded = try bld.linearNoBias(x, embed_weight, 1, 2, 2);
+    const logits = try bld.linearNoBias(embedded, lm_head_weight, 1, 2, 2);
+    try g.markOutput(logits);
+
+    var tc_backend = TestCompute.init(allocator);
+    defer tc_backend.deinit();
+    defer tc_backend.freeWeights();
+    try tc_backend.addWeight("model.embed_tokens.weight", &.{ 1.0, 0.0, 0.0, 1.0 });
+    try tc_backend.addWeight("lm_head.tied.weight", &.{ 1.0, 0.0, 0.0, 1.0 });
+    tc_backend.return_shared_weight_handle = true;
+    var cb = tc_backend.backend();
+
+    var result = try execute(allocator, &g, &cb, .{});
+    defer result.deinit(&cb);
+    const actual = try cb.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 3.0, 4.0 }, actual);
 }
 
 fn testDuplicateWeightParameters(allocator: std.mem.Allocator, capture: bool) !void {
@@ -8025,4 +8421,17 @@ test "Metal i64 arithmetic and mixed comparisons never round through float" {
     const cast_bytes = (try gpu.exportTensorData(cast, a)).?;
     defer a.free(cast_bytes.payload.bytes);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ -1, 0, 2 }), cast_bytes.payload.bytes);
+}
+
+test "native Conv1d preserves dilation with padding stride and multiple channels" {
+    var attrs: ml.graph.node.ConvAttrs = .{};
+    attrs.num_spatial = 1;
+    attrs.dilations[0] = 2;
+    try expectNativeConvolution(attrs, Shape.init(.f32, &.{ 1, 1, 5 }), Shape.init(.f32, &.{ 1, 1, 2 }), Shape.init(.f32, &.{ 1, 1, 3 }), &.{ 1, 2, 3, 4, 5 }, &.{ 1, 1, 5 }, &.{ 1, 1 }, &.{ 1, 1, 2 }, &.{ 4, 6, 8 }, &.{ 1, 1, 3 });
+    attrs.padding[0] = .{ 1, 1 };
+    attrs.strides[0] = 2;
+    try expectNativeConvolution(attrs, Shape.init(.f32, &.{ 1, 1, 5 }), Shape.init(.f32, &.{ 1, 1, 2 }), Shape.init(.f32, &.{ 1, 1, 3 }), &.{ 1, 2, 3, 4, 5 }, &.{ 1, 1, 5 }, &.{ 1, 1 }, &.{ 1, 1, 2 }, &.{ 2, 6, 4 }, &.{ 1, 1, 3 });
+    attrs.padding[0] = .{ 0, 0 };
+    attrs.strides[0] = 1;
+    try expectNativeConvolution(attrs, Shape.init(.f32, &.{ 1, 2, 5 }), Shape.init(.f32, &.{ 1, 2, 2 }), Shape.init(.f32, &.{ 1, 1, 3 }), &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, &.{ 1, 2, 5 }, &.{ 1, 2, 3, 4 }, &.{ 1, 2, 2 }, &.{ 57, 67, 77 }, &.{ 1, 1, 3 });
 }

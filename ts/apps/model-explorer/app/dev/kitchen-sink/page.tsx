@@ -1,4 +1,4 @@
-import { kernels, manifest, snippetsFor } from "@/lib/data";
+import { kernels, manifest } from "@/lib/data";
 import { KitchenSinkClient } from "./sink-client";
 
 export const metadata = {
@@ -8,13 +8,5 @@ export const metadata = {
 
 export default function KitchenSinkPage() {
   const routes = kernels.routes.slice(0, 3);
-  const snippets = snippetsFor(routes.map((r) => r.source));
-  return (
-    <KitchenSinkClient
-      routes={routes}
-      snippets={snippets}
-      gitCommit={manifest.gitCommit}
-      permalinkBase={manifest.permalinkBase}
-    />
-  );
+  return <KitchenSinkClient routes={routes} permalinkBase={manifest.permalinkBase} />;
 }

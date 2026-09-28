@@ -688,6 +688,7 @@ test "generated route policy inventory is unique and describes wire modes" {
     const server = generated.server;
     var found_buffered_query = false;
     var found_streaming_retrieval = false;
+    var found_streaming_research = false;
     var found_streaming_inference_connection = false;
     for (server.routes, 0..) |route, index| {
         for (server.routes[index + 1 ..]) |other| {
@@ -699,11 +700,14 @@ test "generated route policy inventory is unique and describes wire modes" {
             found_buffered_query = route.request_body == .buffered and !route.streaming_response;
         if (std.mem.eql(u8, route.operation_id, "retrievalAgent"))
             found_streaming_retrieval = route.request_body == .buffered and route.streaming_response;
+        if (std.mem.eql(u8, route.operation_id, "researchAgent"))
+            found_streaming_research = route.request_body == .buffered and route.streaming_response;
         if (std.mem.eql(u8, route.operation_id, "invokeInferenceConnection"))
             found_streaming_inference_connection = route.request_body == .buffered and route.streaming_response;
     }
     try std.testing.expect(found_buffered_query);
     try std.testing.expect(found_streaming_retrieval);
+    try std.testing.expect(found_streaming_research);
     try std.testing.expect(found_streaming_inference_connection);
     try std.testing.expectEqual(server.routes.len, request_admission_policy.public_operation_policies.len);
 
@@ -726,6 +730,8 @@ test "generated route policy inventory is unique and describes wire modes" {
 
     try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("queryBuilderAgent").?);
     try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("retrievalAgent").?);
+    try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("researchAgent").?);
+    try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("advanceResearchJob").?);
     try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("globalQuery").?);
     try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("queryTable").?);
     try std.testing.expectEqual(.query, request_admission_policy.publicOperationClass("scanKeys").?);

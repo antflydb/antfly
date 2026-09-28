@@ -2798,6 +2798,32 @@ test "rolling upgrade leader catches up legacy follower rejection" {
     }
 }
 
+test "leader status reports lagging voter replication without changing commit state" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var voters = [_]types.NodeId{ 1, 2, 3 };
+    try storage.seedConfState(.{ .voters = &voters });
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 7,
+        .peers = &voters,
+        .check_quorum = false,
+        .pre_vote = false,
+    }, storage.storage());
+    defer raft.deinit();
+    try raft.campaign();
+    clearMessages(&raft);
+    try raft.step(.{ .msg_type = .request_vote_response, .from = 2, .to = 1, .term = 1 });
+    const last = raft.log.lastIndex();
+    raft.progress[1].match_index = last;
+    raft.progress[1].recent_active = true;
+    const status = raft.status();
+    try std.testing.expectEqual(types.StateRole.leader, status.soft.role);
+    try std.testing.expectEqual(@as(usize, 2), status.voters_at_last_index);
+    try std.testing.expectEqual(@as(usize, 2), status.recent_active_voters);
+    try std.testing.expectEqual(@as(types.Index, 0), status.lowest_voter_match_index);
+}
+
 test "legacy append rejections coalesce until heartbeat and forward progress cancels fallback" {
     for ([_]bool{ false, true }) |ack_before_heartbeat| {
         var fixture = try initLeaderFromSnapshotWithMaxInflight(1);

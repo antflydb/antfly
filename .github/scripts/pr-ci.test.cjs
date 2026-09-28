@@ -21,6 +21,7 @@ function fixture() {
   const statuses = [];
   const checks = [], dispatches = [], cancelled = [], runs = [], outputs = {}, notices = [];
   let permission = 'write';
+  let permissionCalls = 0;
   let files = [{filename: 'docs/guide.md'}];
   let jobs = [{name: 'PR CI result', conclusion: 'success'}];
   const github = {rest: {
@@ -43,8 +44,10 @@ function fixture() {
     },
     issues: {getComment: async () => ({data: structuredClone(comment)})},
     repos: {createCommitStatus: async body => {statuses.push(structuredClone(body));}, getCollaboratorPermissionLevel: async () => {
-      if (typeof permission === 'number') throw Object.assign(new Error('Permission lookup failed'), {status: permission});
-      return {data: {permission}};
+      permissionCalls++;
+      const current = Array.isArray(permission) ? permission.shift() : permission;
+      if (typeof current === 'number') throw Object.assign(new Error('Permission lookup failed'), {status: current});
+      return {data: {permission: current}};
     }},
     actions: {
       listWorkflowRuns: async ({status}) => runs.filter(r => r.status === status),
@@ -57,7 +60,8 @@ function fixture() {
   const core = {setOutput: (k,v) => {outputs[k]=v;}, notice: msg => notices.push(msg)};
   const env = {PR_NUMBER: '7', CHECK_ID: '1', COMMENT_ID: '17', HEAD_SHA: SHA, BASE_SHA: BASE};
   return {pr, comment, context, checks, statuses, notices, dispatches, cancelled, runs, outputs, env, github,
-    permission: value => {permission = value;}, files: value => {files = value;},
+    permission: value => {permission = value;}, permissionCalls: () => permissionCalls,
+    files: value => {files = value;},
     jobs: value => {jobs = value;},
     call: (mode='event') => main({github, context, core, mode, config, env}),
     finish: () => {
@@ -100,6 +104,33 @@ test('approval is consumed once, uses the default branch, and publishes on the P
   f.finish(); await f.call();
   assert.equal(f.checks[0].conclusion,'success');
   await assert.rejects(f.call('verify'),/expired/);
+});
+
+test('transient collaborator lookup failures retry but authorization failures remain closed', async () => {
+  const transient = fixture(); transient.permission([503, 502, 'write']);
+  await transient.call();
+  assert.equal(transient.permissionCalls(), 3);
+  assert.equal(transient.dispatches.length, 1);
+
+  const denied = fixture(); denied.permission([403, 'write']);
+  await denied.call();
+  assert.equal(denied.permissionCalls(), 1);
+  assert.equal(denied.dispatches.length, 0);
+
+  const exhausted = fixture(); exhausted.permission([503, 503, 503, 'write']);
+  await exhausted.call();
+  assert.equal(exhausted.permissionCalls(), 3);
+  assert.equal(exhausted.dispatches.length, 0);
+
+  const unknown = fixture();
+  let unknownCalls = 0;
+  unknown.github.rest.repos.getCollaboratorPermissionLevel = async () => {
+    unknownCalls++;
+    throw new Error('unexpected lookup failure');
+  };
+  await unknown.call();
+  assert.equal(unknownCalls, 1);
+  assert.equal(unknown.dispatches.length, 0);
 });
 
 test('PR checks link to the admitted run through completion and revocation', async t => {
@@ -580,6 +611,44 @@ test('PR orchestrator limits all called suites to read-only GitHub caches', () =
     const workflow = fs.readFileSync(path.join(root, file), 'utf8');
     for (const match of workflow.matchAll(/^\s*cache-mode:\s*(.*?)\s*$/gm)) {
       assert.ok(['read', 'none'].includes(match[1]), `${file} broadens PR cache access`);
+    }
+  }
+});
+
+test('full and soak labels require fresh approval and preserve suite admission', async t => {
+  for (const [label, suite] of [['ci:full', 'full'], ['ci:soak', 'soak']]) {
+    await t.test(label, async () => {
+      const f = fixture();
+      f.pr.labels = [{name: label}];
+      f.context.payload.issue.labels = structuredClone(f.pr.labels);
+      f.context.eventName = 'pull_request_target';
+      f.context.payload.action = 'labeled';
+      f.context.payload.label = {name: label};
+      await f.call();
+      assert.equal(f.dispatches.length, 0);
+      f.context.eventName = 'issue_comment';
+      f.context.payload.action = 'created';
+      await f.call();
+      f.env.CHECK_ID = f.dispatches[0].inputs.check_id;
+      await f.call('admit');
+      assert.ok(JSON.parse(f.outputs.suites).includes(suite));
+      f.env.SUITE = suite;
+      await f.call('verify');
+      f.pr.labels = [];
+      await assert.rejects(f.call('verify'), /selected suites changed/);
+    });
+  }
+});
+
+test('PR result maps expanded suites to their single execution job', () => {
+  const workflow = fs.readFileSync(path.resolve(__dirname, '../workflows/pr-ci.yml'), 'utf8');
+  const script = workflow.split('const needs = JSON.parse(process.env.RESULTS);')[1].split('\n  publish:')[0];
+  const check = new Function('process', `const needs = JSON.parse(process.env.RESULTS);${script}`);
+  const results = {approve: {result: 'success', outputs: {suites: JSON.stringify(['zig', 'full', 'vopr', 'soak'])}}, zig: {result: 'success'}, vopr: {result: 'success'}};
+  check({env: {RESULTS: JSON.stringify(results)}});
+  for (const job of ['zig', 'vopr']) {
+    for (const result of ['failure', 'skipped', 'cancelled']) {
+      assert.throws(() => check({env: {RESULTS: JSON.stringify({...results, [job]: {result}})}}), /did not pass/);
     }
   }
 });

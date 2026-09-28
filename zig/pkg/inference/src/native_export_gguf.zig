@@ -1126,6 +1126,18 @@ test "gliner boundary export cannot write a legacy span bundle" {
     try requireLegacyGlinerExportProfile(.{ .allocator = a, .gliner_model_type = "gliner2" });
 }
 
+/// The classification MLP is a few MB but runs on every classification
+/// request; a quantized copy costs more per request (GLiNER2.5-Decide Metal:
+/// 27 ms vs 5 ms) than it saves in bundle size.
+fn keepGlinerHeadTensorDense(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "classifier.");
+}
+
+test "gliner head export keeps the classifier dense" {
+    try std.testing.expect(keepGlinerHeadTensorDense("classifier.0.weight"));
+    try std.testing.expect(!keepGlinerHeadTensorDense("span_rep.span_rep_layer.project_start.0.weight"));
+}
+
 fn defaultGlinerHeadOutputPath(allocator: std.mem.Allocator, output_path: []const u8) ![]u8 {
     const parent = std.fs.path.dirname(output_path) orelse ".";
     return std.fs.path.join(allocator, &.{ parent, "gliner_head.gguf" });
@@ -1154,7 +1166,13 @@ fn writeGlinerEncoderGguf(
     quantization: QuantizationMode,
     filter: QuantizationFilter,
 ) !void {
-    const config_bytes = try c_file.readFileFromDir(allocator, model_dir, "config.json");
+    // Original Fastino checkpoints keep only wrapper metadata in config.json;
+    // the DeBERTa geometry lives in the encoder sidecar. Parsing the wrapper
+    // would silently stamp deberta-v3-base geometry on a large encoder.
+    const config_bytes = c_file.readFileFromDir(allocator, model_dir, "encoder_config/config.json") catch |err| switch (err) {
+        error.FileNotFound => try c_file.readFileFromDir(allocator, model_dir, "config.json"),
+        else => return err,
+    };
     defer allocator.free(config_bytes);
     const config = try deberta_mod.parseConfig(allocator, config_bytes);
 
@@ -1340,7 +1358,8 @@ fn writeGlinerHeadGguf(
         const dimensions = try glinerHeadDimsForRecord(allocator, record.descriptor.name, record.descriptor.shape, transform);
         errdefer allocator.free(dimensions);
         const tensor_quantization = supportedQuantizationForDescriptor(false, quantization, record.descriptor, transform);
-        const filtered_quantization = if (quantizationFilterMatches(filter, record.descriptor.name, record.descriptor.name))
+        const filtered_quantization = if (quantizationFilterMatches(filter, record.descriptor.name, record.descriptor.name) and
+            !keepGlinerHeadTensorDense(record.descriptor.name))
             tensor_quantization
         else
             .none;
@@ -1534,12 +1553,14 @@ fn copyGlinerBundleAssets(
         "vocab.txt",
         "vocab.json",
         "merges.txt",
+        "encoder_config/config.json",
     };
     for (asset_names) |asset_name| {
         const bytes = c_file.readFileFromDir(allocator, model_dir, asset_name) catch continue;
         defer allocator.free(bytes);
         const target = try std.fs.path.join(allocator, &.{ out_dir, asset_name });
         defer allocator.free(target);
+        if (std.fs.path.dirname(target)) |parent| try compat.cwd().createDirPath(io, parent);
         try compat.cwd().writeFile(io, .{ .sub_path = target, .data = bytes });
     }
     try writeGlinerBundleMarker(allocator, out_dir, output_path);

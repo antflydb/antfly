@@ -16,7 +16,9 @@ const std = @import("std");
 const image_mod = @import("image.zig");
 const multistage_ocr = @import("multistage_ocr.zig");
 
-pub fn cropBBox(allocator: std.mem.Allocator, img: image_mod.Image, bbox: [4]f64) !image_mod.Image {
+pub const Orientation = enum { preserve, rotate_tall_ccw };
+
+pub fn cropBBox(allocator: std.mem.Allocator, img: image_mod.Image, bbox: [4]f64, orientation: Orientation) !image_mod.Image {
     const x = @as(i64, @intFromFloat(bbox[0]));
     const y = @as(i64, @intFromFloat(bbox[1]));
     const width = @as(i64, @intFromFloat(bbox[2] - bbox[0])) + 1;
@@ -24,8 +26,13 @@ pub fn cropBBox(allocator: std.mem.Allocator, img: image_mod.Image, bbox: [4]f64
 
     if (width <= 0 or height <= 0) return zeroImage(allocator, 1, 1, img.channels);
 
-    const out_width: u32 = @intCast(width);
-    const out_height: u32 = @intCast(height);
+    const crop_width: u32 = @intCast(width);
+    const crop_height: u32 = @intCast(height);
+    // Paddle's recognition crop uses np.rot90 when height / width >= 1.5.
+    const rotate = orientation == .rotate_tall_ccw and
+        @as(u64, crop_height) * 2 >= @as(u64, crop_width) * 3;
+    const out_width = if (rotate) crop_height else crop_width;
+    const out_height = if (rotate) crop_width else crop_height;
     const channels: u32 = if (img.channels == 0) 3 else img.channels;
     const pixel_count = @as(usize, out_width) * @as(usize, out_height) * @as(usize, channels);
     const data = try allocator.alloc(u8, pixel_count);
@@ -36,14 +43,17 @@ pub fn cropBBox(allocator: std.mem.Allocator, img: image_mod.Image, bbox: [4]f64
     const src_height = @as(i64, img.height);
     const channel_count = @as(usize, channels);
 
-    for (0..@as(usize, out_height)) |dy| {
-        for (0..@as(usize, out_width)) |dx| {
+    for (0..@as(usize, crop_height)) |dy| {
+        for (0..@as(usize, crop_width)) |dx| {
             const src_x = x + @as(i64, @intCast(dx));
             const src_y = y + @as(i64, @intCast(dy));
             if (src_x < 0 or src_y < 0 or src_x >= src_width or src_y >= src_height) continue;
 
             const src_offset = (@as(usize, @intCast(src_y)) * @as(usize, img.width) + @as(usize, @intCast(src_x))) * channel_count;
-            const dst_offset = (dy * @as(usize, out_width) + dx) * channel_count;
+            const dst_offset = (if (rotate)
+                (@as(usize, crop_width) - 1 - dx) * @as(usize, out_width) + dy
+            else
+                dy * @as(usize, out_width) + dx) * channel_count;
             @memcpy(data[dst_offset .. dst_offset + channel_count], img.data[src_offset .. src_offset + channel_count]);
         }
     }
@@ -57,7 +67,7 @@ pub fn cropBBox(allocator: std.mem.Allocator, img: image_mod.Image, bbox: [4]f64
 }
 
 pub fn cropRegion(allocator: std.mem.Allocator, img: image_mod.Image, region: multistage_ocr.TextRegion) !image_mod.Image {
-    return cropBBox(allocator, img, region.bbox);
+    return cropBBox(allocator, img, region.bbox, .preserve);
 }
 
 pub fn sortTextRegionsByReadingOrder(regions: []multistage_ocr.TextRegion) void {
@@ -93,7 +103,7 @@ test "cropBBox returns inclusive rectangular crop" {
         .channels = 3,
     };
 
-    const cropped = try cropBBox(allocator, src, .{ 1, 0, 2, 0 });
+    const cropped = try cropBBox(allocator, src, .{ 1, 0, 2, 0 }, .preserve);
     defer cropped.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 2), cropped.width);
@@ -113,7 +123,7 @@ test "cropBBox pads out of bounds with zeros" {
         .channels = 3,
     };
 
-    const cropped = try cropBBox(allocator, src, .{ -1, 0, 1, 0 });
+    const cropped = try cropBBox(allocator, src, .{ -1, 0, 1, 0 }, .preserve);
     defer cropped.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 3), cropped.width);
@@ -122,4 +132,39 @@ test "cropBBox pads out of bounds with zeros" {
         1, 2, 3,
         4, 5, 6,
     }, cropped.data);
+}
+
+test "recognition crop rotates tall RGB pixels counterclockwise and preserves source coordinates" {
+    const allocator = std.testing.allocator;
+    var pixels = [_]u8{
+        1,  2,  3,  4,  5,  6,
+        7,  8,  9,  10, 11, 12,
+        13, 14, 15, 16, 17, 18,
+    };
+    const src = image_mod.Image{ .data = &pixels, .width = 2, .height = 3, .channels = 3 };
+    const rotated = try cropBBox(allocator, src, .{ 0, 0, 1, 2 }, .rotate_tall_ccw);
+    defer rotated.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 3), rotated.width);
+    try std.testing.expectEqual(@as(u32, 2), rotated.height);
+    try std.testing.expectEqualSlices(u8, &.{
+        4, 5, 6, 10, 11, 12, 16, 17, 18,
+        1, 2, 3, 7,  8,  9,  13, 14, 15,
+    }, rotated.data);
+
+    const preserved = try cropBBox(allocator, src, .{ 0, 0, 1, 2 }, .preserve);
+    defer preserved.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 2), preserved.width);
+    try std.testing.expectEqual(@as(u32, 3), preserved.height);
+    try std.testing.expectEqualSlices(u8, &pixels, preserved.data);
+
+    const square = try cropBBox(allocator, src, .{ 0, 0, 1, 1 }, .rotate_tall_ccw);
+    defer square.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, pixels[0..12], square.data);
+
+    const padded = try cropBBox(allocator, src, .{ -1, 0, 0, 2 }, .rotate_tall_ccw);
+    defer padded.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, &.{
+        1, 2, 3, 7, 8, 9, 13, 14, 15,
+        0, 0, 0, 0, 0, 0, 0,  0,  0,
+    }, padded.data);
 }

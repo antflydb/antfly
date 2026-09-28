@@ -105,11 +105,13 @@ const public_limits = @import("public_limits.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
 const request_admission_policy = @import("request_admission_policy.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
+const research_agent = @import("research_agent.zig");
 const web_search = @import("web_search.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const distributed_join = @import("distributed_join.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
+const research_jobs = @import("research_jobs.zig");
 const repair_jobs = @import("repair_jobs.zig");
 const admin_routes = @import("../admin/routes.zig");
 const internal_api_routes = @import("../internal/routes.zig");
@@ -569,6 +571,19 @@ fn restoreRetryDelayNs(err: anyerror, job_id: u64, attempt_id: u64) u64 {
     };
 }
 
+fn restoreRewriteStepError(err: anyerror) anyerror {
+    // A source or target owner may briefly be unroutable while its group
+    // elects a leader. Source observations are read-only; routed source writes
+    // distinguish non-proposal from an unknown outcome. Every rewrite step
+    // resumes from durable source and target receipts.
+    // Keep the same attempt: requeueing it durably on every election gap adds
+    // metadata WAL commits and eventually exponential backoff to the outage.
+    return switch (err) {
+        error.RestoreValidationPending, error.GroupLeaderUnavailable => error.RestoreStagingWait,
+        else => err,
+    };
+}
+
 fn waitForRestoreCutoverFence(
     alloc: std.mem.Allocator,
     reads: table_reads.TableReadSource,
@@ -603,6 +618,12 @@ test "restore cutover readiness waits without exponential retry" {
     try std.testing.expectEqual(restore_staging_wait_ns, restoreRetryDelayNs(error.RestoreStagingWait, 42, 8));
     try std.testing.expect(restoreRetryDelayNs(error.RestoreValidationPending, 42, 8) > restore_staging_wait_ns);
     try std.testing.expect(restoreJobErrorIsRetryable(error.RestoreStagingWait));
+    try std.testing.expectEqual(error.RestoreStagingWait, restoreRewriteStepError(error.RestoreValidationPending));
+    try std.testing.expectEqual(error.RestoreStagingWait, restoreRewriteStepError(error.GroupLeaderUnavailable));
+    // An RPC whose outcome is unknown must retain its distinct error so the
+    // owner receipt can be reconciled; it is not a pre-dispatch routing gap.
+    try std.testing.expectEqual(error.RaftBatchWriteOutcomeUnknown, restoreRewriteStepError(error.RaftBatchWriteOutcomeUnknown));
+    try std.testing.expectEqual(error.RestoreStagingScopeChanged, restoreRewriteStepError(error.RestoreStagingScopeChanged));
 }
 
 test "restore cutover lost begin reply waits for the same fence to drain" {
@@ -1427,6 +1448,11 @@ pub const ApiHttpServerConfig = struct {
     join_job_retention_ms: ?u64 = null,
     artifact_reprocess_job_store_path: ?[]const u8 = null,
     artifact_reprocess_job_retention_ms: ?u64 = null,
+    /// Durable research-agent jobs: an engine-owned store (standalone), else
+    /// a docstore at this path, else `<session_store_path>.research_jobs`.
+    research_job_store: ?*backend_erased.Store = null,
+    research_job_store_path: ?[]const u8 = null,
+    research_job_retention_ms: ?u64 = null,
     repair_job_store_path: ?[]const u8 = null,
     repair_job_retention_ms: ?u64 = null,
     /// Engine-owned durable storage for restore jobs. The caller retains
@@ -3419,6 +3445,10 @@ pub const ApiHttpServer = struct {
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    research_job_store: research_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    research_state_key: [32]u8 = undefined,
+    research_state_key_ready: std.atomic.Value(bool) = .init(false),
+    research_state_key_mutex: std.atomic.Mutex = .unlocked,
     repair_job_store: repair_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     restore_job_store: restore_jobs.Store = .{ .alloc = undefined },
     rewrite_artifact_peer_cursor: std.atomic.Value(usize) = .init(0),
@@ -3644,6 +3674,10 @@ pub const ApiHttpServer = struct {
                 .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
                 .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
+            .research_job_store = research_jobs.Store.init(owner_alloc, .{
+                .path = cfg.research_job_store_path,
+                .retention_ms = cfg.research_job_retention_ms,
+            }),
             .repair_job_store = repair_jobs.Store.init(owner_alloc, .{
                 .repair_job_store_path = cfg.repair_job_store_path,
                 .repair_job_retention_ms = cfg.repair_job_retention_ms,
@@ -3713,6 +3747,29 @@ pub const ApiHttpServer = struct {
 
     fn protocolStoreNowNs() u64 {
         return platform_time.monotonicNs();
+    }
+
+    /// Key that signs client-carried research checkpoints. Derived from the
+    /// internal service secret so every node of a cluster verifies every
+    /// other node's checkpoints; otherwise random per process, so standalone
+    /// checkpoints stop verifying after a restart (durable jobs do not).
+    pub fn researchStateKey(self: *ApiHttpServer, io: std.Io) ![32]u8 {
+        if (self.research_state_key_ready.load(.acquire)) return self.research_state_key;
+        @import("antfly_platform").sync.lockYielding(&self.research_state_key_mutex);
+        defer self.research_state_key_mutex.unlock();
+        if (!self.research_state_key_ready.load(.acquire)) {
+            if (self.cfg.internal_service_secret) |secret| {
+                std.crypto.auth.hmac.sha2.HmacSha256.create(&self.research_state_key, "antfly research_state v1", secret);
+            } else try io.randomSecure(&self.research_state_key);
+            self.research_state_key_ready.store(true, .release);
+        }
+        return self.research_state_key;
+    }
+
+    /// Multi-threaded runtime for bounded agent fan-out (parallel tool calls
+    /// and research researchers). Null runs the same work sequentially.
+    pub fn agentConcurrencyIo(self: *const ApiHttpServer) ?std.Io {
+        return configuredApiNetworkIo(self.cfg);
     }
 
     pub fn inferenceIo(self: *const ApiHttpServer) std.Io {
@@ -4026,6 +4083,20 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.artifact_reprocess_job_store.attachOpenedStore(opened);
         }
+        if (cfg.research_job_store) |store| {
+            try server.research_job_store.attachRuntime(store);
+        } else if (cfg.research_job_store_path orelse cfg.session_store_path) |base_path| {
+            const job_path = if (cfg.research_job_store_path != null)
+                try alloc.dupe(u8, base_path)
+            else
+                try std.fmt.allocPrint(alloc, "{s}.research_jobs", .{base_path});
+            defer alloc.free(job_path);
+            const opened = try alloc.create(research_jobs.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try research_jobs.OpenedStore.open(alloc, job_path);
+            errdefer opened.deinit();
+            try server.research_job_store.attachOpenedStore(opened);
+        }
         if (cfg.repair_job_store_path orelse cfg.session_store_path) |base_path| {
             const job_path = if (cfg.repair_job_store_path != null)
                 try alloc.dupe(u8, base_path)
@@ -4103,6 +4174,7 @@ pub const ApiHttpServer = struct {
         }
         self.join_job_store.deinit();
         self.artifact_reprocess_job_store.deinit();
+        self.research_job_store.deinit();
         self.repair_job_store.deinit();
         self.restore_job_store.deinit();
         self.scheduled_restore_jobs.deinit(self.alloc);
@@ -4581,6 +4653,7 @@ pub const ApiHttpServer = struct {
         };
         self.join_job_store.cleanupExpiredJoinJobs();
         self.artifact_reprocess_job_store.cleanupExpiredJobs();
+        self.research_job_store.cleanupExpiredJobs();
         self.repair_job_store.cleanupExpiredJobs();
         if (self.cfg.backend_runtime) |runtime| {
             _ = runtime.durable_jobs.poll(32) catch |err| {
@@ -7358,6 +7431,35 @@ pub const ApiHttpServer = struct {
         query_embedding_security_scope: QueryEmbeddingSecurityScope,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !void {
+        return self.executeA2aAgent(.retrieval, alloc, body, task_id, context_id, queue, query_embedding_security_scope, authenticated_identity);
+    }
+
+    /// A2A `research` skill: the same native research agent as
+    /// `/agents/research`, reported as A2A task artifacts and status updates.
+    pub fn executeA2aResearch(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        body: []const u8,
+        task_id: []const u8,
+        context_id: []const u8,
+        queue: *a2a.EventQueue,
+        query_embedding_security_scope: QueryEmbeddingSecurityScope,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !void {
+        return self.executeA2aAgent(.research, alloc, body, task_id, context_id, queue, query_embedding_security_scope, authenticated_identity);
+    }
+
+    fn executeA2aAgent(
+        self: *ApiHttpServer,
+        comptime kind: enum { retrieval, research },
+        alloc: std.mem.Allocator,
+        body: []const u8,
+        task_id: []const u8,
+        context_id: []const u8,
+        queue: *a2a.EventQueue,
+        query_embedding_security_scope: QueryEmbeddingSecurityScope,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !void {
         var diagnostic_context: query_request_diagnostics.Context = .{};
         const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
         defer diagnostic_scope.deinit();
@@ -7393,6 +7495,7 @@ pub const ApiHttpServer = struct {
                         .scan_key_page = scanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
                     },
+                    .io = runner.server.agentConcurrencyIo(),
                 };
             }
 
@@ -7527,7 +7630,10 @@ pub const ApiHttpServer = struct {
             .secret_store = self.cfg.secret_store,
             .inference_api_key = self.cfg.inference_api_key,
             .io = self.inferenceIo(),
-            .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
+            .deadline_ns = platform_time.monotonicNs() +| switch (kind) {
+                .retrieval => 5 * std.time.ns_per_min,
+                .research => (research_agent.deadlineMs(alloc, body) orelse research_agent.max_deadline_ms) *| std.time.ns_per_ms,
+            },
         };
 
         var query_runner = RetrievalQueryRunner{
@@ -7568,7 +7674,7 @@ pub const ApiHttpServer = struct {
                         .string => |text| text,
                         else => "completed",
                     } else "completed";
-                    try sink.queue.status(event_alloc, sink.task_id, sink.context_id, state, "retrieval completed");
+                    try sink.queue.status(event_alloc, sink.task_id, sink.context_id, state, "agent completed");
                 }
             }
         };
@@ -7578,8 +7684,22 @@ pub const ApiHttpServer = struct {
             .task_id = task_id,
             .context_id = context_id,
         };
-        try queue.status(alloc, task_id, context_id, "working", "retrieval started");
-        const retrieval_resp = retrieval_agent.executeWithEventSink(alloc, query_runner.iface(), generation_runner.iface(), body, sink.iface()) catch |err| switch (err) {
+        try queue.status(alloc, task_id, context_id, "working", @tagName(kind) ++ " started");
+        const retrieval_resp = (switch (kind) {
+            .retrieval => retrieval_agent.executeWithEventSink(alloc, query_runner.iface(), generation_runner.iface(), body, sink.iface()),
+            .research => research_agent.execute(alloc, query_runner.iface(), generation_runner.iface(), body, sink.iface(), .{
+                .deadline_ns = generation_runner.deadline_ns,
+                .state_key = try self.researchStateKey(self.inferenceIo()),
+            }),
+        }) catch |err| switch (err) {
+            error.InvalidResearchAgentRequest => {
+                try queue.status(alloc, task_id, context_id, "failed", "invalid research agent request");
+                return;
+            },
+            error.InvalidResearchState => {
+                try queue.status(alloc, task_id, context_id, "failed", "research_state was modified or issued by another server");
+                return;
+            },
             error.TreeRootSetTooLarge => {
                 try queue.status(alloc, task_id, context_id, "failed", "tree root set exceeds the bounded retrieval limit");
                 return;
@@ -12298,6 +12418,7 @@ pub const ApiHttpServer = struct {
             error.PortableImportRecoveryRequired,
             error.PortableRuntimeActivationPending,
             error.StorageBusy,
+            error.StorageKernelOwnerStaleDescriptor,
             error.StorageReadTemporarilyUnavailable,
             error.RestoreStagingInProgress,
             error.ConcurrencyUnavailable,
@@ -12450,27 +12571,71 @@ pub const ApiHttpServer = struct {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const retry_io = self.sharedApiIo();
-        const start_ns = retryMonotonicNs(retry_io);
-        const retry_deadline_ns = table_catalog.RoutingBudget.initIo(null, retry_io).deadlineFrom(.{
+        const clock = table_catalog.RoutingBudget.initIo(null, retry_io);
+        const start_ns = clock.nowNs();
+        var retry_deadline_ns = clock.deadlineFrom(.{
             .deadline_ns = request.deadline_ns,
             .io = request.deadline_io,
         });
+        if (clock.deadlineFrom(.{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io })) |deadline|
+            retry_deadline_ns = if (retry_deadline_ns) |current| @min(current, deadline) else deadline;
+        const attempt_deadline_ns: ?u64 = if (retry_timeout_ns != 0)
+            @min(retry_deadline_ns orelse std.math.maxInt(u64), start_ns +| retry_timeout_ns)
+        else
+            retry_deadline_ns;
+        const Cancellation = struct {
+            request: CancellationToken,
+            options: ?CancellationToken,
+            fn check(ptr: *const anyopaque) bool {
+                const self_: *const @This() = @ptrCast(@alignCast(ptr));
+                return self_.request.isCancelled() or if (self_.options) |token| token.isCancelled() else false;
+            }
+        };
+        var cancellation = Cancellation{ .request = request.cancellation, .options = opts.cancellation };
+        var scoped = opts;
+        // The first ordinary read keeps its caller budget. The readiness
+        // ceiling applies only after a transient readiness failure, never to
+        // a successful long-running read admitted with a larger deadline.
+        scoped.execution_deadline_ns = retry_deadline_ns;
+        scoped.execution_io = clock.io;
+        scoped.cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = Cancellation.check };
+        var retrying = false;
+        var last_readiness_error: anyerror = error.StorageReadTemporarilyUnavailable;
         while (true) {
             try ensureTableOperationActive(request);
-            return source.lookup(alloc, table_name, key, opts, consistency) catch |err| switch (err) {
-                error.StorageReadTemporarilyUnavailable => {
-                    const now_ns = retryMonotonicNs(retry_io);
-                    if (retry_timeout_ns == 0) return err;
-                    const sleep_ns = boundedRetrySleepNs(
-                        retry_deadline_ns,
-                        now_ns,
-                        start_ns,
-                        retry_timeout_ns,
-                        retry_poll_ns,
-                    ) orelse return err;
+            try ensureRequestActive(scoped.cancellation);
+            if (retryDeadlineExpired(retry_deadline_ns, clock.nowNs())) return error.DeadlineExceeded;
+            if (retrying and retryDeadlineExpired(attempt_deadline_ns, clock.nowNs())) return last_readiness_error;
+            return source.lookup(alloc, table_name, key, scoped, consistency) catch |err| switch (err) {
+                error.StorageReadTemporarilyUnavailable,
+                error.StorageKernelOwnerStaleDescriptor,
+                error.NotLeader,
+                error.LeaderUnavailable,
+                error.GroupLeaderUnavailable,
+                error.UnknownGroup,
+                error.ReadIndexTimeout,
+                error.TopologyChanged,
+                error.IdentityReadGenerationChanged,
+                error.DocIdentityNamespaceMismatch,
+                => {
+                    const terminal_error = if (err == error.StorageKernelOwnerStaleDescriptor) error.StorageReadTemporarilyUnavailable else err;
+                    const now_ns = clock.nowNs();
+                    if (retryDeadlineExpired(retry_deadline_ns, now_ns)) return error.DeadlineExceeded;
+                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return terminal_error;
                     if (sleep_ns == 0) return error.DeadlineExceeded;
-                    try sleepNsCancellable(retry_io, sleep_ns, request.cancellation);
+                    // Each iteration resolves a fresh fenced route and obtains
+                    // its own quorum/apply proof. No stale read fallback or
+                    // mutation replay is admitted by this readiness retry.
+                    retrying = true;
+                    last_readiness_error = terminal_error;
+                    scoped.execution_deadline_ns = attempt_deadline_ns;
+                    try sleepNsCancellable(retry_io, sleep_ns, scoped.cancellation);
                     continue;
+                },
+                error.Timeout, error.DeadlineExceeded => {
+                    if (retryDeadlineExpired(retry_deadline_ns, clock.nowNs())) return error.DeadlineExceeded;
+                    if (retrying and clock.nowNs() -| start_ns >= retry_timeout_ns) return error.StorageReadTemporarilyUnavailable;
+                    return err;
                 },
                 else => return err,
             };
@@ -12604,6 +12769,7 @@ pub const ApiHttpServer = struct {
                 error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
                 error.PersistentDescriptorAdmissionExhausted,
                 error.StorageBusy,
+                error.StorageKernelOwnerStaleDescriptor,
                 error.StorageReadTemporarilyUnavailable,
                 error.ConcurrencyUnavailable,
                 => return error.StorageReadTemporarilyUnavailable,
@@ -12680,6 +12846,7 @@ pub const ApiHttpServer = struct {
             error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageBusy,
+            error.StorageKernelOwnerStaleDescriptor,
             error.StorageReadTemporarilyUnavailable,
             error.ConcurrencyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
@@ -12788,6 +12955,7 @@ pub const ApiHttpServer = struct {
             error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageBusy,
+            error.StorageKernelOwnerStaleDescriptor,
             error.StorageReadTemporarilyUnavailable,
             error.ConcurrencyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
@@ -15273,7 +15441,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
@@ -15299,7 +15467,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest list failed table={s} doc={s} err={}", .{ table_name, doc_key, err });
@@ -16225,7 +16393,7 @@ pub const ApiHttpServer = struct {
                 const before = worker_state.value.rewrite_progress;
                 driver.step(self, &job, &worker_state.value, context) catch |err| {
                     if (restore_staging_diagnostic_gate.admit(platform_time.monotonicNs())) std.log.warn("restore rewrite retry staging={s} phase={s} owner={d} err={s}", .{ @tagName(phase), @tagName(worker_state.value.rewrite_progress.phase), worker_state.value.rewrite_progress.owner, @errorName(err) });
-                    return @as(anyerror![]u8, err);
+                    return @as(anyerror![]u8, restoreRewriteStepError(err));
                 };
                 rewrite_diagnostic = worker_state.value.rewrite_progress;
                 // Bound CPU/IO work and yield on a pending full owner pass,
@@ -16417,7 +16585,9 @@ pub const ApiHttpServer = struct {
         if (self.cfg.deployment_mode == .standalone) return (self.cfg.restore_owner orelse return error.RestoreValidationPending).execute(alloc, table_name, group_id, request, context);
         var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
         const router = self.cfg.session_router orelse fallback.router();
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.RestoreValidationPending;
+        // No route means no owner request was sent. Preserve that readiness
+        // classification instead of conflating it with an unknown owner write.
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
         defer route.deinit(alloc);
         switch (route) {
             .local => return (self.cfg.restore_owner orelse return error.RestoreValidationPending).execute(alloc, table_name, group_id, request, context),
@@ -16539,6 +16709,15 @@ pub const ApiHttpServer = struct {
     fn stagedRestoreError(err: anyerror) cluster_api_http.ClusterApi.ExecuteRestoreError {
         return switch (err) {
             error.RestoreStagingYield => error.RestoreStagingYield,
+            error.RestoreStagingWait => error.RestoreStagingWait,
+            // Routing gaps also occur during global validation and cutover,
+            // after the rewrite driver has handed off. Their durable owner
+            // progress is still resumable within this same attempt.
+            error.GroupLeaderUnavailable => error.RestoreStagingWait,
+            // Owner transitions can report StorageBusy while the pinned plan
+            // is progressing. Retry the next cooperative slice on the same
+            // durable attempt; a readiness fence uses the longer wait below.
+            error.StorageBusy => error.RestoreStagingYield,
             error.Cancelled => error.Cancelled,
             error.RestoreJobFenced, error.NotLeader => error.NotLeader,
             error.TableAlreadyExists => error.TableAlreadyExists,
@@ -18290,7 +18469,7 @@ pub const ApiHttpServer = struct {
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .read_requires_primary),
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .standby_read_unavailable),
             error.DistributedQueryUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .distributed_query_unavailable),
-            error.StorageBusy, error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
+            error.StorageBusy, error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor, error.ConcurrencyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
             error.InvalidManifest,
             error.InvalidTableFile,
             error.TableBlockChecksumMismatch,
@@ -20716,6 +20895,7 @@ pub const RestoreWorkerTestDriver = if (builtin.is_test) struct {
 test "staged restore worker publishes a dependency complete mixed native cohort" {
     try @import("restore_worker_fixture.zig").run(RestoreWorkerTestDriver, false);
     try @import("restore_worker_fixture.zig").run(RestoreWorkerTestDriver, true);
+    try @import("restore_worker_fixture.zig").runWithPolicy(RestoreWorkerTestDriver, false, null, null, .{ .validation_route_gaps = 3 });
 }
 
 test "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners" {
@@ -20943,6 +21123,26 @@ test "native restore validation uncertainty remains an asynchronous retry" {
     try std.testing.expect(restoreJobErrorIsRetryable(error.RestoreValidationPending));
     try std.testing.expect(restoreJobErrorIsRetryable(error.BackupRepositoryBusy));
     try std.testing.expect(!restoreJobErrorIsRetryable(error.BackupIntegrityFailure));
+}
+
+test "busy staged restore owner retains its pinned attempt" {
+    const routed_wait = ApiHttpServer.stagedRestoreError(error.GroupLeaderUnavailable);
+    try std.testing.expectEqual(error.RestoreStagingWait, routed_wait);
+    try std.testing.expectEqual(restore_staging_wait_ns, restoreRetryDelayNs(routed_wait, 42, 8));
+    // Ambiguous owner writes retain the receipt-reconciliation retry path.
+    try std.testing.expectEqual(error.RestoreValidationPending, ApiHttpServer.stagedRestoreError(error.RaftBatchWriteOutcomeUnknown));
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreStagingWait),
+        ApiHttpServer.stagedRestoreError(error.RestoreStagingWait),
+    );
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreStagingYield),
+        ApiHttpServer.stagedRestoreError(error.StorageBusy),
+    );
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreValidationPending),
+        ApiHttpServer.stagedRestoreError(error.BackupRepositoryBusy),
+    );
 }
 
 test "restore worker authority is fenced across leadership reacquisition" {
@@ -22085,6 +22285,7 @@ fn queryBuilderQueryModesForFieldCapability(capability: storage_schema.FieldCapa
     return switch (capability.field_type) {
         .text, .html => if (capability.searchable) &.{"full_text"} else &.{},
         .search_as_you_type => if (capability.searchable) &.{ "full_text", "autocomplete" } else &.{"autocomplete"},
+        .substring => if (capability.searchable) &.{ "full_text", "substring" } else &.{"substring"},
         .keyword, .link => if (capability.filterable) &.{"exact"} else &.{},
         .numeric, .datetime => if (capability.filterable) &.{ "exact", "range" } else &.{},
         .boolean => if (capability.filterable) &.{"exact"} else &.{},
@@ -24124,7 +24325,7 @@ test "storage migration job observation preserves admitted and unpublished catal
 
 test "storage migration command admission fences delayed starts across handlers" {
     const migration = @import("../common/vector_migration.zig");
-    const Db = @import("../storage/db/db.zig").DB;
+    const Db = @import("antfly_source_root").antfly_sources.physical_db.DB;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -27403,6 +27604,10 @@ test "api http point lookup retries bounded local readiness races" {
     };
     const FakeReads = struct {
         attempts: u32 = 0,
+        first_error: anyerror = error.StorageReadTemporarilyUnavailable,
+        observed_deadline: ?u64 = null,
+        fail_first: bool = true,
+        cancel_on_first: ?*std.atomic.Value(bool) = null,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{ .ptr = self, .vtable = &.{
@@ -27417,14 +27622,19 @@ test "api http point lookup retries bounded local readiness races" {
             alloc: std.mem.Allocator,
             table_name: []const u8,
             key: []const u8,
-            _: db_mod.types.LookupOptions,
+            options: db_mod.types.LookupOptions,
             _: raft_mod.ReadConsistency,
         ) anyerror!?table_reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("doc:1", key);
             self.attempts += 1;
-            if (self.attempts == 1) return error.StorageReadTemporarilyUnavailable;
+            self.observed_deadline = options.execution_deadline_ns;
+            try std.testing.expect(options.cancellation != null);
+            if (self.fail_first and self.attempts == 1) {
+                if (self.cancel_on_first) |token| token.store(true, .release);
+                return self.first_error;
+            }
             return .{
                 .json = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
                 .version = 7,
@@ -27449,29 +27659,83 @@ test "api http point lookup retries bounded local readiness races" {
         }
     };
 
-    var reads = FakeReads{};
-    var server = ApiHttpServer.init(
+    const transient_errors = [_]anyerror{ error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.UnknownGroup, error.ReadIndexTimeout, error.TopologyChanged, error.IdentityReadGenerationChanged, error.DocIdentityNamespaceMismatch };
+    for (transient_errors) |first_error| {
+        var reads = FakeReads{ .first_error = first_error };
+        var server = ApiHttpServer.init(
+            std.testing.allocator,
+            .{},
+            FakeStatus.source(),
+            reads.source(),
+            DummyWrites.source(),
+        );
+        defer server.deinit();
+        var response = (try server.lookupWithReadinessRetry(
+            std.testing.allocator,
+            reads.source(),
+            "docs",
+            "doc:1",
+            .{},
+            .read_index,
+            .{},
+        )).?;
+        defer response.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+        try std.testing.expect(reads.observed_deadline != null);
+        try std.testing.expectEqual(@as(u64, 7), response.version);
+        try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", response.json);
+    }
+
+    var stale_reads = FakeReads{ .first_error = error.StorageKernelOwnerStaleDescriptor };
+    var read_only_server = ApiHttpServer.init(std.testing.allocator, .{}, FakeStatus.source(), stale_reads.source(), null);
+    defer read_only_server.deinit();
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, read_only_server.lookupWithReadinessRetry(
         std.testing.allocator,
-        .{},
-        FakeStatus.source(),
-        reads.source(),
-        DummyWrites.source(),
-    );
-    defer server.deinit();
-    var response = (try server.lookupWithReadinessRetry(
-        std.testing.allocator,
-        reads.source(),
+        stale_reads.source(),
         "docs",
         "doc:1",
         .{},
         .read_index,
         .{},
-    )).?;
-    defer response.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
-    try std.testing.expectEqual(@as(u64, 7), response.version);
-    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", response.json);
+    ));
+    try std.testing.expectEqual(@as(u32, 1), stale_reads.attempts);
+    for (transient_errors) |failure| {
+        var reads = FakeReads{ .first_error = failure };
+        const expected = if (failure == error.StorageKernelOwnerStaleDescriptor) error.StorageReadTemporarilyUnavailable else failure;
+        try std.testing.expectError(expected, read_only_server.lookupWithReadinessRetry(std.testing.allocator, reads.source(), "docs", "doc:1", .{}, .read_index, .{}));
+        try std.testing.expectEqual(@as(u32, 1), reads.attempts);
+    }
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, FakeStatus.source(), null, DummyWrites.source());
+    defer server.deinit();
+    var expired = FakeReads{};
+    try std.testing.expectError(error.DeadlineExceeded, server.lookupWithReadinessRetry(std.testing.allocator, expired.source(), "docs", "doc:1", .{ .execution_deadline_ns = 0 }, .read_index, .{}));
+    try std.testing.expectEqual(@as(u32, 0), expired.attempts);
+    var canceled: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectError(error.Cancelled, server.lookupWithReadinessRetry(std.testing.allocator, expired.source(), "docs", "doc:1", .{ .cancellation = CancellationToken.fromAtomic(&canceled) }, .read_index, .{}));
+    try std.testing.expectEqual(@as(u32, 0), expired.attempts);
+    canceled.store(false, .release);
+    var midflight = FakeReads{ .first_error = error.NotLeader, .cancel_on_first = &canceled };
+    try std.testing.expectError(error.Cancelled, server.lookupWithReadinessRetry(std.testing.allocator, midflight.source(), "docs", "doc:1", .{}, .read_index, .{ .cancellation = CancellationToken.fromAtomic(&canceled) }));
+    try std.testing.expectEqual(@as(u32, 1), midflight.attempts);
+    var bounded = FakeReads{ .first_error = error.UnknownGroup };
+    const deadline = platform_time.monotonicNs() + 10 * std.time.ns_per_ms;
+    try std.testing.expectError(error.DeadlineExceeded, server.lookupWithReadinessRetry(std.testing.allocator, bounded.source(), "docs", "doc:1", .{}, .read_index, .{ .deadline_ns = deadline }));
+    // The OS may deschedule this thread before source admission. Both zero
+    // and one attempt are valid; admitting a second attempt after expiry is not.
+    try std.testing.expect(bounded.attempts <= 1);
+    if (bounded.attempts == 1) try std.testing.expectEqual(@as(?u64, deadline), bounded.observed_deadline);
+    var ordinary = FakeReads{ .fail_first = false };
+    var ordinary_response = (try server.lookupWithReadinessRetry(std.testing.allocator, ordinary.source(), "docs", "doc:1", .{}, .read_index, .{})).?;
+    ordinary_response.deinit(std.testing.allocator);
+    try std.testing.expect(ordinary.observed_deadline == null);
+    const longer_deadline = platform_time.monotonicNs() + 60 * std.time.ns_per_s;
+    ordinary_response = (try server.lookupWithReadinessRetry(std.testing.allocator, ordinary.source(), "docs", "doc:1", .{ .execution_deadline_ns = longer_deadline }, .read_index, .{})).?;
+    ordinary_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u64, longer_deadline), ordinary.observed_deadline);
+    var validation = FakeReads{ .first_error = error.InvalidArgument };
+    try std.testing.expectError(error.InvalidArgument, server.lookupWithReadinessRetry(std.testing.allocator, validation.source(), "docs", "doc:1", .{}, .read_index, .{}));
+    try std.testing.expectEqual(@as(u32, 1), validation.attempts);
 }
 
 test "api http transient read retry honors expired request deadline before source query" {
@@ -29774,7 +30038,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     try std.testing.expectEqual(@as(u16, 200), card_resp.status);
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"skills\":[{\"id\":\"query-builder\"},{\"id\":\"retrieval\"}]}",
+        "{\"skills\":[{\"id\":\"query-builder\"},{\"id\":\"retrieval\"},{\"id\":\"research\"}]}",
         card_resp.body,
     );
 
@@ -38987,6 +39251,8 @@ test "api http server preserves public query availability errors" {
                     .lookup = lookup,
                     .scan = scan,
                     .query = query,
+                    .document_artifact_manifest = artifactManifest,
+                    .document_artifact_manifests = artifactManifests,
                 },
             };
         }
@@ -39025,6 +39291,16 @@ test "api http server preserves public query availability errors" {
             try std.testing.expectEqualStrings("docs", table_name);
             return self.query_error;
         }
+
+        fn artifactManifest(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.query_error;
+        }
+
+        fn artifactManifests(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.query_error;
+        }
     };
 
     const cases = [_]struct {
@@ -39041,6 +39317,7 @@ test "api http server preserves public query availability errors" {
         .{ .query_error = error.DistributedQueryUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
         .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "", .json = true, .unavailable_code = "read_requires_primary", .unavailable_message = "read requires primary" },
         .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
+        .{ .query_error = error.StorageKernelOwnerStaleDescriptor, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
         .{ .query_error = error.StorageBusy, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
         .{ .query_error = error.IndexRebuilding, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
         .{ .query_error = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
@@ -39055,6 +39332,11 @@ test "api http server preserves public query availability errors" {
         var reads = FakeReads{ .query_error = case.query_error };
         var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
         defer server.deinit();
+
+        if (case.query_error == error.StorageKernelOwnerStaleDescriptor) {
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ApiHttpServer.executePublicDocumentArtifactManifest(&server, alloc, "docs", "doc:a", "chunks", .{}));
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ApiHttpServer.executePublicDocumentArtifactManifests(&server, alloc, "docs", "doc:a", .{}));
+        }
 
         var resp = try server.handlePublicTableQuery("docs",
             \\{"query":{"match_all":{}}}
@@ -53126,5 +53408,37 @@ test "system catalog identity failures remain unavailable across status adapters
         defer response.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u16, 503), response.status);
         try std.testing.expectEqualStrings("CatalogRoutingUnavailable", response.body);
+    }
+}
+
+test "system catalog public mutation retains admission proof across the HTTP adapter" {
+    const Fixture = struct {
+        err: anyerror,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn call(ptr: *anyopaque, _: std.mem.Allocator, _: api_operation.RequestContext, _: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.err;
+        }
+    };
+    var fixture = Fixture{ .err = error.NotLeader };
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .system_catalog = Fixture.call } }, null, null);
+    defer server.deinit();
+    for ([_]anyerror{ error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataMutationOutcomeUnknown }) |err| {
+        fixture.err = err;
+        var mutation = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = "/databases/owned", .content_type = "application/json", .body = "{}" });
+        defer mutation.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 503), mutation.status);
+        if (err == error.MetadataMutationOutcomeUnknown) {
+            try std.testing.expect(mutation.header(http_common.metadata_mutation_not_admitted_header) == null);
+            try std.testing.expectEqualStrings(metadata_http_routes.Routes.raft_mutation_outcome_unknown, mutation.header(metadata_http_routes.Routes.raft_mutation_outcome_header).?);
+        } else {
+            try std.testing.expectEqualStrings(http_common.metadata_mutation_not_admitted_value, mutation.header(http_common.metadata_mutation_not_admitted_header).?);
+            try std.testing.expectEqualStrings(metadata_http_routes.Routes.raft_mutation_outcome_not_proposed, mutation.header(metadata_http_routes.Routes.raft_mutation_outcome_header).?);
+        }
+        var read = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/databases/owned" });
+        defer read.deinit(std.testing.allocator);
+        try std.testing.expect(read.header(http_common.metadata_mutation_not_admitted_header) == null);
     }
 }

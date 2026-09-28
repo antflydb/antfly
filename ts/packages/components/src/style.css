@@ -380,3 +380,43 @@
   border-radius: 4px;
   margin-bottom: 4px;
 }
+
+.react-af-research-report-title {
+  margin-bottom: 4px;
+}
+
+.react-af-research-report-summary {
+  font-style: italic;
+  color: #444;
+}
+
+.react-af-research-report-section {
+  margin: 16px 0;
+}
+
+.react-af-research-report-heading {
+  margin-bottom: 4px;
+}
+
+.react-af-research-report-paragraph {
+  line-height: 1.5;
+}
+
+.react-af-research-citation {
+  font-size: 0.75em;
+}
+
+.react-af-research-citation a {
+  text-decoration: none;
+}
+
+.react-af-research-citation-unresolved {
+  color: #999;
+}
+
+.react-af-research-report-sources {
+  margin-top: 16px;
+  padding-top: 8px;
+  border-top: 1px solid #eee;
+  font-size: 0.9em;
+}

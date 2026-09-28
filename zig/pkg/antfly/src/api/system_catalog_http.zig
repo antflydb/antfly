@@ -18,11 +18,13 @@ const std = @import("std");
 const domain = @import("../system_catalog/domain.zig");
 const routes = @import("../system_catalog/routes.zig");
 const operation = @import("operation.zig");
+const metadata_authority = @import("../metadata/authority.zig");
 pub const Response = struct {
     status: u16,
     body: []const u8,
     json: bool = true,
     metadata_mutation_outcome: ?enum { unknown } = null,
+    metadata_mutation_not_admitted: bool = false,
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.body);
         self.* = undefined;
@@ -72,7 +74,14 @@ pub fn execute(source: anytype, alloc: std.mem.Allocator, request: operation.Req
             },
             .drop => {},
         }
-        const result = source.systemCatalog(alloc, request, .{ .mutate = .{ .mutation = mutation } }) catch |err| return failure(alloc, err);
+        const result = source.systemCatalog(alloc, request, .{ .mutate = .{ .mutation = mutation } }) catch |err| {
+            var rejected = try failure(alloc, err);
+            // Operations convert every post-proposal authority loss to an
+            // unknown outcome. Only the shared, narrower Raft rejection set
+            // proves this mutation never received a log index.
+            rejected.metadata_mutation_not_admitted = metadata_authority.isMutationNotAdmittedError(err);
+            return rejected;
+        };
         defer alloc.free(result);
         if (mutation_action == .drop or mutation_action == .rename or route.kind == .table) return .{ .status = 204, .body = &.{} };
         return projectMutation(alloc, a, route.kind, mutation_action, result) catch return visibilityPending(alloc);
@@ -214,4 +223,23 @@ test "system catalog mutation response uses admitted identity without a name rea
     const parsed = try std.json.parseFromSlice(Database, std.testing.allocator, result.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u64, 7), parsed.value.database_id);
+}
+
+test "system catalog mutation preserves non-admission proof without marking reads or unknown outcomes" {
+    const Source = struct {
+        err: anyerror,
+        fn systemCatalog(self: @This(), _: std.mem.Allocator, _: operation.RequestContext, _: domain.Call) ![]const u8 {
+            return self.err;
+        }
+    };
+    for ([_]anyerror{ error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataMutationOutcomeUnknown, error.MetadataLinearizableReadTimeout }) |err| {
+        var mutation = try execute(Source{ .err = err }, std.testing.allocator, .{}, .{ .kind = .database, .name = "owned" }, .create, "{}");
+        defer mutation.deinit(std.testing.allocator);
+        try std.testing.expectEqual(metadata_authority.isMutationNotAdmittedError(err), mutation.metadata_mutation_not_admitted);
+        if (mutation.metadata_mutation_not_admitted) try std.testing.expectEqual(@as(u16, 503), mutation.status);
+        try std.testing.expectEqual(err == error.MetadataMutationOutcomeUnknown, mutation.metadata_mutation_outcome != null);
+        var read = try execute(Source{ .err = err }, std.testing.allocator, .{}, .{ .kind = .database, .name = "owned" }, null, "");
+        defer read.deinit(std.testing.allocator);
+        try std.testing.expect(!read.metadata_mutation_not_admitted);
+    }
 }

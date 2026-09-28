@@ -32,8 +32,7 @@
       "attention": "full",
       "summary": "Causal GQA with 16 query / 8 KV heads, Q/K head RMS norm and SwiGLU. A planned dense Metal graph processes token rows; there is no autoregressive decode loop.",
       "source": {
-        "path": "zig/pkg/inference/src/pipelines/embedding.zig",
-        "anchor": "fn tryEmbedTextResidentQwen3Graph("
+        "path": "zig/pkg/inference/src/pipelines/embedding.zig"
       },
       "repeat": {
         "count": 28
@@ -54,8 +53,7 @@
       "method": "last-token",
       "summary": "Last-token pooling selects the final non-padding hidden row of each batch item. The pipeline ensures EOS occupies that position after configured truncation.",
       "source": {
-        "path": "zig/pkg/inference/src/pipelines/embedding.zig",
-        "anchor": "pub const PoolingStrategy = enum {"
+        "path": "zig/pkg/inference/src/pipelines/embedding.zig"
       }
     },
     {
@@ -416,8 +414,7 @@
             ]
           },
           "source": {
-            "path": "zig/pkg/inference/src/pipelines/embedding.zig",
-            "anchor": "pub const PoolingStrategy = enum {"
+            "path": "zig/pkg/inference/src/pipelines/embedding.zig"
           },
           "attrs": {
             "note": "Last active token according to the padding mask, not the final padded row. Model manifest/metadata chooses pooling; runtime limits control truncation."

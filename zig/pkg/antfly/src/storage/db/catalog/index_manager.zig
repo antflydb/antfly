@@ -152,7 +152,7 @@ const repair_shadow_root_prefix = ".repair-shadow-";
 const canonical_algebraic_generation = "canonical";
 const repair_shadow_in_progress_file = ".antfly-repair-shadow-in-progress";
 const repair_shadow_in_progress_magic = "antfly-repair-shadow-in-progress-v1\n";
-var fresh_dense_native_generation_nonce: std.atomic.Value(u64) = .init(1);
+var fresh_dense_native_generation_nonce: @import("antfly_platform").atomic.Value(u64) = .init(1);
 
 const RepairShadowCleanupTestHook = struct {
     context: *anyopaque,
@@ -1263,7 +1263,7 @@ const SharedVectorBlockGeneration = struct {
     opened: vector_block_store_mod.Opened,
     source_snapshot: ?vector_block_store_mod.Opened = null,
     member_bindings: ?*vector_block_store_mod.member_bindings.Cache = null,
-    refs: std.atomic.Value(u64) = .init(1),
+    refs: @import("antfly_platform").atomic.Value(u64) = .init(1),
 
     fn create(alloc: Allocator, opened: vector_block_store_mod.Opened) !*SharedVectorBlockGeneration {
         const generation = try alloc.create(SharedVectorBlockGeneration);
@@ -1382,20 +1382,20 @@ pub const IndexManager = struct {
     // posting state for this same source transaction. Ordinary maintenance
     // must never infer mutation identity from cardinality and a merely newer
     // generation.
-    vector_block_stable_tip_sequence: std.atomic.Value(u64) = .init(0),
+    vector_block_stable_tip_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
     vector_block_stable_tip_index: std.atomic.Value(usize) = .init(0),
     vector_block_generation: ?*SharedVectorBlockGeneration = null,
     /// Wake deferred posting acceleration for same-sequence vector rebuilds
     /// as well as new source writes. No borrowed pointer/ABA identity escapes.
-    vector_block_publication_revision: std.atomic.Value(u64) = .init(1),
+    vector_block_publication_revision: @import("antfly_platform").atomic.Value(u64) = .init(1),
     // Once a source transaction changes dense artifacts, an older immutable
     // base must never receive later coverage-only watermarks. Keeping CURRENT
     // at its last genuinely covered sequence is also the crash-safe dirty
     // marker: restart can prove that a replacement base is required without
     // relying on this process-local bit.
     vector_block_projection_dirty: std.atomic.Value(bool) = .init(false),
-    vector_block_candidate_sequence: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    vector_block_candidate_since_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    vector_block_candidate_sequence: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
+    vector_block_candidate_since_ns: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     /// 0 = idle, 1 = queued/running, 2 = rerun requested while active.
     repair_cleanup_state: std.atomic.Value(u8) = .init(0),
@@ -1407,19 +1407,19 @@ pub const IndexManager = struct {
     // compacting an older schema generation) for CPU, mmap residency, and the
     // shared text-merge resource budget.
     text_backfill_active: std.atomic.Value(u32) = .init(0),
-    next_text_index_instance_id: std.atomic.Value(u64) = .init(1),
+    next_text_index_instance_id: @import("antfly_platform").atomic.Value(u64) = .init(1),
     /// Process-local generation of the extraction plan consumed by writes.
     /// Prepared batches compare this scalar instead of rereading and hashing
     /// the serialized catalog under the DB apply lock.
-    write_plan_generation: std.atomic.Value(u64) = .init(1),
+    write_plan_generation: @import("antfly_platform").atomic.Value(u64) = .init(1),
     write_plan_cache_mutex: std.Io.Mutex = .init,
     /// Non-zero while one request is constructing the immutable plan for a
     /// cold generation. Publication is rare; acquisitions remain lock-free
     /// apart from the short cache pointer fence and never duplicate the owned
     /// catalog clone under a thundering herd.
-    write_plan_build_generation: std.atomic.Value(u64) = .init(0),
+    write_plan_build_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
     write_plan_cache: ?*WritePlanSnapshotEpoch = null,
-    next_dense_capture_incarnation: std.atomic.Value(u64) = .init(1),
+    next_dense_capture_incarnation: @import("antfly_platform").atomic.Value(u64) = .init(1),
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
@@ -1458,7 +1458,7 @@ pub const IndexManager = struct {
     /// A fresh value is assigned on every insertion, including same-name,
     /// same-config recreation, so detached work never derives identity from
     /// mutable record contents. Zero remains reserved as "no incarnation".
-    next_failed_index_load_incarnation_id: std.atomic.Value(u64) = .init(1),
+    next_failed_index_load_incarnation_id: @import("antfly_platform").atomic.Value(u64) = .init(1),
     /// Stable resident retry ring. Every quarantined index is safe to reopen,
     /// even when destructive reconstruction requires operator authorization.
     /// Entries borrow the owned map keys and are updated under catalog_mutex.
@@ -5769,7 +5769,7 @@ pub const IndexManager = struct {
         ) bool {
             const request = self.generated_templates[template_index];
             if (request.kind != .chunk_text) return false;
-            if (request.persist_artifact or request.full_text_index or request.consumer_indexes.len > 0) return true;
+            if (request.independently_required or request.full_text_index or request.consumer_indexes.len > 0) return true;
             for (self.chunk_dependents[template_index]) |dependent_index| {
                 const consumer = self.generated_templates[dependent_index];
                 if (!generatedEmbeddingRequired(extracted, consumer)) continue;
@@ -6581,7 +6581,7 @@ pub const IndexManager = struct {
         // Manually configured managers may not own an executor. Their worker
         // sweeps are normally synchronous; retain the established teardown
         // fallback for a structural mutation racing such a sweep.
-        while (self.graph_metric_schedule_pins.load(.acquire) != 0) std.Thread.yield() catch {};
+        while (self.graph_metric_schedule_pins.load(.acquire) != 0) @import("antfly_platform").time.yieldNow();
     }
 
     pub fn deinit(self: *IndexManager) void {
@@ -13714,14 +13714,14 @@ pub const IndexManager = struct {
             if (entry.chunk_name) |chunk_name| {
                 if (self.getEnrichment(.chunk, chunk_name)) |chunk_cfg| {
                     if (chunk_cfg.source_artifact_name.len == 0) {
-                        try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false);
+                        try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
                     }
                 }
             }
             for (entry.source_artifact_names) |artifact_name| {
                 const chunk_cfg = self.getEnrichment(.chunk, artifact_name) orelse continue;
                 if (chunk_cfg.source_artifact_name.len > 0) continue;
-                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false);
+                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
             }
         }
 
@@ -13729,7 +13729,7 @@ pub const IndexManager = struct {
             for (entry.artifact_sources) |source| {
                 const chunk_cfg = self.getEnrichment(.chunk, source.artifact_name) orelse continue;
                 if (chunk_cfg.source_artifact_name.len > 0) continue;
-                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true);
+                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, true);
             }
         }
 
@@ -13794,21 +13794,8 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
-                            try requests.append(alloc, .{
-                                .kind = .chunk_text,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
-                                .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
-                                .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
-                                .chunk_size = chunk_cfg.chunk_size,
-                                .chunk_overlap = chunk_cfg.chunk_overlap,
-                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
-                                .full_text_index = chunk_cfg.full_text_index,
-                                .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
-                            });
-                        }
+                        if (chunk_cfg.source_artifact_name.len == 0)
+                            try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try requests.append(alloc, .{
                                 .kind = .dense_embedding,
@@ -13816,7 +13803,11 @@ pub const IndexManager = struct {
                                 .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
                                 .embedding_name = try alloc.dupe(u8, embedding_name),
                                 .embedding_input = embedding_cfg.embedding_input,
-                                .input_kind = embeddingInputKindForChunkEnrichment(chunk_cfg),
+                                // A named embedding producer consumes the
+                                // chunk artifact emitted by a separate
+                                // producer, even when that chunk producer
+                                // itself reads the parent document directly.
+                                .input_kind = .materialized_chunks,
                                 .doc_key = try alloc.dupe(u8, doc_key),
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
@@ -13908,28 +13899,15 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims != 0) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
-                            try requests.append(alloc, .{
-                                .kind = .chunk_text,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
-                                .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
-                                .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
-                                .chunk_size = chunk_cfg.chunk_size,
-                                .chunk_overlap = chunk_cfg.chunk_overlap,
-                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
-                                .full_text_index = chunk_cfg.full_text_index,
-                                .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
-                            });
-                        }
+                        if (chunk_cfg.source_artifact_name.len == 0)
+                            try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try requests.append(alloc, .{
                                 .kind = .sparse_embedding,
                                 .index_name = try alloc.dupe(u8, entry.config.name),
                                 .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
                                 .embedding_name = try alloc.dupe(u8, embedding_name),
-                                .input_kind = embeddingInputKindForChunkEnrichment(chunk_cfg),
+                                .input_kind = .materialized_chunks,
                                 .doc_key = try alloc.dupe(u8, doc_key),
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
@@ -13965,8 +13943,9 @@ pub const IndexManager = struct {
             if (request.input_kind == .materialized_chunks and request.artifact_name.len > 0) {
                 const chunk_cfg = self.getEnrichment(.chunk, request.artifact_name) orelse
                     return error.InvalidIndexConfig;
-                if (chunk_cfg.source_artifact_name.len == 0) return error.InvalidIndexConfig;
-                request.upstream_artifact_name = try alloc.dupe(u8, chunk_cfg.source_artifact_name);
+                if (chunk_cfg.source_artifact_name.len > 0) {
+                    request.upstream_artifact_name = try alloc.dupe(u8, chunk_cfg.source_artifact_name);
+                }
             }
             request.consumer_indexes = switch (request.kind) {
                 .asset => try self.textIndexesForChunk(
@@ -19230,6 +19209,7 @@ pub const IndexManager = struct {
         self: *IndexManager,
         cfg: types.IndexConfig,
     ) !FreshDenseNativeGeneration {
+        if (builtin.os.tag == .freestanding) return error.DenseNativeV2NotPermitted;
         if (!self.freshDenseNativeV2Permitted(cfg)) return error.DenseNativeV2NotPermitted;
         try fs_paths.createDirPathPortable(self.checkpointIo(), self.base_path);
 
@@ -19315,6 +19295,8 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
         generation: *const FreshDenseNativeGeneration,
     ) void {
+        // Browser indexes never allocate a native filesystem generation.
+        if (builtin.os.tag == .freestanding) return;
         const canonical_path = self.indexPath(cfg.name) catch return;
         defer self.alloc.free(canonical_path);
         self.clearActiveIndexRootPointer(canonical_path) catch {};
@@ -19701,7 +19683,7 @@ pub const IndexManager = struct {
     /// Returns the authenticated physical root currently selected for an
     /// index. Callers that retain this path across a mutation must also hold
     /// the appropriate catalog/structural lease.
-    pub fn activeIndexPath(self: *const IndexManager, name: []const u8) ![]u8 {
+    pub fn activeIndexPath(self: *const IndexManager, name: []const u8) anyerror![]u8 {
         const canonical_path = try self.indexPath(name);
         errdefer self.alloc.free(canonical_path);
         if (try self.readActiveIndexRootPointer(canonical_path, name)) |relative_active_path| {
@@ -30535,7 +30517,7 @@ fn openTextPersistentIndexWithRetry(
     opts: persistent_mod.PersistentIndexOptions,
 ) !persistent_mod.PersistentIndex {
     const max_attempts: usize = 6;
-    const debug_open = std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+    const debug_open = @import("antfly_platform").env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         if (debug_open) {
@@ -30591,7 +30573,7 @@ fn sleepBeforeTextPersistentOpenRetry(attempt: usize) void {
             else => return,
         };
     } else {
-        const spins = 64 * (capped + 1);
+        const spins: usize = 64 * (@as(usize, capped) + 1);
         for (0..spins) |_| std.atomic.spinLoopHint();
     }
 }
@@ -31053,6 +31035,7 @@ fn appendGeneratedChunkRequest(
     chunk_cfg: *const enrichment_catalog.EnrichmentConfig,
     full_text_index: bool,
     persist_artifact: bool,
+    independently_required: bool,
 ) !void {
     for (requests.items) |*request| {
         if (request.kind != .chunk_text) continue;
@@ -31066,6 +31049,7 @@ fn appendGeneratedChunkRequest(
         // cannot change persistence or default full-text behavior.
         request.full_text_index = request.full_text_index or full_text_index or chunk_cfg.full_text_index;
         request.persist_artifact = request.persist_artifact or persist_artifact;
+        request.independently_required = request.independently_required or independently_required;
         return;
     }
 
@@ -31081,6 +31065,7 @@ fn appendGeneratedChunkRequest(
         .chunker_json = chunk_cfg.chunker_json,
         .full_text_index = full_text_index or chunk_cfg.full_text_index,
         .persist_artifact = persist_artifact,
+        .independently_required = independently_required,
         .execution_json = chunk_cfg.execution_json,
     });
     errdefer enrichment_types.freeGeneratedRequest(alloc, request);
@@ -35046,6 +35031,7 @@ test "dense index unions multiple embedding artifact sources without overwriting
         .kind = .chunk,
         .field = "body",
         .chunk_size = 256,
+        .chunker_json = "{\"provider\":\"antfly\",\"model\":\"fixed-bert-tokenizer\",\"store_chunks\":false,\"text\":{\"target_tokens\":128}}",
     });
     try manager.addEnrichment(&store, .{
         .name = "body_dense_v1",
@@ -35070,6 +35056,9 @@ test "dense index unions multiple embedding artifact sources without overwriting
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(generated, "doc:generated", "title", "", "", "title_dense_v1"));
     try std.testing.expect(hasGeneratedChunkRequest(generated, "doc:generated", "body", "", "document_chunks_v1"));
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(generated, "doc:generated", "text", "", "document_chunks_v1", "body_dense_v1"));
+    for (generated) |request| if (request.kind == .chunk_text) {
+        try std.testing.expect(request.persist_artifact);
+    };
 
     var write_plan = try manager.acquireWritePlanSnapshot();
     defer write_plan.release();
@@ -35126,7 +35115,7 @@ test "dense index unions multiple embedding artifact sources without overwriting
         try std.testing.expect(try enrichment_config_validation.producerJsonValuesEqual(alloc, producer_json, request.producer_json));
         try std.testing.expectEqual(
             if (std.mem.eql(u8, request.embedding_name, "body_dense_v1"))
-                enrichment_types.EmbeddingInputKind.inline_chunks
+                enrichment_types.EmbeddingInputKind.materialized_chunks
             else
                 enrichment_types.EmbeddingInputKind.document,
             request.input_kind,
@@ -44858,7 +44847,7 @@ fn testPublicDenseSnapshot(native_only: bool) !void {
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
-    const DB = @import("../db.zig").DB;
+    const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
     var resources = resource_manager_mod.ResourceManager.init(.{});
     defer resources.deinit(alloc);
     resources.dense_query_snapshot = true;

@@ -384,6 +384,33 @@ Request-level overrides may reduce scope, such as lowering `max_results` or
 disabling content extraction, but should not expand capabilities beyond what the
 connection and policy allow.
 
+## Fetch
+
+Agents read full pages with the `fetch` tool (`pkg/antfly/src/api/web_fetch.zig`).
+Fetch is opt-in (`fetch` in `enabled_tools` or a `fetch_config`) and admits a
+URL only when `web_search` returned it in the same run or its host is under
+`fetch_config.allowed_hosts`:
+
+```json
+{
+  "tools": {
+    "enabled_tools": ["web_search", "fetch"],
+    "web_search_connection": "agent-web",
+    "fetch_config": {"max_content_length": 12000, "allowed_hosts": ["docs.example.com"]}
+  }
+}
+```
+
+A returned URL with a changed query string is a different URL and is rejected,
+so text injected into a document cannot make the model send retrieved data to
+an attacker-controlled endpoint. Downloads use the shared remote-content client
+with private-address blocking always on and every redirect hop re-validated;
+`block_private_ips: false` and `s3_credentials` are rejected. Size (20 MiB),
+time (60 s), and extracted text (50,000 characters) have server ceilings that a
+request can only lower. HTML is reduced to visible text; binary content is
+refused. Fetched pages become `fetch:<url>` hits and count against the same
+tool-result token budget as search results.
+
 ## RBAC And Policy
 
 Long term, web-search authorization should be evaluated from:

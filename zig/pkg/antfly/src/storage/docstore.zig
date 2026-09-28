@@ -389,7 +389,7 @@ pub const DocStore = struct {
     alloc: Allocator,
     /// Process-local wake hint, published only after successful row/schema
     /// commits. Durable mutation IDs and timers remain the restart authority.
-    columnar_revision: std.atomic.Value(u64) = .init(0),
+    columnar_revision: @import("antfly_platform").atomic.Value(u64) = .init(0),
     // 0 unknown, 1 no retention catalog, 2 catalog may exist. Admission marks
     // this before its commit; an aborted admission merely leaves a safe probe.
     retained_effects_cache: std.atomic.Value(u8) = .init(0),
@@ -1703,6 +1703,7 @@ pub const DocStore = struct {
     pub const TransactionalGuard = struct {
         ptr: *anyopaque,
         validate: *const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror!void,
+        validate_at_commit: ?*const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror!void = null,
     };
 
     fn putBatchWithReplayOnceWithOptions(
@@ -1820,7 +1821,8 @@ pub const DocStore = struct {
         // Recheck immediately before commit. A guard may contain a wall-clock
         // lease expiry, and building a large replay value can outlive the tenure
         // even though no competing writer can modify the record mid-transaction.
-        if (transactional_guard) |guard| try guard.validate(guard.ptr, self.alloc, &txn);
+        if (transactional_guard) |guard| if (guard.validate_at_commit) |validate|
+            try validate(guard.ptr, self.alloc, &txn);
         try batch.commit();
         return promoted_bytes;
     }

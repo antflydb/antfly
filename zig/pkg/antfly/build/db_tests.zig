@@ -176,6 +176,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.catalog.enrichment_catalog.test.enrichment catalog round trip without source_template",
         "storage.db.catalog.index_manager.test.dense index manager accepts external embedding indexes without enrichments",
         "storage.db.catalog.index_manager.test.generated enrichment request identity includes source_template",
+        "storage.db.catalog.index_manager.test.dense index unions multiple embedding artifact sources without overwriting members",
         "storage.db.catalog.index_manager.test.graph config parses artifact source and shorthand asset enrichment",
         "storage.db.catalog.index_manager.test.remove drops generated embedding artifacts while retaining reusable chunk artifacts and shorthand enrichments",
         "storage.db.catalog.index_manager.test.shorthand chunk and embedding enrichment compatibility includes source_template",
@@ -216,6 +217,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db managed dense enrichment delete recreate recovers after corrupt artifact",
         "storage.db.db.test.db managed dense enrichment delete recreate recovers after corrupt artifact across reopen",
         "storage.db.db.test.db managed dense enrichment remains searchable after transient rate limits",
+        "storage.db.db.test.db chunked dense retry preserves published vectors until replacements succeed",
+        "storage.db.db.test.db reopened chunked dense HBC deletes stale vectors through artifact loader",
+        "storage.db.db.test.db synchronous chunk replacement retires stale embeddings in the same commit",
+        "storage.db.db.test.db asynchronous empty inline chunks retire old embeddings",
+        "storage.db.db.test.pending chunk deletes index only new keys by document",
+        "storage.db.db.test.pending artifact writes index only new writes by document",
+        "storage.db.db.test.materialized preserved sources dedupe pending chunk keys",
+        "storage.db.db.test.db generated replay atomically promotes staged artifacts and deletes stale generation",
+        "storage.db.enrichment.enrichment_runtime.test.rejected chunk embedding publication records its request for stale cleanup",
+        "storage.db.enrichment.enrichment_runtime.test.empty chunk sources retain their own document revisions",
+        "storage.db.enrichment.enrichment_runtime.test.stale embedding cleanup guards each request in a shared window",
+        "storage.db.db.test.db cached chunk cleanup survives another failed shared batch request",
         "storage.db.db.test.db managed dense enrichment retries temporary model capacity without terminal coverage",
         "storage.db.db.test.db managed sparse enrichment retries temporary model capacity without terminal coverage",
         "storage.db.db.test.db managed vector admission durably seeds missing enrichment artifacts",
@@ -257,6 +270,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.enrichment_runtime.test.enrichment runtime graph materializer rejects non-finite mapped weights",
         "storage.db.enrichment.enrichment_runtime.test.enrichment worker chunk cache keys preserve embedded separators",
         "storage.db.enrichment.enrichment_runtime.test.enrichment worker retry delay is exponential and capped",
+        "enrichment inline backoff wakes for teardown before and during wait admission",
         "storage.db.enrichment.enrichment_runtime.test.foreground enrichment catch-up guard has a monotonic deadline",
         "storage.db.enrichment.enrichment_runtime.test.foreground enrichment catch-up treats cancellation as a waiter outcome",
         "storage.db.enrichment.enrichment_runtime.test.isolated enrichment request does not advance when durable parking fails",
@@ -490,6 +504,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "mixed numeric concrete sort keys share one cursor domain",
         "schema boolean doc values back native sort planner",
         "db exact sort resolves mapped geo metadata filters from typed doc values",
+        "highlight",
+        "attachHighlights",
+        "schema-driven dotted path ignores unindexed literal key",
+        "text analysis rejects invalid shingle bounds",
     };
     const lib_db_query_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -503,6 +521,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     addRuntimeTestFilters(b, run_lib_db_query_tests, &lib_db_query_default_filters);
     const lib_db_query_step = b.step("antfly-storage-db-query-test", "Run root-module DB query/indexing tests");
     lib_db_query_step.dependOn(&run_lib_db_query_tests.step);
+
+    const highlight_filters = [_][]const u8{
+        "highlight",
+        "attachHighlights",
+        "schema-driven dotted path ignores unindexed literal key",
+        "text analysis rejects invalid shingle bounds",
+        "document mapper emits mapped keyword subfield",
+    };
+    const highlight_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &highlight_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_highlight_tests = b.addRunArtifact(highlight_tests);
+    addRuntimeTestFilters(b, run_highlight_tests, &highlight_filters);
+    b.step("antfly-storage-highlight-test", "Run source mapping and highlight analysis regressions")
+        .dependOn(&run_highlight_tests.step);
 
     const lib_db_text_query_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -568,6 +603,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &.{
             "storage.db.db.test.db reopens persisted",
+            "storage.db.db.test.db owner open does not downgrade a newer durable schema for Raft catch-up",
             "storage.db.db.test.db split prepare and finalize work with durable lsm primary backend",
             "storage.db.db.test.db delete index persists",
             "storage.db.db.test.db indexed delete removes",
@@ -599,8 +635,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.db.test.db batch enforces optimistic version predicates",
             "coordinator recovery durably aborts a stale prepared transaction",
             "idempotent begin upgrades a legacy transaction coordinator role",
+            "transaction participant batch",
+            "transaction trace retains every key",
             "transaction recovery delegates stale coordinator abort to replicated resolver",
             "replicated recovery is coordinator-owned and acknowledges through hooks",
+            "replicated recovery batches proven followers preserves uncertain debt and retains self handoff",
+            "relational integrity ",
+            "distributed txn deferred reference handoff",
             "transaction recovery drains terminal HA outbox without remaining intents",
             "non-replicated transaction recovery honors the per-run page limit",
             "retained terminal transactions honor the extended retry cutoff",

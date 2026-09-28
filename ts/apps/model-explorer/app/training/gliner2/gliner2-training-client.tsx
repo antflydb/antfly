@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { CodeLink } from "@/components/code/code-link";
-import { type ClientSnippet, SnippetProvider } from "@/components/code/snippet-context";
+import { SourceLinkProvider } from "@/components/code/source-link-context";
 import { EnvFlagChip } from "@/components/primitives/chips";
 import { Scene, ScrollyChapter } from "@/components/scrollytelling/scrolly";
 import { Figure } from "@/components/viz/glyphs";
@@ -818,17 +818,9 @@ function OperatorGatesFigure() {
 /* Page                                                                */
 /* ------------------------------------------------------------------ */
 
-export function Gliner2TrainingClient({
-  snippets,
-  gitCommit,
-  permalinkBase,
-}: {
-  snippets: Record<string, ClientSnippet>;
-  gitCommit: string;
-  permalinkBase?: string;
-}) {
+export function Gliner2TrainingClient({ permalinkBase }: { permalinkBase?: string }) {
   return (
-    <SnippetProvider snippets={snippets} gitCommit={gitCommit} permalinkBase={permalinkBase}>
+    <SourceLinkProvider permalinkBase={permalinkBase}>
       <div className="py-8">
         <header className="mx-auto max-w-7xl px-4">
           <p className="font-mono text-xs uppercase tracking-wider text-muted-foreground">
@@ -1072,6 +1064,6 @@ export function Gliner2TrainingClient({
           </Scene>
         </ScrollyChapter>
       </div>
-    </SnippetProvider>
+    </SourceLinkProvider>
   );
 }

@@ -25,8 +25,8 @@ const db = @import("../storage/db/mod.zig");
 const native = @import("../storage/db/restore_staging.zig");
 const owner_api = @import("restore_owner.zig");
 const catalog_mod = @import("restore_catalog.zig");
-const reads = @import("table_reads.zig");
-const writes = @import("table_writes.zig");
+const reads = @import("table_read_source.zig");
+const writes = @import("table_write_source.zig");
 const distributed = @import("distributed_txn.zig");
 const contract = @import("distributed_txn_contract.zig");
 const operation = @import("operation.zig");
@@ -57,6 +57,7 @@ const Fixture = struct {
     target_paths: [3][]const u8 = undefined,
     target_open: [3]bool = @splat(false),
     restart_after_commit: bool = false,
+    validation_route_gaps: usize = 0,
     faults_seen: [3]u8 = @splat(0),
     remote_calls: usize = 0,
     owner_calls: usize = 0,
@@ -203,6 +204,10 @@ const Fixture = struct {
         if (request.action == .publish) try std.testing.expectEqual(stages.State.published, progress.state);
         if (request.action == .validate) {
             try std.testing.expectEqual(stages.State.validating, progress.state);
+            if (self.validation_route_gaps != 0) {
+                self.validation_route_gaps -= 1;
+                return error.GroupLeaderUnavailable;
+            }
             for (self.dbs[0..self.owner_count]) |target| {
                 var state = (try target.restoreStagingStatus(alloc)).?;
                 defer state.deinit();
@@ -521,7 +526,7 @@ pub fn runWithPersistence(comptime Driver: type, invalid_child: bool, override: 
     return runWithPolicy(Driver, invalid_child, override, persistence, .{});
 }
 
-pub const Policy = struct { failover_safe: bool = false, guard: ?http.RestoreExecutionGuard = null, gate: ?db.HAWriteGate = null, mirror: ?db.HAAsyncEffectMirror = null, term: u64 = 1, portable: bool = false, restart_after_commit: bool = false, table_restore: bool = false, migration: bool = false, generated: bool = false, remote_owner: bool = false, benchmark_rows: usize = 1 };
+pub const Policy = struct { failover_safe: bool = false, guard: ?http.RestoreExecutionGuard = null, gate: ?db.HAWriteGate = null, mirror: ?db.HAAsyncEffectMirror = null, term: u64 = 1, portable: bool = false, restart_after_commit: bool = false, table_restore: bool = false, migration: bool = false, generated: bool = false, remote_owner: bool = false, benchmark_rows: usize = 1, validation_route_gaps: usize = 0 };
 
 fn generatedSchema(alloc: std.mem.Allocator, input: []const u8, default_base: []const u8) ![]const u8 {
     var schema = try std.json.parseFromSlice(std.json.Value, alloc, input, .{});
@@ -563,7 +568,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     var raft = raft_engine.core.MemoryStorage.init(alloc);
     defer raft.deinit();
     var svc: metadata_service.MetadataService = undefined;
-    var fixture: Fixture = .{ .alloc = alloc, .raft = &raft, .runtime = &runtime, .non_raft = override != null, .restart_after_commit = policy.restart_after_commit, .owner_count = if (policy.table_restore) 1 else 3 };
+    var fixture: Fixture = .{ .alloc = alloc, .raft = &raft, .runtime = &runtime, .non_raft = override != null, .restart_after_commit = policy.restart_after_commit, .owner_count = if (policy.table_restore) 1 else 3, .validation_route_gaps = policy.validation_route_gaps };
     var opened: usize = 0;
     defer for (fixture.dbs[0..opened], 0..) |target, i| {
         if (fixture.target_open[i]) target.close();
@@ -713,7 +718,12 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     source.freeAdminSnapshot(&hidden);
     _ = try server.restore_job_store.retryRunning(a, worker.value, "RestoreStagingYield", 0);
     const started_ns = @import("antfly_platform").time.monotonicNs();
-    for (0..(if (policy.restart_after_commit) @as(usize, 6000) else 120)) |_| {
+    // Debug and contended runs can admit one row per cooperative slice. Scale
+    // the fixture's work bound with its corpus instead of assuming that every
+    // owner imports hundreds of rows within the same CPU quantum.
+    const corpus_slice_budget = 120 + 8 * policy.benchmark_rows * fixture.owner_count;
+    const slice_budget = @max(corpus_slice_budget, if (policy.restart_after_commit) @as(usize, 6000) else 120);
+    for (0..slice_budget) |_| {
         try Driver.work(&server, worker.value.job_id);
         // A routing/authentication setup error is not a simulated owner retry.
         // Fail promptly with the first bounded HTTP diagnostic above instead
@@ -722,6 +732,12 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
             return error.RestoreOwnerRouteDidNotReachOwner;
         const bytes = (try server.restore_job_store.load(a, worker.value.job_id)).?;
         const state = try std.json.parseFromSlice(restore_jobs.JobState, a, bytes, .{});
+        if (policy.validation_route_gaps != 0) {
+            // Owner routing gaps preserve the pinned attempt and all durable
+            // validation progress rather than adding replicated job retries.
+            try std.testing.expectEqual(worker.value.attempt_id, state.value.attempt_id);
+            try std.testing.expect(state.value.phase != .queued);
+        }
         if (state.value.phase == .succeeded) {
             try std.testing.expect(!invalid_child);
             const result = try std.json.parseFromSlice(std.json.Value, a, state.value.result_json orelse return error.MissingRestoreResult, .{});
@@ -744,10 +760,20 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         try std.testing.io.sleep(.fromMilliseconds(12), .awake);
     } else {
         const state = try std.json.parseFromSlice(restore_jobs.JobState, a, (try server.restore_job_store.load(a, worker.value.job_id)).?, .{});
-        std.debug.print("restore worker did not converge: phase={s} error={s}\n", .{ @tagName(state.value.phase), state.value.last_error orelse "none" });
+        std.debug.print("restore worker did not converge: phase={s} attempt={d} staging_attempt={d} owner_phase={d} owner_cursor={d} validation_phase={d} validation_owner={d} error={s}\n", .{
+            @tagName(state.value.phase),
+            state.value.attempt_id,
+            state.value.staging_attempt_id,
+            state.value.staging_owner_phase,
+            state.value.staging_owner_cursor,
+            state.value.staging_validation_phase,
+            state.value.staging_validation_owner,
+            state.value.last_error orelse "none",
+        });
         return error.RestoreWorkerDidNotConverge;
     }
     var published = (try source.adminSnapshot()).?;
+    try std.testing.expectEqual(@as(usize, 0), fixture.validation_route_gaps);
     if (policy.benchmark_rows > 1) {
         var artifact_bytes: u64 = 0;
         for (manifests[0..fixture.owner_count]) |manifest| for (manifest.shards) |shard| {

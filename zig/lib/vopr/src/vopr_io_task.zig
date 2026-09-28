@@ -44,6 +44,9 @@ pub const TaskSnapshot = struct {
     sleep_clock: ?std.Io.Clock,
     awaited_task_id: ?ids.StableId,
     waiting_on_futex: bool,
+    /// Diagnostic only; never recorded as a stable replay identity.
+    futex_address: ?usize,
+    futex_uncancelable: bool,
     external_resource_id: ?ids.StableId,
 };
 
@@ -306,6 +309,8 @@ pub const Kernel = struct {
             .sleep_clock = if (task.sleep) |sleep| sleep.clock else null,
             .awaited_task_id = if (task.waiting_on_future) |awaited| awaited.id else null,
             .waiting_on_futex = task.futex_ptr != null,
+            .futex_address = if (task.futex_ptr) |ptr| @intFromPtr(ptr) else null,
+            .futex_uncancelable = task.futex_uncancelable,
             .external_resource_id = task.external_id,
         };
     }
@@ -472,6 +477,9 @@ pub const Kernel = struct {
     pub fn groupAwait(self: *Kernel, public_group: *std.Io.Group, token: *anyopaque) !void {
         const group: *GroupState = @ptrCast(@alignCast(token));
         if (group.public != public_group) return error.InvalidVoprIoGroup;
+        // The last child can finish before its parked awaiter resumes. The
+        // group still belongs to that awaiter even when tasks is empty.
+        if (group.awaiter != null) return error.InvalidVoprIoGroup;
         while (group.tasks.items.len != 0) {
             const awaiter = self.currentTask() orelse return error.VoprIoAwaitOutsideTask;
             if (group.awaiter != null) return error.InvalidVoprIoGroup;
@@ -494,6 +502,7 @@ pub const Kernel = struct {
     pub fn groupCancel(self: *Kernel, public_group: *std.Io.Group, token: *anyopaque) !void {
         const group: *GroupState = @ptrCast(@alignCast(token));
         if (group.public != public_group) return error.InvalidVoprIoGroup;
+        if (group.awaiter != null) return error.InvalidVoprIoGroup;
         self.cancelGroupTasks(group);
         while (group.tasks.items.len != 0) {
             const awaiter = self.currentTask() orelse return error.VoprIoAwaitOutsideTask;
@@ -528,7 +537,7 @@ pub const Kernel = struct {
         token: *anyopaque,
     ) !void {
         const group: *GroupState = @ptrCast(@alignCast(token));
-        if (group.public != public_group or group.tasks.items.len != 0)
+        if (group.public != public_group or group.tasks.items.len != 0 or group.awaiter != null)
             return error.InvalidVoprIoGroup;
         self.destroyGroup(group);
     }

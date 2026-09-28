@@ -3,7 +3,7 @@
 import { parseAsStringLiteral, useQueryState } from "nuqs";
 import { Suspense } from "react";
 import { CodeLink } from "@/components/code/code-link";
-import { type ClientSnippet, SnippetProvider } from "@/components/code/snippet-context";
+import { SourceLinkProvider } from "@/components/code/source-link-context";
 import { ChoiceGroup } from "@/components/primitives/choice-group";
 import { KvCacheBlocks } from "@/components/viz/kv-cache-blocks";
 import { L } from "@/lib/links";
@@ -133,8 +133,6 @@ const MODEL_CHOICES = [
 /* ------------------------------------------------------------------ */
 
 interface KvClientProps {
-  snippets: Record<string, ClientSnippet>;
-  gitCommit: string;
   permalinkBase?: string;
 }
 
@@ -146,7 +144,7 @@ export function KvClient(props: KvClientProps) {
   );
 }
 
-function KvInner({ snippets, gitCommit, permalinkBase }: KvClientProps) {
+function KvInner({ permalinkBase }: KvClientProps) {
   const [model, setModel] = useQueryState(
     "model",
     parseAsStringLiteral([
@@ -161,7 +159,7 @@ function KvInner({ snippets, gitCommit, permalinkBase }: KvClientProps) {
   const note = MODEL_NOTES[model];
 
   return (
-    <SnippetProvider snippets={snippets} gitCommit={gitCommit} permalinkBase={permalinkBase}>
+    <SourceLinkProvider permalinkBase={permalinkBase}>
       <div className="mx-auto max-w-6xl space-y-8 px-4 py-8">
         <header className="max-w-3xl">
           <h1 className="text-3xl font-bold tracking-tight">KV cache</h1>
@@ -251,6 +249,6 @@ function KvInner({ snippets, gitCommit, permalinkBase }: KvClientProps) {
           <CodeLink link={L("generation-kv-policy")} />
         </p>
       </div>
-    </SnippetProvider>
+    </SourceLinkProvider>
   );
 }

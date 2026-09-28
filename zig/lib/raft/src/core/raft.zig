@@ -723,11 +723,27 @@ pub const Raft = struct {
         var votes_granted: usize = 0;
         var votes_rejected: usize = 0;
         var votes_unknown: usize = 0;
+        var voters_at_last_index: usize = 0;
+        var recent_active_voters: usize = 0;
+        var lowest_voter_match_index: types.Index = 0;
         for (self.votes) |vote| switch (vote) {
             .granted => votes_granted += 1,
             .rejected => votes_rejected += 1,
             .unknown => votes_unknown += 1,
         };
+        if (self.soft_state.role == .leader) {
+            lowest_voter_match_index = self.log.lastIndex();
+            for (self.conf_state.voters) |voter| {
+                const idx = peerIndex(self.peers, voter) orelse {
+                    lowest_voter_match_index = 0;
+                    continue;
+                };
+                const progress = self.progress[idx];
+                if (progress.match_index >= self.log.lastIndex()) voters_at_last_index += 1;
+                if (progress.recent_active or voter == self.cfg.id) recent_active_voters += 1;
+                lowest_voter_match_index = @min(lowest_voter_match_index, progress.match_index);
+            }
+        }
         return .{
             .id = self.cfg.id,
             .group_id = self.cfg.group_id,
@@ -741,6 +757,9 @@ pub const Raft = struct {
             .votes_granted = votes_granted,
             .votes_rejected = votes_rejected,
             .votes_unknown = votes_unknown,
+            .voters_at_last_index = voters_at_last_index,
+            .recent_active_voters = recent_active_voters,
+            .lowest_voter_match_index = lowest_voter_match_index,
         };
     }
 

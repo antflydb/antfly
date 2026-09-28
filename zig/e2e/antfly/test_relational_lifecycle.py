@@ -6,20 +6,34 @@
 import json
 
 import pytest
-
 import test_auth as auth
 from helpers import wait_until
-from test_auth import _basic_auth
+from test_auth import AUTH_BOOTSTRAP_PASSWORD, _basic_auth
 from test_relational_sessions import _schema
 
 auth_api = auth.auth_api
 
 
+def _constraint_status(api, table):
+    path = f"/tables/{table}/constraints/status"
+    # AuthApi exposes raw HTTP through request_raw; the stateful fixture's
+    # existing helper is named _request.
+    response = (
+        api.request_raw("GET", path, timeout=30)
+        if hasattr(api, "request_raw")
+        else api._request("GET", path)
+    )
+    if response.status_code == 409 and (
+        "constraint schema or ownership changed; refresh and retry" in response.text
+    ):
+        return None
+    response.raise_for_status()
+    return response.json()
+
+
 def _enforced(api, table):
     assert wait_until(
-        lambda: (
-            api.get(f"/tables/{table}/constraints/status").get("state") == "enforced"
-        ),
+        lambda: (_constraint_status(api, table) or {}).get("state") == "enforced",
         timeout_s=30,
     )
 
@@ -27,7 +41,7 @@ def _enforced(api, table):
 @pytest.mark.parametrize("permissions", ["admin", "both", "parent_only"])
 def test_cascade_session_keeps_logical_authorization(auth_api, permissions):
     api = auth_api
-    api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     for table, schema in [("parent", _schema()), ("child", _schema("parent"))]:
         api.post(f"/tables/{table}", {"schema": schema})
         _enforced(api, table)
@@ -96,7 +110,7 @@ def test_constraint_retirement_completes_and_survives_restart(stateful_api, drop
         # Retirement prepares a durable drop proof; deletion still requires
         # the explicit DELETE authorized by the public lifecycle contract.
         def ready_to_drop():
-            status = api.get("/tables/retiring/constraints/status")
+            status = _constraint_status(api, "retiring") or {}
             return (status.get("retirement") or {}).get("phase") == "ready_to_drop"
 
         assert wait_until(ready_to_drop, timeout_s=60), api.debug_logs()[-5000:]
@@ -168,7 +182,7 @@ def test_check_only_activation_repair_and_retry(stateful_api):
     schema["checks"] = [{"name": "positive", "column": "id", "op": "gt", "value": 0}]
     api.put("/tables/checks/schema", schema)
     assert wait_until(
-        lambda: api.get("/tables/checks/constraints/status").get("state") == "invalid",
+        lambda: (_constraint_status(api, "checks") or {}).get("state") == "invalid",
         timeout_s=30,
     )
     # Repair and retry retain the caller's exact schema fence.

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { CodeLink } from "@/components/code/code-link";
-import { type ClientSnippet, SnippetProvider } from "@/components/code/snippet-context";
+import { SourceLinkProvider } from "@/components/code/source-link-context";
 import { Scene, ScrollyChapter } from "@/components/scrollytelling/scrolly";
 import { Figure } from "@/components/viz/glyphs";
 import { L } from "@/lib/links";
@@ -422,17 +422,9 @@ function ReceiptsFigure({ step }: { step: 0 | 1 }) {
 /* Page                                                                */
 /* ------------------------------------------------------------------ */
 
-export function TrainingClient({
-  snippets,
-  gitCommit,
-  permalinkBase,
-}: {
-  snippets: Record<string, ClientSnippet>;
-  gitCommit: string;
-  permalinkBase?: string;
-}) {
+export function TrainingClient({ permalinkBase }: { permalinkBase?: string }) {
   return (
-    <SnippetProvider snippets={snippets} gitCommit={gitCommit} permalinkBase={permalinkBase}>
+    <SourceLinkProvider permalinkBase={permalinkBase}>
       <div className="py-8">
         <header className="mx-auto max-w-7xl px-4">
           <h1 className="text-3xl font-bold tracking-tight">Training</h1>
@@ -590,6 +582,6 @@ export function TrainingClient({
           </Scene>
         </ScrollyChapter>
       </div>
-    </SnippetProvider>
+    </SourceLinkProvider>
   );
 }

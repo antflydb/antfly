@@ -849,6 +849,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const embedded_db_tests = b.addTest(.{
         .root_module = embedded_db_mod,
         .filters = &.{
+            "embedded custom storage owns its physical namespace",
             "embedded db openLite persists documents in aflite file",
             "embedded db openLite close syncs unsynced batch before readonly reopen",
             "embedded db openLite propagates no_sync to aflite backend",
@@ -1307,6 +1308,36 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "wildcard matching distinguishes operators from escaped literals",
         "wildcard literal escaping round trips metacharacters",
         "wildcard search plans preserve escaped exact literals and prefixes",
+        "wildcard filter with prefix star",
+        "wildcard filter with suffix star",
+        "wildcard filter with question mark",
+        "wildcard filter seeks by literal prefix in large term dictionary",
+        "wildcard filter without operators uses one exact lookup",
+        "wildcard filter with leading operator still scans the whole dictionary",
+        "fuzzy filter finds similar terms",
+        "fuzzy filter prunes dead dictionary prefixes without decoding them",
+        "fuzzy filter pruning matches the unpruned reference on a mixed dictionary",
+        "regexp filter prunes dead dictionary prefixes without decoding them",
+        "highlight exact terms",
+        "highlight with stemming",
+        "highlight span offsets",
+        "highlight contains matcher marks bytes inside and across tokens",
+        "keyword matchers highlight a whole value across three words",
+        "highlight clips a match wider than its fragment",
+        "highlight offsets follow stored text through character filters",
+        "substring highlights include repeated and crossing occurrences",
+        "fuzzy highlights respect prefixes and long tokens",
+        "highlight prefix wildcard fuzzy and regexp matchers mark whole tokens",
+        "highlight fragments respect size and count limits",
+        "substring field queries lower to suffix-dictionary prefix lookups",
+        "attachHighlights marks analyzed, prefix, and substring matches on stored source",
+        "named highlight queries use their own index analyzers",
+        "highlight fragment limit applies across queries and array items",
+        "limited highlight window retains nearby matches from other queries",
+        "fuzzy phrase clauses highlight matched surface terms",
+        "runtime schema derives substring companions",
+        "api query contract parses public hierarchy controls",
+        "api query contract rejects public filters beyond the traversal depth budget",
         "algebraic wildcard helpers preserve escaped literals",
         "algebraic traversal intersects query-scoped node admission",
         "traverse preserves table-scoped identities across result dedup and algebraic fallback",
@@ -1482,7 +1513,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Keep retrieval's unit/contract gate independent of the HTTP-linked
     // serving harness pulled in by root-test. Reuse the same root module and
     // runner, with only retrieval tests selected for code generation.
-    const retrieval_filters = &[_][]const u8{ "api.retrieval_agent.", "api.document_renderer.", "api.web_search." };
+    const retrieval_filters = &[_][]const u8{ "api.retrieval_agent.", "api.document_renderer.", "api.web_search.", "api.web_fetch.", "api.agent_tools.", "api.research_agent.", "api.research_jobs." };
     const retrieval_selected_filters = selectTestFilters(b, retrieval_filters);
     const retrieval_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -1508,6 +1539,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "artifact enrichment accepts typed chunker and rejects ambiguous legacy config",
+        "artifact enrichment list does not expose internal JSON or producer credentials",
+        "typed enrichment producer and graph scorer normalize to legacy storage fields",
+        "empty legacy graph scorer remains a deterministic resolver",
         "staged restore published metadata wins cancellation only after every owner opens",
         "staged restore worker publishes a dependency complete mixed native cohort",
         "staged restore worker rebuilds a dependency complete mixed portable cohort",
@@ -1645,11 +1680,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "API kernel create ",
         "API kernel failed fallible create releases unpublished state",
         "API kernel runtime I/O ",
+        "DistributedCandidateSource",
+        "DistributedEntitySink",
+        "prefixUpperBoundAlloc",
     };
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
     const api_http_runtime_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = &api_http_runtime_default_filters,
+        .filters = @import("test_support.zig").compileFiltersWithAnchors(b, &.{"api module compiles"}, api_http_runtime_filters),
         // The native-generation merge raised this linked API/DB harness to
         // 16.01 GB in macOS ReleaseFast codegen. Reserve measured usage plus
         // headroom; the shared runner still caps aggregate compilation.
@@ -1727,6 +1765,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lite_native_tests = addFilteredTestRunArtifact(b, lite_native_tests);
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
+    const portable_wal_tests = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .filters = &.{"portable WAL"},
+    });
+    const run_portable_wal_tests = b.addRunArtifact(portable_wal_tests);
+    b.step("portable-wal-test", "Run hosted WAL durability and read-only tests").dependOn(&run_portable_wal_tests.step);
+    lite_native_test_step.dependOn(&run_portable_wal_tests.step);
     const lite_benchmark = b.addTest(.{
         .root_module = lite_native_test_mod,
         .filters = &.{"lite throughput benchmark"},
@@ -1848,6 +1893,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_runtime_default_filters = [_][]const u8{
         "http host reserves service workers through its runtime and rolls back overcommit",
         "managed raft progress driver advances independently and joins on stop",
+        "managed raft progress driver coalesces request wakes without accelerating ticks",
+        "managed raft progress driver retains stop across wake reset",
+        "managed raft progress driver releases source ownership after startup refusal",
         "managed raft progress driver publishes source failure",
         "managed raft progress driver reports a wedged round unhealthy",
         "managed raft progress driver ignores a completed observed generation",
@@ -2324,6 +2372,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "table workflow can drive real metadata service topology and split setup",
             "table workflow can drive placement intents through the real metadata control loop",
             "metadata http service catalog cache is independent from volatile projection traffic",
+            "metadata http service linearizable reads leave elections to the cadence driver",
             "lifecycle listener detach drains callbacks and preserves unrelated listeners",
             "metadata.table mutation routing forwards only to a routable remote leader",
             "metadata http client forwards table create and drop to the internal route",
@@ -2335,6 +2384,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "metadata http client preserves unrecognized server outcomes for forwarded table mutations",
             "metadata http client does not replay unmarked table mutation rejection proof",
             "metadata http client round-trips server endpoints",
+            "metadata http client v0.2 snapshot fallback preserves proof budget and cancellation",
             "stamped definition replacement falls back to v0.2 text route",
             "definition replacement does not replay an ambiguous admitted request",
             "routed table mutation",
@@ -2824,6 +2874,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const vopr_registry_test_step = b.step("vopr-registry-test", "Record and exact-replay every context-free VOPR scenario through the CLI registry");
     vopr_registry_test_step.dependOn(&run_vopr_cli_registry_tests.step);
 
+    const abort_regression_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"distributed txn"},
+    });
+    const abort_regression_step = b.step("antfly-transaction-abort-test", "Run transaction coordinator and bounded abort regressions");
+    abort_regression_step.dependOn(&b.addRunArtifact(abort_regression_tests).step);
+
     const transaction_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"transaction VOPR exactly replays and emits a formal sidecar"},
@@ -3095,6 +3152,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &.{
             "full cluster VOPR exact replays",
+            "full cluster graph inflight restart cutoff drains parked hooks",
+            "failed node replacement leaves a drainable empty slot",
+            "metadata wrapper rejects empty node startup and restores external ownership after retry",
             "full cluster VOPR initializes teardown ownership on reused memory",
             "full cluster VOPR bounded startup cleanup exact replay",
         },
@@ -3106,6 +3166,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "Run one shared-scheduler metadata, data, serverless, HTTP, and client deployment history",
     );
     full_cluster_vopr_test_step.dependOn(&run_full_cluster_vopr_tests.step);
+
+    const full_cluster_graph_replay_soak_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"full cluster VOPR graph inflight restart repeated exact replay"},
+        .max_rss = full_cluster_vopr_max_rss,
+    });
+    b.step("full-cluster-graph-replay-soak-test", "Repeat the graph restart recorded history and exact replay")
+        .dependOn(&b.addRunArtifact(full_cluster_graph_replay_soak_tests).step);
+    const full_cluster_graph_cutoff_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"full cluster graph inflight restart cutoff drains parked hooks"},
+        .max_rss = full_cluster_vopr_max_rss,
+    });
+    b.step("full-cluster-graph-cutoff-test", "Verify graph restart hooks drain at a bounded replay cutoff")
+        .dependOn(&b.addRunArtifact(full_cluster_graph_cutoff_tests).step);
+    const full_cluster_node_replacement_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{
+            "failed node replacement leaves a drainable empty slot",
+            "metadata wrapper rejects empty node startup and restores external ownership after retry",
+        },
+        .max_rss = full_cluster_vopr_max_rss,
+    });
+    b.step("full-cluster-node-replacement-test", "Verify failed metadata replacement leaves a safe empty slot")
+        .dependOn(&b.addRunArtifact(full_cluster_node_replacement_tests).step);
 
     const extension_lifecycle_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -4342,6 +4427,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
     raft_runtime_test_step.dependOn(&run_raft_ready_continuation_tests.step);
 
+    const raft_host_progress_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "raft integration module compiles", "host drops stale inbound", "host queues live snapshot" },
+    });
+    b.step("antfly-raft-host-progress-test", "Run host progress notification and bounded inbound drain regressions").dependOn(&b.addRunArtifact(raft_host_progress_tests).step);
+
     const raft_restore_test_step = b.step("antfly-raft-restore-test", "Run focused Raft restore authority and restart tests");
     raft_restore_test_step.dependOn(&run_raft_restore_tests.step);
 
@@ -5553,6 +5644,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.persistent.",
             "storage.persistent_vopr.",
             "storage.portable_backup.",
+            "storage.portable_wal.",
             "storage.posting_segment_store.",
             "storage.resource_manager.",
             "storage.retained_effects.",

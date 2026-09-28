@@ -1639,6 +1639,12 @@ def test_executable_embedding_artifact_producer_survives_restart(
             "field": "body",
             "chunk_size": 128,
             "chunk_overlap": 16,
+            "chunker": {
+                "provider": "antfly",
+                "model": "fixed-bert-tokenizer",
+                "store_chunks": False,
+                "text": {"target_tokens": 64, "overlap_tokens": 8},
+            },
         },
     )
     stateful_api.put(

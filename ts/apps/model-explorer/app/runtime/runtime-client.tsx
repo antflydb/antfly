@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { Fragment } from "react";
 import { CodeLink } from "@/components/code/code-link";
-import { type ClientSnippet, SnippetProvider } from "@/components/code/snippet-context";
+import { SourceLinkProvider } from "@/components/code/source-link-context";
 import { Divergence, Scene, ScrollyChapter } from "@/components/scrollytelling/scrolly";
 import { SpineStrip } from "@/components/spine-strip";
 import {
@@ -110,7 +110,7 @@ function Box({
 function HttpDoorsFigure() {
   const doors = [
     { label: "generateEmbeddings", sub: "/ai/v1/embeddings" },
-    { label: "rerankPrompts", sub: "/ai/v1/rerank" },
+    { label: "rerankDocuments", sub: "/ai/v1/rerank" },
     { label: "generateContent", sub: "/ai/v1/generate" },
     { label: "chatCompletions", sub: "/ai/v1/chat/completions" },
   ];
@@ -658,17 +658,9 @@ function GenerationLoopFigure() {
 /* Page                                                                */
 /* ------------------------------------------------------------------ */
 
-export function RuntimeClient({
-  snippets,
-  gitCommit,
-  permalinkBase,
-}: {
-  snippets: Record<string, ClientSnippet>;
-  gitCommit: string;
-  permalinkBase?: string;
-}) {
+export function RuntimeClient({ permalinkBase }: { permalinkBase?: string }) {
   return (
-    <SnippetProvider snippets={snippets} gitCommit={gitCommit} permalinkBase={permalinkBase}>
+    <SourceLinkProvider permalinkBase={permalinkBase}>
       <div className="py-8">
         <header className="mx-auto max-w-7xl px-4">
           <h1 className="text-3xl font-bold tracking-tight">The runtime spine</h1>
@@ -685,11 +677,12 @@ export function RuntimeClient({
         <ScrollyChapter id="http" number={1} title="A request arrives">
           <Scene id="doors" graphic={<HttpDoorsFigure />}>
             <p>
-              Four doors into one hall. <code>generateEmbeddings</code>, <code>rerankPrompts</code>,{" "}
-              <code>generateContent</code>, and <code>chatCompletions</code> are four handlers on
-              the same inference server. Extraction also has its own handler. Request parsing, model
-              resolution, and resource admission precede task-specific pipelines; a common server
-              does not imply an identical execution path.
+              Four doors into one hall. <code>generateEmbeddings</code>,{" "}
+              <code>rerankDocuments</code>, <code>generateContent</code>, and{" "}
+              <code>chatCompletions</code> are four handlers on the same inference server.
+              Extraction also has its own handler. Request parsing, model resolution, and resource
+              admission precede task-specific pipelines; a common server does not imply an identical
+              execution path.
             </p>
             <p>
               <CodeLink link={L("server-embeddings")} /> · <CodeLink link={L("server-rerank")} /> ·{" "}
@@ -1036,6 +1029,6 @@ export function RuntimeClient({
           </Scene>
         </ScrollyChapter>
       </div>
-    </SnippetProvider>
+    </SourceLinkProvider>
   );
 }

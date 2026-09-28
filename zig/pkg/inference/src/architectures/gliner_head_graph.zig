@@ -1291,7 +1291,7 @@ pub fn runFullGraph(
     if (try useContextualEagerBatch(head_cfg, batch)) {
         if (strategy == .compiled_required) return error.UnsupportedBatchedGlinerGraphStrategy;
         cb.preferEagerQuantMirrors(true);
-        const hidden = try deberta_arch.forwardCt(cb, allocator, deberta_cfg, input_ids, attention_mask, batch, seq_len, true);
+        const hidden = try deberta_arch.forwardCt(cb, allocator, deberta_cfg, input_ids, attention_mask, batch, seq_len, @import("../models/deberta.zig").glinerPrefersWeightMirrors(deberta_cfg));
         defer cb.free(hidden);
         var result = try runContextualEagerHead(cb, allocator, head_cfg, hidden, input_ids, words_mask, span_idx, batch, seq_len);
         result.num_words = @intCast(@as(usize, result.num_words) / batch);

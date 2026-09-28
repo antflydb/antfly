@@ -29,7 +29,6 @@
     "react-dom": "^19.2.7",
     "recharts": "^3.8.1",
     "server-only": "^0.0.1",
-    "shiki": "^3.23.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

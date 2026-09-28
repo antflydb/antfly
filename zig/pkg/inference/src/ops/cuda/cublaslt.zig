@@ -68,6 +68,9 @@ const MatmulHeuristicResult = extern struct {
 
 const TensorCorePlanKind = enum(u8) {
     dense,
+    /// Input-gradient contraction for a frozen row-major weight:
+    /// [rows, out_dim] * [out_dim, in_dim] -> [rows, in_dim].
+    dense_input_gradient,
     dense_bias,
     strided_batched,
 };
@@ -358,7 +361,38 @@ pub const CublasLt = struct {
         out_dim: usize,
         tuning: MatmulTuning,
     ) Error!MatmulSelection {
-        return self.matmulWeightF32Out(ctx, dst, input_bf16, weight_bf16, workspace, rows, in_dim, out_dim, CUDA_R_16BF, tuning, null);
+        return self.matmulWeightF32Out(ctx, dst, input_bf16, weight_bf16, workspace, rows, in_dim, out_dim, CUDA_R_16BF, tuning, .dense, null);
+    }
+
+    /// Tensor-core input-gradient contraction for a frozen row-major BF16
+    /// weight. `grad_output_bf16` is [rows, out_dim], `weight_bf16` is
+    /// [out_dim, in_dim], and the F32 result is [rows, in_dim].
+    pub fn matmulBf16WeightInputGradientF32OutWithTuning(
+        self: *CublasLt,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        grad_output_bf16: buffer_mod.DeviceBuffer,
+        weight_bf16: buffer_mod.DeviceBuffer,
+        workspace: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        tuning: MatmulTuning,
+    ) Error!MatmulSelection {
+        return self.matmulWeightF32Out(
+            ctx,
+            dst,
+            grad_output_bf16,
+            weight_bf16,
+            workspace,
+            rows,
+            in_dim,
+            out_dim,
+            CUDA_R_16BF,
+            tuning,
+            .dense_input_gradient,
+            null,
+        );
     }
 
     /// Tensor-core matmul for FP16 GGUF weights. Activations are staged from
@@ -376,7 +410,7 @@ pub const CublasLt = struct {
         in_dim: usize,
         out_dim: usize,
     ) Error!void {
-        _ = try self.matmulWeightF32Out(ctx, dst, input_f16, weight_f16, workspace, rows, in_dim, out_dim, CUDA_R_16F, .{}, null);
+        _ = try self.matmulWeightF32Out(ctx, dst, input_f16, weight_f16, workspace, rows, in_dim, out_dim, CUDA_R_16F, .{}, .dense, null);
     }
 
     fn matmulWeightF32Out(
@@ -391,6 +425,7 @@ pub const CublasLt = struct {
         out_dim: usize,
         input_type: c_int,
         tuning: MatmulTuning,
+        kind: TensorCorePlanKind,
         bias: ?buffer_mod.DeviceBuffer,
     ) Error!MatmulSelection {
         if (bias != null) {
@@ -401,10 +436,13 @@ pub const CublasLt = struct {
         try self.validateContext(ctx);
         if (rows == 0 or in_dim == 0 or out_dim == 0) return .heuristic;
         if (rows > std.math.maxInt(u32) or in_dim > std.math.maxInt(u32) or out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
+        if (kind == .strided_batched) return error.CublasLtUnsupported;
+        const input_cols = if (kind == .dense_input_gradient) out_dim else in_dim;
+        const output_cols = if (kind == .dense_input_gradient) in_dim else out_dim;
         const element_bytes: usize = if (input_type == CUDA_R_32F) @sizeOf(f32) else @sizeOf(u16);
-        const input_bytes = try checkedMatrixBytes(rows, in_dim, element_bytes);
+        const input_bytes = try checkedMatrixBytes(rows, input_cols, element_bytes);
         const weight_bytes = try checkedMatrixBytes(out_dim, in_dim, element_bytes);
-        const dst_bytes = try checkedMatrixBytes(rows, out_dim, @sizeOf(f32));
+        const dst_bytes = try checkedMatrixBytes(rows, output_cols, @sizeOf(f32));
         try checkRawBytes(input, input_bytes);
         try checkRawBytes(weight, weight_bytes);
         try checkRawBytes(dst, dst_bytes);
@@ -428,7 +466,7 @@ pub const CublasLt = struct {
             .bias = bias,
         };
         try validateWorkspaceAlignment(workspace);
-        var plan_lease = try self.tensorCorePlanFor(if (bias != null) .dense_bias else .dense, input_type, 1, rows, in_dim, out_dim, workspace.len, tuning, ctx, invocation);
+        var plan_lease = try self.tensorCorePlanFor(kind, input_type, 1, rows, in_dim, out_dim, workspace.len, tuning, ctx, invocation);
         defer plan_lease.deinit(self);
         const plan = plan_lease.plan;
         try checkRawBytes(workspace, plan.workspace_size);
@@ -582,6 +620,15 @@ pub const CublasLt = struct {
                 try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.a_desc, key.input_type, key.in_dim, key.out_dim, key.in_dim));
                 try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.b_desc, key.input_type, key.in_dim, key.rows, key.in_dim));
             },
+            .dense_input_gradient => {
+                // Row-major W[out, in] is column-major [in, out] in-place;
+                // row-major dY[rows, out] is column-major [out, rows]. Their
+                // ordinary column-major product is the row-major dX result.
+                transa = CUBLAS_OP_N;
+                transb = CUBLAS_OP_N;
+                try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.a_desc, key.input_type, key.in_dim, key.out_dim, key.in_dim));
+                try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.b_desc, key.input_type, key.out_dim, key.rows, key.out_dim));
+            },
             .strided_batched => {
                 if (key.batch_count > std.math.maxInt(i32)) return error.CublasLtUnsupported;
                 transa = CUBLAS_OP_N;
@@ -592,9 +639,10 @@ pub const CublasLt = struct {
         }
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, @sizeOf(c_int)));
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, @sizeOf(c_int)));
+        const output_dim = if (key.kind == .dense_input_gradient) key.in_dim else key.out_dim;
+        try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.c_desc, CUDA_R_32F, output_dim, key.rows, output_dim));
+        try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.d_desc, CUDA_R_32F, output_dim, key.rows, output_dim));
         if (key.kind == .dense_bias) try self.setBias(plan.op_desc, invocation.bias orelse return error.CublasLtUnsupported);
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.c_desc, CUDA_R_32F, key.out_dim, key.rows, key.out_dim));
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.d_desc, CUDA_R_32F, key.out_dim, key.rows, key.out_dim));
 
         if (key.kind == .strided_batched) {
             var row_order = CUBLASLT_ORDER_ROW;
@@ -953,11 +1001,11 @@ pub const CublasLt = struct {
     ) Error!void {
         // Reuse the bounded, alignment-aware plan cache used by F16/BF16.
         // FP32 is part of the key, and the compute mode remains strict FP32.
-        _ = try self.matmulWeightF32Out(ctx, dst, input_f32, weight_f32, .{}, rows, in_dim, out_dim, CUDA_R_32F, .{}, null);
+        _ = try self.matmulWeightF32Out(ctx, dst, input_f32, weight_f32, .{}, rows, in_dim, out_dim, CUDA_R_32F, .{}, .dense, null);
     }
 
     pub fn matmulF32BiasF32Out(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) Error!void {
-        _ = try self.matmulWeightF32Out(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_32F, .{}, bias);
+        _ = try self.matmulWeightF32Out(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_32F, .{}, .dense_bias, bias);
     }
 
     fn setBias(self: *const CublasLt, desc: MatmulDesc, bias: buffer_mod.DeviceBuffer) Error!void {
@@ -1087,6 +1135,10 @@ test "tensor core plan keys distinguish incompatible layouts" {
     var batched = common;
     batched.kind = .strided_batched;
     try std.testing.expect(!std.meta.eql(common, batched));
+    var input_gradient = common;
+    input_gradient.kind = .dense_input_gradient;
+    try std.testing.expect(!std.meta.eql(common, input_gradient));
+    try std.testing.expect(!std.meta.eql(batched, input_gradient));
 }
 
 test "matmul tuning fingerprints only normalized tuning behavior" {

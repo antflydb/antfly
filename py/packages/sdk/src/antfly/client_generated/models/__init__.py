@@ -249,6 +249,7 @@ from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
+from .enrichment_config_producer import EnrichmentConfigProducer
 from .enrichment_kind import EnrichmentKind
 from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
 from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
@@ -487,6 +488,7 @@ from .graph_artifact_node_mapping_config import GraphArtifactNodeMappingConfig
 from .graph_artifact_node_mapping_config_model import GraphArtifactNodeMappingConfigModel
 from .graph_artifact_producer_config import GraphArtifactProducerConfig
 from .graph_artifact_producer_config_kind import GraphArtifactProducerConfigKind
+from .graph_artifact_producer_config_producer import GraphArtifactProducerConfigProducer
 from .graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
 from .graph_artifact_producer_source_config import GraphArtifactProducerSourceConfig
 from .graph_artifact_producer_source_config_type import GraphArtifactProducerSourceConfigType
@@ -614,6 +616,11 @@ from .graph_resolver_config import GraphResolverConfig
 from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
 from .graph_resolver_config_fusion_combine import GraphResolverConfigFusionCombine
 from .graph_resolver_config_source_artifact_kind import GraphResolverConfigSourceArtifactKind
+from .graph_resolver_scorer_comparison import GraphResolverScorerComparison
+from .graph_resolver_scorer_config import GraphResolverScorerConfig
+from .graph_resolver_scorer_config_combine import GraphResolverScorerConfigCombine
+from .graph_resolver_scorer_config_decision import GraphResolverScorerConfigDecision
+from .graph_resolver_scorer_level import GraphResolverScorerLevel
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
@@ -664,6 +671,8 @@ from .hierarchy_match_hit import HierarchyMatchHit
 from .hierarchy_match_hit_source import HierarchyMatchHitSource
 from .hierarchy_matches import HierarchyMatches
 from .hierarchy_projection import HierarchyProjection
+from .highlight_fragment import HighlightFragment
+from .highlight_span import HighlightSpan
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
@@ -996,10 +1005,12 @@ from .query_filter_error_error import QueryFilterErrorError
 from .query_filter_error_field import QueryFilterErrorField
 from .query_filter_error_status import QueryFilterErrorStatus
 from .query_hierarchy import QueryHierarchy
+from .query_highlight import QueryHighlight
 from .query_hit import QueryHit
 from .query_hit_hierarchy import QueryHitHierarchy
 from .query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
 from .query_hit_hierarchy_level import QueryHitHierarchyLevel
+from .query_hit_highlights import QueryHitHighlights
 from .query_hit_index_scores import QueryHitIndexScores
 from .query_hit_source import QueryHitSource
 from .query_hits import QueryHits
@@ -1084,6 +1095,36 @@ from .reranker_candidate_limit_exceeded_error_status import RerankerCandidateLim
 from .reranker_config import RerankerConfig
 from .reranker_profile import RerankerProfile
 from .reranker_provider import RerankerProvider
+from .research_agent_request import ResearchAgentRequest
+from .research_agent_result import ResearchAgentResult
+from .research_agent_steps import ResearchAgentSteps
+from .research_budget import ResearchBudget
+from .research_citation import ResearchCitation
+from .research_claim import ResearchClaim
+from .research_evidence import ResearchEvidence
+from .research_evidence_source import ResearchEvidenceSource
+from .research_finding import ResearchFinding
+from .research_incomplete_details import ResearchIncompleteDetails
+from .research_incomplete_details_reason import ResearchIncompleteDetailsReason
+from .research_job import ResearchJob
+from .research_job_advance_request import ResearchJobAdvanceRequest
+from .research_job_start_request import ResearchJobStartRequest
+from .research_job_state import ResearchJobState
+from .research_phase import ResearchPhase
+from .research_plan import ResearchPlan
+from .research_reflection import ResearchReflection
+from .research_report import ResearchReport
+from .research_report_section import ResearchReportSection
+from .research_retrieval_step_config import ResearchRetrievalStepConfig
+from .research_state import ResearchState
+from .research_step_config import ResearchStepConfig
+from .research_sub_question import ResearchSubQuestion
+from .research_sub_question_sources_item import ResearchSubQuestionSourcesItem
+from .research_sub_question_status import ResearchSubQuestionStatus
+from .research_unsupported_claim import ResearchUnsupportedClaim
+from .research_usage import ResearchUsage
+from .research_verification import ResearchVerification
+from .research_write_step_config import ResearchWriteStepConfig
 from .resource_type import ResourceType
 from .restore_job import RestoreJob
 from .restore_job_list import RestoreJobList
@@ -1203,6 +1244,16 @@ from .template_field_mapping import TemplateFieldMapping
 from .template_field_mapping_missing_null_policy import TemplateFieldMappingMissingNullPolicy
 from .term_query import TermQuery
 from .term_range_query import TermRangeQuery
+from .text_analysis_component import TextAnalysisComponent
+from .text_analysis_component_config import TextAnalysisComponentConfig
+from .text_analysis_config import TextAnalysisConfig
+from .text_analysis_config_analyzers import TextAnalysisConfigAnalyzers
+from .text_analysis_config_char_filters import TextAnalysisConfigCharFilters
+from .text_analysis_config_date_time_parsers import TextAnalysisConfigDateTimeParsers
+from .text_analysis_config_field_analyzers import TextAnalysisConfigFieldAnalyzers
+from .text_analysis_config_field_date_time_parsers import TextAnalysisConfigFieldDateTimeParsers
+from .text_analysis_config_token_filters import TextAnalysisConfigTokenFilters
+from .text_analysis_config_tokenizers import TextAnalysisConfigTokenizers
 from .text_chunk_options import TextChunkOptions
 from .text_content_part import TextContentPart
 from .text_content_part_type import TextContentPartType
@@ -1533,6 +1584,7 @@ __all__ = (
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
+    "EnrichmentConfigProducer",
     "EnrichmentKind",
     "EnrichmentNeighborContextConfig",
     "EnrichmentNeighborContextConfigDirection",
@@ -1765,6 +1817,7 @@ __all__ = (
     "GraphArtifactNodeMappingConfigModel",
     "GraphArtifactProducerConfig",
     "GraphArtifactProducerConfigKind",
+    "GraphArtifactProducerConfigProducer",
     "GraphArtifactProducerConfigProducerJson",
     "GraphArtifactProducerSourceConfig",
     "GraphArtifactProducerSourceConfigType",
@@ -1892,6 +1945,11 @@ __all__ = (
     "GraphResolverConfigCandidateSearch",
     "GraphResolverConfigFusionCombine",
     "GraphResolverConfigSourceArtifactKind",
+    "GraphResolverScorerComparison",
+    "GraphResolverScorerConfig",
+    "GraphResolverScorerConfigCombine",
+    "GraphResolverScorerConfigDecision",
+    "GraphResolverScorerLevel",
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
@@ -1942,6 +2000,8 @@ __all__ = (
     "HierarchyMatchHit",
     "HierarchyMatchHitSource",
     "HierarchyProjection",
+    "HighlightFragment",
+    "HighlightSpan",
     "ImageURL",
     "ImageURLContentPart",
     "ImageURLContentPartType",
@@ -2270,10 +2330,12 @@ __all__ = (
     "QueryFilterErrorField",
     "QueryFilterErrorStatus",
     "QueryHierarchy",
+    "QueryHighlight",
     "QueryHit",
     "QueryHitHierarchy",
     "QueryHitHierarchyAncestors",
     "QueryHitHierarchyLevel",
+    "QueryHitHighlights",
     "QueryHitIndexScores",
     "QueryHits",
     "QueryHitSource",
@@ -2358,6 +2420,36 @@ __all__ = (
     "RerankerConfig",
     "RerankerProfile",
     "RerankerProvider",
+    "ResearchAgentRequest",
+    "ResearchAgentResult",
+    "ResearchAgentSteps",
+    "ResearchBudget",
+    "ResearchCitation",
+    "ResearchClaim",
+    "ResearchEvidence",
+    "ResearchEvidenceSource",
+    "ResearchFinding",
+    "ResearchIncompleteDetails",
+    "ResearchIncompleteDetailsReason",
+    "ResearchJob",
+    "ResearchJobAdvanceRequest",
+    "ResearchJobStartRequest",
+    "ResearchJobState",
+    "ResearchPhase",
+    "ResearchPlan",
+    "ResearchReflection",
+    "ResearchReport",
+    "ResearchReportSection",
+    "ResearchRetrievalStepConfig",
+    "ResearchState",
+    "ResearchStepConfig",
+    "ResearchSubQuestion",
+    "ResearchSubQuestionSourcesItem",
+    "ResearchSubQuestionStatus",
+    "ResearchUnsupportedClaim",
+    "ResearchUsage",
+    "ResearchVerification",
+    "ResearchWriteStepConfig",
     "ResourceType",
     "RestoreJob",
     "RestoreJobList",
@@ -2477,6 +2569,16 @@ __all__ = (
     "TemplateFieldMappingMissingNullPolicy",
     "TermQuery",
     "TermRangeQuery",
+    "TextAnalysisComponent",
+    "TextAnalysisComponentConfig",
+    "TextAnalysisConfig",
+    "TextAnalysisConfigAnalyzers",
+    "TextAnalysisConfigCharFilters",
+    "TextAnalysisConfigDateTimeParsers",
+    "TextAnalysisConfigFieldAnalyzers",
+    "TextAnalysisConfigFieldDateTimeParsers",
+    "TextAnalysisConfigTokenFilters",
+    "TextAnalysisConfigTokenizers",
     "TextChunkOptions",
     "TextContentPart",
     "TextContentPartType",

@@ -379,6 +379,16 @@ const StorageOwnerTransactionRecovery = struct {
         ));
     }
 
+    fn acknowledgeParticipants(ptr: *anyopaque, txn_id: transactions_mod.TxnId, owner_participant: []const u8, participants: []const []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.config.acknowledge_participants_fn orelse return error.UnsupportedOperation;
+        if (participants.len == 0 or participants.len > 64) return error.InvalidParticipant;
+        var members: [64]kernel_owner_abi.BorrowedBytes = undefined;
+        for (participants, members[0..participants.len]) |participant, *member| member.* = .fromSlice(participant);
+        const abi_txn_id = kernel_owner_abi.TxnId{ .bytes = txn_id };
+        try callbackStatus(callback(self.config.callback_ctx, &abi_txn_id, .fromSlice(owner_participant), &members, participants.len));
+    }
+
     fn cleanupTransaction(
         ptr: *anyopaque,
         txn_id: transactions_mod.TxnId,
@@ -410,6 +420,7 @@ const StorageOwnerTransactionRecovery = struct {
             .replicated_metadata = self.config.replicated_metadata != 0,
             .owns_recovery_fn = if (self.config.replicated_metadata != 0) ownsRecovery else null,
             .acknowledge_participant_fn = if (self.config.replicated_metadata != 0) acknowledgeParticipant else null,
+            .acknowledge_participants_fn = if (self.config.replicated_metadata != 0 and self.config.acknowledge_participants_fn != null) acknowledgeParticipants else null,
             .cleanup_transaction_fn = if (self.config.replicated_metadata != 0) cleanupTransaction else null,
         };
     }
@@ -602,6 +613,7 @@ const StorageOwnerRuntimeHooks = struct {
     ) anyerror!void {
         const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
         const callback = self.config.entity_sink.upsert_batch_fn orelse {
+            for (entries) |entry| if (entry.storage_table != null or entry.delete) return error.EntityPromotionAtomicCommitUnavailable;
             for (entries) |entry| try entityUpsert(ptr, alloc, entry.table, entry.key, entry.doc_json);
             return;
         };
@@ -609,8 +621,10 @@ const StorageOwnerRuntimeHooks = struct {
         defer alloc.free(encoded);
         for (entries, encoded) |source, *destination| destination.* = .{
             .table = .fromSlice(source.table),
+            .storage_table = .fromSlice(source.storage_table orelse ""),
             .key = .fromSlice(source.key),
             .doc_json = .fromSlice(source.doc_json),
+            .delete = @intFromBool(source.delete),
         };
         try kernel_error_identity.statusToError(callback(
             self.config.entity_sink.callback_ctx,
@@ -1849,7 +1863,7 @@ pub fn HandleRegistryOf(comptime T: type) type {
         const Slot = struct {
             /// `generation << 1 | closing`. The slot is open for `generation`
             /// exactly when the closing bit is clear.
-            state: std.atomic.Value(u64) = .init(0),
+            state: @import("antfly_platform").atomic.Value(u64) = .init(0),
             /// Calls that have entered, or are trying to, for any generation.
             active: std.atomic.Value(u32) = .init(0),
             handle: std.atomic.Value(?*T) = .init(null),
@@ -1967,7 +1981,7 @@ pub fn HandleRegistryOf(comptime T: type) type {
             var spins: u32 = 0;
             while (slot.active.load(.seq_cst) != 0) : (spins +|= 1) {
                 if (spins < 64) {
-                    std.Thread.yield() catch {};
+                    @import("antfly_platform").time.yieldNow();
                 } else {
                     handleLockIo().sleep(.fromMicroseconds(500), .awake) catch {};
                 }
@@ -5954,6 +5968,7 @@ pub fn storageOwnerOpen(
     const prepared_schema = local_write.prepareOwnerSchemaBeforeIndexLoad(alloc, request.schema_json.slice()) catch |err| return storageOwnerStatusFromError(err);
     defer local_write.freeOwnerSchemaBeforeIndexLoad(alloc, prepared_schema);
     if (request.restore_cancel_recovery > 1 or request.restore_ha_replay > 1 or
+        request.historical_raft_apply > 1 or
         (request.restore_cancel_recovery != 0 and request.restore_ha_replay != 0) or
         ((request.restore_cancel_recovery != 0 or request.restore_ha_replay != 0) and request.restore_bootstrap_json.len == 0) or request.restore_bootstrap_json.len > 16 * 1024 * 1024) return .invalid_argument;
     var restore_bootstrap: ?std.json.Parsed(antfly.capi_dependencies.storage_db_restore_staging_contract.OwnerBootstrap) = null;
@@ -6019,6 +6034,12 @@ pub fn storageOwnerOpen(
     handle.* = .{
         .alloc = alloc,
         .db = db_mod.DB.open(alloc, path, open_options) catch |err| {
+            // A descriptor captured before structural reconciliation can outlive
+            // the owner that installed a newer durable schema. Reject the stale
+            // open without making Raft apply fatal; its next attempt reloads the
+            // catalog descriptor. Keep exact restore bootstrap failures strict.
+            if (err == error.SchemaVersionRegression and restore_bootstrap == null)
+                return storageOwnerStatusFromError(error.StorageBusy);
             std.log.err("storage owner open failed table={s} group_id={} err={s}", .{
                 table_name, request.group_id, @errorName(err),
             });
@@ -6045,7 +6066,7 @@ pub fn storageOwnerOpen(
     // after the DB occupies its final address, and drain them on failure.
     if (restore_bootstrap) |bootstrap| {
         local_write.configureRestoreOwnerDb(alloc, &handle.db, bootstrap.value, request.restore_cancel_recovery != 0, request.restore_ha_replay != 0) catch |err| return storageOwnerStatusFromError(err);
-    } else local_write.configureStorageKernelOwnerDb(
+    } else local_write.configureStorageKernelOwnerDbAtOpen(
         alloc,
         &handle.db,
         table_name,
@@ -6056,6 +6077,7 @@ pub fn storageOwnerOpen(
         if (owner_context) |context| context.secret_store else null,
         if (owner_context) |context| context.remoteContent() else null,
         &handle.storage_owner_managed_config,
+        request.historical_raft_apply != 0,
     ) catch |err| return storageOwnerStatusFromError(err);
     // DB.open returns by value. Only now is the compiled owner's DB at its
     // permanent address with configuration installed; use the same startup as
@@ -6733,7 +6755,7 @@ pub fn storageOwnerBackupPinControlJson(owner: ?*anyopaque, request: *const kern
     var parsed = std.json.parseFromSlice(seal.Request, handle.alloc, request.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
     defer parsed.deinit();
     const control: backups_api.BackupOperationControl = .{ .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else std.math.maxInt(u64), .cancellation = ownerQueryCancellation(request) };
-    const response = antfly.capi_dependencies.api_table_writes.executeBackupPinControl(handle.alloc, &handle.db, handle.storage_owner_group_id, parsed.value, control) catch |err| {
+    const response = antfly.capi_dependencies.storage_db_backup_pin_control.execute(handle.alloc, &handle.db, handle.storage_owner_group_id, parsed.value, control) catch |err| {
         if (backup_pin_diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs()))
             std.log.warn("backup pin failed phase=native_capture action={s} group_id={d} class={s}", .{ @tagName(parsed.value), handle.storage_owner_group_id, @errorName(err) });
         return storageOwnerStatusFromError(err);
@@ -16879,4 +16901,37 @@ pub fn storageOwnerMergeArtifactsPage(owner_ptr: ?*anyopaque, request: *const ke
         return storageOwnerStatusFromError(err);
     out_result.* = .{ .ptr = encoded.ptr, .len = @intCast(encoded.len) };
     return .ok;
+}
+
+test "storage owner runtime status bulk recovery bridge preserves identities capability and debt" {
+    const Capture = struct {
+        calls: usize = 0,
+        result: kernel_owner_abi.Status = .ok,
+        fn acknowledge(ptr: ?*anyopaque, txn: *const kernel_owner_abi.TxnId, owner: kernel_owner_abi.BorrowedBytes, items: ?[*]const kernel_owner_abi.BorrowedBytes, len: usize) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            std.testing.expectEqual([_]u8{5} ** 16, txn.bytes) catch return .internal;
+            std.testing.expectEqualStrings("owner", owner.slice()) catch return .internal;
+            std.testing.expectEqual(@as(usize, 2), len) catch return .internal;
+            std.testing.expectEqualStrings("first", items.?[0].slice()) catch return .internal;
+            std.testing.expectEqualStrings("second", items.?[1].slice()) catch return .internal;
+            return self.result;
+        }
+    };
+    var capture: Capture = .{};
+    var bridge: StorageOwnerTransactionRecovery = undefined;
+    var owner_id = [_]u8{ 'o', 'w', 'n', 'e', 'r' };
+    bridge.owner_id = &owner_id;
+    bridge.config = .{ .callback_ctx = &capture, .replicated_metadata = 1, .acknowledge_participants_fn = Capture.acknowledge };
+    const config = bridge.dbConfig();
+    try std.testing.expect(config.acknowledge_participants_fn != null);
+    try StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{ "first", "second" });
+    for ([_]anyerror{ error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion, error.RaftBatchWriteOutcomeUnknown }) |err| {
+        capture.result = kernel_error_identity.statusFromError(err);
+        try std.testing.expectError(err, StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{ "first", "second" }));
+    }
+    try std.testing.expectError(error.InvalidParticipant, StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{}));
+    try std.testing.expectEqual(@as(usize, 4), capture.calls);
+    bridge.config.acknowledge_participants_fn = null;
+    try std.testing.expect(bridge.dbConfig().acknowledge_participants_fn == null);
 }

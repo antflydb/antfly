@@ -69,9 +69,10 @@ jobs:
       comment_id: ${{ inputs.comment_id }}
   zig:
     needs: approve
-    if: contains(fromJSON(needs.approve.outputs.suites), 'zig')
+    if: contains(fromJSON(needs.approve.outputs.suites), 'zig') || contains(fromJSON(needs.approve.outputs.suites), 'full')
     uses: ./.github/workflows/zig-tests.yml
     with:
+      full_validation: ${{ contains(fromJSON(needs.approve.outputs.suites), 'full') }}
       pr_number: ${{ inputs.pr_number }}
       head_sha: ${{ needs.approve.outputs.head_sha }}
       base_sha: ${{ needs.approve.outputs.base_sha }}
@@ -127,6 +128,17 @@ jobs:
       base_sha: ${{ needs.approve.outputs.base_sha }}
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
+  vopr:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'vopr') || contains(fromJSON(needs.approve.outputs.suites), 'soak')
+    uses: ./.github/workflows/zig-vopr-pr.yml
+    with:
+      full_soak: ${{ contains(fromJSON(needs.approve.outputs.suites), 'soak') }}
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
   darwin:
     needs: approve
     if: contains(fromJSON(needs.approve.outputs.suites), 'darwin')
@@ -139,7 +151,7 @@ jobs:
       comment_id: ${{ inputs.comment_id }}
   result:
     name: PR CI result
-    needs: [approve, policy, zig, sdks, proxy, operator, scale, gpu, darwin]
+    needs: [approve, policy, zig, sdks, proxy, operator, scale, gpu, vopr, darwin]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -152,7 +164,8 @@ jobs:
             const needs = JSON.parse(process.env.RESULTS);
             if (needs.approve.result !== 'success') throw new Error('Approval failed');
             for (const suite of JSON.parse(needs.approve.outputs.suites)) {
-              if (needs[suite]?.result !== 'success') throw new Error(`${suite} did not pass`);
+              const job = {full: 'zig', soak: 'vopr'}[suite] || suite;
+              if (needs[job]?.result !== 'success') throw new Error(`${suite} did not pass`);
             }
 
   publish:

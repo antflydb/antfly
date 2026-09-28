@@ -10,6 +10,8 @@ from ..models.enrichment_kind import EnrichmentKind
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.chunker_config import ChunkerConfig
+    from ..models.enrichment_config_producer import EnrichmentConfigProducer
     from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
     from ..models.execution_policy import ExecutionPolicy
     from ..models.transcriber_enrichment_config import TranscriberEnrichmentConfig
@@ -39,10 +41,15 @@ class EnrichmentConfig:
                 be mixed; dimensions are always validated independently.
             chunk_size (int | Unset): Chunk size for chunk enrichments.
             chunk_overlap (int | Unset): Chunk overlap for chunk enrichments.
-            chunker_json (str | Unset): Serialized chunker configuration for chunk enrichments.
+            chunker (ChunkerConfig | Unset): A unified configuration for a chunking provider. Example: {'provider':
+                'antfly', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
+            chunker_json (str | Unset): Legacy serialized chunker configuration for chunk enrichments. Cannot be combined
+                with chunker.
             full_text_index (bool | Unset): When true on a chunk or asset enrichment, route generated text into the table's
                 default full-text index. Default: False.
             content_type (str | Unset): Produced asset content type for asset enrichments.
+            producer (EnrichmentConfigProducer | Unset): Write-only producer configuration. Cannot be combined with
+                producer_json or transcriber.
             producer_json (str | Unset): Write-only serialized producer configuration. For managed embedding enrichments
                 Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
             neighbor_context (EnrichmentNeighborContextConfig | Unset): Bounded sample of the document's same-shard graph
@@ -83,9 +90,11 @@ class EnrichmentConfig:
     vector_space: str | Unset = UNSET
     chunk_size: int | Unset = UNSET
     chunk_overlap: int | Unset = UNSET
+    chunker: ChunkerConfig | Unset = UNSET
     chunker_json: str | Unset = UNSET
     full_text_index: bool | Unset = False
     content_type: str | Unset = UNSET
+    producer: EnrichmentConfigProducer | Unset = UNSET
     producer_json: str | Unset = UNSET
     neighbor_context: EnrichmentNeighborContextConfig | Unset = UNSET
     execution: ExecutionPolicy | Unset = UNSET
@@ -111,11 +120,19 @@ class EnrichmentConfig:
 
         chunk_overlap = self.chunk_overlap
 
+        chunker: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.chunker, Unset):
+            chunker = self.chunker.to_dict()
+
         chunker_json = self.chunker_json
 
         full_text_index = self.full_text_index
 
         content_type = self.content_type
+
+        producer: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.producer, Unset):
+            producer = self.producer.to_dict()
 
         producer_json = self.producer_json
 
@@ -153,12 +170,16 @@ class EnrichmentConfig:
             field_dict["chunk_size"] = chunk_size
         if chunk_overlap is not UNSET:
             field_dict["chunk_overlap"] = chunk_overlap
+        if chunker is not UNSET:
+            field_dict["chunker"] = chunker
         if chunker_json is not UNSET:
             field_dict["chunker_json"] = chunker_json
         if full_text_index is not UNSET:
             field_dict["full_text_index"] = full_text_index
         if content_type is not UNSET:
             field_dict["content_type"] = content_type
+        if producer is not UNSET:
+            field_dict["producer"] = producer
         if producer_json is not UNSET:
             field_dict["producer_json"] = producer_json
         if neighbor_context is not UNSET:
@@ -172,6 +193,8 @@ class EnrichmentConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.chunker_config import ChunkerConfig
+        from ..models.enrichment_config_producer import EnrichmentConfigProducer
         from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
         from ..models.execution_policy import ExecutionPolicy
         from ..models.transcriber_enrichment_config import TranscriberEnrichmentConfig
@@ -195,11 +218,25 @@ class EnrichmentConfig:
 
         chunk_overlap = d.pop("chunk_overlap", UNSET)
 
+        _chunker = d.pop("chunker", UNSET)
+        chunker: ChunkerConfig | Unset
+        if isinstance(_chunker, Unset):
+            chunker = UNSET
+        else:
+            chunker = ChunkerConfig.from_dict(_chunker)
+
         chunker_json = d.pop("chunker_json", UNSET)
 
         full_text_index = d.pop("full_text_index", UNSET)
 
         content_type = d.pop("content_type", UNSET)
+
+        _producer = d.pop("producer", UNSET)
+        producer: EnrichmentConfigProducer | Unset
+        if isinstance(_producer, Unset):
+            producer = UNSET
+        else:
+            producer = EnrichmentConfigProducer.from_dict(_producer)
 
         producer_json = d.pop("producer_json", UNSET)
 
@@ -234,9 +271,11 @@ class EnrichmentConfig:
             vector_space=vector_space,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
+            chunker=chunker,
             chunker_json=chunker_json,
             full_text_index=full_text_index,
             content_type=content_type,
+            producer=producer,
             producer_json=producer_json,
             neighbor_context=neighbor_context,
             execution=execution,

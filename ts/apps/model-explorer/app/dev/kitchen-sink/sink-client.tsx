@@ -1,7 +1,7 @@
 "use client";
 
 import { CodeLink } from "@/components/code/code-link";
-import { type ClientSnippet, SnippetProvider } from "@/components/code/snippet-context";
+import { SourceLinkProvider } from "@/components/code/source-link-context";
 import {
   EnvFlagChip,
   FusionChip,
@@ -32,17 +32,13 @@ import { fixtureFrame, fixtureKvTrace, fixtureSankey, fixtureSpec } from "./fixt
 
 export function KitchenSinkClient({
   routes,
-  snippets,
-  gitCommit,
   permalinkBase,
 }: {
   routes: KernelRoute[];
-  snippets: Record<string, ClientSnippet>;
-  gitCommit: string;
   permalinkBase?: string;
 }) {
   return (
-    <SnippetProvider snippets={snippets} gitCommit={gitCommit} permalinkBase={permalinkBase}>
+    <SourceLinkProvider permalinkBase={permalinkBase}>
       <div className="space-y-10 pb-20">
         <section className="mx-auto max-w-7xl space-y-4 px-4 pt-8">
           <h1 className="text-2xl font-bold">Kitchen sink (dev)</h1>
@@ -155,6 +151,6 @@ export function KitchenSinkClient({
           </div>
         </section>
       </div>
-    </SnippetProvider>
+    </SourceLinkProvider>
   );
 }

@@ -171,9 +171,11 @@ pub const GeneratedEnrichmentRequest = struct {
     chunker_json: []const u8 = "",
     full_text_index: bool = false,
     /// Persist generated chunk records even when no text index consumes them.
-    /// Graph indexes read their source payloads from the artifact store, while
-    /// embedding-only consumers can usually reuse the in-flight chunk cache.
+    /// Materialized embedding and graph consumers both require durable chunks.
     persist_artifact: bool = false,
+    /// Run this chunk producer even when every embedding consumer of its
+    /// artifact is satisfied by an explicit vector in the document write.
+    independently_required: bool = false,
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
     /// Serialized neighbor-context configuration for asset producers. When
@@ -276,6 +278,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .chunker_json = chunker_json,
         .full_text_index = request.full_text_index,
         .persist_artifact = request.persist_artifact,
+        .independently_required = request.independently_required,
         .content_type = content_type,
         .producer_json = producer_json,
         .neighbor_context_json = neighbor_context_json,

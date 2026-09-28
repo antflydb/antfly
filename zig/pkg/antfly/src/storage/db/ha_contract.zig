@@ -39,16 +39,16 @@ pub const AsyncEffectMirror = struct {
     /// Serializes the final write-gate check, WAL append, and acknowledgement
     /// with a node-local promotion fence.
     transition_mutex: ?*std.atomic.Mutex = null,
-    last_lsn: ?*std.atomic.Value(u64) = null,
-    failure_count: ?*std.atomic.Value(u64) = null,
+    last_lsn: ?*@import("antfly_platform").atomic.Value(u64) = null,
+    failure_count: ?*@import("antfly_platform").atomic.Value(u64) = null,
     sync_policy: primary_mod.SyncPolicy = .{},
     sync_wait_ctx: ?*anyopaque = null,
     sync_wait_fn: ?SyncWaitFn = null,
-    last_gate_lsn: ?*std.atomic.Value(u64) = null,
+    last_gate_lsn: ?*@import("antfly_platform").atomic.Value(u64) = null,
     last_gate_action: ?*std.atomic.Value(u8) = null,
-    sync_reject_count: ?*std.atomic.Value(u64) = null,
-    sync_wait_count: ?*std.atomic.Value(u64) = null,
-    sync_degraded_count: ?*std.atomic.Value(u64) = null,
+    sync_reject_count: ?*@import("antfly_platform").atomic.Value(u64) = null,
+    sync_wait_count: ?*@import("antfly_platform").atomic.Value(u64) = null,
+    sync_degraded_count: ?*@import("antfly_platform").atomic.Value(u64) = null,
 };
 
 pub const AsyncBatchMirror = AsyncEffectMirror;

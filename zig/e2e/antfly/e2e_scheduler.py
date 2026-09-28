@@ -126,6 +126,12 @@ def normalize_nodeid(nodeid: str) -> str:
     return nodeid
 
 
+def duration_nodeid(nodeid: str) -> str:
+    """Use the same history key from the repository, Zig, or pytest root."""
+    path, separator, test = normalize_nodeid(nodeid).partition("::")
+    return path.replace("\\", "/").rsplit("/", 1)[-1] + separator + test
+
+
 def _safe_group_name(prefix: str, identity: str) -> str:
     readable = re.sub(r"[^A-Za-z0-9_.-]+", "-", identity).strip("-")[-80:]
     digest = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:10]
@@ -473,19 +479,28 @@ class DurationHistory:
                 continue
             if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
                 continue
-            self.tests[nodeid] = {
+            normalized = duration_nodeid(nodeid)
+            previous = self.tests.get(normalized)
+            # Migrate caches containing both prefixed seeds and measured keys.
+            # Prefer the most sampled entry, then the already canonical key.
+            if previous is not None and (
+                samples < previous["samples"]
+                or (samples == previous["samples"] and nodeid != normalized)
+            ):
+                continue
+            self.tests[normalized] = {
                 "seconds": normalized_seconds,
                 "samples": samples,
             }
 
     def estimate(self, nodeid: str, *, process_owned: bool) -> float:
-        entry = self.tests.get(normalize_nodeid(nodeid))
+        entry = self.tests.get(duration_nodeid(nodeid))
         if entry is not None:
             return float(entry["seconds"])
         return DEFAULT_PROCESS_SECONDS if process_owned else DEFAULT_LIGHT_SECONDS
 
     def observe(self, nodeid: str, duration: float) -> None:
-        normalized = normalize_nodeid(nodeid)
+        normalized = duration_nodeid(nodeid)
         self.observed[normalized] = self.observed.get(normalized, 0.0) + max(
             0.0, duration
         )
@@ -558,6 +573,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
     def __init__(self, config: pytest.Config, log: Producer | None = None):
         super().__init__(config, log)
         self.process_slots = int(config.getoption("e2e_process_slots"))
+        self.process_workers = config.getoption("e2e_process_workers")
         self.duration_history = DurationHistory(
             Path(config.getoption("e2e_duration_file"))
         )
@@ -673,6 +689,18 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             self._worker_reserved_process_slots(node) for node in self.assigned_work
         )
 
+    def _process_worker_fits(self, node: WorkerController, scope: str) -> bool:
+        if not self._scope_uses_process(scope):
+            return True
+        limit = getattr(self, "process_workers", None)
+        if limit is None:
+            return True
+        owners = sum(
+            bool(self._worker_reserved_process_slots(candidate))
+            for candidate in self.assigned_work
+        )
+        return bool(self._worker_reserved_process_slots(node)) or owners < limit
+
     def _additional_process_slots(self, node: WorkerController, scope: str) -> int:
         persistent_processes = self._scope_persistent_processes(scope)
         additional = len(
@@ -736,6 +764,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             and reserved_process_slots
             + self._additional_process_slots(candidate, scope)
             <= self.process_slots
+            and self._process_worker_fits(candidate, scope)
             for candidate in self.nodes
         )
 
@@ -845,6 +874,16 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             for scope in queued_scopes
         ):
             return False
+        if getattr(self, "process_workers", None) == 1 and any(
+            self._scope_uses_process(scope)
+            and self._reserved_process_slots()
+            + self._additional_process_slots(node, scope)
+            <= self.process_slots
+            for scope in queued_scopes
+        ):
+            # Reuse the sole process worker when another group can fit beside
+            # its session fixture; rotating it would throw away warm state.
+            return False
         # Waiting for global deadlock leaves an unused session process holding
         # a slot while a different worker drains all transient tests serially.
         # Rotate the exhausted owner even when another worker is making progress.
@@ -943,6 +982,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             for scope, work_unit in self.workqueue.items()
             if any(not complete for complete in work_unit.values())
             and not self._defer_new_persistent_process(node, scope)
+            and self._process_worker_fits(node, scope)
             and (
                 reserved_process_slots + self._additional_process_slots(node, scope)
                 <= self.process_slots
@@ -1116,7 +1156,10 @@ class IsolationAwareScheduling(LoadGroupScheduling):
 
 
 _duration_history: DurationHistory | None = None
+_DURATION_OWNER_PID = "ANTFLY_E2E_DURATION_OWNER_PID"
+_failure_reporter = None
 _duration_report_totals: dict[str, float] = {}
+_duration_phase_totals: dict[str, dict[str, float]] = {}
 _executed_duration_nodeids: set[str] = set()
 
 
@@ -1131,6 +1174,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Maximum concurrently scheduled Antfly process or cluster work units.",
     )
     group.addoption(
+        "--e2e-process-workers",
+        type=int,
+        default=os.environ.get("ANTFLY_E2E_PROCESS_WORKERS"),
+        help="Maximum workers with an active Antfly process or cluster workload.",
+    )
+    group.addoption(
         "--e2e-duration-file",
         default=os.environ.get(
             "ANTFLY_E2E_DURATION_FILE",
@@ -1141,10 +1190,19 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    global _duration_history, _duration_report_totals, _executed_duration_nodeids
+    global _failure_reporter
+    _failure_reporter = None
+    global \
+        _duration_history, \
+        _duration_report_totals, \
+        _duration_phase_totals, \
+        _executed_duration_nodeids
     slots = int(config.getoption("e2e_process_slots"))
     if slots < 1:
         raise pytest.UsageError("--e2e-process-slots must be a positive integer")
+    process_workers = config.getoption("e2e_process_workers", None)
+    if process_workers is not None and int(process_workers) < 1:
+        raise pytest.UsageError("--e2e-process-workers must be a positive integer")
     dist = config.getoption("dist", "no")
     if dist not in {"no", "loadgroup"} and config.getoption("tx", ()):
         raise pytest.UsageError(
@@ -1152,10 +1210,27 @@ def pytest_configure(config: pytest.Config) -> None:
             "and --e2e-process-slots remain enforced; remove the explicit "
             f"--dist={dist} override or use scripts/ci/zig-antfly-e2e-pytest.sh"
         )
-    if not hasattr(config, "workerinput"):
+    # Child pytest processes used by harness tests inherit the duration path.
+    # Only the original controller may publish observations for that path;
+    # xdist workers already report their durations through the controller.
+    owner_pid = os.environ.get(_DURATION_OWNER_PID)
+    if not hasattr(config, "workerinput") and owner_pid in (None, str(os.getpid())):
+        os.environ[_DURATION_OWNER_PID] = str(os.getpid())
         _duration_history = DurationHistory(Path(config.getoption("e2e_duration_file")))
         _duration_report_totals = {}
+        _duration_phase_totals = {}
         _executed_duration_nodeids = set()
+    else:
+        _duration_history = None
+        _duration_report_totals = {}
+        _duration_phase_totals = {}
+        _executed_duration_nodeids = set()
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    global _failure_reporter
+    if not hasattr(session.config, "workerinput"):
+        _failure_reporter = session.config.pluginmanager.get_plugin("terminalreporter")
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -1175,11 +1250,22 @@ def pytest_xdist_make_scheduler(
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    # Long suites can be cancelled after a failed case but before pytest's
+    # final summary or artifact upload. Emit its diagnostic when the controller
+    # receives it, preserving the normal report and exit status unchanged.
+    if getattr(report, "failed", False) and _failure_reporter is not None:
+        _failure_reporter.write_sep(
+            "=", f"Immediate E2E failure: {report.nodeid} ({report.when})"
+        )
+        _failure_reporter.write_line(report.longreprtext)
+        _failure_reporter.flush()
     if _duration_history is None:
         return
     nodeid = normalize_nodeid(report.nodeid)
     duration = max(0.0, float(report.duration))
     if math.isfinite(duration):
+        phases = _duration_phase_totals.setdefault(nodeid, {})
+        phases[report.when] = phases.get(report.when, 0.0) + duration
         _duration_report_totals[nodeid] = (
             _duration_report_totals.get(nodeid, 0.0) + duration
         )
@@ -1202,6 +1288,24 @@ def pytest_sessionfinish(session: pytest.Session) -> None:
         # Setup and teardown are material E2E costs, but only retain their total
         # when the test reached a real call phase. Environment-dependent skips
         # and setup failures must not train expensive full-CI tests toward zero.
+        if report_dir := os.environ.get("ANTFLY_E2E_REPORT_DIR"):
+            report_path = Path(report_dir) / "phase-durations.json"
+            try:
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text(
+                    json.dumps(
+                        {"version": 1, "tests": _duration_phase_totals},
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            except OSError as exc:
+                reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+                if reporter is not None:
+                    reporter.write_line(
+                        f"warning: could not retain E2E phase durations: {exc}"
+                    )
         _flush_duration_reports()
         error = _duration_history.save()
         if error is not None:

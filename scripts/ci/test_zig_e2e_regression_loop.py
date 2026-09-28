@@ -24,6 +24,7 @@ class RegressionEvidenceTests(unittest.TestCase):
         cluster_restore=False,
         profile="",
         report=True,
+        selector="example.py::test_restore",
     ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -34,8 +35,11 @@ class RegressionEvidenceTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import os, sys, resource\n"
                 "from pathlib import Path\n"
+                "if '--collect-only' in sys.argv: print('stub collection'); sys.exit(4 if os.environ['STUB_JUNIT_MODE'] == 'collection-error' else 0)\n"
                 "path = next((arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--junitxml=')), None)\n"
                 "if path is None: print('stub invoked without junit'); sys.exit(0)\n"
+                "print('stub invoked with junit')\n"
+                "print('project=' + sys.argv[sys.argv.index('--project') + 1])\n"
                 "mode = os.environ['STUB_JUNIT_MODE']\n"
                 "if mode != 'missing':\n"
                 "    child = '<skipped/>' if mode == 'skip' or (mode == 'normal-skip' and '/normal/' in path) else ''\n"
@@ -52,7 +56,7 @@ class RegressionEvidenceTests(unittest.TestCase):
                     else (
                         [str(SCRIPT.with_name("zig-e2e-autograph-soak.sh"))]
                         if autograph
-                        else [str(SCRIPT), "example.py::test_restore"]
+                        else [str(SCRIPT), selector]
                     )
                 ),
                 env={
@@ -76,11 +80,32 @@ class RegressionEvidenceTests(unittest.TestCase):
                 for p in reports.rglob("*.xml")
             }
 
-    def test_without_report_directory_supports_empty_argument_array(self):
+    def test_collection_failure_stops_before_workers_and_repetitions(self):
+        result, reports = self.run_loop(mode="collection-error", workers=2, repeats=3)
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertEqual(reports, {})
+        self.assertEqual(result.stdout.count("stub collection"), 1)
+        self.assertNotIn("E2E regression worker=", result.stdout)
+
+    def test_inference_selector_uses_its_project_and_requires_passes(self):
+        result, _ = self.run_loop(
+            selector="e2e/inference/test_dictate.py::test_dictate_cleanup_rewrites_transcript"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("project=e2e/inference", result.stdout)
+        result, _ = self.run_loop(
+            selector="e2e/inference/test_dictate.py::test_dictate_cleanup_rewrites_transcript",
+            mode="skip",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_without_report_directory_still_validates_junit_evidence(self):
         result, reports = self.run_loop(report=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("stub invoked without junit", result.stdout)
+        self.assertIn("stub invoked with junit", result.stdout)
         self.assertEqual(reports, {})
+        skipped, _ = self.run_loop(mode="skip", report=False)
+        self.assertEqual(skipped.returncode, 1, skipped.stdout + skipped.stderr)
 
     def test_cancellation_stops_parallel_workers_and_their_servers(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -95,6 +120,7 @@ class RegressionEvidenceTests(unittest.TestCase):
             uv = root / "uv"
             uv.write_text(
                 f"#!{sys.executable}\nimport subprocess, sys, time\n"
+                "if '--collect-only' in sys.argv: sys.exit(0)\n"
                 f"subprocess.Popen([sys.executable, {str(child)!r}])\n"
                 "time.sleep(60)\n"
             )

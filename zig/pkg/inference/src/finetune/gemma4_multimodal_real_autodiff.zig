@@ -303,10 +303,11 @@ fn makeTrainerInputForExampleWeighted(
         for (0..@min(example.labels.len, rows)) |i| {
             const label = example.labels[i];
             if (label < 0) continue;
+            if (i == 0) return error.InvalidCausalLabelPosition;
             const idx: usize = @intCast(label);
             if (idx >= vocab_size) return error.LabelOutOfRange;
             const row_scale = if (token_scales) |scales| scales[supervised_idx] else default_row_scale;
-            targets[i * vocab_size + idx] = row_scale;
+            targets[(i - 1) * vocab_size + idx] = row_scale;
             supervised_idx += 1;
         }
     }

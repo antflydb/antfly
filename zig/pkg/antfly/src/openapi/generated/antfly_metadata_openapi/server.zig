@@ -14,6 +14,39 @@ pub fn parseQueryBuilderAgentBody(allocator: std.mem.Allocator, body: []const u8
     return std.json.parseFromSlice(types.QueryBuilderRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for researchAgent.
+pub fn parseResearchAgentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ResearchAgentRequest) {
+    return std.json.parseFromSlice(types.ResearchAgentRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for startResearchJob.
+pub fn parseStartResearchJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ResearchJobStartRequest) {
+    return std.json.parseFromSlice(types.ResearchJobStartRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Get a durable research job
+pub const GetResearchJobPathParams = struct {
+    /// Research job identifier.
+    job_id: []const u8,
+};
+
+/// Advance a durable research job
+pub const AdvanceResearchJobPathParams = struct {
+    /// Research job identifier.
+    job_id: []const u8,
+};
+
+/// Parse the JSON request body for advanceResearchJob.
+pub fn parseAdvanceResearchJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ResearchJobAdvanceRequest) {
+    return std.json.parseFromSlice(types.ResearchJobAdvanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Cancel a durable research job
+pub const CancelResearchJobPathParams = struct {
+    /// Research job identifier.
+    job_id: []const u8,
+};
+
 /// Parse the JSON request body for retrievalAgent.
 pub fn parseRetrievalAgentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RetrievalAgentRequest) {
     return std.json.parseFromSlice(types.RetrievalAgentRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -1190,6 +1223,11 @@ pub const Route = struct {
 
 pub const routes = [_]Route{
     .{ .method = "POST", .path = "/agents/query-builder", .operation_id = "queryBuilderAgent", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/agents/research", .operation_id = "researchAgent", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "POST", .path = "/agents/research/jobs", .operation_id = "startResearchJob", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/agents/research/jobs/{jobId}", .operation_id = "getResearchJob", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/agents/research/jobs/{jobId}/advance", .operation_id = "advanceResearchJob", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/agents/research/jobs/{jobId}/cancel", .operation_id = "cancelResearchJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/agents/retrieval", .operation_id = "retrievalAgent", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/backup", .operation_id = "backup", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/backups", .operation_id = "listBackups", .request_body = .none, .streaming_response = false },
@@ -1327,6 +1365,11 @@ pub const routes = [_]Route{
 pub fn ServerRouter(comptime Impl: type) type {
     comptime {
         if (!@hasDecl(Impl, "queryBuilderAgent")) @compileError("ServerRouter: Impl missing required method 'queryBuilderAgent'");
+        if (!@hasDecl(Impl, "researchAgent")) @compileError("ServerRouter: Impl missing required method 'researchAgent'");
+        if (!@hasDecl(Impl, "startResearchJob")) @compileError("ServerRouter: Impl missing required method 'startResearchJob'");
+        if (!@hasDecl(Impl, "getResearchJob")) @compileError("ServerRouter: Impl missing required method 'getResearchJob'");
+        if (!@hasDecl(Impl, "advanceResearchJob")) @compileError("ServerRouter: Impl missing required method 'advanceResearchJob'");
+        if (!@hasDecl(Impl, "cancelResearchJob")) @compileError("ServerRouter: Impl missing required method 'cancelResearchJob'");
         if (!@hasDecl(Impl, "retrievalAgent")) @compileError("ServerRouter: Impl missing required method 'retrievalAgent'");
         if (!@hasDecl(Impl, "backup")) @compileError("ServerRouter: Impl missing required method 'backup'");
         if (!@hasDecl(Impl, "listBackups")) @compileError("ServerRouter: Impl missing required method 'listBackups'");
@@ -1462,6 +1505,11 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// Register all routes on the server with explicit instance context.
         pub fn register(self: *const @This(), server: anytype) !void {
             try server.post("/agents/query-builder", httpx.Handler.bind(self.impl, queryBuilderAgent));
+            try server.post("/agents/research", httpx.Handler.bind(self.impl, researchAgent));
+            try server.post("/agents/research/jobs", httpx.Handler.bind(self.impl, startResearchJob));
+            try server.get("/agents/research/jobs/:jobId", httpx.Handler.bind(self.impl, getResearchJob));
+            try server.post("/agents/research/jobs/:jobId/advance", httpx.Handler.bind(self.impl, advanceResearchJob));
+            try server.post("/agents/research/jobs/:jobId/cancel", httpx.Handler.bind(self.impl, cancelResearchJob));
             try server.post("/agents/retrieval", httpx.Handler.bind(self.impl, retrievalAgent));
             try server.post("/backup", httpx.Handler.bind(self.impl, backup));
             try server.get("/backups", httpx.Handler.bind(self.impl, listBackups));
@@ -1591,6 +1639,39 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /agents/query-builder
         fn queryBuilderAgent(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.queryBuilderAgent(ctx);
+        }
+
+        /// Research Agent - Bounded multi-phase research with a cited report
+        /// POST /agents/research
+        fn researchAgent(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.researchAgent(ctx);
+        }
+
+        /// Start a durable research job
+        /// POST /agents/research/jobs
+        fn startResearchJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.startResearchJob(ctx);
+        }
+
+        /// Get a durable research job
+        /// GET /agents/research/jobs/{jobId}
+        fn getResearchJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
+            return impl.getResearchJob(ctx, job_id);
+        }
+
+        /// Advance a durable research job
+        /// POST /agents/research/jobs/{jobId}/advance
+        fn advanceResearchJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
+            return impl.advanceResearchJob(ctx, job_id);
+        }
+
+        /// Cancel a durable research job
+        /// POST /agents/research/jobs/{jobId}/cancel
+        fn cancelResearchJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
+            return impl.cancelResearchJob(ctx, job_id);
         }
 
         /// Retrieval Agent - Agentic document retrieval with tool calling
@@ -2589,6 +2670,11 @@ pub fn ServerRouter(comptime Impl: type) type {
 // Handler interface. Implement these methods on your Impl struct:
 //
 //   fn queryBuilderAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn researchAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn startResearchJob(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getResearchJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn advanceResearchJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn cancelResearchJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
 //   fn retrievalAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn backup(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listBackups(self: *Impl, ctx: *httpx.Context, params: ListBackupsParams) !httpx.Response

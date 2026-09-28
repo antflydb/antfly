@@ -232,6 +232,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx antfly reads preserve availability and terminal failures",
         "httpx lookup revalidates missing catalog bindings across restore",
         "httpx antfly scan honors optional body and documented bad requests",
+        "httpx antfly scan reports a stale owner descriptor as temporarily unavailable",
         "httpx multi batch route uses the batch commit hook and public response contract",
         "httpx stable transaction commit durably hands off recovery before acknowledgement",
         "httpx shared registrar keeps root probes and rejects removed data aliases",
@@ -297,19 +298,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     run_public_api_parity_aggregate_tests.step.dependOn(&openapi_root_check.step);
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
     public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
-
-    const lib_resolution_source_tests = b.addTest(.{
-        .root_module = options.api_http_runtime_test_mod,
-        .filters = &.{
-            "DistributedCandidateSource",
-            "SourceCandidateProvider",
-            "prefixUpperBoundAlloc",
-            "DistributedEntitySink",
-        },
-    });
-    const run_lib_resolution_source_tests = addFilteredTestRunArtifact(b, lib_resolution_source_tests);
-    const lib_resolution_source_test_step = b.step("antfly-api-resolution-source-test", "Run focused cross-shard resolution candidate-source and entity-sink tests");
-    lib_resolution_source_test_step.dependOn(&run_lib_resolution_source_tests.step);
 
     const lib_api_auth_default_filters = [_][]const u8{
         "storage migration job observation preserves admitted and unpublished catalog state",
@@ -931,7 +919,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "hosted participant attempt deadline preserves the server outcome window",
             "hosted participant rediscovery retries only pre-decision leader unavailability",
             "distributed txn coordinator aborts only participants that may have begun",
+            "DistributedEntitySink deletes an old pinned copy while moving a key",
+            "DistributedEntitySink live replay preserves curator redirects and alias union",
+            "DistributedEntitySink upserts a merge transform per entity",
+            "DistributedEntitySink overwrites the redirect for a merged tombstone",
+            "DistributedEntitySink records a cross-table redirect",
             "DistributedEntitySink atomic promotion batch prefers stateless batch commit",
+            "DistributedEntitySink commits a re-key across pinned physical tables atomically",
             "DistributedEntitySink batch commit remains compatible with transaction-only sources",
             "DistributedEntitySink atomic mode fails closed when unsupported",
             "api http client preserves retryable group transaction unavailability",
@@ -966,6 +960,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed txn bounds unresolved coordinator decision retries",
             "distributed txn propagates one absolute deadline through ambiguous decision recovery",
             "distributed txn participant fanout is bounded and concurrent",
+            "distributed txn acknowledgement windows batch only proven followers and preserve recovery debt",
+            "hosted participant bulk acknowledgements use typed transport and only definite legacy fallback",
+            "distributed txn bulk acknowledgement codec owns bounded participant identities and restore authority",
+            "distributed txn abort fanout preserves durable ordering contact evidence and bounded recovery",
             "distributed txn coordinator never aborts after durable commit decision",
             "distributed txn coordinator never restarts a transaction id on topology change",
             "db transaction recovery runtime resolves table-group participants through distributed txn resolver",
@@ -1118,7 +1116,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "routed internal reads require an explicit peer fence acknowledgement",
             "routing sessions reserve authoritative snapshots for cross-table plans",
             "encode query request preserves unit grouping ancestor projections",
-            "parseRemoteSearchResult preserves grouped hierarchy matches",
+            "parseRemoteSearchResult",
             "remote query returns the shard-selected identity generation",
             "remote simple vector query uses vector worker route",
             "remote scan fails closed without streaming and honors cancellation before transport",
@@ -1140,7 +1138,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "provisioned storage inspection uses table read admission",
             "provisioned distributed aggregations collect path terms nested cardinality",
             "distributed significant terms candidates use configured analyzers and bounded memory",
-            "parseRemoteSearchResult preserves fused index scores",
             "api query contract serializes derived hierarchy ancestry",
             "api query contract preserves the internal grouped unit revision envelope",
             "api query contract serializes hydrated unit ancestor for direct unit hits",
@@ -1525,6 +1522,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         lib_serverless_docid_runtime_filters,
     );
     const run_api_transactions_docid_tests = addFilteredTestRunArtifact(b, api_transactions_docid_tests);
+    b.step("antfly-api-transaction-commit-test", "Run routed transaction commit and entity promotion contracts").dependOn(&run_api_transactions_docid_tests.step);
     const write_implementation_tests = b.addTest(.{
         .name = "api-table-write-implementation-tests",
         .root_module = write_implementation_module,
@@ -1997,13 +1995,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_api_standalone_backup_restore_tests = addFilteredTestRunArtifact(b, lib_api_standalone_backup_restore_tests);
     const staged_restore_driver_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
-        .filters = &.{ "restore cutover lost begin reply waits for the same fence to drain", "staged restore published metadata wins cancellation only after every owner opens", "staged restore worker publishes a dependency complete mixed native cohort", "staged restore worker rebuilds a dependency complete mixed portable cohort", "staged restore worker recovers lost acknowledgements across owner restart matrix", "staged restore worker preserves generated mixed cohorts across HTTP owner faults", "staged table restore worker uses shared dependency complete cohort", "staged restore worker preserves migration mappings and indexes after restart", "staged restore worker measures bounded LSM native and portable work" },
+        .filters = &.{ "busy staged restore owner retains its pinned attempt", "restore cutover lost begin reply waits for the same fence to drain", "staged restore published metadata wins cancellation only after every owner opens", "staged restore worker publishes a dependency complete mixed native cohort", "staged restore worker rebuilds a dependency complete mixed portable cohort", "staged restore worker recovers lost acknowledgements across owner restart matrix", "staged restore worker preserves generated mixed cohorts across HTTP owner faults", "staged table restore worker uses shared dependency complete cohort", "staged restore worker preserves migration mappings and indexes after restart", "staged restore worker measures bounded LSM native and portable work" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-staged-restore-driver-test", "Run bounded staged restore publication and cancellation driver regressions").dependOn(&addFilteredTestRunArtifact(b, staged_restore_driver_tests).step);
     const rewrite_driver_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
-        .filters = &.{ "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners", "restore immutable rewrite failures are terminal" },
+        .filters = &.{ "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners", "restore immutable rewrite failures are terminal", "restore cutover readiness waits without exponential retry" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-rewrite-driver-test", "Run real retained-source rewrite, hidden owner recovery and failed-tail cancellation").dependOn(&addFilteredTestRunArtifact(b, rewrite_driver_tests).step);

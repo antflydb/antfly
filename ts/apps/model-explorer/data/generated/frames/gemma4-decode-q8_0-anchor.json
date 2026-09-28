@@ -5,9 +5,7 @@
  "title": "Historical E2B Q8_0 anchor · schematic operations",
  "description": "METAL.md records a 35-layer Q8_0/f32-KV greedy anchor with 41 compute encoders, 422 planned barriers and 36 planned scopes. The scopes and hazard ticks here are representative, not a capture. This differs in model/precision/route from the Q4_0 illustration and is not a matched before/after experiment.",
  "source": {
-  "path": "work-log/completed/inference/metal/status-history.md",
-  "anchor": "`10979 236888 2088 740`, reports `planned_scopes=36`,",
-  "line": 164
+  "path": "work-log/completed/inference/metal/status-history.md"
  },
  "mode": "planned",
  "stats": {

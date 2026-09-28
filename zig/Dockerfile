@@ -69,7 +69,8 @@ LABEL org.opencontainers.image.description="AntflyDB Zig runtime image"
 LABEL org.opencontainers.image.licenses=Elastic-2.0
 
 RUN apk add --no-cache ca-certificates && \
-    addgroup -S -g 10001 antfly && adduser -S -u 10001 -G antfly -h /home/antfly antfly
+    addgroup -S -g 10001 antfly && adduser -S -u 10001 -G antfly -h /home/antfly antfly && \
+    mkdir -p /antflydb && chown 10001:10001 /antflydb
 
 WORKDIR /
 COPY --from=builder /out/bin/antfly /antfly

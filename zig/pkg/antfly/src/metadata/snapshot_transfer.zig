@@ -5,6 +5,8 @@
 //! view; consumers never combine pages from different projection generations.
 const std = @import("std");
 pub const path = "/internal/v1/snapshots/read";
+pub const peer_path = "/internal/v1/snapshots/peers";
+pub const planning_path = "/internal/v1/snapshots/planning";
 pub const page_bytes = 512 * 1024;
 pub const max_snapshot_bytes = 64 * 1024 * 1024;
 pub const control_snapshot_bytes = 16 * 1024 * 1024;

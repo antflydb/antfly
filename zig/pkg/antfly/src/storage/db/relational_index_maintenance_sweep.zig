@@ -21,8 +21,8 @@ const Head = @import("relational_index_catalog.zig").Head;
 
 pub const Sweep = struct {
     running: std.atomic.Value(bool) = .init(false),
-    requested: std.atomic.Value(u64) = .init(0),
-    observed: std.atomic.Value(u64) = .init(0),
+    requested: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    observed: @import("antfly_platform").atomic.Value(u64) = .init(0),
     pending: std.atomic.Value(bool) = .init(false),
     head: ?Head = null,
     namespace: u64 = 0,

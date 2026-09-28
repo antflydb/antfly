@@ -1020,6 +1020,13 @@ pub const Scenario = struct {
                 while (self.sim.taskSnapshotAt(task_index)) |task| : (task_index += 1) {
                     if (task.status != .finished) std.debug.print("full-cluster teardown retained task={any}\n", .{task});
                 }
+                if (self.public_cluster) |fixture| if (fixture.cluster_live) {
+                    for (fixture.cluster.cluster.nodes, 0..) |*node, index| {
+                        if (!fixture.cluster.cluster.node_live[index]) continue;
+                        const sender = node.runtime.svc.host.http_host.transport_stack.snapshot_transport;
+                        std.debug.print("full-cluster metadata snapshot sender={} shutdown={}\n", .{ index, sender.send_shutdown_requested });
+                    }
+                };
                 if (self.sim.firstCapabilityViolation()) |violation| std.debug.panic(
                     "full-cluster VOPR teardown could not drain canceled tasks: {s}; first capability violation={s} sequence={}",
                     .{ @errorName(err), @tagName(violation.operation), violation.sequence },
@@ -3742,6 +3749,22 @@ test "full cluster VOPR exact replays the composed deployment and recovery" {
         std.debug.print("full-cluster replay mode={s}\n", .{Scenario.mode_names[mode_ordinal]});
         try runExactMode(history_alloc, mode_id, mode_ordinal, 50_000, .complete);
     }
+}
+
+test "full cluster VOPR graph inflight restart repeated exact replay" {
+    const ordinal = @intFromEnum(Scenario.Mode.graph_inflight_restart);
+    for (0..3) |_| {
+        var history_allocator: FixtureAllocator = .init;
+        defer std.debug.assert(history_allocator.deinit() == .ok);
+        try runExactMode(history_allocator.allocator(), Scenario.mode_ids[ordinal], ordinal, 50_000, .complete);
+    }
+}
+
+test "full cluster graph inflight restart cutoff drains parked hooks" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = @intFromEnum(Scenario.Mode.graph_inflight_restart);
+    try runExactMode(history_allocator.allocator(), Scenario.mode_ids[ordinal], ordinal, 19_474, .bounded_lifecycle);
 }
 
 test "full cluster VOPR exact replays resource pressure recovery" {

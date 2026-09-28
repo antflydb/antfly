@@ -195,12 +195,14 @@ required_symbols=(
   termite_f32_to_i32
   termite_round_f32
   termite_primitive_transpose_2d_f32
+  termite_primitive_gather_bf16_f32
   termite_add_bias_relu_rows_f32
   termite_add_weighted_scalars_f32
   termite_linear_bf16_weight_f32_tiled
   termite_linear_f16_weight_f32_tiled
   termite_embedding_lookup_bf16_weight_f32
   termite_embedding_lookup_f16_weight_f32
+  termite_embedding_lookup_i32_bf16_weight_f32
   termite_embedding_lookup_i32_f16_weight_f32
   termite_attention_f32_block
   termite_qwen3vl_vision_attention_tc_bf16_m32n16
@@ -237,6 +239,7 @@ required_symbols=(
   termite_primitive_broadcast_f32
   termite_layer_norm_backward_f32
   termite_primitive_softmax_f32
+  termite_selected_token_logprobs_f32
   termite_gliner25_layer_norm_f32
   termite_gliner25_softmax_f32
   termite_primitive_gather_f32

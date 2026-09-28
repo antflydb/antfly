@@ -43,7 +43,8 @@ const crop_box: c_int = 1;
 const bitmap_rgba_premultiplied: u32 = 1 | (4 << 12);
 
 pub fn renderPagePngAlloc(
-    alloc: std.mem.Allocator,
+    scratch_alloc: std.mem.Allocator,
+    output_alloc: std.mem.Allocator,
     pdf_bytes: []const u8,
     page_number: usize,
     dpi: u16,
@@ -52,7 +53,7 @@ pub fn renderPagePngAlloc(
 ) ![]u8 {
     var session = try Session.init(pdf_bytes);
     defer session.deinit();
-    return try session.renderPagePngAlloc(alloc, page_number, dpi, max_pixels, rotation);
+    return try session.renderPagePngAlloc(scratch_alloc, output_alloc, page_number, dpi, max_pixels, rotation);
 }
 
 pub fn renderPageRgbaAlloc(alloc: std.mem.Allocator, pdf_bytes: []const u8, page_number: usize, dpi: u16, max_pixels: u64, rotation: render.PageRotation) !render.RgbaCanvas {
@@ -83,7 +84,8 @@ pub const SharedSession = struct {
 
     pub fn renderPagePngAlloc(
         self: *@This(),
-        alloc: std.mem.Allocator,
+        scratch_alloc: std.mem.Allocator,
+        output_alloc: std.mem.Allocator,
         page_number: usize,
         dpi: u16,
         max_pixels: u64,
@@ -102,7 +104,7 @@ pub const SharedSession = struct {
         // CoreGraphics once the current page releases the document session.
         try cancellation.check();
         if (self.session == null) self.session = try Session.init(self.pdf_bytes);
-        return try self.session.?.renderPagePngAlloc(alloc, page_number, dpi, max_pixels, rotation);
+        return try self.session.?.renderPagePngAlloc(scratch_alloc, output_alloc, page_number, dpi, max_pixels, rotation);
     }
 
     /// Only the final canvas is charged to the retained-output allocator.
@@ -131,6 +133,7 @@ test "shared session checks cancellation before opening the document" {
     defer session.deinit();
     try std.testing.expectError(error.Canceled, session.renderPagePngAlloc(
         std.testing.allocator,
+        std.testing.allocator,
         1,
         72,
         1_000_000,
@@ -145,7 +148,7 @@ test "compatibility raster needs only one retained canvas and matches PNG" {
     const Probe = struct {
         fn check(_: @This()) !void {}
     };
-    const png = try session.renderPagePngAlloc(std.testing.allocator, 1, 72, 1_000_000, .none, Probe{});
+    const png = try session.renderPagePngAlloc(std.testing.allocator, std.testing.allocator, 1, 72, 1_000_000, .none, Probe{});
     defer std.testing.allocator.free(png);
     const decoded = try image.png.decodeRgba(std.testing.allocator, png);
     defer std.testing.allocator.free(decoded.rgba);
@@ -156,6 +159,29 @@ test "compatibility raster needs only one retained canvas and matches PNG" {
     defer output.allocator().free(raw.rgba);
     try std.testing.expectEqualSlices(u8, decoded.rgba, raw.rgba);
     try std.testing.expectEqual(storage.len, output.end_index);
+}
+
+test "compatibility PNG retains only encoded bytes under the output budget" {
+    const alloc = std.testing.allocator;
+    var session = SharedSession.init(@embedFile("../testdata/simple_text_fixture.pdf"));
+    defer session.deinit();
+    const Probe = struct {
+        fn check(_: @This()) !void {}
+    };
+    const reference_png = try session.renderPagePngAlloc(alloc, alloc, 1, 72, 1_000_000, .none, Probe{});
+    defer alloc.free(reference_png);
+    const reference = try image.png.decodeRgba(alloc, reference_png);
+    defer alloc.free(reference.rgba);
+    const storage = try alloc.alloc(u8, reference_png.len);
+    defer alloc.free(storage);
+    var output = std.heap.FixedBufferAllocator.init(storage);
+    const png = try session.renderPagePngAlloc(alloc, output.allocator(), 1, 72, 1_000_000, .none, Probe{});
+    defer output.allocator().free(png);
+    const decoded = try image.png.decodeRgba(alloc, png);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(reference.width, decoded.width);
+    try std.testing.expectEqual(reference.height, decoded.height);
+    try std.testing.expectEqualSlices(u8, reference.rgba, decoded.rgba);
 }
 
 pub const Session = struct {
@@ -186,15 +212,16 @@ pub const Session = struct {
 
     pub fn renderPagePngAlloc(
         self: *@This(),
-        alloc: std.mem.Allocator,
+        scratch_alloc: std.mem.Allocator,
+        output_alloc: std.mem.Allocator,
         page_number: usize,
         dpi: u16,
         max_pixels: u64,
         rotation: render.PageRotation,
     ) ![]u8 {
-        const raw = try self.renderPageRgbaAlloc(alloc, page_number, dpi, max_pixels, rotation);
-        defer alloc.free(raw.rgba);
-        return image.png.encodeRgba(alloc, @intCast(raw.width), @intCast(raw.height), raw.rgba);
+        const raw = try self.renderPageRgbaAlloc(scratch_alloc, page_number, dpi, max_pixels, rotation);
+        defer scratch_alloc.free(raw.rgba);
+        return image.png.encodeRgbaWithCancellation(scratch_alloc, output_alloc, @intCast(raw.width), @intCast(raw.height), raw.rgba, .{});
     }
 
     pub fn renderPageRgbaAlloc(self: *@This(), alloc: std.mem.Allocator, page_number: usize, dpi: u16, max_pixels: u64, rotation: render.PageRotation) !render.RgbaCanvas {

@@ -547,6 +547,7 @@ pub const AlgebraicIndexStats = struct {
 
 pub const AntflyType = enum {
     search_as_you_type,
+    substring,
     keyword,
     text,
     html,
@@ -562,6 +563,7 @@ pub const AntflyType = enum {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .search_as_you_type => "search_as_you_type",
+            .substring => "substring",
             .keyword => "keyword",
             .text => "text",
             .html => "html",
@@ -584,6 +586,7 @@ pub const AntflyType = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "search_as_you_type", .search_as_you_type },
+            .{ "substring", .substring },
             .{ "keyword", .keyword },
             .{ "text", .text },
             .{ "html", .html },
@@ -851,6 +854,7 @@ pub const CreateFullTextIndexRequest = struct {
     field: ?[]const u8 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     artifact_name: ?[]const u8 = null,
+    analysis_config: ?TextAnalysisConfig = null,
     type: []const u8,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -862,6 +866,7 @@ pub const CreateFullTextIndexRequest = struct {
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
         .{ "artifact_name", "artifact_name", true },
+        .{ "analysis_config", "analysis_config", true },
         .{ "type", "type", false },
     };
 
@@ -901,6 +906,10 @@ pub const CreateFullTextIndexRequest = struct {
         }
         if (self.artifact_name) |value| {
             try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
+        if (self.analysis_config) |value| {
+            try jw.objectField("analysis_config");
             try jw.write(value);
         }
         try jw.objectField("type");
@@ -1582,6 +1591,7 @@ pub const CreatedEnrichmentConfig = struct {
     vector_space: ?[]const u8 = null,
     chunk_size: ?i64 = null,
     chunk_overlap: ?i64 = null,
+    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
     chunker_json: ?[]const u8 = null,
     full_text_index: ?bool = null,
     content_type: ?[]const u8 = null,
@@ -1599,6 +1609,7 @@ pub const CreatedEnrichmentConfig = struct {
         .{ "vector_space", "vector_space", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "chunk_overlap", "chunk_overlap", true },
+        .{ "chunker", "chunker", false },
         .{ "chunker_json", "chunker_json", true },
         .{ "full_text_index", "full_text_index", true },
         .{ "content_type", "content_type", true },
@@ -1648,6 +1659,13 @@ pub const CreatedEnrichmentConfig = struct {
             try jw.objectField("chunk_overlap");
             try jw.write(value);
         }
+        if (self.chunker) |value| {
+            try jw.objectField("chunker");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("chunker");
+            try jw.write(@as(?u8, null));
+        }
         if (self.chunker_json) |value| {
             try jw.objectField("chunker_json");
             try jw.write(value);
@@ -1685,6 +1703,7 @@ pub const CreatedFullTextIndex = struct {
     sources: ?[]const FullTextArtifactIndexSource = null,
     mem_only: ?bool = null,
     field: ?[]const u8 = null,
+    analysis_config: ?TextAnalysisConfig = null,
     type: []const u8,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -1696,6 +1715,7 @@ pub const CreatedFullTextIndex = struct {
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
+        .{ "analysis_config", "analysis_config", true },
         .{ "type", "type", false },
     };
 
@@ -1735,6 +1755,10 @@ pub const CreatedFullTextIndex = struct {
             try jw.objectField("field");
             try jw.write(value);
         }
+        if (self.analysis_config) |value| {
+            try jw.objectField("analysis_config");
+            try jw.write(value);
+        }
         try jw.objectField("type");
         try jw.write(self.type);
         try jw.endObject();
@@ -1746,12 +1770,14 @@ pub const CreatedFullTextIndexConfig = struct {
     sources: ?[]const FullTextArtifactIndexSource = null,
     mem_only: ?bool = null,
     field: ?[]const u8 = null,
+    analysis_config: ?TextAnalysisConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
+        .{ "analysis_config", "analysis_config", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1774,6 +1800,10 @@ pub const CreatedFullTextIndexConfig = struct {
         }
         if (self.field) |value| {
             try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.analysis_config) |value| {
+            try jw.objectField("analysis_config");
             try jw.write(value);
         }
         try jw.endObject();
@@ -3662,12 +3692,16 @@ pub const EnrichmentConfig = struct {
     chunk_size: ?i64 = null,
     /// Chunk overlap for chunk enrichments.
     chunk_overlap: ?i64 = null,
-    /// Serialized chunker configuration for chunk enrichments.
+    /// Chunker configuration for chunk enrichments. Cannot be combined with chunker_json.
+    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
+    /// Legacy serialized chunker configuration for chunk enrichments. Cannot be combined with chunker.
     chunker_json: ?[]const u8 = null,
     /// When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
     full_text_index: ?bool = null,
     /// Produced asset content type for asset enrichments.
     content_type: ?[]const u8 = null,
+    /// Write-only producer configuration. Cannot be combined with producer_json or transcriber.
+    producer: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
     producer_json: ?[]const u8 = null,
     /// Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission.
@@ -3688,9 +3722,11 @@ pub const EnrichmentConfig = struct {
         .{ "vector_space", "vector_space", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "chunk_overlap", "chunk_overlap", true },
+        .{ "chunker", "chunker", false },
         .{ "chunker_json", "chunker_json", true },
         .{ "full_text_index", "full_text_index", true },
         .{ "content_type", "content_type", true },
+        .{ "producer", "producer", true },
         .{ "producer_json", "producer_json", true },
         .{ "neighbor_context", "neighbor_context", true },
         .{ "execution", "execution", true },
@@ -3739,6 +3775,13 @@ pub const EnrichmentConfig = struct {
             try jw.objectField("chunk_overlap");
             try jw.write(value);
         }
+        if (self.chunker) |value| {
+            try jw.objectField("chunker");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("chunker");
+            try jw.write(@as(?u8, null));
+        }
         if (self.chunker_json) |value| {
             try jw.objectField("chunker_json");
             try jw.write(value);
@@ -3749,6 +3792,10 @@ pub const EnrichmentConfig = struct {
         }
         if (self.content_type) |value| {
             try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.producer) |value| {
+            try jw.objectField("producer");
             try jw.write(value);
         }
         if (self.producer_json) |value| {
@@ -3991,6 +4038,7 @@ pub const FullTextIndexConfig = struct {
     field: ?[]const u8 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     artifact_name: ?[]const u8 = null,
+    analysis_config: ?TextAnalysisConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -3998,6 +4046,7 @@ pub const FullTextIndexConfig = struct {
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
         .{ "artifact_name", "artifact_name", true },
+        .{ "analysis_config", "analysis_config", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -4024,6 +4073,10 @@ pub const FullTextIndexConfig = struct {
         }
         if (self.artifact_name) |value| {
             try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
+        if (self.analysis_config) |value| {
+            try jw.objectField("analysis_config");
             try jw.write(value);
         }
         try jw.endObject();
@@ -4608,6 +4661,8 @@ pub const GraphArtifactProducerConfig = struct {
     source: GraphArtifactProducerSourceConfig,
     content_type: ?[]const u8 = null,
     execution: ?ExecutionPolicy = null,
+    /// Write-only producer configuration. Cannot be combined with producer_json.
+    producer: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Write-only producer configuration; it may contain credentials and is never returned.
     producer_json: ?std.json.ArrayHashMap(std.json.Value) = null,
 
@@ -4618,6 +4673,7 @@ pub const GraphArtifactProducerConfig = struct {
         .{ "source", "source", false },
         .{ "content_type", "content_type", true },
         .{ "execution", "execution", true },
+        .{ "producer", "producer", true },
         .{ "producer_json", "producer_json", true },
     };
 
@@ -4643,6 +4699,10 @@ pub const GraphArtifactProducerConfig = struct {
         }
         if (self.execution) |value| {
             try jw.objectField("execution");
+            try jw.write(value);
+        }
+        if (self.producer) |value| {
+            try jw.objectField("producer");
             try jw.write(value);
         }
         if (self.producer_json) |value| {
@@ -7646,6 +7706,8 @@ pub const GraphResolverConfig = struct {
     /// Mention labels this resolver consumes; empty consumes every label (catch-all). Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table).
     labels: ?[]const []const u8 = null,
     type_must_match: ?bool = null,
+    /// Typed matcher scorer. Cannot be combined with scorer_json.
+    scorer: ?GraphResolverScorerConfig = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
     candidate_ann_index: ?[]const u8 = null,
@@ -7670,6 +7732,7 @@ pub const GraphResolverConfig = struct {
         .{ "key_template", "key_template", false },
         .{ "labels", "labels", true },
         .{ "type_must_match", "type_must_match", true },
+        .{ "scorer", "scorer", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
         .{ "candidate_ann_index", "candidate_ann_index", true },
@@ -7714,6 +7777,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.type_must_match) |value| {
             try jw.objectField("type_must_match");
+            try jw.write(value);
+        }
+        if (self.scorer) |value| {
+            try jw.objectField("scorer");
             try jw.write(value);
         }
         if (self.scorer_json) |value| {
@@ -7764,6 +7831,87 @@ pub const GraphResolverConfig = struct {
             try jw.objectField("config_generation");
             try jw.write(value);
         }
+        try jw.endObject();
+    }
+};
+
+pub const GraphResolverScorerComparison = struct {
+    name: []const u8,
+    left: []const u8,
+    right: []const u8,
+    levels: []const GraphResolverScorerLevel,
+};
+
+pub const GraphResolverScorerConfig = struct {
+    comparisons: []const GraphResolverScorerComparison,
+    combine: ?std.json.Value = null,
+    decision: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "comparisons", "comparisons", false },
+        .{ "combine", "combine", true },
+        .{ "decision", "decision", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("comparisons");
+        try jw.write(self.comparisons);
+        if (self.combine) |value| {
+            try jw.objectField("combine");
+            try jw.write(value);
+        }
+        if (self.decision) |value| {
+            try jw.objectField("decision");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GraphResolverScorerLevel = struct {
+    /// Matcher condition, such as 'exact' or 'jaro_winkler >= 0.9'.
+    when: ?[]const u8 = null,
+    /// Catch-all level when no previous condition matched.
+    @"else": ?bool = null,
+    weight: f64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "when", "when", true },
+        .{ "else", "else", true },
+        .{ "weight", "weight", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.when) |value| {
+            try jw.objectField("when");
+            try jw.write(value);
+        }
+        if (self.@"else") |value| {
+            try jw.objectField("else");
+            try jw.write(value);
+        }
+        try jw.objectField("weight");
+        try jw.write(self.weight);
         try jw.endObject();
     }
 };
@@ -8363,6 +8511,7 @@ pub const IndexConfig = struct {
     field: ?[]const u8 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     artifact_name: ?[]const u8 = null,
+    analysis_config: ?TextAnalysisConfig = null,
     publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
@@ -8424,6 +8573,7 @@ pub const IndexConfig = struct {
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
         .{ "artifact_name", "artifact_name", true },
+        .{ "analysis_config", "analysis_config", true },
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
@@ -8493,6 +8643,10 @@ pub const IndexConfig = struct {
         }
         if (self.artifact_name) |value| {
             try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
+        if (self.analysis_config) |value| {
+            try jw.objectField("analysis_config");
             try jw.write(value);
         }
         if (self.publication_policy) |value| {
@@ -10336,6 +10490,114 @@ pub const StatefulGraphResult = union(enum) {
             .graph_paths_result => |v| try jw.write(v.*),
             .legacy_graph_search_result => |v| try jw.write(v.*),
         }
+    }
+};
+
+/// One named analysis component: its type and type-specific configuration.
+pub const TextAnalysisComponent = struct {
+    type: []const u8,
+    config: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "config", "config", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.config) |value| {
+            try jw.objectField("config");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Custom text analysis for a full-text index. Component maps are keyed by the name that analyzers and `field_analyzers` reference. Built-in analyzers (`standard`, `simple`, `keyword`, `html`, `search_as_you_type`, `substring`, and the language analyzers such as `german`) are always available without declaring them. Example: split camelCase identifiers and match them as substrings. ```json { "analysis_config": { "field_analyzers": {"symbol": "code"}, "token_filters": { "tails": {"type": "suffix", "config": {"min": 3, "max": 24}} }, "analyzers": { "code": { "type": "custom", "config": { "tokenizer": "whitespace", "token_filters": ["camel_case", "unique", "tails"] } } } } } ```
+pub const TextAnalysisConfig = struct {
+    /// Map of indexed field name to analyzer name. Overrides the analyzer derived from the table schema for that field.
+    field_analyzers: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Named character filters. Types: `html_strip` (alias `html`), `ascii_fold`, `zero_width_non_joiner`.
+    char_filters: ?std.json.ArrayHashMap(TextAnalysisComponent) = null,
+    /// Named tokenizers. Types: `unicode` (alias `unicode_words`), `whitespace`, `keyword`, `character`, `ngram` (`config.min`, `config.max`), `edge_ngram` (`config.min`, `config.max`, `config.side` of `front` or `back`).
+    tokenizers: ?std.json.ArrayHashMap(TextAnalysisComponent) = null,
+    /// Named token filters. Types: `lowercase` (alias `to_lower`), `stop_words` (alias `stop`; optional `config.language`), `stemmer` (optional `config.language`), `ngram` and `edge_ngram` (`config.min`, `config.max`), `shingle` (`config.min`, `config.max`, `config.separator` of `space` or `none`), `suffix` (`config.min`, `config.max`; emits every suffix of each token so prefix queries answer containment), `length` (`config.min`, `config.max`), `truncate` (`config.length`), `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`. Languages: english, german, french, spanish, italian, portuguese, dutch, swedish, norwegian, danish, finnish.
+    token_filters: ?std.json.ArrayHashMap(TextAnalysisComponent) = null,
+    /// Named analyzers of type `custom`. `config.tokenizer` names a built-in or declared tokenizer; `config.char_filters` and `config.token_filters` list built-in or declared component names in application order. Configuration-free filters (`lowercase`, `stop_words`, `stemmer`, `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`, `suffix`) can be listed by name without declaring them.
+    analyzers: ?std.json.ArrayHashMap(TextAnalysisComponent) = null,
+    /// Name of the date-time parser applied to datetime fields without a field-specific parser.
+    default_datetime_parser: ?[]const u8 = null,
+    /// Map of field name to date-time parser name.
+    field_date_time_parsers: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Named date-time parsers. Type `sanitizedgo` accepts `config.layouts`, a list of Go reference-time layouts tried in order.
+    date_time_parsers: ?std.json.ArrayHashMap(TextAnalysisComponent) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "field_analyzers", "field_analyzers", true },
+        .{ "char_filters", "char_filters", true },
+        .{ "tokenizers", "tokenizers", true },
+        .{ "token_filters", "token_filters", true },
+        .{ "analyzers", "analyzers", true },
+        .{ "default_datetime_parser", "default_datetime_parser", true },
+        .{ "field_date_time_parsers", "field_date_time_parsers", true },
+        .{ "date_time_parsers", "date_time_parsers", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.field_analyzers) |value| {
+            try jw.objectField("field_analyzers");
+            try jw.write(value);
+        }
+        if (self.char_filters) |value| {
+            try jw.objectField("char_filters");
+            try jw.write(value);
+        }
+        if (self.tokenizers) |value| {
+            try jw.objectField("tokenizers");
+            try jw.write(value);
+        }
+        if (self.token_filters) |value| {
+            try jw.objectField("token_filters");
+            try jw.write(value);
+        }
+        if (self.analyzers) |value| {
+            try jw.objectField("analyzers");
+            try jw.write(value);
+        }
+        if (self.default_datetime_parser) |value| {
+            try jw.objectField("default_datetime_parser");
+            try jw.write(value);
+        }
+        if (self.field_date_time_parsers) |value| {
+            try jw.objectField("field_date_time_parsers");
+            try jw.write(value);
+        }
+        if (self.date_time_parsers) |value| {
+            try jw.objectField("date_time_parsers");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 

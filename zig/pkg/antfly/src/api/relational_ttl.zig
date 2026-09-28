@@ -196,7 +196,7 @@ pub fn expireStep(alloc: std.mem.Allocator, source: catalog.CatalogSource, reade
 }
 
 test "distributed txn ttl shares cascade restrict and set null semantics" {
-    const db_mod = @import("../storage/db/db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const metadata = @import("../metadata/api.zig");
     const alloc = std.testing.allocator;
     for ([_][]const u8{ "cascade", "restrict", "set_null" }) |action| for ([_]bool{ false, true }) |inject_refresh| for ([_]bool{ false, true }) |inject_timeout| {
@@ -245,7 +245,7 @@ test "distributed txn ttl shares cascade restrict and set null semantics" {
                 if (self.inject_refresh) for (request.deletes) |key| {
                     if (!std.mem.eql(u8, key, "p")) continue;
                     self.inject_refresh = false;
-                    var reader = @import("table_reads.zig").BoundTableReadSource.init("rows", 501, self.db, @import("../raft/read_gate.zig").alreadyReadSafeBarrier());
+                    var reader = @import("antfly_source_root").antfly_sources.table_reads.BoundTableReadSource.init("rows", 501, self.db, @import("../raft/read_gate.zig").alreadyReadSafeBarrier());
                     var refreshed = try integrity.prepareWithCoverage(allocator, reader.source(), &self.tables, &self.ranges, &.{.{ .table_name = "rows", .writes = &.{.{
                         .key = "c",
                         .value = "{\"id\":2,\"parent\":1,\"expires\":\"1970-01-01T00:00:00.000000001Z\",\"note\":\"fresh\"}",
@@ -281,7 +281,7 @@ test "distributed txn ttl shares cascade restrict and set null semantics" {
         };
         var fixture: Fixture = .{ .db = &db, .tables = .{.{ .table_id = 500, .name = "rows", .schema_json = declaration }} };
         const source: catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.freeAdmin, .routing_snapshot = Fixture.routing, .linearizable_routing_snapshot = Fixture.routing, .free_routing_snapshot = Fixture.freeRouting } };
-        var bound = @import("table_reads.zig").BoundTableReadSource.init("rows", 501, &db, @import("../raft/read_gate.zig").alreadyReadSafeBarrier());
+        var bound = @import("antfly_source_root").antfly_sources.table_reads.BoundTableReadSource.init("rows", 501, &db, @import("../raft/read_gate.zig").alreadyReadSafeBarrier());
         const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .commit_batch = Fixture.commit } };
         var inserted = try integrity.prepareWithCoverage(alloc, bound.source(), &fixture.tables, &fixture.ranges, &.{.{ .table_name = "rows", .writes = &.{
             .{ .key = "p", .value = "{\"id\":1,\"parent\":null,\"expires\":\"1970-01-01T00:00:00.000000001Z\"}" },

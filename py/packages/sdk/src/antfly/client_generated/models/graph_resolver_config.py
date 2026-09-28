@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
@@ -9,6 +9,10 @@ from ..models.graph_resolver_config_candidate_search import GraphResolverConfigC
 from ..models.graph_resolver_config_fusion_combine import GraphResolverConfigFusionCombine
 from ..models.graph_resolver_config_source_artifact_kind import GraphResolverConfigSourceArtifactKind
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.graph_resolver_scorer_config import GraphResolverScorerConfig
+
 
 T = TypeVar("T", bound="GraphResolverConfig")
 
@@ -30,6 +34,7 @@ class GraphResolverConfig:
             skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention
             routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table).
         type_must_match (bool | Unset):  Default: True.
+        scorer (GraphResolverScorerConfig | Unset):
         scorer_json (str | Unset):
         candidate_search (GraphResolverConfigCandidateSearch | Unset):
         candidate_ann_index (str | Unset):
@@ -55,6 +60,7 @@ class GraphResolverConfig:
     source_artifact_kind: GraphResolverConfigSourceArtifactKind | Unset = GraphResolverConfigSourceArtifactKind.ASSET
     labels: list[str] | Unset = UNSET
     type_must_match: bool | Unset = True
+    scorer: GraphResolverScorerConfig | Unset = UNSET
     scorer_json: str | Unset = UNSET
     candidate_search: GraphResolverConfigCandidateSearch | Unset = UNSET
     candidate_ann_index: str | Unset = UNSET
@@ -88,6 +94,10 @@ class GraphResolverConfig:
             labels = self.labels
 
         type_must_match = self.type_must_match
+
+        scorer: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.scorer, Unset):
+            scorer = self.scorer.to_dict()
 
         scorer_json = self.scorer_json
 
@@ -134,6 +144,8 @@ class GraphResolverConfig:
             field_dict["labels"] = labels
         if type_must_match is not UNSET:
             field_dict["type_must_match"] = type_must_match
+        if scorer is not UNSET:
+            field_dict["scorer"] = scorer
         if scorer_json is not UNSET:
             field_dict["scorer_json"] = scorer_json
         if candidate_search is not UNSET:
@@ -163,6 +175,8 @@ class GraphResolverConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_resolver_scorer_config import GraphResolverScorerConfig
+
         d = dict(src_dict)
         name = d.pop("name")
 
@@ -184,6 +198,13 @@ class GraphResolverConfig:
         labels = cast(list[str], d.pop("labels", UNSET))
 
         type_must_match = d.pop("type_must_match", UNSET)
+
+        _scorer = d.pop("scorer", UNSET)
+        scorer: GraphResolverScorerConfig | Unset
+        if isinstance(_scorer, Unset):
+            scorer = UNSET
+        else:
+            scorer = GraphResolverScorerConfig.from_dict(_scorer)
 
         scorer_json = d.pop("scorer_json", UNSET)
 
@@ -228,6 +249,7 @@ class GraphResolverConfig:
             source_artifact_kind=source_artifact_kind,
             labels=labels,
             type_must_match=type_must_match,
+            scorer=scorer,
             scorer_json=scorer_json,
             candidate_search=candidate_search,
             candidate_ann_index=candidate_ann_index,

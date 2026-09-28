@@ -100,9 +100,6 @@ export default function HomePage() {
           <span className="rounded-full border bg-muted/30 px-3 py-1 tabular-nums">
             {manifest.counts.routes} quant routes
           </span>
-          <span className="rounded-full border bg-muted/30 px-3 py-1">
-            pinned to <code>{manifest.gitCommit.slice(0, 10)}</code>
-          </span>
         </div>
         <div className="mt-8 flex justify-center">
           <SpineStrip />
@@ -215,8 +212,8 @@ export default function HomePage() {
           ))}
         </div>
         <p className="mt-4 text-center font-mono text-[11px] text-muted-foreground">
-          Curated teaching diagrams, not traces of a running model — every source link is pinned to
-          commit <code>{manifest.gitCommit.slice(0, 10)}</code>.
+          Curated teaching diagrams, not traces of a running model — source links open the current
+          runtime sources on GitHub.
         </p>
       </section>
 

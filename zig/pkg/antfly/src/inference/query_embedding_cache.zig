@@ -551,7 +551,7 @@ fn deadlineExpiredAt(now_ns: u64, deadline_ns: ?u64) bool {
 }
 
 const TestCompute = struct {
-    calls: std.atomic.Value(u64) = .init(0),
+    calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
     value: f32,
 
     fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
@@ -611,7 +611,7 @@ test "query embedding cache owns values and serves LRU hits" {
 
 pub fn testConcurrentCoalescing() !void {
     const SlowCompute = struct {
-        calls: std.atomic.Value(u64) = .init(0),
+        calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
         io: std.Io,
 
         fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
@@ -678,7 +678,7 @@ test "query embedding cache coalesces concurrent misses" {
 
 pub fn testInflightAdmissionBound() !void {
     const BlockingCompute = struct {
-        calls: std.atomic.Value(u64) = .init(0),
+        calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
         release: std.atomic.Value(bool) = .init(false),
         io: std.Io,
 
@@ -771,7 +771,7 @@ pub fn testInflightAdmissionBound() !void {
 
 pub fn testDisabledCacheRetainsAdmissionBound() !void {
     const BlockingCompute = struct {
-        calls: std.atomic.Value(u64) = .init(0),
+        calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
         release: std.atomic.Value(bool) = .init(false),
 
         fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {

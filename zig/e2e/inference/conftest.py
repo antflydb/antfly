@@ -45,6 +45,8 @@ Usage:
 
 import math
 import os
+import shutil
+from pathlib import Path
 import signal
 import socket
 import subprocess
@@ -626,6 +628,14 @@ def base_url():
         )
         if diagnostic is not None:
             diagnostic += f"\nServer output tail:\n{server.read_output()}"
+    if log_dir := os.environ.get("ANTFLY_INFERENCE_SERVER_LOG_DIR"):
+        destination = Path(log_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+        server.output.seek(0)
+        with (destination / f"inference-server-{server.proc.pid}.log").open(
+            "wb"
+        ) as log:
+            shutil.copyfileobj(server.output, log)
     server.output.close()
     if diagnostic is not None and not server.failure_reported:
         pytest.fail(diagnostic, pytrace=False)

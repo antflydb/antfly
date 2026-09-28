@@ -20,8 +20,8 @@ const std = @import("std");
 pub const slots_count = 256;
 
 pub const Diagnostic = struct {
-    fingerprint: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    fingerprint: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
+    count: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
 };
 
 fn skipWhitespace(bytes: []const u8, cursor: *usize) void {

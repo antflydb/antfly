@@ -263,7 +263,7 @@ pub fn preprocessDecodedRectKeepAspectPadRightWithResample(
     mean: [3]f32,
     std_dev: [3]f32,
     resample: Resample,
-    pad_rgb: [3]u8,
+    pad_rgb: [3]f32,
 ) ![]f32 {
     return preprocessDecodedRectKeepAspectPadRightScaledWithResample(
         allocator,
@@ -288,7 +288,7 @@ pub fn preprocessDecodedRectKeepAspectPadRightScaledWithResample(
     std_dev: [3]f32,
     rescale_factor: f32,
     resample: Resample,
-    pad_rgb: [3]u8,
+    pad_rgb: [3]f32,
 ) ![]f32 {
     try img.validate();
     var resolved_img = img;
@@ -303,7 +303,7 @@ pub fn preprocessDecodedRectKeepAspectPadRightScaledWithResample(
     const cw: usize = content_width;
 
     for (0..3) |ch| {
-        const pad_val = normalizeSample(@floatFromInt(pad_rgb[ch]), mean[ch], std_dev[ch], rescale_factor);
+        const pad_val = normalizeSample(pad_rgb[ch], mean[ch], std_dev[ch], rescale_factor);
         @memset(result[ch * th * tw .. (ch + 1) * th * tw], pad_val);
     }
 
@@ -313,7 +313,7 @@ pub fn preprocessDecodedRectKeepAspectPadRightScaledWithResample(
     const scale_y = src_h / @as(f32, @floatFromInt(th));
 
     if (resample == .bilinear) {
-        preprocessDecodedRectKeepAspectPadRightBilinearSimd(resolved_img, result, cw, tw, th, mean, std_dev, rescale_factor, scale_x, scale_y);
+        try preprocessDecodedRectKeepAspectPadRightBilinearSimd(resolved_img, result, cw, tw, th, mean, std_dev, rescale_factor, scale_x, scale_y);
         return result;
     }
 
@@ -341,7 +341,7 @@ fn preprocessDecodedRectKeepAspectPadRightBilinearSimd(
     rescale_factor: f32,
     scale_x: f32,
     scale_y: f32,
-) void {
+) !void {
     const lanes = 4;
     const VecF = @Vector(lanes, f32);
     const rescale_v: VecF = @splat(rescale_factor);

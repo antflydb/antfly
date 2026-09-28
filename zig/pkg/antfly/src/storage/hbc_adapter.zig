@@ -282,8 +282,8 @@ const HbcPhysicalAccounting = struct {
     mutex: std.atomic.Mutex = .unlocked,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     current_bytes: u64 = 0,
-    published_bytes: std.atomic.Value(u64) = .init(0),
-    pinned_bytes: std.atomic.Value(u64) = .init(0),
+    published_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    pinned_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     fn attach(self: *HbcPhysicalAccounting, manager: *resource_manager_mod.ResourceManager) void {
         lockAtomic(&self.mutex);
@@ -745,8 +745,8 @@ fn snapshotHbcKindStats(stored: *HbcCacheKindStats) HbcCacheKindStats {
     return .{
         .used_bytes = stored.used_bytes,
         .peak_bytes = stored.peak_bytes,
-        .hits = @atomicLoad(u64, &stored.hits, .monotonic),
-        .misses = @atomicLoad(u64, &stored.misses, .monotonic),
+        .hits = platform.atomic.load(u64, &stored.hits, .monotonic),
+        .misses = platform.atomic.load(u64, &stored.misses, .monotonic),
         .insertions = stored.insertions,
         .replacements = stored.replacements,
         .sampled_admissions = stored.sampled_admissions,
@@ -806,7 +806,7 @@ fn noteHbcKindAdmissionSkip(stats: *HbcCacheStats, kind: HbcCacheKind) void {
     hbcKindStats(stats, kind).admission_skips += 1;
 }
 
-fn cacheFillEpochCurrent(fill_epoch: ?*const std.atomic.Value(u64), expected_epoch: u64) bool {
+fn cacheFillEpochCurrent(fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64), expected_epoch: u64) bool {
     const epoch = fill_epoch orelse return true;
     return expected_epoch & 1 == 0 and epoch.load(.acquire) == expected_epoch;
 }
@@ -1032,20 +1032,20 @@ pub const Cache = struct {
     reclaimer_identity: u64 = 0,
     physical_accounting: HbcPhysicalAccounting = .{},
     namespace_pinned_accounting: HbcNamespacePinnedAccounting,
-    admission_target_bytes: std.atomic.Value(u64) = .init(0),
+    admission_target_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
     concurrent_vector_admission_stride: std.atomic.Value(u32) = .init(1),
-    concurrent_vector_admission_counter: std.atomic.Value(u64) = .init(0),
+    concurrent_vector_admission_counter: @import("antfly_platform").atomic.Value(u64) = .init(0),
     // Counts live query-level decoded-residency leases across namespaces.
     // Serial cold starts fill eagerly; only genuinely overlapping fills use
     // the normal-pressure sampling doorkeeper.
-    decoded_query_active_leases: std.atomic.Value(u64) = .init(0),
-    decoded_query_reserved_bytes: std.atomic.Value(u64) = .init(0),
+    decoded_query_active_leases: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    decoded_query_reserved_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
     // Query leases claim logical capacity before their primary-store batch is
     // read, then atomically transfer that entitlement to physical precharge.
     // This prevents concurrent cold-start requests from all observing the
     // same free bytes without charging the full request up front.
-    decoded_query_entitled_bytes: std.atomic.Value(u64) = .init(0),
-    decoded_query_replacement_entitled_bytes: std.atomic.Value(u64) = .init(0),
+    decoded_query_entitled_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    decoded_query_replacement_entitled_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
     /// Coalesce duplicate exact-vector publication and keep cloning outside
     /// the global map/admission lock. These locks do not guard visibility;
     /// the map lock plus HBC's mutation epoch remain authoritative.
@@ -1339,8 +1339,8 @@ pub const Cache = struct {
         stats.vector.misses = 0;
         for (&self.vector_lookup_stats) |*lookup_stats| {
             if (lookup_stats.getPtr(namespace)) |stored| {
-                stats.vector.hits +|= @atomicLoad(u64, &stored.hits, .monotonic);
-                stats.vector.misses +|= @atomicLoad(u64, &stored.misses, .monotonic);
+                stats.vector.hits +|= platform.atomic.load(u64, &stored.hits, .monotonic);
+                stats.vector.misses +|= platform.atomic.load(u64, &stored.misses, .monotonic);
             }
         }
         stats.pinned_bytes = self.namespace_pinned_accounting.current(namespace);
@@ -1351,16 +1351,16 @@ pub const Cache = struct {
     fn noteLookupLocked(self: *Cache, kind: HbcCacheKind, namespace: u64, hit: bool) void {
         const global = hbcKindStats(&self.global_stats, kind);
         if (hit) {
-            _ = @atomicRmw(u64, &global.hits, .Add, 1, .monotonic);
+            _ = platform.atomic.fetchAdd(u64, &global.hits, 1, .monotonic);
         } else {
-            _ = @atomicRmw(u64, &global.misses, .Add, 1, .monotonic);
+            _ = platform.atomic.fetchAdd(u64, &global.misses, 1, .monotonic);
         }
         if (self.namespace_stats.getPtr(namespace)) |stats| {
             const counters = hbcKindStats(stats, kind);
             if (hit) {
-                _ = @atomicRmw(u64, &counters.hits, .Add, 1, .monotonic);
+                _ = platform.atomic.fetchAdd(u64, &counters.hits, 1, .monotonic);
             } else {
-                _ = @atomicRmw(u64, &counters.misses, .Add, 1, .monotonic);
+                _ = platform.atomic.fetchAdd(u64, &counters.misses, 1, .monotonic);
             }
         }
     }
@@ -1368,9 +1368,9 @@ pub const Cache = struct {
     fn noteVectorLookupStriped(self: *Cache, stripe: usize, namespace: u64, hit: bool) void {
         const stats = self.vector_lookup_stats[stripe].getPtr(namespace) orelse return;
         if (hit) {
-            _ = @atomicRmw(u64, &stats.hits, .Add, 1, .monotonic);
+            _ = platform.atomic.fetchAdd(u64, &stats.hits, 1, .monotonic);
         } else {
-            _ = @atomicRmw(u64, &stats.misses, .Add, 1, .monotonic);
+            _ = platform.atomic.fetchAdd(u64, &stats.misses, 1, .monotonic);
         }
     }
 
@@ -1646,7 +1646,7 @@ pub const Cache = struct {
         self: *Cache,
         namespace: u64,
         node: *const Node,
-        fill_epoch: ?*const std.atomic.Value(u64),
+        fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64),
         expected_epoch: u64,
     ) !bool {
         const cloned = try node.clone(self.alloc);
@@ -1691,7 +1691,7 @@ pub const Cache = struct {
         namespace: u64,
         node_id: u64,
         qs: *const QuantizedSet,
-        fill_epoch: ?*const std.atomic.Value(u64),
+        fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64),
         expected_epoch: u64,
     ) !bool {
         var cloned = try qs.clone(self.alloc);
@@ -1775,7 +1775,7 @@ pub const Cache = struct {
         namespace: u64,
         vector_id: u64,
         vector_data: []const f32,
-        fill_epoch: ?*const std.atomic.Value(u64),
+        fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64),
         expected_epoch: u64,
         must_cache: bool,
         precharged: bool,
@@ -1864,7 +1864,7 @@ pub const Cache = struct {
         namespace: u64,
         vector_id: u64,
         metadata: []const u8,
-        fill_epoch: ?*const std.atomic.Value(u64),
+        fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64),
         expected_epoch: u64,
     ) ![]const u8 {
         const copied = try self.alloc.dupe(u8, metadata);
@@ -3839,18 +3839,18 @@ const ExperimentalPostingReadGeneration = struct {
     /// Highest source-journal sequence durably represented by this immutable
     /// generation. This comes from the posting checkpoint/WAL commit boundary,
     /// not from the projection metadata value stored inside the generation.
-    covered_source_sequence: std.atomic.Value(u64),
+    covered_source_sequence: @import("antfly_platform").atomic.Value(u64),
     /// Exact durable WAL boundary represented by this logical generation.
     /// Source sequences alone are insufficient because multiple ordered
     /// derived batches may commit at the same source sequence.
-    wal_generation: std.atomic.Value(u64),
-    wal_committed_bytes: std.atomic.Value(u64),
+    wal_generation: @import("antfly_platform").atomic.Value(u64),
+    wal_committed_bytes: @import("antfly_platform").atomic.Value(u64),
     /// Query-visible topology owned by this exact immutable posting
     /// generation. It is initialized before publication and never changes.
     search_view: SearchViewToken = .{},
     scan_admission: vectorindex_quantized_directory.AdmissionStats = .{},
     // Scheduling-only observations, isolated by immutable generation/filter mode.
-    scan_prediction: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) },
+    scan_prediction: [2]@import("antfly_platform").atomic.Value(u64) = .{ .init(0), .init(0) },
     /// Number of immutable in-memory delta maps above the mmap root. This is
     /// bounded by allocation-free ownership transfer when no query lease is
     /// active; foreground readers never trigger a cloned aggregate.
@@ -4858,7 +4858,7 @@ const ExperimentalPostingCheckpointBuild = struct {
     lock_deferrals_at_start: u64 = 0,
 
     fn allocator() Allocator {
-        return platform.allocator.processAllocator(std.heap.smp_allocator);
+        return platform.allocator.processAllocator(platform.allocator.concurrentFallback());
     }
 
     fn run(self: *ExperimentalPostingCheckpointBuild) void {
@@ -5252,7 +5252,7 @@ pub const HBCIndex = struct {
     native_acceleration_retry: NativeAccelerationRetry = .{},
     experimental_posting_overlay_collapsed_wal_bytes: u64 = 0,
     experimental_posting_capture_started_ns: u64 = 0,
-    posting_publication_lock_deferrals: std.atomic.Value(u64) = .init(0),
+    posting_publication_lock_deferrals: @import("antfly_platform").atomic.Value(u64) = .init(0),
     /// Native authority can become durable while an opportunistic checkpoint
     /// still borrows storage owned by the compatibility LSM. Record the
     /// retirement request explicitly and drain it only at a boundary where no
@@ -5314,7 +5314,7 @@ pub const HBCIndex = struct {
     /// Seqlock-style epoch for optimistic complete-snapshot searches. Every
     /// mutation, including an aborted one that leaves the durable generation
     /// unchanged, advances this from even -> odd -> even.
-    published_mutation_epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    published_mutation_epoch: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     // Optional refresh state is protected by the index mutation owner. It is
     // deliberately volatile: reopen verifies the durable postings again.
     posting_refresh_next_node: u64 = 1,
@@ -5322,7 +5322,7 @@ pub const HBCIndex = struct {
     // Odd epochs are never clean. This atomic certificate lets operational
     // status observe bounded maintenance without traversing the tree or
     // racing the mutation owner's scan cursor. Reopen starts uncertified.
-    posting_refresh_clean_epoch: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    posting_refresh_clean_epoch: @import("antfly_platform").atomic.Value(u64) = .init(std.math.maxInt(u64)),
     posting_refresh_scan_changed: bool = false,
     /// Publication commits may include durable I/O. Readers of an odd
     /// generation retain the active flight and sleep on its runtime event
@@ -5332,7 +5332,7 @@ pub const HBCIndex = struct {
     published_spare_flight: ?*PublishedSearchStateFlight = null,
     /// Exact reachable-vector coverage is immutable within a published
     /// generation, so only the first complete search needs to validate it.
-    complete_coverage_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(std.math.maxInt(u64)),
+    complete_coverage_generation: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(std.math.maxInt(u64)),
     /// Short state lock for the generation validation flight. Long waits use
     /// CompleteCoverageFlight.ready on the backend runtime's std.Io; they never
     /// spin on an OS-thread mutex or retain a search transaction/workspace.
@@ -5390,13 +5390,13 @@ pub const HBCIndex = struct {
     // rerank batch can therefore admit vectors read from one primary snapshot
     // with a single cache lock without repopulating an entry invalidated by a
     // concurrent update.
-    vector_cache_epoch: std.atomic.Value(u64),
+    vector_cache_epoch: @import("antfly_platform").atomic.Value(u64),
     // A striped seqlock fences cache fills against uncommitted vector writes
     // without retaining one version record per vector. A dirty stripe is odd;
     // commit/abort publication returns it to even. Existing keys in the same
     // stripe remain usable because only miss admission consults this fence.
-    vector_cache_fill_epochs: [vector_cache_fill_stripe_count]std.atomic.Value(u64) = .{std.atomic.Value(u64).init(0)} ** vector_cache_fill_stripe_count,
-    vector_cache_fill_dirty: [vector_cache_fill_dirty_word_count]std.atomic.Value(u64) = .{std.atomic.Value(u64).init(0)} ** vector_cache_fill_dirty_word_count,
+    vector_cache_fill_epochs: [vector_cache_fill_stripe_count]@import("antfly_platform").atomic.Value(u64) = .{@import("antfly_platform").atomic.Value(u64).init(0)} ** vector_cache_fill_stripe_count,
+    vector_cache_fill_dirty: [vector_cache_fill_dirty_word_count]@import("antfly_platform").atomic.Value(u64) = .{@import("antfly_platform").atomic.Value(u64).init(0)} ** vector_cache_fill_dirty_word_count,
     hbc_cache_bytes_accounted: u64 = 0,
     detached_hbc_accounting: HbcPhysicalAccounting = .{},
     search_workspace_bytes_accounted: u64 = 0,
@@ -8114,9 +8114,9 @@ pub const HBCIndex = struct {
     fn noteHbcCacheLookup(self: *HBCIndex, kind: HbcCacheKind, hit: bool) void {
         const counters = &self.hbc_cache_kind_stats[@intFromEnum(kind)];
         if (hit) {
-            _ = @atomicRmw(u64, &counters.hits, .Add, 1, .monotonic);
+            _ = platform.atomic.fetchAdd(u64, &counters.hits, 1, .monotonic);
         } else {
-            _ = @atomicRmw(u64, &counters.misses, .Add, 1, .monotonic);
+            _ = platform.atomic.fetchAdd(u64, &counters.misses, 1, .monotonic);
         }
     }
 
@@ -9641,17 +9641,23 @@ pub const HBCIndex = struct {
             else
                 null,
         };
-        build.future = build.io.concurrent(ExperimentalPostingCheckpointBuild.run, .{build}) catch fallback: {
-            // Embedded/single-threaded callers may provide an I/O runtime
-            // without a concurrent lane. Keep ownership in std.Io by creating
-            // one bounded task runtime instead of an unmanaged OS thread.
-            build.owned_io = std.Io.Threaded.init(self.alloc, .{ .concurrent_limit = .limited(1) });
-            build.io = build.owned_io.?.io();
-            break :fallback build.io.concurrent(ExperimentalPostingCheckpointBuild.run, .{build}) catch |fallback_err| {
-                build.deinit();
-                return fallback_err;
+        if (comptime builtin.os.tag == .freestanding) {
+            // The browser has one execution thread; captured immutable inputs
+            // keep the same publication protocol with synchronous preparation.
+            ExperimentalPostingCheckpointBuild.run(build);
+        } else {
+            build.future = build.io.concurrent(ExperimentalPostingCheckpointBuild.run, .{build}) catch fallback: {
+                // Embedded/single-threaded callers may provide an I/O runtime
+                // without a concurrent lane. Keep ownership in std.Io by creating
+                // one bounded task runtime instead of an unmanaged OS thread.
+                build.owned_io = std.Io.Threaded.init(self.alloc, .{ .concurrent_limit = .limited(1) });
+                build.io = build.owned_io.?.io();
+                break :fallback build.io.concurrent(ExperimentalPostingCheckpointBuild.run, .{build}) catch |fallback_err| {
+                    build.deinit();
+                    return fallback_err;
+                };
             };
-        };
+        }
         self.experimental_posting_checkpoint_build = build;
         build.lock_deferrals_at_start = self.posting_publication_lock_deferrals.load(.monotonic);
         std.log.info("dense posting checkpoint build started generation={} sequence={} wal_prefix_bytes={} kind={s} chain_deltas={} obsolete_scan_bytes={}", .{
@@ -21354,7 +21360,7 @@ test "hbc shared cache rejects node quantized and metadata fills from an older p
     var cache = Cache.init(alloc);
     defer cache.deinit();
     const namespace = hbcCacheNamespace("/tmp/hbc-publication-fill-guard");
-    var epoch = std.atomic.Value(u64).init(0);
+    var epoch = @import("antfly_platform").atomic.Value(u64).init(0);
 
     var current_centroid = [_]f32{ 9, 9 };
     const current_node = Node{
@@ -21547,7 +21553,7 @@ test "hbc shared vector leases remain coherent during invalidate and replacement
             ready: *std.atomic.Value(u32),
             start: *std.atomic.Value(bool),
             stop: *std.atomic.Value(bool),
-            borrows: *std.atomic.Value(u64),
+            borrows: *@import("antfly_platform").atomic.Value(u64),
             failed: *std.atomic.Value(bool),
         ) void {
             const value_a = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
@@ -21578,7 +21584,7 @@ test "hbc shared vector leases remain coherent during invalidate and replacement
     var ready = std.atomic.Value(u32).init(0);
     var start = std.atomic.Value(bool).init(false);
     var stop = std.atomic.Value(bool).init(false);
-    var borrows = std.atomic.Value(u64).init(0);
+    var borrows = @import("antfly_platform").atomic.Value(u64).init(0);
     var failed = std.atomic.Value(bool).init(false);
     var readers: [8]std.Io.Future(void) = undefined;
     var started_tasks: usize = 0;
@@ -22920,7 +22926,7 @@ test "hbc shared cache writer progresses under continuous striped reads" {
             ready: *std.atomic.Value(u32),
             start: *std.atomic.Value(bool),
             stop: *std.atomic.Value(bool),
-            reads: *std.atomic.Value(u64),
+            reads: *@import("antfly_platform").atomic.Value(u64),
         ) void {
             _ = ready.fetchAdd(1, .release);
             while (!start.load(.acquire)) std.atomic.spinLoopHint();
@@ -22944,7 +22950,7 @@ test "hbc shared cache writer progresses under continuous striped reads" {
     var ready = std.atomic.Value(u32).init(0);
     var start = std.atomic.Value(bool).init(false);
     var stop = std.atomic.Value(bool).init(false);
-    var reads = std.atomic.Value(u64).init(0);
+    var reads = @import("antfly_platform").atomic.Value(u64).init(0);
     var writer_acquired = std.atomic.Value(bool).init(false);
     var readers: [8]std.Io.Future(void) = undefined;
     var started_tasks: usize = 0;

@@ -391,6 +391,7 @@ pub const Config = struct {
 
     pub const CorsConfig = struct {
         enabled: ?bool = null,
+        /// Omitted or empty origins deny cross-origin access; "*" is explicit opt-in.
         allowed_origins: ?[]const []u8 = null,
         allowed_methods: ?[]const []u8 = null,
         allowed_headers: ?[]const []u8 = null,
@@ -2281,6 +2282,8 @@ pub fn parseInferencePreloadModels(
             .object => |entry| entry,
             else => return error.InvalidConfig,
         };
+        if (!objectContainsOnly(model_object, &.{ "kind", "name", "backend", "format", "quantization", "residency_mode", "memory_budget_mb" }))
+            return error.InvalidConfig;
         // Include the partially parsed entry in error cleanup as soon as any
         // owned fields can be allocated (e.g. a missing name after kind).
         out[i] = .{ .kind = &.{}, .name = &.{} };
@@ -2669,6 +2672,24 @@ test "common config parses inference preload" {
     try std.testing.expectEqualStrings("BAAI/bge-reranker", cfg.inference.preload[1].name);
     try std.testing.expectEqualStrings("native", cfg.inference.preload[1].backend.?);
     try std.testing.expectEqualStrings("onnx", cfg.inference.preload[1].format.?);
+}
+
+test "common config rejects model-specific and unknown preload tuning fields" {
+    const fields = .{
+        .{ "load_strategy", "\"pipeline\"" },
+        .{ "load_workers", "6" },
+        .{ "load_staging_mb", "384" },
+        .{ "prepared_pack", "\"required\"" },
+        .{ "drop_host_cache_after_load", "true" },
+        .{ "startup_strategy", "\"prefetch\"" },
+        .{ "prepared_pak", "\"required\"" },
+    };
+    inline for (fields) |field| {
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(
+            std.testing.allocator,
+            "{\"inference\":{\"preload\":[{\"kind\":\"generator\",\"name\":\"gemma-a4b\",\"" ++ field[0] ++ "\":" ++ field[1] ++ "}]}}",
+        ));
+    }
 }
 
 test "common config rejects invalid prompt cache policy" {

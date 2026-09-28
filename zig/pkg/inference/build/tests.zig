@@ -240,16 +240,9 @@ fn addGliner25Fuzz(ctx: Context) *std.Build.Step.Run {
     const b = ctx.b;
     const no_error_tracing = b.option(bool, "gliner25-fuzz-no-error-tracing", "Work around Zig 0.16.0 fuzz runner error-trace mismatch for GLiNER25 only (use with --fuzz)") orelse false;
     // Keep the standard test runner for deterministic corpus and --fuzz runs.
-    // This pure-Zig platform instance deliberately omits filesystem_capacity.c:
-    // Zig 0.16 cannot instrument that C helper with its fuzz sanitizer profile.
-    // Construct it from shared paths so root and package builds need no nested
-    // package dependency and the ML imports share exactly this module identity.
-    const platform = b.createModule(.{
-        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/platform/src/root.zig" })),
-        .target = ctx.target,
-        .optimize = ctx.optimize,
-        .link_libc = false,
-    });
+    // Reuse the runtime graph's platform module. A second instance gives Zig
+    // two owners for transitive tokenizer sources imported by this test.
+    const platform = ctx.graph.platform_mod;
     const ml = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/ml/src/root.zig" })),
         .target = ctx.target,

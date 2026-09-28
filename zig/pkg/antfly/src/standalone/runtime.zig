@@ -3796,6 +3796,25 @@ pub fn runFromIterator(
         else
             &local_restore_job_store.?;
     }
+    // Research jobs checkpoint every phase so a restart resumes them from the
+    // last completed phase. Local standalone keeps them in a dedicated LSM
+    // root; Lite has no reserved namespace for them yet and keeps them in
+    // memory.
+    const research_job_root = if (lite_backend == null)
+        try std.fmt.allocPrint(alloc, "{s}/api-research-jobs", .{resolved.replica_root_dir})
+    else
+        null;
+    defer if (research_job_root) |path| alloc.free(path);
+    var research_job_backend: ?antfly.lsm_backend.BackendHandle = if (research_job_root) |path|
+        try antfly.lsm_backend.BackendHandle.open(alloc, path, .{})
+    else
+        null;
+    defer if (research_job_backend) |*backend| backend.close();
+    var research_job_store: ?antfly.storage_backend_erased.Store = if (research_job_backend) |*backend|
+        try backend.backend.runtimeStore(alloc, .{ .name = "system/api-research-jobs" })
+    else
+        null;
+    defer if (research_job_store) |*store| store.deinit();
     // Incoming reverse-route observations are an exact, fenced directory, not
     // disposable cache state: retain one latest generation per logical graph
     // key so restarts and L1 eviction do not reintroduce all-shard probes.
@@ -4056,11 +4075,16 @@ pub fn runFromIterator(
                 else => return err,
             };
             seeded_admin.deinit(alloc);
+            // HA auth must come from a secure seed; never rewrite seed credentials here.
+            try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?, null);
         } else {
             // This seeds only the local auth store and must remain auth-gated.
             // Raft-backed metadata writes during metadata bootstrap can block
             // clustered startup before raft listeners are running.
-            try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
+            antfly.usermgr.ensureDefaultAdminUser(&user_manager.?, init.environ_map.get("ANTFLY_BOOTSTRAP_ADMIN_PASSWORD")) catch |err| {
+                std.log.err("auth bootstrap failed: set ANTFLY_BOOTSTRAP_ADMIN_PASSWORD to a unique password of 12 to 72 bytes for a new admin or to replace legacy admin:admin credentials", .{});
+                return err;
+            };
         }
     }
     defer if (user_manager) |*manager| manager.deinit();
@@ -4072,6 +4096,7 @@ pub fn runFromIterator(
     defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
 
     const public_listener = resolvePublicListener(cli);
+    antfly.common.listener_security.warnIfUnauthenticated("public", public_listener.bind_host, public_listener.bind_port, auth_enabled);
     const local_node_id = cli.local_node_id orelse 1;
     const public_api_url = try std.fmt.allocPrint(
         alloc,
@@ -4353,6 +4378,7 @@ pub fn runFromIterator(
             .user_manager = if (user_manager) |*manager| manager else null,
             .session_store = if (lite_session_store) |*store| store else if (native_sessions) |*store| store else null,
             .restore_job_store = if (local_metadata.lifecycle_store == null) restore_job_store else null,
+            .research_job_store = if (research_job_store) |*store| store else null,
             .incoming_graph_route_store = incoming_graph_route_store,
             .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,
@@ -5295,16 +5321,12 @@ fn joinCorsValues(alloc: std.mem.Allocator, values: anytype) ![]u8 {
 
 fn corsAllowedOrigin(config: *const antfly.common.config.Config.CorsConfig, origin: []const u8) ?[]const u8 {
     if (!isSafeCorsOrigin(origin)) return null;
-    if (config.allowed_origins) |origins| {
-        if (origins.len != 0) {
-            for (origins) |allowed| if (std.mem.eql(u8, allowed, "*")) return "*";
-            for (origins) |allowed| {
-                if (std.mem.eql(u8, allowed, origin)) return origin;
-            }
-            return null;
-        }
+    const origins = config.allowed_origins orelse return null;
+    for (origins) |allowed| if (std.mem.eql(u8, allowed, "*")) return "*";
+    for (origins) |allowed| {
+        if (std.mem.eql(u8, allowed, origin)) return origin;
     }
-    return "*";
+    return null;
 }
 
 fn corsMethodAllowed(config: *const antfly.common.config.Config.CorsConfig, method: []const u8) bool {
@@ -5359,14 +5381,11 @@ fn validateCorsConfig(config: ?*const antfly.common.config.Config.CorsConfig) !v
 
     const allow_credentials = cors.allow_credentials orelse false;
     if (cors.allowed_origins) |origins| {
-        if (origins.len == 0 and allow_credentials) return error.CorsCredentialsWithWildcardOrigin;
         for (origins) |origin| {
             if (!isSafeCorsOrigin(origin)) return error.InvalidCorsOrigin;
             if (allow_credentials and std.mem.eql(u8, origin, "*")) return error.CorsCredentialsWithWildcardOrigin;
             if (allow_credentials and std.mem.eql(u8, origin, "null")) return error.CorsCredentialsWithOpaqueOrigin;
         }
-    } else if (allow_credentials) {
-        return error.CorsCredentialsWithWildcardOrigin;
     }
 
     if (cors.allowed_methods) |methods| for (methods) |method| {
@@ -7621,6 +7640,7 @@ fn printUsage() void {
         \\  --host <host>                         Public API host (default: 127.0.0.1)
         \\  --port <port>                         Public API port (default: 8080)
         \\  --auth <true|false>                   Enable authentication for public APIs (default: false)
+        \\                                       First startup requires ANTFLY_BOOTSTRAP_ADMIN_PASSWORD (12 to 72 bytes)
         \\  --id <node-id>                        Local node id (default: 1)
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
@@ -8510,7 +8530,20 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
         }
     };
 
-    var defaults: antfly.common.config.Config.CorsConfig = .{};
+    const restricted = [_]antfly.common.config.Config.CorsConfig{ .{}, .{ .allowed_origins = &.{} } };
+    for (restricted) |policy| {
+        try validateCorsConfig(&policy);
+        var actual = try Harness.execute(&policy, .GET, "https://attacker.example", null, null);
+        defer actual.deinit();
+        try std.testing.expectEqual(@as(u16, 209), actual.status.code);
+        try std.testing.expect(actual.headers.get("Access-Control-Allow-Origin") == null);
+        var preflight = try Harness.execute(&policy, .OPTIONS, "https://attacker.example", "POST", "content-type");
+        defer preflight.deinit();
+        try std.testing.expectEqual(@as(u16, 403), preflight.status.code);
+        try std.testing.expect(preflight.headers.get("Access-Control-Allow-Origin") == null);
+    }
+    // Wildcard behavior is preserved only when explicitly configured.
+    var defaults = antfly.common.config.Config.CorsConfig{ .allowed_origins = &.{@constCast("*")} };
     try validateCorsConfig(&defaults);
     {
         var response = try Harness.execute(&defaults, .GET, "https://any.example", null, null);
@@ -8601,8 +8634,12 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
         .allow_credentials = true,
     };
     try std.testing.expectError(error.CorsCredentialsWithWildcardOrigin, validateCorsConfig(&wildcard_credentials));
-    var default_wildcard_credentials = antfly.common.config.Config.CorsConfig{ .allow_credentials = true };
-    try std.testing.expectError(error.CorsCredentialsWithWildcardOrigin, validateCorsConfig(&default_wildcard_credentials));
+    var no_origins = antfly.common.config.Config.CorsConfig{ .allow_credentials = true };
+    try validateCorsConfig(&no_origins);
+    try std.testing.expect(corsAllowedOrigin(&no_origins, "https://attacker.example") == null);
+    no_origins.allowed_origins = &.{};
+    try validateCorsConfig(&no_origins);
+    try std.testing.expect(corsAllowedOrigin(&no_origins, "https://attacker.example") == null);
     var opaque_origin = "null".*;
     var opaque_origins = [_][]u8{opaque_origin[0..]};
     var opaque_credentials = antfly.common.config.Config.CorsConfig{

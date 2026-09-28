@@ -40,7 +40,7 @@ fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
 }
 
 fn spinOrYield() void {
-    if (builtin.os.tag == .freestanding) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
+    if (builtin.os.tag == .freestanding) std.atomic.spinLoopHint() else @import("antfly_platform").time.yieldNow();
 }
 
 fn sleepPollInterval() void {

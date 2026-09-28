@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 64;
+pub const abi_version: u32 = 66;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -856,6 +856,13 @@ pub const TransactionRecoveryAcknowledgeFn = *const fn (
     BorrowedBytes,
     BorrowedBytes,
 ) callconv(.c) Status;
+pub const TransactionRecoveryAcknowledgeManyFn = *const fn (
+    ?*anyopaque,
+    *const TxnId,
+    BorrowedBytes,
+    ?[*]const BorrowedBytes,
+    usize,
+) callconv(.c) Status;
 pub const TransactionRecoveryCleanupFn = *const fn (
     ?*anyopaque,
     *const TxnId,
@@ -879,6 +886,7 @@ pub const TransactionRecoveryConfig = extern struct {
     resolve_participant_fn: ?TransactionRecoveryResolveFn = null,
     owns_recovery_fn: ?TransactionRecoveryOwnsFn = null,
     acknowledge_participant_fn: ?TransactionRecoveryAcknowledgeFn = null,
+    acknowledge_participants_fn: ?TransactionRecoveryAcknowledgeManyFn = null,
     cleanup_transaction_fn: ?TransactionRecoveryCleanupFn = null,
 };
 
@@ -924,8 +932,10 @@ pub const ResolutionCandidateConfig = extern struct {
 
 pub const EntityUpsert = extern struct {
     table: BorrowedBytes = .{},
+    storage_table: BorrowedBytes = .{},
     key: BorrowedBytes = .{},
     doc_json: BorrowedBytes = .{},
+    delete: u8 = 0,
 };
 pub const EntityUpsertFn = *const fn (
     ?*anyopaque,
@@ -1049,7 +1059,10 @@ pub const OpenRequest = extern struct {
     /// Immutable native ownership domain; not inferred from the first row or
     /// from a caller-supplied source control request. 1 = Raft, 2 = native.
     online_source_authority: u8 = 1,
-    _restore_reserved: [5]u8 = @splat(0),
+    /// This owner is being opened to apply an entry whose catalog descriptor
+    /// may predate the configuration already persisted by this replica.
+    historical_raft_apply: u8 = 0,
+    _restore_reserved: [4]u8 = @splat(0),
     target_observer: TargetObserver = .{},
     transaction_recovery: TransactionRecoveryConfig = .{},
     runtime_hooks: RuntimeHooksConfig = .{},

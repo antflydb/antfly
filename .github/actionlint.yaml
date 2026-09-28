@@ -1,11 +1,14 @@
 self-hosted-runner:
   labels:
     - arc-antfly-standard
+    - arc-antfly-standard-runtime
     - arc-antfly-heavy
+    - arc-antfly-heavy-runtime
     - arc-antfly-l4-spot
     - arc-antfly-docker
     - arc-antfly-publish
     - arc-antfly-publish-arm64
+    - arc-antfly-arm64-runtime
 
 # GitHub supports concurrency.queue: max; actionlint 1.7.12 predates it.
 # Keep controller/admission events queued instead of replacing pending events.

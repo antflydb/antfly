@@ -121,9 +121,22 @@ async function main({github, context, core, mode, config, env = process.env}) {
     if (comment.user.type !== 'User' || comment.user.login.endsWith('[bot]')) {
       throw new Error('Approval must come from a human maintainer account.');
     }
-    const {data} = await github.rest.repos.getCollaboratorPermissionLevel({
-      ...repo, username: comment.user.login,
-    });
+    let response;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        response = await github.rest.repos.getCollaboratorPermissionLevel({
+          ...repo, username: comment.user.login,
+        });
+        break;
+      } catch (err) {
+        // GitHub occasionally returns a transient 5xx during admission. Never
+        // treat a failed lookup as authorization, and do not retry a 4xx denial.
+        if (attempt === 2 ||
+            (err.status !== 429 && !(err.status >= 500 && err.status < 600))) throw err;
+        await new Promise(resolve => setTimeout(resolve, 200 * (attempt + 1)));
+      }
+    }
+    const {data} = response;
     if (!['write', 'maintain', 'admin'].includes(data.permission) && !data.user?.permissions?.push) {
       throw new Error('Approval requires repository write access.');
     }

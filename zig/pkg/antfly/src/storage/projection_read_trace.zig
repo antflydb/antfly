@@ -1,7 +1,7 @@
 //! Default-off attribution only. Logging changes latency; never use traced
 //! runs as performance qualifications. No vector payload or document ID logged.
 const std = @import("std");
-var next_batch: std.atomic.Value(u64) = .init(0);
+var next_batch: @import("antfly_platform").atomic.Value(u64) = .init(0);
 const max_batches = 128;
 
 pub fn record(opened: anytype, requests: anytype) void {

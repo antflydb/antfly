@@ -29,6 +29,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - uses: ./.github/actions/setup-github-cli
       - name: Load pinned toolchain policy
         id: toolchain
@@ -95,6 +97,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - uses: ./.github/actions/setup-github-cli
       - name: Load pinned toolchain policy
         id: toolchain

@@ -112,7 +112,6 @@
     "tokenHandoff": "device"
   },
   "source": {
-    "path": "work-log/completed/inference/gemma4/metal-perf-plan.md",
-    "anchor": "3. **Barrier work reframed by measurement**:"
+    "path": "work-log/completed/inference/gemma4/metal-perf-plan.md"
   }
 }

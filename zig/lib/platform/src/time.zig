@@ -53,6 +53,13 @@ pub fn yieldNow() void {
     io.sleep(.zero, .awake) catch unreachable;
 }
 
+/// Borrowed native runtimes retain their awake-clock authority. Freestanding
+/// hosts have no native Io vtable and use the platform monotonic clock.
+pub fn awakeNs(io: std.Io) u64 {
+    if (comptime builtin.os.tag == .freestanding) return monotonicNs();
+    return @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds));
+}
+
 pub fn monotonicNs() u64 {
     if (comptime builtin.os.tag == .freestanding) {
         freestanding_counter +%= 1;

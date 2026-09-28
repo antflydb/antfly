@@ -14,7 +14,7 @@ import {
 import { parseAsString, parseAsStringLiteral, useQueryState } from "nuqs";
 import { Suspense, useMemo } from "react";
 import { CodeLink } from "@/components/code/code-link";
-import { type ClientSnippet, SnippetProvider } from "@/components/code/snippet-context";
+import { SourceLinkProvider } from "@/components/code/source-link-context";
 import { QuantChip } from "@/components/primitives/chips";
 import { ChoiceGroup } from "@/components/primitives/choice-group";
 
@@ -39,8 +39,6 @@ const FAMILY_COLOR: Record<string, string> = {
 export function KernelsClient(props: {
   routes: KernelRoute[];
   inventory: KernelInventoryEntry[];
-  snippets: Record<string, ClientSnippet>;
-  gitCommit: string;
   permalinkBase?: string;
 }) {
   return (
@@ -53,14 +51,10 @@ export function KernelsClient(props: {
 function KernelsInner({
   routes,
   inventory,
-  snippets,
-  gitCommit,
   permalinkBase,
 }: {
   routes: KernelRoute[];
   inventory: KernelInventoryEntry[];
-  snippets: Record<string, ClientSnippet>;
-  gitCommit: string;
   permalinkBase?: string;
 }) {
   const [q, setQ] = useQueryState("q", parseAsString.withDefault(""));
@@ -86,7 +80,7 @@ function KernelsInner({
   const smallBatch = batch === "1";
 
   return (
-    <SnippetProvider snippets={snippets} gitCommit={gitCommit} permalinkBase={permalinkBase}>
+    <SourceLinkProvider permalinkBase={permalinkBase}>
       <div className="mx-auto max-w-7xl space-y-10 px-4 py-8">
         <header className="max-w-3xl">
           <h1 className="text-3xl font-bold tracking-tight">Kernel routing</h1>
@@ -269,6 +263,6 @@ function KernelsInner({
           )}
         </section>
       </div>
-    </SnippetProvider>
+    </SourceLinkProvider>
   );
 }
