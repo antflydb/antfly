@@ -114,12 +114,20 @@ pub fn forwardRow(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: mode
     if (store.limit_bytes == 0 or trunk < store.min_tokens or trunk == row.ids.len) return forwardFull(cb, a, cfg, laya, row);
     const layers = cfg.num_hidden_layers + laya.head_layers;
     const key = trunk_cache.Cache.key(row.ids[0..trunk], layers, cfg.hidden_size);
-    const entry = store.acquire(key) orelse blk: {
-        const created = try store.create(key, trunk, layers, cfg.hidden_size, !deviceCache(cb));
-        errdefer store.release(created);
-        try fillTrunk(cb, a, cfg, laya, row.ids[0..trunk], created, store.allocator);
-        store.publish(created);
-        break :blk created;
+    // The entry's bytes and admission lease are reserved before encoding;
+    // a trunk that cannot fit runs uncached, and a concurrent miss on the
+    // same state waits for this fill rather than repeating it.
+    const entry = switch (try store.lookup(key, trunk, layers, cfg.hidden_size, !deviceCache(cb))) {
+        .hit => |hit| hit,
+        .fill => |created| blk: {
+            fillTrunk(cb, a, cfg, laya, row.ids[0..trunk], created, store.allocator) catch |err| {
+                store.abandon(created);
+                return err;
+            };
+            store.publish(created);
+            break :blk created;
+        },
+        .bypass => return forwardFull(cb, a, cfg, laya, row),
     };
     defer store.release(entry);
     return forwardCached(cb, a, cfg, laya, row, entry);

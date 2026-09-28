@@ -23,7 +23,13 @@
 //! are pinned and never evicted. The bound defaults to
 //! ANTFLY_LAYA_TRUNK_CACHE_MB (256 MiB); 0 disables caching. Trunks shorter
 //! than `min_tokens` are not cached. With admission configured, every
-//! published entry holds a KV lease on the model's admission controller.
+//! entry holds a KV lease on the model's admission controller.
+//!
+//! `lookup` reserves an entry's bytes and admission lease before the caller
+//! encodes anything, so concurrent misses never exceed the budget, and it
+//! lets only one caller fill a given key: later misses for that key wait for
+//! the fill instead of duplicating it. An entry that cannot fit is bypassed
+//! without encoding it for the cache.
 const std = @import("std");
 const platform = @import("antfly_platform");
 const memory = @import("../runtime/tier/memory.zig");
@@ -93,7 +99,12 @@ pub const Admission = struct {
     device: bool,
 };
 
-pub const Stats = struct { hits: u64 = 0, misses: u64 = 0, entries: usize = 0, bytes: usize = 0, evictions: u64 = 0, refusals: u64 = 0 };
+pub const Stats = struct { hits: u64 = 0, misses: u64 = 0, entries: usize = 0, bytes: usize = 0, evictions: u64 = 0, refusals: u64 = 0, waits: u64 = 0 };
+
+/// What `lookup` hands back. `hit` and `fill` entries are pinned: `release`
+/// them when done. A `fill` entry must be filled and then `publish`ed, or
+/// `abandon`ed on failure. `bypass` means: do not use the cache.
+pub const Lookup = union(enum) { hit: *Entry, fill: *Entry, bypass };
 
 pub const Cache = struct {
     allocator: std.mem.Allocator,
@@ -103,6 +114,9 @@ pub const Cache = struct {
     admission: ?Admission = null,
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
+    /// Reserved entries being filled; their bytes count in `reserved_bytes`.
+    pending: std.ArrayListUnmanaged(*Entry) = .empty,
+    reserved_bytes: usize = 0,
     clock: u64 = 0,
     stats: Stats = .{},
 
@@ -120,8 +134,10 @@ pub const Cache = struct {
     }
 
     pub fn deinit(self: *Cache) void {
+        std.debug.assert(self.pending.items.len == 0);
         for (self.entries.items) |entry| self.destroy(entry);
         self.entries.deinit(self.allocator);
+        self.pending.deinit(self.allocator);
     }
 
     /// Charge future entries to the session's admission controller.
@@ -152,6 +168,12 @@ pub const Cache = struct {
     pub fn acquire(self: *Cache, k: [32]u8) ?*Entry {
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        if (self.hitLocked(k)) |entry| return entry;
+        self.stats.misses += 1;
+        return null;
+    }
+
+    fn hitLocked(self: *Cache, k: [32]u8) ?*Entry {
         for (self.entries.items) |entry| if (std.mem.eql(u8, &entry.key, &k)) {
             entry.pins += 1;
             self.clock += 1;
@@ -159,29 +181,133 @@ pub const Cache = struct {
             self.stats.hits += 1;
             return entry;
         };
-        self.stats.misses += 1;
         return null;
     }
 
+    fn pendingLocked(self: *Cache, k: [32]u8) bool {
+        for (self.pending.items) |entry| if (std.mem.eql(u8, &entry.key, &k)) return true;
+        return false;
+    }
+
+    /// A cached trunk (`hit`), or a reserved entry for the caller to fill
+    /// (`fill`), or `bypass` when the entry cannot fit the budget or the
+    /// admission controller. Reservation happens before any encoding. A miss
+    /// on a key another caller is filling waits for that fill.
+    pub fn lookup(self: *Cache, k: [32]u8, tokens: usize, layers: usize, hidden: usize, host: bool) !Lookup {
+        const count = try std.math.mul(usize, try std.math.mul(usize, 2 * layers, tokens), hidden);
+        const size = try std.math.mul(usize, count, if (self.precision == .f16) @as(usize, 2) else 4);
+        while (true) {
+            platform.sync.lockYielding(&self.mutex);
+            if (self.hitLocked(k)) |entry| {
+                self.mutex.unlock();
+                return .{ .hit = entry };
+            }
+            if (self.pendingLocked(k)) {
+                self.stats.waits += 1;
+                self.mutex.unlock();
+                platform.time.yieldBriefly();
+                continue;
+            }
+            self.stats.misses += 1;
+            const reserved = self.reserveLocked(size) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            const lease = reserved orelse {
+                self.stats.refusals += 1;
+                self.mutex.unlock();
+                return .bypass;
+            };
+            const entry = self.allocator.create(Entry) catch |err| {
+                dropReservation(lease);
+                self.mutex.unlock();
+                return err;
+            };
+            entry.* = .{ .key = k, .tokens = tokens, .hidden = hidden, .layers = layers, .precision = self.precision, .pins = 1, .lease = lease.lease };
+            self.pending.append(self.allocator, entry) catch |err| {
+                self.allocator.destroy(entry);
+                dropReservation(lease);
+                self.mutex.unlock();
+                return err;
+            };
+            self.reserved_bytes += size;
+            self.mutex.unlock();
+            // Host storage is allocated outside the lock; its bytes are
+            // already reserved.
+            const host_count = if (host) count else 0;
+            const allocated = switch (self.precision) {
+                .f16 => if (self.allocator.alloc(f16, host_count)) |v| blk: {
+                    entry.host16 = v;
+                    break :blk true;
+                } else |_| false,
+                .f32 => if (self.allocator.alloc(f32, host_count)) |v| blk: {
+                    entry.host32 = v;
+                    break :blk true;
+                } else |_| false,
+            };
+            if (!allocated) {
+                self.abandon(entry);
+                return error.OutOfMemory;
+            }
+            return .{ .fill = entry };
+        }
+    }
+
+    const Reserved = struct { lease: ?memory.AdmissionLease };
+
+    /// Make room for `size` bytes under the byte budget and the admission
+    /// controller, evicting least recently used unpinned entries. Null when
+    /// it cannot fit.
+    fn reserveLocked(self: *Cache, size: usize) !?Reserved {
+        if (size > self.limit_bytes) return null;
+        while (self.stats.bytes + self.reserved_bytes + size > self.limit_bytes) {
+            if (!self.evictOne()) return null;
+        }
+        const admission = self.admission orelse return .{ .lease = null };
+        const amounts: memory.AdmissionAmounts = if (admission.device) .{ .backend_kv_bytes = size } else .{ .host_kv_bytes = size };
+        // Under memory pressure, give back older entries before refusing.
+        while (true) {
+            if (admission.controller.tryAcquire(admission.backend_class, admission.limits, amounts, true)) |lease| {
+                return .{ .lease = lease };
+            } else |_| {
+                if (!self.evictOne()) return null;
+            }
+        }
+    }
+
+    fn dropReservation(reserved: Reserved) void {
+        if (reserved.lease) |lease| {
+            var owned = lease;
+            owned.release();
+        }
+    }
+
+    fn removePendingLocked(self: *Cache, entry: *Entry) void {
+        const index = std.mem.indexOfScalar(*Entry, self.pending.items, entry).?;
+        _ = self.pending.swapRemove(index);
+        self.reserved_bytes -= entry.bytes();
+    }
+
+    /// Unpin an entry from `lookup` (either kind) or `acquire`. An entry that
+    /// is no longer cached is freed on its last release.
     pub fn release(self: *Cache, entry: *Entry) void {
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         entry.pins -= 1;
-        if (entry.pins == 0 and std.mem.indexOfScalar(*Entry, self.entries.items, entry) == null) self.destroy(entry);
+        if (entry.pins == 0 and std.mem.indexOfScalar(*Entry, self.entries.items, entry) == null and
+            std.mem.indexOfScalar(*Entry, self.pending.items, entry) == null) self.destroy(entry);
     }
 
-    /// Allocate an unpublished, pinned entry for the caller to fill. Device
-    /// entries (`host = false`) get no host storage.
-    pub fn create(self: *Cache, k: [32]u8, tokens: usize, layers: usize, hidden: usize, host: bool) !*Entry {
-        const count = if (host) try std.math.mul(usize, try std.math.mul(usize, 2 * layers, tokens), hidden) else 0;
-        const entry = try self.allocator.create(Entry);
-        errdefer self.allocator.destroy(entry);
-        entry.* = .{ .key = k, .tokens = tokens, .hidden = hidden, .layers = layers, .precision = self.precision, .pins = 1 };
-        switch (self.precision) {
-            .f16 => entry.host16 = try self.allocator.alloc(f16, count),
-            .f32 => entry.host32 = try self.allocator.alloc(f32, count),
-        }
-        return entry;
+    /// Give up a `fill` entry (the fill failed): drop its reservation and
+    /// lease and free it. Waiters retry and one of them fills instead. The
+    /// caller must not `release` it afterwards.
+    pub fn abandon(self: *Cache, entry: *Entry) void {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.removePendingLocked(entry);
+        entry.pins -= 1;
+        std.debug.assert(entry.pins == 0);
+        self.destroy(entry);
     }
 
     /// Evict the least recently used unpinned entry; false when none is.
@@ -199,33 +325,21 @@ pub const Cache = struct {
         return true;
     }
 
-    /// Publish a filled entry when it fits the budget, evicting least recently
-    /// used unpinned entries. The caller keeps its pin either way and must
-    /// `release` it; an unpublished entry is freed on its last release.
+    /// Publish a filled `fill` entry. Its bytes and lease were reserved by
+    /// `lookup`, so it always fits. The caller keeps its pin and must
+    /// `release` it.
     pub fn publish(self: *Cache, entry: *Entry) void {
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        if (entry.bytes() > self.limit_bytes) return;
-        for (self.entries.items) |existing| if (std.mem.eql(u8, &existing.key, &entry.key)) return;
-        while (self.stats.bytes + entry.bytes() > self.limit_bytes) {
-            if (!self.evictOne()) return;
-        }
-        if (self.admission) |admission| {
-            const amounts: memory.AdmissionAmounts = if (admission.device) .{ .backend_kv_bytes = entry.bytes() } else .{ .host_kv_bytes = entry.bytes() };
-            // Under memory pressure, give back older entries before refusing.
-            while (true) {
-                if (admission.controller.tryAcquire(admission.backend_class, admission.limits, amounts, true)) |lease| {
-                    entry.lease = lease;
-                    break;
-                } else |_| {
-                    if (!self.evictOne()) {
-                        self.stats.refusals += 1;
-                        return;
-                    }
-                }
-            }
-        }
-        self.entries.append(self.allocator, entry) catch return;
+        self.entries.ensureUnusedCapacity(self.allocator, 1) catch {
+            // Keep the entry usable for this caller; it is freed on release.
+            self.removePendingLocked(entry);
+            if (entry.lease) |*lease| lease.release();
+            entry.lease = null;
+            return;
+        };
+        self.removePendingLocked(entry);
+        self.entries.appendAssumeCapacity(entry);
         self.clock += 1;
         entry.last_used = self.clock;
         self.stats.bytes += entry.bytes();
@@ -241,7 +355,18 @@ pub const Cache = struct {
     }
 };
 
-test "laya trunk cache pins, evicts least recently used, and frees unpublished entries" {
+/// Test helper: `lookup` that must reserve, then fill with `value` and publish.
+fn fillFor(cache: *Cache, k: [32]u8, tokens: usize, layers: usize, hidden: usize, value: f16) !*Entry {
+    const entry = switch (try cache.lookup(k, tokens, layers, hidden, true)) {
+        .fill => |e| e,
+        else => return error.TestUnexpectedResult,
+    };
+    @memset(entry.host16, value);
+    cache.publish(entry);
+    return entry;
+}
+
+test "laya trunk cache pins, evicts least recently used, and bypasses what cannot fit" {
     const a = std.testing.allocator;
     var cache = Cache.init(a, 2 * 2 * 4 * 8 * @sizeOf(f16));
     defer cache.deinit();
@@ -250,35 +375,42 @@ test "laya trunk cache pins, evicts least recently used, and frees unpublished e
     const k3 = Cache.key(&.{ 9, 9, 9, 9 }, 1, 8);
     try std.testing.expect(!std.mem.eql(u8, &k1, &k2));
     try std.testing.expect(cache.acquire(k1) == null);
-    for ([_][32]u8{ k1, k2 }) |k| {
-        const entry = try cache.create(k, 4, 1, 8, true);
-        @memset(entry.host16, 1);
-        cache.publish(entry);
-        cache.release(entry);
-    }
+    for ([_][32]u8{ k1, k2 }) |k| cache.release(try fillFor(&cache, k, 4, 1, 8, 1));
     try std.testing.expectEqual(@as(usize, 2), cache.snapshot().entries);
-    // k1 is pinned, so publishing k3 must evict k2 even though k1 is older.
+    // A second lookup of a cached key is a hit, not a fill.
+    switch (try cache.lookup(k1, 4, 1, 8, true)) {
+        .hit => |e| cache.release(e),
+        else => return error.TestUnexpectedResult,
+    }
+    // k1 is pinned, so reserving k3 must evict k2 even though k1 is older.
     const pinned = cache.acquire(k1).?;
-    const third = try cache.create(k3, 4, 1, 8, true);
-    cache.publish(third);
-    cache.release(third);
+    cache.release(try fillFor(&cache, k3, 4, 1, 8, 1));
     try std.testing.expect(cache.acquire(k2) == null);
     try std.testing.expectEqual(@as(u64, 1), cache.snapshot().evictions);
     cache.release(pinned);
-    // An entry larger than the whole budget is never published but still freed.
-    const huge = try cache.create(Cache.key(&.{7}, 3, 64), 4, 3, 64, false);
-    cache.publish(huge);
-    cache.release(huge);
+    // An entry larger than the whole budget is bypassed before any encoding.
+    try std.testing.expect((try cache.lookup(Cache.key(&.{7}, 3, 64), 4, 3, 64, false)) == .bypass);
     try std.testing.expectEqual(@as(usize, 2), cache.snapshot().entries);
+    // An abandoned fill frees its reservation, so the key can be filled again.
+    const k4 = Cache.key(&.{4}, 1, 8);
+    switch (try cache.lookup(k4, 4, 1, 8, true)) {
+        .fill => |e| cache.abandon(e),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 0), cache.reserved_bytes);
+    cache.release(try fillFor(&cache, k4, 4, 1, 8, 1));
 }
 
-test "laya trunk cache stores f16 and f32 slots and charges admission" {
+test "laya trunk cache stores f16 and f32 slots and charges admission before filling" {
     const a = std.testing.allocator;
     for ([_]Precision{ .f16, .f32 }) |precision| {
         var cache = Cache.init(a, 1 << 20);
         defer cache.deinit();
         cache.precision = precision;
-        const entry = try cache.create(Cache.key(&.{1}, 1, 4), 2, 1, 4, true);
+        const entry = switch (try cache.lookup(Cache.key(&.{1}, 1, 4), 2, 1, 4, true)) {
+            .fill => |e| e,
+            else => return error.TestUnexpectedResult,
+        };
         const values = [_]f32{ 0.5, -1.25, 3.0e-3, 1000.0, 1, 2, 3, 4 };
         entry.store(1, &values);
         var out: [8]f32 = undefined;
@@ -288,23 +420,93 @@ test "laya trunk cache stores f16 and f32 slots and charges admission" {
         cache.publish(entry);
         cache.release(entry);
     }
-    // A controller with no room refuses the entry, which is then not cached.
+    // A controller with no room refuses the reservation: nothing is filled.
     var controller: memory.AdmissionController = .{};
     var cache = Cache.init(a, 1 << 20);
     defer cache.deinit();
     cache.configureAdmission(.{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 16 }, .device = false });
-    const entry = try cache.create(Cache.key(&.{2}, 1, 4), 2, 1, 4, true);
-    cache.publish(entry);
-    cache.release(entry);
+    try std.testing.expect((try cache.lookup(Cache.key(&.{2}, 1, 4), 2, 1, 4, true)) == .bypass);
     try std.testing.expectEqual(@as(usize, 0), cache.snapshot().entries);
     try std.testing.expectEqual(@as(u64, 1), cache.snapshot().refusals);
-    // With room, the lease is held while cached and released on eviction.
+    // With room, the lease is taken at reservation, held while cached, and
+    // released on eviction.
     cache.configureAdmission(.{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1 << 20 }, .device = false });
-    const kept = try cache.create(Cache.key(&.{3}, 1, 4), 2, 1, 4, true);
+    const kept = switch (try cache.lookup(Cache.key(&.{3}, 1, 4), 2, 1, 4, true)) {
+        .fill => |e| e,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(kept.bytes(), controller.snapshot().host_kv_bytes);
     cache.publish(kept);
     cache.release(kept);
     try std.testing.expectEqual(kept.bytes(), controller.snapshot().host_kv_bytes);
     cache.deinit();
     cache = Cache.init(a, 1 << 20);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_kv_bytes);
+}
+
+test "laya trunk cache keeps concurrent misses inside the budget and fills each key once" {
+    const a = std.testing.allocator;
+    const tokens = 4;
+    const layers = 1;
+    const hidden = 8;
+    const entry_bytes = 2 * layers * tokens * hidden * @sizeOf(f16);
+    // Room for exactly one entry.
+    var cache = Cache.init(a, entry_bytes);
+    defer cache.deinit();
+    const Worker = struct {
+        cache: *Cache,
+        key: [32]u8,
+        fills: *std.atomic.Value(u32),
+        hits: *std.atomic.Value(u32),
+        bypasses: *std.atomic.Value(u32),
+        over_budget: *std.atomic.Value(bool),
+        failed: *std.atomic.Value(bool),
+        fn run(self: @This()) void {
+            const result = self.cache.lookup(self.key, tokens, layers, hidden, true) catch {
+                self.failed.store(true, .seq_cst);
+                return;
+            };
+            switch (result) {
+                .fill => |entry| {
+                    _ = self.fills.fetchAdd(1, .seq_cst);
+                    // Encoding takes a while; others must wait, not refill.
+                    platform.sync.lockYielding(&self.cache.mutex);
+                    if (self.cache.stats.bytes + self.cache.reserved_bytes > self.cache.limit_bytes) self.over_budget.store(true, .seq_cst);
+                    self.cache.mutex.unlock();
+                    for (0..200) |_| platform.time.yieldBriefly();
+                    @memset(entry.host16, 3);
+                    self.cache.publish(entry);
+                    self.cache.release(entry);
+                },
+                .hit => |entry| {
+                    _ = self.hits.fetchAdd(1, .seq_cst);
+                    if (entry.host16[0] != 3) self.failed.store(true, .seq_cst);
+                    self.cache.release(entry);
+                },
+                .bypass => _ = self.bypasses.fetchAdd(1, .seq_cst),
+            }
+        }
+    };
+    var fills = std.atomic.Value(u32).init(0);
+    var hits = std.atomic.Value(u32).init(0);
+    var bypasses = std.atomic.Value(u32).init(0);
+    var over_budget = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    const shared = Cache.key(&.{ 5, 5, 5 }, layers, hidden);
+    var threads: [8]std.Thread = undefined;
+    for (&threads, 0..) |*thread, i| {
+        // Six threads miss on one key; two on keys of their own.
+        const k = if (i < 6) shared else Cache.key(&.{@intCast(i)}, layers, hidden);
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{Worker{ .cache = &cache, .key = k, .fills = &fills, .hits = &hits, .bypasses = &bypasses, .over_budget = &over_budget, .failed = &failed }});
+    }
+    for (threads) |thread| thread.join();
+    try std.testing.expect(!failed.load(.seq_cst));
+    try std.testing.expect(!over_budget.load(.seq_cst));
+    try std.testing.expectEqual(@as(u32, 8), fills.load(.seq_cst) + hits.load(.seq_cst) + bypasses.load(.seq_cst));
+    const stats = cache.snapshot();
+    try std.testing.expect(stats.bytes <= entry_bytes);
+    try std.testing.expectEqual(@as(usize, 0), cache.reserved_bytes);
+    // The shared key is filled once unless it was evicted and refilled
+    // between waves; never more fills than distinct keys plus evictions.
+    try std.testing.expect(fills.load(.seq_cst) <= 3 + stats.evictions);
 }
