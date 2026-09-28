@@ -16,6 +16,8 @@ authored as `stinkbugaf` (including GitHub no-reply aliases), three as
 paths; the others touch Apache tooling or packages. The previously reported
 count of 11 Codex commits does not match this current path-scoped, non-merge
 query, so it must not be treated as a verified consent inventory.
+The 39 commit IDs, dates, author identities, and subjects are preserved in
+[the author audit](apache-author-audit-2026-09.tsv).
 
 This is evidence of authorship and affected paths, **not** evidence of an
 Apache license grant or a DCO sign-off. The historical inbound rights for
