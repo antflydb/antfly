@@ -2346,7 +2346,7 @@ test "lite group commit hands leadership to a bounded queued group" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.id == 0) {
                 self.gate.started.store(true, .release);
-                while (!self.gate.proceed.load(.acquire)) std.Thread.yield() catch {};
+                while (!self.gate.proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
             }
             var buf: [32]u8 = undefined;
             const key = try std.fmt.bufPrint(&buf, "queued-{d}", .{self.id});
@@ -2368,7 +2368,7 @@ test "lite group commit hands leadership to a bounded queued group" {
         worker.* = .{ .store = &store, .gate = &gate, .id = i };
         threads[i] = try std.Thread.spawn(.{}, Worker.run, .{worker});
         spawned += 1;
-        if (i == 0) while (!gate.started.load(.acquire)) std.Thread.yield() catch {};
+        if (i == 0) while (!gate.started.load(.acquire)) @import("antfly_platform").time.yieldNow();
     }
     while (true) {
         store.commit_mutex.lockUncancelable(std.testing.io);
@@ -2380,7 +2380,7 @@ test "lite group commit hands leadership to a bounded queued group" {
         }
         store.commit_mutex.unlock(std.testing.io);
         if (queued == 8) break;
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     gate.proceed.store(true, .release);
     for (threads[0..spawned]) |thread| thread.join();
@@ -2476,7 +2476,7 @@ test "lite online vacuum publishes while group-commit mutations keep landing" {
         hammer.stop.store(true, .release);
         if (!joined) thread.join();
     }
-    while (hammer.submitted.load(.acquire) < 4) std.Thread.yield() catch {};
+    while (hammer.submitted.load(.acquire) < 4) @import("antfly_platform").time.yieldNow();
     _ = try store.vacuum();
     hammer.stop.store(true, .release);
     thread.join();
@@ -2505,7 +2505,7 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
         fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
             if (armed.load(.acquire) and file.handle != live_handle and armed.swap(false, .acq_rel)) {
                 started.store(true, .release);
-                while (!proceed.load(.acquire)) std.Thread.yield() catch {};
+                while (!proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
             }
             return std.Options.debug_io.vtable.fileSync(userdata, file);
         }
@@ -2547,7 +2547,7 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
         if (!joined) thread.join();
         Gate.armed.store(false, .release);
     }
-    while (!Gate.started.load(.acquire)) std.Thread.yield() catch {};
+    while (!Gate.started.load(.acquire)) @import("antfly_platform").time.yieldNow();
     write = try store.beginWrite();
     try write.put("doc", "during copy");
     try write.put("new", "also during copy");

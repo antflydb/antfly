@@ -5,7 +5,7 @@ const std = @import("std");
 
 // These epochs order local writable owners, not remote nodes or durable
 // incarnations. Neither epochs nor stamps cross the status wire protocol.
-var next_owner_epoch: std.atomic.Value(u64) = .init(1);
+var next_owner_epoch: @import("antfly_platform").atomic.Value(u64) = .init(1);
 
 pub fn allocateOwnerEpoch() u64 {
     const epoch = next_owner_epoch.fetchAdd(1, .monotonic);

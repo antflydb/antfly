@@ -60,7 +60,7 @@ const remote_capabilities = @import("remote_capabilities.zig");
 const execution_context = @import("execution_context.zig");
 const shared_vector = @import("antfly_vector").vector;
 const antfly_image = @import("antfly_image");
-var traced_local_batches = std.atomic.Value(u64).init(0);
+var traced_local_batches = @import("antfly_platform").atomic.Value(u64).init(0);
 
 pub const SparseEmbedding = db_embedder.SparseEmbedding;
 

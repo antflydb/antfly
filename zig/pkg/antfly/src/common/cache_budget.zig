@@ -14,7 +14,7 @@ const std = @import("std");
 pub const CacheBudget = struct {
     max_bytes: usize,
     used_bytes: std.atomic.Value(usize) = .init(0),
-    rejected_reservations: std.atomic.Value(u64) = .init(0),
+    rejected_reservations: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub const Stats = struct {
         max_bytes: usize,

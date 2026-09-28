@@ -19,7 +19,7 @@ const std = @import("std");
 pub const Account = struct {
     backing: std.mem.Allocator,
     refs: std.atomic.Value(usize) = .init(1),
-    bytes: std.atomic.Value(u64) = .init(0),
+    bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
     last_pass: u64 = 0,
 
     pub fn create(backing: std.mem.Allocator) !*Account {
@@ -35,11 +35,11 @@ pub const Account = struct {
     pub fn release(self: *Account) void {
         if (self.refs.fetchSub(1, .acq_rel) == 1) self.backing.destroy(self);
     }
-    pub fn charge(self: *Account, bytes: usize) void {
+    pub fn charge(self: *Account, bytes: u64) void {
         _ = self.retain();
         _ = self.bytes.fetchAdd(bytes, .monotonic);
     }
-    pub fn discharge(self: *Account, bytes: usize) void {
+    pub fn discharge(self: *Account, bytes: u64) void {
         _ = self.bytes.fetchSub(bytes, .monotonic);
         self.release();
     }
@@ -51,7 +51,7 @@ pub const Account = struct {
     }
 };
 
-var pass_id: std.atomic.Value(u64) = .init(1);
+var pass_id: @import("antfly_platform").atomic.Value(u64) = .init(1);
 pub fn nextPass() u64 {
     return pass_id.fetchAdd(1, .monotonic);
 }

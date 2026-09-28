@@ -48,3 +48,12 @@ const glibc = if (builtin.os.tag == .linux and builtin.link_libc and builtin.abi
 test "process allocator reclamation is a portable best-effort operation" {
     _ = reclaimUnusedProcessMemory();
 }
+
+/// Process-lifetime fallback for shared caches and independently owned work.
+/// Browser instances have one execution thread and use the WASM heap; native
+/// threaded owners retain the scalable allocator and its cross-thread frees.
+pub fn concurrentFallback() std.mem.Allocator {
+    if (comptime builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64) return std.heap.wasm_allocator;
+    if (comptime builtin.single_threaded) return std.heap.page_allocator;
+    return std.heap.smp_allocator;
+}

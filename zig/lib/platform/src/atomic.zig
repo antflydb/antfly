@@ -16,7 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 fn usePlainValue(comptime T: type) bool {
-    return builtin.cpu.arch == .wasm32 and @bitSizeOf(T) > 32;
+    return builtin.single_threaded and builtin.cpu.arch == .wasm32 and @bitSizeOf(T) > 32;
 }
 
 pub fn Value(comptime T: type) type {
@@ -59,6 +59,20 @@ pub fn Value(comptime T: type) type {
                 return old;
             }
 
+            pub inline fn fetchOr(self: *@This(), operand: T, order: anytype) T {
+                _ = order;
+                const old = self.raw;
+                self.raw |= operand;
+                return old;
+            }
+
+            pub inline fn fetchAnd(self: *@This(), operand: T, order: anytype) T {
+                _ = order;
+                const old = self.raw;
+                self.raw &= operand;
+                return old;
+            }
+
             pub inline fn cmpxchgWeak(
                 self: *@This(),
                 expected_value: T,
@@ -98,4 +112,31 @@ pub fn Value(comptime T: type) type {
     }
 
     return std.atomic.Value(T);
+}
+
+/// Raw counters embedded in wire/diagnostic records keep their scalar layout.
+/// Only the single-threaded wasm32 runtime may use plain wide accesses.
+pub inline fn load(comptime T: type, ptr: *const T, comptime order: std.builtin.AtomicOrder) T {
+    if (comptime usePlainValue(T)) return ptr.*;
+    return @atomicLoad(T, ptr, order);
+}
+
+pub inline fn fetchAdd(comptime T: type, ptr: *T, operand: T, comptime order: std.builtin.AtomicOrder) T {
+    if (comptime usePlainValue(T)) {
+        const old = ptr.*;
+        ptr.* +%= operand;
+        return old;
+    }
+    return @atomicRmw(T, ptr, .Add, operand, order);
+}
+
+test "wide values preserve native atomic identity and compare-exchange semantics" {
+    if (comptime !usePlainValue(u64)) try std.testing.expect(Value(u64) == std.atomic.Value(u64));
+    const high: u64 = 0x1_0000_0000;
+    var value = Value(u64).init(high);
+    try std.testing.expectEqual(high, value.fetchAdd(9, .monotonic));
+    try std.testing.expectEqual(high + 9, value.swap(high, .acq_rel));
+    try std.testing.expectEqual(@as(?u64, high), value.cmpxchgStrong(0, 1, .acq_rel, .acquire));
+    try std.testing.expectEqual(@as(?u64, null), value.cmpxchgStrong(high, high + 2, .acq_rel, .acquire));
+    try std.testing.expectEqual(high + 2, value.load(.acquire));
 }

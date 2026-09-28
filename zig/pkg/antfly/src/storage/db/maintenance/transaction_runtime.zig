@@ -569,7 +569,7 @@ fn recordRun(runtime: *Runtime, now_ns: u64, summary: RunSummary, failed: bool) 
 }
 
 fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.Thread.yield() catch {};
+    while (!mutex.tryLock()) @import("antfly_platform").time.yieldNow();
 }
 
 const TestResolver = struct {

@@ -8,7 +8,10 @@
 //! owning model-family packages.
 
 const std = @import("std");
-const data_uri = @import("antfly_scraping").data_uri;
+const data_uri = if (@import("builtin").os.tag == .freestanding)
+    @import("antfly_data_uri")
+else
+    @import("antfly_scraping").data_uri;
 const antfly_image = @import("antfly_image");
 
 pub const mimeTypeEssence = data_uri.mediaTypeEssence;
@@ -915,7 +918,7 @@ pub const InferenceCapabilities = struct {
     /// may derive pixels from its wire budget; encoded inputs keep model limits.
     pub fn renderPixelLimit(self: InferenceCapabilities, raw: bool) u64 {
         const pixels = self.batch.max_decoded_pixels orelse std.math.maxInt(u64);
-        return if (raw) @min(pixels, if (self.attachment_payload_max_bytes) |bytes| bytes / 4 else std.math.maxInt(u64)) else pixels;
+        return if (raw) @min(pixels, if (self.attachment_payload_max_bytes) |bytes| @as(u64, bytes) / 4 else std.math.maxInt(u64)) else pixels;
     }
 
     pub fn validate(self: InferenceCapabilities) !void {

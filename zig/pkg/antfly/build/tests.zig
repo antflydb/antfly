@@ -849,6 +849,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const embedded_db_tests = b.addTest(.{
         .root_module = embedded_db_mod,
         .filters = &.{
+            "embedded custom storage owns its physical namespace",
             "embedded db openLite persists documents in aflite file",
             "embedded db openLite close syncs unsynced batch before readonly reopen",
             "embedded db openLite propagates no_sync to aflite backend",
@@ -1764,6 +1765,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lite_native_tests = addFilteredTestRunArtifact(b, lite_native_tests);
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
+    const portable_wal_tests = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .filters = &.{"portable WAL"},
+    });
+    const run_portable_wal_tests = b.addRunArtifact(portable_wal_tests);
+    b.step("portable-wal-test", "Run hosted WAL durability and read-only tests").dependOn(&run_portable_wal_tests.step);
+    lite_native_test_step.dependOn(&run_portable_wal_tests.step);
     const lite_benchmark = b.addTest(.{
         .root_module = lite_native_test_mod,
         .filters = &.{"lite throughput benchmark"},
@@ -5618,6 +5626,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.persistent.",
             "storage.persistent_vopr.",
             "storage.portable_backup.",
+            "storage.portable_wal.",
             "storage.posting_segment_store.",
             "storage.resource_manager.",
             "storage.retained_effects.",
