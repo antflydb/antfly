@@ -97,8 +97,6 @@ def populate_npm_package(platform: Platform, extracted: Path, version: str) -> P
     update_json_version(manifest, version)
     for name in ("bin", "lib", "include", "share", "LICENSES"):
         clean_path(package_dir / name)
-    (package_dir / "bin").mkdir()
-    shutil.copy2(extracted / "antfly-lite", package_dir / "bin" / "antfly-lite")
     shutil.copytree(
         extracted / "lib",
         package_dir / "lib",
@@ -154,8 +152,6 @@ def write_wheel(
         ROOT / "py" / "packages" / "embedded" / "pyproject.toml"
     )
     wheel = f"Wheel-Version: 1.0\nGenerator: package_lite_release.py\nRoot-Is-Purelib: false\nTag: {tag}\n"
-    entry_points = "[console_scripts]\nantfly-lite = antfly_embedded._cli:lite_main\nantfly-inference = antfly_embedded._cli:inference_main\n"
-
     with zipfile.ZipFile(wheel_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for item in sorted(source.rglob("*")):
             if item.is_file() and "__pycache__" not in item.parts:
@@ -164,13 +160,6 @@ def write_wheel(
                     f"antfly_embedded/{item.relative_to(source).as_posix()}",
                     item.read_bytes(),
                 )
-        for binary in ("antfly-lite", "antfly-inference"):
-            add_bytes(
-                archive,
-                f"antfly_embedded/_bin/{binary}",
-                (extracted / binary).read_bytes(),
-                0o755,
-            )
         for item in sorted((extracted / "lib").rglob("*")):
             if item.is_file():
                 add_bytes(
@@ -195,7 +184,6 @@ def write_wheel(
                 )
         add_bytes(archive, f"{dist_info}/METADATA", metadata.as_bytes())
         add_bytes(archive, f"{dist_info}/WHEEL", wheel.encode())
-        add_bytes(archive, f"{dist_info}/entry_points.txt", entry_points.encode())
         buffer = io.StringIO()
         csv.writer(buffer).writerows([*records, (f"{dist_info}/RECORD", "", "")])
         add_bytes(archive, f"{dist_info}/RECORD", buffer.getvalue().encode())

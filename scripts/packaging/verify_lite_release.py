@@ -60,7 +60,7 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
 
             lib_name = lite_library_name(platform)
             library = source_bytes(f"./lib/{lib_name}")
-            lite = source_bytes("./antfly-lite")
+            source_bytes("./antfly-lite")
             worker = source_bytes("./antfly-inference")
             require(
                 source_bytes("./LICENSE") == apache,
@@ -85,8 +85,12 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
                 f"worker mismatch: {wheel_path}",
             )
             require(
-                wheel.read("antfly_embedded/_bin/antfly-lite") == lite,
-                f"Lite executable mismatch: {wheel_path}",
+                not any(
+                    name.startswith("antfly_embedded/_bin/")
+                    or name.endswith("/entry_points.txt")
+                    for name in wheel.namelist()
+                ),
+                f"embedded wheel exposes CLI commands: {wheel_path}",
             )
             require(
                 wheel.read(f"antfly_embedded-{python_version}.dist-info/LICENSE") == apache,
@@ -134,8 +138,11 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
                 f"worker mismatch: {npm_path}",
             )
             require(
-                npm_bytes("bin/antfly-lite") == lite,
-                f"Lite executable mismatch: {npm_path}",
+                not any(
+                    member.name.startswith("package/bin/") for member in npm.getmembers()
+                )
+                and "bin" not in manifest,
+                f"embedded npm package exposes CLI commands: {npm_path}",
             )
             require(
                 npm_bytes("LICENSE") == apache, f"wrong npm license text: {npm_path}"

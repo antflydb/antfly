@@ -124,6 +124,7 @@ class LitePackagingTests(unittest.TestCase):
                     (npm / "lib" / package.lite_library_name(platform)).is_file()
                 )
                 self.assertTrue((npm / "lib/antfly-inference").is_file())
+                self.assertFalse((npm / "bin").exists())
                 self.assertTrue((npm / "LICENSES/third-party/example.txt").is_file())
                 wheel = (
                     root
@@ -136,7 +137,8 @@ class LitePackagingTests(unittest.TestCase):
                     self.assertIn(
                         "antfly_embedded/_lib/" + package.lite_library_name(platform), names
                     )
-                    self.assertIn("antfly_embedded/_bin/antfly-lite", names)
+                    self.assertFalse(any(name.startswith("antfly_embedded/_bin/") for name in names))
+                    self.assertFalse(any(name.endswith("/entry_points.txt") for name in names))
                     self.assertIn(
                         "antfly_embedded-1.2.3.dist-info/LICENSES/third-party/example.txt",
                         names,
@@ -170,8 +172,6 @@ class LitePackagingTests(unittest.TestCase):
                     capture_output=True,
                 )
                 for location in (
-                    "_bin/antfly-lite",
-                    "_bin/antfly-inference",
                     "_lib/antfly-inference",
                 ):
                     installed = install_dir / "antfly_embedded" / location

@@ -9,7 +9,6 @@
     "directory": "ts/packages/embedded-linux-x64"
   },
   "files": [
-    "bin",
     "include",
     "lib",
     "share",

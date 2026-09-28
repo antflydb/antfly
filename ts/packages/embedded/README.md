@@ -16,8 +16,9 @@ pnpm add @antfly/embedded
 ```
 
 Published platform packages include the Apache-2.0 `libantfly` library and
-inference worker. Source checkouts can build the shared library with
-"Library discovery" below. From the `antfly` monorepo source tree, build it
+private inference worker, without installing CLI commands. Source checkouts
+can build the shared library with "Library discovery" below. From the
+`antfly` monorepo source tree, build it
 with `cd zig && zig build lite` (produces `zig/zig-out/lib/libantfly.*`);
 this package does not build it for you.
 

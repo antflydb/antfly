@@ -33,3 +33,9 @@ against the archives before registry promotion. Go and Rust consumers link the
 same C ABI from a release archive or local build. A separate Lite or inference
 convenience package should be introduced only when it offers a distinct API or
 distribution benefit; the current combined bindings cover both use cases.
+
+Installing an embedded binding does not register `antfly-lite` or
+`antfly-inference` as a command. Platform packages keep `antfly-inference` only
+as a private executable next to `libantfly`, where the runtime can find it for
+isolated worker calls. Direct C API inference runs in-process. The Apache Lite
+archive remains the distribution for the `antfly-lite` command-line tool.
