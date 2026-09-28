@@ -16,6 +16,7 @@ const data_raft_protocol = @import("../common/data_raft_protocol.zig");
 const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 
 pub const raft_batch_protocol_version = data_raft_protocol.batch_protocol_version;
+pub const raft_batch_artifact_catalog_protocol_version = data_raft_protocol.batch_artifact_catalog_protocol_version;
 pub const raft_batch_timestamp_protocol_version = data_raft_protocol.batch_timestamp_protocol_version;
 pub const raft_batch_activation_barrier_protocol_version = data_raft_protocol.batch_activation_barrier_protocol_version;
 pub const raft_batch_merge_transition_protocol_version = data_raft_protocol.batch_merge_transition_protocol_version;

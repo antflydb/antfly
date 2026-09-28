@@ -646,6 +646,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/sql/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Open a durable idle HTTP SQL connection
+         * @description Creates a principal- and API-node-owned connection with a one-hour idle-use deadline. Active or uncertain transactions retain their exact connection binding until completion or reconciliation; expiry is not an abort decision. Send connection_id with later SQL and prepared requests. This ID is not a transaction session_id. DISCARD ALL resets only this connection's setting overlay and prepared resources, and refuses active or uncertain transactions. Do not automatically replay ambiguous create responses.
+         */
+        post: operations["openSQLConnection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/connections/{connection_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Close an idle SQL connection and its prepared resources
+         * @description Refuses an active, beginning or uncertain transaction; route to owner_node_id.
+         */
+        delete: operations["closeSQLConnection"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/sql/prepared": {
         parameters: {
             query?: never;
@@ -721,6 +763,46 @@ export interface paths {
          * @description Cluster-administrator-only, revision-fenced publication of typed setting definitions and global, database, and credential-role defaults. SQL SET cannot change policy-sensitive settings. Observe an ambiguous mutation before retrying.
          */
         post: operations["administerSqlSettings"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/store-roots/enroll": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve a physical store-root signing identity
+         * @description Cluster-administrator-only approval of a locally signed proof bound to the metadata cluster, node, store and physical root. Ordinary node registration does not grant retirement authority. The request is not automatically retried; observe the enrollment after an ambiguous 503.
+         */
+        post: operations["enrollStoreRoot"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/store-roots/enrollment-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check one exact physical store-root enrollment
+         * @description Read-only, linearizable cluster-administrator check for the exact identity in a signed proof. Use after an ambiguous enroll response; this operation never submits another enrollment mutation.
+         */
+        post: operations["getStoreRootEnrollmentStatus"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4290,6 +4372,8 @@ export interface components {
             namespace?: string;
             /** @description Optional durable SQL session. Preparation binds its authenticated scope and current setting catalog under the session lease; execution must supply the same session. */
             session_id?: string;
+            /** @description Optional idle HTTP SQL connection. Preparation binds to its current DISCARD generation; a transaction-bound preparation remains bound to session_id instead. */
+            connection_id?: string;
         };
         SQLPreparedExecutionRequest: {
             parameters?: unknown[];
@@ -4297,6 +4381,26 @@ export interface components {
             limit?: number;
             /** @description Optional durable transaction session. Required when the resource was prepared against a session; otherwise independent of the prepared resource lifetime. */
             session_id?: string;
+            /** @description Required for a connection-bound resource; DISCARD ALL closes it without affecting other clients' resources. */
+            connection_id?: string;
+        };
+        SQLConnectionOpenRequest: {
+            /** @default default */
+            database?: string;
+            /** @default public */
+            namespace?: string;
+        };
+        SQLConnectionResponse: {
+            connection_id: string;
+            /** @description The owning API node. Zero denotes a standalone-local endpoint; send subsequent connection requests to that same endpoint. Otherwise route requests to the returned owning node. */
+            owner_node_id: string;
+            /**
+             * Format: int64
+             * @description Idle-use deadline in Unix milliseconds. An attached active or uncertain transaction remains accessible for completion and reconciliation after this deadline; expiry never implies abort.
+             */
+            expires_at_ms: number;
+            database: string;
+            namespace: string;
         };
         SQLPreparedResponse: {
             prepared_id: string;
@@ -4343,6 +4447,22 @@ export interface components {
         };
         /** @description Put a complete definition/default set or drop one by name. */
         SqlSettingMutationRequest: components["schemas"]["SqlSettingMutationPut"] | components["schemas"]["SqlSettingMutationDrop"];
+        StoreRootEnrollmentIdentity: {
+            metadata_incarnation: string;
+            /** Format: int64 */
+            node_id: number;
+            /** Format: int64 */
+            store_id: number;
+            /** @description Decimal u128 string; never pass through a floating-point JSON number. */
+            root_incarnation: string;
+            /** @description Ed25519 public key in lowercase hex. */
+            public_key: string;
+        };
+        StoreRootEnrollmentRequest: {
+            identity: components["schemas"]["StoreRootEnrollmentIdentity"];
+            /** @description Ed25519 proof-of-possession signature in lowercase hex. */
+            signature: string;
+        };
         /**
          * @description Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...),
          *     never interpolated into SQL text. To preserve integer precision in
@@ -4369,6 +4489,8 @@ export interface components {
             limit?: number;
             /** @description Opaque SQL session identifier returned by a previous response. */
             session_id?: string;
+            /** @description Durable idle HTTP connection. Its scope and settings are inherited; active transaction IDs cannot be bypassed by omitting session_id. DISCARD ALL requires this identity and is rejected while a transaction is active or uncertain. */
+            connection_id?: string;
         };
         /**
          * @description Authoritative native SQL session state after the statement. Failed sessions require ROLLBACK or ROLLBACK TO SAVEPOINT; uncertain commit outcomes must be reconciled by transaction_id, never replayed.
@@ -8135,6 +8257,11 @@ export interface components {
             lease_expires_at: number;
             lease_state: string;
             sync_level: string;
+            /**
+             * @description Durable read-only transaction outcome. outcome_unknown is not permission to replay a mutation with another ID.
+             * @enum {string}
+             */
+            disposition: "active" | "outcome_unknown" | "committed" | "committed_pending" | "committed_repair_required" | "aborted";
             staged_table_count: number;
             staged_read_count: number;
             staged_write_count: number;
@@ -21516,6 +21643,70 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    openSQLConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["SQLConnectionOpenRequest"];
+            };
+        };
+        responses: {
+            /** @description Opened connection and routing owner */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLConnectionResponse"];
+                };
+            };
+            /** @description Connection admission failed */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    closeSQLConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Closed connection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Connection close rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
     prepareSQL: {
         parameters: {
             query?: never;
@@ -21587,7 +21778,10 @@ export interface operations {
     closePreparedSQL: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required to close a connection-bound prepared resource. */
+                "X-Antfly-SQL-Connection-Id"?: string;
+            };
             path: {
                 prepared_id: string;
             };
@@ -21675,6 +21869,131 @@ export interface operations {
                 content?: never;
             };
             /** @description Mutation outcome unknown or metadata unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    enrollStoreRoot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StoreRootEnrollmentRequest"];
+            };
+        };
+        responses: {
+            /** @description Enrollment committed and observed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoreRootEnrollmentIdentity"];
+                };
+            };
+            /** @description Invalid identity or proof of possession */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Cluster administrator permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Root registration or enrollment changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata peer upgrade required */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Outcome unknown or metadata unavailable; observe before retrying */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getStoreRootEnrollmentStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StoreRootEnrollmentIdentity"];
+            };
+        };
+        responses: {
+            /** @description Exact enrollment observed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoreRootEnrollmentIdentity"];
+                };
+            };
+            /** @description Invalid identity */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Cluster administrator permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Exact identity is not enrolled, or store-root registration changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata unavailable; retry the read later */
             503: {
                 headers: {
                     [name: string]: unknown;

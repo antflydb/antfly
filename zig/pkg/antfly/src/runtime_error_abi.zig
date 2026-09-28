@@ -23,6 +23,16 @@ const std = @import("std");
 
 pub const abi_version: u32 = 1;
 
+test "FK publication progress and corrupt retirement proofs retain distinct boundary semantics" {
+    const pending = statusFromError(error.GenerationAdmissionAcknowledgementPending);
+    const changed = statusFromError(error.GenerationRetirementChanged);
+    const corrupted = statusFromError(error.InvalidRetirementSummary);
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), pending.code);
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), changed.code);
+    try std.testing.expectEqual(@intFromEnum(Code.corrupt), corrupted.code);
+    try std.testing.expect(pending.detail != changed.detail and changed.detail != corrupted.detail);
+}
+
 pub const Code = enum(c_int) {
     ok = 0,
     out_of_memory,
@@ -638,6 +648,54 @@ pub const Detail = enum(c_int) {
     // unprotected table into RuntimeBoundaryFailure.
     row_policy_catalog_changed,
     online_merge_artifact_catalog_uncoordinated,
+    artifact_catalog_drift,
+    invalid_artifact_catalog_command,
+    artifact_catalog_epoch_changed,
+    artifact_catalog_scope_changed,
+    online_merge_artifact_catalog_changed,
+    store_root_enrollment_changed,
+    invalid_store_root_enrollment,
+    initial_child_root_receipt_changed,
+    invalid_initial_fk_retirement_signature,
+    initial_fk_retirement_signing_key_unavailable,
+    initial_fk_retirement_reporter_changed,
+    initial_fk_retirement_work_changed,
+    initial_fk_retirement_publication_changed,
+    initial_fk_retirement_reservation_changed,
+    invalid_initial_fk_retirement_ack,
+    invalid_initial_fk_retirement_page,
+    initial_fk_retirement_root_changed,
+    replica_retirement_recovery_in_progress,
+    membership_change_fenced,
+    initial_child_publication_changed,
+    invalid_initial_child_publication,
+    initial_fk_retirement_proof_unavailable,
+    invalid_initial_fk_retirement_ticket,
+    invalid_initial_fk_retirement_intent,
+    initial_fk_retirement_path_changed,
+    artifact_catalog_corrupt,
+    artifact_catalog_epoch_exhausted,
+    online_merge_artifact_tails_unsupported,
+    setting_authority_unavailable,
+    invalid_generation_publication,
+    invalid_retirement_summary,
+    generation_admission_acknowledgement_pending,
+    generation_admission_changed,
+    generation_admission_pending,
+    generation_admission_revision_exhausted,
+    invalid_generation_admission,
+    generation_admission_activation_required,
+    generation_retirement_acknowledgement_pending,
+    generation_retirement_changed,
+    generation_retirement_handoff_required,
+    generation_retirement_pending,
+    generation_retirement_revision_exhausted,
+    invalid_generation_retirement,
+    initial_child_publication_missing,
+    initial_child_not_published,
+    invalid_control_receipt_position,
+    invalid_graph_transfer,
+    graph_generation_mismatch,
 };
 
 pub const Status = extern struct {
@@ -655,6 +713,54 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.SettingAuthorityUnavailable => status(.unavailable, .setting_authority_unavailable),
+        error.InvalidGenerationPublication => status(.invalid_argument, .invalid_generation_publication),
+        error.InvalidRetirementSummary => status(.corrupt, .invalid_retirement_summary),
+        error.InvalidControlReceiptPosition => status(.corrupt, .invalid_control_receipt_position),
+        error.InvalidGraphTransfer => status(.invalid_argument, .invalid_graph_transfer),
+        error.GraphGenerationMismatch => status(.conflict, .graph_generation_mismatch),
+        error.GenerationAdmissionAcknowledgementPending => status(.retryable, .generation_admission_acknowledgement_pending),
+        error.GenerationAdmissionChanged => status(.conflict, .generation_admission_changed),
+        error.GenerationAdmissionPending => status(.retryable, .generation_admission_pending),
+        error.GenerationAdmissionRevisionExhausted => status(.conflict, .generation_admission_revision_exhausted),
+        error.InvalidGenerationAdmission => status(.invalid_argument, .invalid_generation_admission),
+        error.GenerationAdmissionActivationRequired => status(.conflict, .generation_admission_activation_required),
+        error.GenerationRetirementAcknowledgementPending => status(.retryable, .generation_retirement_acknowledgement_pending),
+        error.GenerationRetirementChanged => status(.conflict, .generation_retirement_changed),
+        error.GenerationRetirementHandoffRequired => status(.conflict, .generation_retirement_handoff_required),
+        error.GenerationRetirementPending => status(.retryable, .generation_retirement_pending),
+        error.GenerationRetirementRevisionExhausted => status(.conflict, .generation_retirement_revision_exhausted),
+        error.InvalidGenerationRetirement => status(.invalid_argument, .invalid_generation_retirement),
+        error.InitialChildPublicationMissing => status(.not_found, .initial_child_publication_missing),
+        error.InitialChildNotPublished => status(.retryable, .initial_child_not_published),
+        error.InitialChildPublicationChanged => status(.conflict, .initial_child_publication_changed),
+        error.InvalidInitialChildPublication => status(.invalid_argument, .invalid_initial_child_publication),
+        error.InitialFkRetirementProofUnavailable => status(.unavailable, .initial_fk_retirement_proof_unavailable),
+        error.InvalidInitialFkRetirementTicket => status(.invalid_argument, .invalid_initial_fk_retirement_ticket),
+        error.InvalidInitialFkRetirementIntent => status(.corrupt, .invalid_initial_fk_retirement_intent),
+        error.InitialFkRetirementPathChanged => status(.conflict, .initial_fk_retirement_path_changed),
+        error.ArtifactCatalogCorrupt => status(.corrupt, .artifact_catalog_corrupt),
+        error.ArtifactCatalogEpochExhausted => status(.internal, .artifact_catalog_epoch_exhausted),
+        error.OnlineMergeArtifactTailsUnsupported => status(.unsupported, .online_merge_artifact_tails_unsupported),
+        error.ArtifactCatalogDrift => status(.retryable, .artifact_catalog_drift),
+        error.InvalidArtifactCatalogCommand => status(.invalid_argument, .invalid_artifact_catalog_command),
+        error.ArtifactCatalogEpochChanged => status(.conflict, .artifact_catalog_epoch_changed),
+        error.ArtifactCatalogScopeChanged => status(.conflict, .artifact_catalog_scope_changed),
+        error.OnlineMergeArtifactCatalogChanged => status(.conflict, .online_merge_artifact_catalog_changed),
+        error.StoreRootEnrollmentChanged => status(.forbidden, .store_root_enrollment_changed),
+        error.InvalidStoreRootEnrollment => status(.invalid_argument, .invalid_store_root_enrollment),
+        error.InitialChildRootReceiptChanged => status(.conflict, .initial_child_root_receipt_changed),
+        error.InvalidInitialFkRetirementSignature => status(.forbidden, .invalid_initial_fk_retirement_signature),
+        error.InitialFkRetirementSigningKeyUnavailable => status(.unavailable, .initial_fk_retirement_signing_key_unavailable),
+        error.InitialFkRetirementReporterChanged => status(.conflict, .initial_fk_retirement_reporter_changed),
+        error.InitialFkRetirementWorkChanged => status(.conflict, .initial_fk_retirement_work_changed),
+        error.InitialFkRetirementPublicationChanged => status(.conflict, .initial_fk_retirement_publication_changed),
+        error.InitialFkRetirementReservationChanged => status(.conflict, .initial_fk_retirement_reservation_changed),
+        error.InvalidInitialFkRetirementAck => status(.invalid_argument, .invalid_initial_fk_retirement_ack),
+        error.InvalidInitialFkRetirementPage => status(.invalid_argument, .invalid_initial_fk_retirement_page),
+        error.InitialFkRetirementRootChanged => status(.conflict, .initial_fk_retirement_root_changed),
+        error.ReplicaRetirementRecoveryInProgress => status(.retryable, .replica_retirement_recovery_in_progress),
+        error.MembershipChangeFenced => status(.conflict, .membership_change_fenced),
         error.SqlRangeTrackingRequired => status(.unsupported, .sql_range_tracking_required),
         error.SqlStatementSnapshotRequired => status(.unsupported, .sql_statement_snapshot_required),
         error.InvalidRangeTrackingState => status(.corrupt, .invalid_range_tracking_state),
@@ -1279,6 +1385,54 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .initial_child_publication_changed => "InitialChildPublicationChanged",
+        .invalid_initial_child_publication => "InvalidInitialChildPublication",
+        .initial_fk_retirement_proof_unavailable => "InitialFkRetirementProofUnavailable",
+        .invalid_initial_fk_retirement_ticket => "InvalidInitialFkRetirementTicket",
+        .invalid_initial_fk_retirement_intent => "InvalidInitialFkRetirementIntent",
+        .initial_fk_retirement_path_changed => "InitialFkRetirementPathChanged",
+        .artifact_catalog_corrupt => "ArtifactCatalogCorrupt",
+        .artifact_catalog_epoch_exhausted => "ArtifactCatalogEpochExhausted",
+        .online_merge_artifact_tails_unsupported => "OnlineMergeArtifactTailsUnsupported",
+        .setting_authority_unavailable => "SettingAuthorityUnavailable",
+        .invalid_generation_publication => "InvalidGenerationPublication",
+        .invalid_retirement_summary => "InvalidRetirementSummary",
+        .invalid_control_receipt_position => "InvalidControlReceiptPosition",
+        .invalid_graph_transfer => "InvalidGraphTransfer",
+        .graph_generation_mismatch => "GraphGenerationMismatch",
+        .generation_admission_acknowledgement_pending => "GenerationAdmissionAcknowledgementPending",
+        .generation_admission_changed => "GenerationAdmissionChanged",
+        .generation_admission_pending => "GenerationAdmissionPending",
+        .generation_admission_revision_exhausted => "GenerationAdmissionRevisionExhausted",
+        .invalid_generation_admission => "InvalidGenerationAdmission",
+        .generation_admission_activation_required => "GenerationAdmissionActivationRequired",
+        .generation_retirement_acknowledgement_pending => "GenerationRetirementAcknowledgementPending",
+        .generation_retirement_changed => "GenerationRetirementChanged",
+        .generation_retirement_handoff_required => "GenerationRetirementHandoffRequired",
+        .generation_retirement_pending => "GenerationRetirementPending",
+        .generation_retirement_revision_exhausted => "GenerationRetirementRevisionExhausted",
+        .invalid_generation_retirement => "InvalidGenerationRetirement",
+        .initial_child_publication_missing => "InitialChildPublicationMissing",
+        .initial_child_not_published => "InitialChildNotPublished",
+        .artifact_catalog_drift => "ArtifactCatalogDrift",
+        .invalid_artifact_catalog_command => "InvalidArtifactCatalogCommand",
+        .artifact_catalog_epoch_changed => "ArtifactCatalogEpochChanged",
+        .artifact_catalog_scope_changed => "ArtifactCatalogScopeChanged",
+        .online_merge_artifact_catalog_changed => "OnlineMergeArtifactCatalogChanged",
+        .store_root_enrollment_changed => "StoreRootEnrollmentChanged",
+        .invalid_store_root_enrollment => "InvalidStoreRootEnrollment",
+        .initial_child_root_receipt_changed => "InitialChildRootReceiptChanged",
+        .invalid_initial_fk_retirement_signature => "InvalidInitialFkRetirementSignature",
+        .initial_fk_retirement_signing_key_unavailable => "InitialFkRetirementSigningKeyUnavailable",
+        .initial_fk_retirement_reporter_changed => "InitialFkRetirementReporterChanged",
+        .initial_fk_retirement_work_changed => "InitialFkRetirementWorkChanged",
+        .initial_fk_retirement_publication_changed => "InitialFkRetirementPublicationChanged",
+        .initial_fk_retirement_reservation_changed => "InitialFkRetirementReservationChanged",
+        .invalid_initial_fk_retirement_ack => "InvalidInitialFkRetirementAck",
+        .invalid_initial_fk_retirement_page => "InvalidInitialFkRetirementPage",
+        .initial_fk_retirement_root_changed => "InitialFkRetirementRootChanged",
+        .replica_retirement_recovery_in_progress => "ReplicaRetirementRecoveryInProgress",
+        .membership_change_fenced => "MembershipChangeFenced",
         .sql_range_tracking_required => "SqlRangeTrackingRequired",
         .sql_statement_snapshot_required => "SqlStatementSnapshotRequired",
         .invalid_range_tracking_state => "InvalidRangeTrackingState",
@@ -2027,6 +2181,9 @@ test "generation capacity retains retryability across the runtime boundary" {
 }
 
 test "system catalog errors retain their stable runtime boundary classification" {
+    const unavailable = statusFromError(error.SettingAuthorityUnavailable);
+    try std.testing.expectEqual(@intFromEnum(Code.unavailable), unavailable.code);
+    try std.testing.expectEqual(error.SettingAuthorityUnavailable, errorFromStatus(unavailable));
     const errors = [_]anyerror{ error.TableTopologyProtocolUpgradeRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
     for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
 }

@@ -10,6 +10,24 @@ const integrity = @import("relational_integrity_contract.zig");
 
 pub const key = "\x00\x00__metadata__:relational_integrity_generation_retirement";
 pub const active_prefix = "\x00\x00__metadata__:relational_integrity_retired_generation:";
+const set_summary = @import("retirement_set_summary.zig");
+
+/// A missing summary is valid only for a brand-new empty set. This feature
+/// has no legacy scan fallback: unexplained tombstones must fail closed.
+pub fn authenticatedSummary(txn: anytype) !set_summary.Summary {
+    if (try set_summary.read(txn)) |value| return value;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    if (try cursor.seekAtOrAfter(active_prefix)) |entry| {
+        if (std.mem.startsWith(u8, entry.key, active_prefix)) return error.InvalidGenerationRetirement;
+    }
+    return set_summary.emptySummary();
+}
+
+fn stageSummaryAdd(txn: anytype, generation: integrity.Generation, value: []const u8) !void {
+    _ = try authenticatedSummary(txn);
+    try set_summary.add(txn, generation, value);
+}
 pub const gc_progress_key = "\x00\x00__metadata__:relational_integrity_retired_generation_gc";
 pub const activation_receipt_key = "\x00\x00__metadata__:relational_integrity_generation_activation_receipt";
 pub const completed_pending_key = "\x00\x00__metadata__:relational_integrity_generation_completed_pending";
@@ -465,7 +483,10 @@ pub fn stageVerifiedActivation(alloc: std.mem.Allocator, txn: anytype, fence: to
         if (try optionalKey(txn, &physical_key)) |previous| {
             _ = try Active.decode(previous, entry[8..24].*);
             if (!std.mem.eql(u8, previous, next)) return error.GenerationRetirementChanged;
-        } else try txn.put(&physical_key, next);
+        } else {
+            try stageSummaryAdd(txn, entry[8..24].*, next);
+            try txn.put(&physical_key, next);
+        }
     }
     const prior = if (try optionalKey(txn, gc_progress_key)) |bytes| try GcProgress.decode(bytes) else null;
     const progress: GcProgress = .{ .revision = if (prior) |old| std.math.add(u64, old.revision, 1) catch return error.GenerationRetirementRevisionExhausted else 1 };
@@ -510,6 +531,7 @@ pub fn stageChildGenerationRetirements(alloc: std.mem.Allocator, txn: anytype, f
             const active = try Active.decode(previous, generation);
             if (!active.samePublication(try Active.decode(value, generation))) return error.GenerationRetirementChanged;
         } else {
+            try stageSummaryAdd(txn, generation, value);
             try txn.put(&physical_key, value);
             added = true;
         }
@@ -540,6 +562,7 @@ pub fn stageTransferredActive(alloc: std.mem.Allocator, txn: anytype, physical_k
     const progress: GcProgress = .{ .revision = if (prior) |old| std.math.add(u64, old.revision, 1) catch return error.GenerationRetirementRevisionExhausted else 1 };
     const encoded = try progress.encode(alloc);
     defer alloc.free(encoded);
+    try stageSummaryAdd(txn, generation, value);
     try txn.put(physical_key, value);
     try txn.put(gc_progress_key, encoded);
 }
@@ -560,6 +583,10 @@ pub fn isRetired(txn: anytype, reference: integrity.Reference) !bool {
 }
 
 pub const GcRecord = struct { key: []const u8, value: []const u8 };
+fn gcRecordBudgetBytes(tombstones: bool, key_len: usize, value_len: usize) !usize {
+    const raw = std.math.add(usize, key_len, value_len) catch return error.InvalidIntegrityBudget;
+    return std.math.add(usize, raw, if (tombstones) set_summary.max_mutation_bytes else 0) catch error.InvalidIntegrityBudget;
+}
 pub const GcCommand = struct {
     owner_group_id: u64,
     namespace: @import("doc_identity.zig").Namespace,
@@ -583,7 +610,7 @@ pub const GcCommand = struct {
         var bytes: usize = 0;
         var previous = before.cursor;
         for (self.deletions) |record| {
-            bytes = std.math.add(usize, bytes, record.key.len +| record.value.len) catch return error.InvalidIntegrityBudget;
+            bytes = std.math.add(usize, bytes, try gcRecordBudgetBytes(before.tombstones, record.key.len, record.value.len)) catch return error.InvalidIntegrityBudget;
             if (bytes > 16 * 1024 * 1024 or std.mem.order(u8, record.key, previous) != .gt or
                 (after.tombstones == before.tombstones and !after.complete and std.mem.order(u8, record.key, after.cursor) == .gt)) return error.InvalidGenerationRetirement;
             if (before.tombstones) {
@@ -666,7 +693,7 @@ pub fn prepareGcPage(alloc: std.mem.Allocator, txn: anytype, max_records: usize,
     var complete = true;
     while (item) |entry| : (item = try cursor.next()) {
         if (!std.mem.startsWith(u8, entry.key, scan_prefix)) break;
-        const size = std.math.add(usize, entry.key.len, entry.value.len) catch return error.IntegrityRecordTooLarge;
+        const size = try gcRecordBudgetBytes(progress.tombstones, entry.key.len, entry.value.len);
         if (inspected == max_records or size > max_bytes - bytes) {
             if (inspected == 0) return error.IntegrityRecordTooLarge;
             complete = false;
@@ -729,7 +756,7 @@ pub fn applyGcPage(txn: anytype, page: anytype) !void {
         if (!std.mem.startsWith(u8, entry.key, scan_prefix) or
             (!switched and after.cursor.len != 0 and std.mem.order(u8, entry.key, after.cursor) == .gt)) break;
         observed += 1;
-        observed_bytes = std.math.add(usize, observed_bytes, entry.key.len + entry.value.len) catch return error.IntegrityRecordTooLarge;
+        observed_bytes = std.math.add(usize, observed_bytes, try gcRecordBudgetBytes(before.tombstones, entry.key.len, entry.value.len)) catch return error.IntegrityRecordTooLarge;
         if (observed > 4096 or observed_bytes > 16 * 1024 * 1024) return error.InvalidIntegrityBudget;
         const retired = if (before.tombstones)
             try tombstoneRetirable(txn, entry.key, entry.value)
@@ -757,6 +784,7 @@ pub fn applyGcPage(txn: anytype, page: anytype) !void {
         if (!retired) return error.GenerationRetirementChanged;
         const present = (try optionalKey(txn, record.key)) orelse return error.GenerationRetirementChanged;
         if (!std.mem.eql(u8, present, record.value)) return error.GenerationRetirementChanged;
+        if (before.tombstones) try set_summary.remove(txn, record.key[active_prefix.len..][0..16].*, record.value);
         try txn.delete(record.key);
         previous = record.key;
     }

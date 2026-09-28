@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 69;
+pub const abi_version: u32 = 70;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -517,6 +517,8 @@ pub const MetadataProjectionKind = enum(u32) {
     backup_cohort = 63,
     /// Abort-only validation of a proposed initial-FK Raft command.
     fk_initial_create_preflight = 64,
+    /// Exact immutable hidden-owner reservation; absent is an ordinary group.
+    fk_initial_group_reservation = 65,
     backup_cohort_progress = 43,
     backup_cohorts = 44,
     restore_staging_job = 45,
@@ -717,6 +719,7 @@ pub const DataApplyProjectionKind = enum(u32) {
     current_merge_receiver = 6,
     group_state_keys_page = 7,
     topology_rejection = 8,
+    merge_membership = 9,
 };
 
 /// One bounded projection read. Fields unused by `kind` must remain zero.
@@ -980,6 +983,10 @@ pub const CoordinatedTtlRequest = extern struct {
 pub const CoordinatedTtlEnqueueFn = *const fn (?*anyopaque, *const CoordinatedTtlRequest) callconv(.c) u8;
 
 pub const RuntimeHooksConfig = extern struct {
+    artifact_publication_ctx: ?*anyopaque = null,
+    /// Zero means queue admission only. Native producers must observe their
+    /// durable receipt before reporting output or coverage as complete.
+    artifact_publication_enqueue_fn: ?*const fn (?*anyopaque, u64, *const [24]u8, BorrowedBytes) callconv(.c) Status = null,
     native_authority_ctx: ?*const anyopaque = null,
     native_authority_fn: ?NativeAuthorityFn = null,
     resolution_candidates: ResolutionCandidateConfig = .{},
@@ -1106,6 +1113,19 @@ pub const NativeInitialChildControlRequest = extern struct {
     operation_index: u64 = 0,
 };
 
+pub const NativeFkGenerationControlRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+};
+
+pub extern fn antfly_storage_owner_native_fk_generation_control_json(
+    owner: ?*anyopaque,
+    request: *const NativeFkGenerationControlRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
 /// Complete offline HA-seed operations that must remain beside physical DB
 /// restore/validation code. Values are append-only because they are recorded
 /// in `FailureIdentity.operation` for cross-unit diagnostics.
@@ -1118,7 +1138,7 @@ pub const HASeedOperation = enum(u32) {
 /// Private owner discovery is physical metadata, not public catalog routing.
 pub const HiddenRestoreRequest = extern struct {
     version: u32 = abi_version,
-    operation: enum(u32) { read_bootstrap = 0, capture_snapshot = 1, capture_public_snapshot = 2, read_initial_child = 3 },
+    operation: enum(u32) { read_bootstrap = 0, capture_snapshot = 1, capture_public_snapshot = 2, read_initial_child = 3, cancel_initial_child_retirement = 4 },
     context: ?*anyopaque = null,
     path: BorrowedBytes = .{},
     table_name: BorrowedBytes = .{},

@@ -72,9 +72,13 @@ fn admittedScopeCount(txn: anytype) !usize {
 }
 
 pub fn stageInstall(alloc: std.mem.Allocator, txn: anytype, command: Install, plan_id: [16]u8, term: u64, index: u64) !@import("restore_staging_contract.zig").GenerationAdmissionReceipt {
+    return stageInstallPosition(alloc, txn, command, plan_id, .{ .raft = .{ .term = term, .index = index } });
+}
+
+pub fn stageInstallPosition(alloc: std.mem.Allocator, txn: anytype, command: Install, plan_id: [16]u8, stamp: @import("receipt_position.zig").Position) !@import("restore_staging_contract.zig").GenerationAdmissionReceipt {
+    try stamp.validate();
     const contract = @import("restore_staging_contract.zig");
     const logical = try installReceiptDigest(command);
-    if (term == 0 or index == 0) return error.InvalidGenerationHandoff;
     var target_keys: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer target_keys.deinit(alloc);
     for (command.mappings) |mapping| {
@@ -121,8 +125,9 @@ pub fn stageInstall(alloc: std.mem.Allocator, txn: anytype, command: Install, pl
         .scope = command.scope,
         .source_summary_digest = command.source_summary_digest,
         .logical_digest = logical,
-        .applied_term = term,
-        .applied_index = index,
+        .applied_term = stamp.term(),
+        .applied_index = stamp.index(),
+        .native_position = stamp.nativePosition(),
     };
     const encoded = try receipt.encode();
     try txn.put(install_receipt_key, &encoded);
@@ -139,6 +144,13 @@ pub const SealRecord = struct {
     seal: topology.GenerationHandoffSeal,
     term: u64,
     index: u64,
+    native_position: ?@import("receipt_position.zig").Native = null,
+
+    pub fn position(self: SealRecord) !@import("receipt_position.zig").Position {
+        const result = try @import("receipt_position.zig").fromFields(self.term, self.index, self.native_position);
+        try result.requireNamespace(self.fence.namespace);
+        return result;
+    }
 };
 
 fn optional(txn: anytype, key: []const u8) !?[]const u8 {
@@ -188,31 +200,31 @@ pub fn stageBegin(txn: anytype, fence: topology.Fence, intent: topology.Generati
     try txn.delete(seal_key);
 }
 
-fn encodeSeal(record: SealRecord) ![292]u8 {
-    if (record.fence.role != .rewrite_source or record.term == 0 or record.index == 0 or
+fn encodeSeal(record: SealRecord) ![309]u8 {
+    if (record.fence.role != .rewrite_source or
         std.mem.allEqual(u8, &record.seal.plan_digest, 0) or
         std.mem.allEqual(u8, &record.seal.admissions_digest, 0) or
         std.mem.allEqual(u8, &record.seal.retired_digest, 0)) return error.InvalidGenerationHandoff;
-    var bytes: [292]u8 = @splat(0);
-    @memcpy(bytes[0..4], "EGS1");
+    var bytes: [309]u8 = @splat(0);
+    @memcpy(bytes[0..4], "EGS2");
     const fence_bytes = try record.fence.encode();
     @memcpy(bytes[4..140], &fence_bytes);
     @memcpy(bytes[140..172], &record.seal.plan_digest);
     @memcpy(bytes[172..204], &record.seal.admissions_digest);
     @memcpy(bytes[204..236], &record.seal.retired_digest);
     std.mem.writeInt(u64, bytes[236..244], record.seal.retired_count, .little);
-    std.mem.writeInt(u64, bytes[244..252], record.term, .little);
-    std.mem.writeInt(u64, bytes[252..260], record.index, .little);
-    std.crypto.hash.Blake3.hash(bytes[0..260], bytes[260..292], .{});
+    @memcpy(bytes[244..277], &try (try record.position()).encode());
+    std.crypto.hash.Blake3.hash(bytes[0..277], bytes[277..309], .{});
     return bytes;
 }
 
 pub fn loadSeal(txn: anytype) !?SealRecord {
     const bytes = (try optional(txn, seal_key)) orelse return null;
-    if (bytes.len != 292 or !std.mem.eql(u8, bytes[0..4], "EGS1")) return error.InvalidGenerationHandoff;
+    if (bytes.len != 309 or !std.mem.eql(u8, bytes[0..4], "EGS2")) return error.InvalidGenerationHandoff;
     var checksum: [32]u8 = undefined;
-    std.crypto.hash.Blake3.hash(bytes[0..260], &checksum, .{});
-    if (!std.mem.eql(u8, &checksum, bytes[260..292])) return error.InvalidGenerationHandoff;
+    std.crypto.hash.Blake3.hash(bytes[0..277], &checksum, .{});
+    if (!std.mem.eql(u8, &checksum, bytes[277..309])) return error.InvalidGenerationHandoff;
+    const stamp = try @import("receipt_position.zig").Position.decode(bytes[244..277]);
     const record: SealRecord = .{
         .fence = try topology.Fence.decode(bytes[4..140]),
         .seal = .{
@@ -221,19 +233,25 @@ pub fn loadSeal(txn: anytype) !?SealRecord {
             .retired_digest = bytes[204..236].*,
             .retired_count = std.mem.readInt(u64, bytes[236..244], .little),
         },
-        .term = std.mem.readInt(u64, bytes[244..252], .little),
-        .index = std.mem.readInt(u64, bytes[252..260], .little),
+        .term = stamp.term(),
+        .index = stamp.index(),
+        .native_position = stamp.nativePosition(),
     };
     _ = try encodeSeal(record);
     return record;
 }
 
 pub fn stageSeal(txn: anytype, fence: topology.Fence, seal: topology.GenerationHandoffSeal, term: u64, index: u64) !void {
+    return stageSealPosition(txn, fence, seal, .{ .raft = .{ .term = term, .index = index } });
+}
+
+pub fn stageSealPosition(txn: anytype, fence: topology.Fence, seal: topology.GenerationHandoffSeal, stamp: @import("receipt_position.zig").Position) !void {
+    try stamp.requireNamespace(fence.namespace);
     const current = (try @import("relational_integrity_topology.zig").current(txn)) orelse return error.IntegrityTopologyFenceMissing;
     if (!current.eql(fence)) return error.IntegrityTopologyChanged;
     const intent = (try loadIntent(txn)) orelse return error.GenerationHandoffIntentMissing;
     if (!intent.fence.eql(fence) or !std.mem.eql(u8, &intent.intent.plan_digest, &seal.plan_digest)) return error.IntegrityTopologyChanged;
-    const record: SealRecord = .{ .fence = fence, .seal = seal, .term = term, .index = index };
+    const record: SealRecord = .{ .fence = fence, .seal = seal, .term = stamp.term(), .index = stamp.index(), .native_position = stamp.nativePosition() };
     if (try loadSeal(txn)) |existing| {
         if (!existing.fence.eql(fence) or !std.meta.eql(existing.seal, seal)) return error.IntegrityTopologyChanged;
         return;
@@ -304,8 +322,25 @@ pub fn sealStatus(txn: anytype, namespace: @import("doc_identity_namespace.zig")
 
 /// Called on the linearizable owner read path, after the fence has closed
 /// admission. The bounded live-scope projection is sorted logically; the
-/// tombstone digest streams physical records in key order without allocation.
+/// historical tombstone attestation comes from one transactional summary read.
+pub const ScanControl = struct {
+    ptr: *anyopaque,
+    check_fn: *const fn (*anyopaque) anyerror!void,
+
+    fn check(self: @This()) !void {
+        try self.check_fn(self.ptr);
+    }
+};
+
 pub fn summaryAlloc(alloc: std.mem.Allocator, txn: anytype, namespace: @import("doc_identity_namespace.zig").Namespace) !Summary {
+    return summaryAllocControlled(alloc, txn, namespace, null);
+}
+
+/// The result attests one coherent read snapshot or fails as a whole. Never
+/// publish a partial digest when cancellation/deadline interrupts live scope
+/// discovery: retries must obtain a fresh complete snapshot.
+pub fn summaryAllocControlled(alloc: std.mem.Allocator, txn: anytype, namespace: @import("doc_identity_namespace.zig").Namespace, control: ?ScanControl) !Summary {
+    if (control) |value| try value.check();
     const persisted = try loadIntent(txn);
     const fence = try @import("relational_integrity_topology.zig").current(txn);
     if (fence) |active_fence| {
@@ -325,6 +360,7 @@ pub fn summaryAlloc(alloc: std.mem.Allocator, txn: anytype, namespace: @import("
     var item = try cursor.seekAtOrAfter(admission.prefix);
     while (item) |record| : (item = try cursor.next()) {
         if (!std.mem.startsWith(u8, record.key, admission.prefix)) break;
+        if (control) |value| try value.check();
         if (entries.items.len >= portable.max_source_generation_admissions or record.key.len != admission.prefix.len + 32)
             return error.InvalidGenerationAdmission;
         const scope = try admission.Scope.decode(record.value);
@@ -361,30 +397,23 @@ pub fn summaryAlloc(alloc: std.mem.Allocator, txn: anytype, namespace: @import("
     }.less);
     const admissions_digest = try portable.sourceGenerationAdmissionSummaryDigest(namespace, entries.items);
     var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update("empty-generation-retirements-v1");
+    hash.update("empty-generation-retirements-patricia-v1");
     var number: [8]u8 = undefined;
     inline for (.{ namespace.table_id, namespace.shard_id, namespace.range_id }) |part| {
         std.mem.writeInt(u64, &number, part, .little);
         hash.update(&number);
     }
-    var retired_count: u64 = 0;
-    item = try cursor.seekAtOrAfter(retirement.active_prefix);
-    while (item) |record| : (item = try cursor.next()) {
-        if (!std.mem.startsWith(u8, record.key, retirement.active_prefix)) break;
-        if (record.key.len != retirement.active_prefix.len + 16) return error.InvalidGenerationRetirement;
-        _ = try retirement.Active.decode(record.value, record.key[retirement.active_prefix.len..][0..16].*);
-        std.mem.writeInt(u64, &number, record.key.len, .little);
-        hash.update(&number);
-        hash.update(record.key);
-        std.mem.writeInt(u64, &number, record.value.len, .little);
-        hash.update(&number);
-        hash.update(record.value);
-        retired_count = std.math.add(u64, retired_count, 1) catch return error.InvalidGenerationRetirement;
-    }
+    // Activation, transfer, and GC maintain this authenticated set in their
+    // own transaction. Planning/preflight remain one point read regardless of
+    // retirement history; the source fence still freezes subsequent changes.
+    const retired = try retirement.authenticatedSummary(txn);
+    const retired_count = retired.count;
+    hash.update(&retired.digest);
     std.mem.writeInt(u64, &number, retired_count, .little);
     hash.update(&number);
     var retired_digest: integrity.Digest = undefined;
     hash.final(&retired_digest);
+    if (control) |value| try value.check();
     const seal = if (fence != null) try loadSeal(txn) else null;
     const owned_entries = try entries.toOwnedSlice(alloc);
     return .{
@@ -481,9 +510,10 @@ test "empty generation handoff intent and seal are fence-bound and cancel only b
     try stageBegin(&txn, fence, intent);
     const seal: topology.GenerationHandoffSeal = .{ .plan_digest = intent.plan_digest, .admissions_digest = @splat(4), .retired_digest = @splat(5), .retired_count = 2 };
     try stageSeal(&txn, fence, seal, 6, 7);
+    const cursor_opens_before_sealed_status = txn.cursor_opens;
     const sealed_status = try sealStatus(&txn, fence.namespace);
     try std.testing.expectEqual(@as(u64, 7), sealed_status.seal.?.index);
-    try std.testing.expectEqual(cursor_opens_before_status + 1, txn.cursor_opens);
+    try std.testing.expectEqual(cursor_opens_before_sealed_status, txn.cursor_opens);
     try stageSeal(&txn, fence, seal, 6, 7);
     try stageSeal(&txn, fence, seal, 6, 8); // lost reply, new Raft entry
     try std.testing.expectEqual(@as(u64, 7), (try loadSeal(&txn)).?.index);
@@ -531,4 +561,58 @@ test "empty generation owner lookup streams a coherent summary from a read trans
     try std.testing.expectEqual(@as(usize, 0), parsed.value.admissions.len);
     try std.testing.expectEqual(@as(u64, 0), parsed.value.retired_count);
     try std.testing.expect(parsed.value.intent == null and parsed.value.seal == null);
+}
+
+test "empty generation summary uses one authenticated history read and honors cancellation" {
+    const alloc = std.testing.allocator;
+    const Mock = struct {
+        const Self = @This();
+        root: [61]u8 = @splat(0),
+        summary_reads: usize = 0,
+        pub fn get(self: *@This(), name: []const u8) anyerror![]const u8 {
+            if (std.mem.eql(u8, name, @import("retirement_set_summary.zig").root_key)) {
+                self.summary_reads += 1;
+                return &self.root;
+            }
+            return error.NotFound;
+        }
+        const Cursor = struct {
+            owner: *Self,
+            const Entry = struct { key: []const u8, value: []const u8 };
+            pub fn close(_: *@This()) void {}
+            pub fn seekAtOrAfter(_: *@This(), prefix: []const u8) !?Entry {
+                if (std.mem.eql(u8, prefix, retirement.active_prefix)) return error.UnexpectedHistoryScan;
+                return null;
+            }
+            pub fn next(_: *@This()) !?Entry {
+                return null;
+            }
+        };
+        pub fn openCursor(self: *@This()) !Cursor {
+            return .{ .owner = self };
+        }
+    };
+    var txn: Mock = .{};
+    // Stub the root-read boundary; the authenticated tree's own tests cover
+    // actual mutations, canonical roots, snapshot/replay, and branch collapse.
+    @memcpy(txn.root[0..4], "RST1");
+    std.mem.writeInt(u64, txn.root[21..29], 100_000, .little);
+    @memset(txn.root[29..61], 7);
+    const fence: topology.Fence = .{ .transition_id = 7, .attempt = 1, .peer_group_id = 8, .owner_group_id = 9, .role = .child_generation_parent, .namespace = .{ .table_id = 10, .shard_id = 9, .range_id = 9 }, .catalog_digest = @splat(2) };
+    const Budget = struct {
+        remaining: usize,
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.remaining == 0) return error.Cancelled;
+            self.remaining -= 1;
+        }
+    };
+    var budget: Budget = .{ .remaining = 0 };
+    try std.testing.expectError(error.Cancelled, summaryAllocControlled(alloc, &txn, fence.namespace, .{ .ptr = &budget, .check_fn = Budget.check }));
+    try std.testing.expectEqual(@as(usize, 0), txn.summary_reads);
+    budget.remaining = 2;
+    var complete = try summaryAllocControlled(alloc, &txn, fence.namespace, .{ .ptr = &budget, .check_fn = Budget.check });
+    defer complete.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 100_000), complete.retired_count);
+    try std.testing.expectEqual(@as(usize, 1), txn.summary_reads);
 }

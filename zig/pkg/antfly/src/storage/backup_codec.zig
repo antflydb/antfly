@@ -61,6 +61,9 @@ pub const BlockType = enum(u8) {
     /// Authenticated online source-copy only; ordinary restores rebuild their
     /// own claims and must reject this owner-bound shadow integrity stream.
     integrity_batch = 0x1B,
+    /// Certified online source-copy only. Preserves physical artifact
+    /// ownership and incarnation state; never accepted by ordinary restore.
+    source_artifact_batch = 0x1C,
     blob_header = 0x20,
     blob_chunk = 0x21,
     footer_index = 0x22,

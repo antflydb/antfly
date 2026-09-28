@@ -67,7 +67,7 @@ const IntentAdmission = struct {
         return self.retained_bytes +| 48;
     }
 };
-const IntentCost = struct { bytes: u64, retained: u64 };
+const IntentCost = struct { bytes: u64, retained: u64, retained_keys: u64 = 0 };
 // Read dependencies that are not also writes need durable shared guards.
 // A predicate check alone is not a prepare vote: another transaction could
 // delete its parent row after the check but before the coordinator commits.
@@ -109,6 +109,10 @@ pub const WriteIntent = struct {
     /// Schema-bound canonical AROW produced before voting prepared. The API
     /// sidecar retains only API-only special fields needed by commit effects.
     prepared_row: ?[]const u8 = null,
+    /// Native preparation overwrites these bounds from the pinned vector
+    /// catalog; public caller estimates are never used as admission authority.
+    retained_artifact_bytes: u64 = 0,
+    retained_artifact_keys: u64 = 0,
 };
 
 pub const IntentValue = struct {
@@ -192,7 +196,13 @@ fn retainedIntentBytes(alloc: Allocator, intent: WriteIntent) !u64 {
             }
         }
     };
-    return std.math.add(u64, 16 + 2 + internal_keys.encodedComponentLen(intent.key), payload) catch error.TransactionTooLarge;
+    const primary = std.math.add(u64, 16 + 2 + internal_keys.encodedComponentLen(intent.key), payload) catch return error.TransactionTooLarge;
+    return std.math.add(u64, primary, intent.retained_artifact_bytes) catch error.TransactionTooLarge;
+}
+
+fn retainedIntentKeys(intent: WriteIntent, retained: u64) !u64 {
+    if (retained == 0) return 0;
+    return std.math.add(u64, 1, intent.retained_artifact_keys) catch error.TransactionTooLarge;
 }
 
 fn appendOwnedBytes(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), bytes: []u8) !void {
@@ -301,6 +311,9 @@ pub const TxnSummaryPage = struct {
 };
 
 pub const ResolutionExtraBatch = struct {
+    /// Borrowed through this resolution attempt. Terminal-decision retries do
+    /// not attach it: they must never re-certify already applied row effects.
+    commit_participant: ?@import("commit_participant.zig").Participant = null,
     /// Recovery owns one budgeted snapshot through atomic resolution.
     captured_intents: ?[]backend_scan.OwnedKVPair = null,
     cleanup_context: ?*anyopaque = null,
@@ -734,7 +747,7 @@ pub const TxnManager = struct {
                 admission.bytes = std.math.add(u64, admission.bytes, cost) catch return error.TransactionTooLarge;
                 admission.retained_bytes = std.math.add(u64, admission.retained_bytes, retained) catch return error.TransactionTooLarge;
                 admission.retained_keys += @intFromBool(retained != 0);
-                try pending_costs.put(self.alloc, key, .{ .bytes = cost, .retained = retained });
+                try pending_costs.put(self.alloc, key, .{ .bytes = cost, .retained = retained, .retained_keys = @intFromBool(retained != 0) });
                 const member_key = try makeIntentMemberKey(self.alloc, txn_id, key);
                 try appendOwnedBytes(self.alloc, &write_keys, member_key);
                 const member_value = try self.alloc.alloc(u8, 16);
@@ -745,7 +758,7 @@ pub const TxnManager = struct {
             }
             // Hash-map keys must outlive the snapshot.
             pending_costs.clearRetainingCapacity();
-            for (writes.items) |write| try pending_costs.put(self.alloc, write.key[intent_members_prefix.len + 17 ..], .{ .bytes = std.mem.readInt(u64, write.value[0..8], .little), .retained = std.mem.readInt(u64, write.value[8..16], .little) });
+            for (writes.items) |write| try pending_costs.put(self.alloc, write.key[intent_members_prefix.len + 17 ..], .{ .bytes = std.mem.readInt(u64, write.value[0..8], .little), .retained = std.mem.readInt(u64, write.value[8..16], .little), .retained_keys = @intFromBool(std.mem.readInt(u64, write.value[8..16], .little) != 0) });
         }
 
         // Compute the final replacement-aware ledger before allocating any
@@ -759,22 +772,23 @@ pub const TxnManager = struct {
                     else => return err,
                 };
                 defer self.alloc.free(raw);
-                if (raw.len != 16) return error.InvalidTxnRecord;
-                break :blk IntentCost{ .bytes = std.mem.readInt(u64, raw[0..8], .little), .retained = std.mem.readInt(u64, raw[8..16], .little) };
+                if (raw.len != 16 and raw.len != 24) return error.InvalidTxnRecord;
+                break :blk IntentCost{ .bytes = std.mem.readInt(u64, raw[0..8], .little), .retained = std.mem.readInt(u64, raw[8..16], .little), .retained_keys = if (raw.len == 24) std.mem.readInt(u64, raw[16..24], .little) else @intFromBool(std.mem.readInt(u64, raw[8..16], .little) != 0) };
             };
             const cost = try intentAdmissionBytes(intent);
             const retained = try retainedIntentBytes(self.alloc, intent);
+            const retained_keys = try retainedIntentKeys(intent, retained);
             if (prior) |old| {
                 admission.bytes = std.math.sub(u64, admission.bytes, old.bytes) catch return error.InvalidTxnRecord;
                 admission.retained_bytes = std.math.sub(u64, admission.retained_bytes, old.retained) catch return error.InvalidTxnRecord;
-                admission.retained_keys = std.math.sub(u64, admission.retained_keys, @intFromBool(old.retained != 0)) catch return error.InvalidTxnRecord;
+                admission.retained_keys = std.math.sub(u64, admission.retained_keys, old.retained_keys) catch return error.InvalidTxnRecord;
             } else {
                 admission.count = std.math.add(u64, admission.count, 1) catch return error.TransactionTooLarge;
             }
             admission.bytes = std.math.add(u64, admission.bytes, cost) catch return error.TransactionTooLarge;
             admission.retained_bytes = std.math.add(u64, admission.retained_bytes, retained) catch return error.TransactionTooLarge;
-            admission.retained_keys += @intFromBool(retained != 0);
-            try pending_costs.put(self.alloc, intent.key, .{ .bytes = cost, .retained = retained });
+            admission.retained_keys = std.math.add(u64, admission.retained_keys, retained_keys) catch return error.TransactionTooLarge;
+            try pending_costs.put(self.alloc, intent.key, .{ .bytes = cost, .retained = retained, .retained_keys = retained_keys });
             try last_intents.put(self.alloc, intent.key, index);
         }
         var range_reservations = std.ArrayListUnmanaged(VersionPredicate).empty;
@@ -815,9 +829,10 @@ pub const TxnManager = struct {
             if (last_intents.get(intent.key).? != index) continue;
             const member_key = try makeIntentMemberKey(self.alloc, txn_id, intent.key);
             try appendOwnedBytes(self.alloc, &write_keys, member_key);
-            const member_value = try self.alloc.alloc(u8, 16);
+            const member_value = try self.alloc.alloc(u8, 24);
             std.mem.writeInt(u64, member_value[0..8], pending_costs.get(intent.key).?.bytes, .little);
             std.mem.writeInt(u64, member_value[8..16], pending_costs.get(intent.key).?.retained, .little);
+            std.mem.writeInt(u64, member_value[16..24], pending_costs.get(intent.key).?.retained_keys, .little);
             try appendOwnedBytes(self.alloc, &write_vals, member_value);
             try writes.append(self.alloc, .{ .key = member_key, .value = member_value });
             const intent_key = try self.makeIntentKey(txn_id, intent.key);
@@ -1141,7 +1156,7 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyBatchWithReservation(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 });
+        try self.applyBatchWithParticipant(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -2441,8 +2456,13 @@ pub const TxnManager = struct {
 
     const ReservationChange = struct { previous: u64, next: u64 };
     fn applyBatchWithReservation(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange) !void {
+        return self.applyBatchWithParticipant(writes, deletes, replay, reservation, null);
+    }
+
+    fn applyBatchWithParticipant(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant) !void {
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
+        if (participant) |observer| try batch.setCommitParticipant(observer);
         if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
         for (deletes) |key| {
             batch.delete(key) catch |err| switch (err) {
@@ -3051,6 +3071,47 @@ test "retained transaction reservations admit existing prepares release abort an
         errdefer txn.abort();
         _ = try retained_effects.admit(&txn, ns, 2, @splat(2), retained_effects.default_limit);
         try txn.commit();
+    }
+}
+
+test "retained transaction vector credits replace exactly and survive reopen before abort" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-vector-reserved");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    const id: TxnId = @splat(76);
+    const intent: WriteIntent = .{ .key = "row", .value = "{}", .retained_artifact_bytes = 256, .retained_artifact_keys = 2 };
+    const expected = 48 + try retainedIntentBytes(alloc, intent);
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.put(&internal_keys.identity_namespace_key, &@as(retained_effects.Namespace, @splat(1)));
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.initTransaction(id, 1);
+        try manager.writeIntents(id, &.{intent}, &.{});
+        var smaller = intent;
+        smaller.retained_artifact_bytes = 64;
+        smaller.retained_artifact_keys = 1;
+        try manager.writeIntents(id, &.{ smaller, intent, intent }, &.{});
+        const admission = (try manager.loadIntentAdmission(alloc, id)).?;
+        try std.testing.expectEqual(expected, admission.reservation());
+        try std.testing.expectEqual(@as(u64, 3), admission.retained_keys);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try std.testing.expectEqual(expected, (try manager.loadIntentAdmission(alloc, id)).?.reservation());
+        try manager.resolveIntents(id, .aborted, 2);
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 0), (try retained_effects.loadReservations(&read)).?.bytes);
     }
 }
 

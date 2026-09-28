@@ -19,6 +19,7 @@ const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig");
 
 pub const protocol_version = internal_batch_forwarding.raft_batch_protocol_version;
+pub const artifact_catalog_protocol_version = internal_batch_forwarding.raft_batch_artifact_catalog_protocol_version;
 pub const timestamp_protocol_version = internal_batch_forwarding.raft_batch_timestamp_protocol_version;
 pub const activation_barrier_protocol_version = internal_batch_forwarding.raft_batch_activation_barrier_protocol_version;
 pub const merge_transition_protocol_version = internal_batch_forwarding.raft_batch_merge_transition_protocol_version;
@@ -206,8 +207,8 @@ fn consumerTests() type {
             try std.testing.expect(merge_copy_attempt_protocol_version > merge_artifacts_protocol_version);
             try std.testing.expect(merge_page_protocol_version > merge_copy_attempt_protocol_version);
             try std.testing.expect(source_scope_protocol_version > relational_transfer_protocol_version);
-            try std.testing.expectEqual(protocol_version, source_scope_protocol_version);
-            try std.testing.expectEqual(protocol_version, source_pin_protocol_version);
+            try std.testing.expectEqual(protocol_version, artifact_catalog_protocol_version);
+            try std.testing.expectEqual(source_scope_protocol_version, source_pin_protocol_version);
             const encoded = try encodeProtocolBarrier(std.testing.allocator, "docs", timestamp_protocol_version);
             defer std.testing.allocator.free(encoded);
 

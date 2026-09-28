@@ -367,6 +367,30 @@ pub fn decodeRecord(alloc: Allocator, raw: []const u8) !DecodedRecord {
     };
 }
 
+/// Finalize an exclusively owned record prepared by encodeRecord(sequence=0).
+/// Key-list allocation/encoding can precede the serialized commit section;
+/// the reservation is assigned once, immediately before atomic persistence.
+pub fn finalizePreparedRecordSequence(raw: []u8, sequence: u64) !void {
+    const offset = binary_magic.len + @sizeOf(u16);
+    if (sequence == 0 or raw.len < offset + @sizeOf(u64) + 2 or
+        !std.mem.eql(u8, raw[0..binary_magic.len], binary_magic) or
+        std.mem.readInt(u16, raw[binary_magic.len..][0..2], .little) != 1 or
+        std.mem.readInt(u64, raw[offset..][0..8], .little) != 0) return error.InvalidBatchRequest;
+    std.mem.writeInt(u64, raw[offset..][0..8], sequence, .little);
+}
+
+test "ordered artifact inventory prepared replay assigns sequence exactly once" {
+    const alloc = std.testing.allocator;
+    const raw = try encodeRecord(alloc, .{ .changed_artifact_keys = &.{"binary\xffkey"}, .target_hints = &.{.dense_vector} });
+    defer alloc.free(raw);
+    try finalizePreparedRecordSequence(raw, 9);
+    var decoded = try decodeRecord(alloc, raw);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 9), decoded.record.sequence);
+    try std.testing.expectEqualStrings("binary\xffkey", decoded.record.changed_artifact_keys[0]);
+    try std.testing.expectError(error.InvalidBatchRequest, finalizePreparedRecordSequence(raw, 10));
+}
+
 fn looksLikeEncodedRecord(raw: []const u8) bool {
     if (looksLikeBinaryRecord(raw)) return true;
     const trimmed = std.mem.trim(u8, raw, &std.ascii.whitespace);

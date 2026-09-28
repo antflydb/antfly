@@ -17,6 +17,7 @@ pub const CanceledPublication = struct {
     revision: u64,
     hosted: bool,
     canceled: bool,
+    published: bool = false,
 };
 
 pub const CanceledReservation = struct {
@@ -26,6 +27,7 @@ pub const CanceledReservation = struct {
     plan_digest: [32]u8,
     hosted: bool,
     canceled: bool,
+    obsolete_placement: bool = false,
 };
 
 pub const RegisteredRoot = struct {
@@ -52,12 +54,20 @@ pub fn validate(
     try signed.receipt.validate();
     if (!std.meta.eql(group_work, store_work)) return error.InitialFkRetirementWorkChanged;
     try contract.requireExactWork(ticket, group_work, metadata_cluster, publication.revision);
-    if (!publication.canceled or !publication.hosted or
+    const phase_matches = switch (ticket.replica.retirement_authority) {
+        .canceled_plan => publication.canceled and !publication.published,
+        .published_obsolete => publication.published and !publication.canceled,
+    };
+    if (!phase_matches or !publication.hosted or
         publication.child_table_id != ticket.replica.child_table_id or
         !std.mem.eql(u8, &publication.plan_id, &ticket.replica.plan_id) or
         !std.mem.eql(u8, &publication.plan_digest, &ticket.replica.plan_digest))
         return error.InitialFkRetirementPublicationChanged;
-    if (!reservation.canceled or !reservation.hosted or
+    const reservation_matches = switch (ticket.replica.retirement_authority) {
+        .canceled_plan => reservation.canceled and !reservation.obsolete_placement,
+        .published_obsolete => reservation.obsolete_placement and !reservation.canceled,
+    };
+    if (!reservation_matches or !reservation.hosted or
         reservation.child_table_id != ticket.replica.child_table_id or
         reservation.range_id != ticket.replica.range_id or
         !std.mem.eql(u8, &reservation.plan_id, &ticket.replica.plan_id) or
@@ -120,6 +130,22 @@ test "retirement ACK validates exact canceled work and current physical-root sig
         .public_key = root.public_key,
     };
     try std.testing.expectEqual(Disposition.newly_acked, try validate(signed, ticket.metadata_incarnation, publication, reservation, work, work, current));
+    var obsolete = work;
+    obsolete.retirement_authority = .published_obsolete;
+    try std.testing.expectEqualDeep(obsolete, try retirement.Replica.decode(&try obsolete.encode()));
+    var obsolete_ticket = ticket;
+    obsolete_ticket.replica = obsolete;
+    const obsolete_signed = try auth.SignedReceipt.sign(root, try contract.Receipt.fromUnlinkedIntent(.{ .ticket = obsolete_ticket, .phase = .unlinked }, 31));
+    var published = publication;
+    published.canceled = false;
+    published.published = true;
+    var exclusion = reservation;
+    exclusion.canceled = false;
+    exclusion.obsolete_placement = true;
+    try std.testing.expectEqual(Disposition.newly_acked, try validate(obsolete_signed, ticket.metadata_incarnation, published, exclusion, obsolete, obsolete, current));
+    try std.testing.expectError(error.InitialFkRetirementPublicationChanged, validate(obsolete_signed, ticket.metadata_incarnation, publication, exclusion, obsolete, obsolete, current));
+    try std.testing.expectError(error.InitialFkRetirementReservationChanged, validate(obsolete_signed, ticket.metadata_incarnation, published, reservation, obsolete, obsolete, current));
+    try std.testing.expectError(error.InitialFkRetirementWorkChanged, validate(signed, ticket.metadata_incarnation, published, exclusion, obsolete, obsolete, current));
     var acked = work;
     acked.acked = true;
     try std.testing.expectEqual(Disposition.already_acked, try validate(signed, ticket.metadata_incarnation, publication, reservation, acked, acked, current));

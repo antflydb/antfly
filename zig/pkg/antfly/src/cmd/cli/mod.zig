@@ -179,7 +179,15 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, command, "backup")) return "usage: antfly backup --table <table> --location <uri> [options]\n";
     if (std.mem.eql(u8, command, "restore")) return "usage: antfly restore --location <uri> [options]\n";
     if (std.mem.eql(u8, command, "auth")) return "usage: antfly auth <me|users|permissions|roles|row-filters|subjects|api-keys> [options]\n";
-    if (std.mem.eql(u8, command, "internal")) return "usage: antfly internal metadata status\n";
+    if (std.mem.eql(u8, command, "internal")) return
+    \\usage: antfly internal metadata status
+    \\       antfly internal store-root proof --replica-root-dir <dir> --metadata-incarnation <32-char lowercase hex> --node-id <id> --store-id <id>
+    \\       antfly internal store-root enroll --file <proof.json>
+    \\       antfly internal store-root status --file <proof.json>
+    \\Generate the proof on the data node, then enroll it with a cluster-admin token.
+    \\If enroll returns an ambiguous error, check status before any manual retry.
+    \\
+    ;
     return null;
 }
 

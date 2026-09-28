@@ -37,6 +37,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const projection_seal = @import("projection_seal.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
@@ -1354,6 +1355,48 @@ pub const PersistentIndex = struct {
         try txn.commit();
     }
 
+    pub fn loadProjectionSeal(self: *PersistentIndex, alloc: Allocator) !?projection_seal.Seal {
+        const raw = (try self.readGenerationMetadataAlloc(alloc, projection_seal.metadata_key)) orelse return null;
+        defer alloc.free(raw);
+        return try projection_seal.Seal.decode(raw);
+    }
+
+    /// Called only after ordered replay has applied every effect through the
+    /// supplied cut. Force physical durability BEFORE publishing its coverage;
+    /// a crash may leave data ahead of the seal, never a seal ahead of data.
+    /// The owner must serialize this with its per-index replay/apply lane.
+    pub fn publishProjectionSeal(self: *PersistentIndex, seal: projection_seal.Seal) !void {
+        if (self.read_only) return error.ReadOnly;
+        _ = try seal.encode();
+        var next = seal;
+        self.lockStorage();
+        defer self.unlockStorage();
+        var already_covered = false;
+        {
+            var read = try self.beginReadMainTxn();
+            defer read.abort();
+            const previous = read.get(.meta, projection_seal.metadata_key) catch |err| if (err == error.NotFound) null else return err;
+            if (previous) |raw| {
+                const old = try projection_seal.Seal.decode(raw);
+                if (!old.sameIdentity(seal)) return error.ProjectionSealIdentityChanged;
+                // Incremental replay preserves the completed baseline of this
+                // physical generation. Reset/removal deletes the entire seal.
+                if (next.baseline == null) next.baseline = old.baseline;
+                next.applied_sequence = @max(next.applied_sequence, old.applied_sequence);
+                already_covered = std.meta.eql(old, next);
+            }
+        }
+        // Even an idempotent retry must finish a previously failed seal sync.
+        try self.main_store_owner.sync(true);
+        if (already_covered) return;
+        try self.wal.sync(true);
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        try txn.put(.meta, projection_seal.metadata_key, &try next.encode());
+        try txn.commit();
+        try self.main_store_owner.sync(true);
+    }
+
     /// Physical segments, including fully-deleted segments, are projection
     /// history. They prevent changing a generation's analyzer semantics.
     pub fn hasPhysicalSegments(self: *PersistentIndex) bool {
@@ -1863,6 +1906,10 @@ pub const PersistentIndex = struct {
         }
         try saveNextSegmentId(&txn, replacement_writer.next_segment_id);
         txn.delete(.meta, meta_rebuild_cursor) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        txn.delete(.meta, projection_seal.metadata_key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
         };
@@ -3405,6 +3452,12 @@ pub const PersistentIndex = struct {
         errdefer txn.abort();
         var writer_publication = try self.writer.prepareSegmentsManyData(old_seg_ids, &.{});
         defer writer_publication.abort();
+        // Unlike compaction replacement, structural removal is not a proof
+        // that the old source cut is still represented by this generation.
+        txn.delete(.meta, projection_seal.metadata_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
 
         for (old_seg_ids) |old_id| {
             const old_seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, old_id));
@@ -3889,6 +3942,96 @@ fn cleanupPersistDir(path: [*:0]const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "ordered artifact inventory physical projection seal survives reopen and retires with its generation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    const options: PersistentIndexOptions = .{ .path = path, .main_backend = .lsm, .wal_backend = .lsm };
+    var seal: projection_seal.Seal = .{ .root = 1, .namespace = @splat(1), .generation = 2, .config_hash = 3, .applied_sequence = 4 };
+    {
+        var idx = try PersistentIndex.open(alloc, options);
+        defer idx.close();
+        const segment = try buildSimpleSegment(alloc, "doc", "durable");
+        defer alloc.free(segment);
+        try idx.indexSegment(segment);
+        try idx.publishProjectionSeal(seal);
+        try std.testing.expectEqualDeep(seal, (try idx.loadProjectionSeal(alloc)).?);
+        var old = seal;
+        old.applied_sequence -= 1;
+        try idx.publishProjectionSeal(old);
+        try std.testing.expectEqualDeep(seal, (try idx.loadProjectionSeal(alloc)).?);
+        var foreign = seal;
+        foreign.root += 1;
+        try std.testing.expectError(error.ProjectionSealIdentityChanged, idx.publishProjectionSeal(foreign));
+        // A completed snapshot can strengthen an already durable replay cut.
+        seal.baseline = .{ .boundary = .{ .authority = .{ .namespace = seal.namespace, .epoch = 1, .catalog_digest = @splat(2) }, .replay_sequence = 2 }, .gap_epoch = 0 };
+        try idx.publishProjectionSeal(seal);
+        try std.testing.expectEqualDeep(seal, (try idx.loadProjectionSeal(alloc)).?);
+        seal.applied_sequence += 1;
+        var incremental = seal;
+        incremental.baseline = null;
+        try idx.publishProjectionSeal(incremental);
+    }
+    {
+        var idx = try PersistentIndex.open(alloc, options);
+        defer idx.close();
+        try std.testing.expectEqualDeep(seal, (try idx.loadProjectionSeal(alloc)).?);
+        try std.testing.expectEqual(@as(u32, 1), idx.snapshot().liveDocCount());
+        const pinned = idx.acquireSnapshot();
+        defer pinned.release();
+        try idx.resetAllForRebuild();
+        try std.testing.expect(try idx.loadProjectionSeal(alloc) == null);
+        try std.testing.expectEqual(@as(u32, 1), pinned.liveDocCount());
+        try std.testing.expectEqual(@as(u32, 0), idx.snapshot().liveDocCount());
+        try idx.sync(true);
+    }
+    {
+        var idx = try PersistentIndex.open(alloc, options);
+        defer idx.close();
+        try std.testing.expect(try idx.loadProjectionSeal(alloc) == null);
+        const segment = try buildSimpleSegment(alloc, "new", "rebuilt");
+        defer alloc.free(segment);
+        try idx.indexSegment(segment);
+        seal.generation += 1;
+        try idx.publishProjectionSeal(seal);
+        const id = idx.snapshot().segments[0].id;
+        try idx.removeSegments(&.{id});
+        try std.testing.expect(try idx.loadProjectionSeal(alloc) == null);
+    }
+}
+
+test "ordered artifact inventory physical projection seal and data remain coherent across modeled crash" {
+    const alloc = std.testing.allocator;
+    var runtime = storage_sim.Runtime.init(alloc);
+    defer runtime.deinit();
+    var device_model = storage_sim.ModeledDevice.init(alloc);
+    defer device_model.deinit();
+    const path: [*:0]const u8 = "/physical-projection-seal-crash";
+    const options = persistentModeledOptionsToIndexOptions(path, .{}, &device_model, &runtime);
+    var idx = try PersistentIndex.open(alloc, options);
+    defer idx.close();
+    const segment = try buildSimpleSegment(alloc, "doc", "durable");
+    defer alloc.free(segment);
+    try idx.indexSegment(segment);
+    const seal: projection_seal.Seal = .{ .root = 1, .namespace = @splat(1), .generation = 2, .config_hash = 3, .applied_sequence = 4 };
+    try idx.publishProjectionSeal(seal);
+    try crashReopenModeledPersistentIndex(alloc, &idx, &device_model, options);
+    try std.testing.expectEqualDeep(seal, (try idx.loadProjectionSeal(alloc)).?);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(alloc, idx.snapshot(), "durable"));
+    // Failed reset commit must preserve BOTH the physical rows and their
+    // certificate. The deletion is not a separate best-effort metadata write.
+    try device_model.injectSyncFailureForPathContains("/index/");
+    try expectModeledPersistentReplaceError(idx.resetAllForRebuild());
+    try crashReopenModeledPersistentIndex(alloc, &idx, &device_model, options);
+    try std.testing.expectEqualDeep(seal, (try idx.loadProjectionSeal(alloc)).?);
+    try std.testing.expectEqual(@as(u32, 1), idx.snapshot().liveDocCount());
+    try idx.resetAllForRebuild();
+    try crashReopenModeledPersistentIndex(alloc, &idx, &device_model, options);
+    try std.testing.expect(try idx.loadProjectionSeal(alloc) == null);
+    try std.testing.expectEqual(@as(u32, 0), idx.snapshot().liveDocCount());
 }
 
 test "persistent independent indexes publish while another owner is locked" {

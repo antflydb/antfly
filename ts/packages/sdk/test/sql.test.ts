@@ -17,6 +17,83 @@ import { AntflyClient, SQLExecutionError } from "../src/client.js";
 
 afterEach(() => vi.unstubAllGlobals());
 
+describe("durable SQL connection client", () => {
+  const connection = {
+    connection_id: "a".repeat(32),
+    owner_node_id: "0",
+    expires_at_ms: 1800000000000,
+    database: "analytics",
+    namespace: "public",
+  };
+
+  it("opens and closes on the owning endpoint without redirects or retries", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(connection)))
+      .mockResolvedValueOnce(new Response("{}"));
+    vi.stubGlobal("fetch", fetch);
+    const client = new AntflyClient({
+      baseUrl: "http://localhost:8080",
+      auth: { type: "token", token: "credential" },
+    });
+    const signal = new AbortController().signal;
+    expect(await client.openSQLConnection({ database: "analytics" }, { signal })).toEqual(
+      connection
+    );
+    await client.closeSQLConnection(connection.connection_id, { signal });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+      "http://localhost:8080/db/v1/sql/connections",
+      `http://localhost:8080/db/v1/sql/connections/${connection.connection_id}`,
+    ]);
+    expect(JSON.parse(fetch.mock.calls[0][1].body)).toEqual({ database: "analytics" });
+    expect(fetch.mock.calls[1][1]).toMatchObject({ method: "DELETE", body: undefined });
+    for (const [, options] of fetch.mock.calls) {
+      expect(options).toMatchObject({
+        redirect: "error",
+        credentials: "omit",
+        signal,
+        headers: { Authorization: "Bearer credential" },
+      });
+    }
+  });
+
+  it.each([
+    "open",
+    "close",
+  ])("preserves ambiguous %s diagnostics without replay", async (operation) => {
+    const diagnostic = { code: "40003", message: "outcome unknown", retryable: false };
+    const fetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(diagnostic), { status: 503 }));
+    vi.stubGlobal("fetch", fetch);
+    const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+    const work =
+      operation === "open"
+        ? client.openSQLConnection()
+        : client.closeSQLConnection(connection.connection_id);
+    await expect(work).rejects.toBeInstanceOf(SQLExecutionError);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects invalid IDs and malformed acknowledgments", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...connection, owner_node_id: 0 })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...connection, connection_id: "bad" })))
+      .mockResolvedValueOnce(new Response("[]"));
+    vi.stubGlobal("fetch", fetch);
+    const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+    await expect(client.closeSQLConnection("a/b?c")).rejects.toThrow("connection ID");
+    await expect(client.openSQLConnection()).rejects.toThrow("Invalid SQL connection response");
+    await expect(client.openSQLConnection()).rejects.toThrow("Invalid SQL connection response");
+    await expect(client.closeSQLConnection(connection.connection_id)).rejects.toThrow(
+      "Invalid SQL connection close response"
+    );
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+});
+
 describe("durable SQL prepared client", () => {
   const prepared = {
     prepared_id: "opaque-resource",

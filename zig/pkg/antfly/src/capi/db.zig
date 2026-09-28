@@ -459,6 +459,17 @@ const StorageOwnerRuntimeHooks = struct {
     config: kernel_owner_abi.RuntimeHooksConfig,
     group_id: u64,
 
+    fn artifactPublicationDispatcher(self: *StorageOwnerRuntimeHooks) ?db_mod.ArtifactPublicationDispatcher {
+        if (self.config.artifact_publication_enqueue_fn == null) return null;
+        return .{ .ptr = self, .enqueue = enqueueArtifactPublication };
+    }
+
+    fn enqueueArtifactPublication(ptr: *anyopaque, namespace: [24]u8, command: []const u8) !void {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const enqueue = self.config.artifact_publication_enqueue_fn orelse return error.ArtifactCatalogDrift;
+        try kernel_error_identity.statusToError(enqueue(self.config.artifact_publication_ctx, self.group_id, &namespace, .fromSlice(command)));
+    }
+
     const CandidateCapture = struct {
         alloc: Allocator,
         value: ?[]u8 = null,
@@ -4516,6 +4527,10 @@ pub fn metadataApplyStoreProjection(
             defer value.deinit(alloc);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
+        .fk_initial_group_reservation => blk: {
+            const value = handle.store.initialGroupReservation(request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .relational_topology_protocol_activation_version => blk: {
             const value = handle.store.getRelationalTopologyProtocolActivationVersion(request.group_id) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, value);
@@ -4741,6 +4756,10 @@ pub fn metadataApplyStoreProjection(
                 },
                 .fk_initial_retirement_page => |input| {
                     const value = handle.store.fkInitialRetirementTicketPageJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .store_root_control => |input| {
+                    const value = handle.store.storeRootControlJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .fk_initial_parent_decision => |input| {
@@ -5313,6 +5332,12 @@ pub fn dataApplyStoreProjection(
     const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
     const alloc = handle.alloc;
     const encoded = switch (request.kind) {
+        .merge_membership => blk: {
+            const value = handle.store.observeMergeMembership(alloc, request.group_id) catch |err|
+                return storageOwnerStatusFromError(err);
+            break :blk std.json.Stringify.valueAlloc(alloc, value, .{}) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
         .topology_rejection => blk: {
             const value = handle.store.topologyRejection(alloc, request.group_id, request.after_sequence) catch |err|
                 return storageOwnerStatusFromError(err);
@@ -6008,6 +6033,7 @@ pub fn storageOwnerOpen(
             return .invalid_argument;
     }
     const runtime_hooks_config = request.runtime_hooks;
+    if ((runtime_hooks_config.artifact_publication_ctx == null) != (runtime_hooks_config.artifact_publication_enqueue_fn == null)) return .invalid_argument;
     if ((runtime_hooks_config.coordinated_ttl_ctx == null) != (runtime_hooks_config.coordinated_ttl_enqueue_fn == null))
         return .invalid_argument;
     const candidate_configured = runtime_hooks_config.resolution_candidates.get_fn != null or
@@ -6042,7 +6068,7 @@ pub fn storageOwnerOpen(
         alloc.destroy(value);
     };
     var runtime_hooks: ?*StorageOwnerRuntimeHooks = null;
-    if (candidate_configured or entity_sink_configured or runtime_hooks_config.promotion_owner_fn != null or runtime_hooks_config.native_authority_fn != null or runtime_hooks_config.coordinated_ttl_enqueue_fn != null) {
+    if (candidate_configured or entity_sink_configured or runtime_hooks_config.promotion_owner_fn != null or runtime_hooks_config.native_authority_fn != null or runtime_hooks_config.coordinated_ttl_enqueue_fn != null or runtime_hooks_config.artifact_publication_enqueue_fn != null) {
         runtime_hooks = alloc.create(StorageOwnerRuntimeHooks) catch return .out_of_memory;
         runtime_hooks.?.* = .{ .config = runtime_hooks_config, .group_id = request.group_id };
     }
@@ -6095,6 +6121,7 @@ pub fn storageOwnerOpen(
         .prefer_existing_identity_namespace = identity_namespace != null,
         .transaction_recovery = if (recovery) |value| value.dbConfig() else .{},
         .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() else null,
+        .artifact_publication_dispatcher = if (runtime_hooks) |value| value.artifactPublicationDispatcher() else null,
         .entity_sink = if (runtime_hooks) |value| value.entitySink() else null,
         .promotion_owner = if (runtime_hooks) |value| value.promotionOwner() else null,
         // Reconcile the authoritative resolver catalog before autonomous
@@ -6743,6 +6770,25 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
         .ptr = response.ptr,
         .len = @intCast(response.len),
     };
+    return .ok;
+}
+
+pub fn storageOwnerNativeFkGenerationControlJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.NativeFkGenerationControlRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var owned = batch_api.parseInternalBatchRequest(handle.alloc, request.request_json.slice()) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer owned.deinit(handle.alloc);
+    handle.db.batchNativeFkGenerationApply(owned.req) catch |err| return storageOwnerStatusFromError(err);
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = response.len };
     return .ok;
 }
 
@@ -17693,6 +17739,13 @@ pub fn storageOwnerRelationalTransitionRead(owner_ptr: ?*anyopaque, request: *co
 }
 
 fn hiddenRestoreJson(alloc: std.mem.Allocator, db: *db_mod.DB, request: *const kernel_owner_abi.HiddenRestoreRequest, out_result: *kernel_owner_abi.OwnedBytes) !void {
+    if (request.operation == .cancel_initial_child_retirement) {
+        const Record = @typeInfo(@typeInfo(@TypeOf(db.readInitialChildPublicationRecord())).error_union.payload).optional.child;
+        var parsed = try std.json.parseFromSlice(struct { expected: Record, cancel_revision: u64 }, alloc, request.snapshot_token.slice(), .{ .ignore_unknown_fields = false });
+        defer parsed.deinit();
+        if (parsed.value.expected.namespace.table_id != request.table_id) return error.InitialChildPublicationChanged;
+        return db.cancelColdInitialChildForRetirement(parsed.value.expected, parsed.value.cancel_revision);
+    }
     if (request.operation == .read_initial_child) {
         const record = (try db.readInitialChildPublicationRecord()) orelse return;
         // A cold hidden owner is opened read-only without a public table
@@ -17729,6 +17782,7 @@ fn hiddenRestoreJson(alloc: std.mem.Allocator, db: *db_mod.DB, request: *const k
         },
         .capture_public_snapshot => unreachable,
         .read_initial_child => unreachable,
+        .cancel_initial_child_retirement => unreachable,
     }
 }
 
@@ -17756,7 +17810,7 @@ pub fn storageOwnerHiddenRestoreJson(owner_ptr: ?*anyopaque, request: *const ker
         hiddenRestoreJson(handle.alloc, &handle.db, request, out_result) catch |err| return storageOwnerStatusFromError(err);
         return .ok;
     }
-    if ((request.operation != .read_bootstrap and request.operation != .read_initial_child) or request.path.len == 0) return .invalid_argument;
+    if ((request.operation != .read_bootstrap and request.operation != .read_initial_child and request.operation != .cancel_initial_child_retirement) or request.path.len == 0) return .invalid_argument;
     const context = asStorageOwnerContext(request.context) orelse return .invalid_argument;
     const alloc = context.alloc;
     const runtime = context.backend_runtime.ptr();
@@ -17765,7 +17819,7 @@ pub fn storageOwnerHiddenRestoreJson(owner_ptr: ?*anyopaque, request: *const ker
         error.FileNotFound => return .ok,
         else => return storageOwnerStatusFromError(err),
     };
-    var db = db_mod.DB.open(alloc, request.path.slice(), .{ .backend_runtime = runtime, .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false }) catch |err| return storageOwnerStatusFromError(err);
+    var db = db_mod.DB.open(alloc, request.path.slice(), .{ .backend_runtime = runtime, .open_mode = if (request.operation == .cancel_initial_child_retirement) .writer else .query_readonly, .primary_only_readonly = request.operation != .cancel_initial_child_retirement, .start_index_workers = false, .start_optional_runtimes = false }) catch |err| return storageOwnerStatusFromError(err);
     defer db.close();
     hiddenRestoreJson(alloc, &db, request, out_result) catch |err| return storageOwnerStatusFromError(err);
     return .ok;

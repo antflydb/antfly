@@ -191,6 +191,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
     resolution_candidate_source: ?runtime_callbacks.CandidateSource = null,
     coordinated_ttl: ?@import("../storage/coordinated_ttl.zig").Port = null,
+    artifact_publications: ?@import("../storage/artifact_publication_dispatch.zig").Port = null,
     entity_sink: ?runtime_callbacks.EntitySink = null,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     native_migration_policy: ?runtime_callbacks.DenseNativeMigrationPolicySource = null,
@@ -1661,6 +1662,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         group_id: u64,
         table_id: u64,
     ) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+        try self.ensureContextConfigured();
         const generation = self.visibleRootGeneration(group_id);
         var resident: ?Lease = blk: {
             lock(&self.mutex);
@@ -1695,6 +1697,43 @@ pub const ProvisionedKernelOwnerSource = struct {
         group_id: u64,
     ) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
         return self.readHiddenInitialChildRecord(alloc, group_id, 0);
+    }
+
+    pub fn cancelColdInitialChildRetirementAtPath(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_path: []const u8, expected: @import("../storage/db/relational_initial_child_publication.zig").Record, cancel_revision: u64) !void {
+        try self.ensureContextConfigured();
+        const path = try std.fs.path.join(alloc, &.{ group_path, "table-db" });
+        defer alloc.free(path);
+        const payload = try std.json.Stringify.valueAlloc(alloc, .{ .expected = expected, .cancel_revision = cancel_revision }, .{});
+        defer alloc.free(payload);
+        var output: abi.OwnedBytes = .{};
+        try kernel_error_identity.statusToError(abi.antfly_storage_owner_hidden_restore_json(null, &.{ .operation = .cancel_initial_child_retirement, .context = self.context.handle, .path = .fromSlice(path), .table_id = expected.namespace.table_id, .snapshot_token = .fromSlice(payload) }, &output));
+        defer abi.antfly_storage_owner_buffer_destroy(&output);
+    }
+
+    /// The retirement worker holds the placement lease and drains all owners
+    /// before its final check. A renamed root must be read at its exact trash
+    /// path after a crash; resolving by group ID could inspect a replacement.
+    pub fn readColdInitialChildRetirementRecordAtPath(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_path: []const u8,
+    ) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+        try self.ensureContextConfigured();
+        const path = try std.fs.path.join(alloc, &.{ group_path, "table-db" });
+        defer alloc.free(path);
+        var output: abi.OwnedBytes = .{};
+        try kernel_error_identity.statusToError(abi.antfly_storage_owner_hidden_restore_json(null, &.{
+            .operation = .read_initial_child,
+            .context = self.context.handle,
+            .path = .fromSlice(path),
+            .table_id = 0,
+        }, &output));
+        defer abi.antfly_storage_owner_buffer_destroy(&output);
+        if (output.len == 0) return null;
+        var parsed = try std.json.parseFromSlice(@import("../storage/db/relational_initial_child_publication.zig").Record, alloc, output.slice(), .{ .ignore_unknown_fields = false });
+        defer parsed.deinit();
+        try parsed.value.validate();
+        return parsed.value;
     }
 
     pub fn captureHASeedHiddenReplicaSnapshot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, scope: [32]u8, snapshot_token: []const u8, destination_root: []const u8) !void {
@@ -3028,6 +3067,8 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn runtimeHooksConfig(self: *ProvisionedKernelOwnerSource) abi.RuntimeHooksConfig {
         return .{
+            .artifact_publication_ctx = if (self.artifact_publications != null) self else null,
+            .artifact_publication_enqueue_fn = if (self.artifact_publications != null) enqueueArtifactPublication else null,
             .coordinated_ttl_ctx = if (self.coordinated_ttl != null) self else null,
             .coordinated_ttl_enqueue_fn = if (self.coordinated_ttl != null) enqueueCoordinatedTtl else null,
             .native_authority_ctx = if (self.native_migration_policy != null) self else null,
@@ -3052,6 +3093,20 @@ pub const ProvisionedKernelOwnerSource = struct {
         std.debug.assert(self.entries.items.len == 0);
         self.coordinated_ttl = port;
         return self;
+    }
+
+    pub fn withArtifactPublications(self: *ProvisionedKernelOwnerSource, port: @import("../storage/artifact_publication_dispatch.zig").Port) *ProvisionedKernelOwnerSource {
+        std.debug.assert(self.entries.items.len == 0);
+        self.artifact_publications = port;
+        return self;
+    }
+
+    fn enqueueArtifactPublication(ptr: ?*anyopaque, group_id: u64, namespace: *const [24]u8, command: abi.BorrowedBytes) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const port = self.artifact_publications orelse return .invalid_argument;
+        if (command.len == 0 or command.ptr == null) return .invalid_argument;
+        port.enqueue(group_id, namespace.*, command.slice()) catch |err| return kernel_error_identity.statusFromError(err);
+        return .ok;
     }
 
     fn enqueueCoordinatedTtl(ptr: ?*anyopaque, request: *const abi.CoordinatedTtlRequest) callconv(.c) u8 {
@@ -3357,6 +3412,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
         defer response.deinit();
         return .{ .json = try alloc.dupe(u8, response.bytes()), .version = response.version(), .expected_content_digest = response.expectedContentDigest() };
+    }
+
+    pub fn applyFkGenerationNative(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_types.BatchRequest,
+    ) !void {
+        const command = req.relational_topology orelse return error.InvalidBatchRequest;
+        if (command.fence.owner_group_id != group_id) return error.IntegrityTopologyChanged;
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .allow_deferred_catalog = true });
+        defer lease.deinit();
+        if (lease.entry.identity.table_id != command.fence.namespace.table_id or
+            lease.entry.identity.shard_id != command.fence.namespace.shard_id or
+            lease.entry.identity.range_id != command.fence.namespace.range_id) return error.IntegrityTopologyChanged;
+        const encoded = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        defer alloc.free(encoded);
+        var response = try lease.owner().nativeFkGenerationControlJson(table_name, encoded);
+        defer response.deinit();
     }
 
     pub fn applyInitialChildNative(
@@ -4095,7 +4170,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?table_read_source.LookupResponse {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}") and consistency != .read_index) return error.RestoreStagingScopeChanged;
         if (opts.restore_staging_scope != null) return self.lookupRestoreStaging(alloc, group_id, table_name, key, opts, fence);
+        if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}")) return error.RestoreStagingScopeChanged;
         try self.validateRoutedRead(alloc, fence, group_id, table_name);
         if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}")) {
             if (!publishedHandoffReceiptReadCertified(key, opts, consistency))
@@ -4540,10 +4617,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?table_read_source.LookupResponse {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}") and consistency != .read_index) return error.RestoreStagingScopeChanged;
         if (opts.restore_staging_scope != null) return self.lookupRestoreStaging(alloc, group_id, table_name, key, opts, null);
         // Unscoped handoff receipts belong exclusively to the published,
         // catalog-fenced route above, never a direct hidden-owner lookup.
-        if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}"))
+        if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
+            std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}"))
             return error.RestoreStagingScopeChanged;
         try self.prepareLookupRead(group_id, key, opts, consistency);
         const request_json = try table_reads.encodeStorageKernelLookupRequest(alloc, key, opts);
@@ -4571,7 +4650,11 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn lookupRestoreStaging(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8, opts: db_types.LookupOptions, fence: ?metadata_api.CatalogRouteFence) !?table_read_source.LookupResponse {
         const scope = opts.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
-        const handoff_receipt = std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}");
+        const handoff_identity = std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}");
+        const handoff_receipt = handoff_identity or std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}");
+        if (handoff_identity and (fence != null or opts.include_primary_digest or opts.relational_integrity_catalog or opts.relational_integrity_action or
+            opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or
+            opts.relational_activation_json.len != 0 or opts.fields.len != 0 or opts.generation_handoff_install_read_index_certified)) return error.RestoreStagingScopeChanged;
         if (handoff_receipt and (opts.restore_staging_plan_id == null or key.len != 0)) return error.RestoreStagingScopeChanged;
         var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, opts.restore_staging_plan_id, if (handoff_receipt) .resolve else .read, .{ .deadline_ns = opts.execution_deadline_ns, .deadline_io = opts.execution_io, .cancellation = opts.cancellation orelse .none });
         defer descriptor.deinit(alloc);
@@ -4820,6 +4903,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer if (private_path) |path| alloc.free(path);
         var lease = if (descriptor) |owned| try self.acquireDescriptor(group_id, table_name, private_path.?, owned) else try self.acquire(group_id, table_name);
         defer lease.deinit();
+        if (req.transaction != null and req.restore_staging_scope != null) {
+            // Private activation uses the batch route to retain exact Plan
+            // authority for every transaction phase, including abort/retry.
+            // The ordinary document batch handler does not execute transaction
+            // controls. Reuse the native transaction dispatcher (no Raft entry
+            // or synthetic watermark); the descriptor above and the native
+            // scoped transaction APIs independently validate the hidden owner.
+            if (descriptor == null) return error.RestoreStagingScopeChanged;
+            var response = try lease.owner().replicatedBatchJson(table_name, request_json);
+            defer response.deinit();
+            return {};
+        }
         var callback_error_relay: kernel_error_identity.CallbackErrorRelay = .{};
         var committed_effects_context = CommittedBatchEffectsContext{
             .source = self,

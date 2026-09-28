@@ -6325,7 +6325,7 @@ pub const HostedProvisionedTableReadSource = struct {
         } };
     }
 
-    // Only the exact hidden handoff receipt read may route without a public
+    // Only exact hidden handoff receipt/capability reads may route without a public
     // catalog fence. The remote endpoint independently checks service auth,
     // scope, Plan and read-index, and the owner resolves the hidden descriptor.
     fn handoffReceiptExecutor(self: *HostedProvisionedTableReadSource) http_common.RequestExecutor {
@@ -6343,7 +6343,12 @@ pub const HostedProvisionedTableReadSource = struct {
 
     fn scopedHandoffReceiptLookup(key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) bool {
         return key.len == 0 and consistency == .read_index and
-            std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") and
+            (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
+                std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}")) and
+            !opts.include_primary_digest and !opts.relational_integrity_catalog and !opts.relational_integrity_action and
+            !opts.generation_handoff_install_read_index_certified and
+            opts.relational_integrity_jobs_json.len == 0 and opts.relational_index_status_json.len == 0 and
+            opts.relational_activation_json.len == 0 and opts.fields.len == 0 and
             opts.restore_staging_scope != null and opts.restore_staging_plan_id != null;
     }
 
@@ -7462,7 +7467,8 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") and
+        if ((std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
+            std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}")) and
             (opts.restore_staging_scope != null or opts.restore_staging_plan_id != null))
         {
             if (!scopedHandoffReceiptLookup(key, opts, consistency)) return error.RestoreStagingScopeChanged;
@@ -7473,6 +7479,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .remote => |remote| try lookupRemote(self.handoffReceiptExecutor(), alloc, remote.base_uri, group_id, table_name, key, opts, .read_index),
             };
         }
+        if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}")) return error.RestoreStagingScopeChanged;
         if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") and
             self.router.localStatus(group_id) != .active)
             return error.NotLeader;

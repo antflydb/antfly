@@ -47,6 +47,13 @@ pub const AppendMetadataMutationOptions = struct {
 };
 
 pub const BatchMutationPayload = struct {
+    /// Original authority for ordinary rows and coordinated resolutions. Input
+    /// provenance cannot substitute a standby-local replay sequence.
+    ordinary_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+    artifact_publication_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+    artifact_publication_transport_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+    native_topology_position: ?@import("../db/receipt_position.zig").Native = null,
+    artifact_catalog_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
     /// Initial hidden FK owner controls are Raft decisions. Standby replay
     /// must preserve that exact entry identity for owner receipts and reject
     /// an ordinary batch carrying the same private command.
@@ -67,6 +74,9 @@ pub const BatchMutationPayload = struct {
 /// Page semantics cannot be silently ignored by older standbys. Their V1
 /// decoder rejects V2 before applying rows, independently of Raft negotiation.
 fn batchMutationVersion(request: db_types.BatchRequest) u32 {
+    if (request.artifact_publication_transport != null) return 16;
+    if (request.artifact_publication != null) return 14;
+    if (request.artifact_catalog != null) return 12;
     if (request.restore_staging) |command| if (command == .import_page and command.import_page.source_generation_proof_page) return 11;
     if (request.restore_staging) |command| if (command == .install_generation_admissions) return 10;
     if (request.relational_topology) |command| switch (command.action) {
@@ -222,12 +232,13 @@ test "storage.hot_standby initial hidden FK HA payload preserves exact Raft rece
 }
 
 fn validatePageFields(request: db_types.BatchRequest) !void {
+    try @import("../db/artifact_inventory.zig").validateRequest(request);
     try @import("../db/online_source_contract.zig").validateRequest(request);
     try @import("../db/merge_page_contract.zig").validateRequest(request);
     if (request.merge_checkpoint) |checkpoint| {
         if ((checkpoint.page_source != null) != (checkpoint.page_receiver_namespace != null)) return error.InvalidMergePage;
         if (checkpoint.page_source) |source| {
-            if (checkpoint.kind != .begin_copy and !(checkpoint.kind == .accept and source.integrity != null)) return error.InvalidMergePage;
+            if (checkpoint.kind != .begin_copy and !(checkpoint.kind == .accept and (source.integrity != null or source.artifact_catalog != null))) return error.InvalidMergePage;
             try source.validate();
             const receiver = checkpoint.page_receiver_namespace.?;
             if (receiver.table_id == 0 or receiver.shard_id == 0 or receiver.range_id == 0) return error.InvalidMergePage;
@@ -505,6 +516,8 @@ pub fn encodeBatchMutationRequestAlloc(
     alloc: Allocator,
     request: db_types.BatchRequest,
 ) ![]u8 {
+    if (request.artifact_catalog != null) return error.InvalidArtifactCatalogCommand;
+    if (request.artifact_publication != null or request.artifact_publication_transport != null) return error.InvalidBatchRequest;
     if (batchMutationVersion(request) == 8) return error.InvalidInitialChildPublication;
     if (batchMutationVersion(request) == 10) return error.InvalidRestoreStagingCommand;
     if (request.relational_topology) |command| if (command.action == .seal_graph_retirement) return error.InvalidGraphRetirementSeal;
@@ -559,6 +572,164 @@ pub fn encodeOnlineSourceMutationRequestAlloc(alloc: Allocator, request: db_type
     }, .{});
 }
 
+pub fn encodeArtifactCatalogMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.RaftAppliedEntryIdentity) ![]u8 {
+    if (request.artifact_catalog == null or entry.term == 0 or entry.index == 0) return error.InvalidArtifactCatalogCommand;
+    try validatePageFields(request);
+    return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .schema_version = 12, .request = request, .artifact_catalog_raft_entry = entry, .online_source_applied_index = if (request.online_source != null) entry.index else null }, .{});
+}
+
+pub fn encodeArtifactPublicationMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.RaftAppliedEntryIdentity) ![]u8 {
+    if (request.artifact_publication == null or entry.term == 0 or entry.index == 0) return error.InvalidBatchRequest;
+    try @import("../db/artifact_publication.zig").validateRequest(alloc, request);
+    return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .schema_version = 14, .request = request, .artifact_publication_raft_entry = entry }, .{});
+}
+
+pub fn encodeArtifactPublicationTransportMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.RaftAppliedEntryIdentity) ![]u8 {
+    if (request.artifact_publication_transport == null or entry.term == 0 or entry.index == 0) return error.InvalidBatchRequest;
+    try @import("../db/artifact_publication_transport.zig").validateBatchRequest(request);
+    return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .schema_version = 16, .request = request, .artifact_publication_transport_raft_entry = entry }, .{});
+}
+
+pub fn encodeRaftBatchMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, entry: db_types.RaftAppliedEntryIdentity) ![]u8 {
+    const payload: BatchMutationPayload = .{ .schema_version = 15, .request = request, .ordinary_raft_entry = entry };
+    try validateOrdinaryRaftPayload(payload);
+    return std.json.Stringify.valueAlloc(alloc, payload, .{});
+}
+
+test "ordered artifact inventory standby finalization carries only the upload control and exact Raft identity" {
+    const alloc = std.testing.allocator;
+    const request: db_types.BatchRequest = .{ .artifact_publication_transport = .{ .action = .finalize, .namespace = @splat(1), .publication_digest = @splat(2), .manifest_root = @splat(3) } };
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchMutationRequestAlloc(alloc, request));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeRaftBatchMutationRequestAlloc(alloc, request, .{ .term = 4, .index = 5 }));
+    const bytes = try encodeArtifactPublicationTransportMutationRequestAlloc(alloc, request, .{ .term = 4, .index = 5 });
+    defer alloc.free(bytes);
+    try std.testing.expect(bytes.len < 4096);
+    const record: replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = bytes };
+    var decoded = try decodeBatchMutationRequest(alloc, record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 16), decoded.value.schema_version);
+    try std.testing.expectEqualDeep(request, decoded.value.request);
+    try std.testing.expectEqual(@as(u64, 5), decoded.value.artifact_publication_transport_raft_entry.?.index);
+    try std.testing.expect((try decodeRestoreFinishForReplay(alloc, record)) == null);
+}
+
+test "ordered artifact inventory standby baseline keeps discovery and apply cuts distinct" {
+    const alloc = std.testing.allocator;
+    const publication = @import("../db/artifact_publication.zig");
+    const row = try @import("../internal_keys.zig").relationalRowKeyAlloc(alloc, "row\x00\xff");
+    defer alloc.free(row);
+    var command: publication.Command = .{
+        .mode = .baseline,
+        .namespace = @splat(1),
+        .authority_epoch = 2,
+        .catalog_digest = @splat(3),
+        .producer_name = "",
+        .producer_generation = 0,
+        .sources = &.{},
+        .mutations = &.{},
+        .publication_digest = @splat(0),
+        .baseline = .{ .observed_term = 4, .observed_index = 5, .expected_cursor = "", .next_cursor = row, .upper_bound = row, .row_keys = &.{row}, .at_end = true },
+    };
+    command.publication_digest = command.digest();
+    const request: db_types.BatchRequest = .{ .artifact_publication = command };
+    const applied: db_types.RaftAppliedEntryIdentity = .{ .term = 6, .index = 9 };
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchMutationRequestAlloc(alloc, request));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeRaftBatchMutationRequestAlloc(alloc, request, applied));
+    const bytes = try encodeArtifactPublicationMutationRequestAlloc(alloc, request, applied);
+    defer alloc.free(bytes);
+    const record: replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = bytes };
+    var decoded = try decodeBatchMutationRequest(alloc, record);
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(request, decoded.value.request);
+    try std.testing.expectEqualDeep(applied, decoded.value.artifact_publication_raft_entry.?);
+    try std.testing.expectEqual(@as(u64, 5), decoded.value.request.artifact_publication.?.baseline.?.observed_index);
+}
+
+test "ordered artifact inventory standby validation retains epoch repairs and exact apply identity" {
+    const alloc = std.testing.allocator;
+    const publication = @import("../db/artifact_publication.zig");
+    var command: publication.Command = .{
+        .mode = .validate_inputs,
+        .namespace = @splat(1),
+        .authority_epoch = 2,
+        .catalog_digest = @splat(3),
+        .producer_name = "",
+        .producer_generation = 0,
+        .sources = &.{},
+        .mutations = &.{},
+        .publication_digest = @splat(0),
+        .validation = .{ .mutation_epoch = 11, .expected_cursor = "", .next_cursor = "\xff\x00proof", .at_end = true, .repair_documents = &.{"doc\xff"} },
+    };
+    command.publication_digest = command.digest();
+    const request: db_types.BatchRequest = .{ .artifact_publication = command };
+    const applied: db_types.RaftAppliedEntryIdentity = .{ .term = 6, .index = 9 };
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchMutationRequestAlloc(alloc, request));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeRaftBatchMutationRequestAlloc(alloc, request, applied));
+    const bytes = try encodeArtifactPublicationMutationRequestAlloc(alloc, request, applied);
+    defer alloc.free(bytes);
+    const record: replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = bytes };
+    var decoded = try decodeBatchMutationRequest(alloc, record);
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(request, decoded.value.request);
+    try std.testing.expectEqualDeep(applied, decoded.value.artifact_publication_raft_entry.?);
+}
+
+test "ordered artifact inventory standby census preserves page claims and exact apply identity" {
+    const alloc = std.testing.allocator;
+    const publication = @import("../db/artifact_publication.zig");
+    var command: publication.Command = .{
+        .mode = .census,
+        .namespace = @splat(1),
+        .authority_epoch = 2,
+        .catalog_digest = @splat(3),
+        .producer_name = "index\xff",
+        .producer_generation = 4,
+        .producer_artifact_name = "model\x00",
+        .sources = &.{},
+        .mutations = &.{},
+        .publication_digest = @splat(0),
+        .census = .{ .document_key = "doc\x80", .chunk_name = "chunk\x00", .before = @splat(5), .after = @splat(6) },
+    };
+    command.publication_digest = command.digest();
+    const request: db_types.BatchRequest = .{ .artifact_publication = command };
+    const applied: db_types.RaftAppliedEntryIdentity = .{ .term = 6, .index = 9 };
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchMutationRequestAlloc(alloc, request));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeRaftBatchMutationRequestAlloc(alloc, request, applied));
+    const bytes = try encodeArtifactPublicationMutationRequestAlloc(alloc, request, applied);
+    defer alloc.free(bytes);
+    const record: replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = bytes };
+    var decoded = try decodeBatchMutationRequest(alloc, record);
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(request, decoded.value.request);
+    try std.testing.expectEqualDeep(applied, decoded.value.artifact_publication_raft_entry.?);
+}
+
+test "ordered artifact inventory standby transport marker cannot masquerade as ordinary replay" {
+    const alloc = std.testing.allocator;
+    const raw = try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{
+        .schema_version = 15,
+        .request = .{},
+        .ordinary_raft_entry = .{ .term = 1, .index = 2 },
+        .artifact_publication_transport_raft_entry = .{ .term = 1, .index = 2 },
+    }, .{});
+    defer alloc.free(raw);
+    const record: replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = raw };
+    try std.testing.expectError(error.InvalidBatchRequest, decodeBatchMutationRequest(alloc, record));
+    try std.testing.expectError(error.InvalidBatchRequest, decodeRestoreFinishForReplay(alloc, record));
+}
+
+fn validateOrdinaryRaftPayload(payload: BatchMutationPayload) !void {
+    const entry = payload.ordinary_raft_entry orelse return error.InvalidBatchRequest;
+    if (payload.schema_version != 15 or entry.term == 0 or entry.index == 0 or
+        payload.native_topology_position != null or payload.artifact_publication_raft_entry != null or payload.artifact_publication_transport_raft_entry != null or payload.artifact_catalog_raft_entry != null or
+        payload.initial_child_raft_entry != null or payload.graph_retirement_raft_entry != null or payload.restore_generation_admission_raft_entry != null or
+        payload.online_source_applied_index != null or payload.restore_staging_bootstrap != null or payload.request.online_source != null)
+        return error.InvalidBatchRequest;
+    const base = batchMutationVersion(payload.request);
+    if (base > 7 and base != 11) return error.InvalidBatchRequest;
+    try validatePageFields(payload.request);
+}
+
 pub fn encodeBatchMutationWithRestoreBootstrapAlloc(alloc: Allocator, request: db_types.BatchRequest, bootstrap: @import("../db/restore_staging_contract.zig").OwnerBootstrap) ![]u8 {
     try validatePageFields(request);
     if (request.restore_staging == null or request.restore_staging.? != .begin or !std.mem.eql(u8, &request.restore_staging.?.begin.digest(), &bootstrap.scope.digest())) return error.InvalidRestoreStagingCommand;
@@ -604,7 +775,29 @@ pub fn decodeBatchMutationRequest(
         .allocate = .alloc_always,
     });
     errdefer parsed.deinit();
+    if (parsed.value.schema_version == 15) {
+        try validateOrdinaryRaftPayload(parsed.value);
+        return parsed;
+    }
+    if (parsed.value.ordinary_raft_entry != null) return error.InvalidBatchRequest;
+    if (parsed.value.schema_version == 13) {
+        try validateNativeTopologyPayload(alloc, parsed.value);
+        return parsed;
+    }
+    if (parsed.value.native_topology_position != null) return error.InvalidControlReceiptPosition;
     if (parsed.value.schema_version != batchMutationVersion(parsed.value.request)) return error.UnsupportedBatchMutationPayloadVersion;
+    if ((parsed.value.schema_version == 16) != (parsed.value.artifact_publication_transport_raft_entry != null)) return error.InvalidBatchRequest;
+    if (parsed.value.artifact_publication_transport_raft_entry) |entry| {
+        if (entry.term == 0 or entry.index == 0 or parsed.value.restore_staging_bootstrap != null) return error.InvalidBatchRequest;
+        try @import("../db/artifact_publication_transport.zig").validateBatchRequest(parsed.value.request);
+    }
+    if ((parsed.value.schema_version == 14) != (parsed.value.artifact_publication_raft_entry != null)) return error.InvalidBatchRequest;
+    if (parsed.value.artifact_publication_raft_entry) |entry| {
+        if (entry.term == 0 or entry.index == 0 or parsed.value.restore_staging_bootstrap != null) return error.InvalidBatchRequest;
+        try @import("../db/artifact_publication.zig").validateRequest(alloc, parsed.value.request);
+    }
+    if ((parsed.value.schema_version == 12) != (parsed.value.artifact_catalog_raft_entry != null)) return error.InvalidArtifactCatalogCommand;
+    if (parsed.value.artifact_catalog_raft_entry) |entry| if (entry.term == 0 or entry.index == 0) return error.InvalidArtifactCatalogCommand;
     if ((parsed.value.schema_version == 8) != (parsed.value.initial_child_raft_entry != null)) return error.InvalidInitialChildPublication;
     if (parsed.value.initial_child_raft_entry) |entry| if (entry.term == 0 or entry.index == 0) return error.InvalidInitialChildPublication;
     const graph_seal = if (parsed.value.request.relational_topology) |command| command.action == .seal_graph_retirement else false;
@@ -617,6 +810,23 @@ pub fn decodeBatchMutationRequest(
     if ((parsed.value.request.online_source != null) != (parsed.value.online_source_applied_index != null)) return error.MissingOnlineSourceAppliedIndex;
     try validatePageFields(parsed.value.request);
     return parsed;
+}
+
+fn validateNativeTopologyPayload(alloc: Allocator, payload: BatchMutationPayload) !void {
+    const stamp = payload.native_topology_position orelse return error.InvalidControlReceiptPosition;
+    try stamp.validate();
+    if (payload.schema_version != 13 or payload.ordinary_raft_entry != null or payload.artifact_catalog_raft_entry != null or payload.artifact_publication_raft_entry != null or
+        payload.initial_child_raft_entry != null or payload.graph_retirement_raft_entry != null or
+        payload.restore_generation_admission_raft_entry != null or payload.online_source_applied_index != null or
+        payload.restore_staging_bootstrap != null) return error.InvalidControlReceiptPosition;
+    try @import("../db/native_topology_receipt.zig").validateRequest(alloc, payload.request);
+    if (!stamp.namespace.eql(payload.request.relational_topology.?.fence.namespace)) return error.IdentityNamespaceMismatch;
+}
+
+pub fn encodeNativeTopologyMutationRequestAlloc(alloc: Allocator, request: db_types.BatchRequest, stamp: @import("../db/receipt_position.zig").Native) ![]u8 {
+    const payload: BatchMutationPayload = .{ .schema_version = 13, .request = request, .native_topology_position = stamp };
+    try validateNativeTopologyPayload(alloc, payload);
+    return std.json.Stringify.valueAlloc(alloc, payload, .{});
 }
 
 /// Inspect only the fixed-size restore completion proof on duplicate replay.
@@ -632,8 +842,13 @@ pub fn decodeRestoreFinishForReplay(
     const Finish = @FieldType(@import("../db/restore_staging_contract.zig").Control, "finish");
     const Projection = struct {
         schema_version: u32 = 1,
+        ordinary_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+        artifact_publication_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
+        artifact_publication_transport_raft_entry: ?db_types.RaftAppliedEntryIdentity = null,
         online_source_applied_index: ?u64 = null,
         request: struct {
+            artifact_publication: ?struct {} = null,
+            artifact_publication_transport: ?struct {} = null,
             restore_staging: ?struct { finish: ?Finish = null } = null,
             online_source: ?struct {} = null,
             merge_page: ?struct { source: struct { retention: ?struct {} = null, integrity: ?struct {} = null }, chunk: ?struct {} = null, next_snapshot_position: ?struct {} = null } = null,
@@ -642,6 +857,42 @@ pub fn decodeRestoreFinishForReplay(
     };
     var parsed = try std.json.parseFromSlice(Projection, alloc, record.payload, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
+    if (parsed.value.schema_version == 15) {
+        const entry = parsed.value.ordinary_raft_entry orelse return error.InvalidBatchRequest;
+        if (entry.term == 0 or entry.index == 0 or parsed.value.artifact_publication_raft_entry != null or
+            parsed.value.artifact_publication_transport_raft_entry != null or parsed.value.request.artifact_publication_transport != null or
+            parsed.value.request.artifact_publication != null or parsed.value.request.online_source != null or parsed.value.online_source_applied_index != null)
+            return error.InvalidBatchRequest;
+        return if (parsed.value.request.restore_staging) |staging| staging.finish else null;
+    }
+    if (parsed.value.ordinary_raft_entry != null) return error.InvalidBatchRequest;
+    if (parsed.value.schema_version == 16) {
+        const entry = parsed.value.artifact_publication_transport_raft_entry orelse return error.InvalidBatchRequest;
+        if (entry.term == 0 or entry.index == 0 or parsed.value.request.artifact_publication_transport == null or
+            parsed.value.artifact_publication_raft_entry != null or parsed.value.request.artifact_publication != null or
+            parsed.value.request.restore_staging != null) return error.InvalidBatchRequest;
+        var control = try decodeBatchMutationRequest(alloc, record);
+        defer control.deinit();
+        return null;
+    }
+    if (parsed.value.schema_version == 14) {
+        const entry = parsed.value.artifact_publication_raft_entry orelse return error.InvalidBatchRequest;
+        if (entry.term == 0 or entry.index == 0 or parsed.value.request.artifact_publication == null or
+            parsed.value.request.restore_staging != null or parsed.value.request.online_source != null or
+            parsed.value.request.merge_page != null or parsed.value.request.merge_checkpoint != null or
+            parsed.value.online_source_applied_index != null) return error.InvalidBatchRequest;
+        // This projection is only used after the full envelope was applied.
+        // Scan immutable payload bytes without cloning large artifact values.
+        return null;
+    }
+    if (parsed.value.artifact_publication_raft_entry != null or parsed.value.request.artifact_publication != null) return error.UnsupportedBatchMutationPayloadVersion;
+    if (parsed.value.schema_version == 13) {
+        // Native control envelopes are bounded control records, not row
+        // batches. Validate their full authority before accepting a duplicate.
+        var control = try decodeBatchMutationRequest(alloc, record);
+        defer control.deinit();
+        return null;
+    }
     const has_page = parsed.value.request.merge_page != null or if (parsed.value.request.merge_checkpoint) |checkpoint|
         checkpoint.page_source != null or checkpoint.page_receiver_namespace != null
     else

@@ -65,6 +65,27 @@ const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const storage_snapshot_source = @import("storage_snapshot_source.zig");
 const storage_maintenance_source = @import("storage_maintenance_source.zig");
 const table_write_source = @import("table_write_source.zig");
+
+// ProvisionSummary.indexes_pending is the coarse maintenance retry debt,
+// not a public index count. A busy owner has not proved its catalog complete
+// even when no individual index was inspected. Keep one retry token until a
+// full pass succeeds; never turn a degraded owner into endless pending work.
+fn structuralReconcilePending(result: table_write_source.LocalStructuralReconcileResult) !usize {
+    return switch (result.state) {
+        .complete => @intCast(result.indexes_pending),
+        .busy, .repair_pending, .restore_repair_pending => @intCast(@max(1, result.indexes_pending)),
+        .degraded => error.StorageKernelReconcileDegraded,
+    };
+}
+
+test "owner catalog busy without index debt keeps provisioning retry until full reconciliation" {
+    try std.testing.expectEqual(@as(usize, 1), try structuralReconcilePending(.{ .state = .busy }));
+    try std.testing.expectEqual(@as(usize, 1), try structuralReconcilePending(.{ .state = .repair_pending }));
+    try std.testing.expectEqual(@as(usize, 1), try structuralReconcilePending(.{ .state = .restore_repair_pending }));
+    try std.testing.expectEqual(@as(usize, 3), try structuralReconcilePending(.{ .state = .busy, .indexes_pending = 3 }));
+    try std.testing.expectEqual(@as(usize, 0), try structuralReconcilePending(.{ .state = .complete }));
+    try std.testing.expectError(error.StorageKernelReconcileDegraded, structuralReconcilePending(.{ .state = .degraded }));
+}
 const http_routes = @import("http_routes.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const transaction_recovery_source = @import("transaction_recovery_source.zig");
@@ -1418,16 +1439,28 @@ fn requireInitialChildRetirementRecord(
     observation: InitialChildRetirementObservation,
     proof: ?InitialFkRetirementProof,
 ) !void {
+    return requireInitialChildRetirementRecordForPurpose(observation, proof, .physical_cleanup);
+}
+
+const InitialChildRetirementPurpose = enum { prepare_intent, physical_cleanup };
+
+fn requireInitialChildRetirementRecordForPurpose(
+    observation: InitialChildRetirementObservation,
+    proof: ?InitialFkRetirementProof,
+    purpose: InitialChildRetirementPurpose,
+) !void {
     const value = observation.record orelse {
         if (observation.initial_fk_root_generation != 0) return error.InitialChildRetirementProofUnavailable;
         return;
     };
     if (value.phase != .released and proof == null) return error.InitialFkRetirementTicketRequired;
     if (proof) |expected| {
-        // The plan identity alone cannot advance a still-hidden owner into
-        // retirement. Its local Raft publication must have durably accepted
-        // the cancellation before the physical cleanup can start.
-        if (value.phase != .canceled) return error.InitialChildPublicationChanged;
+        // A prepared journal is written BEFORE the cancel metadata CAS; it
+        // binds identity but authorizes no unlink. Recovery independently
+        // requires terminal metadata ownership plus the canceled cold record.
+        // A released owner can never be canceled by this journal protocol.
+        if (value.phase == .released or (purpose == .physical_cleanup and value.phase != .canceled))
+            return error.InitialChildPublicationChanged;
         if (value.namespace.table_id != expected.child_table_id or
             !std.mem.eql(u8, &value.plan_id, &expected.plan_id) or
             !std.mem.eql(u8, &value.plan_digest, &expected.plan_digest))
@@ -1457,6 +1490,10 @@ fn testPrivateInitialChildRetirementProof() !void {
         .plan_digest = record.plan_digest,
     };
     try std.testing.expectError(error.InitialChildPublicationChanged, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, proof));
+    try requireInitialChildRetirementRecordForPurpose(.{ .initial_fk_root_generation = 4, .record = record }, proof, .prepare_intent);
+    var wrong = proof;
+    wrong.plan_digest = @splat(99);
+    try std.testing.expectError(error.InitialChildPublicationChanged, requireInitialChildRetirementRecordForPurpose(.{ .initial_fk_root_generation = 4, .record = record }, wrong, .prepare_intent));
     record.phase = .canceled;
     record.phase_term = 2;
     record.phase_index = 4;
@@ -1468,6 +1505,7 @@ fn testPrivateInitialChildRetirementProof() !void {
         .plan_digest = record.plan_digest,
     }));
     record.phase = .released;
+    try std.testing.expectError(error.InitialChildPublicationChanged, requireInitialChildRetirementRecordForPurpose(.{ .initial_fk_root_generation = 4, .record = record }, proof, .prepare_intent));
     try requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, null);
     try std.testing.expectError(error.InitialChildPublicationChanged, requireInitialChildRetirementRecord(.{ .initial_fk_root_generation = 4, .record = record }, proof));
     try requireInitialChildRetirementRecord(.{}, null);
@@ -9617,6 +9655,7 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         proof: ?InitialFkRetirementProof,
+        purpose: InitialChildRetirementPurpose,
     ) !void {
         const group_path = try std.fmt.allocPrint(alloc, "{s}/group-{d}", .{ self.replica_root_dir, group_id });
         defer alloc.free(group_path);
@@ -9649,7 +9688,7 @@ pub const ProvisionedTableWriteSource = struct {
         };
         if (!db_present and observation.initial_fk_root_generation != 0)
             return error.InitialChildRetirementProofUnavailable;
-        try requireInitialChildRetirementRecord(observation, proof);
+        try requireInitialChildRetirementRecordForPurpose(observation, proof, purpose);
     }
 
     fn executeReplicaRetirementCleanup(
@@ -9659,8 +9698,42 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: ?[]const u8,
         initial_fk_proof: ?InitialFkRetirementProof,
     ) !void {
+        return self.executeReplicaRetirementCleanupWithAction(alloc, group_id, table_name, initial_fk_proof, null);
+    }
+
+    pub const QuiescedReplicaAction = struct {
+        ptr: *anyopaque,
+        run: *const fn (*anyopaque) anyerror!void,
+    };
+
+    /// The caller holds the exact replica placement/Raft lease. This seam
+    /// drains physical owners and caches, then runs the ticket-bound durable
+    /// rename while those reservations remain held. It never schedules the
+    /// generic retirement journal, whose identity is weaker than the ticket.
+    pub fn withQuiescedInitialFkReplica(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        proof: InitialFkRetirementProof,
+        action: QuiescedReplicaAction,
+    ) !void {
+        try proof.validate();
+        return self.executeReplicaRetirementCleanupWithAction(alloc, group_id, null, proof, action);
+    }
+
+    fn executeReplicaRetirementCleanupWithAction(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: ?[]const u8,
+        initial_fk_proof: ?InitialFkRetirementProof,
+        action: ?QuiescedReplicaAction,
+    ) !void {
         if (group_id == 0) return error.InvalidArgument;
-        try self.requireInitialChildRetirementProof(alloc, group_id, initial_fk_proof);
+        // A custom ticket-bound continuation performs its own cold exact
+        // proof, may durably cancel hidden AICH, and rechecks canceled state
+        // before unlink. Generic retirement still requires prior cancellation.
+        if (action == null) try self.requireInitialChildRetirementProof(alloc, group_id, initial_fk_proof, .physical_cleanup);
         try self.beginReplicaRetirementActivity(group_id, table_name);
         var retirement_active = true;
         errdefer if (retirement_active) self.endReplicaRetirementActivity(group_id);
@@ -9710,7 +9783,10 @@ pub const ProvisionedTableWriteSource = struct {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         self.invalidateSharedPathCaches(path);
-        const trash_path = try moveRetiredReplicaPathToTrash(alloc, self.replica_root_dir, group_id);
+        const trash_path = if (action) |custom| blk: {
+            try custom.run(custom.ptr);
+            break :blk null;
+        } else try moveRetiredReplicaPathToTrash(alloc, self.replica_root_dir, group_id);
 
         // The atomic rename is the logical deletion boundary. Release cache
         // and activity reservations before potentially slow recursive I/O;
@@ -9975,11 +10051,11 @@ pub const ProvisionedTableWriteSource = struct {
             .alloc = alloc,
             .intents = try alloc.alloc(PersistedReplicaRetirementIntent, 0),
         };
-        // Fail before creating even a prepared journal entry. Recovery repeats
-        // this cold proof immediately before the physical rename, so a process
-        // restart cannot turn an old generic journal into hidden-owner unlink.
+        // Bind exact cold identity before creating a prepared journal. A hidden
+        // owner may be journaled before the cancel CAS, but physical cleanup
+        // separately requires durable cancellation and terminal ownership.
         for (targets) |target|
-            try self.requireInitialChildRetirementProof(alloc, target.group_id, target.initial_fk_proof);
+            try self.requireInitialChildRetirementProof(alloc, target.group_id, target.initial_fk_proof, .prepare_intent);
 
         // Clone and canonicalize caller memory before reserving any shared
         // state. The short ownership phase below contains no filesystem work.
@@ -14507,8 +14583,9 @@ pub const ProvisionedTableWriteSource = struct {
                 )) orelse return error.StorageKernelOwnerUnavailable;
                 summary.indexes_added += @intCast(result.indexes_added);
                 summary.indexes_removed += @intCast(result.indexes_removed);
-                summary.indexes_pending += @intCast(result.indexes_pending);
-                if (result.indexes_pending != 0) {
+                const pending = try structuralReconcilePending(result);
+                summary.indexes_pending += pending;
+                if (pending != 0) {
                     self.notifyLocalIndexRepairDebt(table.name, group_id, .signal_runnable);
                 }
             }
@@ -23542,7 +23619,8 @@ pub const ProvisionedTableWriteSource = struct {
             const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
             return try owner.replicatedBatchGroupLocal(alloc, group_id, table_name, req, metadata_prepared, entry);
         } else {
-            if (metadata_prepared or self.raft_batcher != null or self.ha_write_gate != null or
+            if (metadata_prepared or self.raft_batcher != null or
+                (self.ha_write_gate != null and self.ha_async_mirror == null) or
                 req.row_policy_publication == null or req.row_policy_install_bundle.len == 0 or
                 req.row_policy_principal_proof.len != 0 or req.row_policy_database.len != 0 or
                 req.row_policy_admitted_at_seconds != 0 or req.range_guards.len != 0 or
@@ -23562,6 +23640,16 @@ pub const ProvisionedTableWriteSource = struct {
                 req.merge_checkpoint != null or req.merge_replication != null or
                 req.merge_page != null or req.merge_artifacts.len != 0 or req.transaction != null)
                 return error.RowPolicyUnsupported;
+            // A local policy phase is HA-safe only when the opened owner can
+            // durably mirror its receipt into the same fenced primary log as
+            // the metadata decision. The DB checks the pinned gate again at
+            // commit, after this preflight and any cache/open work.
+            if (self.ha_async_mirror) |mirror| {
+                if (self.ha_write_gate == null) return error.RowPolicyUnsupported;
+                if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+                    return error.RowPolicyUnsupported;
+            }
+            try enforceHAWriteGateOptional(self.ha_write_gate);
             const applied = entry orelse return error.InvalidBatchRequest;
             const cache = self.write_cache orelse return error.RowPolicyUnsupported;
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);

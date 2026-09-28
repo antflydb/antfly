@@ -276,9 +276,12 @@ pub const MergeReplicationCheckpoint = struct {
     allow_doc_identity_reassignment: bool = false,
     receiver_identity_reassignment_namespace: ?doc_identity_mod.Namespace = null,
     /// Opt-in immutable source binding for atomic, resumable receiver pages.
-    /// Only begin_copy may install it; ordinary checkpoint payloads stay empty.
+    /// Installed by begin_copy or artifact/integrity-aware acceptance;
+    /// ordinary checkpoint payloads stay empty.
     page_source: ?@import("merge_page_contract.zig").Source = null,
     page_receiver_namespace: ?doc_identity_mod.Namespace = null,
+    /// Exact source layouts installed once with the protocol-15 copy receipt.
+    page_source_catalogs: ?@import("artifact_inventory.zig").Catalogs = null,
 };
 
 /// Private data-Raft command used by the distributed transaction protocol.
@@ -341,6 +344,13 @@ pub const BatchRequest = struct {
     schema_version: ?u32 = null,
     /// Private, replicated source-retention lifecycle. Never accepted by public JSON.
     online_source: ?@import("online_source_contract.zig").Command = null,
+    /// Ordered complete artifact catalog; accepted only by private Raft ingress.
+    artifact_catalog: ?@import("artifact_inventory.zig").Command = null,
+    /// Exact producer result; only authenticated owner-leader Raft ingress.
+    artifact_publication: ?@import("artifact_publication.zig").Command = null,
+    /// Bounded authenticated upload stages for a large ordered publication.
+    /// Only the owner leader proposes these private controls.
+    artifact_publication_transport: ?@import("artifact_publication_transport.zig").Request = null,
     /// Private replicated hidden-owner lifecycle; public JSON cannot set it.
     restore_staging: ?@import("restore_staging_contract.zig").Control = null,
     restore_staging_scope: ?[32]u8 = null,

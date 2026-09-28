@@ -10,6 +10,7 @@ const transactions = @import("transactions.zig");
 const catalog = @import("../sql/catalog.zig");
 const ast = @import("../sql/ast.zig");
 const Budget = @import("../sql/memory_budget.zig");
+const connection_record = @import("sql_connection_record.zig");
 
 const key = "\x00sql-prepared-v1";
 pub const max_resources = 128;
@@ -55,6 +56,10 @@ pub const Resource = struct {
     /// executed against another session's (possibly policy-sensitive) values.
     /// Null preserves the original session-independent resource contract.
     session_id: ?[32]u8 = null,
+    /// Idle HTTP connection ownership is distinct from an active transaction.
+    /// The generation is fenced atomically with DISCARD ALL in the same store.
+    connection_id: ?[32]u8 = null,
+    connection_generation: ?u64 = null,
     /// The described types depend on the scoped setting definitions, not on
     /// the mutable session values. Execution re-reads values at its own cut.
     setting_epoch: ?u64 = null,
@@ -88,20 +93,24 @@ const Action = union(enum) { create: Resource, close: []const u8 };
 
 pub fn create(store: *transactions.DurableSessionStore, resource: Resource, now_ms: u64) !void {
     if (resource.statement.len == 0 or resource.statement.len > max_statement_bytes or resource.bindings.len > 64 or resource.parameter_types.len > 1024 or resource.expires_at_ms <= now_ms or resource.expires_at_ms - now_ms > ttl_ms) return error.SqlProgramLimitExceeded;
-    _ = try access(store, store.alloc, .{ .create = resource }, resource.principal, resource.owner_node_id, now_ms);
+    try access(store, store.alloc, .{ .create = resource }, resource.principal, resource.owner_node_id, now_ms, resource.connection_id);
 }
 
 pub fn load(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, id: []const u8, principal: []const u8, owner_node_id: u64, now_ms: u64) !Owned {
+    return loadForConnection(store, alloc, id, principal, owner_node_id, now_ms, null);
+}
+
+pub fn loadForConnection(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, id: []const u8, principal: []const u8, owner_node_id: u64, now_ms: u64, connection_id: ?[32]u8) !Owned {
     return switch (store.backend) {
         .docstore => |backend| blk: {
             var txn = try backend.beginReadTxn();
             defer txn.abort();
-            break :blk try loadTxn(&txn, alloc, id, principal, owner_node_id, now_ms);
+            break :blk try loadTxn(&txn, alloc, id, principal, owner_node_id, now_ms, connection_id);
         },
         .runtime => |backend| blk: {
             var txn = try backend.beginRead();
             defer txn.abort();
-            break :blk try loadTxn(&txn, alloc, id, principal, owner_node_id, now_ms);
+            break :blk try loadTxn(&txn, alloc, id, principal, owner_node_id, now_ms, connection_id);
         },
     };
 }
@@ -115,7 +124,7 @@ fn resourceKey(id: []const u8) ![key.len + 1 + 32]u8 {
     return result;
 }
 
-fn loadTxn(txn: anytype, alloc: std.mem.Allocator, id: []const u8, principal: []const u8, owner_node_id: u64, now_ms: u64) !Owned {
+fn loadTxn(txn: anytype, alloc: std.mem.Allocator, id: []const u8, principal: []const u8, owner_node_id: u64, now_ms: u64, connection_id: ?[32]u8) !Owned {
     const resource_key = try resourceKey(id);
     const raw = txn.get(&resource_key) catch |err| switch (err) {
         error.NotFound => return error.SqlPreparedNotFound,
@@ -130,30 +139,42 @@ fn loadTxn(txn: anytype, alloc: std.mem.Allocator, id: []const u8, principal: []
     if (value.value.statement.len > max_statement_bytes or value.value.bindings.len > 64 or value.value.parameter_types.len > 1024) return error.SqlProgramLimitExceeded;
     if (value.value.expires_at_ms <= now_ms or !std.mem.eql(u8, value.value.principal, principal) or !std.mem.eql(u8, &value.value.id, id)) return error.SqlPreparedNotFound;
     if (value.value.owner_node_id != owner_node_id) return error.SqlPreparedWrongOwner;
+    if (value.value.connection_id) |bound| {
+        const supplied = connection_id orelse return error.SqlPreparedNotFound;
+        if (!std.mem.eql(u8, &bound, &supplied)) return error.SqlPreparedNotFound;
+        var connection = try connection_record.loadTxn(txn, alloc, &bound);
+        defer connection.deinit();
+        try connection.value.requireOwner(&bound, principal, owner_node_id, now_ms);
+        if (value.value.connection_generation != connection.value.generation) return error.SqlPreparedNotFound;
+    } else if (connection_id != null or value.value.connection_generation != null) return error.SqlPreparedNotFound;
     return .{ .alloc = alloc, .budget = budget, .parsed = value, .value = value.value };
 }
 
 pub fn close(store: *transactions.DurableSessionStore, id: []const u8, principal: []const u8, owner_node_id: u64, now_ms: u64) !void {
-    _ = try access(store, store.alloc, .{ .close = id }, principal, owner_node_id, now_ms);
+    try access(store, store.alloc, .{ .close = id }, principal, owner_node_id, now_ms, null);
 }
 
-fn access(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64) !void {
+pub fn closeForConnection(store: *transactions.DurableSessionStore, id: []const u8, principal: []const u8, owner_node_id: u64, now_ms: u64, connection_id: [32]u8) !void {
+    try access(store, store.alloc, .{ .close = id }, principal, owner_node_id, now_ms, connection_id);
+}
+
+fn access(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64, connection_id: ?[32]u8) !void {
     if (store.fail_writes_for_test) return error.InjectedSessionStoreFailure;
     return switch (store.backend) {
         .docstore => |backend| blk: {
             var txn = try backend.beginWriteTxn();
             errdefer txn.abort();
-            break :blk try accessTxn(&txn, alloc, action, principal, owner_node_id, now_ms);
+            break :blk try accessTxn(&txn, alloc, action, principal, owner_node_id, now_ms, connection_id);
         },
         .runtime => |backend| blk: {
             var txn = try backend.beginWrite();
             errdefer txn.abort();
-            break :blk try accessTxn(&txn, alloc, action, principal, owner_node_id, now_ms);
+            break :blk try accessTxn(&txn, alloc, action, principal, owner_node_id, now_ms, connection_id);
         },
     };
 }
 
-fn accessTxn(txn: anytype, alloc: std.mem.Allocator, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64) !void {
+fn accessTxn(txn: anytype, alloc: std.mem.Allocator, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64, connection_id: ?[32]u8) !void {
     const raw = txn.get(key) catch |err| switch (err) {
         error.NotFound => "{}",
         else => return err,
@@ -173,7 +194,7 @@ fn accessTxn(txn: anytype, alloc: std.mem.Allocator, action: Action, principal: 
         .close => |value| value,
     };
     if (action == .close) {
-        var owned = try loadTxn(txn, alloc, id, principal, owner_node_id, now_ms);
+        var owned = try loadTxn(txn, alloc, id, principal, owner_node_id, now_ms, connection_id);
         owned.deinit();
     }
     for (parsed.value.resources) |resource| {
@@ -196,6 +217,22 @@ fn accessTxn(txn: anytype, alloc: std.mem.Allocator, action: Action, principal: 
     switch (action) {
         .close => if (!found) return error.SqlPreparedNotFound,
         .create => |resource| {
+            if (resource.connection_id) |bound| {
+                if (resource.connection_generation == null) return error.InvalidSqlConnection;
+                var connection = try connection_record.loadTxn(txn, alloc, &bound);
+                defer connection.deinit();
+                try connection.value.requireOwner(&bound, principal, owner_node_id, now_ms);
+                if (connection.value.generation != resource.connection_generation.?) return error.SqlConnectionChanged;
+                switch (connection.value.state) {
+                    .idle => if (resource.session_id != null) return error.SqlTransactionNotActive,
+                    .active => {
+                        const attached = resource.session_id orelse return error.SqlTransactionNotActive;
+                        const active_hex = std.fmt.bytesToHex(connection.value.active_txn.?, .lower);
+                        if (!std.mem.eql(u8, &attached, &active_hex)) return error.SqlTransactionNotActive;
+                    },
+                    .beginning, .uncertain => return error.SqlConnectionBusy,
+                }
+            } else if (resource.connection_generation != null) return error.InvalidSqlConnection;
             if (count == max_resources) return error.SqlWriteCapacityUnavailable;
             const encoded_resource = try std.json.Stringify.valueAlloc(scratch, resource, .{});
             defer scratch.free(encoded_resource);
@@ -213,6 +250,48 @@ fn accessTxn(txn: anytype, alloc: std.mem.Allocator, action: Action, principal: 
     if (total_bytes > max_record_bytes -| encoded.len) return error.SqlProgramLimitExceeded;
     try txn.put(key, encoded);
     try txn.commit();
+}
+
+/// Called only from the connection's native write transaction. The caller
+/// bumps its generation and clears its setting overlay in that same commit.
+/// Other principals and other connections' resources are never inspected by
+/// identity alone, much less deleted.
+pub fn discardConnectionTxn(txn: anytype, alloc: std.mem.Allocator, connection_id: [32]u8) !usize {
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    if (raw.len > 64 << 10) return error.SqlProgramLimitExceeded;
+    var parsed = try std.json.parseFromSlice(Directory, alloc, raw, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    if (parsed.value.resources.len > max_resources) return error.SqlProgramLimitExceeded;
+    var retained: [max_resources]Entry = undefined;
+    var count: usize = 0;
+    var removed: usize = 0;
+    for (parsed.value.resources) |entry| {
+        const resource_key = try resourceKey(&entry.id);
+        const bytes = txn.get(&resource_key) catch |err| switch (err) {
+            error.NotFound => return error.InvalidSqlPreparedDirectory,
+            else => return err,
+        };
+        if (bytes.len > max_resource_bytes) return error.SqlProgramLimitExceeded;
+        var resource = try std.json.parseFromSlice(Resource, alloc, bytes, .{ .allocate = .alloc_always });
+        defer resource.deinit();
+        if (!std.mem.eql(u8, &resource.value.id, &entry.id)) return error.InvalidSqlPreparedDirectory;
+        if (resource.value.connection_id) |owner| {
+            if (std.mem.eql(u8, &owner, &connection_id)) {
+                try txn.delete(&resource_key);
+                removed += 1;
+                continue;
+            }
+        }
+        retained[count] = entry;
+        count += 1;
+    }
+    const encoded = try std.json.Stringify.valueAlloc(alloc, Directory{ .resources = retained[0..count] }, .{});
+    defer alloc.free(encoded);
+    try txn.put(key, encoded);
+    return removed;
 }
 
 test "SQL prepared durable directory preserves ownership expiry admission and loaded execution" {

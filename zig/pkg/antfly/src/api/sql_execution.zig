@@ -122,6 +122,10 @@ pub const Adapter = struct {
     target: ?system_catalog.Target = null,
     outcome_transaction_id: ?[32]u8 = null,
     session_id: ?[]const u8 = null,
+    /// Durable idle HTTP connection identity, never an alias for session_id.
+    connection_id: ?[32]u8 = null,
+    connection_revision: ?u64 = null,
+    connection_generation: ?u64 = null,
     result_session_id: ?[32]u8 = null,
     transaction_status: @import("../sql/session.zig").Status = .idle,
     active_transaction: ?[16]u8 = null,
@@ -169,12 +173,13 @@ pub const Adapter = struct {
             const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return error.SqlTransactionNotActive;
             if (try self.server.txn_sessions.principalAccess(self.server.alloc, id, http_server.transactionPrincipal(self.identity.*)) != .allowed) return error.SqlTransactionNotActive;
             inherited = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
+            if (!std.meta.eql(inherited.?.connection_id, self.connection_id)) return error.SqlConnectionNotFound;
             if (self.inherit_session_database) self.database = inherited.?.metadata.database;
             if (self.inherit_session_namespace) self.namespace = inherited.?.metadata.namespace;
             self.setting_overlay = try attachedSettingOverlay(self.setting_overlay_source, self.setting_overlay, inherited.?.setting_active.items);
         }
         var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context };
-        var owner = session_api.Adapter{ .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server) };
+        var owner = session_api.Adapter{ .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay };
         var session = sessions.Session{ .owner = owner.owner(), .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .namespace = self.session_namespace orelse self.namespace } };
         if (self.session_id) |encoded| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return error.SqlTransactionNotActive;

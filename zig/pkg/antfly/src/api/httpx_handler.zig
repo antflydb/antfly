@@ -383,10 +383,10 @@ fn witnessDDLError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         error.ReservedForeignKeySupportIndex => jsonErrorResponse(ctx, 400, "__fk_partial_ indexes are server-owned foreign-key support; edit or retire the foreign key instead"),
         error.ForeignKeyPartialSupportIndexConflict => jsonErrorResponse(ctx, 409, "foreign-key support index name conflicts with an existing definition"),
         error.ForeignKeyPartialSupportIndexRequired, error.RelationalIndexNotReady => jsonErrorResponse(ctx, 409, "foreign-key support changed or is still building; refresh the schema and retry"),
-        error.ForeignKeyInitialSelfReferenceUnsupported => jsonErrorResponse(ctx, 409, "initial self-referential foreign-key publication is unavailable on this deployment; no table was created"),
         error.ForeignKeyTargetNotUnique, error.ForeignKeyTypeMismatch, error.ForeignKeyParentTableNotFound => jsonErrorResponse(ctx, 400, "foreign key requires an existing parent with a matching ordered unique key and compatible scalar column types"),
         error.TableGenerationChanged, error.SchemaVersionChanged, error.TableTransitionActive, error.ConstraintRetirementInProgress => jsonErrorResponse(ctx, 409, "parent schema changed or has active maintenance; refresh and retry"),
         error.MetadataUnavailable, error.NotLeader, error.ProposalDropped => jsonErrorResponse(ctx, 503, "foreign-key support metadata is unavailable; retry"),
+        error.SettingAuthorityUnavailable => jsonErrorResponse(ctx, 503, "metadata setting authority is not configured; contact an operator before retrying foreign-key publication"),
         error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => jsonErrorResponse(ctx, 400, "invalid relational schema definition"),
         error.UnsupportedRestoreSource => jsonErrorResponse(ctx, 409, "online schema rewrite requires row-derived indexes and completed source maintenance; independently authored artifacts are unsupported"),
         error.UnknownSchemaVersion, error.RestoreStagingScopeChanged => jsonErrorResponse(ctx, 409, "schema rewrite source definitions are incomplete or changed; verify source schema history and refresh before retrying"),
@@ -405,6 +405,32 @@ fn witnessDDLError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         error.MetadataMutationOutcomeUnknown => AntflyApiHandler.metadataMutationOutcomeUnknownResponse(ctx),
         else => err,
     };
+}
+
+const fk_publication_upgrade_message = "coordinated foreign-key publication requires a metadata cluster upgrade; no schema change was admitted";
+
+fn fkPublicationUpgradeRequired(err: anyerror) bool {
+    // Only the exact all-member decoder rejection proves the DDL was not
+    // proposed. Unknown metadata or transport outcomes must retain their
+    // separate recovery path and must never be advertised as safe to replay.
+    return err == error.TableTopologyProtocolUpgradeRequired;
+}
+
+test "FK publication upgrade response excludes unknown mutation outcomes" {
+    try std.testing.expect(fkPublicationUpgradeRequired(error.TableTopologyProtocolUpgradeRequired));
+    try std.testing.expect(!fkPublicationUpgradeRequired(error.MetadataMutationOutcomeUnknown));
+    try std.testing.expect(!fkPublicationUpgradeRequired(error.NotLeader));
+}
+
+test "FK publication reports missing setting authority as service unavailable" {
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/tables/docs/schema");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try witnessDDLError(&ctx, error.SettingAuthorityUnavailable);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "setting authority") != null);
 }
 
 fn foreignKeyParentsAllowed(alloc: std.mem.Allocator, identity: ?AuthenticatedIdentity, schema_json: []const u8) !bool {
@@ -2582,7 +2608,9 @@ pub const AntflyApiHandler = struct {
             ctx.request.uri.query orelse "",
         ) catch return textResponse(ctx, 400, "invalid lookup options");
         defer lookup_options.deinit(ctx.allocator);
-        if (std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}")) {
+        if (std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
+            std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}"))
+        {
             // A legacy unauthenticated internal peer must never gain the
             // hidden, unfenced receipt capability merely by setting a query
             // parameter. Public route middleware is not sufficient here.
@@ -4426,7 +4454,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, "")) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+        if (!(try self.api_server.transactionSessionReadable(txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
@@ -4802,6 +4830,7 @@ pub const AntflyApiHandler = struct {
             error.CatalogRoutingSnapshotTimeout,
             error.ReadIndexUnavailable,
             error.StorageReadTemporarilyUnavailable,
+            error.GenerationTransitionActive,
             error.ConcurrencyUnavailable,
             error.NotLeader,
             error.LeaderUnavailable,
@@ -5366,6 +5395,8 @@ pub const AntflyApiHandler = struct {
         prepared_id: ?[]const u8 = null,
         prepared_response: ?[]const u8 = null,
         prepared_response_budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 16 << 20 },
+        connection_owned: ?@import("sql_connections.zig").Owned = null,
+        connection_session_hex: [32]u8 = undefined,
 
         fn run(self: *@This()) void {
             // Wake on the executor that owns the request waiter, not the
@@ -5382,8 +5413,34 @@ pub const AntflyApiHandler = struct {
             const prepared = @import("sql_prepared.zig");
             var resource: ?prepared.Owned = null;
             defer if (resource) |*value| value.deinit();
+            defer if (self.connection_owned) |*value| value.deinit();
             const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
             const resource_principal = http_server_mod.transactionPrincipal(self.adapter.identity.*) orelse "";
+            if (self.adapter.connection_id) |connection_id| {
+                const store = self.adapter.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+                self.connection_owned = try @import("sql_connections.zig").loadReconciled(store, &self.adapter.server.txn_sessions, std.heap.page_allocator, connection_id, resource_principal, self.adapter.server.localSessionNodeId(), now_ms);
+                const connection = self.connection_owned.?.value;
+                if (connection.state == .beginning or connection.state == .uncertain) return error.SqlConnectionBusy;
+                if ((!self.adapter.inherit_session_database and !std.mem.eql(u8, self.adapter.database, connection.database)) or
+                    (!self.adapter.inherit_session_namespace and !std.mem.eql(u8, self.adapter.namespace, connection.namespace))) return error.SqlConnectionChanged;
+                self.adapter.database = connection.database;
+                self.adapter.namespace = connection.namespace;
+                self.database = connection.database;
+                self.namespace = connection.namespace;
+                self.adapter.inherit_session_database = false;
+                self.adapter.inherit_session_namespace = false;
+                self.adapter.connection_generation = connection.generation;
+                self.adapter.connection_revision = connection.revision;
+                if (connection.active_txn) |active| {
+                    self.connection_session_hex = std.fmt.bytesToHex(active, .lower);
+                    if (self.adapter.session_id) |supplied| if (!std.mem.eql(u8, supplied, &self.connection_session_hex)) return error.SqlTransactionNotActive;
+                    self.adapter.session_id = &self.connection_session_hex;
+                    self.adapter.setting_overlay = &.{};
+                } else {
+                    if (self.adapter.session_id != null) return error.SqlTransactionNotActive;
+                    self.adapter.setting_overlay = connection.overlay;
+                }
+            }
             if (self.prepared_mode != .statement) {
                 const store = self.adapter.server.txn_sessions.durable orelse return error.SqlPreparedDurabilityUnavailable;
                 const owner = self.adapter.server.localSessionNodeId();
@@ -5393,11 +5450,14 @@ pub const AntflyApiHandler = struct {
                         self.prepared_response_budget.allocator().free(self.prepared_response.?);
                         self.prepared_response = null;
                     }
-                    try prepared.close(store, self.prepared_id.?, resource_principal, owner, now_ms);
+                    if (self.adapter.connection_id) |connection_id|
+                        try prepared.closeForConnection(store, self.prepared_id.?, resource_principal, owner, now_ms, connection_id)
+                    else
+                        try prepared.close(store, self.prepared_id.?, resource_principal, owner, now_ms);
                     return;
                 }
                 if (self.prepared_mode == .execute) {
-                    resource = try prepared.load(store, std.heap.page_allocator, self.prepared_id.?, resource_principal, owner, now_ms);
+                    resource = try prepared.loadForConnection(store, std.heap.page_allocator, self.prepared_id.?, resource_principal, owner, now_ms, self.adapter.connection_id);
                     const value = resource.?.value;
                     try value.verifyExecutionSession(self.adapter.session_id);
                     self.statement = value.statement;
@@ -5421,12 +5481,13 @@ pub const AntflyApiHandler = struct {
                 const setting: ?@import("sql_http_settings.zig").Command = if (parsed_setting) |value| switch (value) {
                     .catalog => |catalog_setting| .{ .catalog = catalog_setting },
                     .reset_all => .reset_all,
+                    .discard_all => .discard_all,
                     else => null,
                 } else null;
                 if (setting) |command| {
                     self.is_write = switch (command) {
                         .catalog => |catalog_setting| catalog_setting != .show,
-                        .reset_all => true,
+                        .reset_all, .discard_all => true,
                     };
                     var execution = try self.adapter.server.acquireSqlExecution(self.is_write);
                     defer execution.release();
@@ -5456,7 +5517,9 @@ pub const AntflyApiHandler = struct {
                 const owner = self.adapter.server.localSessionNodeId();
                 if (try registry.principalAccess(self.adapter.server.alloc, id, http_server_mod.transactionPrincipal(self.adapter.identity.*)) != .allowed) return error.SqlTransactionNotActive;
                 attached_state = (try registry.getSqlState(self.adapter.server.alloc, id)) orelse return error.SqlTransactionNotActive;
+                if (!std.meta.eql(attached_state.?.connection_id, self.adapter.connection_id)) return error.SqlConnectionNotFound;
                 const state = &attached_state.?;
+                if (state.terminal_abort) return error.SqlTransactionAborted;
                 if (state.owner_node_id != owner) return error.SessionLeaseLost;
                 try registry.validateSqlLease(self.adapter.server.alloc, id, owner);
                 if (state.execution_started or state.terminal != null) return error.SqlTransactionOutcomeUnknown;
@@ -5508,7 +5571,7 @@ pub const AntflyApiHandler = struct {
                 const response = std.json.Stringify.valueAlloc(self.prepared_response_budget.allocator(), .{ .prepared_id = @as([]const u8, &id), .expires_at_ms = expires, .owner_node_id = encoded_owner, .parameter_types = parameter_types, .columns = description.binding.columns }, .{}) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
                 errdefer self.prepared_response_budget.allocator().free(response);
                 try self.adapter.context.ensureActive();
-                try prepared.create(self.adapter.server.txn_sessions.durable.?, .{ .id = id, .principal = resource_principal, .owner_node_id = self.adapter.server.localSessionNodeId(), .expires_at_ms = expires, .database = self.database, .namespace = self.namespace, .statement = self.statement, .session_id = if (attached_id) |session| std.fmt.bytesToHex(session, .lower) else null, .setting_epoch = if (compiled.uses_current_setting) description.settings.?.epoch else null, .parameter_types = description.binding.parameter_types, .bindings = bindings.items }, now_ms);
+                try prepared.create(self.adapter.server.txn_sessions.durable.?, .{ .id = id, .principal = resource_principal, .owner_node_id = self.adapter.server.localSessionNodeId(), .expires_at_ms = expires, .database = self.adapter.database, .namespace = self.adapter.namespace, .statement = self.statement, .session_id = if (attached_id) |session| std.fmt.bytesToHex(session, .lower) else null, .connection_id = self.adapter.connection_id, .connection_generation = self.adapter.connection_generation, .setting_epoch = if (compiled.uses_current_setting) description.settings.?.epoch else null, .parameter_types = description.binding.parameter_types, .bindings = bindings.items }, now_ms);
                 self.prepared_response = response;
                 return;
             }
@@ -5556,6 +5619,65 @@ pub const AntflyApiHandler = struct {
         return self.executeSQLMode(ctx, .close, prepared_id);
     }
 
+    pub fn openSQLConnection(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const store = self.api_server.txn_sessions.durable orelse return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "durable SQL connection storage unavailable" });
+        const body = (try ctx.body()) orelse "{}";
+        if (body.len > 4096) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL connection request too large" });
+        const Input = struct { database: []const u8 = "default", namespace: []const u8 = "public" };
+        var parsed = std.json.parseFromSlice(Input, ctx.allocator, body, .{}) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL connection request" });
+        defer parsed.deinit();
+        if (parsed.value.database.len == 0 or parsed.value.database.len > 256 or parsed.value.namespace.len == 0 or parsed.value.namespace.len > 256)
+            return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL connection scope" });
+        var random: [16]u8 = undefined;
+        try self.api_server.sqlPlanCacheIo().randomSecure(&random);
+        const connection_id = std.fmt.bytesToHex(random, .lower);
+        const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+        const owner_node_id = self.api_server.localSessionNodeId();
+        const principal = http_server_mod.transactionPrincipal(identity) orelse "";
+        @import("sql_connections.zig").reconcileExpired(store, &self.api_server.txn_sessions, self.api_server.alloc, now_ms) catch |err| {
+            var buffer: [256]u8 = undefined;
+            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
+        };
+        _ = @import("sql_connections.zig").mutate(store, .{ .create = .{
+            .id = connection_id,
+            .principal = principal,
+            .owner_node_id = owner_node_id,
+            .expires_at_ms = now_ms +| @import("sql_connection_record.zig").ttl_ms,
+            .database = parsed.value.database,
+            .namespace = parsed.value.namespace,
+        } }, principal, owner_node_id, now_ms) catch |err| {
+            var buffer: [256]u8 = undefined;
+            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
+        };
+        var owner_buffer: [20]u8 = undefined;
+        const owner = try std.fmt.bufPrint(&owner_buffer, "{d}", .{owner_node_id});
+        return ctx.status(200).json(.{ .connection_id = &connection_id, .owner_node_id = owner, .expires_at_ms = now_ms +| @import("sql_connection_record.zig").ttl_ms, .database = parsed.value.database, .namespace = parsed.value.namespace });
+    }
+
+    pub fn closeSQLConnection(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id_raw: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const decoded = distributed_txn.parseTxnIdHex(connection_id_raw) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid connection_id" });
+        const connection_id = std.fmt.bytesToHex(decoded, .lower);
+        const store = self.api_server.txn_sessions.durable orelse return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "durable SQL connection storage unavailable" });
+        const principal = http_server_mod.transactionPrincipal(identity) orelse "";
+        const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+        var connection = @import("sql_connections.zig").loadReconciled(store, &self.api_server.txn_sessions, self.api_server.alloc, connection_id, principal, self.api_server.localSessionNodeId(), now_ms) catch |err| {
+            var buffer: [256]u8 = undefined;
+            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
+        };
+        connection.deinit();
+        _ = @import("sql_connections.zig").mutate(store, .{ .close = connection_id }, principal, self.api_server.localSessionNodeId(), now_ms) catch |err| {
+            var buffer: [256]u8 = undefined;
+            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
+        };
+        return ctx.status(200).json(.{});
+    }
+
     fn executeSQLMode(self: *AntflyApiHandler, ctx: *httpx.Context, mode: SQLPreparedMode, resource_id: ?[]const u8) !httpx.Response {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*value| value.deinit(self.api_server.alloc);
@@ -5579,6 +5701,7 @@ pub const AntflyApiHandler = struct {
             namespace: ?[]const u8 = null,
             limit: ?i64 = null,
             session_id: ?[]const u8 = null,
+            connection_id: ?[]const u8 = null,
         };
         var parsed = std.json.parseFromSlice(Input, preparation_alloc, body, .{ .parse_numbers = false }) catch |err| {
             if (preparation_budget.exhausted) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL preparation memory budget exceeded" });
@@ -5600,6 +5723,10 @@ pub const AntflyApiHandler = struct {
             const id = distributed_txn.parseTxnIdHex(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL session_id must be a 32-character transaction id" });
             if (try self.forwardTransactionSession(ctx, id, body)) |response| return response;
         }
+        const connection_id: ?[32]u8 = if (if (mode == .close) ctx.header("x-antfly-sql-connection-id") else request.connection_id) |encoded| blk: {
+            const decoded = distributed_txn.parseTxnIdHex(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL connection_id must be a 32-character hex id" });
+            break :blk std.fmt.bytesToHex(decoded, .lower);
+        } else null;
         const limit = request.limit orelse 128;
         if (limit < 1 or limit > 4096) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL result limit must be between 1 and 4096" });
         // Preparation has an independent bounded lane. The worker transfers
@@ -5629,7 +5756,7 @@ pub const AntflyApiHandler = struct {
         };
         var runtime_io = runtime.io() orelse return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
         var job = SQLJob{
-            .adapter = .{ .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
+            .adapter = .{ .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
             .statement = statement,
             .prepared_mode = mode,
             .prepared_id = prepared_id,
@@ -6262,6 +6389,73 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    /// Enrollment is an explicit cluster-admin approval of a root-local
+    /// possession proof. The internal service credential used for store
+    /// registration cannot mint this grant.
+    pub fn enrollStoreRoot(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const admitted = identity orelse return jsonErrorResponse(ctx, 403, "forbidden");
+        if (!http_server_mod.permissionsAllow(admitted.permissions, .@"*", "*", .admin))
+            return jsonErrorResponse(ctx, 403, "forbidden");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing store-root enrollment proof");
+        const enrollment_http = @import("store_root_enrollment_http.zig");
+        if (body.len > enrollment_http.max_body_bytes) return textResponse(ctx, 413, "store-root enrollment proof too large");
+        var parsed = std.json.parseFromSlice(enrollment_http.Request, ctx.allocator, body, .{ .ignore_unknown_fields = false }) catch
+            return textResponse(ctx, 400, "invalid store-root enrollment proof");
+        defer parsed.deinit();
+        const request = parsed.value.toDomain() catch return textResponse(ctx, 400, "invalid store-root enrollment proof");
+        var context = operationContext(ctx, identity);
+        context.setting_admin = true;
+        const result = self.api_server.source.systemCatalog(ctx.allocator, context, .{ .store_root_enroll = request }) catch |err|
+            return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
+        defer ctx.allocator.free(result);
+        var observed = std.json.parseFromSlice(@import("../metadata/store_root_enrollment.zig").Identity, ctx.allocator, result, .{}) catch
+            return textResponse(ctx, 503, "invalid store-root enrollment result");
+        defer observed.deinit();
+        if (!std.meta.eql(request.identity, observed.value)) return textResponse(ctx, 503, "store-root enrollment identity mismatch");
+        const public_json = enrollment_http.encodeIdentityAlloc(ctx.allocator, observed.value) catch
+            return textResponse(ctx, 503, "invalid store-root enrollment result");
+        defer ctx.allocator.free(public_json);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(public_json);
+        return ctx.response.build();
+    }
+
+    /// A read-only, exact-identity observation resolves an ambiguous enroll
+    /// response without ever replaying the mutation on the client's behalf.
+    pub fn getStoreRootEnrollmentStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const admitted = identity orelse return jsonErrorResponse(ctx, 403, "forbidden");
+        if (!http_server_mod.permissionsAllow(admitted.permissions, .@"*", "*", .admin))
+            return jsonErrorResponse(ctx, 403, "forbidden");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing store-root identity");
+        const enrollment_http = @import("store_root_enrollment_http.zig");
+        if (body.len > enrollment_http.max_body_bytes) return textResponse(ctx, 413, "store-root identity too large");
+        var parsed = std.json.parseFromSlice(enrollment_http.Identity, ctx.allocator, body, .{ .ignore_unknown_fields = false }) catch
+            return textResponse(ctx, 400, "invalid store-root identity");
+        defer parsed.deinit();
+        const requested = parsed.value.toDomain() catch return textResponse(ctx, 400, "invalid store-root identity");
+        var context = operationContext(ctx, identity);
+        context.setting_admin = true;
+        const result = self.api_server.source.systemCatalog(ctx.allocator, context, .{ .store_root_enrollment_status = requested }) catch |err|
+            return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
+        defer ctx.allocator.free(result);
+        var observed = std.json.parseFromSlice(@import("../metadata/store_root_enrollment.zig").Identity, ctx.allocator, result, .{}) catch
+            return textResponse(ctx, 503, "invalid store-root enrollment status");
+        defer observed.deinit();
+        if (!std.meta.eql(requested, observed.value)) return textResponse(ctx, 503, "store-root enrollment identity mismatch");
+        const public_json = enrollment_http.encodeIdentityAlloc(ctx.allocator, observed.value) catch
+            return textResponse(ctx, 503, "invalid store-root enrollment status");
+        defer ctx.allocator.free(public_json);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(public_json);
+        return ctx.response.build();
+    }
+
     const PublicTableBinding = struct {
         physical: []u8,
         logical: ?[]u8 = null,
@@ -6867,8 +7061,6 @@ pub const AntflyApiHandler = struct {
         @import("relational_witness_ddl.zig").validateArtifactNames(alloc, sealed_indexes_json) catch |err| return witnessDDLError(ctx, err);
         const fk_schema = tables_api.effectiveSchemaJson(create_req.schema_json);
         const has_initial_fk = try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(alloc, fk_schema);
-        if (has_initial_fk and try @import("relational_witness_ddl.zig").needed(alloc, fk_schema, ""))
-            return jsonErrorResponse(ctx, 422, "initial MATCH PARTIAL foreign keys require atomic parent support-index publication; create the table without that constraint, then add it with ALTER TABLE");
         // Initial FK-bearing CREATE computes support in its immutable plan.
         // Parent schema changes and hidden child reservation are owned by one
         // metadata begin transaction; ingress must not publish parent CASes.
@@ -6894,7 +7086,10 @@ pub const AntflyApiHandler = struct {
                 error.ForeignKeyParentSchemaPending => return jsonErrorResponse(ctx, 503, "parent support-index schema migration is still settling; no child CREATE was admitted, retry after parent maintenance completes"),
                 error.DeadlineExceeded => return jsonErrorResponse(ctx, 503, "initial foreign-key preparation timed out; no child CREATE was admitted, retry after parent maintenance completes"),
                 error.MetadataCapabilityUnavailable, error.UnsupportedOperation => return jsonErrorResponse(ctx, 409, "coordinated initial foreign key publication is unavailable on this deployment"),
-                else => return witnessDDLError(ctx, err),
+                else => {
+                    if (fkPublicationUpgradeRequired(err)) return metadataMutationNotAdmittedTextResponse(ctx, fk_publication_upgrade_message);
+                    return witnessDDLError(ctx, err);
+                },
             };
             // Build both responses before the durable begin. An allocator
             // failure after commit must not erase the caller's recovery handle.
@@ -6930,7 +7125,10 @@ pub const AntflyApiHandler = struct {
                 error.TableGenerationChanged,
                 => return jsonErrorResponse(ctx, 409, "table name or owner generation changed; refresh and retry"),
                 error.MetadataCapabilityUnavailable, error.UnsupportedOperation => return jsonErrorResponse(ctx, 409, "coordinated initial foreign key publication is unavailable on this deployment"),
-                else => return witnessDDLError(ctx, err),
+                else => {
+                    if (fkPublicationUpgradeRequired(err)) return metadataMutationNotAdmittedTextResponse(ctx, fk_publication_upgrade_message);
+                    return witnessDDLError(ctx, err);
+                },
             };
             return jsonResponse(ctx, fkInitialCreateHttpStatus(accepted), if (accepted.state == .admission_unknown) unknown_response else pending_response);
         }
@@ -7503,10 +7701,12 @@ pub const AntflyApiHandler = struct {
                     return jsonErrorResponse(ctx, 409, "table identity or schema version changed; refresh and retry");
                 const accepted = self.api_server.beginFkGenerationPublication(alloc, operationContext(ctx, authenticated_identity), authenticated_identity, before.*, supported_schema.?) catch |begin_err| switch (begin_err) {
                     error.Forbidden => return jsonErrorResponse(ctx, 403, "foreign key publication requires admin permission on every affected parent"),
-                    error.ForeignKeySelfPublicationNotActivated => return jsonErrorResponse(ctx, 409, "self-referential foreign key publication is not active; no schema change was admitted"),
                     error.CatalogGenerationChanged, error.TableGenerationChanged, error.SchemaVersionChanged, error.GenerationPublicationChanged => return jsonErrorResponse(ctx, 409, "schema or owner generation changed; refresh and retry"),
                     error.MetadataCapabilityUnavailable, error.UnsupportedOperation => return jsonErrorResponse(ctx, 503, "coordinated foreign key publication is unavailable"),
-                    else => return witnessDDLError(ctx, begin_err),
+                    else => {
+                        if (fkPublicationUpgradeRequired(begin_err)) return metadataMutationNotAdmittedTextResponse(ctx, fk_publication_upgrade_message);
+                        return witnessDDLError(ctx, begin_err);
+                    },
                 };
                 const id_hex = std.fmt.bytesToHex(accepted.plan_id, .lower);
                 const response = try std.json.Stringify.valueAlloc(alloc, .{
@@ -9300,6 +9500,117 @@ test "system catalog SQL setting publication requires cluster admin and forwards
     try std.testing.expectEqual(@as(usize, 1), source.calls);
 }
 
+test "store-root enrollment requires cluster admin and forwards only valid possession proof" {
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var admin_permission = try usermgr.Permission.initOwned(alloc, .@"*", "*", .admin);
+    defer admin_permission.deinit(alloc);
+    var admin = try auth.manager.createUser("root_admin", "secret", &.{admin_permission});
+    defer admin.deinit(alloc);
+    var reader_permission = try usermgr.Permission.initOwned(alloc, .table, "*", .read);
+    defer reader_permission.deinit(alloc);
+    var reader = try auth.manager.createUser("root_reader", "secret", &.{reader_permission});
+    defer reader.deinit(alloc);
+    const Source = struct {
+        calls: usize = 0,
+        status_reads: usize = 0,
+        mismatch_enroll: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, call: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!context.setting_admin) return error.TestUnexpectedResult;
+            switch (call) {
+                .store_root_enroll => |request| {
+                    try request.validate();
+                    self.calls += 1;
+                    var result = request.identity;
+                    if (self.mismatch_enroll) result.root_incarnation += 1;
+                    return std.json.Stringify.valueAlloc(a, result, .{});
+                },
+                .store_root_enrollment_status => |requested| {
+                    try requested.validate();
+                    self.status_reads += 1;
+                    return std.json.Stringify.valueAlloc(a, requested, .{});
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        fn iface(self: *@This()) http_server_mod.StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = catalog } };
+        }
+    };
+    var source = Source{};
+    var api_server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.iface(), null, null);
+    defer api_server.deinit();
+    var e2e: HttpxE2eServer = undefined;
+    try e2e.init(alloc, &api_server);
+    defer e2e.deinit();
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try e2e.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/db/v1/store-roots/enroll", .{base});
+    defer alloc.free(url);
+    const seed: [32]u8 = @splat(7);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const proof = try @import("../metadata/store_root_enrollment.zig").Request.sign(.{
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .node_id = 3,
+        .store_id = 5,
+        .root_incarnation = 7,
+        .public_key = pair.public_key.toBytes(),
+    }, seed);
+    const body = try @import("store_root_enrollment_http.zig").encodeAlloc(alloc, proof);
+    defer alloc.free(body);
+    const reader_auth = try encodeBasicAuthorization(alloc, "root_reader", "secret");
+    defer alloc.free(reader_auth);
+    const admin_auth = try encodeBasicAuthorization(alloc, "root_admin", "secret");
+    defer alloc.free(admin_auth);
+    const reader_headers = [_][2][]const u8{ .{ "authorization", reader_auth }, .{ "content-type", "application/json" } };
+    var denied = try requestWithRetry(&client, io.io(), .POST, url, body, &reader_headers, 20);
+    defer denied.deinit();
+    try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+    const admin_headers = [_][2][]const u8{ .{ "authorization", admin_auth }, .{ "content-type", "application/json" } };
+    var invalid = try requestWithRetry(&client, io.io(), .POST, url, "{}", &admin_headers, 20);
+    defer invalid.deinit();
+    try std.testing.expectEqual(@as(u16, 400), invalid.status.code);
+    var allowed = try requestWithRetry(&client, io.io(), .POST, url, body, &admin_headers, 20);
+    defer allowed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), allowed.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, allowed.body orelse "", "\"root_incarnation\":\"7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed.body orelse "", "\"public_key\":\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    source.mismatch_enroll = true;
+    var mismatched = try requestWithRetry(&client, io.io(), .POST, url, body, &admin_headers, 20);
+    defer mismatched.deinit();
+    try std.testing.expectEqual(@as(u16, 503), mismatched.status.code);
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
+    source.mismatch_enroll = false;
+    const status_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/store-roots/enrollment-status", .{base});
+    defer alloc.free(status_url);
+    const status_body = try @import("store_root_enrollment_http.zig").encodeIdentityAlloc(alloc, proof.identity);
+    defer alloc.free(status_body);
+    var denied_status = try requestWithRetry(&client, io.io(), .POST, status_url, status_body, &reader_headers, 20);
+    defer denied_status.deinit();
+    try std.testing.expectEqual(@as(u16, 403), denied_status.status.code);
+    try std.testing.expectEqual(@as(usize, 0), source.status_reads);
+    var allowed_status = try requestWithRetry(&client, io.io(), .POST, status_url, status_body, &admin_headers, 20);
+    defer allowed_status.deinit();
+    try std.testing.expectEqual(@as(u16, 200), allowed_status.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_status.body orelse "", "\"root_incarnation\":\"7\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), source.status_reads);
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
+}
+
 test "compressed requests authenticate before decompression and reuse the identity" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
@@ -9641,6 +9952,21 @@ test "internal routed batch preserves typed validation across the HTTP forwardin
         wire.status = 500;
         try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupBatchWithForwarding("http://127.0.0.1", 7, "docs", body, 1000, forwarding, null, null));
     }
+}
+
+test "public transaction preparation generation transition is retryable without outcome claims" {
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/transactions/commit");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = undefined };
+    var response = try handler.transactionPreparationError(&ctx, error.GenerationTransitionActive);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+    try std.testing.expectEqualStrings("transaction preparation temporarily unavailable", response.body.?);
+    try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "aborted") == null);
 }
 
 test "internal transaction HTTP size rejection is actionable without claiming not proposed" {
@@ -12261,6 +12587,168 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
     }
 }
 
+test "httpx SQL connection routes preserve settings and retire prepared resources" {
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var permission = try usermgr.Permission.initOwned(alloc, .@"*", "*", .admin);
+    defer permission.deinit(alloc);
+    var alice = try auth.manager.createUser("connection_alice", "secret", &.{permission});
+    defer alice.deinit(alloc);
+    var bob = try auth.manager.createUser("connection_bob", "secret", &.{permission});
+    defer bob.deinit(alloc);
+    const alice_auth = try encodeBasicAuthorization(alloc, "connection_alice", "secret");
+    defer alloc.free(alice_auth);
+    const bob_auth = try encodeBasicAuthorization(alloc, "connection_bob", "secret");
+    defer alloc.free(bob_auth);
+    const Source = struct {
+        const definitions = [_]@import("../sql/setting_catalog.zig").Definition{
+            .{ .identity = .{ .id = 1, .generation = 1 }, .name = "app.limit", .kind = .integer, .session_writable = true, .default = .{ .integer = 3 } },
+        };
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn catalog(_: *anyopaque, arena: std.mem.Allocator, context: operation_contract.RequestContext, call: system_catalog.Call) ![]u8 {
+            if (call != .setting_snapshot) return error.TestUnexpectedCatalogCall;
+            if (!std.mem.eql(u8, context.setting_read_principal orelse "", call.setting_snapshot.principal)) return error.Forbidden;
+            return std.json.Stringify.valueAlloc(arena, @import("../sql/setting_catalog.zig").RawSnapshot{ .scope = call.setting_snapshot, .epoch = 1, .definitions = &definitions }, .{});
+        }
+    };
+    var source: Source = .{};
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var storage = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    defer storage.close();
+    var native = try storage.runtimeStore(alloc, .{ .name = "http-sql-connection-routes-test" });
+    defer native.deinit();
+    var durable = transactions_api.DurableSessionStore.initRuntime(alloc, &native);
+    var server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager, .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const Route = struct {
+        const Kind = enum { open, sql, prepare, execute, close };
+        const Reply = struct {
+            status: u16,
+            body: []u8,
+            fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+                allocator.free(self.body);
+            }
+        };
+        fn call(allocator: std.mem.Allocator, api: *AntflyApiHandler, authorization: []const u8, kind: Kind, id: ?[]const u8, body: ?[]const u8) !Reply {
+            var request = try httpx.Request.init(allocator, if (kind == .close) .DELETE else .POST, "http://127.0.0.1/db/v1/sql");
+            defer request.deinit();
+            try request.headers.append("authorization", authorization);
+            request.body = body;
+            var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = switch (kind) {
+                .open => try api.openSQLConnection(&ctx),
+                .sql => try api.executeSQL(&ctx),
+                .prepare => try api.prepareSQL(&ctx),
+                .execute => try api.executePreparedSQL(&ctx, id.?),
+                .close => try api.closeSQLConnection(&ctx, id.?),
+            };
+            defer response.deinit();
+            return .{ .status = response.status.code, .body = try allocator.dupe(u8, response.body orelse "") };
+        }
+        fn statement(allocator: std.mem.Allocator, api: *AntflyApiHandler, authorization: []const u8, connection_id: []const u8, sql: []const u8) !Reply {
+            const body = try std.json.Stringify.valueAlloc(allocator, .{ .statement = sql, .connection_id = connection_id }, .{});
+            defer allocator.free(body);
+            return call(allocator, api, authorization, .sql, null, body);
+        }
+    };
+    var opened = try Route.call(alloc, &handler, alice_auth, .open, null, "{}");
+    defer opened.deinit(alloc);
+    if (opened.status != 200) std.debug.print("SQL connection open: {s}\n", .{opened.body[0..@min(opened.body.len, 512)]});
+    try std.testing.expectEqual(@as(u16, 200), opened.status);
+    var parsed_open = try std.json.parseFromSlice(sql_wire.SQLConnectionResponse, alloc, opened.body, .{});
+    defer parsed_open.deinit();
+    const connection_id = parsed_open.value.connection_id;
+
+    var foreign_read = try Route.statement(alloc, &handler, bob_auth, connection_id, "SHOW app.limit");
+    defer foreign_read.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), foreign_read.status);
+    var foreign_error = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, foreign_read.body, .{});
+    defer foreign_error.deinit();
+    try std.testing.expectEqualStrings("08003", foreign_error.value.code);
+
+    const Step = struct {
+        sql: []const u8,
+        status: u16 = 200,
+        tag: ?[]const u8 = null,
+        value: ?[]const u8 = null,
+        code: ?[]const u8 = null,
+    };
+    for ([_]Step{
+        .{ .sql = "SET app.limit = 5", .tag = "SET" },
+        .{ .sql = "SHOW app.limit", .tag = "SHOW", .value = "5" },
+        .{ .sql = "BEGIN ISOLATION LEVEL READ COMMITTED", .tag = "BEGIN" },
+        .{ .sql = "SET LOCAL app.limit = 8", .tag = "SET" },
+        .{ .sql = "SHOW app.limit", .tag = "SHOW", .value = "8" },
+        .{ .sql = "DISCARD ALL", .status = 400, .code = "25001" },
+        .{ .sql = "SET app.limit = 7", .tag = "SET" },
+        .{ .sql = "COMMIT", .tag = "COMMIT" },
+        .{ .sql = "SHOW app.limit", .tag = "SHOW", .value = "7" },
+        .{ .sql = "BEGIN ISOLATION LEVEL READ COMMITTED", .tag = "BEGIN" },
+        .{ .sql = "SET app.limit = 10", .tag = "SET" },
+        .{ .sql = "ROLLBACK", .tag = "ROLLBACK" },
+        .{ .sql = "SHOW app.limit", .tag = "SHOW", .value = "7" },
+    }) |step| {
+        var reply = try Route.statement(alloc, &handler, alice_auth, connection_id, step.sql);
+        defer reply.deinit(alloc);
+        if (reply.status != step.status) std.debug.print("{s}: {s}\n", .{ step.sql, reply.body });
+        try std.testing.expectEqual(step.status, reply.status);
+        if (step.code) |code| {
+            var diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, reply.body, .{});
+            defer diagnostic.deinit();
+            try std.testing.expectEqualStrings(code, diagnostic.value.code);
+        } else {
+            var result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, reply.body, .{});
+            defer result.deinit();
+            try std.testing.expectEqualStrings(step.tag.?, result.value.command_tag);
+            if (step.value) |value| try std.testing.expectEqualStrings(value, result.value.rows[0][0].string);
+        }
+    }
+
+    const prepare_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "SELECT current_setting('app.limit')", .connection_id = connection_id }, .{});
+    defer alloc.free(prepare_body);
+    var prepared_reply = try Route.call(alloc, &handler, alice_auth, .prepare, null, prepare_body);
+    defer prepared_reply.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), prepared_reply.status);
+    var parsed_prepared = try std.json.parseFromSlice(sql_wire.SQLPreparedResponse, alloc, prepared_reply.body, .{});
+    defer parsed_prepared.deinit();
+    var discarded = try Route.statement(alloc, &handler, alice_auth, connection_id, "DISCARD ALL");
+    defer discarded.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), discarded.status);
+    var post_discard = try Route.statement(alloc, &handler, alice_auth, connection_id, "SHOW app.limit");
+    defer post_discard.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), post_discard.status);
+    var parsed_show = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, post_discard.body, .{});
+    defer parsed_show.deinit();
+    try std.testing.expectEqualStrings("3", parsed_show.value.rows[0][0].string);
+    const execute_body = try std.json.Stringify.valueAlloc(alloc, .{ .connection_id = connection_id }, .{});
+    defer alloc.free(execute_body);
+    var retired = try Route.call(alloc, &handler, alice_auth, .execute, parsed_prepared.value.prepared_id, execute_body);
+    defer retired.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), retired.status);
+    var retired_error = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, retired.body, .{});
+    defer retired_error.deinit();
+    try std.testing.expectEqualStrings("26000", retired_error.value.code);
+
+    var foreign_close = try Route.call(alloc, &handler, bob_auth, .close, connection_id, null);
+    defer foreign_close.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), foreign_close.status);
+    var closed = try Route.call(alloc, &handler, alice_auth, .close, connection_id, null);
+    defer closed.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), closed.status);
+    var after_close = try Route.statement(alloc, &handler, alice_auth, connection_id, "SHOW app.limit");
+    defer after_close.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), after_close.status);
+}
+
 test "httpx SQL executes one relational page with exact integer parameters" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -14000,7 +14488,7 @@ test "httpx antfly schema update returns full table status after projection" {
     try std.testing.expectEqual(@as(u32, 0), writes.synchronous_update_calls.load(.monotonic));
 }
 
-test "httpx antfly schema update owns self partial support and rejects public index forgery" {
+test "httpx antfly schema update owns self partial support and requires coordinated publication" {
     const alloc = std.testing.allocator;
     var source = SchemaUpdateStatusSource{};
     defer source.deinit(alloc);
@@ -14026,14 +14514,21 @@ test "httpx antfly schema update owns self partial support and rejects public in
         \\{"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"docs","parent_columns":["id"],"match":"partial"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
     ;
     const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    // Support-index preparation is owned by the server, but it cannot publish
+    // a new FK generation through this fixture's ordinary schema CAS alone.
+    const supported = try api_server.preparePartialWitnessSchema(alloc, "docs", body, initial, .{});
+    defer alloc.free(supported);
+    var prepared = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, supported);
+    defer prepared.deinit(alloc);
+    try @import("../schema/relational_witness_indexes.zig").requireCoverage(prepared, &.{"id"});
     for (0..2) |_| {
         var response = try requestWithRetry(&client, client_io.io(), .PUT, url, body, &headers, 20);
         defer response.deinit();
-        try std.testing.expectEqual(@as(u16, 200), response.status.code);
-        var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, source.schema_json.?);
-        defer parsed.deinit(alloc);
-        try @import("../schema/relational_witness_indexes.zig").requireCoverage(parsed, &.{"id"});
-        try std.testing.expectEqual(@as(u32, 2), parsed.version);
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "coordinated foreign key publication is unavailable") != null);
+        try std.testing.expectEqualStrings(initial, source.schema_json.?);
+        try std.testing.expectEqual(@as(u32, 0), writes.reconcile_calls.load(.monotonic));
+        try std.testing.expectEqual(@as(u32, 0), writes.synchronous_update_calls.load(.monotonic));
     }
     const forged = try std.mem.replaceOwned(u8, alloc, body, "\"foreign_keys\":", "\"relational_indexes\":[{\"name\":\"__fk_partial_forged\",\"keys\":[{\"column\":\"id\"}]}],\"foreign_keys\":");
     defer alloc.free(forged);
@@ -14090,19 +14585,23 @@ test "httpx hidden handoff receipt rejects public caller even in legacy internal
     }, source.iface(), null, null);
     defer api_server.deinit();
     var handler = AntflyApiHandler{ .api_server = &api_server };
-    var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/internal/v1/groups/7/tables/hidden/documents/control?read_consistency=read_index&_relational_topology=%7B%22mode%22%3A%22generation_handoff_install%22%7D&_restore_staging_scope=1111111111111111111111111111111111111111111111111111111111111111&_restore_staging_plan_id=22222222222222222222222222222222");
-    defer request.deinit();
-    var ctx = httpx.Context.init(alloc, undefined, &request);
-    defer ctx.deinit();
-    const params = [_]httpx.RouteParam{
-        .{ .name = "group_id", .value = "7" },
-        .{ .name = "table_name", .value = "hidden" },
-        .{ .name = "key", .value = "control" },
-    };
-    ctx.params = &params;
-    var response = try handler.internalGroupLookup(&ctx);
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 401), response.status.code);
+    for ([_][]const u8{ "generation_handoff_install", "generation_handoff_identity" }) |mode| {
+        const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1/internal/v1/groups/7/tables/hidden/documents/control?read_consistency=read_index&_relational_topology=%7B%22mode%22%3A%22{s}%22%7D&_restore_staging_scope=1111111111111111111111111111111111111111111111111111111111111111&_restore_staging_plan_id=22222222222222222222222222222222", .{mode});
+        defer alloc.free(url);
+        var request = try httpx.Request.init(alloc, .GET, url);
+        defer request.deinit();
+        var ctx = httpx.Context.init(alloc, undefined, &request);
+        defer ctx.deinit();
+        const params = [_]httpx.RouteParam{
+            .{ .name = "group_id", .value = "7" },
+            .{ .name = "table_name", .value = "hidden" },
+            .{ .name = "key", .value = "control" },
+        };
+        ctx.params = &params;
+        var response = try handler.internalGroupLookup(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 401), response.status.code);
+    }
 }
 
 test "httpx FK source control rejects missing service token in legacy internal mode" {

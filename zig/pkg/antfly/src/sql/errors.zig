@@ -36,6 +36,15 @@ pub const Diagnostic = struct {
 pub fn describe(err: anyerror) Diagnostic {
     return switch (err) {
         error.SqlPreparedNotFound => .{ .code = "26000", .message = "The prepared resource is unknown, expired or inaccessible.", .retryable = false },
+        error.SqlConnectionNotFound => .{ .code = "08003", .message = "The SQL connection is unknown, expired or inaccessible.", .retryable = false },
+        error.SqlConnectionWrongOwner => .{ .code = "55000", .message = "The SQL connection belongs to another API node.", .hint = "Send the request to the owner_node_id returned when the connection was opened.", .retryable = false },
+        error.SqlConnectionBusy, error.ActiveSqlTransaction => .{ .code = "25001", .message = "DISCARD or connection close requires an idle SQL connection with no active or uncertain transaction.", .hint = "Finish or reconcile the active transaction first.", .retryable = false },
+        error.NoActiveSqlTransaction => .{ .code = "25P01", .message = "SET LOCAL requires an active SQL transaction.", .retryable = false },
+        error.SqlConnectionChanged => .{ .code = "40001", .message = "The SQL connection scope or setting overlay changed during this request.", .hint = "Refresh the connection and retry only after checking the prior request outcome.", .retryable = false },
+        error.SqlConnectionUnavailable => .{ .code = "53300", .message = "Durable SQL connection storage is unavailable.", .retryable = false },
+        error.InvalidSqlConnection => .{ .code = "22023", .message = "The SQL connection record or request is invalid.", .retryable = false },
+        error.SqlConnectionAlreadyExists => .{ .code = "42P04", .message = "The SQL connection identifier already exists.", .retryable = false },
+        error.InvalidSqlPreparedDirectory => .{ .code = "XX000", .message = "The durable prepared resource directory is inconsistent.", .retryable = false },
         error.SqlPreparedWrongOwner => .{ .code = "55000", .message = "The prepared resource belongs to another API node.", .hint = "Send this request to the owner_node_id returned by preparation; resources are not adopted by another owner.", .retryable = false },
         error.SqlPreparedDurabilityUnavailable => .{ .code = "0A000", .message = "Durable SQL preparation requires a configured native session store.", .retryable = false },
         error.SqlPreparedAlreadyExists => .{ .code = "42P05", .message = "The prepared resource identifier already exists.", .retryable = false },
@@ -52,6 +61,8 @@ pub fn describe(err: anyerror) Diagnostic {
         error.InvalidConstraintRetirement => .{ .code = "0A000", .message = "This combined schema change cannot use constraint retirement.", .hint = "Separate constraint removal from unrelated schema changes.", .retryable = false },
         error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => .{ .code = "22023", .message = "The proposed SQL schema is invalid for the native storage types or constraints.", .retryable = false },
         error.SchemaVersionChanged, error.TableGenerationChanged => .{ .code = "40001", .message = "The schema changed before this DDL could commit.", .retryable = true },
+        error.TableTopologyProtocolUpgradeRequired => .{ .code = "53300", .message = "The metadata cluster is not yet ready for coordinated foreign-key publication.", .hint = "No schema change was admitted. Upgrade all metadata voters and learners, then retry the complete DDL.", .retryable = true },
+        error.SettingAuthorityUnavailable => .{ .code = "53300", .message = "The metadata setting authority is not configured for this SQL operation.", .hint = "Ask an operator to configure trusted setting authority, then inspect schema state before resubmitting DDL. Do not automatically replay a mutation.", .retryable = false },
         error.SqlNumericOutOfRange => .{ .code = "22003", .message = "A numeric expression exceeds its supported range.", .retryable = false },
         error.InvalidSqlDateTime => .{ .code = "22007", .message = "The datetime is invalid or outside the supported UTC nanosecond range.", .hint = "Use a valid ISO date or RFC3339 timestamp representable as unsigned epoch nanoseconds.", .retryable = false },
         error.SqlGroupingError => .{ .code = "42803", .message = "A grouped expression references an ungrouped column or invalid aggregate.", .hint = "Group every non-aggregate column and avoid nested aggregate functions.", .retryable = false },
@@ -74,8 +85,6 @@ pub fn describe(err: anyerror) Diagnostic {
         error.RowPolicyUnsupported, error.RowPolicyTopologyUnsupported => .{ .code = "0A000", .message = "Row policy publication is not supported for this table shape.", .hint = "Remove unsupported indexes or topology features before enabling the policy; no publication was started.", .retryable = false },
         error.ForeignKeyGenerationPublicationRequired => .{ .code = "0A000", .message = "This foreign-key definition requires parent-owner generation publication.", .hint = "Use a deployment with coordinated foreign-key publication; no schema change was admitted.", .retryable = false },
         error.ForeignKeyPartialSupportIndexRequired => .{ .code = "0A000", .message = "Initial MATCH PARTIAL foreign keys require atomic parent support-index publication.", .hint = "Create the table without that constraint, then add it with ALTER TABLE. No table publication was admitted.", .retryable = false },
-        error.ForeignKeyInitialSelfReferenceUnsupported => .{ .code = "0A000", .message = "Initial self-referential foreign-key publication is not available on this deployment.", .hint = "No table was created. Use a deployment with coordinated self-FK publication before relying on this constraint.", .retryable = false },
-        error.ForeignKeySelfPublicationNotActivated => .{ .code = "0A000", .message = "Self-referential foreign-key publication is not active on this deployment.", .hint = "No schema publication was admitted; keep the current table definition.", .retryable = false },
         error.SqlRowIdentityRequired => .{ .code = "0A000", .message = "This mutation requires an explicit row identity.", .hint = "Provide a non-null _id for each inserted row." },
         error.SqlStatementSnapshotRequired => .{ .code = "0A000", .message = "This query requires a consistent statement snapshot that is not available.", .hint = "Narrow the query to one bounded page or use a runtime with statement snapshots." },
         error.SqlRangeTrackingRequired => .{ .code = "0A000", .message = "This transaction requires activated, owner-fenced range protection.", .hint = "Use a runtime that supports the requested isolation level; isolation was not downgraded.", .retryable = false },
@@ -100,6 +109,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlCardinalityViolation => .{ .code = "21000", .message = "A scalar subquery returned more than one row.", .hint = "Use a unique predicate or an aggregate to produce at most one value.", .retryable = false },
         error.SqlMutationCardinalityViolation => .{ .code = "21000", .message = "A target row matched more than one mutation source row.", .hint = "Make the source unique per target row; no changes were committed.", .retryable = false },
         error.SqlTruncateReferenced => .{ .code = "2BP01", .message = "TRUNCATE has referencing tables outside the requested set.", .hint = "List every referencing table or explicitly request CASCADE.", .retryable = false },
+        error.UnsupportedEmptyGenerationAuthority => .{ .code = "0A000", .message = "TRUNCATE requires owners with durable generation-handoff receipt authority.", .hint = "Native-only owners do not yet support this barrier. No TRUNCATE job was admitted; use DELETE instead.", .retryable = false },
         error.SqlTruncateExternalForeignKey => .{ .code = "0A000", .message = "TRUNCATE cannot yet retire inverse foreign-key witnesses on an untouched parent.", .hint = "Use DELETE, or explicitly truncate a complete dependency cohort. No barrier was admitted.", .retryable = false },
         error.RelationalCheckViolation => .{ .code = "23514", .message = "The mutation violates a check constraint.", .hint = "Change the row values to satisfy the table's check constraints.", .retryable = false },
         error.StoredDestinationAuthorizationRevoked => .{ .code = "42501", .message = "The durable credential no longer authorizes this SQL operation.", .hint = "Use a current Basic or API-key credential with whole-table admin permission before retrying DDL.", .retryable = false },
@@ -138,6 +148,8 @@ test "SQL diagnostics retain definite constraints conflicts and unknown outcomes
         .{ .err = error.SqlNotNullViolation, .code = "23502", .retryable = false },
         .{ .err = error.PreparedReadSetChanged, .code = "40001", .retryable = true },
         .{ .err = error.SqlStatementReadUnavailable, .code = "53300", .retryable = true },
+        .{ .err = error.TableTopologyProtocolUpgradeRequired, .code = "53300", .retryable = true },
+        .{ .err = error.SettingAuthorityUnavailable, .code = "53300", .retryable = false },
         .{ .err = error.SqlMutationOutcomeUnknown, .code = "40003", .retryable = false },
         .{ .err = error.QueryCanceled, .code = "57014", .retryable = null },
         .{ .err = error.RowPolicyUnsupported, .code = "0A000", .retryable = false },
@@ -150,20 +162,21 @@ test "SQL diagnostics retain definite constraints conflicts and unknown outcomes
     }
 }
 
+test "SQL FK decoder upgrade is definite nonadmission not an ambiguous DDL outcome" {
+    const upgrade = describe(error.TableTopologyProtocolUpgradeRequired);
+    try std.testing.expectEqual(@as(u16, 503), upgrade.httpStatus());
+    try std.testing.expect(std.mem.indexOf(u8, upgrade.hint.?, "No schema change was admitted") != null);
+    const unknown = describe(error.SqlMutationOutcomeUnknown);
+    try std.testing.expectEqual(@as(u16, 409), unknown.httpStatus());
+    try std.testing.expectEqual(@as(?bool, false), unknown.retryable);
+}
+
 test "SQL diagnostics hide unrecognized implementation errors" {
     const value = describe(error.SecretStoragePathOrParameter);
     try std.testing.expectEqualStrings("XX000", value.code);
     try std.testing.expect(std.mem.indexOf(u8, value.message, "Secret") == null);
     try std.testing.expectEqual(@as(u16, 500), value.httpStatus());
     try std.testing.expectEqual(@as(u16, 409), describe(error.SqlMutationOutcomeUnknown).httpStatus());
-}
-
-test "initial self-FK diagnostic does not recommend a guarded ALTER path" {
-    const value = describe(error.ForeignKeyInitialSelfReferenceUnsupported);
-    try std.testing.expectEqualStrings("0A000", value.code);
-    try std.testing.expectEqual(@as(?bool, false), value.retryable);
-    try std.testing.expect(std.mem.indexOf(u8, value.hint.?, "add it with ALTER TABLE") == null);
-    try std.testing.expect(std.mem.indexOf(u8, value.hint.?, "No table was created") != null);
 }
 
 test "durable SQL destination credential rejection is forbidden, not internal" {

@@ -88,6 +88,7 @@ pub fn stageBegin(txn: anytype, fence: Fence) !void {
 }
 
 pub fn stageBeginWithHandoff(txn: anytype, fence: Fence, handoff: ?@import("relational_integrity_topology_contract.zig").GenerationHandoffIntent) !void {
+    try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     if (handoff != null and fence.role != .rewrite_source) return error.InvalidGenerationHandoff;
     _ = try fence.encode();
     const abort_key = abortedKey(fence);
@@ -153,6 +154,7 @@ fn abortedKey(fence: Fence) [abort_prefix.len + 9]u8 {
 /// These small structural receipts require an authoritative metadata history
 /// horizon before collection; elapsed wall time is not a correctness proof.
 pub fn stageAbortTransition(txn: anytype, expected: Fence) !void {
+    try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     _ = try expected.encode();
     if (expected.role != .split_source and expected.role != .split_destination and expected.role != .merge_source and expected.role != .merge_destination and expected.role != .rewrite_source and expected.role != .truncate_parent) return error.InvalidIntegrityTopologyFence;
     const key = abortedKey(expected);
@@ -182,12 +184,14 @@ pub fn admitPrepare(txn: anytype, manager: *transactions.TxnManager, alloc: Allo
 }
 
 pub fn requireUnfenced(txn: anytype) !void {
+    try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     if (try current(txn) != null) return error.IntegrityTopologyBusy;
 }
 
 /// Runtime reconciliation of an already-published identical producer catalog
 /// is harmless while frozen; delayed *changes* may not create new callbacks.
 pub fn requireUnfencedOrUnchanged(txn: anytype, key: []const u8, candidate: []const u8) !void {
+    if (try @import("artifact_reconcile_intent.zig").permitCatalog(std.heap.page_allocator, txn, key, candidate)) return;
     if (try current(txn) == null and try @import("online_integrity_shadow.zig").rawRange(txn) == null) return;
     const existing = (try optional(txn, key)) orelse return error.IntegrityTopologyBusy;
     if (!std.mem.eql(u8, existing, candidate)) return error.IntegrityTopologyBusy;
@@ -204,6 +208,7 @@ pub fn requireDrained(txn: anytype, manager: *transactions.TxnManager, expected:
 /// Final release must share the ownership/cutover transaction. Persist a
 /// checksummed receipt so delayed control commands cannot resurrect a fence.
 pub fn stageRelease(txn: anytype, expected: Fence) !void {
+    try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     // Publication must activate the exact pending parent generations before
     // lifting the write fence. Until that path exists, release fails closed.
     try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
@@ -222,6 +227,7 @@ pub fn stageRelease(txn: anytype, expected: Fence) !void {
 /// Cancelling an ambiguously delivered begin consumes its epoch even if the
 /// begin has not arrived yet. Never releases another live lifecycle owner.
 pub fn stageCancel(txn: anytype, expected: Fence) !void {
+    try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     _ = try expected.encode();
     if (try current(txn)) |actual| {
         if (actual.admission_epoch == expected.admission_epoch and !actual.eql(expected)) return error.IntegrityTopologyChanged;

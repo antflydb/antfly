@@ -1124,6 +1124,11 @@ pub const DBCore = struct {
                 .name = index_name,
                 .kind = value.kind,
             });
+            if (value.kind == .full_text) try self.index_manager.publishFullTextReplaySeal(.{
+                .index_name = index_name,
+                .sequence = sequence,
+                .config_hash = config_hash,
+            });
         }
         try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
             self.alloc,
@@ -3026,6 +3031,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     const store = try alloc.create(docstore_mod.DocStore);
     store.* = opened_primary.store;
     owned_store = store;
+    if (!read_only) try @import("../artifact_footprint.zig").initializeEmpty(store);
 
     const change_journal = try alloc.create(change_journal_mod.Journal);
     owned_change_journal = change_journal;
@@ -3205,6 +3211,9 @@ fn hasAnyUserNamespaceKey(store: *docstore_mod.DocStore) !bool {
 }
 
 pub fn clearAllKeysFromStore(alloc: Allocator, store: *docstore_mod.DocStore) !void {
+    // Preserve the local monotonic invalidation epoch across root replacement;
+    // an older maintenance reader must never observe an epoch ABA after clear.
+    try @import("../artifact_footprint.zig").invalidate(store);
     const keys = try store.scanRange(alloc, "", "");
     defer docstore_mod.DocStore.freeResults(alloc, keys);
     if (keys.len == 0) return;
@@ -3212,6 +3221,7 @@ pub fn clearAllKeysFromStore(alloc: Allocator, store: *docstore_mod.DocStore) !v
     var deletes = std.ArrayListUnmanaged([]const u8).empty;
     defer deletes.deinit(alloc);
     for (keys) |item| {
+        if (@import("../artifact_footprint.zig").isKey(item.key)) continue;
         try deletes.append(alloc, item.key);
     }
     try store.putBatch(&.{}, deletes.items);
@@ -3237,6 +3247,8 @@ pub fn importStoreSnapshotWithIo(
     defer alloc.free(snapshot_path);
     if (try storeSnapshotHasV2Magic(io, snapshot_path)) {
         try importStreamingStoreSnapshot(alloc, io, store, snapshot_path, cancellation);
+        try @import("../artifact_footprint.zig").invalidate(store);
+        try store.sync(true);
         return true;
     }
 
@@ -3253,16 +3265,20 @@ pub fn importStoreSnapshotWithIo(
         const end = @min(offset + batch_size, decoded.entries.len);
         const writes = try alloc.alloc(docstore_mod.KVPair, end - offset);
         defer alloc.free(writes);
-        for (decoded.entries[offset..end], 0..) |entry, i| {
-            writes[i] = .{
+        var count: usize = 0;
+        for (decoded.entries[offset..end]) |entry| {
+            if (@import("../artifact_footprint.zig").isKey(entry.key)) continue;
+            writes[count] = .{
                 .key = entry.key,
                 .value = entry.value,
             };
+            count += 1;
         }
-        try store.putBatch(writes, &.{});
+        try store.putBatch(writes[0..count], &.{});
         offset = end;
     }
 
+    try @import("../artifact_footprint.zig").invalidate(store);
     try store.sync(true);
     return false;
 }
@@ -3526,6 +3542,14 @@ fn importStreamingStoreSnapshot(
         errdefer if (key_owned) alloc.free(key);
         if (try file.readPositionalAll(io, key, offset) != key.len) return error.InvalidTableFile;
         offset += key_len_u64;
+        if (@import("../artifact_footprint.zig").isKey(key)) {
+            // Never import source-local certification/cursors into a different
+            // physical store. Actual imported family mutations update ours.
+            alloc.free(key);
+            key_owned = false;
+            offset += value_len_u64;
+            continue;
+        }
         const value = try alloc.alloc(u8, value_len);
         var value_owned = true;
         errdefer if (value_owned) alloc.free(value);

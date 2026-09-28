@@ -960,6 +960,11 @@ pub const Call = union(enum) {
     fk_initial_parent_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
     /// Internal, read-only discovery. A ticket is not authority to unlink.
     fk_initial_retirement_page: @import("../metadata/fk_initial_retirement_wire.zig").PageRequest,
+    store_root_enroll: @import("../metadata/store_root_enrollment.zig").Request,
+    /// Exact, linearizable read used to resolve an ambiguous enrollment response.
+    store_root_enrollment_status: @import("../metadata/store_root_enrollment.zig").Identity,
+    fk_initial_retirement_signed_page: @import("../metadata/fk_initial_retirement_wire.zig").SignedPageRequest,
+    fk_initial_retirement_ack: @import("../metadata/fk_initial_retirement_wire.zig").AckRequest,
     setting_mutate: @import("settings.zig").Request,
     list_tables: TableList,
     export_snapshot: void,
@@ -973,7 +978,68 @@ pub const Call = union(enum) {
     table_status: TableStatusTarget,
     write_validation: []const u8,
     write_validation_revision: void,
+
+    pub fn requiresAdministrativeGrant(self: @This()) bool {
+        return switch (self) {
+            .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
+            else => false,
+        };
+    }
+
+    /// Additional body-bound read grant for principal or owner-sensitive
+    /// catalog reads. The principal-independent policy publication stamp is
+    /// deliberately excluded: its transport still requires an authenticated
+    /// internal service, but ordinary table reads need no setting authority.
+    pub fn requiresSettingAuthorityReadGrant(self: @This()) bool {
+        return switch (self) {
+            .setting_snapshot,
+            .policy_snapshot,
+            .policy_install_snapshot,
+            .policy_publication_work,
+            .fk_generation_publication_status,
+            .fk_generation_publication_work,
+            .fk_generation_publication_decision,
+            .fk_generation_publication_source_decision,
+            .fk_initial_create_prepare,
+            .fk_initial_child_decision,
+            .fk_initial_create_status,
+            .fk_generation_table_locked,
+            .fk_initial_create_work,
+            .fk_initial_parent_decision,
+            => true,
+            else => false,
+        };
+    }
+
+    pub fn isMutation(self: @This()) bool {
+        return self == .mutate or self == .fk_initial_retirement_ack or
+            (self != .store_root_enrollment_status and self.requiresAdministrativeGrant());
+    }
 };
+
+test "system catalog policy publication status is a service-only read, not a setting grant" {
+    const status: Call = .{ .policy_publication_status = 7 };
+    try std.testing.expect(!status.isMutation());
+    try std.testing.expect(!status.requiresAdministrativeGrant());
+    try std.testing.expect(!status.requiresSettingAuthorityReadGrant());
+    try std.testing.expect((Call{ .policy_publication_work = 0 }).requiresSettingAuthorityReadGrant());
+    try std.testing.expect((Call{ .policy_install_snapshot = undefined }).requiresSettingAuthorityReadGrant());
+    try std.testing.expect((Call{ .setting_snapshot = undefined }).requiresSettingAuthorityReadGrant());
+    try std.testing.expect((Call{ .fk_generation_publication_status = undefined }).requiresSettingAuthorityReadGrant());
+    try std.testing.expect((Call{ .policy_publication_begin = undefined }).requiresAdministrativeGrant());
+}
+
+test "store-root enrollment status is an admin-bound read, not a mutation" {
+    const query: Call = .{ .store_root_enrollment_status = .{
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .node_id = 3,
+        .store_id = 5,
+        .root_incarnation = 7,
+        .public_key = @splat(1),
+    } };
+    try std.testing.expect(query.requiresAdministrativeGrant());
+    try std.testing.expect(!query.isMutation());
+}
 
 pub fn httpStatus(err: anyerror) u16 {
     return switch (err) {
@@ -983,6 +1049,10 @@ pub fn httpStatus(err: anyerror) u16 {
         error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge, error.RowPolicyLimitExceeded => 413,
         error.TableTopologyProtocolUpgradeRequired, error.RowPolicyUnsupported => 426,
         error.Forbidden => 403,
+        error.InvalidInitialFkRetirementSignature, error.InitialFkRetirementSigningKeyUnavailable => 403,
+        error.StoreRootEnrollmentChanged => 409,
+        error.InvalidStoreRootEnrollment, error.InvalidInitialFkRetirementAck => 400,
+        error.InitialChildRootReceiptChanged, error.InitialFkRetirementReporterChanged, error.InitialFkRetirementWorkChanged, error.InitialFkRetirementPublicationChanged, error.InitialFkRetirementReservationChanged => 409,
         error.UnsupportedOperation, error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.CatalogRoutingSnapshotTimeout, error.ResourceTemporarilyUnavailable => 503,
         error.MetadataMutationOutcomeUnknown, error.NotLeader, error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded => 503,
         else => 500,

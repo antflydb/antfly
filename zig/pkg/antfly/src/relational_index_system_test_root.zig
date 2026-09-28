@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 pub const antfly_sources = @import("source_owner_physical.zig");
 test {
+    _ = @import("storage/rewrite_tail_spool.zig");
     _ = @import("storage/db/relational_integrity.zig");
     _ = @import("storage/db/relational_index_system_test.zig");
     _ = @import("storage/db/relational_index_cover_system_test.zig");

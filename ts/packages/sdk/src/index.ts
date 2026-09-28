@@ -455,6 +455,8 @@ export type {
   SparseEmbedding,
   SQLColumn,
   SQLColumnType,
+  SQLConnectionOpenRequest,
+  SQLConnectionResponse,
   SQLDiagnostic,
   SQLMutationOutcome,
   SQLPreparedExecutionRequest,

@@ -241,7 +241,7 @@ fn initialize(alloc: Allocator, io: std.Io, file: std.Io.File, index: std.Io.Fil
         used[blob_index] = true;
         const kind = std.meta.stringToEnum(codec.BlockType, object.role) orelse return error.InvalidBackupManifest;
         switch (kind) {
-            .cluster_manifest, .table_manifest, .shard_header, .document_batch, .embedding_batch, .sparse_batch, .summary_batch, .chunk_batch, .edge_batch, .transaction_batch, .doc_identity_batch, .metadata_batch, .artifact_batch, .resolution_batch, .integrity_batch, .shard_footer, .file_footer => {},
+            .cluster_manifest, .table_manifest, .shard_header, .document_batch, .embedding_batch, .sparse_batch, .summary_batch, .chunk_batch, .edge_batch, .transaction_batch, .doc_identity_batch, .metadata_batch, .artifact_batch, .resolution_batch, .integrity_batch, .source_artifact_batch, .shard_footer, .file_footer => {},
             else => return error.InvalidBackupManifest,
         }
         var bytes: [object_record_size]u8 = @splat(0);

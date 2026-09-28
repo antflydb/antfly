@@ -316,6 +316,7 @@ pub const MetadataServer = struct {
             owned_public_write_source = public_write_source;
 
             var api_server_cfg = cfg.api_server_cfg;
+            api_server_cfg.configureRemoteCatalogPublicationAuthority();
             // Restore-owner and durable-session RPCs share the same owned
             // data-bearing routes and transport as ordinary hosted reads and
             // writes. An API caller need not inject a test-only executor to
@@ -1760,6 +1761,47 @@ test "metadata server can expose admin listener endpoints" {
     });
     defer rejected_setting.deinit(std.heap.page_allocator);
     try std.testing.expectEqual(@as(u16, 401), rejected_setting.status);
+
+    // A policy-status read does not need the separate setting grant, but the
+    // real host must reject missing and forged service credentials before the
+    // contextual catalog handler can grant its narrow read capability.
+    const policy_status_body = try std.json.Stringify.valueAlloc(std.heap.page_allocator, @import("../system_catalog/domain.zig").Call{ .policy_publication_status = 77 }, .{});
+    defer std.heap.page_allocator.free(policy_status_body);
+    var missing_policy_service = try executor.executor().execute(std.heap.page_allocator, .{
+        .method = .POST,
+        .uri = setting_uri,
+        .headers = &.{},
+        .body = policy_status_body,
+        .content_type = "application/json",
+    });
+    defer missing_policy_service.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 401), missing_policy_service.status);
+    var forged_policy_service = try executor.executor().execute(std.heap.page_allocator, .{
+        .method = .POST,
+        .uri = setting_uri,
+        .headers = &.{.{ .name = @import("../api/internal_service_auth.zig").header_name, .value = wrong_service_token }},
+        .body = policy_status_body,
+        .content_type = "application/json",
+    });
+    defer forged_policy_service.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 401), forged_policy_service.status);
+    const valid_service_token = try @import("../api/internal_service_auth.zig").tokenAlloc(std.heap.page_allocator, .{ .secret = "metadata-service-secret-0123456789abcdef", .issuer = "metadata-node" }, now_seconds);
+    defer std.heap.page_allocator.free(valid_service_token);
+    var authenticated_policy_status = try executor.executor().execute(std.heap.page_allocator, .{
+        .method = .POST,
+        .uri = setting_uri,
+        .headers = &.{
+            .{ .name = @import("../api/internal_service_auth.zig").header_name, .value = valid_service_token },
+            .{ .name = "X-Antfly-Raft-Mutation-Remaining-Ms", .value = "5000" },
+            .{ .name = "X-Antfly-Raft-Mutation-Forwards-Remaining", .value = "0" },
+            .{ .name = "X-Antfly-Raft-Mutation-Campaign-Allowed", .value = "false" },
+        },
+        .body = policy_status_body,
+        .content_type = "application/json",
+    });
+    defer authenticated_policy_status.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 409), authenticated_policy_status.status);
+    try std.testing.expectEqualStrings("RowPolicyCatalogChanged", authenticated_policy_status.body);
 
     // A forged service header must not reach the decoder-activation probe.
     // This exercises the real host authentication middleware, not just the

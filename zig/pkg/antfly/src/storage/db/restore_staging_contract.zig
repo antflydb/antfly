@@ -247,16 +247,21 @@ pub const GenerationAdmissionReceipt = struct {
     logical_digest: Digest,
     applied_term: u64,
     applied_index: u64,
+    native_position: ?@import("receipt_position.zig").Native = null,
 
-    const magic = "ARGS";
-    const encoded_len = 4 + 32 * 3 + 8 * 2 + 32;
+    const magic = "ARG2";
+    const encoded_len = 4 + 32 * 3 + @import("receipt_position.zig").Position.encoded_len + 32;
+
+    pub fn position(self: @This()) !@import("receipt_position.zig").Position {
+        return @import("receipt_position.zig").fromFields(self.applied_term, self.applied_index, self.native_position);
+    }
 
     pub fn validate(self: @This()) !void {
         if (std.mem.allEqual(u8, &self.scope, 0) or
             std.mem.allEqual(u8, &self.source_summary_digest, 0) or
-            std.mem.allEqual(u8, &self.logical_digest, 0) or
-            self.applied_term == 0 or self.applied_index == 0)
+            std.mem.allEqual(u8, &self.logical_digest, 0))
             return error.InvalidRestoreGenerationAdmissionReceipt;
+        _ = try self.position();
     }
 
     pub fn encode(self: @This()) ![encoded_len]u8 {
@@ -266,9 +271,8 @@ pub const GenerationAdmissionReceipt = struct {
         @memcpy(bytes[4..36], &self.scope);
         @memcpy(bytes[36..68], &self.source_summary_digest);
         @memcpy(bytes[68..100], &self.logical_digest);
-        std.mem.writeInt(u64, bytes[100..108], self.applied_term, .little);
-        std.mem.writeInt(u64, bytes[108..116], self.applied_index, .little);
-        std.crypto.hash.Blake3.hash(bytes[0..116], bytes[116..148], .{});
+        @memcpy(bytes[100..133], &try (try self.position()).encode());
+        std.crypto.hash.Blake3.hash(bytes[0..133], bytes[133..165], .{});
         return bytes;
     }
 
@@ -276,14 +280,16 @@ pub const GenerationAdmissionReceipt = struct {
         if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], magic))
             return error.InvalidRestoreGenerationAdmissionReceipt;
         var checksum: Digest = undefined;
-        std.crypto.hash.Blake3.hash(bytes[0..116], &checksum, .{});
-        if (!std.mem.eql(u8, &checksum, bytes[116..148])) return error.InvalidRestoreGenerationAdmissionReceipt;
+        std.crypto.hash.Blake3.hash(bytes[0..133], &checksum, .{});
+        if (!std.mem.eql(u8, &checksum, bytes[133..165])) return error.InvalidRestoreGenerationAdmissionReceipt;
+        const stamp = try @import("receipt_position.zig").Position.decode(bytes[100..133]);
         const result: @This() = .{
             .scope = bytes[4..36].*,
             .source_summary_digest = bytes[36..68].*,
             .logical_digest = bytes[68..100].*,
-            .applied_term = std.mem.readInt(u64, bytes[100..108], .little),
-            .applied_index = std.mem.readInt(u64, bytes[108..116], .little),
+            .applied_term = stamp.term(),
+            .applied_index = stamp.index(),
+            .native_position = stamp.nativePosition(),
         };
         try result.validate();
         return result;

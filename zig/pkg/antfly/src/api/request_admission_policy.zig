@@ -89,6 +89,10 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "listBackups", .class = .none },
     .{ .operation_id = "multiBatchWrite", .class = .write },
     .{ .operation_id = "getCluster", .class = .none },
+    // Enrollment is bounded administrative owner-control work, not a query
+    // or document mutation. Its durable authority validates admission.
+    .{ .operation_id = "enrollStoreRoot", .class = .none },
+    .{ .operation_id = "getStoreRootEnrollmentStatus", .class = .none },
     .{ .operation_id = "listConnections", .class = .none },
     .{ .operation_id = "invokeInferenceConnection", .class = .inference },
     .{ .operation_id = "evaluate", .class = .none },
@@ -97,6 +101,8 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     // or prepared-plan lookup; preparation/close do not execute data work.
     .{ .operation_id = "executeSQL", .class = .none },
     .{ .operation_id = "prepareSQL", .class = .none },
+    .{ .operation_id = "openSQLConnection", .class = .none },
+    .{ .operation_id = "closeSQLConnection", .class = .none },
     .{ .operation_id = "closePreparedSQL", .class = .none },
     .{ .operation_id = "executePreparedSQL", .class = .none },
     .{ .operation_id = "restore", .class = .none },

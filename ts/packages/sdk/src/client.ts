@@ -80,6 +80,8 @@ import type {
   RetrievalAgentStreamCallbacks,
   RunResearchJobOptions,
   ScanKeysRequest,
+  SQLConnectionOpenRequest,
+  SQLConnectionResponse,
   SQLDiagnostic,
   SQLPreparedExecutionRequest,
   SQLPreparedResponse,
@@ -877,6 +879,47 @@ export class AntflyClient {
   /** Execute one statement with bounded transport and no automatic mutation retries. */
   async executeSQL(request: SQLRequest, options?: WriteOptions): Promise<SQLResponse> {
     return this.sqlResponse(await this.sqlRequest<SQLResponse>("/db/v1/sql", request, options));
+  }
+
+  /** Open a durable, principal-bound SQL connection on this API node. Keep its owner for routing. */
+  async openSQLConnection(
+    request: SQLConnectionOpenRequest = {},
+    options?: WriteOptions
+  ): Promise<SQLConnectionResponse> {
+    const data = await this.sqlRequest<SQLConnectionResponse>(
+      "/db/v1/sql/connections",
+      request,
+      options
+    );
+    if (
+      !data ||
+      typeof data.connection_id !== "string" ||
+      !/^[0-9a-f]{32}$/.test(data.connection_id) ||
+      typeof data.owner_node_id !== "string" ||
+      !/^(0|[1-9][0-9]{0,19})$/.test(data.owner_node_id) ||
+      !Number.isSafeInteger(data.expires_at_ms) ||
+      data.expires_at_ms <= 0 ||
+      typeof data.database !== "string" ||
+      !data.database ||
+      typeof data.namespace !== "string" ||
+      !data.namespace
+    )
+      throw new Error("Invalid SQL connection response");
+    return data;
+  }
+
+  /** Close an idle SQL connection on its owner. Unknown mutation outcomes are never replayed. */
+  async closeSQLConnection(connectionId: string, options?: WriteOptions): Promise<void> {
+    if (!/^[0-9a-f]{32}$/.test(connectionId))
+      throw new Error("SQL connection ID must be 32 lowercase hexadecimal characters");
+    const data = await this.sqlRequest<Record<string, never>>(
+      `/db/v1/sql/connections/${encodeURIComponent(connectionId)}`,
+      undefined,
+      options,
+      "DELETE"
+    );
+    if (!data || Array.isArray(data) || typeof data !== "object" || Object.keys(data).length !== 0)
+      throw new Error("Invalid SQL connection close response");
   }
 
   /**

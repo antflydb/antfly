@@ -35,7 +35,9 @@ pub const Flags = packed struct(u8) {
     has_source_hash: bool = false,
     has_graph_generation: bool = false,
     portable_unbound_graph_generation: bool = false,
-    _reserved: u5 = 0,
+    /// Descriptive origin only, never a substitute for accepted provenance.
+    authored: bool = false,
+    _reserved: u4 = 0,
 };
 
 pub const Header = struct {
@@ -64,6 +66,16 @@ pub fn hashEmbeddingSource(source: []const u8, semantic_producer: []const u8) u6
 }
 
 pub fn encodeDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, vector: []const f32) ![]u8 {
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, vector);
+}
+
+/// Only explicit user-vector ingress may set this origin. In particular, an
+/// absent source hash in old or imported output does not establish authorship.
+pub fn encodeAuthoredDenseEmbeddingAlloc(alloc: Allocator, vector: []const f32) ![]u8 {
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, null, true, vector);
+}
+
+fn encodeDenseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, authored: bool, vector: []const f32) ![]u8 {
     const payload_len = @sizeOf(u32) + vector.len * @sizeOf(u32);
     const total_len = header_len + payload_len;
     const out = try alloc.alloc(u8, total_len);
@@ -72,7 +84,7 @@ pub fn encodeDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, vector: []
     writeHeader(out[0..header_len], .{
         .version = codec_version,
         .kind = .dense_embedding,
-        .flags = .{ .has_source_hash = source_hash != null },
+        .flags = .{ .has_source_hash = source_hash != null, .authored = authored },
         .source_hash = source_hash orelse 0,
         .payload_len = @intCast(payload_len),
     });
@@ -182,6 +194,14 @@ pub const GraphEdge = struct {
 };
 
 pub fn encodeSparseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, indices: []const u32, values: []const f32) ![]u8 {
+    return encodeSparseEmbeddingWithOriginAlloc(alloc, source_hash, false, indices, values);
+}
+
+pub fn encodeAuthoredSparseEmbeddingAlloc(alloc: Allocator, indices: []const u32, values: []const f32) ![]u8 {
+    return encodeSparseEmbeddingWithOriginAlloc(alloc, null, true, indices, values);
+}
+
+fn encodeSparseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, authored: bool, indices: []const u32, values: []const f32) ![]u8 {
     if (indices.len != values.len) return error.InvalidSparseEmbedding;
     const payload_len = @sizeOf(u32) + indices.len * (@sizeOf(u32) + @sizeOf(u32));
     const total_len = header_len + payload_len;
@@ -191,7 +211,7 @@ pub fn encodeSparseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, indices: 
     writeHeader(out[0..header_len], .{
         .version = codec_version,
         .kind = .sparse_embedding,
-        .flags = .{ .has_source_hash = source_hash != null },
+        .flags = .{ .has_source_hash = source_hash != null, .authored = authored },
         .source_hash = source_hash orelse 0,
         .payload_len = @intCast(payload_len),
     });
@@ -457,6 +477,10 @@ pub fn decodeHeaderPrefix(data: []const u8) !Header {
     const source_hash = std.mem.readInt(u64, data[pos..][0..8], .little);
     pos += @sizeOf(u64);
 
+    if (flags.authored and (flags.has_source_hash or source_hash != 0 or
+        flags.has_graph_generation or flags.portable_unbound_graph_generation or
+        (kind != .dense_embedding and kind != .sparse_embedding))) return error.InvalidArtifactHeader;
+
     const payload_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += @sizeOf(u32);
     if (pos != header_len) return error.InvalidArtifactHeader;
@@ -474,6 +498,56 @@ pub fn sourceHash(data: []const u8) !?u64 {
     const header = try decodeHeader(data);
     if (!header.flags.has_source_hash) return null;
     return header.source_hash;
+}
+
+test "ordered artifact inventory vector origin is explicit and preserves payloads" {
+    const alloc = std.testing.allocator;
+    const vector = [_]f32{ 0.25, -0.5 };
+    const indices = [_]u32{ 3, 19 };
+    const dense = try encodeAuthoredDenseEmbeddingAlloc(alloc, &vector);
+    defer alloc.free(dense);
+    const sparse = try encodeAuthoredSparseEmbeddingAlloc(alloc, &indices, &vector);
+    defer alloc.free(sparse);
+    const generated = try encodeDenseEmbeddingAlloc(alloc, 42, &vector);
+    defer alloc.free(generated);
+    const unhashed = try encodeDenseEmbeddingAlloc(alloc, null, &vector);
+    defer alloc.free(unhashed);
+    const sparse_unhashed = try encodeSparseEmbeddingAlloc(alloc, null, &indices, &vector);
+    defer alloc.free(sparse_unhashed);
+    try std.testing.expect((try decodeHeader(dense)).flags.authored);
+    try std.testing.expect((try decodeHeader(sparse)).flags.authored);
+    try std.testing.expect(!(try decodeHeader(generated)).flags.authored);
+    try std.testing.expect(!(try decodeHeader(unhashed)).flags.authored);
+    try std.testing.expect(!(try decodeHeader(sparse_unhashed)).flags.authored);
+    try std.testing.expectEqual(@as(?u64, null), try sourceHash(dense));
+    try std.testing.expectEqual(@as(?u64, 42), try sourceHash(generated));
+    try std.testing.expectEqualSlices(u8, dense[header_len..], unhashed[header_len..]);
+    try std.testing.expectEqualSlices(u8, sparse[header_len..], sparse_unhashed[header_len..]);
+    const decoded = try decodeDenseEmbeddingAlloc(alloc, dense);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualSlices(f32, &vector, decoded);
+    var decoded_sparse = try decodeSparseEmbeddingAlloc(alloc, sparse);
+    defer decoded_sparse.deinit(alloc);
+    try std.testing.expectEqualSlices(u32, &indices, decoded_sparse.indices);
+    try std.testing.expectEqualSlices(f32, &vector, decoded_sparse.values);
+}
+
+test "ordered artifact inventory rejects contradictory authored vector envelopes" {
+    const alloc = std.testing.allocator;
+    const raw = try encodeAuthoredDenseEmbeddingAlloc(alloc, &.{1});
+    defer alloc.free(raw);
+    const flags_offset = magic.len + @sizeOf(u16) + @sizeOf(u8);
+    const valid_flags = raw[flags_offset];
+    for ([_]u8{ 1, 2, 4 }) |contradiction| {
+        raw[flags_offset] = valid_flags | contradiction;
+        try std.testing.expectError(error.InvalidArtifactHeader, decodeHeader(raw));
+    }
+    raw[flags_offset] = valid_flags;
+    raw[flags_offset + 1] = 1;
+    try std.testing.expectError(error.InvalidArtifactHeader, decodeHeader(raw));
+    raw[flags_offset + 1] = 0;
+    raw[flags_offset - 1] = @intFromEnum(Kind.asset);
+    try std.testing.expectError(error.InvalidArtifactHeader, decodeHeader(raw));
 }
 
 fn writeHeader(dst: []u8, header: Header) void {

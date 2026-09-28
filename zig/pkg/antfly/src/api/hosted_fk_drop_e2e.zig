@@ -37,7 +37,8 @@ fn request(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: [
 fn requestWithTimeout(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, suffix: []const u8, method: http.Method, body: ?[]const u8, timeout_ms: u32) !http.HttpResponse {
     const uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base, suffix });
     defer alloc.free(uri);
-    return transport.execute(alloc, .{ .method = method, .uri = uri, .headers = headers, .content_type = if (body == null) null else "application/json", .body = body orelse "", .timeout_ms = timeout_ms });
+    const authorization = if (headers.len > 0 and std.ascii.eqlIgnoreCase(headers[0].name, "authorization")) headers[0].value else null;
+    return transport.execute(alloc, .{ .method = method, .uri = uri, .authorization = authorization, .headers = if (authorization != null) headers[1..] else headers, .content_type = if (body == null) null else "application/json", .body = body orelse "", .timeout_ms = timeout_ms });
 }
 fn sql(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, statement: []const u8) !http.HttpResponse {
     const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement }, .{});
@@ -54,6 +55,23 @@ fn batch(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []c
     defer alloc.free(suffix);
     return requestWithTimeout(alloc, transport, headers, base, suffix, .POST, body, timeout_ms);
 }
+fn awaitEnforced(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, name: []const u8) !void {
+    const path = try std.fmt.allocPrint(alloc, "/db/v1/tables/{s}/constraints/status", .{name});
+    defer alloc.free(path);
+    const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < deadline) {
+        var response = try request(alloc, transport, headers, base, path, .GET, null);
+        defer response.deinit(alloc);
+        if (response.status == 200) {
+            var status = try std.json.parseFromSlice(struct { state: []const u8, ranges: []const std.json.Value }, alloc, response.body, .{ .ignore_unknown_fields = true });
+            defer status.deinit();
+            if (status.value.ranges.len != 0 and std.mem.eql(u8, status.value.state, "enforced")) return;
+        } else if (response.status != 409 and response.status != 503 and response.status != 504) return error.ConstraintCoverageUnavailable;
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return error.ConstraintCoverageUnavailable;
+}
+
 fn job(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, id: []const u8) !http.HttpResponse {
     const suffix = try std.fmt.allocPrint(alloc, "/db/v1/restore/jobs/{s}", .{id});
     defer alloc.free(suffix);
@@ -216,18 +234,21 @@ fn awaitTruncate(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestEx
     const plan_id = try staging.idForAttempt(job_id, 1);
     const source = http_server.StatusSource.fromMetadataHttpService(metadata.server.svc);
     const deadline = platform.time.monotonicNs() +| 45 * std.time.ns_per_s;
-    var observed_published = false;
+    var last_phase: ?staging.State = null;
     while (platform.time.monotonicNs() < deadline) {
         if (try source.getRestoreStaging(alloc, plan_id, .{ .deadline_ns = @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s) })) |encoded| {
             defer alloc.free(encoded);
             var staged = try std.json.parseFromSlice(staging.Job, alloc, encoded, .{ .ignore_unknown_fields = true });
             defer staged.deinit();
+            if (last_phase == null or last_phase.? != staged.value.state) {
+                std.debug.print("truncate staging phase={s}\n", .{@tagName(staged.value.state)});
+                last_phase = staged.value.state;
+            }
             if (staged.value.plan.external_fk_parents.len != 1 or staged.value.plan.external_fk_parents[0].ranges.len != 1) return error.TruncateParentPlanMismatch;
             if (staged.value.state == .published) {
                 const parent_group = staged.value.plan.external_fk_parents[0].ranges[0].group_id;
                 const activation_receipt = try source.getRestoreStagingReceipt(alloc, plan_id, .activating, parent_group, .{ .deadline_ns = @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s) }) orelse return error.TruncateParentActivationReceiptMissing;
                 alloc.free(activation_receipt);
-                observed_published = true;
             } else {
                 var public_child = try table(alloc, transport, headers, base, "children");
                 defer public_child.deinit(alloc);
@@ -251,7 +272,17 @@ fn awaitTruncate(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestEx
             const phase = (try field(state.value, "phase")).string;
             if (std.mem.eql(u8, phase, "failed")) return error.TruncateJobFailed;
             if (std.mem.eql(u8, phase, "succeeded")) {
-                if (!observed_published) return error.TruncatePublicationUnobserved;
+                // Job completion can race the preceding staging read. Prove
+                // the durable terminal state, not whether polling saw it.
+                const terminal_bytes = (try source.getRestoreStaging(alloc, plan_id, .{ .deadline_ns = @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s) })) orelse return error.TruncatePublicationUnobserved;
+                defer alloc.free(terminal_bytes);
+                var terminal = try std.json.parseFromSlice(staging.Job, alloc, terminal_bytes, .{ .ignore_unknown_fields = true });
+                defer terminal.deinit();
+                if (terminal.value.state != .published or terminal.value.plan.external_fk_parents.len != 1 or terminal.value.plan.external_fk_parents[0].ranges.len != 1)
+                    return error.TruncatePublicationUnobserved;
+                const parent_group = terminal.value.plan.external_fk_parents[0].ranges[0].group_id;
+                const activation = (try source.getRestoreStagingReceipt(alloc, plan_id, .activating, parent_group, .{ .deadline_ns = @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s) })) orelse return error.TruncateParentActivationReceiptMissing;
+                alloc.free(activation);
                 var child = try table(alloc, transport, headers, base, "children");
                 defer child.deinit(alloc);
                 const new_id = try tableId(alloc, child);
@@ -265,10 +296,53 @@ fn awaitTruncate(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestEx
     return error.TruncateJobTimeout;
 }
 
-const MountedMode = enum { drop, truncate };
+const recovery_fixture = @import("hosted_truncate_recovery_fixture.zig");
+const MountedMode = enum { drop, truncate, truncate_fault };
+
+fn awaitRetirementState(alloc: std.mem.Allocator, io: std.Io, data: *data_runtime.DataServer, route: ParentRoute, acknowledged: bool, drivers: []const *raft.ManagedProgressDriver) !void {
+    const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+    const reader = (if (data.http_server) |*server| server.table_reads else null) orelse return error.ParentReadSourceMissing;
+    while (platform.time.monotonicNs() < deadline) {
+        for (drivers) |driver| try driver.checkFailure();
+        var response = reader.lookup(alloc, route.table_name, "", .{
+            .relational_topology_json = "{\"mode\":\"parent_activation\"}",
+            .execution_deadline_ns = @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s),
+        }, .read_index) catch |err| switch (err) {
+            error.NotLeader, error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerUnavailable, error.Timeout, error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded => {
+                try io.sleep(.fromMilliseconds(20), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        if (response) |*value| {
+            defer value.deinit(alloc);
+            var parsed = try std.json.parseFromSlice(?@import("../storage/db/relational_integrity_generation_retirement.zig").OwnerStatus, alloc, value.json, .{});
+            defer parsed.deinit();
+            if (parsed.value) |status| {
+                try std.testing.expectEqual(route.group_id, status.fence.owner_group_id);
+                if (status.completed and status.acknowledged == acknowledged) return;
+            }
+        }
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return error.ParentRetirementStateTimeout;
+}
 
 fn mountedHostedExternalParent(mode: MountedMode) !void {
     const alloc = std.testing.allocator;
+    const usermgr = @import("../usermgr/mod.zig");
+    const casbin = @import("antfly_casbin");
+    var auth_store = usermgr.MemoryStore.init(alloc);
+    defer auth_store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var auth_manager = try usermgr.UserManager.init(alloc, auth_store.iface(), try usermgr.initDefaultEnforcer(alloc, policy_store.iface()));
+    defer auth_manager.deinit();
+    var permission = try usermgr.Permission.initOwned(alloc, .table, "*", .admin);
+    defer permission.deinit(alloc);
+    var admin = try auth_manager.createUser("truncate-admin", "truncate-password", &.{permission});
+    defer admin.deinit(alloc);
+    const admin_headers = [_]http.RequestHeader{.{ .name = "Authorization", .value = "Basic dHJ1bmNhdGUtYWRtaW46dHJ1bmNhdGUtcGFzc3dvcmQ=" }};
     const process_alloc = platform.allocator.processAllocator(alloc);
     const trusted_secret = "hosted-fk-drop-trusted-v1";
     const internal_secret = "hosted-fk-drop-internal-v1";
@@ -297,7 +371,7 @@ fn mountedHostedExternalParent(mode: MountedMode) !void {
         .replica_catalog_path = meta_catalog,
         .snapshot_root_dir = snapshots,
         .observe_local_replica_root = true,
-        .api_server_cfg = .{ .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
+        .api_server_cfg = .{ .auth_enabled = true, .user_manager = &auth_manager, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
     });
     defer metadata.deinit();
     try metadata.start();
@@ -341,6 +415,23 @@ fn mountedHostedExternalParent(mode: MountedMode) !void {
     var data_control_live = true;
     defer if (data_control_live) data_control.deinit();
     try data_control.start();
+    const restarter: recovery_fixture.DataRestart = .{
+        .alloc = process_alloc,
+        .io = io,
+        .server = &data,
+        .server_live = &data_live,
+        .raft_driver = &data_raft,
+        .raft_live = &data_raft_live,
+        .control_driver = &data_control,
+        .control_live = &data_control_live,
+        .metadata_uri = metadata_uri,
+        .config = .{
+            .replica_root_dir = data_root,
+            .replica_catalog_path = data_catalog,
+            .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
+            .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
+        },
+    };
     const base = try data.baseUri(alloc);
     defer alloc.free(base);
     var executor = executor_mod.StdHttpExecutor.init(alloc, .{});
@@ -364,7 +455,7 @@ fn mountedHostedExternalParent(mode: MountedMode) !void {
         if (response.status != 200) std.debug.print("hosted FK create status={d}\n", .{response.status});
         try std.testing.expectEqual(@as(u16, 200), response.status);
     }
-    _ = try awaitTable(alloc, io, transport, &headers, base, "parents");
+    const parent_id = try awaitTable(alloc, io, transport, &headers, base, "parents");
     const child_id = try awaitTable(alloc, io, transport, &headers, base, "children");
     var parent_insert = try batch(alloc, transport, &headers, base, "parents", "{\"inserts\":{\"parent-row\":{\"id\":1}},\"sync_level\":\"full_text\"}", 3_000);
     defer parent_insert.deinit(alloc);
@@ -379,6 +470,18 @@ fn mountedHostedExternalParent(mode: MountedMode) !void {
     var after_add = try table(alloc, transport, &headers, base, "children");
     defer after_add.deinit(alloc);
     try std.testing.expect(try hasForeignKey(alloc, after_add));
+    awaitEnforced(alloc, io, transport, &headers, base, "children") catch |err| {
+        try meta_raft.checkFailure();
+        try meta_control.checkFailure();
+        try data_raft.checkFailure();
+        try data_control.checkFailure();
+        for ([_][]const u8{ "parents", "children" }) |name| {
+            var visible = try table(alloc, transport, &headers, base, name);
+            defer visible.deinit(alloc);
+            std.debug.print("activation timeout table={s} status={d} body={s}\n", .{ name, visible.status, visible.body });
+        }
+        return err;
+    };
     var child_insert = try batch(alloc, transport, &headers, base, "children", "{\"inserts\":{\"child-row\":{\"id\":7,\"parent_id\":1}},\"sync_level\":\"full_text\"}", 10_000);
     defer child_insert.deinit(alloc);
     if (child_insert.status != 201) std.debug.print("hosted FK child insert status={d}\n", .{child_insert.status});
@@ -405,53 +508,106 @@ fn mountedHostedExternalParent(mode: MountedMode) !void {
             try std.testing.expect(!try hasForeignKey(alloc, after_drop));
             break :blk child_id;
         },
-        .truncate => blk: {
-            var truncate = try sql(alloc, transport, &headers, metadata_uri, "TRUNCATE children");
+        .truncate, .truncate_fault => blk: {
+            const coordinator = metadata.server.owned_public_http_server orelse return error.PublicationSupervisorUnavailable;
+            const hooks = http_server.ApiHttpServer.TruncateTestDriver;
+            defer hooks.release(coordinator);
+            if (mode == .truncate_fault) hooks.arm(coordinator, .parent_activated);
+            var truncate = try sql(alloc, transport, &admin_headers, metadata_uri, "TRUNCATE children");
             defer truncate.deinit(alloc);
             if (truncate.status != 202 and truncate.status != 409) std.debug.print("hosted FK TRUNCATE status={d}\n", .{truncate.status});
-            break :blk try awaitTruncate(alloc, io, transport, &headers, metadata_uri, &metadata, child_id, truncate);
+            try std.testing.expectEqual(@as(u16, 202), truncate.status);
+            if (mode == .truncate_fault) {
+                const drivers = [_]*raft.ManagedProgressDriver{ &meta_raft, &meta_control, &data_raft, &data_control };
+                try recovery_fixture.awaitBoundary(io, coordinator, &drivers);
+                try awaitRetirementState(alloc, io, &data, parent_route, false, &drivers);
+                // The parent activation committed, but its coordinator receipt
+                // was lost. Reopen the same roots before allowing its retry.
+                try restarter.restart();
+                try awaitRetirementState(alloc, io, &data, parent_route, false, &drivers);
+                hooks.arm(coordinator, .before_parent_ack);
+                try recovery_fixture.awaitBoundary(io, coordinator, &drivers);
+                try awaitRetirementState(alloc, io, &data, parent_route, false, &drivers);
+                var published_child = try table(alloc, transport, &admin_headers, metadata_uri, "children");
+                defer published_child.deinit(alloc);
+                try std.testing.expect(try tableId(alloc, published_child) != child_id);
+                hooks.arm(coordinator, .after_parent_ack);
+                try recovery_fixture.awaitBoundary(io, coordinator, &drivers);
+                try awaitRetirementState(alloc, io, &data, parent_route, true, &drivers);
+                // Lose the ACK reply and process-local owner caches. Metadata
+                // and the owner must recover the original job, not a new SQL.
+                try restarter.restart();
+                try awaitRetirementState(alloc, io, &data, parent_route, true, &drivers);
+                hooks.release(coordinator);
+            }
+            break :blk try awaitTruncate(alloc, io, transport, &admin_headers, metadata_uri, &metadata, child_id, truncate);
         },
     };
 
-    data_control.deinit();
-    data_control_live = false;
-    data_raft.deinit();
-    data_raft_live = false;
-    data.deinit();
-    data_live = false;
-    data = try data_runtime.DataServer.initFromMetadataApiUrl(process_alloc, .{
-        .replica_root_dir = data_root,
-        .replica_catalog_path = data_catalog,
-        .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
-    }, metadata_uri);
-    data_live = true;
-    try data.start();
-    try data.registerNodeIfConfigured();
-    data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
-    data_raft_live = true;
-    try data_raft.start();
-    data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, std.time.ns_per_ms);
-    data_control_live = true;
-    try data_control.start();
+    if (mode != .truncate_fault) try restarter.restart();
     const restarted_base = try data.baseUri(alloc);
     defer alloc.free(restarted_base);
     try awaitTableId(alloc, io, transport, &headers, restarted_base, "children", next_child_id);
     var restarted_child = try table(alloc, transport, &headers, restarted_base, "children");
     defer restarted_child.deinit(alloc);
-    try std.testing.expectEqual(mode == .truncate, try hasForeignKey(alloc, restarted_child));
+    try std.testing.expectEqual(mode != .drop, try hasForeignKey(alloc, restarted_child));
+    try awaitTableId(alloc, io, transport, &headers, restarted_base, "parents", parent_id);
     const parent_server = if (data.http_server) |*server| server else return error.ParentReadSourceMissing;
     const parent_reader = parent_server.table_reads orelse return error.ParentReadSourceMissing;
     if (mode == .drop) {
         const current_parent_receipt = try awaitParentAcknowledged(alloc, io, parent_reader, parent_route);
         try std.testing.expect(!std.mem.eql(u8, &prior_parent_receipt, &current_parent_receipt));
     }
-    var released_delete = try batch(alloc, transport, &headers, restarted_base, "parents", "{\"deletes\":[\"parent-row\"],\"sync_level\":\"full_text\"}", 3_000);
+    // Cold restart readiness is a linearizable read, never a retried mutation.
+    const parent_ready_deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+    while (true) {
+        var ready = parent_reader.lookup(alloc, parent_route.table_name, "", .{
+            .relational_integrity_catalog = true,
+            .execution_deadline_ns = @min(parent_ready_deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s),
+        }, .read_index) catch |err| switch (err) {
+            error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerUnavailable, error.Timeout, error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded => {
+                if (platform.time.monotonicNs() >= parent_ready_deadline) return err;
+                try io.sleep(.fromMilliseconds(20), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        if (ready) |*response| {
+            response.deinit(alloc);
+            break;
+        }
+        if (platform.time.monotonicNs() >= parent_ready_deadline) return error.ParentReadSourceMissing;
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+    var released_delete = try batch(alloc, transport, &headers, restarted_base, "parents", "{\"deletes\":[\"parent-row\"],\"sync_level\":\"full_text\"}", 10_000);
     defer released_delete.deinit(alloc);
     if (released_delete.status != 201) std.debug.print("hosted FK post-retirement delete status={d}\n", .{released_delete.status});
     try std.testing.expectEqual(@as(u16, 201), released_delete.status);
+    if (mode != .drop) {
+        try awaitEnforced(alloc, io, transport, &headers, restarted_base, "children");
+        var orphan = try batch(alloc, transport, &headers, restarted_base, "children", "{\"inserts\":{\"orphan\":{\"id\":8,\"parent_id\":1}},\"sync_level\":\"full_text\"}", 10_000);
+        defer orphan.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 409), orphan.status);
+        var new_parent = try batch(alloc, transport, &headers, restarted_base, "parents", "{\"inserts\":{\"new-parent\":{\"id\":2}},\"sync_level\":\"full_text\"}", 10_000);
+        defer new_parent.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 201), new_parent.status);
+        var new_child = try batch(alloc, transport, &headers, restarted_base, "children", "{\"inserts\":{\"new-child\":{\"id\":9,\"parent_id\":2}},\"sync_level\":\"full_text\"}", 10_000);
+        defer new_child.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 201), new_child.status);
+        var protected = try batch(alloc, transport, &headers, restarted_base, "parents", "{\"deletes\":[\"new-parent\"],\"sync_level\":\"full_text\"}", 10_000);
+        defer protected.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 409), protected.status);
+    }
 }
 
 test "mounted hosted external-parent FK DROP publishes after parent ACK" {
     try mountedHostedExternalParent(.drop);
+}
+
+test "mounted hosted external-parent FK TRUNCATE retires old references across restart" {
+    try mountedHostedExternalParent(.truncate);
+}
+
+test "mounted hosted external-parent FK TRUNCATE recovers lost activation and ACK replies across cold owners" {
+    try mountedHostedExternalParent(.truncate_fault);
 }

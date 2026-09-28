@@ -22,6 +22,80 @@ const schema =
     \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"later","expression":{"op":"literal","type":"integer","value":"9"}}],"generated_columns":[{"column":"doubled","expression":{"op":"multiply","args":[{"op":"column","column":"id"},{"op":"literal","type":"integer","value":"2"}]}}],"relational_indexes":[{"name":"by_id","keys":[{"column":"id"}],"include_columns":["doubled"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"doubled":{"type":"integer"},"later":{"type":"integer"}},"additionalProperties":false}}}}
 ;
 
+test "relational index system merge tail streams REF5 oversized row with bounded resume chunks" {
+    const retained = @import("../retained_effects.zig");
+    const frame = @import("../retained_frame.zig");
+    const internal = @import("../internal_keys.zig");
+    const tail = @import("merge_tail_reader.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("merge-tail-ref5");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 11, .shard_id = 101, .range_id = 101 }, .start_optional_runtimes = false };
+    var db = try db_mod.DB.open(alloc, directory.path(), options);
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    // A real first primary apply persists the physical namespace before the
+    // separate retention admission. The bootstrap predates the retained cut.
+    try db.batchRaftReplicatedApply(.{ .timestamp_ns = 1, .writes = &.{.{ .key = "bootstrap", .value = "{}" }} }, .{ .term = 1, .index = 1 });
+    const identity = try db.relationalTopologyIdentity();
+    const scope: @import("online_source_contract.zig").Scope = .{
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+        .receiver_namespace = .{ .table_id = 11, .shard_id = 102, .range_id = 102 },
+        .fence = .{ .role = .merge_source, .transition_id = 100, .attempt = 1, .peer_group_id = 102, .owner_group_id = 101, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest, .admission_epoch = identity.next_epoch },
+    };
+    const pin: [32]u8 = @splat(7);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try retained.admitWithCapabilities(&txn, scope.namespace(), 1, pin, retained.default_limit, false, true);
+        try txn.commit();
+    }
+    const key = try internal.documentKeyAlloc(alloc, "large-row");
+    defer alloc.free(key);
+    const value = try alloc.alloc(u8, 17 * 1024 * 1024);
+    defer alloc.free(value);
+    @memset(value, 'x');
+    try db.core.store.put(key, value);
+    var read = try db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+    var transferred = false;
+    errdefer if (!transferred) read.abort();
+    const scratch = try alloc.alloc(u8, frame.chunk_bytes);
+    errdefer if (!transferred) alloc.free(scratch);
+    var cache: frame.View.ChunkCache = .{ .bytes = scratch };
+    const retained_value = (try retained.readFrame(&read, scope.namespace(), 1, pin, 0, &cache)).?;
+    const view = switch (retained_value) {
+        .chunked => |v| v,
+        .contiguous => return error.TestUnexpectedResult,
+    };
+    var session: tail.Session = .{
+        .db = &db,
+        .txn = read,
+        .frame = retained_value,
+        .chunk_buffer = scratch,
+        .chunk_cache = cache,
+        .scope = scope,
+        .admission = .{ .namespace = scope.namespace(), .consumer_epoch = 1, .pin = pin, .start = 0, .acknowledged = 0, .snapshot_certificate = @splat(5), .admitted_applied_index = 1 },
+        .sequence = 1,
+        .total = view.effect_count,
+    };
+    transferred = true;
+    defer session.deinit();
+    var fragment = (try session.next(alloc, pages.max_rows, pages.max_bytes, .none)).?;
+    defer fragment.deinit();
+    try std.testing.expect(fragment.streamed != null);
+    try std.testing.expect(fragment.frame_complete);
+    const source: pages.Source = .{ .namespace = identity.namespace, .pin_digest = @splat(5), .applied_index = 1, .retention = .{ .epoch = 1, .after_sequence = 0 } };
+    const context: types.MergeReplicationContext = .{ .transition_id = 100, .donor_group_id = 101, .receiver_group_id = 102, .identity_namespace = scope.receiver_namespace, .copy_attempt = scope.copy_attempt };
+    try std.testing.expectError(error.MergePageChunkRequired, fragment.request(source, context, 1));
+    const chunks = try fragment.chunkRequests(source, context, 1);
+    const first = try chunks.requestAt(0);
+    try std.testing.expectEqual(@as(u64, value.len), first.merge_page.?.chunk.?.total_bytes);
+    try std.testing.expectEqualSlices(u8, value[0..pages.chunk_bytes], first.merge_page.?.chunk.?.data);
+    const resumed = try chunks.requestAt(pages.chunk_bytes);
+    try std.testing.expectEqual(@as(u64, pages.chunk_bytes), resumed.merge_page.?.chunk.?.offset);
+    try std.testing.expectEqualSlices(u8, value[pages.chunk_bytes .. 2 * pages.chunk_bytes], resumed.merge_page.?.chunk.?.data);
+}
+
 fn seal(input: types.BatchRequest) types.BatchRequest {
     var request = input;
     request.merge_page.?.digest = pages.commandDigest(request);
@@ -328,7 +402,7 @@ test "relational index system merge tail sessions decode bounded immutable fragm
         try db.batchRaftReplicatedApply(.{ .timestamp_ns = 111, .writes = &.{ .{ .key = "a", .value = "{\"id\":1}" }, .{ .key = "b", .value = "{\"id\":2}" } }, .deletes = &.{"c"} }, .{ .term = 1, .index = 2 });
         var session = (try db.beginMergeTailRead(scope, 0)).?;
         defer session.deinit();
-        const frame_digest = session.reader.frame_digest;
+        const frame_digest = session.frameDigest();
         var canceled = std.atomic.Value(bool).init(true);
         try std.testing.expectError(error.Canceled, session.next(alloc, 1, 1024, .fromAtomic(&canceled)));
         try std.testing.expectEqual(@as(u32, 0), session.offset);

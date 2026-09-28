@@ -128,7 +128,7 @@ pub fn namespaceBytes(value: identity.Namespace) [24]u8 {
 }
 
 pub const Command = union(enum) {
-    admit: struct { scope: Scope, limit: u64 = 256 * 1024 * 1024 },
+    admit: struct { scope: Scope, limit: u64 = 256 * 1024 * 1024, artifact_catalog: ?@import("artifact_inventory.zig").Binding = null },
     acknowledge: struct { scope: Scope, previous: u64, next: u64 },
     release: Scope,
     final_fence: struct { scope: Scope, expected_sequence: u64 },
@@ -145,7 +145,10 @@ pub const Command = union(enum) {
     pub fn validate(self: Command) !void {
         try self.scope().validate();
         switch (self) {
-            .admit => |value| if (value.limit < 16 * 1024 * 1024) return error.InvalidOnlineSourceCommand,
+            .admit => |value| {
+                if (value.limit < 16 * 1024 * 1024) return error.InvalidOnlineSourceCommand;
+                if (value.artifact_catalog) |binding| if (!binding.valid()) return error.InvalidOnlineSourceCommand;
+            },
             .acknowledge => |value| if (value.next < value.previous) return error.InvalidOnlineSourceCommand,
             .reclaim => |value| if (value.frame_limit == 0 or value.frame_limit > 128 or value.byte_limit == 0 or value.byte_limit > 16 * 1024 * 1024) return error.InvalidOnlineSourceCommand,
             .publish_certificate => |value| {

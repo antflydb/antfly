@@ -35,8 +35,14 @@ const std = @import("std");
 /// Version 15 decodes the durable fenced FK generation publication transition.
 /// Version 16 decodes initial FK creation. Version 17 decodes the physical
 /// store-root UUID extension in store registration records. Version 18 adds
-/// the exact physical-root Ed25519 verifier; no ACK semantics are enabled.
-pub const current_version: u16 = 18;
+/// the exact physical-root Ed25519 verifier. Version 19 adds administrator
+/// enrollment, root-authenticated retirement ACKs, immutable artifact
+/// inventory bindings for online merge admission, and typed FK table locks
+/// distinguishing ordinary generation cuts from initial support reservation.
+/// Version 20 admits ordered direct-vector artifact merges. The entire ordered
+/// artifact workflow requires this capability, so a partial rolling upgrade
+/// cannot certify a source whose later pages an older voter cannot execute.
+pub const current_version: u16 = 20;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.
@@ -50,10 +56,15 @@ pub const system_catalog_version: u16 = 7;
 pub const sql_setting_catalog_version: u16 = 12;
 pub const sql_row_policy_catalog_version: u16 = 13;
 pub const sql_row_policy_publication_version: u16 = 14;
-pub const fk_generation_publication_version: u16 = 15;
-pub const fk_initial_create_version: u16 = 17;
+// Generation table locks carry a typed owner discriminant from v19 onward;
+// an older metadata voter would persist the former untyped lock and permit
+// schema finalization through an active immutable publication cut.
+pub const fk_generation_publication_version: u16 = 19;
+pub const fk_initial_create_version: u16 = 19;
 pub const store_root_uuid_decoder_version: u16 = 17;
 pub const store_root_signing_decoder_version: u16 = 18;
+pub const store_root_enrollment_version: u16 = 19;
+pub const ordered_merge_artifact_version: u16 = 20;
 /// Minimum decoder capability required by the atomic create/drop wire format.
 /// Later, unrelated metadata features must not unnecessarily stop table DDL
 /// when a membership change temporarily includes a lower-capability peer.

@@ -8,12 +8,17 @@ from ....sql_transport import sql_request, sql_request_async
 from ...client import AuthenticatedClient, Client
 from ...models.close_prepared_sql_response_200 import ClosePreparedSQLResponse200
 from ...models.sql_diagnostic import SQLDiagnostic
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     prepared_id: str,
+    *,
+    x_antfly_sql_connection_id: str | Unset = UNSET,
 ) -> dict[str, Any]:
+    headers: dict[str, Any] = {}
+    if not isinstance(x_antfly_sql_connection_id, Unset):
+        headers["X-Antfly-SQL-Connection-Id"] = x_antfly_sql_connection_id
 
     _kwargs: dict[str, Any] = {
         "method": "delete",
@@ -22,6 +27,7 @@ def _get_kwargs(
         ),
     }
 
+    _kwargs["headers"] = headers
     return _kwargs
 
 
@@ -53,11 +59,13 @@ def sync_detailed(
     prepared_id: str,
     *,
     client: AuthenticatedClient,
+    x_antfly_sql_connection_id: str | Unset = UNSET,
 ) -> Response[ClosePreparedSQLResponse200 | SQLDiagnostic]:
     """Release a durable prepared SQL resource
 
     Args:
         prepared_id (str):
+        x_antfly_sql_connection_id (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -69,6 +77,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         prepared_id=prepared_id,
+        x_antfly_sql_connection_id=x_antfly_sql_connection_id,
     )
 
     response = sql_request(
@@ -83,11 +92,13 @@ def sync(
     prepared_id: str,
     *,
     client: AuthenticatedClient,
+    x_antfly_sql_connection_id: str | Unset = UNSET,
 ) -> ClosePreparedSQLResponse200 | SQLDiagnostic | None:
     """Release a durable prepared SQL resource
 
     Args:
         prepared_id (str):
+        x_antfly_sql_connection_id (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -100,6 +111,7 @@ def sync(
     return sync_detailed(
         prepared_id=prepared_id,
         client=client,
+        x_antfly_sql_connection_id=x_antfly_sql_connection_id,
     ).parsed
 
 
@@ -107,11 +119,13 @@ async def asyncio_detailed(
     prepared_id: str,
     *,
     client: AuthenticatedClient,
+    x_antfly_sql_connection_id: str | Unset = UNSET,
 ) -> Response[ClosePreparedSQLResponse200 | SQLDiagnostic]:
     """Release a durable prepared SQL resource
 
     Args:
         prepared_id (str):
+        x_antfly_sql_connection_id (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -123,6 +137,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         prepared_id=prepared_id,
+        x_antfly_sql_connection_id=x_antfly_sql_connection_id,
     )
 
     response = await sql_request_async(client.get_async_httpx_client(), **kwargs)
@@ -134,11 +149,13 @@ async def asyncio(
     prepared_id: str,
     *,
     client: AuthenticatedClient,
+    x_antfly_sql_connection_id: str | Unset = UNSET,
 ) -> ClosePreparedSQLResponse200 | SQLDiagnostic | None:
     """Release a durable prepared SQL resource
 
     Args:
         prepared_id (str):
+        x_antfly_sql_connection_id (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -152,5 +169,6 @@ async def asyncio(
         await asyncio_detailed(
             prepared_id=prepared_id,
             client=client,
+            x_antfly_sql_connection_id=x_antfly_sql_connection_id,
         )
     ).parsed

@@ -17,6 +17,164 @@ const integrity = @import("relational_integrity.zig");
 const catalog = @import("relational_integrity_catalog.zig");
 const tuples = @import("relational_index_keys.zig");
 
+test "relational integrity authenticated retirement summary survives abort reopen and owner transfer" {
+    const alloc = std.testing.allocator;
+    const retirement = @import("relational_integrity_generation_retirement.zig");
+    const summary = @import("retirement_set_summary.zig");
+    const admission = @import("relational_integrity_generation_admission.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retirement-summary", .{tmp.sub_path});
+    defer alloc.free(path);
+    const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retirement-summary-transfer", .{tmp.sub_path});
+    defer alloc.free(target_path);
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 41, .shard_id = 31, .range_id = 31 }, .start_optional_runtimes = false, .start_index_workers = false };
+    const fence: @import("relational_integrity_topology.zig").Fence = .{ .role = .child_generation_parent, .transition_id = 7, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = options.identity_namespace.?, .catalog_digest = @splat(2) };
+    const transition: admission.Transition = .{ .child_table_id = 11, .child_table_name = "children", .constraint_name = "fk", .expected_generation = @splat(3), .next_generation = @splat(4), .plan_id = @splat(5), .decision_digest = @splat(6) };
+    var committed: summary.Summary = undefined;
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try std.testing.expectError(error.InvalidIntegrityOperation, db.batch(.{ .writes = &.{.{ .key = summary.root_key, .value = "forged" }} }));
+        try std.testing.expectError(error.InvalidIntegrityOperation, db.batch(.{ .deletes = &.{summary.root_key} }));
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            defer txn.abort();
+            try retirement.stageChildGenerationRetirements(alloc, &txn, fence, &.{transition});
+            try std.testing.expectEqual(@as(u64, 1), (try retirement.authenticatedSummary(&txn)).count);
+        }
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect(try summary.read(&read) == null);
+            try std.testing.expectEqual(@as(u64, 0), (try retirement.authenticatedSummary(&read)).count);
+        }
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try retirement.stageChildGenerationRetirements(alloc, &txn, fence, &.{transition});
+        committed = try retirement.authenticatedSummary(&txn);
+        try txn.commit();
+    }
+    var reopened = try db_mod.DB.open(alloc, path, options);
+    defer reopened.close();
+    var read = try reopened.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualDeep(committed, try retirement.authenticatedSummary(&read));
+    var target = try db_mod.DB.open(alloc, target_path, options);
+    defer target.close();
+    var txn = try target.core.store.beginWriteTxn();
+    var target_committed = false;
+    defer if (!target_committed) txn.abort();
+    const active_key = retirement.activeKey(transition.expected_generation.?);
+    const value = try read.get(&active_key);
+    try retirement.stageTransferredActive(alloc, &txn, &active_key, value);
+    try retirement.stageTransferredActive(alloc, &txn, &active_key, value);
+    try std.testing.expectEqualDeep(committed, try retirement.authenticatedSummary(&txn));
+    try txn.commit();
+    target_committed = true;
+    var corrupt = try target.core.store.beginWriteTxn();
+    defer corrupt.abort();
+    try corrupt.delete(summary.root_key);
+    try std.testing.expectError(error.InvalidGenerationRetirement, retirement.authenticatedSummary(&corrupt));
+}
+
+fn retirementSummaryNativeWalBenchmark(batch_size: usize, count: usize) !void {
+    const alloc = std.testing.allocator;
+    const summary = @import("retirement_set_summary.zig");
+    const retirement = @import("relational_integrity_generation_retirement.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var insert_bytes: [2]u64 = undefined;
+    var gc_bytes: [2]u64 = undefined;
+    for (0..2) |variant| {
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retirement-waf-{d}", .{ tmp.sub_path, variant });
+        defer alloc.free(path);
+        var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        const before = db.snapshotLsmMaintenanceStats().wal_retained_bytes;
+        const started = @import("antfly_platform").time.monotonicNs();
+        // Identical opaque retirement-sized payloads isolate the additional
+        // authenticated-tree storage cost; semantic authority is tested above.
+        const payload: [764]u8 = @splat(7);
+        for (0..count / batch_size) |batch_index| {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            for (0..batch_size) |offset| {
+                var generation: [16]u8 = @splat(0);
+                std.mem.writeInt(u64, generation[0..8], batch_index * batch_size + offset + 1, .big);
+                var hash: [32]u8 = undefined;
+                std.crypto.hash.Blake3.hash(&generation, &hash, .{});
+                generation = hash[0..16].*;
+                if (variant == 1) try summary.add(&txn, generation, &payload);
+                try txn.put(&retirement.activeKey(generation), &payload);
+            }
+            try txn.commit();
+        }
+        const after_insert = db.snapshotLsmMaintenanceStats().wal_retained_bytes;
+        insert_bytes[variant] = after_insert -| before;
+        if (variant == 1) {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u64, count), (try summary.read(&read)).?.count);
+            const read_started = @import("antfly_platform").time.monotonicNs();
+            for (0..10_000) |_| _ = try summary.read(&read);
+            std.debug.print("retirement summary native point_reads=10000 elapsed_ns={d}\n", .{@import("antfly_platform").time.monotonicNs() -| read_started});
+        }
+        // Replace one batch while keeping the retained-set cardinality stable.
+        // This exercises path churn, not only construction and full teardown.
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            for (0..batch_size) |offset| {
+                const old_generation = retirementBenchmarkGeneration(offset);
+                const new_generation = retirementBenchmarkGeneration(count + offset);
+                if (variant == 1) {
+                    try summary.remove(&txn, old_generation, &payload);
+                    try summary.add(&txn, new_generation, &payload);
+                }
+                try txn.delete(&retirement.activeKey(old_generation));
+                try txn.put(&retirement.activeKey(new_generation), &payload);
+            }
+            try txn.commit();
+        }
+        const after_churn = db.snapshotLsmMaintenanceStats().wal_retained_bytes;
+        for (0..count / batch_size) |batch_index| {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            for (0..batch_size) |offset| {
+                var generation: [16]u8 = @splat(0);
+                std.mem.writeInt(u64, generation[0..8], batch_size + batch_index * batch_size + offset + 1, .big);
+                var hash: [32]u8 = undefined;
+                std.crypto.hash.Blake3.hash(&generation, &hash, .{});
+                generation = hash[0..16].*;
+                if (variant == 1) try summary.remove(&txn, generation, &payload);
+                try txn.delete(&retirement.activeKey(generation));
+            }
+            try txn.commit();
+        }
+        gc_bytes[variant] = db.snapshotLsmMaintenanceStats().wal_retained_bytes -| after_churn;
+        std.debug.print("retirement native WAF variant={d} n={d} batch={d} insert_wal={d} churn_wal={d} gc_wal={d} elapsed_ns={d}\n", .{ variant, count, batch_size, insert_bytes[variant], after_churn -| after_insert, gc_bytes[variant], @import("antfly_platform").time.monotonicNs() -| started });
+    }
+    try std.testing.expect(insert_bytes[0] > 0 and gc_bytes[0] > 0);
+    // Guard against accidentally persisting the full 128-level sparse path.
+    // GC's small baseline consists only of delete keys, so its ratio differs.
+    try std.testing.expect(insert_bytes[1] < insert_bytes[0] * 4);
+    try std.testing.expect(gc_bytes[1] < gc_bytes[0] * 32);
+}
+
+fn retirementBenchmarkGeneration(index: usize) [16]u8 {
+    var generation: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, generation[0..8], index + 1, .big);
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&generation, &hash, .{});
+    return hash[0..16].*;
+}
+
+test "relational integrity retirement summary native WAL amplification benchmark" {
+    try retirementSummaryNativeWalBenchmark(1, 64);
+    try retirementSummaryNativeWalBenchmark(64, 512);
+}
+
 test "self-FK dual owner preserves one admission fence across begin stage and activation restarts" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1074,10 +1232,13 @@ test "relational integrity accepted generation survives restart and bounded two-
         var gc_lookup = (try db.lookup(alloc, &address.routing, .{ .relational_topology_json = "{\"mode\":\"generation_gc\"}" })) orelse return error.TestMissingGenerationGcPage;
         defer gc_lookup.deinit(alloc);
         try std.testing.expect(!std.mem.eql(u8, gc_lookup.json, "null"));
+        try std.testing.expectEqual(@as(u64, 1), (try retirement.authenticatedSummary(&read)).count);
         // Exactly one reference is examined per page, including live rows;
         // each committed progress record survives an owner reopen.
         var pages: usize = 0;
         while (pages < 6) : (pages += 1) {
+            if ((try retirement.GcProgress.decode(try read.get(retirement.gc_progress_key))).tombstones)
+                try std.testing.expectError(error.IntegrityRecordTooLarge, retirement.prepareGcPage(alloc, &read, 1, @import("retirement_set_summary.zig").max_mutation_bytes));
             var page = (try retirement.prepareGcPage(alloc, &read, 1, 1024 * 1024)) orelse break;
             defer page.deinit();
             const command = page.command(namespace.shard_id, namespace);
@@ -1101,6 +1262,7 @@ test "relational integrity accepted generation survives restart and bounded two-
         try std.testing.expect((try retirement.GcProgress.decode(try read.get(retirement.gc_progress_key))).complete);
         try std.testing.expectError(error.NotFound, read.get(&old_key));
         try std.testing.expectError(error.NotFound, read.get(&retirement.activeKey(old.constraint_generation)));
+        try std.testing.expectEqualDeep(@import("retirement_set_summary.zig").emptySummary(), try retirement.authenticatedSummary(&read));
         _ = try integrity.Reference.decode(&live_key, try read.get(&live_key));
         try std.testing.expect(try retirement.isRetired(&read, old));
         try std.testing.expectError(error.GenerationRetired, integrity.prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = old } }}));

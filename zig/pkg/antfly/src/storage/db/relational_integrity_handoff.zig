@@ -30,6 +30,32 @@ pub const prune_key = @import("relational_integrity_handoff_contract.zig").prune
 pub const max_records = @import("relational_integrity_handoff_contract.zig").max_records;
 pub const max_bytes = @import("relational_integrity_handoff_contract.zig").max_bytes;
 
+fn recordBudgetBytes(key: []const u8, value_len: usize) !usize {
+    const raw = std.math.add(usize, key.len, value_len) catch return error.IntegrityRecordTooLarge;
+    // Imported tombstones also update the destination's authenticated set.
+    // Reserve the worst compressed path even if this record is an idempotent
+    // duplicate; producer and receiver must agree without reading receiver state.
+    const extra: usize = if (std.mem.startsWith(u8, key, generation_retirement.active_prefix))
+        @import("retirement_set_summary.zig").max_mutation_bytes
+    else
+        0;
+    return std.math.add(usize, raw, extra) catch error.IntegrityRecordTooLarge;
+}
+
+test "retirement handoff reserves authenticated path writes before page admission" {
+    const key = generation_retirement.activeKey(@splat(1));
+    const raw = key.len + 764;
+    const charged = try recordBudgetBytes(&key, 764);
+    try std.testing.expectEqual(raw + @import("retirement_set_summary.zig").max_mutation_bytes, charged);
+    try std.testing.expectEqual(@as(usize, 8), try recordBudgetBytes("row", 5));
+    try std.testing.expect(charged > raw);
+    const permitted = max_bytes / charged;
+    try std.testing.expect(permitted > 0 and permitted < max_records);
+    try std.testing.expect(permitted * charged <= max_bytes);
+    try std.testing.expect((permitted + 1) * charged > max_bytes);
+    try std.testing.expectError(error.IntegrityRecordTooLarge, recordBudgetBytes(&key, std.math.maxInt(usize)));
+}
+
 pub const Manifest = @import("relational_integrity_handoff_contract.zig").Manifest;
 pub const Record = @import("relational_integrity_handoff_contract.zig").Record;
 pub const Page = @import("relational_integrity_handoff_contract.zig").Page;
@@ -101,7 +127,7 @@ pub fn readPage(alloc: Allocator, store: *docstore.DocStore, manifest: Manifest,
             const address = (try integrity.parseKey(entry.key)).address;
             if (manifest.upper.len != 0 and std.mem.order(u8, &address.routing, manifest.upper) != .lt) break;
             if (!contains(manifest, &address.routing)) return error.KeyOutOfRange;
-            const size = std.math.add(usize, entry.key.len, entry.value.len) catch return error.IntegrityRecordTooLarge;
+            const size = try recordBudgetBytes(entry.key, entry.value.len);
             if (records.items.len == max_records or size > max_bytes - bytes) {
                 if (records.items.len == 0) return error.IntegrityRecordTooLarge;
                 exhausted = false;
@@ -150,7 +176,7 @@ pub fn readPage(alloc: Allocator, store: *docstore.DocStore, manifest: Manifest,
             if (!std.mem.startsWith(u8, entry.key, generation_retirement.active_prefix)) break;
             if (entry.key.len != generation_retirement.active_prefix.len + 16) return error.InvalidGenerationRetirement;
             _ = try generation_retirement.Active.decode(entry.value, entry.key[generation_retirement.active_prefix.len..][0..16].*);
-            const size = std.math.add(usize, entry.key.len, entry.value.len) catch return error.IntegrityRecordTooLarge;
+            const size = try recordBudgetBytes(entry.key, entry.value.len);
             if (records.items.len == max_records or size > max_bytes - bytes) {
                 if (records.items.len == 0) return error.IntegrityRecordTooLarge;
                 exhausted = false;
@@ -231,7 +257,7 @@ pub fn apply(alloc: Allocator, txn: anytype, fence: topology.Fence, command: Com
             if (page.records.len > max_records or page.after.len > integrity.key_len + 32 or page.next_cursor.len > integrity.key_len + 32) return error.IntegrityRecordTooLarge;
             var admission_bytes: usize = 0;
             for (page.records) |record| {
-                const size = std.math.add(usize, record.key.len, record.value.len) catch return error.IntegrityRecordTooLarge;
+                const size = try recordBudgetBytes(record.key, record.value.len);
                 admission_bytes = std.math.add(usize, admission_bytes, size) catch return error.IntegrityRecordTooLarge;
                 if (admission_bytes > max_bytes) return error.IntegrityRecordTooLarge;
             }
@@ -251,7 +277,7 @@ pub fn apply(alloc: Allocator, txn: anytype, fence: topology.Fence, command: Com
             var bytes: usize = 0;
             var previous = page.after;
             for (page.records) |record| {
-                bytes = std.math.add(usize, bytes, record.key.len + record.value.len) catch return error.IntegrityRecordTooLarge;
+                bytes = std.math.add(usize, bytes, try recordBudgetBytes(record.key, record.value.len)) catch return error.IntegrityRecordTooLarge;
                 if (bytes > max_bytes or std.mem.order(u8, record.key, previous) != .gt or std.mem.order(u8, record.key, page.next_cursor) == .gt) return error.InvalidIntegrityKey;
                 if (std.mem.startsWith(u8, record.key, generation_admission.prefix)) {
                     try generation_admission.stageTransferred(txn, record.key, record.value);

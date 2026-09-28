@@ -1521,6 +1521,12 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
     defer builder.deinit();
     const table = try builder.load(table_name);
     const row_table_index = try builder.outputIndex(table_name, table.view.version());
+    // An empty native page has no claims, references, or parent observations.
+    // Its source catalog is still validated above, and the caller commits the
+    // exact activation checkpoint/EOF CAS. Resolving external parents here
+    // would unnecessarily require public routes inside a private empty restore
+    // cohort and can prevent TRUNCATE from ever completing validation.
+    if (rows.len == 0) return .{ .arena = arena, .tables = try builder.output.toOwnedSlice(builder.alloc) };
     var plan = try builder.bindingPlanSelected(table, phase == .unique, phase == .foreign_key);
     defer plan.deinit();
     var selected_fields: std.ArrayList([]const u8) = .empty;
@@ -1570,6 +1576,44 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
         table_request.predicates = predicates.items;
     }
     return .{ .arena = arena, .tables = try builder.output.toOwnedSlice(builder.alloc), .validation_failure = validation_failure, .backfill_partial = backfill_partial };
+}
+
+test "empty activation page validates source catalog without probing external parents" {
+    const alloc = std.testing.allocator;
+    const definition =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const encoded = try testCatalogEnvelope(alloc, 12, definition);
+    defer alloc.free(encoded);
+    const Fake = struct {
+        catalog: []const u8,
+        calls: usize = 0,
+        fn lookup(ptr: *anyopaque, allocator: Allocator, name: []const u8, key: []const u8, opts: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("children", name);
+            try std.testing.expectEqualStrings("", key);
+            try std.testing.expect(opts.relational_integrity_catalog);
+            self.calls += 1;
+            return .{ .json = try allocator.dupe(u8, self.catalog), .version = 0 };
+        }
+    };
+    var fake: Fake = .{ .catalog = encoded };
+    const source: reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = undefined, .query = undefined } };
+    const metadata = [_]TableRecord{.{ .table_id = 12, .name = "children", .schema_json = definition }};
+    var prepared = try prepareBackfillWithCoverage(alloc, source, &metadata, &.{}, "children", &.{}, .foreign_key);
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), prepared.tables.len);
+    try std.testing.expectEqualStrings("children", prepared.tables[0].table_name);
+    try std.testing.expectEqual(@as(usize, 0), prepared.tables[0].integrity_commands.len);
+    try std.testing.expectEqual(@as(usize, 0), prepared.tables[0].writes.len);
+    try std.testing.expectError(error.TableNotFound, prepareBackfillWithCoverage(alloc, source, &metadata, &.{}, "children", &.{.{ .key = "row", .json = "{\"id\":1}", .version = 1, .expected_content_digest = @splat(1) }}, .foreign_key));
+    fake.catalog = "{}";
+    if (prepareBackfillWithCoverage(alloc, source, &metadata, &.{}, "children", &.{}, .foreign_key)) |unexpected| {
+        var owned = unexpected;
+        owned.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }
 
 pub fn prepareBackfillWithCoverage(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, table_name: []const u8, rows: []const BackfillRow, phase: BackfillPhase) !Prepared {

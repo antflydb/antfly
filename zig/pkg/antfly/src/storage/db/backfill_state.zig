@@ -41,7 +41,9 @@ const PublishFaultPoint = enum {
     after_rename,
 };
 
-var test_publish_fault: ?PublishFaultPoint = null;
+/// Test-only crash seam shared by callers verifying destructive rebuild order.
+/// Production publication never consults this value.
+pub var test_publish_fault: ?PublishFaultPoint = null;
 
 pub const LoadResult = union(enum) {
     absent,

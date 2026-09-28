@@ -37,6 +37,7 @@ pub const InitialChildRequest = struct {
 };
 
 pub const InitialChildReceipt = struct {
+    root_attestation: ?@import("../metadata/initial_child_root_attestation.zig").Attestation = null,
     plan_id: [16]u8,
     child_table_id: u64,
     child_group_id: u64,
@@ -52,6 +53,7 @@ pub const InitialChildReceipt = struct {
     applied_index: u64,
 
     pub fn validate(self: InitialChildReceipt, request: InitialChildRequest) !void {
+        if (self.root_attestation) |proof| try proof.verify(self.digest());
         if (!std.mem.eql(u8, &self.plan_id, &request.plan_id) or
             self.child_table_id != request.child_table_id or
             self.child_group_id != request.child_group_id or

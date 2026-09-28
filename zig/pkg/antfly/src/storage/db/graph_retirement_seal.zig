@@ -10,10 +10,10 @@ const graph_config = @import("graph_retirement_config.zig");
 pub const intent_key = "\x00\x00__metadata__:graph_retirement_intent_v1";
 pub const receipt_key = "\x00\x00__metadata__:graph_retirement_seal_v1";
 const scope_magic = "GRS1";
-const receipt_magic = "GRR1";
+const receipt_magic = "GRR2";
 const scope_payload_len = 4 + 136 + 16 + 32 + 8 + 32;
 const scope_len = scope_payload_len + 32;
-const receipt_payload_len = 4 + 32 + 32 + 8 + 8;
+const receipt_payload_len = 4 + 32 + 32 + @import("receipt_position.zig").Position.encoded_len;
 const receipt_len = receipt_payload_len + 32;
 
 pub const Scope = struct {
@@ -92,17 +92,20 @@ pub const Receipt = struct {
     digest: [32]u8,
     applied_term: u64,
     applied_index: u64,
+    native_position: ?@import("receipt_position.zig").Native = null,
+
+    pub fn position(self: Receipt) !@import("receipt_position.zig").Position {
+        return @import("receipt_position.zig").fromFields(self.applied_term, self.applied_index, self.native_position);
+    }
 
     pub fn encode(self: Receipt) ![receipt_len]u8 {
-        if (self.applied_term == 0 or self.applied_index == 0 or
-            std.mem.allEqual(u8, &self.scope_digest, 0) or std.mem.allEqual(u8, &self.digest, 0))
+        if (std.mem.allEqual(u8, &self.scope_digest, 0) or std.mem.allEqual(u8, &self.digest, 0))
             return error.InvalidGraphRetirementSeal;
         var bytes: [receipt_len]u8 = undefined;
         @memcpy(bytes[0..4], receipt_magic);
         @memcpy(bytes[4..36], &self.scope_digest);
         @memcpy(bytes[36..68], &self.digest);
-        std.mem.writeInt(u64, bytes[68..76], self.applied_term, .little);
-        std.mem.writeInt(u64, bytes[76..84], self.applied_index, .little);
+        @memcpy(bytes[68..101], &try (try self.position()).encode());
         std.crypto.hash.Blake3.hash(bytes[0..receipt_payload_len], bytes[receipt_payload_len..], .{});
         return bytes;
     }
@@ -112,11 +115,13 @@ pub const Receipt = struct {
         var checksum: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(bytes[0..receipt_payload_len], &checksum, .{});
         if (!std.mem.eql(u8, &checksum, bytes[receipt_payload_len..])) return error.InvalidGraphRetirementSeal;
+        const stamp = try @import("receipt_position.zig").Position.decode(bytes[68..101]);
         const result: Receipt = .{
             .scope_digest = bytes[4..36].*,
             .digest = bytes[36..68].*,
-            .applied_term = std.mem.readInt(u64, bytes[68..76], .little),
-            .applied_index = std.mem.readInt(u64, bytes[76..84], .little),
+            .applied_term = stamp.term(),
+            .applied_index = stamp.index(),
+            .native_position = stamp.nativePosition(),
         };
         _ = try result.encode();
         return result;
@@ -174,6 +179,11 @@ pub fn stageBegin(txn: anytype, scope: Scope) !void {
 }
 
 pub fn stageSeal(txn: anytype, scope: Scope, term: u64, index: u64) !Receipt {
+    return stageSealPosition(txn, scope, .{ .raft = .{ .term = term, .index = index } });
+}
+
+pub fn stageSealPosition(txn: anytype, scope: Scope, stamp: @import("receipt_position.zig").Position) !Receipt {
+    try stamp.requireNamespace(scope.fence.namespace);
     const current = try status(txn);
     const intent = current.intent orelse return error.InvalidGraphRetirementScope;
     if (!intent.eql(scope)) return error.InvalidGraphRetirementScope;
@@ -183,7 +193,7 @@ pub fn stageSeal(txn: anytype, scope: Scope, term: u64, index: u64) !Receipt {
     const encoded_scope = try scope.encode();
     var scope_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(&encoded_scope, &scope_digest, .{});
-    const receipt: Receipt = .{ .scope_digest = scope_digest, .digest = try scope.sealDigest(), .applied_term = term, .applied_index = index };
+    const receipt: Receipt = .{ .scope_digest = scope_digest, .digest = try scope.sealDigest(), .applied_term = stamp.term(), .applied_index = stamp.index(), .native_position = stamp.nativePosition() };
     const encoded = try receipt.encode();
     try txn.put(receipt_key, &encoded);
     return receipt;

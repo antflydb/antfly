@@ -36,6 +36,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data runtime ordered artifact upload handoff",
+        "data runtime hosted FK retirement",
         "pure topology control bypasses only ordinary dense repair writer preflight",
         "data ownership fallback requires a single store across all roles",
         "data relational maintenance yields to raft persistence and follows elections",
@@ -178,6 +180,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft read safety deadline and cancellation cover owner lock admission",
         "data raft read safety barrier completes only after matching ReadState apply",
         "data raft native snapshot requires an install completion receipt",
+        "data runtime native FK retirement preserves source ownership and exact cold path",
         "data raft read safety barrier rejects pre-restart responses for both read paths",
         "data raft ticker advances consensus independently of control rounds",
         "data raft stable placement refreshes changed peer transport endpoints",
@@ -274,6 +277,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, private_initial_owner_predicate_tests).step);
 
     const lib_data_storage_default_filters = [_][]const u8{
+        "membership reducer",
+        "FK retirement worker",
+        "data raft online topology arbitration persists exact rejection and scopes release across reopen",
         // Regressions previously selected only by unit-test-progress.
         "split status decodes an omitted nullable source phase",
         "derive merge transition phases",

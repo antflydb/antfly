@@ -1,5 +1,7 @@
 import type {
   AntflyClient,
+  SQLConnectionOpenRequest,
+  SQLConnectionResponse,
   SQLPreparedExecutionRequest,
   SQLPreparedResponse,
   SQLPrepareRequest,
@@ -15,9 +17,15 @@ const execute: SQLPreparedExecutionRequest = {
 const resource: Promise<SQLPreparedResponse> = client.prepareSQL(prepare);
 const result: Promise<SQLResponse> = client.executePreparedSQL("resource", execute);
 const closed: Promise<void> = client.closePreparedSQL("resource");
+const openConnection: Promise<SQLConnectionResponse> = client.openSQLConnection({
+  database: "analytics",
+} satisfies SQLConnectionOpenRequest);
+const closeConnection: Promise<void> = client.closeSQLConnection("a".repeat(32));
 void resource;
 void result;
 void closed;
+void openConnection;
+void closeConnection;
 
 declare const prepared: SQLPreparedResponse;
 const exactOwner: string = prepared.owner_node_id;

@@ -687,7 +687,9 @@ pub const TableDropAdmission = struct {
 
 fn initialPlacementProofForGroup(service: anytype, range_group_id: u64) !?fk_generation_publication.InitialPlacementProof {
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
-    if (comptime !@hasDecl(@TypeOf(store.*), "initialGroupReservation")) return null;
+    // A missing authority capability is not evidence that a group is ordinary.
+    // In particular the compiled owner facade must preserve this point lookup.
+    if (comptime !@hasDecl(@TypeOf(store.*), "initialGroupReservation")) return error.MetadataCapabilityUnavailable;
     const reservation = (try store.initialGroupReservation(service.metadata_group_id, range_group_id)) orelse return null;
     return if (reservation.retirement_scope == .hosted_store)
         fk_generation_publication.InitialPlacementProof.fromReservation(reservation)
@@ -703,6 +705,20 @@ fn cachedInitialPlacementProof(service: anytype, range_group_id: u64) !?fk_gener
         } else return error.TableTopologyProtocolUpgradeRequired;
     }
     return proof;
+}
+
+test "relational topology admission rejects missing hidden-owner authority" {
+    const Fake = struct {
+        const Store = struct {};
+        store: Store = .{},
+        metadata_group_id: u64 = 1,
+
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return &self.store;
+        }
+    };
+    var fake: Fake = .{};
+    try std.testing.expectError(error.MetadataCapabilityUnavailable, initialPlacementProofForGroup(&fake, 7));
 }
 
 fn ensureInitialPlacementReadCut(service: anytype, request: api_operation.RequestContext) !void {
@@ -3078,12 +3094,15 @@ fn stripRuntimeDenseNativeStatus(record: *metadata_table_manager.StoreRecord) vo
 }
 
 fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
-    if (record.relational_topology_protocol_version != 0) return metadata_runtime_status_protocol.current_record_version;
+    for (record.runtime_statuses) |status| {
+        if (status.schema_epoch != 0) return metadata_runtime_status_protocol.schema_epoch_record_version;
+    }
+    if (record.relational_topology_protocol_version != 0) return metadata_runtime_status_protocol.framed_index_record_version;
     if (record.dense_native_storage_protocol_version != 0 or
         storeHasDenseVectorProjectionPending(record) or
         storeHasDenseNativeStorageStatus(record))
     {
-        return metadata_runtime_status_protocol.current_record_version;
+        return metadata_runtime_status_protocol.framed_index_record_version;
     }
     for (record.runtime_statuses) |status| {
         if (metadata_table_manager.runtimeEnrichmentHasInferenceDiagnostics(status.enrichment)) {
@@ -3099,11 +3118,14 @@ fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord
 /// and cannot be erased merely to cross an older proposal boundary. Embedding
 /// activity is deliberately absent: it is an ephemeral observability overlay.
 fn runtimeStatusMandatoryRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
-    if (record.relational_topology_protocol_version != 0) return metadata_runtime_status_protocol.current_record_version;
+    for (record.runtime_statuses) |status| {
+        if (status.schema_epoch != 0) return metadata_runtime_status_protocol.schema_epoch_record_version;
+    }
+    if (record.relational_topology_protocol_version != 0) return metadata_runtime_status_protocol.framed_index_record_version;
     if (record.dense_native_storage_protocol_version != 0 or
         storeHasDenseVectorProjectionPending(record) or
         storeHasDenseNativeStorageStatus(record))
-        return metadata_runtime_status_protocol.current_record_version;
+        return metadata_runtime_status_protocol.framed_index_record_version;
     if (metadata_table_manager.storeRequiresCurrentRuntimeStatusProfile(record))
         return metadata_runtime_status_protocol.previous_record_version;
     return metadata_runtime_status_protocol.v0_2_0_record_version;
@@ -3135,7 +3157,7 @@ fn stripRuntimeStatusAboveVersion(
     record: *metadata_table_manager.StoreRecord,
     supported_version: u16,
 ) void {
-    if (supported_version == metadata_runtime_status_protocol.current_record_version) return;
+    if (metadata_runtime_status_protocol.profileSatisfies(supported_version, metadata_runtime_status_protocol.framed_index_record_version)) return;
     stripRuntimeDenseNativeStatus(record);
     if (supported_version == metadata_runtime_status_protocol.inference_diagnostics_record_version) return;
     stripRuntimeInferenceDiagnostics(alloc, record);
@@ -3167,6 +3189,9 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
         return required_version;
     if (runtimeStatusProtocolVersionReady(service, required_version)) return required_version;
     if (required_version == metadata_runtime_status_protocol.current_record_version and
+        runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.framed_index_record_version))
+        return metadata_runtime_status_protocol.framed_index_record_version;
+    if (metadata_runtime_status_protocol.profileSatisfies(required_version, metadata_runtime_status_protocol.framed_index_record_version) and
         runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.inference_diagnostics_record_version))
         return metadata_runtime_status_protocol.inference_diagnostics_record_version;
     if (runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.positional_record_version))
@@ -3179,11 +3204,14 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
     const requires_v11 = switch (command) {
+        .apply_store_root_enrollment, .ack_initial_fk_retirement => return metadata_topology_protocol.store_root_enrollment_version,
+        .apply_fk_generation_publication => return metadata_topology_protocol.fk_generation_publication_version,
         // Initial CREATE carries the v2 reservation and retirement scope in
         // durable metadata. Its admission proof must survive through the
         // final append, not just the public workflow's earlier probe.
         .apply_fk_initial_create, .upsert_fk_initial_replica_intent, .remove_fk_initial_replica_intent => return metadata_topology_protocol.fk_initial_create_version,
-        .apply_restore_staging, .create_restore_job_with_staging, .compare_and_set_backup_cohort, .compare_and_set_online_merge => true,
+        .compare_and_set_online_merge => |update| if (update.next.artifact_catalog != null) return metadata_topology_protocol.ordered_merge_artifact_version else true,
+        .apply_restore_staging, .create_restore_job_with_staging, .compare_and_set_backup_cohort => true,
         .upsert_table => |table| table.relational_retirement_json.len != 0 or table.requiresStorageMetadataExtension(),
         .compare_and_replace_table => |cas| cas.expected.relational_retirement_json.len != 0 or cas.replacement.relational_retirement_json.len != 0 or cas.expected.requiresStorageMetadataExtension() or cas.replacement.requiresStorageMetadataExtension(),
         .apply_table_topology => |mutation| switch (mutation) {
@@ -3202,8 +3230,11 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         },
         .admit_split_transition => |admission| admission.record.table_contract.integrity_protocol != .none or admission.record.table_contract.read_schema_json.len != 0,
         .upsert_split_transition => |record| record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0,
-        .admit_online_merge => true,
-        .upsert_merge_transition => |record| record.online != null or record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0,
+        .admit_online_merge => |admission| if (admission.next.artifact_catalog != null) return metadata_topology_protocol.ordered_merge_artifact_version else true,
+        .upsert_merge_transition => |record| blk: {
+            if (record.online) |online| if (online.artifact_catalog != null) return metadata_topology_protocol.ordered_merge_artifact_version;
+            break :blk record.online != null or record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0;
+        },
         else => false,
     };
     return if (requires_v11) metadata_topology_protocol.coordinated_lifecycle_version else 0;
@@ -7778,9 +7809,7 @@ pub const MetadataService = struct {
     }
 
     fn runLifecycleReconcileHookIfRequested(self: *MetadataService) !void {
-        const hook = self.lifecycle_reconcile_hook orelse return;
-        if (!self.lifecycle_reconcile_requested.swap(false, .acq_rel)) return;
-        try hook.run();
+        try runRequestedLifecycleReconcile(self.lifecycle_reconcile_hook, &self.lifecycle_reconcile_requested);
     }
 
     fn runReplicationBackfillRound(self: *MetadataService) !void {
@@ -12332,9 +12361,7 @@ pub const MetadataHttpService = struct {
     }
 
     fn runLifecycleReconcileHookIfRequested(self: *MetadataHttpService) !void {
-        const hook = self.lifecycle_reconcile_hook orelse return;
-        if (!self.lifecycle_reconcile_requested.swap(false, .acq_rel)) return;
-        try hook.run();
+        try runRequestedLifecycleReconcile(self.lifecycle_reconcile_hook, &self.lifecycle_reconcile_requested);
     }
 
     fn runReplicationBackfillRound(self: *MetadataHttpService) !void {
@@ -12665,6 +12692,20 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try signing_service.propose(&.{signing_command});
     try std.testing.expectEqual(@as(usize, 1), signing_service.appended);
     const initial_create_command: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{}" };
+    const generation_command: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{}" };
+    try std.testing.expectEqual(metadata_topology_protocol.fk_generation_publication_version, transitionRequiredCoordinatedDecoderVersion(generation_command));
+    var mixed_generation: Fake = .{ .member_versions = &.{ 19, 18, 19 } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&mixed_generation, generation_command, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed_generation.propose(&.{generation_command}));
+    try std.testing.expectEqual(@as(usize, 0), mixed_generation.appended);
+    mixed_generation.member_versions = &.{ 19, 19, 19 };
+    try ensureCoordinatedDecoderWithContext(&mixed_generation, generation_command, .{});
+    mixed_generation.cache.cached.?.readiness.term += 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed_generation.propose(&.{generation_command}));
+    try std.testing.expectEqual(@as(usize, 0), mixed_generation.appended);
+    try ensureCoordinatedDecoderWithContext(&mixed_generation, generation_command, .{});
+    try mixed_generation.propose(&.{generation_command});
+    try std.testing.expectEqual(@as(usize, 1), mixed_generation.appended);
     try std.testing.expectEqual(metadata_topology_protocol.fk_initial_create_version, transitionRequiredCoordinatedDecoderVersion(initial_create_command));
     const hidden_remove: metadata_storage.TransitionCommand = .{ .remove_fk_initial_replica_intent = .{
         .proof = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .child_table_id = 71, .range_id = 9 },
@@ -12699,6 +12740,9 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try ensureCoordinatedDecoderWithContext(&mixed, root_command, .{});
     try mixed.propose(&.{ legacy, root_command });
     try std.testing.expectEqual(@as(usize, 3), mixed.appended);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed.propose(&.{initial_create_command}));
+    mixed.member_versions = &.{ 19, 19, 19 };
+    try ensureCoordinatedDecoderWithContext(&mixed, initial_create_command, .{});
     try mixed.propose(&.{initial_create_command});
     try std.testing.expectEqual(@as(usize, 4), mixed.appended);
     mixed.cache.cached.?.readiness.term += 1;
@@ -14590,15 +14634,25 @@ fn reportStoreStatusesWithCapabilities(
     // Relational topology is a framed V17 admission fact too. Asking only
     // for V15 here can silently discard every ordinary group heartbeat at
     // the mandatory-profile fence below, even when all voters support V17.
-    const current_profile_required = vector_projection_transition_possible or
+    const framed_profile_required = vector_projection_transition_possible or
         native_storage_transition_possible or relational_topology_transition_possible;
-    const native_required_version = if (current_profile_required)
-        metadata_runtime_status_protocol.current_record_version
+    var schema_epoch_required = false;
+    for (reports) |report| {
+        for (report.runtime_statuses) |status| {
+            if (status.schema_epoch != 0) schema_epoch_required = true;
+        }
+    }
+    const native_required_version = if (schema_epoch_required)
+        metadata_runtime_status_protocol.schema_epoch_record_version
+    else if (framed_profile_required)
+        metadata_runtime_status_protocol.framed_index_record_version
     else
         required_version;
     const supported_version = highestSupportedRuntimeStatusVersion(service, native_required_version);
-    if (current_profile_required and
-        supported_version != metadata_runtime_status_protocol.current_record_version)
+    if (schema_epoch_required and supported_version != metadata_runtime_status_protocol.schema_epoch_record_version)
+        return error.RuntimeStatusProtocolUnavailable;
+    if (framed_profile_required and
+        !metadata_runtime_status_protocol.profileSatisfies(supported_version, metadata_runtime_status_protocol.framed_index_record_version))
     {
         return error.RuntimeStatusProtocolUnavailable;
     }
@@ -16236,8 +16290,55 @@ pub const TableProjectionExpectation = struct {
     indexes_json: ?[]const u8 = null,
 };
 
+fn runRequestedLifecycleReconcile(optional_hook: ?LifecycleReconcileHook, requested: *std.atomic.Value(bool)) !void {
+    const hook = optional_hook orelse return;
+    if (!requested.swap(false, .acq_rel)) return;
+    hook.run() catch |err| {
+        // Consuming a wake is not completing its durable work. Preserve it for
+        // the next scheduled control round without spinning or requiring new
+        // external catalog activity to recover from temporary unavailability.
+        requested.store(true, .release);
+        return err;
+    };
+}
+
+test "metadata lifecycle reconciles hidden generation after a transient control failure" {
+    const Capture = struct {
+        calls: usize = 0,
+        fn run(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) return error.StorageReadTemporarilyUnavailable;
+        }
+    };
+    var capture: Capture = .{};
+    const hook: LifecycleReconcileHook = .{ .ptr = &capture, .vtable = &.{ .run = Capture.run } };
+    var requested = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, runRequestedLifecycleReconcile(hook, &requested));
+    try std.testing.expect(requested.load(.acquire));
+    try runRequestedLifecycleReconcile(hook, &requested);
+    try std.testing.expect(!requested.load(.acquire));
+    try runRequestedLifecycleReconcile(hook, &requested);
+    try std.testing.expectEqual(@as(usize, 2), capture.calls);
+}
+
 fn lifecycleKeyMatchesMetadataNamespace(metadata_group_id: u64, signal: metadata_storage.raft_apply_store.CommittedKeySignal) bool {
     if (signal.metadata_group_id != metadata_group_id) return false;
+
+    // Hidden generations participate in placement before they have public
+    // table/range keys. A phase commit that exposes or retires such an owner
+    // must wake reconciliation on its own, without waiting for a heartbeat or
+    // unrelated public DDL. Match job records, not per-row restore progress.
+    var hidden_prefix_buf: [160]u8 = undefined;
+    const initial_prefix = fk_generation_publication.initialPrefixForGroup(&hidden_prefix_buf, metadata_group_id) catch return false;
+    if (std.mem.startsWith(u8, signal.key, initial_prefix)) return true;
+    // Ordinary ADD/DROP pins its table cut until publication completes. A
+    // finalization deferred under that lock needs a fresh reconcile when the
+    // lock is released, even if no owner reports or table writes follow it.
+    const fk_lock_prefix = fk_generation_publication.tableLockPrefix(&hidden_prefix_buf, metadata_group_id) catch return false;
+    if (std.mem.startsWith(u8, signal.key, fk_lock_prefix)) return true;
+    const restore_prefix = @import("restore_staging.zig").prefix(&hidden_prefix_buf, metadata_group_id) catch return false;
+    if (std.mem.startsWith(u8, signal.key, restore_prefix) and std.mem.startsWith(u8, signal.key[restore_prefix.len..], "job:")) return true;
 
     var node_prefix_buf: [96]u8 = undefined;
     const node_prefix = metadata_storage.raft_apply_store.nodePrefixForGroup(&node_prefix_buf, metadata_group_id) catch return false;
@@ -16282,6 +16383,25 @@ fn lifecycleKeyMatchesMetadataNamespace(metadata_group_id: u64, signal: metadata
     var reallocation_request_key_buf: [96]u8 = undefined;
     const reallocation_request_key = metadata_storage.raft_apply_store.reallocationRequestKeyForGroup(&reallocation_request_key_buf, metadata_group_id) catch return false;
     return std.mem.eql(u8, signal.key, reallocation_request_key);
+}
+
+test "metadata lifecycle reconciles hidden generation phase commits without public topology keys" {
+    var key_buf: [192]u8 = undefined;
+    const group_id: u64 = 19;
+    const initial_key = try fk_generation_publication.initialKey(&key_buf, group_id, 42);
+    try std.testing.expect(lifecycleKeyMatchesMetadataNamespace(group_id, .{ .metadata_group_id = group_id, .key = initial_key }));
+    try std.testing.expect(!lifecycleKeyMatchesMetadataNamespace(group_id + 1, .{ .metadata_group_id = group_id, .key = initial_key }));
+    const other_key = try fk_generation_publication.initialKey(&key_buf, group_id + 1, 42);
+    try std.testing.expect(!lifecycleKeyMatchesMetadataNamespace(group_id, .{ .metadata_group_id = group_id, .key = other_key }));
+    const lock_key = try fk_generation_publication.tableLockKey(&key_buf, group_id, 42);
+    try std.testing.expect(lifecycleKeyMatchesMetadataNamespace(group_id, .{ .metadata_group_id = group_id, .key = lock_key }));
+    const other_lock = try fk_generation_publication.tableLockKey(&key_buf, group_id + 1, 42);
+    try std.testing.expect(!lifecycleKeyMatchesMetadataNamespace(group_id, .{ .metadata_group_id = group_id, .key = other_lock }));
+    const restore = @import("restore_staging.zig");
+    const restore_key = try restore.jobKey(&key_buf, group_id, @splat(1));
+    try std.testing.expect(lifecycleKeyMatchesMetadataNamespace(group_id, .{ .metadata_group_id = group_id, .key = restore_key }));
+    const progress_key = try restore.progressKey(&key_buf, group_id, @splat(1));
+    try std.testing.expect(!lifecycleKeyMatchesMetadataNamespace(group_id, .{ .metadata_group_id = group_id, .key = progress_key }));
 }
 
 fn waitForTableLifecycleConvergence(

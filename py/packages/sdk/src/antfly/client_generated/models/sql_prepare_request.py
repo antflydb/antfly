@@ -19,12 +19,15 @@ class SQLPrepareRequest:
         namespace (str | Unset):
         session_id (str | Unset): Optional durable SQL session. Preparation binds its authenticated scope and current
             setting catalog under the session lease; execution must supply the same session.
+        connection_id (str | Unset): Optional idle HTTP SQL connection. Preparation binds to its current DISCARD
+            generation; a transaction-bound preparation remains bound to session_id instead.
     """
 
     statement: str
     database: str | Unset = UNSET
     namespace: str | Unset = UNSET
     session_id: str | Unset = UNSET
+    connection_id: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         statement = self.statement
@@ -34,6 +37,8 @@ class SQLPrepareRequest:
         namespace = self.namespace
 
         session_id = self.session_id
+
+        connection_id = self.connection_id
 
         field_dict: dict[str, Any] = {}
 
@@ -48,6 +53,8 @@ class SQLPrepareRequest:
             field_dict["namespace"] = namespace
         if session_id is not UNSET:
             field_dict["session_id"] = session_id
+        if connection_id is not UNSET:
+            field_dict["connection_id"] = connection_id
 
         return field_dict
 
@@ -62,11 +69,14 @@ class SQLPrepareRequest:
 
         session_id = d.pop("session_id", UNSET)
 
+        connection_id = d.pop("connection_id", UNSET)
+
         sql_prepare_request = cls(
             statement=statement,
             database=database,
             namespace=namespace,
             session_id=session_id,
+            connection_id=connection_id,
         )
 
         return sql_prepare_request

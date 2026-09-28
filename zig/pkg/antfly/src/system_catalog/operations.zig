@@ -27,6 +27,51 @@ const settings = @import("settings.zig");
 
 pub const Request = domain.Request;
 
+pub fn storeRootMutation(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: domain.Call) ![]u8 {
+    const enroll = input == .store_root_enroll;
+    if (enroll and !context.setting_admin) return error.Forbidden;
+    if (!enroll and input != .fk_initial_retirement_ack) return error.InvalidArgument;
+    try context.ensureActive();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.store_root_enrollment_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    svc.lockCatalogMutation();
+    var gate_held = true;
+    defer if (gate_held) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const wire = @import("../metadata/fk_initial_retirement_wire.zig");
+    const preflight: wire.Control = if (enroll) .{ .preflight_enrollment = input.store_root_enroll } else .{ .preflight_ack = input.fk_initial_retirement_ack };
+    const checked = try store.storeRootControlJson(alloc, svc.metadata_group_id, preflight);
+    alloc.free(checked);
+    const bytes = if (enroll) try std.json.Stringify.valueAlloc(alloc, input.store_root_enroll, .{}) else try std.json.Stringify.valueAlloc(alloc, input.fk_initial_retirement_ack, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > 8192) return error.CatalogCommandTooLarge;
+    const command: storage.TransitionCommand = if (enroll) .{ .apply_store_root_enrollment = bytes } else .{ .ack_initial_fk_retirement = bytes };
+    const receipt = try svc.proposeTransitionCommandWithReceipt(command);
+    svc.unlockCatalogMutation();
+    gate_held = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const observed: wire.Control = if (enroll) .{ .enrollment_status = input.store_root_enroll.identity } else .{ .ack_status = input.fk_initial_retirement_ack };
+    return store.storeRootControlJson(alloc, svc.metadata_group_id, observed) catch return error.MetadataMutationOutcomeUnknown;
+}
+
+pub fn storeRootPage(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/fk_initial_retirement_wire.zig").SignedPageRequest) ![]u8 {
+    try request.verify();
+    try context.ensureActive();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.storeRootControlJson(alloc, svc.metadata_group_id, .{ .authorized_page = request });
+}
+
+pub fn storeRootEnrollmentStatus(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, identity: @import("../metadata/store_root_enrollment.zig").Identity) ![]u8 {
+    if (!context.setting_admin) return error.Forbidden;
+    try identity.validate();
+    try context.ensureActive();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.storeRootControlJson(alloc, svc.metadata_group_id, .{ .enrollment_status = identity });
+}
+
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
     try context.ensureActive();
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
@@ -268,9 +313,10 @@ pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, con
     try command.validateShape();
     try context.ensureActive();
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.fk_generation_publication_version);
-    svc.lockCatalogMutation();
-    defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
+    svc.lockCatalogMutation();
+    var gate_held = true;
+    defer if (gate_held) svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
@@ -278,6 +324,8 @@ pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, con
     if (bytes.len > fk_publication.max_bytes) return error.CatalogCommandTooLarge;
     try context.ensureActive();
     const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_fk_generation_publication = bytes });
+    svc.unlockCatalogMutation();
+    gate_held = false;
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
     const observed = store.fkGenerationPublicationStatusJson(alloc, svc.metadata_group_id, command.child_table_id) catch return error.MetadataMutationOutcomeUnknown;
     errdefer alloc.free(observed);
@@ -293,9 +341,10 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     try command.validateShape();
     try context.ensureActive();
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.fk_initial_create_version);
-    svc.lockCatalogMutation();
-    defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
+    svc.lockCatalogMutation();
+    var gate_held = true;
+    defer if (gate_held) svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
@@ -308,6 +357,8 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     try store.preflightFkInitialCreateCommand(svc.metadata_group_id, bytes);
     try context.ensureActive();
     const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_fk_initial_create = bytes });
+    svc.unlockCatalogMutation();
+    gate_held = false;
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
     const observed = store.fkInitialCreateStatusJson(alloc, svc.metadata_group_id, command.child_table_id) catch return error.MetadataMutationOutcomeUnknown;
     errdefer alloc.free(observed);
@@ -468,6 +519,9 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         // a future store-bound transport, but never serve it through this
         // generic operation.
         .fk_initial_retirement_page => error.InitialFkRetirementNotActivated,
+        .store_root_enroll, .fk_initial_retirement_ack => storeRootMutation(svc, alloc, context, input),
+        .store_root_enrollment_status => |identity| storeRootEnrollmentStatus(svc, alloc, context, identity),
+        .fk_initial_retirement_signed_page => |request| storeRootPage(svc, alloc, context, request),
         .setting_mutate => |request| mutateSetting(svc, alloc, context, request),
         .write_validation_revision => blk: {
             try svc.ensureLinearizableReadWithContext(context);

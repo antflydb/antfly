@@ -1,6 +1,6 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
-//! Mounted graph TRUNCATE through public SQL with a test-only admission permit.
+//! Mounted public graph TRUNCATE with nonempty edges and cold-owner recovery.
 const std = @import("std");
 const platform = @import("antfly_platform");
 const metadata_runtime = @import("../metadata/runtime.zig");
@@ -9,12 +9,100 @@ const raft = @import("../raft/mod.zig");
 const executor_mod = @import("../raft/transport/std_http_executor.zig");
 const http = @import("../raft/transport/http_common.zig");
 const http_server = @import("http_server.zig");
-const sql_truncate = @import("sql_truncate.zig");
 const staging = @import("../metadata/restore_staging.zig");
 const fk_publication = @import("../metadata/fk_generation_publication.zig");
 const test_helpers = @import("../public_test_helpers.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
+const recovery_fixture = @import("hosted_truncate_recovery_fixture.zig");
+
+fn awaitGraphTarget(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, expected: bool) !void {
+    const body = try @import("test_contract_helpers.zig").encodeGraphNeighborsQueryRequest(alloc, "neighbors", "links", &.{"doc-a"}, &.{"cites"}, 10);
+    defer alloc.free(body);
+    const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < deadline) {
+        var response = try request(alloc, transport, headers, base, "/db/v1/tables/docs/query", .POST, body);
+        defer response.deinit(alloc);
+        if (response.status == 200) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
+            defer parsed.deinit();
+            const responses = parsed.value.object.get("responses") orelse return error.GraphQueryShapeChanged;
+            if (responses != .array or responses.array.items.len != 1) return error.GraphQueryShapeChanged;
+            if (responses.array.items[0].object.get("graph_results")) |results| {
+                if (results.object.get("neighbors")) |neighbors| {
+                    const stats = neighbors.object.get("stats") orelse return error.GraphQueryShapeChanged;
+                    const truncated = stats.object.get("truncated") orelse return error.GraphQueryShapeChanged;
+                    if (truncated != .bool or truncated.bool) return error.GraphQueryIncomplete;
+                    if (neighbors.object.get("nodes")) |nodes| {
+                        if (nodes != .array) return error.GraphQueryShapeChanged;
+                        var found = false;
+                        for (nodes.array.items) |node| {
+                            const key = node.object.get("key") orelse return error.GraphQueryShapeChanged;
+                            if (key == .string and std.mem.eql(u8, key.string, "graph-target")) found = true;
+                        }
+                        if (found == expected) return;
+                    }
+                }
+            }
+        } else if (response.status != 409 and response.status != 503 and response.status != 500) {
+            return error.GraphQueryFailed;
+        }
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return error.GraphEdgeStateTimeout;
+}
+
+fn assertGraphEdgesRetired(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8) !void {
+    // Reuse both document keys in the replacement generation without edges.
+    // A stale adjacency cannot hide merely because its old endpoints vanished.
+    var replacement = try request(alloc, transport, headers, base, "/db/v1/tables/docs/batch", .POST, "{\"inserts\":{\"doc-a\":{\"id\":1},\"graph-target\":{\"id\":99}},\"sync_level\":\"full_index\"}");
+    defer replacement.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), replacement.status);
+    try awaitGraphTarget(alloc, io, transport, headers, base, false);
+}
+
+fn readPausedGraphSeal(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, data: *data_runtime.DataServer, receipt: http.HttpResponse, drivers: []const *raft.ManagedProgressDriver) !@import("../storage/db/graph_retirement_seal.zig").Receipt {
+    const seal = @import("../storage/db/graph_retirement_seal.zig");
+    var accepted = try std.json.parseFromSlice(std.json.Value, alloc, receipt.body, .{});
+    defer accepted.deinit();
+    const text = (try field(try field(accepted.value, "ddl_receipt"), "restore_job_id")).string;
+    const plan_id = try staging.idForAttempt(try std.fmt.parseUnsigned(u64, text, 10), 1);
+    const source = http_server.StatusSource.fromMetadataHttpService(metadata.server.svc);
+    const encoded = (try source.getRestoreStaging(alloc, plan_id, .{ .deadline_ns = platform.time.monotonicNs() +| 2 * std.time.ns_per_s })) orelse return error.GraphTruncatePlanMismatch;
+    defer alloc.free(encoded);
+    var staged = try std.json.parseFromSlice(staging.Job, alloc, encoded, .{});
+    defer staged.deinit();
+    try std.testing.expectEqual(staging.State.cutover, staged.value.state);
+    const target = staged.value.plan.targets[0];
+    const old = target.replace orelse return error.GraphTruncatePlanMismatch;
+    const scope = (try staging.graphSealScopeForOldRange(alloc, staged.value.plan, staged.value.plan_digest, target, old.ranges[0])) orelse return error.GraphTruncatePlanMismatch;
+    const reader = (if (data.http_server) |*server| server.table_reads else null) orelse return error.GraphOwnerReadUnavailable;
+    const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < deadline) {
+        for (drivers) |driver| try driver.checkFailure();
+        var response = reader.lookup(alloc, old.table.name, old.ranges[0].start_key, .{ .relational_topology_json = "{\"mode\":\"graph_retirement\"}", .execution_deadline_ns = @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s) }, .read_index) catch |err| switch (err) {
+            error.NotLeader, error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerUnavailable, error.Timeout, error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded => {
+                try io.sleep(.fromMilliseconds(20), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        if (response) |*value| {
+            defer value.deinit(alloc);
+            var status = try std.json.parseFromSlice(seal.Status, alloc, value.json, .{});
+            defer status.deinit();
+            const intent = status.value.intent orelse return error.GraphSealMissing;
+            try std.testing.expect(intent.eql(scope));
+            if (status.value.receipt) |sealed| {
+                try std.testing.expect(sealed.applied_term != 0 and sealed.applied_index != 0);
+                try std.testing.expectEqualDeep(try scope.sealDigest(), sealed.digest);
+                return sealed;
+            }
+        }
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return error.GraphSealMissing;
+}
 
 fn basicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {
     const raw = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ username, password });
@@ -272,7 +360,7 @@ fn awaitGraphTruncate(alloc: std.mem.Allocator, io: std.Io, transport: http.Requ
     return error.GraphTruncateJobTimeout;
 }
 
-fn assertHandoffInstallSurvivesRestart(alloc: std.mem.Allocator, metadata: *metadata_runtime.Server, accepted_response: http.HttpResponse) !void {
+fn assertHandoffInstallSurvivesRestart(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, accepted_response: http.HttpResponse, drivers: []const *raft.ManagedProgressDriver) !void {
     var accepted = try std.json.parseFromSlice(std.json.Value, alloc, accepted_response.body, .{});
     defer accepted.deinit();
     const job_text = (try field(try field(accepted.value, "ddl_receipt"), "restore_job_id")).string;
@@ -292,7 +380,9 @@ fn assertHandoffInstallSurvivesRestart(alloc: std.mem.Allocator, metadata: *meta
     // metadata process has a local kernel source too, but probing a data-group
     // ID through it would create/read a different physical root. Use the
     // public table lookup so placement routing reaches the actual owner.
-    const reads = (metadata.server.owned_public_read_source orelse return error.GraphTruncateReadSourceMissing).source();
+    const hosted = metadata.server.owned_public_read_source orelse return error.GraphTruncateReadSourceMissing;
+    const reads = hosted.source();
+    const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
     for (staged.value.plan.targets) |target| {
         if (target.ranges.len != 1 or target.ranges[0].start_key.len != 0 or target.ranges[0].end_key != null)
             return error.GraphTruncatePlanMismatch;
@@ -300,10 +390,33 @@ fn assertHandoffInstallSurvivesRestart(alloc: std.mem.Allocator, metadata: *meta
         const mapped = (try staging.mappedEmptyGenerationHandoffForGroup(alloc, staged.value.plan, staged.value.plan_digest, range.group_id)) orelse return error.GraphTruncatePlanMismatch;
         var first: ?@import("../storage/db/restore_staging_contract.zig").GenerationAdmissionReceipt = null;
         for (0..2) |_| {
-            var response = (try reads.lookup(alloc, target.table.name, "", .{
-                .relational_topology_json = "{\"mode\":\"generation_handoff_install\"}",
-                .execution_deadline_ns = platform.time.monotonicNs() +| 5 * std.time.ns_per_s,
-            }, .read_index)) orelse return error.GenerationHandoffInstallMissing;
+            const observed = blk: while (platform.time.monotonicNs() < deadline) {
+                for (drivers) |driver| try driver.checkFailure();
+                const routing = try @import("table_catalog.zig").routedGroupSnapshotUntil(alloc, hosted.catalog, target.table.name, "", @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s));
+                if (routing.fence()) |fence| {
+                    if (fence.table_id != target.table.table_id or fence.route.group_id != range.group_id or fence.route.range_id != range.range_id)
+                        return error.GenerationHandoffInstallMismatch;
+                } else {
+                    try io.sleep(.fromMilliseconds(20), .awake);
+                    continue;
+                }
+                const response = reads.lookup(alloc, target.table.name, "", .{
+                    .relational_topology_json = "{\"mode\":\"generation_handoff_install\"}",
+                    .execution_deadline_ns = @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s),
+                }, .read_index) catch |err| switch (err) {
+                    error.NotLeader, error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerUnavailable, error.Timeout, error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded => {
+                        try io.sleep(.fromMilliseconds(20), .awake);
+                        continue;
+                    },
+                    else => return err,
+                };
+                if (response) |value| break :blk value;
+                // Outer null can mean no active placement during restart.
+                // An authoritative native receipt absence is JSON null below
+                // and fails immediately; never substitute a stale/local read.
+                try io.sleep(.fromMilliseconds(20), .awake);
+            } else return error.GenerationHandoffInstallRoutingTimeout;
+            var response = observed;
             defer response.deinit(alloc);
             var parsed = try std.json.parseFromSlice(?@import("../storage/db/restore_staging_contract.zig").GenerationAdmissionReceipt, alloc, response.json, .{});
             defer parsed.deinit();
@@ -317,7 +430,7 @@ fn assertHandoffInstallSurvivesRestart(alloc: std.mem.Allocator, metadata: *meta
     }
 }
 
-test "mounted hosted graph TRUNCATE seals and CASCADE retires FK cohort across restart" {
+fn mountedGraphTruncate(faults: bool) !void {
     const alloc = std.testing.allocator;
     const process_alloc = platform.allocator.processAllocator(alloc);
     const trusted_secret = "hosted-graph-truncate-trusted-v1";
@@ -406,7 +519,24 @@ test "mounted hosted graph TRUNCATE seals and CASCADE retires FK cohort across r
     var data_control_live = true;
     defer if (data_control_live) data_control.deinit();
     try data_control.start();
-    const base = try data.baseUri(alloc);
+    const restarter: recovery_fixture.DataRestart = .{
+        .alloc = process_alloc,
+        .io = io,
+        .server = &data,
+        .server_live = &data_live,
+        .raft_driver = &data_raft,
+        .raft_live = &data_raft_live,
+        .control_driver = &data_control,
+        .control_live = &data_control_live,
+        .metadata_uri = metadata_uri,
+        .config = .{
+            .replica_root_dir = data_root,
+            .replica_catalog_path = data_catalog,
+            .store_registration = .{ .node_id = 19, .store_id = 19, .role = "data" },
+            .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
+        },
+    };
+    var base = try data.baseUri(alloc);
     defer alloc.free(base);
     var executor = executor_mod.StdHttpExecutor.init(alloc, .{});
     defer executor.deinit();
@@ -420,32 +550,57 @@ test "mounted hosted graph TRUNCATE seals and CASCADE retires FK cohort across r
     defer alloc.free(token);
     const headers = [_]http.RequestHeader{.{ .name = http_server.trusted_principal_header, .value = token }};
 
-    var created = try sql(alloc, transport, &headers, base, "CREATE TABLE docs (id BIGINT PRIMARY KEY)");
+    var created = try sql(alloc, transport, &headers, base, "CREATE TABLE docs (id BIGINT PRIMARY KEY, graph_target TEXT)");
     defer created.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), created.status);
     const old_id = try awaitTableId(alloc, io, transport, &headers, base, null, null);
-    var index = try request(alloc, transport, &headers, base, "/db/v1/tables/docs/indexes/links", .POST, "{\"name\":\"links\",\"type\":\"graph\"}");
+    var index = try request(alloc, transport, &headers, base, "/db/v1/tables/docs/indexes/links", .POST, "{\"name\":\"links\",\"type\":\"graph\",\"edge_types\":[{\"name\":\"cites\",\"field\":\"graph_target\"}]}");
     defer index.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), index.status);
     try awaitIndex(alloc, io, transport, &headers, base);
-    var inserted = try request(alloc, transport, &headers, base, "/db/v1/tables/docs/batch", .POST, "{\"inserts\":{\"doc-a\":{\"id\":1}},\"sync_level\":\"full_text\"}");
+    var inserted = try request(alloc, transport, &headers, base, "/db/v1/tables/docs/batch", .POST, "{\"inserts\":{\"doc-a\":{\"id\":1,\"graph_target\":\"graph-target\"},\"graph-target\":{\"id\":99}},\"sync_level\":\"full_index\"}");
     defer inserted.deinit(alloc);
+    if (inserted.status != 201) std.debug.print("graph seed status={d} body={s}\n", .{ inserted.status, inserted.body[0..@min(inserted.body.len, 2048)] });
     try std.testing.expectEqual(@as(u16, 201), inserted.status);
+    try awaitGraphTarget(alloc, io, transport, &headers, base, true);
 
-    // Public graph TRUNCATE is closed before any durable job admission.
-    var guarded = try sql(alloc, transport, &admin_headers, metadata_uri, "TRUNCATE docs");
-    defer guarded.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), guarded.status);
-    try std.testing.expectEqual(old_id, try awaitTableId(alloc, io, transport, &headers, base, null, null));
-    try sql_truncate.grantGraphTruncateForTest(old_id);
-    defer sql_truncate.clearGraphTruncateForTest();
+    const coordinator = metadata.server.owned_public_http_server orelse return error.PublicationSupervisorUnavailable;
+    const hooks = http_server.ApiHttpServer.TruncateTestDriver;
+    defer hooks.release(coordinator);
+    if (faults) hooks.arm(coordinator, .source_sealed);
     var truncate = try sql(alloc, transport, &admin_headers, metadata_uri, "TRUNCATE docs");
     defer truncate.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), truncate.status);
+    if (faults) {
+        const drivers = [_]*raft.ManagedProgressDriver{ &meta_raft, &meta_control, &data_raft, &data_control };
+        try recovery_fixture.awaitBoundary(io, coordinator, &drivers);
+        const before = try readPausedGraphSeal(alloc, io, &metadata, &data, truncate, &drivers);
+        // The source sealed durably, but no metadata owner receipt was saved.
+        // A cold reopen must retain the exact Raft receipt and closed gate.
+        try restarter.restart();
+        const after = try readPausedGraphSeal(alloc, io, &metadata, &data, truncate, &drivers);
+        try std.testing.expectEqualDeep(before, after);
+        hooks.arm(coordinator, .before_parent_ack);
+        try recovery_fixture.awaitBoundary(io, coordinator, &drivers);
+        // Publication committed while the HTTP job still lacks completion.
+        // Lose the owner again and reconcile the same original admission.
+        try restarter.restart();
+        const fresh_base = try data.baseUri(alloc);
+        alloc.free(base);
+        base = fresh_base;
+        hooks.release(coordinator);
+    }
     const new_id = try awaitGraphTruncate(alloc, io, transport, &admin_headers, metadata_uri, &metadata, &.{old_id}, truncate);
     try awaitIndex(alloc, io, transport, &headers, base);
     var old_document = try request(alloc, transport, &headers, base, "/db/v1/tables/docs/documents/doc-a", .GET, null);
     defer old_document.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 404), old_document.status);
+    if (faults) {
+        try assertHandoffInstallSurvivesRestart(alloc, io, &metadata, truncate, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
+        try std.testing.expectEqual(new_id, try awaitTableId(alloc, io, transport, &headers, base, null, null));
+        try assertGraphEdgesRetired(alloc, io, transport, &headers, base);
+        return;
+    }
 
     data_control.deinit();
     data_control_live = false;
@@ -475,6 +630,7 @@ test "mounted hosted graph TRUNCATE seals and CASCADE retires FK cohort across r
     var after_restart = try request(alloc, transport, &headers, restarted_base, "/db/v1/tables/docs/documents/doc-a", .GET, null);
     defer after_restart.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 404), after_restart.status);
+    try assertGraphEdgesRetired(alloc, io, transport, &headers, restarted_base);
 
     // Exercise the same graph barrier as part of a dependency-closed FK
     // cohort. ADD FK is the supported hosted publication path, so this does
@@ -502,13 +658,8 @@ test "mounted hosted graph TRUNCATE seals and CASCADE retires FK cohort across r
     // exact key; never replay the mutation after an accepted response.
     try awaitChildDocumentVisible(alloc, io, transport, &headers, restarted_base, old_child_id);
 
-    var guarded_cascade = try sql(alloc, transport, &admin_headers, metadata_uri, "TRUNCATE docs CASCADE");
-    defer guarded_cascade.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), guarded_cascade.status);
     try std.testing.expectEqual(new_id, try awaitTableId(alloc, io, transport, &headers, restarted_base, null, null));
     try std.testing.expectEqual(old_child_id, try awaitNamedTableId(alloc, io, transport, &headers, restarted_base, "children", null, null));
-    const cohort_ids = if (new_id < old_child_id) [_]u64{ new_id, old_child_id } else [_]u64{ old_child_id, new_id };
-    try sql_truncate.grantGraphTruncateCohortForTest(&cohort_ids);
     var cascade = try sql(alloc, transport, &admin_headers, metadata_uri, "TRUNCATE docs CASCADE");
     defer cascade.deinit(alloc);
     const after_cascade_id = try awaitGraphTruncate(alloc, io, transport, &admin_headers, metadata_uri, &metadata, &.{ new_id, old_child_id }, cascade);
@@ -525,7 +676,7 @@ test "mounted hosted graph TRUNCATE seals and CASCADE retires FK cohort across r
     defer deleted_post_fk_child.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 404), deleted_post_fk_child.status);
     try std.testing.expect(after_cascade_id != new_id);
-    try assertHandoffInstallSurvivesRestart(alloc, &metadata, cascade);
+    try assertHandoffInstallSurvivesRestart(alloc, io, &metadata, cascade, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
 
     // The target receipt is a durable owner fact, not merely a metadata ACK.
     // Reopen both owners cold and repeat the exact hidden read-index lookup;
@@ -553,7 +704,15 @@ test "mounted hosted graph TRUNCATE seals and CASCADE retires FK cohort across r
     try data_control.start();
     const final_base = try data.baseUri(alloc);
     defer alloc.free(final_base);
-    try assertHandoffInstallSurvivesRestart(alloc, &metadata, cascade);
+    try assertHandoffInstallSurvivesRestart(alloc, io, &metadata, cascade, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
     try std.testing.expectEqual(after_cascade_id, try awaitTableId(alloc, io, transport, &headers, final_base, null, null));
     try std.testing.expectEqual(after_cascade_child_id, try awaitNamedTableId(alloc, io, transport, &headers, final_base, "children", null, null));
+}
+
+test "mounted hosted graph TRUNCATE seals and CASCADE retires FK cohort across restart" {
+    try mountedGraphTruncate(false);
+}
+
+test "mounted hosted graph TRUNCATE recovers lost seal receipt and publication completion across cold owners" {
+    try mountedGraphTruncate(true);
 }

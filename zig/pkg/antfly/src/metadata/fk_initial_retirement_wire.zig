@@ -18,6 +18,7 @@ pub const max_cursor_len: usize = 256;
 
 pub const PageRequest = struct {
     store_id: u64,
+    root_incarnation: u128 = 0,
     after_key: ?[]const u8 = null,
     limit: u16 = max_page_items,
 
@@ -27,6 +28,83 @@ pub const PageRequest = struct {
         if (self.after_key) |key| try validateCursor(metadata_group_id, self.store_id, key);
     }
 };
+
+pub const SignedPageRequest = struct {
+    identity: @import("store_root_enrollment.zig").Identity,
+    reporter_incarnation: u64,
+    page: PageRequest,
+    signature: [64]u8,
+
+    fn digest(self: @This()) ![32]u8 {
+        if (self.reporter_incarnation == 0 or self.page.store_id != self.identity.store_id or self.page.root_incarnation != self.identity.root_incarnation or
+            self.page.limit == 0 or self.page.limit > max_page_items or
+            (self.page.after_key != null and self.page.after_key.?.len > max_cursor_len)) return error.InvalidInitialFkRetirementPage;
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly/initial-fk-retirement-page/v1");
+        hash.update(&(try self.identity.digest()));
+        var numbers: [10]u8 = undefined;
+        std.mem.writeInt(u64, numbers[0..8], self.reporter_incarnation, .little);
+        std.mem.writeInt(u16, numbers[8..10], self.page.limit, .little);
+        hash.update(&numbers);
+        hash.update(&.{@intFromBool(self.page.after_key != null)});
+        if (self.page.after_key) |cursor| hash.update(cursor);
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+
+    pub fn verify(self: @This()) !void {
+        const message = try self.digest();
+        const verifier = try std.crypto.sign.Ed25519.PublicKey.fromBytes(self.identity.public_key);
+        std.crypto.sign.Ed25519.Signature.fromBytes(self.signature).verify(&message, verifier) catch return error.InvalidInitialFkRetirementSignature;
+    }
+
+    pub fn sign(identity: @import("store_root_enrollment.zig").Identity, reporter_incarnation: u64, page: PageRequest, seed: [32]u8) !@This() {
+        var result: @This() = .{ .identity = identity, .reporter_incarnation = reporter_incarnation, .page = page, .signature = undefined };
+        const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+        if (!std.mem.eql(u8, &pair.public_key.toBytes(), &identity.public_key)) return error.InvalidInitialFkRetirementSignature;
+        result.signature = (try pair.sign(&(try result.digest()), null)).toBytes();
+        return result;
+    }
+};
+
+pub const Control = union(enum) {
+    preflight_enrollment: @import("store_root_enrollment.zig").Request,
+    enrollment_status: @import("store_root_enrollment.zig").Identity,
+    authorized_page: SignedPageRequest,
+    preflight_ack: AckRequest,
+    ack_status: AckRequest,
+};
+
+test "hosted initial FK retirement page signature binds root reporter and cursor" {
+    const seed: [32]u8 = @splat(11);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const identity: @import("store_root_enrollment.zig").Identity = .{
+        .metadata_incarnation = @splat('7'),
+        .node_id = 1,
+        .store_id = 2,
+        .root_incarnation = 3,
+        .public_key = pair.public_key.toBytes(),
+    };
+    const signed = try SignedPageRequest.sign(identity, 4, .{ .store_id = 2, .root_incarnation = 3, .limit = 1 }, seed);
+    try signed.verify();
+    var changed = signed;
+    changed.reporter_incarnation += 1;
+    try std.testing.expectError(error.InvalidInitialFkRetirementSignature, changed.verify());
+    changed = signed;
+    changed.page.after_key = "other cursor";
+    try std.testing.expectError(error.InvalidInitialFkRetirementSignature, changed.verify());
+    changed = signed;
+    changed.page.limit = 2;
+    try std.testing.expectError(error.InvalidInitialFkRetirementSignature, changed.verify());
+    changed = signed;
+    changed.identity.metadata_incarnation[0] ^= 1;
+    try std.testing.expectError(error.InvalidInitialFkRetirementSignature, changed.verify());
+    changed = signed;
+    changed.page.root_incarnation += 1;
+    try std.testing.expectError(error.InvalidInitialFkRetirementPage, changed.verify());
+    try std.testing.expectError(error.InvalidInitialFkRetirementSignature, SignedPageRequest.sign(identity, 4, signed.page, @splat(12)));
+}
 
 /// Store-indexed work is ordered by the same immutable key as the metadata
 /// cursor. `next_key` may advance across already-ACKed rows and is therefore
@@ -43,7 +121,8 @@ pub const PageResponse = struct {
         var previous_key_len: usize = 0;
         for (self.items) |item| {
             try item.validate();
-            if (item.replica.store_id != request.store_id) return error.InvalidInitialFkRetirementPage;
+            if (item.replica.store_id != request.store_id or
+                (request.root_incarnation != 0 and item.replica.store_root_incarnation != request.root_incarnation)) return error.InvalidInitialFkRetirementPage;
             const key = try retirement.storeKey(&key_buf, metadata_group_id, item.replica);
             if (previous_key_len != 0) {
                 if (std.mem.order(u8, key, previous_key_buf[0..previous_key_len]) != .gt) return error.InvalidInitialFkRetirementPage;

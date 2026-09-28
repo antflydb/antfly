@@ -3,7 +3,6 @@
 //! TRUNCATE is a durable, fenced fresh-generation publication. No row scan,
 //! delete batch, source artifact, or retained tail is involved.
 const std = @import("std");
-const builtin = @import("builtin");
 const server_mod = @import("http_server.zig");
 const catalog = @import("../sql/catalog.zig");
 const ast = @import("../sql/ast.zig");
@@ -14,66 +13,6 @@ const stages = @import("../metadata/restore_staging.zig");
 const jobs = @import("restore_jobs.zig");
 const operation = @import("operation.zig");
 const integrity_catalog = @import("../storage/db/relational_integrity_catalog.zig");
-
-// Test binaries can exercise the real SQL route while the public graph
-// cutover gate remains closed. The permit is single-use and bound to one
-// exact, already-authorized physical cohort; production cannot grant it.
-const graph_test_busy = std.math.maxInt(u16);
-var graph_truncate_test_count: std.atomic.Value(u16) = .init(0);
-var graph_truncate_test_ids: [128]u64 = undefined;
-
-pub fn grantGraphTruncateForTest(table_id: u64) !void {
-    return grantGraphTruncateCohortForTest(&.{table_id});
-}
-
-/// IDs must be sorted and unique so a mounted CASCADE test cannot broaden a
-/// permit merely by changing SQL name order or admitting another table.
-pub fn grantGraphTruncateCohortForTest(table_ids: []const u64) !void {
-    if (!builtin.is_test) return error.TestOnlyGraphTruncateUnavailable;
-    if (table_ids.len == 0 or table_ids.len > graph_truncate_test_ids.len) return error.InvalidGraphTruncateTestPermit;
-    for (table_ids, 0..) |id, index| {
-        if (id == 0 or (index != 0 and id <= table_ids[index - 1])) return error.InvalidGraphTruncateTestPermit;
-    }
-    if (graph_truncate_test_count.cmpxchgStrong(0, graph_test_busy, .acq_rel, .acquire) != null)
-        return error.GraphTruncateTestPermitAlreadyActive;
-    @memcpy(graph_truncate_test_ids[0..table_ids.len], table_ids);
-    graph_truncate_test_count.store(@intCast(table_ids.len), .release);
-}
-
-pub fn clearGraphTruncateForTest() void {
-    if (builtin.is_test) graph_truncate_test_count.store(0, .release);
-}
-
-fn consumeGraphTruncateTestPermit(selected: []const records.TableRecord) bool {
-    if (!builtin.is_test) return false;
-    const count = graph_truncate_test_count.load(.acquire);
-    if (count == 0 or count == graph_test_busy or selected.len != count) return false;
-    if (graph_truncate_test_count.cmpxchgStrong(count, graph_test_busy, .acq_rel, .acquire) != null) return false;
-    defer graph_truncate_test_count.store(0, .release);
-    var ids: [128]u64 = undefined;
-    for (selected, 0..) |table, index| ids[index] = table.table_id;
-    std.mem.sort(u64, ids[0..selected.len], {}, std.sort.asc(u64));
-    return std.mem.eql(u64, ids[0..selected.len], graph_truncate_test_ids[0..selected.len]);
-}
-
-test "graph TRUNCATE diagnostic permit is single-use and table-bound" {
-    defer clearGraphTruncateForTest();
-    const selected = [_]records.TableRecord{.{ .table_id = 71, .name = "docs" }};
-    try std.testing.expect(!consumeGraphTruncateTestPermit(&selected));
-    try grantGraphTruncateForTest(71);
-    try std.testing.expectError(error.GraphTruncateTestPermitAlreadyActive, grantGraphTruncateForTest(72));
-    try std.testing.expect(consumeGraphTruncateTestPermit(&selected));
-    try std.testing.expect(!consumeGraphTruncateTestPermit(&selected));
-    try grantGraphTruncateForTest(72);
-    try std.testing.expect(!consumeGraphTruncateTestPermit(&selected));
-    try std.testing.expectError(error.InvalidGraphTruncateTestPermit, grantGraphTruncateCohortForTest(&.{ 72, 71 }));
-    const cohort = [_]records.TableRecord{ .{ .table_id = 72, .name = "child" }, .{ .table_id = 71, .name = "parent" } };
-    try std.testing.expect(!consumeGraphTruncateTestPermit(&cohort));
-    clearGraphTruncateForTest();
-    try grantGraphTruncateCohortForTest(&.{ 71, 72 });
-    try std.testing.expect(consumeGraphTruncateTestPermit(&cohort));
-    try std.testing.expect(!consumeGraphTruncateTestPermit(&cohort));
-}
 
 /// Predict the fresh child identities with the exact owner compiler, before
 /// the hidden generation exists. This is not a hash of a policy name: the
@@ -202,9 +141,10 @@ fn buildExternalParents(
             try context.ensureActive();
             var response = (try reads.lookup(alloc, draft.table.name, range.start_key, .{ .relational_topology_json = "{\"mode\":\"identity\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.TableNotFound;
             defer response.deinit(alloc);
-            const Native = struct { namespace: @import("../storage/db/doc_identity.zig").Namespace, catalog_digest: [32]u8, next_epoch: u64 };
+            const Native = @import("../storage/db/relational_integrity_topology_contract.zig").Identity;
             const native = try std.json.parseFromSliceLeaky(Native, alloc, response.json, .{ .ignore_unknown_fields = true });
             if (native.namespace.table_id != draft.table.table_id or native.namespace.shard_id != metadata.rangeDocIdentityShardId(range) or native.namespace.range_id != metadata.rangeDocIdentityRangeId(range)) return error.TableGenerationChanged;
+            try native.requireGenerationHandoffReceipts();
             fence.* = .{ .transition_id = std.mem.readInt(u64, id[0..8], .little), .attempt = 1, .admission_epoch = native.next_epoch, .owner_group_id = range.group_id, .peer_group_id = range.group_id, .role = .truncate_parent, .namespace = native.namespace, .catalog_digest = native.catalog_digest };
         }
         result.* = .{ .table = draft.table, .ranges = ranges, .fences = fences, .foreign_keys = draft.foreign_keys.items };
@@ -219,10 +159,10 @@ test {
 /// Dependency adjacency is built once; closure is O(tables + FK edges).
 /// CASCADE follows incoming references only, never silently empties parents.
 pub fn select(alloc: std.mem.Allocator, tables: []const records.TableRecord, requested: []const []const u8, cascade: bool) ![]records.TableRecord {
-    return selectInternal(alloc, tables, requested, cascade, false);
+    return selectInternal(alloc, tables, requested, cascade);
 }
 
-fn selectInternal(alloc: std.mem.Allocator, tables: []const records.TableRecord, requested: []const []const u8, cascade: bool, allow_external_parents: bool) ![]records.TableRecord {
+fn selectInternal(alloc: std.mem.Allocator, tables: []const records.TableRecord, requested: []const []const u8, cascade: bool) ![]records.TableRecord {
     var names: std.StringHashMapUnmanaged(usize) = .empty;
     for (tables, 0..) |table, i| try names.put(alloc, table.name, i);
     const included = try alloc.alloc(bool, tables.len);
@@ -239,8 +179,6 @@ fn selectInternal(alloc: std.mem.Allocator, tables: []const records.TableRecord,
     }
     const incoming = try alloc.alloc(std.ArrayList(usize), tables.len);
     @memset(incoming, .empty);
-    const Edge = struct { child: usize, parent: usize };
-    var edges: std.ArrayList(Edge) = .empty;
     for (tables, 0..) |table, child| {
         for ([_][]const u8{ table.schema_json, table.read_schema_json }) |definition| {
             if (definition.len == 0) continue;
@@ -249,7 +187,6 @@ fn selectInternal(alloc: std.mem.Allocator, tables: []const records.TableRecord,
             if (schema.foreign_keys) |foreign_keys| for (foreign_keys.value) |fk| {
                 const parent = names.get(fk.parent_table) orelse return error.ForeignKeyParentTableNotFound;
                 try incoming[parent].append(alloc, child);
-                try edges.append(alloc, .{ .child = child, .parent = parent });
             };
         }
     }
@@ -262,10 +199,8 @@ fn selectInternal(alloc: std.mem.Allocator, tables: []const records.TableRecord,
             try queue.append(alloc, child);
         };
     }
-    // Until old-child inverse witness generations can be retired on untouched
-    // parents, reject this boundary before admission. Never delete a parent
-    // merely to make a cohort complete.
-    if (!allow_external_parents) for (edges.items) |edge| if (included[edge.child] and !included[edge.parent]) return error.SqlTruncateExternalForeignKey;
+    // Outgoing parents remain untouched. Their accepted child generations
+    // are switched by the separately fenced retirement/ACK portion of Plan.
     const result = try alloc.alloc(records.TableRecord, queue.items.len);
     for (queue.items, result) |index, *table| {
         table.* = tables[index];
@@ -370,7 +305,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             if (std.mem.eql(u8, bound.name, table.name) and bound.table_id == table.table_id) break;
         } else return error.CatalogGenerationChanged;
     }
-    const selected = try selectInternal(a, snapshot.tables, requested, ddl.cascade, true);
+    const selected = try select(a, snapshot.tables, requested, ddl.cascade);
     const names = try a.alloc([]const u8, selected.len);
     for (selected, names) |table, *name| {
         if (table.storage_migration != null or table.relational_retirement_json.len != 0 or table.restore_backup_id.len != 0) return error.TableTransitionActive;
@@ -380,24 +315,8 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         if (!try server_mod.tablePermissionCurrentlyAllowed(identity, name, .admin)) return error.Forbidden;
         if (try server_mod.resolveEffectiveRowFilterJson(a, identity, name) != null) return error.Forbidden;
     }
-    // The external-parent retirement protocol is staged, but its mounted
-    // publication/ACK/restart proof is not complete. Check the exact same
-    // selected cohort only after authorization, before owner reads or a
-    // durable job ID. Do not disclose an FK dependency to another principal.
-    _ = try selectInternal(a, snapshot.tables, requested, ddl.cascade, false);
-    // Graph-derived state and metrics do not yet have a cutover proof
-    // spanning the old and fresh owner generations. A pristine target alone
-    // cannot prove dependent graph readers and workers are fenced. Check
-    // only after authorization of the entire FK-closed cohort, but before
-    // source reads or durable job admission.
-    var has_graph = false;
-    for (selected) |table| {
-        const graph = try stages.hasGraphIndex(a, table.indexes_json);
-        has_graph = has_graph or graph;
-    }
     const principal = server_mod.storedDestinationPrincipal(identity);
     try server.requireEmptyGenerationAuthority(principal, names);
-    if (has_graph and !consumeGraphTruncateTestPermit(selected)) return error.UnsupportedSqlExecution;
     var random: [16]u8 = undefined;
     try (server.restore_job_store.io orelse return error.AsyncRestoreUnavailable).randomSecure(&random);
     const key = std.fmt.bytesToHex(random, .lower);
@@ -424,15 +343,16 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             range.* = .{ .table_id = table.table_id, .group_id = group, .range_id = group, .doc_identity_shard_id = group, .doc_identity_range_id = group, .start_key = old.start_key, .end_key = old.end_key };
             var response = (try (server.table_reads orelse return error.UnsupportedSqlExecution).lookup(a, before.name, old.start_key, .{ .relational_topology_json = "{\"mode\":\"identity\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.TableNotFound;
             defer response.deinit(a);
-            const Native = struct { namespace: @import("../storage/db/doc_identity.zig").Namespace, catalog_digest: [32]u8, next_epoch: u64 };
+            const Native = @import("../storage/db/relational_integrity_topology_contract.zig").Identity;
             const native = try std.json.parseFromSliceLeaky(Native, a, response.json, .{ .ignore_unknown_fields = true });
             if (native.namespace.table_id != before.table_id or native.namespace.shard_id != metadata.rangeDocIdentityShardId(old) or native.namespace.range_id != metadata.rangeDocIdentityRangeId(old)) return error.TableGenerationChanged;
+            try native.requireGenerationHandoffReceipts();
             fence.* = .{ .transition_id = std.mem.readInt(u64, id[0..8], .little), .attempt = 1, .admission_epoch = native.next_epoch, .owner_group_id = old.group_id, .peer_group_id = group, .role = .rewrite_source, .namespace = native.namespace, .catalog_digest = native.catalog_digest };
             // A linearizable preview becomes an immutable Plan assertion, not
             // authority by itself. The coordinator will fence this source and
             // compare a second read-indexed summary before irreversible
             // cutover, catching any intervening FK admission or retirement.
-            var summary_response = (try (server.table_reads orelse return error.UnsupportedSqlExecution).topologyStatus(a, before.name, old.start_key, "{\"mode\":\"generation_handoff_summary\"}")) orelse return error.TableGenerationChanged;
+            var summary_response = (try (server.table_reads orelse return error.UnsupportedSqlExecution).lookup(a, before.name, old.start_key, .{ .relational_topology_json = "{\"mode\":\"generation_handoff_summary\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.TableGenerationChanged;
             defer summary_response.deinit(a);
             const summary = try std.json.parseFromSliceLeaky(@import("../storage/db/empty_generation_handoff.zig").Summary, a, summary_response.json, .{ .allocate = .alloc_always });
             if (!summary.namespace.eql(native.namespace) or summary.intent != null or summary.seal != null) return error.TableGenerationChanged;
@@ -500,8 +420,7 @@ test "SQL TRUNCATE closure follows incoming FKs without emptying an untouched pa
         .{ .table_id = 12, .name = "unrelated" },
     };
     try std.testing.expectError(error.SqlTruncateReferenced, select(a, &tables, &.{"parents"}, false));
-    try std.testing.expectError(error.SqlTruncateExternalForeignKey, select(a, &tables, &.{"children"}, true));
-    const staged_child = try selectInternal(a, &tables, &.{"children"}, true, true);
+    const staged_child = try select(a, &tables, &.{"children"}, false);
     try std.testing.expectEqual(@as(usize, 1), staged_child.len);
     try std.testing.expectEqualStrings("children", staged_child[0].name);
     const cascade = try select(a, &tables, &.{"parents"}, true);

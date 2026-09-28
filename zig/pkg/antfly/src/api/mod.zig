@@ -86,6 +86,7 @@ pub const kernel_bridge = @import("kernel_bridge.zig");
 const kernel_abi = @import("kernel_abi.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
+pub const store_root_enrollment_http = @import("store_root_enrollment_http.zig");
 pub const connections = @import("connections.zig");
 const protocol_adapters = @import("protocol_adapters.zig");
 
@@ -246,6 +247,8 @@ test "api module compiles" {
     _ = @import("sql_schema_cache.zig");
     _ = sql_pgwire;
     _ = sql_session;
+    _ = @import("sql_connection_record.zig");
+    _ = @import("sql_connections.zig");
     _ = cluster;
     _ = batch;
     _ = backups;
@@ -293,6 +296,7 @@ test "api module compiles" {
     _ = kernel_bridge;
     _ = http_client;
     _ = httpx_handler;
+    _ = store_root_enrollment_http;
     _ = connections;
     _ = ClusterHealth;
     _ = ClusterStatus;

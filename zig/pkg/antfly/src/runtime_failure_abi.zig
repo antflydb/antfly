@@ -15,7 +15,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 57;
+pub const abi_version: u32 = 59;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -673,6 +673,54 @@ pub const Status = enum(u32) {
     generation_publication_changed = 714,
     generation_retired = 715,
     online_merge_artifact_catalog_uncoordinated = 716,
+    artifact_catalog_drift = 717,
+    invalid_artifact_catalog_command = 718,
+    artifact_catalog_epoch_changed = 719,
+    artifact_catalog_scope_changed = 720,
+    online_merge_artifact_catalog_changed = 721,
+    store_root_enrollment_changed = 722,
+    invalid_store_root_enrollment = 723,
+    initial_child_root_receipt_changed = 724,
+    invalid_initial_fk_retirement_signature = 725,
+    initial_fk_retirement_signing_key_unavailable = 726,
+    initial_fk_retirement_reporter_changed = 727,
+    initial_fk_retirement_work_changed = 728,
+    initial_fk_retirement_publication_changed = 729,
+    initial_fk_retirement_reservation_changed = 730,
+    invalid_initial_fk_retirement_ack = 731,
+    invalid_initial_fk_retirement_page = 732,
+    initial_fk_retirement_root_changed = 733,
+    replica_retirement_recovery_in_progress = 734,
+    membership_change_fenced = 735,
+    initial_child_publication_changed = 736,
+    invalid_initial_child_publication = 737,
+    initial_fk_retirement_proof_unavailable = 738,
+    invalid_initial_fk_retirement_ticket = 739,
+    invalid_initial_fk_retirement_intent = 740,
+    initial_fk_retirement_path_changed = 741,
+    artifact_catalog_corrupt = 742,
+    artifact_catalog_epoch_exhausted = 743,
+    online_merge_artifact_tails_unsupported = 744,
+    setting_authority_unavailable = 745,
+    invalid_generation_publication = 746,
+    invalid_retirement_summary = 747,
+    generation_admission_acknowledgement_pending = 748,
+    generation_admission_changed = 749,
+    generation_admission_pending = 750,
+    generation_admission_revision_exhausted = 751,
+    invalid_generation_admission = 752,
+    generation_admission_activation_required = 753,
+    generation_retirement_acknowledgement_pending = 754,
+    generation_retirement_changed = 755,
+    generation_retirement_handoff_required = 756,
+    generation_retirement_pending = 757,
+    generation_retirement_revision_exhausted = 758,
+    invalid_generation_retirement = 759,
+    initial_child_publication_missing = 760,
+    initial_child_not_published = 761,
+    invalid_control_receipt_position = 762,
+    invalid_graph_transfer = 763,
+    graph_generation_mismatch = 764,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

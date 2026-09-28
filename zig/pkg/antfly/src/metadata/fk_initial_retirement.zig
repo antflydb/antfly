@@ -22,7 +22,9 @@ pub const Replica = struct {
     store_root_incarnation: u128 = 0,
     replica_id: u64,
     root_generation: u64,
-    /// Metadata may set this only in the terminal canceled publication txn.
+    retirement_authority: enum(u8) { canceled_plan = 0, published_obsolete = 1 } = .canceled_plan,
+    /// Metadata may set this only in a terminal publication txn. For a
+    /// published plan, the distinct authority excludes its current placement.
     canceled: bool = false,
     /// This may become true only after an exact store-root UUID is recorded
     /// and an incarnation-fenced physical retirement receipt is verified.
@@ -33,7 +35,7 @@ pub const Replica = struct {
             self.child_table_id == 0 or self.group_id == 0 or self.range_id == 0 or self.node_id == 0 or
             self.replica_id == 0 or self.root_generation == 0 or
             (self.store_id != 0 and self.store_root_incarnation == 0) or
-            (self.acked and !self.canceled))
+            (self.acked and !self.canceled) or (self.retirement_authority == .published_obsolete and !self.canceled))
             return error.InvalidInitialFkRetirement;
     }
 
@@ -41,9 +43,10 @@ pub const Replica = struct {
         try self.validate();
         var bytes: [encoded_len]u8 = @splat(0);
         @memcpy(bytes[0..4], "IFRW");
-        bytes[4] = 1;
+        bytes[4] = if (self.retirement_authority == .canceled_plan) 1 else 2;
         bytes[5] = @intFromBool(self.canceled);
         bytes[6] = @intFromBool(self.acked);
+        bytes[7] = @intFromEnum(self.retirement_authority);
         @memcpy(bytes[8..24], &self.plan_id);
         @memcpy(bytes[24..56], &self.plan_digest);
         inline for (.{ self.child_table_id, self.group_id, self.range_id, self.node_id, self.store_id, self.store_incarnation, self.replica_id, self.root_generation }, 0..) |value, index| {
@@ -57,8 +60,8 @@ pub const Replica = struct {
     }
 
     pub fn decode(bytes: []const u8) !Replica {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "IFRW") or bytes[4] != 1 or
-            bytes[5] > 1 or bytes[6] > 1 or bytes[7] != 0 or !std.mem.allEqual(u8, bytes[136..144], 0))
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "IFRW") or (bytes[4] != 1 and bytes[4] != 2) or
+            bytes[5] > 1 or bytes[6] > 1 or bytes[7] > 1 or (bytes[4] == 1 and bytes[7] != 0) or !std.mem.allEqual(u8, bytes[136..144], 0))
             return error.InvalidInitialFkRetirement;
         var checksum: publication.Digest = undefined;
         std.crypto.hash.Blake3.hash(bytes[0 .. encoded_len - 32], &checksum, .{});
@@ -77,6 +80,7 @@ pub const Replica = struct {
             .store_root_incarnation = std.mem.readInt(u128, bytes[120..136], .little),
             .canceled = bytes[5] == 1,
             .acked = bytes[6] == 1,
+            .retirement_authority = @enumFromInt(bytes[7]),
         };
         try result.validate();
         return result;

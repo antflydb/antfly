@@ -31,18 +31,35 @@ fn dataControl(ptr: *anyopaque) !void {
 }
 
 fn awaitBatch(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, table: []const u8, body: []const u8) !http.HttpResponse {
+    // Poll only read-only readiness. A 503 from a mutation is not proof that
+    // admission failed, so never replay a write to wait for a cold owner.
+    const status_uri = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/{s}/constraints/status", .{ base, table });
+    defer alloc.free(status_uri);
+    const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < deadline) {
+        var response = transport.execute(alloc, .{ .method = .GET, .uri = status_uri, .headers = headers, .timeout_ms = 3_000 }) catch |err| switch (err) {
+            error.Timeout, error.ConnectionRefused, error.ConnectionResetByPeer => {
+                try io.sleep(.fromMilliseconds(20), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        defer response.deinit(alloc);
+        if (response.status == 200) {
+            var parsed = try std.json.parseFromSlice(struct { state: []const u8, ranges: []const std.json.Value }, alloc, response.body, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            if (parsed.value.ranges.len > 0 and std.mem.eql(u8, parsed.value.state, "enforced")) break;
+        } else if (response.status != 409 and response.status != 503 and response.status != 504) {
+            return error.ConstraintCoverageUnavailable;
+        }
+        try io.sleep(.fromMilliseconds(20), .awake);
+    } else return error.ConstraintCoverageUnavailable;
     const uri = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/{s}/batch", .{ base, table });
     defer alloc.free(uri);
-    for (0..600) |_| {
-        var response = try transport.execute(alloc, .{ .method = .POST, .uri = uri, .headers = headers, .content_type = "application/json", .body = body, .timeout_ms = 3_000 });
-        if (response.status != 503) return response;
-        response.deinit(alloc);
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
-    return error.TablePlacementTimeout;
+    return transport.execute(alloc, .{ .method = .POST, .uri = uri, .headers = headers, .content_type = "application/json", .body = body, .timeout_ms = 15_000 });
 }
 
-test "mounted hosted FK parent owner is read-index ready" {
+test "mounted initial MATCH PARTIAL publication enforces constraints across restart" {
     const alloc = std.testing.allocator;
     const process_alloc = platform.allocator.processAllocator(alloc);
     const internal_secret = "hosted-fk-internal-service-secret-v1";
@@ -148,6 +165,29 @@ test "mounted hosted FK parent owner is read-index ready" {
     const token = try test_helpers.encodeTrustedPrincipalToken(alloc, trusted_secret, claims);
     defer alloc.free(token);
     const headers = [_]http.RequestHeader{.{ .name = http_server.trusted_principal_header, .value = token }};
+    // Hosted owner receipts require explicit administrator enrollment of the
+    // physical store key; ordinary service registration cannot authorize it.
+    const signing_root = try @import("../storage/db/root_signing_identity.zig").load(alloc, io, data_root);
+    const proof = try @import("../metadata/store_root_enrollment.zig").Request.sign(.{
+        .metadata_incarnation = (try metadata.server.svc.metadataIncarnation()) orelse return error.MetadataIncarnationUnavailable,
+        .node_id = 9,
+        .store_id = 9,
+        .root_incarnation = signing_root.root_incarnation,
+        .public_key = signing_root.public_key,
+    }, signing_root.seed);
+    const proof_body = try @import("store_root_enrollment_http.zig").encodeAlloc(alloc, proof);
+    defer alloc.free(proof_body);
+    const enrollment_uri = try std.fmt.allocPrint(alloc, "{s}/db/v1/store-roots/enroll", .{base});
+    defer alloc.free(enrollment_uri);
+    var enrolled = try transport.execute(alloc, .{ .method = .POST, .uri = enrollment_uri, .headers = &headers, .content_type = "application/json", .body = proof_body });
+    defer enrolled.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), enrolled.status);
+    var enrolled_identity = std.json.parseFromSlice(@import("store_root_enrollment_http.zig").Identity, alloc, enrolled.body, .{}) catch |err| {
+        std.debug.print("hosted initial FK enrollment response shape err={s} body={s}\n", .{ @errorName(err), enrolled.body });
+        return err;
+    };
+    defer enrolled_identity.deinit();
+    try std.testing.expectEqual(proof.identity, try enrolled_identity.value.toDomain());
     const parent_uri = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/parents", .{base});
     defer alloc.free(parent_uri);
     const parent_body =
@@ -210,9 +250,8 @@ test "mounted hosted FK parent owner is read-index ready" {
     if (!ready) std.debug.print("linked hosted parent read-index unavailable err={s}\n", .{if (last_error) |err| @errorName(err) else "none"});
     try std.testing.expect(ready);
 
-    // A rejected initial MATCH PARTIAL create must not leave a hidden child
-    // or an orphaned generation publication behind. Keep this assertion even
-    // while the coordinated publication path remains publicly guarded.
+    // Exercise the public asynchronous publication path, including parent
+    // support-index installation; a guarded rejection is not activation.
     const child_uri = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/children", .{base});
     defer alloc.free(child_uri);
     const child_body =
@@ -226,6 +265,9 @@ test "mounted hosted FK parent owner is read-index ready" {
         .body = child_body,
     });
     defer child_response.deinit(alloc);
+    if (child_response.status != 202)
+        std.debug.print("hosted initial FK create status={} body={s}\n", .{ child_response.status, child_response.body });
+    try std.testing.expectEqual(@as(u16, 202), child_response.status);
     if (child_response.status == 202) {
         const publication = @import("../metadata/fk_generation_publication.zig");
         const Accepted = struct { table_id: []const u8, publication_id: []const u8, state: []const u8 };
@@ -250,6 +292,10 @@ test "mounted hosted FK parent owner is read-index ready" {
         var published = false;
         const publication_deadline = platform.time.monotonicNs() +| 45 * std.time.ns_per_s;
         while (platform.time.monotonicNs() < publication_deadline) {
+            try meta_raft.checkFailure();
+            try meta_control.checkFailure();
+            try data_raft.checkFailure();
+            try data_control.checkFailure();
             const status_json = try source.systemCatalog(alloc, .{
                 .deadline_ns = @min(publication_deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s),
                 .fk_generation_publication_authority = true,
@@ -278,6 +324,28 @@ test "mounted hosted FK parent owner is read-index ready" {
             try io.sleep(.fromMilliseconds(20), .awake);
         }
         if (!published) {
+            placement_diagnostic: {
+                const svc = metadata.server.svc;
+                if (!svc.catalog_mutation_mutex.tryLock(std.Options.debug_io)) {
+                    std.debug.print("linked hosted initial placement catalog lane is busy at deadline\n", .{});
+                    break :placement_diagnostic;
+                }
+                defer svc.unlockCatalogMutation();
+                var diagnostic = @import("../metadata/control_loop.zig").MetadataControlLoop.init(alloc);
+                defer diagnostic.deinit();
+                try diagnostic.state.syncProjected(svc);
+                try diagnostic.state.seedDesiredFromProjected();
+                var current = try diagnostic.state.captureCurrent(svc);
+                defer current.deinit(alloc);
+                var plan = try diagnostic.reconciler.computePlan(diagnostic.state.tableManager(), diagnostic.state.placementCandidates(), diagnostic.state.placementCandidateInfo(), current.current);
+                defer plan.deinit(alloc);
+                std.debug.print("linked hosted initial placement projection tables={} ranges={} hidden={} candidates={} planned_placements={} lifecycle_pending={} hook={}\n", .{
+                    current.current.tables.len,                 current.current.ranges.len, current.current.initial_fk_owner_group_ids.len,
+                    diagnostic.state.placementCandidates().len, plan.placement_upserts.len, svc.lifecycle_reconcile_requested.load(.acquire),
+                    svc.lifecycle_reconcile_hook != null,
+                });
+                for (plan.placement_upserts) |intent| std.debug.print("linked hosted planned placement group={} node={} store={}\n", .{ intent.record.group_id, intent.record.local_node_id, intent.store_id });
+            }
             var stalled_snapshot = try metadata.server.svc.adminSnapshot();
             defer metadata.server.svc.freeAdminSnapshot(&stalled_snapshot);
             const durable_json = try source.systemCatalog(alloc, .{
@@ -355,11 +423,8 @@ test "mounted hosted FK parent owner is read-index ready" {
             .execution_deadline_ns = parent_probe_started_ns +| 5 * std.time.ns_per_s,
         }, .read_index)) orelse return error.TestExpectedParentIntegrityCatalog;
         defer parent_catalog_probe.deinit(alloc);
-        std.debug.print("linked hosted parent integrity catalog read-index elapsed_ms={}\n", .{(platform.time.monotonicNs() -| parent_probe_started_ns) / std.time.ns_per_ms});
-        const parent_metadata_started_ns = platform.time.monotonicNs();
         var parent_metadata = try transport.execute(alloc, .{ .method = .GET, .uri = parent_uri, .headers = &headers, .timeout_ms = 5_000 });
         defer parent_metadata.deinit(alloc);
-        std.debug.print("linked hosted parent metadata GET status={} elapsed_ms={}\n", .{ parent_metadata.status, (platform.time.monotonicNs() -| parent_metadata_started_ns) / std.time.ns_per_ms });
         try std.testing.expectEqual(@as(u16, 200), parent_metadata.status);
         const parent_batch_uri = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/parents/batch", .{base});
         defer alloc.free(parent_batch_uri);
@@ -376,7 +441,6 @@ test "mounted hosted FK parent owner is read-index ready" {
             return err;
         };
         defer parent_insert.deinit(alloc);
-        std.debug.print("linked hosted parent insert status={} elapsed_ms={}\n", .{ parent_insert.status, (platform.time.monotonicNs() -| parent_insert_started_ns) / std.time.ns_per_ms });
         try std.testing.expectEqual(@as(u16, 201), parent_insert.status);
         // Probe the exact indexed read used by MATCH PARTIAL before issuing a
         // mutation. This distinguishes an unavailable support index from a
@@ -412,56 +476,11 @@ test "mounted hosted FK parent owner is read-index ready" {
         if (support_scan) |value| {
             var response = value;
             defer response.deinit(alloc);
-            std.debug.print("linked hosted parent support scan index={s} rows={} elapsed_ms={}\n", .{ support.name, std.mem.count(u8, response.ndjson, "\n"), (platform.time.monotonicNs() -| support_scan_started_ns) / std.time.ns_per_ms });
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, response.ndjson, "\n"));
         } else return error.TestExpectedParentSupportScan;
-        const child_target = try @import("../system_catalog/domain.zig").Target.literal("children");
-        const direct_resolve_started_ns = platform.time.monotonicNs();
-        const direct_resolve = source.systemCatalog(alloc, .{ .deadline_ns = direct_resolve_started_ns +| 5 * std.time.ns_per_s }, .{ .resolve = child_target }) catch |err| {
-            std.debug.print("linked hosted direct child resolve err={s} elapsed_ms={}\n", .{ @errorName(err), (platform.time.monotonicNs() -| direct_resolve_started_ns) / std.time.ns_per_ms });
-            return err;
-        };
-        defer alloc.free(direct_resolve);
-        std.debug.print("linked hosted direct child resolve bytes={} elapsed_ms={}\n", .{ direct_resolve.len, (platform.time.monotonicNs() -| direct_resolve_started_ns) / std.time.ns_per_ms });
-        const direct_status_started_ns = platform.time.monotonicNs();
-        const direct_status = source.systemCatalog(alloc, .{ .deadline_ns = direct_status_started_ns +| 5 * std.time.ns_per_s }, .{ .table_status = .{ .logical = child_target } }) catch |err| {
-            std.debug.print("linked hosted direct child table_status err={s} elapsed_ms={}\n", .{ @errorName(err), (platform.time.monotonicNs() -| direct_status_started_ns) / std.time.ns_per_ms });
-            return err;
-        };
-        defer alloc.free(direct_status);
-        std.debug.print("linked hosted direct child table_status bytes={} elapsed_ms={}\n", .{ direct_status.len, (platform.time.monotonicNs() -| direct_status_started_ns) / std.time.ns_per_ms });
-        const routed_resolve_started_ns = platform.time.monotonicNs();
-        const routed_resolve = mounted_api.source.systemCatalog(alloc, .{ .deadline_ns = routed_resolve_started_ns +| 5 * std.time.ns_per_s }, .{ .resolve = child_target }) catch |err| {
-            std.debug.print("linked hosted routed child resolve err={s} elapsed_ms={}\n", .{ @errorName(err), (platform.time.monotonicNs() -| routed_resolve_started_ns) / std.time.ns_per_ms });
-            return err;
-        };
-        defer alloc.free(routed_resolve);
-        std.debug.print("linked hosted routed child resolve bytes={} elapsed_ms={}\n", .{ routed_resolve.len, (platform.time.monotonicNs() -| routed_resolve_started_ns) / std.time.ns_per_ms });
-        const child_metadata_started_ns = platform.time.monotonicNs();
         var child_metadata = try transport.execute(alloc, .{ .method = .GET, .uri = child_uri, .headers = &headers, .timeout_ms = 5_000 });
         defer child_metadata.deinit(alloc);
-        std.debug.print("linked hosted child metadata GET status={} elapsed_ms={}\n", .{ child_metadata.status, (platform.time.monotonicNs() -| child_metadata_started_ns) / std.time.ns_per_ms });
         try std.testing.expectEqual(@as(u16, 200), child_metadata.status);
-        const validation_started_ns = platform.time.monotonicNs();
-        mounted_api.validateTableWritesAgainstSchemaWithContext(.{ .deadline_ns = validation_started_ns +| 5 * std.time.ns_per_s }, child_name.?, &.{@import("../storage/db/types.zig").BatchWrite{
-            .key = "valid-child",
-            .value = "{\"id\":7,\"pa\":1,\"pb\":null}",
-        }}) catch |err| {
-            std.debug.print("linked hosted valid child validation err={s} elapsed_ms={}\n", .{ @errorName(err), (platform.time.monotonicNs() -| validation_started_ns) / std.time.ns_per_ms });
-            return err;
-        };
-        std.debug.print("linked hosted valid child validation elapsed_ms={}\n", .{(platform.time.monotonicNs() -| validation_started_ns) / std.time.ns_per_ms});
-        // Preparation is read-only. If this bounded probe completes, the
-        // remaining public timeout is in authorization or distributed commit.
-        const preparation_started_ns = platform.time.monotonicNs();
-        var prepared = @import("relational_integrity_commit.zig").prepareWithCoverageControlled(alloc, reader, visible.tables, visible.ranges, &.{.{
-            .table_name = child_name.?,
-            .writes = &.{.{ .key = "valid-child", .value = "{\"id\":7,\"pa\":1,\"pb\":null}" }},
-        }}, .{ .deadline_ns = preparation_started_ns +| 5 * std.time.ns_per_s }) catch |err| {
-            std.debug.print("linked hosted valid child preparation err={s} elapsed_ms={}\n", .{ @errorName(err), (platform.time.monotonicNs() -| preparation_started_ns) / std.time.ns_per_ms });
-            return err;
-        };
-        defer prepared.deinit();
-        std.debug.print("linked hosted valid child preparation participants={} elapsed_ms={}\n", .{ prepared.tables.len, (platform.time.monotonicNs() -| preparation_started_ns) / std.time.ns_per_ms });
         const valid_uri = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/children/batch", .{base});
         defer alloc.free(valid_uri);
         const valid_started_ns = platform.time.monotonicNs();
@@ -483,7 +502,7 @@ test "mounted hosted FK parent owner is read-index ready" {
             return err;
         };
         defer valid_child.deinit(alloc);
-        if (valid_child.status != 201) std.debug.print("linked hosted valid MATCH PARTIAL insert status={} elapsed_ms={} body={s}\n", .{ valid_child.status, (platform.time.monotonicNs() -| valid_started_ns) / std.time.ns_per_ms, valid_child.body });
+        if (valid_child.status != 201 and valid_child.status != 202) std.debug.print("linked hosted valid MATCH PARTIAL insert status={} elapsed_ms={} body={s}\n", .{ valid_child.status, (platform.time.monotonicNs() -| valid_started_ns) / std.time.ns_per_ms, valid_child.body });
         // A distributed commit can be durable before all participants report
         // propagation. A 202 is not an invitation to replay the mutation:
         // wait for an authoritative public read of the committed row instead.
@@ -587,7 +606,14 @@ test "mounted hosted FK parent owner is read-index ready" {
         defer alloc.free(restarted_lookup_uri);
         const recovered_visible_deadline_ns = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
         while (true) {
-            var lookup = try transport.execute(alloc, .{ .method = .GET, .uri = restarted_lookup_uri, .headers = &headers, .timeout_ms = 3_000 });
+            var lookup = transport.execute(alloc, .{ .method = .GET, .uri = restarted_lookup_uri, .headers = &headers, .timeout_ms = 3_000 }) catch |err| switch (err) {
+                error.Timeout, error.ConnectionRefused, error.ConnectionResetByPeer => {
+                    if (platform.time.monotonicNs() >= recovered_visible_deadline_ns) return error.RecoveredChildVisibilityTimeout;
+                    try io.sleep(.fromMilliseconds(20), .awake);
+                    continue;
+                },
+                else => return err,
+            };
             const status = lookup.status;
             lookup.deinit(alloc);
             if (status == 200) break;
@@ -603,136 +629,4 @@ test "mounted hosted FK parent owner is read-index ready" {
         try std.testing.expectEqual(@as(u16, 409), still_blocked.status);
         return;
     }
-    if (child_response.status != 422) std.debug.print("linked hosted child guard status={} body={s}\n", .{ child_response.status, child_response.body });
-    try std.testing.expectEqual(@as(u16, 422), child_response.status);
-    const GuardError = struct { @"error": []const u8 };
-    var guard_error = try std.json.parseFromSlice(GuardError, alloc, child_response.body, .{ .ignore_unknown_fields = true });
-    defer guard_error.deinit();
-    try std.testing.expectEqualStrings(
-        "initial MATCH PARTIAL foreign keys require atomic parent support-index publication; create the table without that constraint, then add it with ALTER TABLE",
-        guard_error.value.@"error",
-    );
-
-    var after_rejection = try metadata.server.svc.adminSnapshot();
-    defer metadata.server.svc.freeAdminSnapshot(&after_rejection);
-    try std.testing.expectEqual(@as(usize, 1), after_rejection.tables.len);
-    try std.testing.expectEqual(parent_table_id, after_rejection.tables[0].table_id);
-    const work_json = try http_server.StatusSource.fromMetadataHttpService(metadata.server.svc).systemCatalog(alloc, .{
-        .deadline_ns = platform.time.monotonicNs() +| 5 * std.time.ns_per_s,
-        .fk_generation_publication_authority = true,
-    }, .{ .fk_initial_create_work = 0 });
-    defer alloc.free(work_json);
-    var work = try std.json.parseFromSlice(?@import("../metadata/fk_generation_publication.zig").InitialWork, alloc, work_json, .{});
-    defer work.deinit();
-    try std.testing.expect(work.value == null);
-
-    // Exercise the private publication protocol while public MATCH PARTIAL
-    // CREATE remains guarded. This uses the same admitted plan and supervisor
-    // as ingress, without making an unproven route available to users.
-    var internal_request = try @import("tables.zig").parseCreateTableRequest(alloc, child_body);
-    defer internal_request.deinit(alloc);
-    // Public ingress resolves the logical FK target before planning. The
-    // internal test bypasses ingress, so provide the same physical target.
-    const physical_parent = try std.fmt.allocPrint(alloc, "\"parent_table\":\"{s}\"", .{parent_name.?});
-    defer alloc.free(physical_parent);
-    const resolved_schema = try std.mem.replaceOwned(u8, alloc, internal_request.schema_json.?, "\"parent_table\":\"parents\"", physical_parent);
-    alloc.free(internal_request.schema_json.?);
-    internal_request.schema_json = resolved_schema;
-    const begin = if (data.http_server) |*server| try server.beginFkInitialCreate(
-        alloc,
-        .{ .deadline_ns = platform.time.monotonicNs() +| 20 * std.time.ns_per_s },
-        null,
-        try @import("../system_catalog/domain.zig").Target.literal("children"),
-        internal_request,
-    ) else return error.Unavailable;
-    try std.testing.expect(begin.state == .pending);
-    const private_source = http_server.StatusSource.fromMetadataHttpService(metadata.server.svc);
-    const private_deadline = platform.time.monotonicNs() +| 45 * std.time.ns_per_s;
-    var private_phase: @import("../metadata/fk_generation_publication.zig").InitialPhase = .preparing_support;
-    var private_receipts: usize = 0;
-    while (platform.time.monotonicNs() < private_deadline) {
-        const status_json = try private_source.systemCatalog(alloc, .{
-            .deadline_ns = @min(private_deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s),
-            .fk_generation_publication_authority = true,
-        }, .{ .fk_initial_create_status = begin.child_table_id });
-        defer alloc.free(status_json);
-        var status = try std.json.parseFromSlice(@import("../metadata/fk_generation_publication.zig").InitialPublication, alloc, status_json, .{ .ignore_unknown_fields = true });
-        defer status.deinit();
-        private_phase = status.value.phase;
-        private_receipts = status.value.child_provisioned.len;
-        if (private_phase == .published) break;
-        try io.sleep(.fromMilliseconds(20), .awake);
-    }
-    if (private_phase != .published)
-        std.debug.print("hosted private initial FK stalled phase={s} child_receipts={}\n", .{ @tagName(private_phase), private_receipts });
-    try std.testing.expectEqual(@import("../metadata/fk_generation_publication.zig").InitialPhase.published, private_phase);
-    var published_snapshot = try metadata.server.svc.adminSnapshot();
-    defer metadata.server.svc.freeAdminSnapshot(&published_snapshot);
-    try std.testing.expectEqual(@as(usize, 2), published_snapshot.tables.len);
-    const published_child = for (published_snapshot.tables) |table| {
-        if (table.table_id == begin.child_table_id) break table;
-    } else return error.TestExpectedPublishedChild;
-    try std.testing.expect(published_child.name.len != 0);
-    const private_group = for (published_snapshot.ranges) |range| {
-        if (range.table_id == begin.child_table_id) break range.group_id;
-    } else return error.TestExpectedPublishedChildRange;
-    const hidden_record = (try data.readHiddenInitialChildRecord(private_group, begin.child_table_id)) orelse
-        return error.TestExpectedHiddenChildReceipt;
-    try std.testing.expect(hidden_record.phase == .released);
-    try std.testing.expect(hidden_record.provision_term != 0 and hidden_record.provision_index != 0);
-
-    // A completed owner receipt and the published table must survive loss of
-    // the data process, not merely a live coordinator cursor. Stop workers
-    // before closing the owner, then reopen the same Raft and LSM roots.
-    data_control.deinit();
-    data_control_alive = false;
-    data_raft.deinit();
-    data_raft_alive = false;
-    data.deinit();
-    data_alive = false;
-    data = try data_runtime.DataServer.initFromMetadataApiUrl(process_alloc, .{
-        .replica_root_dir = data_root,
-        .replica_catalog_path = data_catalog,
-        .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{
-            .deployment_mode = .distributed,
-            .trusted_principal_secret = trusted_secret,
-            .trusted_principal_issuer = issuer,
-            .internal_service_secret = internal_secret,
-            .internal_service_issuer = issuer,
-            .internal_service_auth_capability = "v1; mode=enforce",
-        },
-    }, metadata_uri);
-    data_alive = true;
-    try data.start();
-    for (0..32) |_| {
-        data.registerNodeIfConfigured() catch |err| switch (err) {
-            error.StoreRegistrationNotVisible => {
-                try io.sleep(.fromMilliseconds(1), .awake);
-                continue;
-            },
-            else => return err,
-        };
-        break;
-    } else return error.StoreRegistrationNotVisible;
-    data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
-    data_raft_alive = true;
-    try data_raft.start();
-    data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, std.time.ns_per_ms);
-    data_control_alive = true;
-    try data_control.start();
-    const recovered = for (0..200) |_| {
-        const value = data.readHiddenInitialChildRecord(private_group, begin.child_table_id) catch |err| switch (err) {
-            error.StorageReadTemporarilyUnavailable => {
-                try io.sleep(.fromMilliseconds(10), .awake);
-                continue;
-            },
-            else => return err,
-        };
-        if (value) |record| break record;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    } else return error.TestExpectedRecoveredHiddenChildReceipt;
-    try std.testing.expect(recovered.phase == .released);
-    try std.testing.expectEqual(hidden_record.provision_term, recovered.provision_term);
-    try std.testing.expectEqual(hidden_record.provision_index, recovered.provision_index);
 }

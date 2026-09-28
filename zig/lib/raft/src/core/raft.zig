@@ -41,6 +41,26 @@ const ReadContext = struct {
 
 const encoded_read_context_len = @sizeOf(types.Term) + @sizeOf(u64);
 
+/// Runs synchronously on the Raft owner, at append admission. The callback must
+/// be read-only. Applications can reduce their durable fence plus the retained
+/// log suffix to fence membership before a barrier has reached application.
+/// Supplying the entire retained suffix lets the application use its own
+/// durable applied watermark (which can lead Raft's async apply acknowledgement).
+pub const ProposalAdmission = struct {
+    ptr: *anyopaque,
+    check: *const fn (*anyopaque, Context) anyerror!void,
+
+    pub const Context = struct {
+        group_id: types.GroupId,
+        conf_state: types.ConfState,
+        applied_index: types.Index,
+        pending_conf_index: types.Index,
+        first_index: types.Index,
+        retained_entries: []const types.Entry,
+        proposed_entries: []const types.Entry,
+    };
+};
+
 const PendingRead = struct {
     index: types.Index,
     requester: types.NodeId,
@@ -78,6 +98,7 @@ pub const Config = struct {
     read_only_option: types.ReadOnlyOption = .safe,
     logger: ?logger_mod.Logger = null,
     trace_logger: ?logger_mod.TraceLogger = null,
+    proposal_admission: ?ProposalAdmission = null,
 
     /// Performs every deterministic admission check without consulting
     /// storage or allocating. Callers that publish durable desired state must
@@ -409,6 +430,8 @@ pub const Raft = struct {
         if (self.lead_transferee != null) return;
         if (msg.entries.len == 0) return;
 
+        try self.checkProposalAdmission(msg.entries);
+
         for (msg.entries) |entry| {
             switch (entry.entry_type) {
                 .normal => {},
@@ -520,6 +543,7 @@ pub const Raft = struct {
             };
         }
 
+        try self.checkProposalAdmission(entries);
         if (!self.increaseUncommittedSizeEntries(entries)) return error.ProposalDropped;
         const last_index = self.log.appendOwnedEntries(entries) catch |err| {
             self.reduceUncommittedSizeEntries(entries);
@@ -1611,8 +1635,22 @@ pub const Raft = struct {
 
     fn appendLocalEntryOfType(self: *Raft, entry_type: types.EntryType, data: []const u8) !types.Index {
         const self_idx = try self.localAppendPeerIndex();
+        try self.checkProposalAdmission(&.{.{ .entry_type = entry_type, .data = @constCast(data) }});
         if (!self.increaseUncommittedSizeEntry(entry_type, data)) return error.ProposalDropped;
         return try self.appendLocalEntryOfTypeUnchecked(self_idx, entry_type, data);
+    }
+
+    fn checkProposalAdmission(self: *const Raft, entries: []const types.Entry) !void {
+        const admission = self.cfg.proposal_admission orelse return;
+        try admission.check(admission.ptr, .{
+            .group_id = self.cfg.group_id,
+            .conf_state = self.conf_state,
+            .applied_index = self.log.applied,
+            .pending_conf_index = self.pending_conf_index,
+            .first_index = self.log.firstIndex(),
+            .retained_entries = self.log.entriesFrom(self.log.firstIndex()),
+            .proposed_entries = entries,
+        });
     }
 
     fn appendLocalEntryOfTypeUnchecked(self: *Raft, self_idx: usize, entry_type: types.EntryType, data: []const u8) !types.Index {
@@ -1790,7 +1828,10 @@ pub const Raft = struct {
         const encoded = try leave.encode(self.alloc);
         defer self.alloc.free(encoded);
 
-        self.pending_conf_index = try self.appendLocalEntryOfType(.conf_change_v2, encoded);
+        self.pending_conf_index = self.appendLocalEntryOfType(.conf_change_v2, encoded) catch |err| switch (err) {
+            error.MembershipChangeFenced => return,
+            else => return err,
+        };
         _ = self.maybeCommit();
         try self.bcastAppend();
     }

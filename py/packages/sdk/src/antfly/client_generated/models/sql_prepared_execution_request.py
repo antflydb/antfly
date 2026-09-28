@@ -18,11 +18,14 @@ class SQLPreparedExecutionRequest:
         limit (int | Unset):  Default: 128.
         session_id (str | Unset): Optional durable transaction session. Required when the resource was prepared against
             a session; otherwise independent of the prepared resource lifetime.
+        connection_id (str | Unset): Required for a connection-bound resource; DISCARD ALL closes it without affecting
+            other clients' resources.
     """
 
     parameters: list[Any] | Unset = UNSET
     limit: int | Unset = 128
     session_id: str | Unset = UNSET
+    connection_id: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         parameters: list[Any] | Unset = UNSET
@@ -33,6 +36,8 @@ class SQLPreparedExecutionRequest:
 
         session_id = self.session_id
 
+        connection_id = self.connection_id
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
@@ -42,6 +47,8 @@ class SQLPreparedExecutionRequest:
             field_dict["limit"] = limit
         if session_id is not UNSET:
             field_dict["session_id"] = session_id
+        if connection_id is not UNSET:
+            field_dict["connection_id"] = connection_id
 
         return field_dict
 
@@ -54,10 +61,13 @@ class SQLPreparedExecutionRequest:
 
         session_id = d.pop("session_id", UNSET)
 
+        connection_id = d.pop("connection_id", UNSET)
+
         sql_prepared_execution_request = cls(
             parameters=parameters,
             limit=limit,
             session_id=session_id,
+            connection_id=connection_id,
         )
 
         return sql_prepared_execution_request

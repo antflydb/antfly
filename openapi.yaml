@@ -3443,6 +3443,83 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/sql/connections:
+    post:
+      operationId: openSQLConnection
+      summary: Open a durable idle HTTP SQL connection
+      tags:
+        - data_operations
+      description: >
+        Creates a principal- and API-node-owned connection with a one-hour idle-use deadline. Active or
+        uncertain transactions retain their exact connection binding until completion or reconciliation;
+        expiry is not an abort decision. Send connection_id with later SQL and prepared requests. This
+        ID is not a transaction session_id. DISCARD ALL resets only this connection's setting overlay
+        and prepared resources, and refuses active or uncertain transactions. Do not automatically replay
+        ambiguous create responses.
+      x-antfly-client-request-policy:
+        max_retries: 0
+        follow_redirects: false
+        cookies_enabled: false
+        max_response_size: 16777216
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SQLConnectionOpenRequest'
+      responses:
+        '200':
+          description: Opened connection and routing owner
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLConnectionResponse'
+        default:
+          description: Connection admission failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLDiagnostic'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/sql/connections/{connection_id}:
+    parameters:
+      - name: connection_id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: ^[0-9a-f]{32}$
+    delete:
+      operationId: closeSQLConnection
+      summary: Close an idle SQL connection and its prepared resources
+      tags:
+        - data_operations
+      description: Refuses an active, beginning or uncertain transaction; route to owner_node_id.
+      x-antfly-client-request-policy:
+        max_retries: 0
+        follow_redirects: false
+        cookies_enabled: false
+        max_response_size: 16777216
+      responses:
+        '200':
+          description: Closed connection
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          description: Connection close rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLDiagnostic'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/sql/prepared:
     post:
       operationId: prepareSQL
@@ -3547,6 +3624,14 @@ paths:
       summary: Release a durable prepared SQL resource
       tags:
         - data_operations
+      parameters:
+        - name: X-Antfly-SQL-Connection-Id
+          in: header
+          required: false
+          schema:
+            type: string
+            pattern: ^[0-9a-fA-F]{32}$
+          description: Required to close a connection-bound prepared resource.
       x-antfly-client-request-policy:
         max_retries: 0
         follow_redirects: false
@@ -3605,6 +3690,83 @@ paths:
           description: Metadata peer upgrade required
         '503':
           description: Mutation outcome unknown or metadata unavailable
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/store-roots/enroll:
+    post:
+      operationId: enrollStoreRoot
+      summary: Approve a physical store-root signing identity
+      tags:
+        - cluster_management
+      description: >
+        Cluster-administrator-only approval of a locally signed proof bound to the metadata cluster, node,
+        store and physical root. Ordinary node registration does not grant retirement authority. The request
+        is not automatically retried; observe the enrollment after an ambiguous 503.
+      x-antfly-client-request-policy:
+        max_retries: 0
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StoreRootEnrollmentRequest'
+      responses:
+        '200':
+          description: Enrollment committed and observed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoreRootEnrollmentIdentity'
+        '400':
+          description: Invalid identity or proof of possession
+        '401':
+          description: Authentication required
+        '403':
+          description: Cluster administrator permission required
+        '409':
+          description: Root registration or enrollment changed
+        '426':
+          description: Metadata peer upgrade required
+        '503':
+          description: Outcome unknown or metadata unavailable; observe before retrying
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/store-roots/enrollment-status:
+    post:
+      operationId: getStoreRootEnrollmentStatus
+      summary: Check one exact physical store-root enrollment
+      tags:
+        - cluster_management
+      description: >
+        Read-only, linearizable cluster-administrator check for the exact identity in a signed proof.
+        Use after an ambiguous enroll response; this operation never submits another enrollment mutation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StoreRootEnrollmentIdentity'
+      responses:
+        '200':
+          description: Exact enrollment observed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoreRootEnrollmentIdentity'
+        '400':
+          description: Invalid identity
+        '401':
+          description: Authentication required
+        '403':
+          description: Cluster administrator permission required
+        '409':
+          description: Exact identity is not enrolled, or store-root registration changed
+        '503':
+          description: Metadata unavailable; retry the read later
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -11940,6 +12102,11 @@ components:
           pattern: ^[0-9a-fA-F]{32}$
           description: Optional durable SQL session. Preparation binds its authenticated scope and current
             setting catalog under the session lease; execution must supply the same session.
+        connection_id:
+          type: string
+          pattern: ^[0-9a-fA-F]{32}$
+          description: Optional idle HTTP SQL connection. Preparation binds to its current DISCARD generation;
+            a transaction-bound preparation remains bound to session_id instead.
     SQLPreparedExecutionRequest:
       type: object
       additionalProperties: false
@@ -11959,6 +12126,53 @@ components:
           pattern: ^[0-9a-fA-F]{32}$
           description: Optional durable transaction session. Required when the resource was prepared against
             a session; otherwise independent of the prepared resource lifetime.
+        connection_id:
+          type: string
+          pattern: ^[0-9a-fA-F]{32}$
+          description: Required for a connection-bound resource; DISCARD ALL closes it without affecting
+            other clients' resources.
+    SQLConnectionOpenRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        database:
+          type: string
+          minLength: 1
+          maxLength: 256
+          default: default
+        namespace:
+          type: string
+          minLength: 1
+          maxLength: 256
+          default: public
+    SQLConnectionResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - connection_id
+        - owner_node_id
+        - expires_at_ms
+        - database
+        - namespace
+      properties:
+        connection_id:
+          type: string
+          pattern: ^[0-9a-f]{32}$
+        owner_node_id:
+          type: string
+          description: >
+            The owning API node. Zero denotes a standalone-local endpoint; send subsequent connection
+            requests to that same endpoint. Otherwise route requests to the returned owning node.
+        expires_at_ms:
+          type: integer
+          format: int64
+          description: >
+            Idle-use deadline in Unix milliseconds. An attached active or uncertain transaction remains
+            accessible for completion and reconciliation after this deadline; expiry never implies abort.
+        database:
+          type: string
+        namespace:
+          type: string
     SQLPreparedResponse:
       type: object
       additionalProperties: false
@@ -12094,6 +12308,48 @@ components:
       oneOf:
         - $ref: '#/components/schemas/SqlSettingMutationPut'
         - $ref: '#/components/schemas/SqlSettingMutationDrop'
+    StoreRootEnrollmentIdentity:
+      type: object
+      additionalProperties: false
+      required:
+        - metadata_incarnation
+        - node_id
+        - store_id
+        - root_incarnation
+        - public_key
+      properties:
+        metadata_incarnation:
+          type: string
+          pattern: ^[0-9a-f]{32}$
+        node_id:
+          type: integer
+          format: int64
+          minimum: 1
+        store_id:
+          type: integer
+          format: int64
+          minimum: 1
+        root_incarnation:
+          type: string
+          pattern: ^[1-9][0-9]{0,38}$
+          description: Decimal u128 string; never pass through a floating-point JSON number.
+        public_key:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Ed25519 public key in lowercase hex.
+    StoreRootEnrollmentRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - identity
+        - signature
+      properties:
+        identity:
+          $ref: '#/components/schemas/StoreRootEnrollmentIdentity'
+        signature:
+          type: string
+          pattern: ^[0-9a-f]{128}$
+          description: Ed25519 proof-of-possession signature in lowercase hex.
     SQLRequest:
       type: object
       additionalProperties: false
@@ -12144,6 +12400,12 @@ components:
           type: string
           pattern: ^[0-9a-fA-F]{32}$
           description: Opaque SQL session identifier returned by a previous response.
+        connection_id:
+          type: string
+          pattern: ^[0-9a-fA-F]{32}$
+          description: Durable idle HTTP connection. Its scope and settings are inherited; active transaction
+            IDs cannot be bypassed by omitting session_id. DISCARD ALL requires this identity and is rejected
+            while a transaction is active or uncertain.
     SQLTransactionStatus:
       type: string
       enum:
@@ -18168,6 +18430,7 @@ components:
         - lease_expires_at
         - lease_state
         - sync_level
+        - disposition
         - staged_table_count
         - staged_read_count
         - staged_write_count
@@ -18194,6 +18457,17 @@ components:
           type: string
         sync_level:
           type: string
+        disposition:
+          type: string
+          enum:
+            - active
+            - outcome_unknown
+            - committed
+            - committed_pending
+            - committed_repair_required
+            - aborted
+          description: Durable read-only transaction outcome. outcome_unknown is not permission to replay
+            a mutation with another ID.
         staged_table_count:
           type: integer
         staged_read_count:

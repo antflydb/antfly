@@ -18,11 +18,20 @@ const Allocator = std.mem.Allocator;
 const integrity = @import("relational_integrity_contract.zig");
 const identity = @import("doc_identity_namespace.zig");
 
+pub const GenerationHandoffReceiptAuthority = enum { unsupported, raft, native };
+
 pub const Identity = struct {
     namespace: identity.Namespace,
     catalog_digest: [32]u8,
     next_epoch: u64,
     backup_seal_supported: bool = false,
+    // Explicit durable authority domain; native receipts never contain a
+    // fabricated Raft position. Missing capability fails closed at admission.
+    generation_handoff_receipt_authority: GenerationHandoffReceiptAuthority = .unsupported,
+
+    pub fn requireGenerationHandoffReceipts(self: Identity) !void {
+        if (self.generation_handoff_receipt_authority == .unsupported) return error.UnsupportedEmptyGenerationAuthority;
+    }
 };
 
 pub const Status = struct { fence: ?Fence, drained: bool };

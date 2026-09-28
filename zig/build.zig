@@ -1441,6 +1441,26 @@ pub fn create(b: *std.Build) ?Artifacts {
         standalone_initial_fk_tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     const run_standalone_initial_fk_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_initial_fk_tests);
     b.step("antfly-standalone-initial-fk-test", "Run linked native standalone initial-FK owner publication tests").dependOn(&run_standalone_initial_fk_tests.step);
+    const graph_transfer_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/graph_transfer_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_graph_transfer_tests = b.addRunArtifact(graph_transfer_tests);
+    b.step("antfly-graph-transfer-test", "Validate certified graph artifact generation transfer").dependOn(&run_graph_transfer_tests.step);
+    owner_tests.unit_test_step.dependOn(&run_graph_transfer_tests.step);
+    const standalone_policy_ha_tests = owner_tests.standalone_policy_ha_tests;
+    standalone_policy_ha_tests.root_module.addObject(consumer_test_metadata.object);
+    inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+        standalone_policy_ha_tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
+    const run_standalone_policy_ha_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_policy_ha_tests);
+    b.step("antfly-standalone-policy-ha-test", "Run native standalone and HA row-policy publication regressions").dependOn(&run_standalone_policy_ha_tests.step);
+    // Native activation must remain covered by the existing physical-owner
+    // CI gates, not only by developer-invoked focused targets.
+    for ([_]*std.Build.Step.Run{ run_standalone_initial_fk_tests, run_standalone_policy_ha_tests }) |run| {
+        owner_tests.storage_test_step.dependOn(&run.step);
+        owner_tests.integration_test_step.dependOn(&run.step);
+    }
 
     const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, lmdb_engine_mod, runtime_library_artifacts);
     b.step("antfly-storage-owner-test", "Run real compiled storage owner ABI regressions").dependOn(&storage_owner_runs.runs[0].step);

@@ -27,7 +27,25 @@ pub const Digest = [32]u8;
 pub const chunk_bytes = 1024 * 1024;
 pub const max_chunk_bytes = chunk_bytes;
 pub const max_row_bytes = std.math.maxInt(u32);
+pub const ChunkPayload = enum { row, artifact };
+
+/// The certified source declares its complete effect language. A receiver
+/// must never infer graph support from an index name or reinterpret a v14 page.
+pub fn artifactKeyAllowed(source: Source, key_bytes: []const u8) bool {
+    const binding = source.artifact_catalog orelse return false;
+    if (!binding.valid()) return false;
+    return @import("online_vector_artifacts.zig").isKey(key_bytes) or
+        (binding.effect_protocol == 15 and @import("online_graph_artifacts.zig").isKey(key_bytes));
+}
+
+pub fn validateArtifactEffect(source: Source, key_bytes: []const u8, value: ?[]const u8) !void {
+    if (!artifactKeyAllowed(source, key_bytes)) return error.InvalidMergePage;
+    if (@import("online_graph_artifacts.zig").isKey(key_bytes)) {
+        try @import("online_graph_artifacts.zig").validate(key_bytes, value);
+    } else try @import("online_vector_artifacts.zig").validate(key_bytes, value);
+}
 pub const Chunk = struct {
+    payload: ChunkPayload = .row,
     row_key: []const u8,
     timestamp: u64,
     total_bytes: u64,
@@ -72,18 +90,20 @@ pub const Source = struct {
     applied_index: u64,
     retention: ?Retention = null,
     integrity: ?IntegrityBinding = null,
+    artifact_catalog: ?@import("artifact_inventory.zig").Binding = null,
 
     pub fn jsonStringify(self: @This(), stream: anytype) !void {
         try @import("relational_integrity_json.zig").write(self, stream);
     }
 
     pub fn eql(a: Source, b: Source) bool {
-        return a.namespace.eql(b.namespace) and a.applied_index == b.applied_index and std.mem.eql(u8, &a.pin_digest, &b.pin_digest) and std.meta.eql(a.retention, b.retention) and std.meta.eql(a.integrity, b.integrity);
+        return a.namespace.eql(b.namespace) and a.applied_index == b.applied_index and std.mem.eql(u8, &a.pin_digest, &b.pin_digest) and std.meta.eql(a.retention, b.retention) and std.meta.eql(a.integrity, b.integrity) and std.meta.eql(a.artifact_catalog, b.artifact_catalog);
     }
     pub fn validate(self: Source) !void {
         if (self.namespace.table_id == 0 or self.namespace.shard_id == 0 or self.namespace.range_id == 0 or
             self.applied_index == 0 or std.mem.allEqual(u8, &self.pin_digest, 0)) return error.InvalidMergePage;
         if (self.retention) |retention| if (retention.epoch == 0) return error.InvalidMergePage;
+        if (self.artifact_catalog) |binding| if (!binding.valid() or self.retention == null) return error.InvalidMergePage;
         if (self.integrity) |binding| if (self.retention == null or std.mem.allEqual(u8, &binding.catalog_digest, 0) or std.mem.allEqual(u8, &binding.generation_set, 0)) return error.InvalidMergePage;
     }
 };
@@ -122,6 +142,10 @@ pub const Command = struct {
     /// Native, already-keyed claim/reference/job afterimages. They never pass
     /// through the document mapper or an ordinary caller-authored batch.
     integrity: []const IntegrityEffect = &.{},
+    /// Certified physical artifacts, including explicit tombstones. The source
+    /// binding declares the effect language; values never pass through JSON
+    /// row mapping or asynchronous inference during transfer.
+    artifact_effects: []const IntegrityEffect = &.{},
 
     pub fn jsonStringify(self: @This(), stream: anytype) !void {
         try @import("merge_page_wire.zig").write(self, stream);
@@ -171,9 +195,9 @@ pub const Progress = struct {
     /// private HTTP receipts. Parsing a typed struct is not admission proof.
     pub fn validate(self: Progress) !void {
         if ((self.version != 4 and self.version != 3 and self.version != (if (self.source.retention != null) @as(u8, 2) else @as(u8, 1))) or self.cursor.len > max_cursor_bytes) return error.InvalidMergePage;
-        if (self.snapshot_position) |position| if (self.version != 4 or self.source.retention == null or (self.phase != .rows and !(self.phase == .artifacts and self.source.integrity != null)) or position.offset < 4) return error.InvalidMergePage;
+        if (self.snapshot_position) |position| if (self.version != 4 or self.source.retention == null or (self.phase != .rows and !(self.phase == .artifacts and (self.source.integrity != null or self.source.artifact_catalog != null))) or position.offset < 4) return error.InvalidMergePage;
         if (self.assembly) |assembly| if ((self.version != 3 and self.version != 4) or assembly.next_offset == 0 or assembly.next_offset % chunk_bytes != 0 or
-            assembly.next_offset >= max_row_bytes or std.mem.allEqual(u8, &assembly.transfer_digest, 0) or (self.phase != .rows and self.phase != .tail)) return error.InvalidMergePage;
+            assembly.next_offset >= max_row_bytes or std.mem.allEqual(u8, &assembly.transfer_digest, 0) or (self.phase != .rows and self.phase != .tail and !(self.phase == .artifacts and self.source.artifact_catalog != null))) return error.InvalidMergePage;
         try self.source.validate();
         if (self.source.retention) |retention| {
             if (self.tail_sequence < retention.after_sequence or self.tail_offset > self.tail_total_effects or
@@ -222,6 +246,13 @@ pub fn commandDigest(request: anytype) Digest {
         hash.update(&buffer);
     }
     hash.update(&command.source.pin_digest);
+    if (command.source.artifact_catalog) |binding| {
+        bytes(&hash, "ordered-artifact-catalog-v1");
+        hashCount(&hash, binding.epoch);
+        hash.update(&binding.digest);
+        hash.update(&binding.semantic_digest);
+        hashCount(&hash, binding.effect_protocol);
+    }
     if (command.source.retention) |retention| {
         bytes(&hash, "retained-tail-v1");
         hashCount(&hash, retention.epoch);
@@ -258,7 +289,7 @@ pub fn commandDigest(request: anytype) Digest {
         },
     };
     if (command.chunk) |chunk| {
-        bytes(&hash, "row-chunk-v1");
+        bytes(&hash, if (chunk.payload == .row) "row-chunk-v1" else "vector-artifact-chunk-v1");
         bytes(&hash, chunk.row_key);
         hashCount(&hash, chunk.timestamp);
         hashCount(&hash, chunk.total_bytes);
@@ -298,6 +329,15 @@ pub fn commandDigest(request: anytype) Digest {
             if (effect.value) |value| bytes(&hash, value);
         }
     }
+    if (command.artifact_effects.len != 0) {
+        bytes(&hash, "direct-vector-effects-v1");
+        hashCount(&hash, command.artifact_effects.len);
+        for (command.artifact_effects) |effect| {
+            bytes(&hash, effect.key);
+            hash.update(&.{@intFromBool(effect.value != null)});
+            if (effect.value) |value| bytes(&hash, value);
+        }
+    }
     return hash.finalResult();
 }
 
@@ -320,15 +360,20 @@ pub fn RowChunks(comptime Request: type) type {
         row_digest: Digest,
         pub fn init(request: Request) !@This() {
             try validateRequest(request);
-            if (request.merge_page.?.chunk != null or request.merge_page.?.integrity.len != 0 or request.writes.len != 1 or request.deletes.len != 0 or request.merge_artifacts.len != 0 or
-                (request.merge_page.?.phase != .rows and request.merge_page.?.phase != .tail)) return error.InvalidMergePage;
-            if (request.writes[0].value.len > max_row_bytes) return error.TransactionTooLarge;
+            const vector = request.merge_page.?.artifact_effects.len != 0;
+            if (request.merge_page.?.chunk != null or request.merge_page.?.integrity.len != 0 or request.deletes.len != 0 or request.merge_artifacts.len != 0) return error.InvalidMergePage;
+            if (vector) {
+                if (request.writes.len != 0 or request.merge_page.?.artifact_effects.len != 1 or request.merge_page.?.artifact_effects[0].value == null) return error.InvalidMergePage;
+            } else if (request.writes.len != 1 or (request.merge_page.?.phase != .rows and request.merge_page.?.phase != .tail)) return error.InvalidMergePage;
+            const value = if (vector) request.merge_page.?.artifact_effects[0].value.? else request.writes[0].value;
+            if (value.len > max_row_bytes) return error.TransactionTooLarge;
             var digest: Digest = undefined;
-            std.crypto.hash.sha2.Sha256.hash(request.writes[0].value, &digest, .{});
+            std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
             return .{ .base = request, .row_digest = digest };
         }
         pub fn requestAt(self: @This(), offset: u64) !Request {
-            const row = self.base.writes[0];
+            const vector = self.base.merge_page.?.artifact_effects.len != 0;
+            const row: struct { key: []const u8, value: []const u8 } = if (vector) .{ .key = self.base.merge_page.?.artifact_effects[0].key, .value = self.base.merge_page.?.artifact_effects[0].value.? } else .{ .key = self.base.writes[0].key, .value = self.base.writes[0].value };
             if (offset >= row.value.len or offset % chunk_bytes != 0) return error.InvalidMergePage;
             const start: usize = @intCast(offset);
             const data = row.value[start..@min(row.value.len, start +| chunk_bytes)];
@@ -336,8 +381,9 @@ pub fn RowChunks(comptime Request: type) type {
             std.crypto.hash.sha2.Sha256.hash(data, &checksum, .{});
             var result = self.base;
             result.writes = &.{};
+            result.merge_page.?.artifact_effects = &.{};
             result.merge_page.?.timestamps = &.{};
-            result.merge_page.?.chunk = .{ .row_key = row.key, .timestamp = self.base.merge_page.?.timestamps[0], .total_bytes = row.value.len, .row_digest = self.row_digest, .offset = offset, .data = data, .chunk_digest = checksum };
+            result.merge_page.?.chunk = .{ .payload = if (vector) .artifact else .row, .row_key = row.key, .timestamp = if (vector) 0 else self.base.merge_page.?.timestamps[0], .total_bytes = row.value.len, .row_digest = self.row_digest, .offset = offset, .data = data, .chunk_digest = checksum };
             result.merge_page.?.digest = commandDigest(result);
             try validateRequest(result);
             return result;
@@ -346,7 +392,7 @@ pub fn RowChunks(comptime Request: type) type {
 }
 
 pub fn effectCount(request: anytype) usize {
-    return if (request.merge_page.?.chunk != null) 1 else request.writes.len + request.deletes.len + request.merge_artifacts.len + request.merge_page.?.integrity.len;
+    return if (request.merge_page.?.chunk != null) 1 else request.writes.len + request.deletes.len + request.merge_artifacts.len + request.merge_page.?.integrity.len + request.merge_page.?.artifact_effects.len;
 }
 
 /// Shape validation happens before row preparation; memory/CPU cost is bounded
@@ -362,11 +408,20 @@ pub fn validateRequest(request: anytype) !void {
         request.relational_index_maintenance != null or request.relational_repair)
         return error.InvalidMergePage;
     try command.source.validate();
-    if (command.next_snapshot_position) |position| if (command.source.retention == null or (command.phase != .rows and !(command.phase == .artifacts and command.source.integrity != null)) or position.offset < 4) return error.InvalidMergePage;
+    if (command.artifact_effects.len != 0 and !@import("online_vector_artifacts.zig").isEnabled()) return error.InvalidMergePage;
+    if (command.artifact_effects.len != 0 and (command.source.artifact_catalog == null or command.source.retention == null or
+        (command.phase != .artifacts and command.phase != .tail) or (if (command.chunk) |chunk| chunk.payload != .artifact else false) or request.merge_artifacts.len != 0)) return error.InvalidMergePage;
+    if (command.next_snapshot_position) |position| if (command.source.retention == null or (command.phase != .rows and !(command.phase == .artifacts and (command.source.integrity != null or command.source.artifact_catalog != null))) or position.offset < 4) return error.InvalidMergePage;
     if (command.integrity.len != 0 and (command.source.integrity == null or (command.phase != .cleanup_integrity and command.phase != .artifacts and command.phase != .tail) or request.merge_artifacts.len != 0 or command.chunk != null)) return error.InvalidMergePage;
     if (request.timestamp_ns != 0 or (command.chunk == null and command.timestamps.len != request.writes.len)) return error.InvalidMergePage;
     if (command.chunk) |chunk| {
-        if ((command.phase != .rows and command.phase != .tail) or request.deletes.len != 0 or request.merge_artifacts.len != 0 or
+        if (chunk.payload == .artifact) {
+            if (!@import("online_vector_artifacts.zig").isEnabled() or command.source.artifact_catalog == null or command.source.retention == null or
+                (command.phase != .artifacts and command.phase != .tail) or request.writes.len != 0 or chunk.timestamp != 0 or
+                !artifactKeyAllowed(command.source, chunk.row_key)) return error.InvalidMergePage;
+            if (command.phase == .artifacts and command.next_snapshot_position == null) return error.InvalidMergePage;
+        } else if (command.phase != .rows and command.phase != .tail) return error.InvalidMergePage;
+        if (request.deletes.len != 0 or request.merge_artifacts.len != 0 or
             command.timestamps.len != 0 or chunk.row_key.len == 0 or chunk.row_key.len > max_cursor_bytes or chunk.total_bytes == 0 or
             chunk.offset % chunk_bytes != 0 or chunk.offset >= chunk.total_bytes or chunk.data.len == 0 or chunk.data.len > chunk_bytes or
             chunk.data.len > chunk.total_bytes - chunk.offset or (!chunk.complete() and chunk.data.len != chunk_bytes)) return error.InvalidMergePage;
@@ -379,6 +434,14 @@ pub fn validateRequest(request: anytype) !void {
         if (request.writes.len != 0) {
             if (!chunk.complete() or request.writes.len != 1 or !std.mem.eql(u8, request.writes[0].key, chunk.row_key) or request.writes[0].value.len != chunk.total_bytes) return error.InvalidMergePage;
             std.crypto.hash.sha2.Sha256.hash(request.writes[0].value, &checksum, .{});
+            if (!std.mem.eql(u8, &checksum, &chunk.row_digest)) return error.InvalidMergePage;
+        }
+        if (command.artifact_effects.len != 0) {
+            if (chunk.payload != .artifact or !chunk.complete() or command.artifact_effects.len != 1) return error.InvalidMergePage;
+            const effect = command.artifact_effects[0];
+            const value = effect.value orelse return error.InvalidMergePage;
+            if (!std.mem.eql(u8, effect.key, chunk.row_key) or value.len != chunk.total_bytes) return error.InvalidMergePage;
+            std.crypto.hash.sha2.Sha256.hash(value, &checksum, .{});
             if (!std.mem.eql(u8, &checksum, &chunk.row_digest)) return error.InvalidMergePage;
         }
     }
@@ -406,6 +469,9 @@ pub fn validateRequest(request: anytype) !void {
     };
     var size: usize = 0;
     var previous = command.after;
+    if (command.chunk) |chunk| if (chunk.payload == .artifact and command.phase == .artifacts) {
+        previous = "";
+    };
     if (command.chunk) |chunk| if (request.writes.len == 0) try ordered(&previous, chunk.row_key);
     for (request.writes) |row| {
         try ordered(&previous, row.key);
@@ -420,7 +486,10 @@ pub fn validateRequest(request: anytype) !void {
         try ordered(&previous, row.key);
         size +|= row.key.len +| row.value.len;
     }
-    if (command.phase == .tail) previous = "";
+    // Certified portable objects are ordered individually, not globally by
+    // their storage keys. The receipt still verifies the exact prior cursor
+    // and strictly advancing object position.
+    if (command.phase == .tail or (command.phase == .artifacts and command.next_snapshot_position != null)) previous = "";
     const integrity_contract = @import("relational_integrity_contract.zig");
     for (command.integrity) |effect| {
         try ordered(&previous, effect.key);
@@ -430,6 +499,16 @@ pub fn validateRequest(request: anytype) !void {
             _ = integrity_contract.validateTransferRecord(effect.key, value) catch return error.InvalidMergePage;
             size +|= value.len;
         } else if (command.phase != .tail and command.phase != .cleanup_integrity) return error.InvalidMergePage;
+        size +|= effect.key.len;
+    }
+    if (command.artifact_effects.len != 0) {
+        if (command.phase == .artifacts and command.next_snapshot_position == null) return error.InvalidMergePage;
+        previous = "";
+    }
+    for (command.artifact_effects) |effect| {
+        try ordered(&previous, effect.key);
+        try validateArtifactEffect(command.source, effect.key, effect.value);
+        if (effect.value) |value| size +|= value.len else if (command.phase != .tail) return error.InvalidMergePage;
         size +|= effect.key.len;
     }
     if (count > 1 and size > max_bytes) return error.InvalidMergePage;
@@ -445,7 +524,7 @@ pub fn validateRequest(request: anytype) !void {
                 .eq => return error.InvalidMergePage,
             }
         }
-    } else if (count != 0 and !std.mem.eql(u8, previous, command.next)) return error.InvalidMergePage;
+    } else if (count != 0 and !std.mem.eql(u8, if (command.chunk) |chunk| chunk.row_key else previous, command.next)) return error.InvalidMergePage;
     if (!std.mem.eql(u8, &command.digest, &commandDigest(request))) return error.InvalidMergePage;
 }
 
@@ -461,8 +540,9 @@ pub const CheckpointPlan = union(enum) { unchanged, clear, bind: Progress };
 /// Shared native/projection control fold. A replayed begin cannot reset the
 /// cursor; a newer attempt must restart cleanup and bind its own source pin.
 pub fn checkpointPlan(prior: anytype, next: anytype, checkpoint: anytype, progress: ?Progress) !CheckpointPlan {
+    try @import("merge_artifact_catalog.zig").validateCheckpoint(checkpoint);
     if ((checkpoint.page_source != null) != (checkpoint.page_receiver_namespace != null) or
-        (checkpoint.page_source != null and checkpoint.kind != .begin_copy and !(checkpoint.kind == .accept and checkpoint.page_source.?.integrity != null))) return error.InvalidMergeCheckpoint;
+        (checkpoint.page_source != null and checkpoint.kind != .begin_copy and !(checkpoint.kind == .accept and (checkpoint.page_source.?.integrity != null or checkpoint.page_source.?.artifact_catalog != null)))) return error.InvalidMergeCheckpoint;
     const current = next.transition_id == checkpoint.transition_id and next.copy_attempt.order(checkpoint.copy_attempt) == .eq;
     const matching = if (progress) |value| value.transition_id == checkpoint.transition_id and
         value.donor_group_id == checkpoint.donor_group_id and value.receiver_group_id == checkpoint.receiver_group_id and
@@ -492,7 +572,12 @@ pub fn checkpointPlan(prior: anytype, next: anytype, checkpoint: anytype, progre
 
 pub fn validateRange(alloc: std.mem.Allocator, state: anytype, request: anytype) !void {
     const merged = state.merged_range orelse return error.InvalidMergeState;
-    if (request.merge_page.?.chunk) |chunk| if (!merged.contains(chunk.row_key) or state.receiver_base_range.contains(chunk.row_key)) return error.KeyOutOfRange;
+    if (request.merge_page.?.chunk) |chunk| {
+        const owned = if (chunk.payload == .artifact) (try @import("../internal_keys.zig").decodeDocumentComponentAlloc(alloc, chunk.row_key)) orelse return error.InvalidMergePage else null;
+        defer if (owned) |key_bytes| alloc.free(key_bytes);
+        const owner = owned orelse chunk.row_key;
+        if (!merged.contains(owner) or state.receiver_base_range.contains(owner)) return error.KeyOutOfRange;
+    }
     for (request.writes) |row| if (!merged.contains(row.key) or state.receiver_base_range.contains(row.key)) return error.KeyOutOfRange;
     for (request.deletes) |row| if (!merged.contains(row) or state.receiver_base_range.contains(row)) return error.KeyOutOfRange;
     for (request.merge_artifacts) |row| {
@@ -503,6 +588,11 @@ pub fn validateRange(alloc: std.mem.Allocator, state: anytype, request: anytype)
     for (request.merge_page.?.integrity) |effect| {
         const parsed = try @import("relational_integrity_contract.zig").parseKey(effect.key);
         if (!merged.contains(&parsed.address.routing) or state.receiver_base_range.contains(&parsed.address.routing)) return error.KeyOutOfRange;
+    }
+    for (request.merge_page.?.artifact_effects) |effect| {
+        const owner = (try @import("../internal_keys.zig").decodeDocumentComponentAlloc(alloc, effect.key)) orelse return error.InvalidMergePage;
+        defer alloc.free(owner);
+        if (!merged.contains(owner) or state.receiver_base_range.contains(owner)) return error.KeyOutOfRange;
     }
 }
 

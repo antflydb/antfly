@@ -191,11 +191,13 @@ pub const LookupInput = struct {
 };
 
 fn validateHandoffReceiptLookup(input: LookupInput, request: operation.RequestContext) Error!void {
+    const identity = std.mem.eql(u8, input.options.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}");
     const hidden_scoped = input.options.restore_staging_scope != null and input.options.restore_staging_plan_id != null and request.catalog_route_fence_json.len == 0;
     const published_routed = input.options.restore_staging_scope == null and input.options.restore_staging_plan_id == null and request.catalog_route_fence_json.len != 0;
-    if (!std.mem.eql(u8, input.options.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
-        (!hidden_scoped and !published_routed) or
+    if ((!identity and !std.mem.eql(u8, input.options.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}")) or
+        (!hidden_scoped and (!published_routed or identity)) or
         input.key.len != 0 or input.consistency != .read_index or
+        input.options.generation_handoff_install_read_index_certified or
         input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
         input.options.relational_integrity_jobs_json.len != 0 or input.options.relational_index_status_json.len != 0 or
         input.options.relational_activation_json.len != 0 or input.options.fields.len != 0)
@@ -227,6 +229,38 @@ test "hidden generation handoff receipt requires exact scoped read-index request
     invalid.options.restore_staging_plan_id = null;
     try validateHandoffReceiptLookup(invalid, .{ .catalog_route_fence_json = "{}" });
     try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+}
+
+test "hidden generation handoff identity requires exact scoped read-index request" {
+    const input: LookupInput = .{ .group_id = 7, .table_name = "hidden", .key = "", .options = .{
+        .relational_topology_json = "{\"mode\":\"generation_handoff_identity\"}",
+        .restore_staging_scope = @splat(1),
+        .restore_staging_plan_id = @splat(2),
+    } };
+    try validateHandoffReceiptLookup(input, .{});
+    var invalid = input;
+    invalid.options.restore_staging_scope = null;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.options.restore_staging_plan_id = null;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.consistency = .stale;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.key = "row";
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.options.relational_integrity_catalog = true;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    invalid = input;
+    invalid.options.generation_handoff_install_read_index_certified = true;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{}));
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(input, .{ .catalog_route_fence_json = "{}" }));
+    invalid = input;
+    invalid.options.restore_staging_scope = null;
+    invalid.options.restore_staging_plan_id = null;
+    try std.testing.expectError(error.InvalidArgument, validateHandoffReceiptLookup(invalid, .{ .catalog_route_fence_json = "{}" }));
 }
 
 pub const Operations = struct {
@@ -1012,7 +1046,7 @@ pub const Operations = struct {
                 if (scoped.value.scope.fence.owner_group_id != input.group_id or input.consistency != .read_index or
                     input.key.len != 0 or input.options.restore_staging_scope != null) return error.InvalidArgument;
             };
-            if (probe.value.mode) |mode| if (std.mem.eql(u8, mode, "generation_handoff_install")) {
+            if (probe.value.mode) |mode| if (std.mem.eql(u8, mode, "generation_handoff_install") or std.mem.eql(u8, mode, "generation_handoff_identity")) {
                 // This private receipt is looked up after cutover, when the
                 // fresh hidden owner intentionally has no public route fence.
                 // Do not generalize the exception to other hidden reads.

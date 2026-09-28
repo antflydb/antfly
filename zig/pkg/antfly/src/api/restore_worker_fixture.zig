@@ -92,6 +92,8 @@ const Fixture = struct {
     root: []const u8 = "",
     tail_injected: bool = false,
     facts_alloc: ?std.mem.Allocator = null,
+    destination_handoff_writes: usize = 0,
+    destination_handoff_identity_reads: usize = 0,
 
     fn printValidationTimings(self: *@This()) void {
         const t = &self.validation_timings;
@@ -116,13 +118,46 @@ const Fixture = struct {
         try std.testing.expect(original.core.identity_namespace.eql(request.scope.fence.namespace));
         // Deterministic manual executor: materialize the same production pin,
         // without introducing an asynchronous worker into this failure fixture.
-        if (request.operation == .publication) return std.json.Stringify.valueAlloc(alloc, try original.prepareOnlineSourcePublication(request.scope, context.cancellation), .{});
+        if (request.operation == .publication) {
+            const publication = try original.prepareOnlineSourcePublication(request.scope, context.cancellation);
+            return std.json.Stringify.valueAlloc(alloc, publication, .{});
+        }
         var input = request;
         if (self.non_raft and input.operation == .admission) input.scope.authority = .native;
         return @import("../storage/db/online_merge_io.zig").executeJson(original, alloc, input, context.cancellation);
     }
+    fn destinationIndex(self: *@This(), name: []const u8, scope: ?[32]u8, plan_id: ?[16]u8, group: ?u64) !usize {
+        const i = try index(name);
+        if (!self.target_open[i]) return error.RestoreStagingScopeChanged;
+        const expected = self.scopes[i];
+        if (!std.mem.eql(u8, &(scope orelse return error.RestoreStagingScopeChanged), &expected.digest()) or
+            !std.mem.eql(u8, &(plan_id orelse return error.RestoreStagingScopeChanged), &expected.plan_id) or
+            !expected.target_namespace.eql(self.dbs[i].core.identity_namespace)) return error.RestoreStagingScopeChanged;
+        if (group) |value| if (value != expected.target_namespace.shard_id) return error.RestoreStagingScopeChanged;
+        return i;
+    }
     fn sourceBatch(ptr: *anyopaque, _: std.mem.Allocator, name: []const u8, request: db.types.BatchRequest) !?void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (request.restore_staging_scope != null or request.restore_staging_plan_id != null) {
+            const command = request.relational_topology orelse return error.UnexpectedCall;
+            const i = try self.destinationIndex(name, request.restore_staging_scope, request.restore_staging_plan_id, command.fence.owner_group_id);
+            if (command.action != .install_generation_handoff or command.fence.role != .rewrite_destination or
+                !command.fence.namespace.eql(self.scopes[i].target_namespace)) return error.RestoreStagingScopeChanged;
+            // The logical name is shared by old and hidden generations. Only
+            // the exact staging authority may select the hidden owner.
+            try std.testing.expectError(error.RestoreStagingScopeChanged, self.destinationIndex(name, null, request.restore_staging_plan_id, command.fence.owner_group_id));
+            try std.testing.expectError(error.RestoreStagingScopeChanged, self.destinationIndex(name, request.restore_staging_scope, @as([16]u8, @splat(0)), command.fence.owner_group_id));
+            try std.testing.expectError(error.RestoreStagingScopeChanged, self.destinationIndex(name, request.restore_staging_scope, request.restore_staging_plan_id, 20 + i));
+            const donor_marker = try self.donors[i].raftAppliedEntry();
+            var apply: Apply = .{ .fixture = self, .index = i };
+            try Apply.propose(&apply, request, .{});
+            try std.testing.expect(std.meta.eql(donor_marker, try self.donors[i].raftAppliedEntry()));
+            var read = try self.donors[i].core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect((try @import("../storage/db/empty_generation_handoff.zig").loadInstallReceipt(&read)) == null);
+            self.destination_handoff_writes += 1;
+            return {};
+        }
         const i = try index(name);
         self.donor_indices[i] += 1;
         if (self.non_raft) try self.donors[i].batch(request) else try self.donors[i].batchRaftReplicatedApply(request, .{ .index = self.donor_indices[i], .term = 1 });
@@ -130,7 +165,30 @@ const Fixture = struct {
     }
     fn sourceLookup(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, key: []const u8, opts: db.types.LookupOptions, _: read_gate.ReadConsistency) !?reads.LookupResponse {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const result = (try self.donors[try index(name)].lookup(alloc, key, opts)) orelse return null;
+        const original = self.donors[try index(name)];
+        const result = (try original.lookup(alloc, key, opts)) orelse return null;
+        return .{ .json = result.json, .version = 0 };
+    }
+    fn destinationLookup(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, name: []const u8, key: []const u8, opts: db.types.LookupOptions, consistency: read_gate.ReadConsistency) !?reads.LookupResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try std.testing.expectEqual(read_gate.ReadConsistency.read_index, consistency);
+        const i = try self.destinationIndex(name, opts.restore_staging_scope, opts.restore_staging_plan_id, group);
+        const identity = std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}");
+        if (!identity and !std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}")) return error.UnexpectedCall;
+        try std.testing.expectEqual(@as(usize, 0), key.len);
+        if (identity) {
+            self.destination_handoff_identity_reads += 1;
+            var invalid = opts;
+            invalid.restore_staging_scope = @splat(0);
+            try std.testing.expectError(error.RestoreStagingScopeChanged, self.dbs[i].lookup(alloc, key, invalid));
+            invalid = opts;
+            invalid.restore_staging_plan_id = null;
+            try std.testing.expectError(error.RestoreStagingScopeChanged, self.dbs[i].lookup(alloc, key, invalid));
+            invalid = opts;
+            invalid.restore_staging_plan_id = @splat(0);
+            try std.testing.expectError(error.RestoreStagingScopeChanged, self.dbs[i].lookup(alloc, key, invalid));
+        }
+        const result = (try self.dbs[i].lookup(alloc, key, opts)) orelse return null;
         return .{ .json = result.json, .version = 0 };
     }
     pub fn readFacts(self: *Fixture, name: []const u8, request: @import("online_merge_io.zig").contract.Request) !@import("online_merge_io.zig").contract.AdmissionFacts {
@@ -451,13 +509,15 @@ const RewritePersistence = struct {
 /// reopen targets; acknowledged writes after the source cut must still appear.
 pub fn runRewrite(comptime Driver: type) !void {
     for ([_]bool{ false, true }) |non_raft| {
-        try runRewriteWithFailure(Driver, false, non_raft, false);
-        try runRewriteWithFailure(Driver, true, non_raft, false);
-        try runRewriteWithFailure(Driver, false, non_raft, true);
+        try runRewriteWithFailure(Driver, false, non_raft, false, false);
+        try runRewriteWithFailure(Driver, true, non_raft, false, false);
+        try runRewriteWithFailure(Driver, false, non_raft, true, false);
     }
+    try runRewriteWithFailure(Driver, false, true, true, true);
 }
 
-fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bool, empty_generation: bool) !void {
+fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bool, empty_generation: bool, unavailable_authority: bool) !void {
+    const unsupported_native_empty = unavailable_authority;
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -494,7 +554,7 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
     var node_config = try Driver.nodeConfig(alloc);
     defer node_config.deinit();
     fixture.node_config = &node_config;
-    var server = http.ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .backend_runtime = &api_runtime, .node_config = &node_config, .online_merge_io = .{ .ptr = &fixture, .execute_fn = Fixture.sourceIo }, .restore_owner = .{ .ptr = &fixture, .execute_fn = Fixture.owner }, .restore_validation = .{ .status = source, .factory = .{ .ptr = &fixture, .bind = Fixture.bind } } }, source, .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.sourceLookup, .scan = Fixture.scan, .query = Fixture.query } }, .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.sourceBatch } });
+    var server = http.ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .backend_runtime = &api_runtime, .node_config = &node_config, .online_merge_io = .{ .ptr = &fixture, .execute_fn = Fixture.sourceIo }, .restore_owner = .{ .ptr = &fixture, .execute_fn = Fixture.owner }, .restore_validation = .{ .status = source, .factory = .{ .ptr = &fixture, .bind = Fixture.bind } } }, source, .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.sourceLookup, .lookup_group_local = Fixture.destinationLookup, .scan = Fixture.scan, .query = Fixture.query } }, .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.sourceBatch } });
     defer server.deinit();
     server.restore_job_store.deinit();
     server.restore_job_store = restore_jobs.Store.initWithIo(alloc, std.testing.io);
@@ -521,6 +581,8 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
         donors_open += 1;
         const schema = if (i == 2) "{}" else old_schema;
         try original.setSchemaJson(alloc, schema);
+        const source_identity = try original.relationalTopologyIdentity();
+        try std.testing.expectEqual(@as(@TypeOf(source_identity.generation_handoff_receipt_authority), if (non_raft) .native else .raft), source_identity.generation_handoff_receipt_authority);
         const initial: db.types.BatchRequest = .{ .timestamp_ns = 123, .writes = &.{ .{ .key = "row", .value = "{\"id\":1,\"x\":2}" }, .{ .key = "removed", .value = "{\"id\":3,\"x\":4}" } } };
         if (non_raft) try original.batch(initial) else try original.batchRaftReplicatedApply(initial, .{ .index = 1, .term = 1 });
         // v1 rows remain physically present but no active/read definition
@@ -579,6 +641,16 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
         plan.cohort_digest = @splat(7);
         try plan.validate(a);
     }
+    // Capture the authenticated plan first. This negative case models an
+    // already-admitted plan encountering a root whose authority is missing
+    // on recovery, not an unauthenticated source-facts request.
+    if (unavailable_authority) for (fixture.donors) |original| {
+        var txn = try original.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(@import("../storage/source_authority.zig").key);
+        try txn.commit();
+        try std.testing.expectEqual(.unsupported, (try original.relationalTopologyIdentity()).generation_handoff_receipt_authority);
+    };
     const plan_json = try std.json.Stringify.valueAlloc(a, plan, .{});
     const source_operations_before_execution = fixture.source_operations;
     _ = try server.restore_job_store.start(a, .{ .scope = .cluster, .source_kind = if (empty_generation) .empty_generation else .schema_rewrite, .backup_id = "rewrite", .location = "metadata://rewrite", .connection = "internal", .restore_mode = "overwrite", .idempotency_namespace = "rewrite-worker", .idempotency_key = "one", .table_names = &.{ "parent", "child", "docs" }, .destination_authorization_principal = @import("stored_destination_authorization.zig").auth_disabled_principal, .rewrite_plan_json = if (empty_generation) null else plan_json, .generation_plan_json = if (empty_generation) plan_json else null });
@@ -587,7 +659,7 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
         const bytes = (try server.restore_job_store.load(a, job_id)).?;
         const state = try std.json.parseFromSlice(restore_jobs.JobState, a, bytes, .{});
         if (state.value.phase == .succeeded) {
-            try std.testing.expect(!invalid_tail);
+            try std.testing.expect(!invalid_tail and !unsupported_native_empty);
             const result = try std.json.parseFromSlice(std.json.Value, a, state.value.result_json orelse return error.MissingRestoreResult, .{});
             try std.testing.expectEqualStrings("completed", result.value.object.get("status").?.string);
             try std.testing.expectEqual(@as(i64, 3), result.value.object.get("committed_table_count").?.integer);
@@ -596,11 +668,12 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
             break;
         }
         if (state.value.phase == .failed) {
-            if (!invalid_tail) {
+            if (!invalid_tail and !unsupported_native_empty) {
                 std.debug.print("rewrite worker failed: {s}\n", .{bytes});
                 return error.RewriteWorkerFailed;
             }
             try std.testing.expectEqual(restore_jobs.StagingResolution.canceled, state.value.staging_resolution);
+            if (unsupported_native_empty) try std.testing.expectEqualStrings("UnsupportedEmptyGenerationAuthority", state.value.staging_failure);
             break;
         }
     } else {
@@ -608,12 +681,37 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
         return error.RewriteWorkerDidNotComplete;
     }
     try std.testing.expectEqual(!empty_generation, fixture.tail_injected);
+    try std.testing.expectEqual(@as(usize, if (empty_generation and !unsupported_native_empty) 3 else 0), fixture.destination_handoff_writes);
+    try std.testing.expectEqual(empty_generation, fixture.destination_handoff_identity_reads != 0);
     if (non_raft) {
         for (fixture.donors) |donor| try std.testing.expect((try donor.raftAppliedEntry()) == null);
         for (fixture.dbs, fixture.target_open) |target, opened| if (opened) try std.testing.expect((try target.raftAppliedEntry()) == null);
     }
     var published = (try source.adminSnapshot()).?;
     defer source.freeAdminSnapshot(&published);
+    if (unsupported_native_empty) {
+        // Recover an already admitted unsupported plan through cancellation,
+        // never through a fabricated Raft receipt or an endless retry.
+        for (published.tables) |record| try std.testing.expect(record.table_id >= 10 and record.table_id <= 12);
+        for (fixture.donors) |original| {
+            try std.testing.expect((try original.relationalTopologyStatus()).fence == null);
+            for ([_][]const u8{ "row", "removed" }) |key| {
+                const row = (try original.lookup(alloc, key, .{})).?;
+                defer alloc.free(row.json);
+                try std.testing.expectEqual(@as(?u64, 123), try original.getTimestamp(alloc, key));
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row.json, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqual(@as(i64, if (std.mem.eql(u8, key, "row")) 2 else 4), parsed.value.object.get("x").?.integer);
+            }
+        }
+        for (fixture.dbs, fixture.target_open) |target, opened| if (opened) {
+            try std.testing.expect((try target.relationalTopologyStatus()).fence == null);
+            var state = (try target.restoreStagingStatus(alloc)).?;
+            defer state.deinit();
+            try std.testing.expectEqual(.canceled, state.value.phase);
+        };
+        return;
+    }
     if (invalid_tail) {
         // Target overflow is terminal only for the immutable rewrite. All old
         // names/identities and acknowledged source mutations remain live.

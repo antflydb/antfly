@@ -190,6 +190,20 @@ fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlob
     };
 }
 
+test "direct public transaction routes exclude connection-owned sessions" {
+    const empty: transactions_api.SessionDetails = .{
+        .status = undefined,
+        .tables = &.{},
+        .read_snapshots = &.{},
+        .savepoint_ids = &.{},
+    };
+    try std.testing.expect(ApiHttpServer.directTransactionRouteEligible(empty, false));
+    var attached = empty;
+    attached.connection_id = @splat('a');
+    try std.testing.expect(!ApiHttpServer.directTransactionRouteEligible(attached, false));
+    try std.testing.expect(ApiHttpServer.directTransactionRouteEligible(attached, true));
+}
+
 test "global query requires a non-empty table name" {
     try std.testing.expectError(
         error.InvalidQueryRequest,
@@ -635,8 +649,8 @@ fn waitForGraphRetirementSeal(
     if (!intent.eql(scope)) return error.RestoreStagingScopeChanged;
     if (parsed.value.receipt) |receipt| {
         const expected_digest = try scope.sealDigest();
-        if (receipt.applied_term == 0 or receipt.applied_index == 0 or
-            !std.mem.eql(u8, &receipt.digest, &expected_digest)) return error.RestoreStagingScopeChanged;
+        try (try receipt.position()).requireNamespace(scope.fence.namespace);
+        if (!std.mem.eql(u8, &receipt.digest, &expected_digest)) return error.RestoreStagingScopeChanged;
         const encoded = try scope.encode();
         var scope_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(&encoded, &scope_digest, .{});
@@ -649,6 +663,105 @@ fn waitForGraphRetirementSeal(
     return error.RestoreStagingWait;
 }
 
+fn requireGenerationHandoffReceiptAuthority(
+    alloc: std.mem.Allocator,
+    reads: table_reads.TableReadSource,
+    table_name: []const u8,
+    range_key: []const u8,
+    namespace: @import("../storage/db/doc_identity.zig").Namespace,
+    group: ?u64,
+    scope: ?[32]u8,
+    plan_id: ?[16]u8,
+    context: api_operation.RequestContext,
+    irreversible: bool,
+) !void {
+    const options: db_mod.types.LookupOptions = .{
+        .relational_topology_json = if (group != null) "{\"mode\":\"generation_handoff_identity\"}" else "{\"mode\":\"identity\"}",
+        .restore_staging_scope = scope,
+        .restore_staging_plan_id = plan_id,
+        .execution_deadline_ns = (try context.platformDeadline()).deadline_ns,
+        .cancellation = context.cancellation,
+    };
+    var response = (if (group) |id|
+        try reads.lookupGroupLocal(alloc, id, table_name, "", options, .read_index)
+    else
+        try reads.lookup(alloc, table_name, range_key, options, .read_index)) orelse return error.RestoreStagingWait;
+    defer response.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(@import("../storage/db/relational_integrity_topology_contract.zig").Identity, alloc, response.json, .{});
+    defer parsed.deinit();
+    if (!parsed.value.namespace.eql(namespace)) return error.RestoreStagingScopeChanged;
+    parsed.value.requireGenerationHandoffReceipts() catch |err| {
+        // A pre-cutover failure can use durable cancellation. Once a seal may
+        // exist, retain every fence and report a recovery capability failure;
+        // never turn missing authority into permission to roll back.
+        if (irreversible and err == error.UnsupportedEmptyGenerationAuthority) return error.UnsupportedEmptyGenerationRecoveryAuthority;
+        return err;
+    };
+}
+
+test "staged restore native handoff capability fails closed without authorizing irreversible cancellation" {
+    const Identity = @import("../storage/db/relational_integrity_topology_contract.zig").Identity;
+    const Mock = struct {
+        identity: Identity,
+        fn lookup(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8, options: db_mod.types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?table_reads.LookupResponse {
+            const mock: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@import("../raft/read_gate.zig").ReadConsistency.read_index, consistency);
+            try std.testing.expectEqualStrings("{\"mode\":\"identity\"}", options.relational_topology_json);
+            return .{ .json = try std.json.Stringify.valueAlloc(alloc, mock.identity, .{}), .version = 0 };
+        }
+        fn lookupGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, _: []const u8, key: []const u8, options: db_mod.types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?table_reads.LookupResponse {
+            const mock: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 2), group);
+            try std.testing.expectEqualStrings("", key);
+            try std.testing.expectEqual(@import("../raft/read_gate.zig").ReadConsistency.read_index, consistency);
+            try std.testing.expectEqualStrings("{\"mode\":\"generation_handoff_identity\"}", options.relational_topology_json);
+            try std.testing.expectEqual(@as([32]u8, @splat(1)), options.restore_staging_scope.?);
+            try std.testing.expectEqual(@as([16]u8, @splat(2)), options.restore_staging_plan_id.?);
+            return .{ .json = try std.json.Stringify.valueAlloc(alloc, mock.identity, .{}), .version = 0 };
+        }
+    };
+    var mock: Mock = .{ .identity = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .catalog_digest = @splat(4), .next_epoch = 1 } };
+    const reads: table_reads.TableReadSource = .{ .ptr = &mock, .vtable = &.{ .lookup = Mock.lookup, .lookup_group_local = Mock.lookupGroup, .scan = undefined, .query = undefined } };
+    try std.testing.expectError(error.UnsupportedEmptyGenerationAuthority, requireGenerationHandoffReceiptAuthority(std.testing.allocator, reads, "table", "", mock.identity.namespace, null, null, null, .{}, false));
+    try std.testing.expect(ApiHttpServer.permanentStagingFailure(error.UnsupportedEmptyGenerationAuthority));
+    try std.testing.expectError(error.UnsupportedEmptyGenerationRecoveryAuthority, requireGenerationHandoffReceiptAuthority(std.testing.allocator, reads, "table", "", mock.identity.namespace, null, null, null, .{}, true));
+    try std.testing.expect(!ApiHttpServer.permanentStagingFailure(error.UnsupportedEmptyGenerationRecoveryAuthority));
+    mock.identity.generation_handoff_receipt_authority = .raft;
+    try requireGenerationHandoffReceiptAuthority(std.testing.allocator, reads, "table", "", mock.identity.namespace, null, null, null, .{}, false);
+    try requireGenerationHandoffReceiptAuthority(std.testing.allocator, reads, "table", "non-first-range-start", mock.identity.namespace, 2, @splat(1), @splat(2), .{}, false);
+}
+
+test "staged restore native handoff parent dispatch preserves exact owner authority" {
+    const parent = @import("restore_parent_activation.zig");
+    const Mock = struct {
+        calls: usize = 0,
+        authorized: bool = false,
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, group: u64, input: parent.Request, _: api_operation.RequestContext) !parent.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("parent", table);
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqual(@as([16]u8, @splat(1)), input.plan_id);
+            self.calls += 1;
+            if (!self.authorized) return error.RestoreActivationDecisionMissing;
+            return .{ .receipt = @splat(4) };
+        }
+    };
+    var mock: Mock = .{};
+    // The native branch must not inspect public placement routing. Only its
+    // configured receiver and request context are usable in this fixture.
+    var server: ApiHttpServer = undefined;
+    server.cfg = .{ .deployment_mode = .standalone };
+    const input: parent.Request = .{ .plan_id = @splat(1), .fence = .{ .role = .truncate_parent, .transition_id = 1, .attempt = 1, .admission_epoch = 1, .owner_group_id = 7, .peer_group_id = 8, .namespace = .{ .table_id = 3, .shard_id = 7, .range_id = 7 }, .catalog_digest = @splat(3) } };
+    try std.testing.expectError(error.RestoreValidationPending, server.executeRestoreParentActivation(std.testing.allocator, "parent", 7, input, .{}));
+    server.cfg.restore_parent_activation = .{ .ptr = &mock, .execute_fn = Mock.execute };
+    try std.testing.expectError(error.RestoreActivationDecisionMissing, server.executeRestoreParentActivation(std.testing.allocator, "parent", 7, input, .{}));
+    try std.testing.expectError(error.InvalidRestoreStaging, server.executeRestoreParentActivation(std.testing.allocator, "parent", 9, input, .{}));
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
+    mock.authorized = true;
+    try std.testing.expectEqual(@as([32]u8, @splat(4)), (try server.executeRestoreParentActivation(std.testing.allocator, "parent", 7, input, .{})).receipt);
+    try std.testing.expectEqual(@as(usize, 2), mock.calls);
+}
+
 fn readGenerationHandoffPreflight(
     alloc: std.mem.Allocator,
     reads: table_reads.TableReadSource,
@@ -658,9 +771,10 @@ fn readGenerationHandoffPreflight(
     plan_id: [16]u8,
     plan_digest: [32]u8,
     handoff: @import("../metadata/restore_staging.zig").GenerationHandoffRange,
+    context: api_operation.RequestContext,
 ) ![32]u8 {
     const stages = @import("../metadata/restore_staging.zig");
-    var response = (try reads.topologyStatus(alloc, table_name, range_key, "{\"mode\":\"generation_handoff_summary\"}")) orelse return error.RestoreStagingWait;
+    var response = (try reads.lookup(alloc, table_name, range_key, .{ .relational_topology_json = "{\"mode\":\"generation_handoff_summary\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.RestoreStagingWait;
     defer response.deinit(alloc);
     var parsed = try std.json.parseFromSlice(@import("../storage/db/empty_generation_handoff.zig").Summary, alloc, response.json, .{ .allocate = .alloc_always });
     defer parsed.deinit();
@@ -699,7 +813,8 @@ fn waitForGenerationHandoffSeal(
         !std.mem.eql(u8, &intent.plan_digest, &plan_digest)) return error.RestoreStagingScopeChanged;
     const logical = try stages.generationHandoffSealDigest(fence, plan_digest, handoff);
     if (summary.seal) |sealed| {
-        if (!sealed.fence.eql(fence) or sealed.term == 0 or sealed.index == 0 or
+        _ = try sealed.position();
+        if (!sealed.fence.eql(fence) or
             !std.mem.eql(u8, &sealed.seal.plan_digest, &plan_digest) or
             !std.mem.eql(u8, &sealed.seal.admissions_digest, &handoff.admissions_digest) or
             !std.mem.eql(u8, &sealed.seal.retired_digest, &handoff.retired_digest) or
@@ -1545,6 +1660,10 @@ pub const ApiHttpServerConfig = struct {
     ard_public_catalog_enabled: bool = false,
     trusted_principal_secret: ?[]const u8 = null,
     trusted_principal_issuer: ?[]const u8 = null,
+    /// Local/standalone sources may authorize publication without an HTTP
+    /// grant. Distributed runtimes explicitly clear this when their distinct
+    /// trusted authority is unconfigured; internal RPC identity is not a substitute.
+    catalog_publication_authority_available: bool = true,
     /// Dedicated node-to-node signing identity. Distributed runtimes validate
     /// both values before opening a listener; they must never share the public
     /// trusted-principal signing domain.
@@ -1660,7 +1779,39 @@ pub const ApiHttpServerConfig = struct {
     /// Optional node-wide resource owner. The owner must outlive ApiHttpServer.
     /// Cache budgets and concurrency are intentionally not HTTP/API config.
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+
+    pub fn configureRemoteCatalogPublicationAuthority(self: *ApiHttpServerConfig) void {
+        self.catalog_publication_authority_available = false;
+        const secret = self.trusted_principal_secret orelse return;
+        const issuer = self.trusted_principal_issuer orelse return;
+        self.catalog_publication_authority_available = secret.len > 0 and issuer.len > 0;
+    }
 };
+
+test "unconfigured remote catalog authority skips background work without borrowing internal credentials" {
+    var cfg: ApiHttpServerConfig = .{};
+    try std.testing.expect(cfg.catalog_publication_authority_available);
+    cfg.internal_service_secret = "internal-only";
+    cfg.internal_service_issuer = "cluster";
+    cfg.configureRemoteCatalogPublicationAuthority();
+    try std.testing.expect(!cfg.catalog_publication_authority_available);
+    // No source is initialized: these configured-unavailable paths must
+    // return before attempting even a no-work metadata read.
+    var server: ApiHttpServer = undefined;
+    server.cfg = cfg;
+    try server.advanceFkGenerationPublicationBackgroundOnce();
+    try server.advanceFkInitialCreateBackgroundOnce();
+    try server.advanceRowPolicyPublicationOnce();
+    cfg.trusted_principal_secret = "distinct-public-authority";
+    cfg.configureRemoteCatalogPublicationAuthority();
+    try std.testing.expect(!cfg.catalog_publication_authority_available);
+    cfg.trusted_principal_issuer = "cluster";
+    cfg.configureRemoteCatalogPublicationAuthority();
+    try std.testing.expect(cfg.catalog_publication_authority_available);
+    cfg.trusted_principal_secret = "";
+    cfg.configureRemoteCatalogPublicationAuthority();
+    try std.testing.expect(!cfg.catalog_publication_authority_available);
+}
 
 pub const RaftQuarantineAdminSource = struct {
     ptr: *anyopaque,
@@ -3274,65 +3425,6 @@ const MetadataMutationRetryPolicy = struct {
     }
 };
 
-fn requireFkGenerationPublicActivation(plan: @import("../metadata/fk_generation_publication.zig").Plan) !void {
-    for (plan.parents) |parent| if (parent.table.table_id == plan.child_before.table_id)
-        return error.ForeignKeySelfPublicationNotActivated;
-}
-
-/// Reject a guarded dual-role publication from the already-authorized schema
-/// images, before the plan builder asks an owner for its integrity catalog.
-/// A newly created table may be committed in metadata while its owner is still
-/// converging; that transient owner state must not turn a deterministic 0A000
-/// capability decision into an internal 500. Existing self-FKs are included so
-/// DROP cannot bypass the same public activation gate.
-fn requireSelfFkPublicationActivatedFromSchemas(alloc: std.mem.Allocator, table_name: []const u8, before_json: []const u8, after_json: []const u8) !void {
-    const schema = @import("../schema/mod.zig");
-    var before = try schema.parseValidatedTableSchema(alloc, before_json);
-    defer before.deinit(alloc);
-    var after = try schema.parseValidatedTableSchema(alloc, after_json);
-    defer after.deinit(alloc);
-    const before_fks = try before.relationalForeignKeyDefinitions(alloc);
-    defer if (before_fks.len > 0) alloc.free(before_fks);
-    const after_fks = try after.relationalForeignKeyDefinitions(alloc);
-    defer if (after_fks.len > 0) alloc.free(after_fks);
-    for (before_fks) |fk| if (std.mem.eql(u8, fk.parent_table, table_name))
-        return error.ForeignKeySelfPublicationNotActivated;
-    for (after_fks) |fk| if (std.mem.eql(u8, fk.parent_table, table_name))
-        return error.ForeignKeySelfPublicationNotActivated;
-}
-
-test "public ordinary self-FK publication remains guarded before metadata admission" {
-    const before_schema =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
-    ;
-    const after_schema =
-        \\{"version":2,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_parent","child_columns":["parent"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
-    ;
-    try std.testing.expectError(error.ForeignKeySelfPublicationNotActivated, requireSelfFkPublicationActivatedFromSchemas(std.testing.allocator, "nodes", before_schema, after_schema));
-    try std.testing.expectError(error.ForeignKeySelfPublicationNotActivated, requireSelfFkPublicationActivatedFromSchemas(std.testing.allocator, "nodes", after_schema, before_schema));
-    try requireSelfFkPublicationActivatedFromSchemas(std.testing.allocator, "other", before_schema, after_schema);
-    const publication = @import("../metadata/fk_generation_publication.zig");
-    const parent: publication.Parent = .{
-        .table = .{ .table_id = 7, .name = "nodes" },
-        .ranges = &.{},
-        .fences = &.{},
-        .transitions = &.{},
-    };
-    const plan: publication.Plan = .{
-        .id = @splat(1),
-        .child_before = .{ .table_id = 7, .name = "nodes" },
-        .child_after = .{ .table_id = 7, .name = "nodes" },
-        .child_catalog_before_b64 = "",
-        .child_ranges = &.{},
-        .child_fences = &.{},
-        .parents = &.{parent},
-    };
-    try std.testing.expectError(error.ForeignKeySelfPublicationNotActivated, requireFkGenerationPublicActivation(plan));
-    var external = plan;
-    external.child_before.table_id = 8;
-    try requireFkGenerationPublicActivation(external);
-}
-
 pub const ApiHttpServer = struct {
     /// Lazily started only at the stable server address. HTTP ingress must be
     /// drained before server destruction, as for the other request owners.
@@ -3718,6 +3810,14 @@ pub const ApiHttpServer = struct {
         in_flight: std.atomic.Value(u32) = .init(0),
     } else struct {} = .{},
     fk_initial_create_cursor: std.atomic.Value(u64) = .init(0),
+    truncate_test_control: if (builtin.is_test) struct {
+        boundary: std.atomic.Value(u8) = .init(0),
+        hits: std.atomic.Value(u32) = .init(0),
+    } else struct {} = .{},
+    fk_initial_test_control: if (builtin.is_test) struct {
+        paused: std.atomic.Value(bool) = .init(false),
+        in_flight: std.atomic.Value(u32) = .init(0),
+    } else struct {} = .{},
     created_at_ns: u64 = 0,
     request_count: std.atomic.Value(u64) = .init(0),
     first_request_started_at_ns: std.atomic.Value(u64) = .init(0),
@@ -4931,6 +5031,19 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn runSessionMaintenanceOnce(self: *ApiHttpServer) !void {
+        // Policy phase decisions and owner receipts each use the shared HA
+        // metadata/owner outbox. Run this coordinator on a writable HA primary
+        // as well, while leaving unrelated primary-local jobs frozen.
+        self.advanceRowPolicyPublicationOnce() catch |err| switch (err) {
+            error.RowPolicyCatalogChanged,
+            error.RowPolicyInstallationPending,
+            error.GroupLeaderUnavailable,
+            error.TableNotFound,
+            error.Canceled,
+            error.DeadlineExceeded,
+            => {},
+            else => std.log.warn("row policy publication deferred err={s}", .{@errorName(err)}),
+        };
         // Durable transaction, repair, and reprocess job checkpoints are
         // primary-local. Their mutating routes are rejected in continuous HA,
         // and their cleanup/resume loop must remain frozen for the same reason.
@@ -4961,16 +5074,6 @@ pub const ApiHttpServer = struct {
             => {},
             else => std.log.warn("relational constraint activation deferred err={s}", .{@errorName(err)}),
         };
-        self.advanceRowPolicyPublicationOnce() catch |err| switch (err) {
-            error.RowPolicyCatalogChanged,
-            error.RowPolicyInstallationPending,
-            error.GroupLeaderUnavailable,
-            error.TableNotFound,
-            error.Canceled,
-            error.DeadlineExceeded,
-            => {},
-            else => std.log.warn("row policy publication deferred err={s}", .{@errorName(err)}),
-        };
         self.advanceFkGenerationPublicationBackgroundOnce() catch |err| switch (err) {
             error.UnsupportedOperation,
             error.GenerationPublicationChanged,
@@ -4983,7 +5086,7 @@ pub const ApiHttpServer = struct {
             => {},
             else => std.log.warn("FK generation publication deferred err={s}", .{@errorName(err)}),
         };
-        self.advanceFkInitialCreateOnce() catch |err| switch (err) {
+        self.advanceFkInitialCreateBackgroundOnce() catch |err| switch (err) {
             error.UnsupportedOperation,
             error.GenerationAdmissionPending,
             error.TopologyChanged,
@@ -5114,6 +5217,7 @@ pub const ApiHttpServer = struct {
     const FkPublicationStepFault = enum { none, before_metadata_mutate, after_metadata_mutate };
 
     fn advanceFkGenerationPublicationBackgroundOnce(self: *ApiHttpServer) !void {
+        if (!self.cfg.catalog_publication_authority_available) return;
         if (builtin.is_test) {
             _ = self.fk_publication_test_control.in_flight.fetchAdd(1, .acq_rel);
             defer _ = self.fk_publication_test_control.in_flight.fetchSub(1, .acq_rel);
@@ -5222,7 +5326,37 @@ pub const ApiHttpServer = struct {
         if (builtin.is_test and fault == .after_metadata_mutate) return error.InjectedPublicationReplyLoss;
     }
 
-    fn advanceFkInitialCreateOnce(self: *ApiHttpServer) !void {
+    fn advanceFkInitialCreateBackgroundOnce(self: *ApiHttpServer) !void {
+        if (!self.cfg.catalog_publication_authority_available) return;
+        if (builtin.is_test) {
+            _ = self.fk_initial_test_control.in_flight.fetchAdd(1, .acq_rel);
+            defer _ = self.fk_initial_test_control.in_flight.fetchSub(1, .acq_rel);
+            if (self.fk_initial_test_control.paused.load(.acquire)) return;
+            return self.advanceFkInitialCreateOnce(.none);
+        }
+        try self.advanceFkInitialCreateOnce(.none);
+    }
+
+    pub const FkInitialCreateTestDriver = if (builtin.is_test) struct {
+        pub const Fault = FkPublicationStepFault;
+        pub fn pauseBackground(server: *ApiHttpServer, io: std.Io) !void {
+            server.fk_initial_test_control.paused.store(true, .release);
+            errdefer server.fk_initial_test_control.paused.store(false, .release);
+            const deadline = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+            while (server.fk_initial_test_control.in_flight.load(.acquire) != 0) {
+                if (platform_time.monotonicNs() >= deadline) return error.PublicationSupervisorPauseTimeout;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+        pub fn step(server: *ApiHttpServer, fault: Fault) !void {
+            try server.advanceFkInitialCreateOnce(fault);
+        }
+        pub fn forgetVolatileCursor(server: *ApiHttpServer) void {
+            server.fk_initial_create_cursor.store(0, .monotonic);
+        }
+    } else struct {};
+
+    fn advanceFkInitialCreateOnce(self: *ApiHttpServer, fault: FkPublicationStepFault) !void {
         const publication = @import("../metadata/fk_generation_publication.zig");
         const control = @import("relational_fk_generation_publication.zig");
         const context: api_operation.RequestContext = .{
@@ -5287,7 +5421,9 @@ pub const ApiHttpServer = struct {
             },
             .publish_child => command.action = .publish_child,
         }
+        if (builtin.is_test and fault == .before_metadata_mutate) return error.InjectedPublicationReplyLoss;
         _ = try self.source.systemCatalog(alloc, context, .{ .fk_initial_create_mutate = command });
+        if (builtin.is_test and fault == .after_metadata_mutate) return error.InjectedPublicationReplyLoss;
     }
 
     pub const FkGenerationBegin = struct {
@@ -5301,18 +5437,13 @@ pub const ApiHttpServer = struct {
     /// checks, read-index owner identities, and exact AIC binding happen in
     /// the builder; metadata rechecks the entire cut at Raft apply.
     pub fn beginFkGenerationPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, identity: ?AuthenticatedIdentity, before: metadata_table_manager.TableRecord, proposed_schema_json: []const u8) !FkGenerationBegin {
-        // Native standalone has no durable local publication decision/owner
-        // receipt loop yet. Do not admit a plan its supervisor cannot drive.
-        if (self.cfg.deployment_mode == .standalone) return error.UnsupportedOperation;
-        try requireSelfFkPublicationActivatedFromSchemas(alloc, before.name, before.schema_json, proposed_schema_json);
+        if (self.cfg.deployment_mode == .standalone and
+            (self.haMutationPolicy().failover_safe_mutations_only or self.cfg.fk_generation_source == null or self.cfg.fk_generation_parent == null))
+            return error.UnsupportedOperation;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
         const plan = try @import("fk_generation_plan_builder.zig").build(self, a, context, identity, before, proposed_schema_json);
-        // The dual-role protocol is implemented below this boundary, but is
-        // not a public DDL capability until mounted ADD/DROP/restart evidence
-        // covers the complete metadata and owner route.
-        try requireFkGenerationPublicActivation(plan);
         const result: FkGenerationBegin = .{
             .plan_id = plan.id,
             .child_table_id = plan.child_before.table_id,
@@ -5358,16 +5489,13 @@ pub const ApiHttpServer = struct {
     /// durable begin, so post-admission allocation failure cannot erase it.
     pub fn submitFkInitialCreatePlan(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, plan: @import("../metadata/fk_generation_publication.zig").InitialCreatePlan) !FkInitialCreateBegin {
         if (self.cfg.deployment_mode == .standalone) {
-            // Native hidden owners have an exact local receipt protocol only
-            // for self-FKs. External parent owners still require the data-Raft
-            // generation protocol; hidden MATCH PARTIAL index readiness also
-            // needs a private owner proof before it can be enabled here.
-            if (self.cfg.fk_initial_child == null or plan.parents.len != 0 or plan.self_transitions.len == 0)
+            // The local metadata journal and native owner ports use the same
+            // immutable initial plan/receipts as hosted publication. Never
+            // admit without the child and parent owner controls; HA remains
+            // separately excluded by the local metadata admission gate.
+            if (self.cfg.fk_initial_child == null or
+                (plan.parents.len != 0 and self.cfg.fk_generation_parent == null))
                 return error.UnsupportedOperation;
-            var scope = std.heap.ArenaAllocator.init(alloc);
-            defer scope.deinit();
-            const partial_support = try @import("../metadata/fk_generation_publication.zig").initialPartialSupportNames(scope.allocator(), plan.child.schema_json, plan.child);
-            if (partial_support.len != 0) return error.UnsupportedOperation;
         }
         const expected_digest = try plan.digest(alloc);
         const result: FkInitialCreateBegin = .{
@@ -5404,6 +5532,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn advanceRowPolicyPublicationOnce(self: *ApiHttpServer) !void {
+        if (!self.cfg.catalog_publication_authority_available) return;
         const coordinator = @import("row_policy_publication_coordinator.zig");
         const policies = @import("../system_catalog/policies.zig");
         const context: api_operation.RequestContext = .{
@@ -12659,6 +12788,23 @@ pub const ApiHttpServer = struct {
         txn_id: db_mod.types.TxnId,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !bool {
+        return self.transactionSessionAccess(txn_id, authenticated_identity, false);
+    }
+
+    pub fn transactionSessionReadable(
+        self: *ApiHttpServer,
+        txn_id: db_mod.types.TxnId,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !bool {
+        return self.transactionSessionAccess(txn_id, authenticated_identity, true);
+    }
+
+    fn transactionSessionAccess(
+        self: *ApiHttpServer,
+        txn_id: db_mod.types.TxnId,
+        authenticated_identity: ?AuthenticatedIdentity,
+        read_only: bool,
+    ) !bool {
         if ((try self.txn_sessions.principalAccess(
             self.alloc,
             txn_id,
@@ -12666,7 +12812,15 @@ pub const ApiHttpServer = struct {
         )) != .allowed) return false;
         var details = (try self.txn_sessions.getDetails(self.alloc, txn_id)) orelse return false;
         defer details.deinit(self.alloc);
+        // Direct transaction routes cannot present or verify the idle HTTP
+        // connection owner. SQL requests use the separate exact-ID adapter;
+        // principal equality alone must not bypass its active fence.
+        if (!directTransactionRouteEligible(details, read_only)) return false;
         return try self.transactionSessionDetailsAuthorized(authenticated_identity, details);
+    }
+
+    fn directTransactionRouteEligible(details: transactions_api.SessionDetails, read_only: bool) bool {
+        return read_only or details.connection_id == null;
     }
 
     pub fn listAuthorizedTransactionSessions(
@@ -12681,7 +12835,7 @@ pub const ApiHttpServer = struct {
         var authorized = std.ArrayListUnmanaged(transactions_api.SessionStatus).empty;
         errdefer authorized.deinit(self.alloc);
         for (candidates) |status| {
-            if (try self.transactionSessionAccessible(status.txn_id, authenticated_identity))
+            if (try self.transactionSessionReadable(status.txn_id, authenticated_identity))
                 try authorized.append(self.alloc, status);
         }
         return try authorized.toOwnedSlice(self.alloc);
@@ -13371,7 +13525,7 @@ pub const ApiHttpServer = struct {
             // the exact catalog incarnation is installed instead of leaking a
             // storage-layer IndexNotFound as an internal 500.
             error.IndexNotFound => return error.WriteUnavailable,
-            error.StorageBusy, error.LeaderUnavailable => return error.WriteUnavailable,
+            error.StorageBusy, error.LeaderUnavailable, error.GenerationTransitionActive => return error.WriteUnavailable,
             error.HASyncCommitWouldBlock,
             error.HASyncCommitWaitLimitExceeded,
             error.HASyncCommitWaitMissingContext,
@@ -17281,6 +17435,32 @@ pub const ApiHttpServer = struct {
         }
     };
 
+    pub const TruncateTestBoundary = enum(u8) { none, source_sealed, parent_activated, before_parent_ack, after_parent_ack };
+
+    pub const TruncateTestDriver = if (builtin.is_test) struct {
+        pub fn arm(server: *ApiHttpServer, boundary: TruncateTestBoundary) void {
+            server.truncate_test_control.hits.store(0, .release);
+            server.truncate_test_control.boundary.store(@intFromEnum(boundary), .release);
+        }
+        pub fn seen(server: *ApiHttpServer) bool {
+            const boundary = server.truncate_test_control.boundary.load(.acquire);
+            return boundary != 0 and server.truncate_test_control.hits.load(.acquire) == boundary;
+        }
+        pub fn release(server: *ApiHttpServer) void {
+            server.truncate_test_control.boundary.store(0, .release);
+        }
+    } else struct {};
+
+    fn truncateTestBoundary(self: *ApiHttpServer, boundary: TruncateTestBoundary) !void {
+        if (comptime builtin.is_test) {
+            if (self.truncate_test_control.boundary.load(.acquire) == @intFromEnum(boundary)) {
+                // An in-flight old boundary cannot satisfy a newly armed phase.
+                self.truncate_test_control.hits.store(@intFromEnum(boundary), .release);
+                return error.RestoreStagingWait;
+            }
+        }
+    }
+
     fn stagingCommand(self: *ApiHttpServer, job: *@import("std").json.Parsed(@import("../metadata/restore_staging.zig").Job), action: @FieldType(@import("../metadata/restore_staging.zig").Command, "action"), receipt: ?@import("../metadata/restore_staging.zig").OwnerReceipt, context: api_operation.RequestContext) !void {
         const command: @import("../metadata/restore_staging.zig").Command = .{ .id = job.value.plan.id, .expected_revision = job.value.revision, .action = action, .receipt = receipt };
         return self.applyRewriteStagingCommand(job, command, context);
@@ -17498,15 +17678,15 @@ pub const ApiHttpServer = struct {
                         };
                     }
                 } else null;
-                if (owner_cursor >= validation_owner_count and handoff_index != 0) return error.RestoreSourceProofMissing;
                 if (pending_handoff) |selected| {
                     if (try self.source.getRestoreStagingReceipt(self.alloc, job.value.plan.id, .validating, selected.range.group_id, context)) |receipt| {
                         self.alloc.free(receipt);
                         owner_cursor += 1;
                         continue;
                     }
+                    try requireGenerationHandoffReceiptAuthority(self.alloc, self.table_reads orelse return error.UnsupportedOperation, selected.table_name, selected.range.start_key, selected.fence.namespace, null, null, null, context, false);
                     try waitForRestoreCutoverFence(self.alloc, self.table_reads orelse return error.UnsupportedOperation, self.table_writes orelse return error.UnsupportedOperation, selected.table_name, selected.range.start_key, selected.fence, selected.graph_scope, .{ .plan_id = job.value.plan.id, .plan_digest = job.value.plan_digest });
-                    const proof = try readGenerationHandoffPreflight(self.alloc, self.table_reads orelse return error.UnsupportedOperation, selected.table_name, selected.range.start_key, selected.fence, job.value.plan.id, job.value.plan_digest, selected.handoff);
+                    const proof = try readGenerationHandoffPreflight(self.alloc, self.table_reads orelse return error.UnsupportedOperation, selected.table_name, selected.range.start_key, selected.fence, job.value.plan.id, job.value.plan_digest, selected.handoff, context);
                     try self.stagingCommand(&job, .source_handoff_checked, .{
                         .group_id = selected.range.group_id,
                         .range_id = if (selected.range.range_id == 0) selected.range.group_id else selected.range.range_id,
@@ -17515,6 +17695,28 @@ pub const ApiHttpServer = struct {
                     }, context);
                     owner_cursor += 1;
                     continue;
+                }
+                // Recovered empty-generation plans must prove every untouched
+                // parent can issue receipts before irreversible cutover. One
+                // owner per slice uses the existing durable progress cursor.
+                if (owner_cursor >= validation_owner_count) {
+                    var parent_index = handoff_index;
+                    const parent_owner: ?struct { name: []const u8, range: metadata_table_manager.RangeRecord } = parent_scan: for (job.value.plan.external_fk_parents) |parent| {
+                        for (parent.ranges) |range| {
+                            if (parent_index == 0) break :parent_scan .{ .name = parent.table.name, .range = range };
+                            parent_index -= 1;
+                        }
+                    } else null;
+                    if (parent_owner) |parent| {
+                        try requireGenerationHandoffReceiptAuthority(self.alloc, self.table_reads orelse return error.UnsupportedOperation, parent.name, parent.range.start_key, .{
+                            .table_id = parent.range.table_id,
+                            .shard_id = metadata_table_manager.rangeDocIdentityShardId(parent.range),
+                            .range_id = metadata_table_manager.rangeDocIdentityRangeId(parent.range),
+                        }, null, null, null, context, false);
+                        owner_cursor += 1;
+                        continue;
+                    }
+                    if (parent_index != 0) return error.RestoreSourceProofMissing;
                 }
             }
             var target_index: usize = 0;
@@ -17541,6 +17743,7 @@ pub const ApiHttpServer = struct {
                         }
                         const writes = self.table_writes orelse return error.UnsupportedOperation;
                         if (phase == .cutover) {
+                            try requireGenerationHandoffReceiptAuthority(self.alloc, self.table_reads orelse return error.UnsupportedOperation, selected.parent.table.name, selected.range.start_key, selected.fence.namespace, null, null, null, context, true);
                             // Parent admission closes before an old-child
                             // fence can be acknowledged by metadata. A lost
                             // begin or pending-stage reply is retried under
@@ -17553,6 +17756,7 @@ pub const ApiHttpServer = struct {
                             _ = (try writes.batch(self.alloc, selected.parent.table.name, .{ .relational_topology = .{ .fence = selected.fence, .action = .cancel } })) orelse return error.RestoreValidationPending;
                         } else {
                             const activated = try self.executeRestoreParentActivation(self.alloc, selected.parent.table.name, selected.range.group_id, .{ .plan_id = job.value.plan.id, .fence = selected.fence }, context);
+                            try self.truncateTestBoundary(.parent_activated);
                             try self.stagingCommand(&job, .parent_activated, .{ .group_id = selected.range.group_id, .range_id = if (selected.range.range_id == 0) selected.range.group_id else selected.range.range_id, .plan_digest = job.value.plan_digest, .completion_digest = activated.receipt }, context);
                             owner_cursor += 1;
                             continue;
@@ -17600,6 +17804,7 @@ pub const ApiHttpServer = struct {
                             const mapped = (try stages.mappedEmptyGenerationHandoffForGroup(self.alloc, job.value.plan, job.value.plan_digest, selected.range.group_id)) orelse return error.RestoreSourceProofMissing;
                             const scope = try stages.ownerScope(self.alloc, job.value.plan, job.value.plan_digest, selected.target, selected.range);
                             const fence = try stages.emptyGenerationDestinationFence(job.value.plan, selected.target, selected.range, selected.handoff, scope);
+                            try requireGenerationHandoffReceiptAuthority(self.alloc, self.table_reads orelse return error.UnsupportedOperation, selected.target.table.name, selected.range.start_key, scope.target_namespace, selected.range.group_id, mapped.command.scope, job.value.plan.id, context, true);
                             const submitted = (self.table_writes orelse return error.UnsupportedOperation).batch(self.alloc, selected.target.table.name, .{ .restore_staging_scope = mapped.command.scope, .restore_staging_plan_id = job.value.plan.id, .relational_topology = .{
                                 .fence = fence,
                                 .action = .install_generation_handoff,
@@ -17621,8 +17826,8 @@ pub const ApiHttpServer = struct {
                             var parsed = try std.json.parseFromSlice(?@import("../storage/db/restore_staging_contract.zig").GenerationAdmissionReceipt, self.alloc, status.json, .{});
                             defer parsed.deinit();
                             const installed = parsed.value orelse return error.RestoreValidationPending;
-                            if (installed.applied_term == 0 or installed.applied_index == 0 or
-                                !std.mem.eql(u8, &installed.scope, &mapped.command.scope) or
+                            try (try installed.position()).requireNamespace(fence.namespace);
+                            if (!std.mem.eql(u8, &installed.scope, &mapped.command.scope) or
                                 !std.mem.eql(u8, &installed.source_summary_digest, &mapped.command.source_summary_digest) or
                                 !std.mem.eql(u8, &installed.logical_digest, &mapped.expected_receipt_digest)) return error.RestoreSourceProofMissing;
                             try self.stagingCommand(&job, .target_admissions_activated, .{
@@ -17694,6 +17899,7 @@ pub const ApiHttpServer = struct {
                             continue;
                         }
                         if (phase == .cutover) {
+                            if (old.handoff != null) try requireGenerationHandoffReceiptAuthority(self.alloc, self.table_reads orelse return error.UnsupportedOperation, old.table.name, old.range.start_key, old.fence.namespace, null, null, null, context, true);
                             try waitForRestoreCutoverFence(self.alloc, self.table_reads orelse return error.UnsupportedOperation, self.table_writes orelse return error.UnsupportedOperation, old.table.name, old.range.start_key, old.fence, old.graph_scope, if (phase == .cutover and old.handoff != null) .{ .plan_id = job.value.plan.id, .plan_digest = job.value.plan_digest } else null);
                         } else {
                             _ = (try (self.table_writes orelse return error.UnsupportedOperation).batch(self.alloc, old.table.name, .{ .relational_topology = .{ .fence = old.fence, .action = .cancel } })) orelse return error.RestoreValidationPending;
@@ -17718,6 +17924,8 @@ pub const ApiHttpServer = struct {
                             try waitForGraphRetirementSeal(self.alloc, self.table_reads orelse return error.UnsupportedOperation, self.table_writes orelse return error.UnsupportedOperation, old.table.name, old.range.start_key, old.graph_scope.?)
                         else
                             null;
+                        if (phase == .cutover and (handoff_seal != null or graph_seal != null))
+                            try self.truncateTestBoundary(.source_sealed);
                         const digest: [32]u8 = if (handoff_seal) |sealed|
                             try stages.generationHandoffOldFenceDigest(old.fence, sealed, graph_seal)
                         else
@@ -17762,6 +17970,7 @@ pub const ApiHttpServer = struct {
                         try self.stagingCommand(&job, .finish_cancel, null, context);
                     },
                     .published => {
+                        try self.truncateTestBoundary(.before_parent_ack);
                         // Target owners are published before parent admission
                         // reopens. The metadata child generation is now
                         // visible, so a direct read-index authority proof can
@@ -17773,6 +17982,7 @@ pub const ApiHttpServer = struct {
                                 if (candidate.owner_group_id == range.group_id) break candidate;
                             } else return error.RestoreSourceProofMissing;
                             _ = try self.executeRestoreParentActivation(self.alloc, parent.table.name, range.group_id, .{ .plan_id = job.value.plan.id, .fence = fence, .acknowledge = true }, context);
+                            try self.truncateTestBoundary(.after_parent_ack);
                         };
                         const resolved = try self.restore_job_store.recordStagingResolution(self.alloc, restore.job_id, restore.attempt_id, staging_attempt, .published);
                         self.alloc.free(resolved);
@@ -17804,6 +18014,8 @@ pub const ApiHttpServer = struct {
                 }
             }
             const scope = try stages.ownerScope(self.alloc, job.value.plan, job.value.plan_digest, target, range);
+            if (phase == .validating and target.empty_generation)
+                try requireGenerationHandoffReceiptAuthority(self.alloc, self.table_reads orelse return error.UnsupportedOperation, target.table.name, range.start_key, scope.target_namespace, range.group_id, scope.digest(), job.value.plan.id, context, false);
             var request: owners.Request = .{ .scope = scope, .action = switch (phase) {
                 .importing => if (target.empty_generation) .begin else .import_page,
                 .validating => .validate,
@@ -17879,7 +18091,10 @@ pub const ApiHttpServer = struct {
 
     pub fn executeRestoreParentActivation(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("restore_parent_activation.zig").Request, context: api_operation.RequestContext) !@import("restore_parent_activation.zig").Response {
         try context.ensureActive();
-        if (self.cfg.deployment_mode == .standalone) return error.UnsupportedOperation;
+        // Native owners validate the exact durable plan, parent fence and
+        // native receipt authority in the configured receiver. They have no
+        // replicated placement router to resolve before that validation.
+        if (self.cfg.deployment_mode == .standalone) return (self.cfg.restore_parent_activation orelse return error.RestoreValidationPending).execute(alloc, table_name, group_id, request, context);
         var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
         const router = self.cfg.session_router orelse fallback.router();
         var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.RestoreValidationPending;
@@ -17896,8 +18111,9 @@ pub const ApiHttpServer = struct {
 
     pub fn executeFkGenerationParent(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("relational_fk_generation_publication.zig").Request, context: api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").Receipt {
         try context.ensureActive();
-        if (self.cfg.deployment_mode == .standalone) return error.UnsupportedOperation;
         try request.validate(group_id);
+        if (self.cfg.deployment_mode == .standalone)
+            return (self.cfg.fk_generation_parent orelse return error.UnsupportedOperation).execute(alloc, table_name, group_id, request, context);
         var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
         const router = self.cfg.session_router orelse fallback.router();
         var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.GenerationAdmissionPending;
@@ -17914,8 +18130,9 @@ pub const ApiHttpServer = struct {
 
     pub fn executeFkGenerationSource(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("relational_fk_generation_publication.zig").SourceRequest, context: api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").SourceReceipt {
         try context.ensureActive();
-        if (self.cfg.deployment_mode == .standalone) return error.UnsupportedOperation;
         try request.validate(group_id);
+        if (self.cfg.deployment_mode == .standalone)
+            return (self.cfg.fk_generation_source orelse return error.UnsupportedOperation).execute(alloc, table_name, group_id, request, context);
         var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
         const router = self.cfg.session_router orelse fallback.router();
         var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.GenerationAdmissionPending;
@@ -18129,6 +18346,7 @@ pub const ApiHttpServer = struct {
             error.RestoreDestinationReauthorizationRequired,
             error.StoredDestinationAuthorizationRevoked,
             error.RestoreNewAdmissionGuarded,
+            error.UnsupportedEmptyGenerationAuthority,
             => true,
             else => false,
         };
@@ -24112,7 +24330,6 @@ fn contextualWitnessDDLError(alloc: std.mem.Allocator, err: anyerror) !contextua
         error.ReservedForeignKeySupportIndex => contextualJsonErrorResponse(alloc, 400, "__fk_partial_ indexes are server-owned foreign-key support; edit or retire the foreign key instead"),
         error.ForeignKeyPartialSupportIndexConflict => contextualJsonErrorResponse(alloc, 409, "foreign-key support index name conflicts with an existing definition"),
         error.ForeignKeyPartialSupportIndexRequired, error.RelationalIndexNotReady => contextualJsonErrorResponse(alloc, 409, "foreign-key support changed or is still building; refresh the schema and retry"),
-        error.ForeignKeyInitialSelfReferenceUnsupported => contextualJsonErrorResponse(alloc, 409, "initial self-referential foreign-key publication is unavailable on this deployment; no table was created"),
         error.ForeignKeyTargetNotUnique, error.ForeignKeyTypeMismatch, error.ForeignKeyParentTableNotFound => contextualJsonErrorResponse(alloc, 400, "foreign key requires an existing parent with a matching ordered unique key and compatible scalar column types"),
         error.TableGenerationChanged, error.SchemaVersionChanged, error.TableTransitionActive, error.ConstraintRetirementInProgress => contextualJsonErrorResponse(alloc, 409, "parent schema changed or has active maintenance; refresh and retry"),
         error.MetadataUnavailable, error.NotLeader, error.ProposalDropped => contextualRetryableTextResponse(alloc, 503, "foreign-key support metadata is unavailable; retry"),
@@ -33034,6 +33251,38 @@ test "api http row policy signer skips absent admitted identity" {
     try std.testing.expect(ApiHttpServer.hasRowPolicyWritePrincipal(.{ .row_policy_credential = &present }));
 }
 
+test "ordinary read needs no principal without policy but active policy fails closed" {
+    const Fixture = struct {
+        active: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+        fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, call: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(call == .policy_publication_status);
+            try std.testing.expectEqual(@as(u64, 7), call.policy_publication_status);
+            try std.testing.expect(context.row_policy_install_authority);
+            if (!self.active) return error.RowPolicyCatalogChanged;
+            return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/policies.zig").PublicationStamp{
+                .table_id = 7,
+                .schema_version = 1,
+                .generation = 2,
+                .catalog_epoch = 3,
+                .phase = .active,
+            }, .{});
+        }
+    };
+    var fixture = Fixture{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, .{
+        .ptr = &fixture,
+        .vtable = &.{ .status = Fixture.status, .system_catalog = Fixture.catalog },
+    }, null, null);
+    defer server.deinit();
+    try std.testing.expect((try server.rowPolicyReadProof(std.testing.allocator, null, .{}, 7, "docs", "main", 1)) == null);
+    fixture.active = true;
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, server.rowPolicyReadProof(std.testing.allocator, null, .{}, 7, "docs", "main", 1));
+}
+
 test "api http server authenticates trusted principal" {
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -38108,15 +38357,34 @@ test "api http server stale no-FK catalog cannot take uncoordinated batch path" 
 
 test "api http server routes table batches through the batch commit hook" {
     const FakeStatus = struct {
-        fn iface(_: *@This()) StatusSource {
+        tables: [1]metadata_table_manager.TableRecord = .{.{
+            .table_id = 1,
+            .name = "docs",
+            .placement_role = "data",
+        }},
+
+        fn iface(self: *@This()) StatusSource {
             return .{
-                .ptr = undefined,
-                .vtable = &.{ .status = status },
+                .ptr = self,
+                .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot },
             };
         }
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = &self.tables,
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
         }
     };
 
@@ -38302,17 +38570,24 @@ test "api http server routes table batches through the batch commit hook" {
     defer legacy_pending_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), legacy_pending_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, legacy_pending_resp.body, "\"status\":\"committed_pending\"") != null);
-    try std.testing.expectEqual(@as(usize, 11), writes.batch_commit_calls);
-    writes.commit_error = error.StorageBusy;
-    var busy_resp = try executeHttpxTestRequest(&server, .{
-        .method = .POST,
-        .uri = "/tables/docs/batch",
-        .content_type = "application/json",
-        .body = batch_body,
-    });
-    defer busy_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 503), busy_resp.status);
     try std.testing.expectEqual(@as(usize, 12), writes.batch_commit_calls);
+    for ([_]anyerror{ error.StorageBusy, error.GenerationTransitionActive }) |unavailable| {
+        writes.commit_error = unavailable;
+        const calls_before = writes.batch_commit_calls;
+        var busy_resp = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = "/tables/docs/batch",
+            .content_type = "application/json",
+            .body = batch_body,
+        });
+        defer busy_resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 503), busy_resp.status);
+        try std.testing.expectEqualStrings("write unavailable", busy_resp.body);
+        // A generic lifecycle rejection is not a durable-abort receipt. The
+        // HTTP boundary must neither replay the write nor invent that proof.
+        try std.testing.expect(std.mem.indexOf(u8, busy_resp.body, "transaction_precommit_aborted") == null);
+        try std.testing.expectEqual(calls_before + 1, writes.batch_commit_calls);
+    }
 
     writes.commit_error = null;
     writes.legacy_visibility_pending_outcome = false;

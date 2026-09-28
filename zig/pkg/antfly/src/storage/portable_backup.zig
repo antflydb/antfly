@@ -525,6 +525,7 @@ pub fn exportPortableToWriterWithOptions(
     };
     var scan = try store.beginReadTxn();
     defer scan.abort();
+    try @import("db/artifact_reconcile_intent.zig").requireAbsent(&scan);
     const source_summary: ?[]SourceGenerationAdmissionSummaryEntry = if (options.source_generation_summary_output) |output|
         try sourceGenerationAdmissionSummaryTxnAlloc(output.alloc, &scan, options.cohort.?)
     else
@@ -546,10 +547,13 @@ pub fn exportPortableToWriterWithOptions(
                 std.mem.readInt(u64, marker[8..16], .little) != certificate.cut.applied_index)
                 return error.SourceSnapshotCutMismatch;
         }
-        const retention = try @import("retained_effects.zig").load(&scan) orelse return error.SourceSnapshotCutMismatch;
-        const namespace_bytes = try scan.get(&internal_keys.identity_namespace_key);
-        if (!std.mem.eql(u8, &retention.namespace, namespace_bytes) or retention.latest != certificate.cut.retained_start)
+        const retention = try @import("retained_effects.zig").load(&scan) orelse {
             return error.SourceSnapshotCutMismatch;
+        };
+        const namespace_bytes = try scan.get(&internal_keys.identity_namespace_key);
+        if (!std.mem.eql(u8, &retention.namespace, namespace_bytes) or retention.latest != certificate.cut.retained_start) {
+            return error.SourceSnapshotCutMismatch;
+        }
     }
 
     var objects = std.ArrayListUnmanaged(PortableObject).empty;
@@ -784,8 +788,12 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     defer if (source_range) |range| ranges.freeRange(alloc, range);
     if (source_copy) |proof| {
         _ = try proof.encode();
-        const pending = try @import("source_pin_state.zig").load(scan) orelse return error.SourceSnapshotCutMismatch;
-        if (!std.mem.eql(u8, &pending.namespace, &proof.scope.namespace()) or !std.mem.eql(u8, &pending.pin, &proof.scope.pin()) or pending.applied_index != proof.applied_index or pending.retained_start != proof.retained_start or !std.mem.eql(u8, &pending.scope_bytes, &try proof.scope.encode())) return error.SourceSnapshotCutMismatch;
+        const pending = try @import("source_pin_state.zig").load(scan) orelse {
+            return error.SourceSnapshotCutMismatch;
+        };
+        if (!std.mem.eql(u8, &pending.namespace, &proof.scope.namespace()) or !std.mem.eql(u8, &pending.pin, &proof.scope.pin()) or pending.applied_index != proof.applied_index or pending.retained_start != proof.retained_start or !std.mem.eql(u8, &pending.scope_bytes, &try proof.scope.encode())) {
+            return error.SourceSnapshotCutMismatch;
+        }
     }
     // A retirement can have already removed its last catalog binding while
     // still retaining cross-table cleanup authority. The catalog alone cannot
@@ -905,6 +913,9 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     var artifact_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
     defer deinitKeyValueBatch(alloc, &artifact_batch);
     var artifact_batch_bytes: usize = 0;
+    var source_artifact_batch: std.ArrayListUnmanaged(backup_codec.KeyValueEntry) = .empty;
+    defer deinitKeyValueBatch(alloc, &source_artifact_batch);
+    var source_artifact_bytes: usize = 0;
 
     var resolution_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
     defer deinitKeyValueBatch(alloc, &resolution_batch);
@@ -957,7 +968,9 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
             const activation = @import("db/relational_integrity_activation.zig");
             if (compiled.bindings.len != 0 and activation.hasActive(compiled)) {
                 const catalog_digest = @import("db/relational_integrity_contract.zig").hash(raw_catalog);
-                if (!std.mem.eql(u8, &catalog_digest, &proof.scope.fence.catalog_digest)) return error.SourceSnapshotCutMismatch;
+                if (!std.mem.eql(u8, &catalog_digest, &proof.scope.fence.catalog_digest)) {
+                    return error.SourceSnapshotCutMismatch;
+                }
                 try activation.requireReady(scan, compiled);
                 const coverage = try scan.get(activation.key);
                 var binding: [64]u8 = undefined;
@@ -1105,6 +1118,34 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     while (scan_entry) |kv| : (scan_entry = try nextPortableDataEntry(&cursor, try cursor.next(), out.stats)) {
         try out.cancellation.check();
         if (isPortableMetadataKey(kv.key)) continue;
+        if (source_copy != null and @import("db/online_graph_artifacts.zig").isKey(kv.key)) {
+            const owner = (try internal_keys.decodeDocumentComponentAlloc(alloc, kv.key)) orelse return error.InvalidGraphTransfer;
+            defer alloc.free(owner);
+            if (source_range) |range| if (!range.contains(owner)) continue;
+            try @import("db/online_graph_artifacts.zig").validate(kv.key, kv.value);
+            const source_batch = @import("db/source_artifact_batch.zig");
+            if (kv.key.len > source_batch.max_key_bytes or kv.value.len +| kv.key.len +| 12 > source_batch.max_bytes)
+                return error.ResourceLimitExceeded;
+            if (source_artifact_batch.items.len != 0 and (source_artifact_bytes +| kv.key.len +| kv.value.len +| 8 > source_batch.max_bytes - 4 or source_artifact_batch.items.len == source_batch.max_entries)) {
+                try flushKeyValueBlock(alloc, out, &source_artifact_batch, .source_artifact_batch);
+                source_artifact_bytes = 0;
+            }
+            const key = try alloc.dupe(u8, kv.key);
+            var key_owned = true;
+            errdefer if (key_owned) alloc.free(key);
+            const value = try alloc.dupe(u8, kv.value);
+            var value_owned = true;
+            errdefer if (value_owned) alloc.free(value);
+            try source_artifact_batch.append(alloc, .{ .key = key, .value = value });
+            key_owned = false;
+            value_owned = false;
+            source_artifact_bytes += key.len + value.len + 8;
+            if (source_artifact_bytes >= batch_target_bytes) {
+                try flushKeyValueBlock(alloc, out, &source_artifact_batch, .source_artifact_batch);
+                source_artifact_bytes = 0;
+            }
+            continue;
+        }
         // Ordered indexes are derived from canonical rows during staged import.
         // Do not copy stale generations or serialize each tuple twice. The
         // active definition manifest is emitted before the primary-row stream.
@@ -1174,8 +1215,20 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
                     chunk_batch_bytes = 0;
                 }
             } else if (internal_keys.isEmbeddingArtifactKey(kv.key)) {
-                try collectEmbedding(alloc, &emb_batches, &sparse_batches, kv.key, kv.value);
-                derived_batch_bytes += kv.key.len + kv.value.len;
+                if (source_copy != null or !try collectEmbedding(alloc, &emb_batches, &sparse_batches, kv.key, kv.value)) {
+                    // Online certificates preserve the exact binary afterimage
+                    // language. The raw object also represents historical
+                    // dense dimensions beyond the legacy u16 batch header.
+                    const raw = try portableBaseVectorAlloc(alloc, kv.key, kv.value);
+                    defer alloc.free(raw);
+                    if (!try appendPortableArtifactEntry(alloc, &artifact_batch, kv.key, raw, .embedding)) return error.InvalidBackupRequest;
+                    artifact_batch_bytes += kv.key.len + raw.len;
+                    counts.embeddings += 1;
+                    if (artifact_batch_bytes >= batch_target_bytes) {
+                        try flushKeyValueBlock(alloc, out, &artifact_batch, .artifact_batch);
+                        artifact_batch_bytes = 0;
+                    }
+                } else derived_batch_bytes += kv.key.len + kv.value.len;
             } else if (internal_keys.isGraphEdgeArtifactKey(kv.key)) {
                 try collectGraphEdgeArtifact(alloc, &edge_batches, kv.key, kv.value);
                 derived_batch_bytes += kv.key.len + kv.value.len;
@@ -1233,6 +1286,9 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     }
     if (artifact_batch.items.len > 0) {
         try flushKeyValueBlock(alloc, out, &artifact_batch, .artifact_batch);
+    }
+    if (source_artifact_batch.items.len > 0) {
+        try flushKeyValueBlock(alloc, out, &source_artifact_batch, .source_artifact_batch);
     }
     if (resolution_batch.items.len > 0) {
         try flushKeyValueBlock(alloc, out, &resolution_batch, .resolution_batch);
@@ -1563,6 +1619,9 @@ fn deinitKeyValueBatch(alloc: Allocator, batch: *std.ArrayListUnmanaged(backup_c
 }
 
 pub fn isPortableMetadataKey(key: []const u8) bool {
+    // Destination facts must be rebuilt from imported physical records, never
+    // copied from a source's potentially partial maintenance certificate.
+    if (@import("artifact_footprint.zig").isKey(key)) return false;
     return std.mem.eql(u8, key, cohort_proof_key) or std.mem.eql(u8, key, source_copy_proof_key) or
         std.mem.startsWith(u8, key, source_generation_admission_prefix) or
         std.mem.eql(u8, key, source_integrity_key) or std.mem.eql(u8, key, source_integrity_catalog_key) or std.mem.eql(u8, key, source_integrity_activation_key) or
@@ -1698,25 +1757,51 @@ fn decodeBase64UrlComponentAlloc(alloc: Allocator, encoded: []const u8) ![]u8 {
 }
 
 /// Parse an embedding artifact value and collect into the appropriate batch.
+fn portableBaseVectorAlloc(alloc: Allocator, key: []const u8, value: []const u8) ![]u8 {
+    const vector_contract = @import("db/online_vector_artifacts.zig");
+    if (enrichment_artifact_codec.decodeHeader(value)) |_| {
+        try vector_contract.validate(key, value);
+        return alloc.dupe(u8, value);
+    } else |_| {}
+    // Old portable imports can leave JSON embeddings. Normalize only this
+    // legacy representation; current binary records retain all header bytes.
+    var parsed = try std.json.parseFromSlice(struct { dims: u32, vector: []f32 }, alloc, value, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (parsed.value.dims != parsed.value.vector.len) return error.InvalidBackupRequest;
+    const raw = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, parsed.value.vector);
+    errdefer alloc.free(raw);
+    try vector_contract.validate(key, raw);
+    return raw;
+}
+
 fn collectEmbedding(
     alloc: Allocator,
     batches: *std.StringHashMapUnmanaged(EmbeddingBatch),
     sparse_batches: *std.StringHashMapUnmanaged(SparseBatch),
     key: []const u8,
     value: []const u8,
-) !void {
-    const parsed_key = (try internal_keys.parseEmbeddingArtifactKeyAlloc(alloc, key)) orelse return;
+) !bool {
+    // Compact vector batches have no origin field. Preserve explicit authored
+    // metadata via the existing binary artifact envelope, even offline.
+    if (enrichment_artifact_codec.decodeHeader(value)) |header| {
+        if (header.flags.authored) return false;
+    } else |_| {}
+    const parsed_key = (try internal_keys.parseEmbeddingArtifactKeyAlloc(alloc, key)) orelse return true;
     defer alloc.free(parsed_key.doc_key);
     defer alloc.free(parsed_key.artifact_name);
 
     if (enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, value)) |vector| {
+        if (vector.len > std.math.maxInt(u16)) {
+            alloc.free(vector);
+            return false;
+        }
         try appendDenseEmbedding(alloc, batches, parsed_key.artifact_name, parsed_key.doc_key, vector);
-        return;
+        return true;
     } else |_| {}
 
     if (enrichment_artifact_codec.decodeSparseEmbeddingAlloc(alloc, value)) |sparse| {
         try appendSparseEmbedding(alloc, sparse_batches, parsed_key.artifact_name, parsed_key.doc_key, sparse);
-        return;
+        return true;
     } else |_| {}
 
     {
@@ -1728,11 +1813,13 @@ fn collectEmbedding(
         const json_parsed = std.json.parseFromSlice(EmbPayload, alloc, value, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
-        }) catch return; // skip malformed embeddings
+        }) catch return true; // retain ordinary backup's malformed-record behavior
         defer json_parsed.deinit();
+        if (json_parsed.value.vector.len > std.math.maxInt(u16)) return false;
         const vector = try alloc.dupe(f32, json_parsed.value.vector);
         try appendDenseEmbedding(alloc, batches, parsed_key.artifact_name, parsed_key.doc_key, vector);
     }
+    return true;
 }
 
 fn appendDenseEmbedding(
@@ -2599,7 +2686,7 @@ fn decodeCohortArtifacts(alloc: Allocator, kind: backup_codec.BlockType, payload
             const decoded = try backup_codec.decodeKeyValueBatch(alloc, payload);
             for (decoded) |entry| {
                 const ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
-                if (ref.kind != (if (kind == .chunk_batch) db_types.ArtifactKind.chunk else .asset)) return error.InvalidBackupRequest;
+                try validatePortableArtifactEntry(alloc, ref, entry.value, if (kind == .chunk_batch) .chunk else .asset);
                 try entries.append(alloc, .{ .key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, ref), .value = entry.value });
             }
         },
@@ -2912,6 +2999,7 @@ fn validateAndImportPortableStagingAfterHeader(
                 archive.saw_document_block = true;
             },
             .integrity_batch => try validateSourceIntegrityBatch(alloc, block.payload, &archive, store),
+            .source_artifact_batch => try validateSourceArtifactBatch(alloc, block.payload, &archive, store),
             .doc_identity_batch => {
                 // The importer validates the identity namespace while applying
                 // the same decoded entries to unpublished staging.
@@ -3501,6 +3589,7 @@ fn validatePortableImportBlockPayload(
 ) !void {
     switch (block_type) {
         .integrity_batch => try validateSourceIntegrityBatch(alloc, payload, archive, null),
+        .source_artifact_batch => try validateSourceArtifactBatch(alloc, payload, archive, null),
         .document_batch => try validateDocumentBatchPayload(alloc, payload, archive),
         .doc_identity_batch => try validateIdentityBatchPayload(alloc, payload),
         .metadata_batch => try validateMetadataBatchPayload(alloc, payload, archive),
@@ -3521,6 +3610,29 @@ fn validatePortableImportBlockPayload(
         .bundle_manifest, .cluster_manifest, .table_manifest, .summary_batch, .transaction_batch => {},
         else => {},
     }
+}
+
+fn validateSourceArtifactBatch(alloc: Allocator, payload: []const u8, archive: *PortableArchiveValidation, store: ?*DocStore) !void {
+    if (archive.source_copy == null or !archive.saw_source_copy) return error.SourceCopyRestoreUnsupported;
+    var reader = try @import("db/source_artifact_batch.zig").Reader.init(payload);
+    if (store) |destination| {
+        var writes: std.ArrayListUnmanaged(KVPair) = .empty;
+        defer writes.deinit(alloc);
+        try writes.ensureTotalCapacity(alloc, reader.remaining);
+        while (try reader.next()) |entry| writes.appendAssumeCapacity(.{ .key = entry.key, .value = entry.value });
+        try destination.putBatch(writes.items, &.{});
+    }
+}
+
+test "ordinary portable restore rejects private source graph artifacts" {
+    var archive: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+    try std.testing.expectError(error.SourceCopyRestoreUnsupported, validatePortableImportBlockPayload(
+        std.testing.allocator,
+        .source_artifact_batch,
+        "\x00\x00\x00\x00",
+        .{ .import_derived_indexes = false },
+        &archive,
+    ));
 }
 
 fn validateSourceIntegrityBatch(alloc: Allocator, payload: []const u8, archive: *PortableArchiveValidation, store: ?*DocStore) !void {
@@ -4173,13 +4285,21 @@ fn validateAndImportMetadataBatchPayload(
     if (writes.len > 0) try store.putBatch(writes, &.{});
 }
 
+fn validatePortableArtifactEntry(alloc: Allocator, ref: db_types.ArtifactRef, value: []const u8, allowed_kind: db_types.ArtifactKind) !void {
+    if (ref.kind == allowed_kind) return;
+    if (allowed_kind != .asset or ref.kind != .embedding or ref.source != null or ref.chunk_id != null or ref.unit_id != null) return error.InvalidBackupRequest;
+    const key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, ref);
+    defer alloc.free(key);
+    @import("db/online_vector_artifacts.zig").validate(key, value) catch return error.InvalidBackupRequest;
+}
+
 fn validatePublicArtifactBatchPayload(alloc: Allocator, payload: []const u8, allowed_kind: db_types.ArtifactKind) !void {
     const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
     defer freeKeyValueEntries(alloc, entries);
     for (entries) |entry| {
         var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
         defer artifact_ref.deinit(alloc);
-        if (artifact_ref.kind != allowed_kind) return error.InvalidBackupRequest;
+        try validatePortableArtifactEntry(alloc, artifact_ref, entry.value, allowed_kind);
     }
 }
 
@@ -4417,7 +4537,7 @@ fn importPublicArtifactBatch(
     for (entries) |entry| {
         var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
         defer artifact_ref.deinit(alloc);
-        if (artifact_ref.kind != allowed_kind) return error.InvalidBackupRequest;
+        try validatePortableArtifactEntry(alloc, artifact_ref, entry.value, allowed_kind);
 
         const store_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
         var store_key_owned = true;
@@ -6209,6 +6329,63 @@ test "import rejects doc identity namespace mismatch unless preserving existing 
         });
         const restored_namespace = (try doc_identity.loadNamespaceFromStore(&dst)) orelse return error.TestExpectedEqual;
         try std.testing.expect(restored_namespace.eql(source_namespace));
+    }
+}
+
+test "online direct vector portable fallback preserves dense dimensions above u16 exactly" {
+    const alloc = std.testing.allocator;
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "row", "historical");
+    defer alloc.free(key);
+    const vectors = try alloc.alloc(f32, @as(usize, std.math.maxInt(u16)) + 1);
+    defer alloc.free(vectors);
+    @memset(vectors, 2);
+    const value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 99, vectors);
+    defer alloc.free(value);
+    try src.put(key, value);
+    var archive: ArrayList(u8) = .empty;
+    defer archive.deinit(alloc);
+    try exportPortable(alloc, &src, &archive);
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, archive.items);
+    const restored = try dst.get(alloc, key);
+    defer alloc.free(restored);
+    try std.testing.expectEqualSlices(u8, value, restored);
+}
+
+test "ordered artifact inventory portable backup preserves authored dense and sparse origin" {
+    const alloc = std.testing.allocator;
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+    const dense_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "row", "dense");
+    defer alloc.free(dense_key);
+    const sparse_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "row", "sparse");
+    defer alloc.free(sparse_key);
+    const dense = try enrichment_artifact_codec.encodeAuthoredDenseEmbeddingAlloc(alloc, &.{ 1, 2 });
+    defer alloc.free(dense);
+    const sparse = try enrichment_artifact_codec.encodeAuthoredSparseEmbeddingAlloc(alloc, &.{ 3, 8 }, &.{ 1, 2 });
+    defer alloc.free(sparse);
+    try src.putBatch(&.{ .{ .key = dense_key, .value = dense }, .{ .key = sparse_key, .value = sparse } }, &.{});
+    var archive: ArrayList(u8) = .empty;
+    defer archive.deinit(alloc);
+    try exportPortable(alloc, &src, &archive);
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, archive.items);
+    for ([_][]const u8{ dense_key, sparse_key }, [_][]const u8{ dense, sparse }) |key, expected| {
+        const restored = try dst.get(alloc, key);
+        defer alloc.free(restored);
+        try std.testing.expectEqualSlices(u8, expected, restored);
     }
 }
 

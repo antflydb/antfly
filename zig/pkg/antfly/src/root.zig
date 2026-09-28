@@ -440,3 +440,7 @@ test {
 
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_physical.zig");
+
+test "online graph snapshot native receiver module" {
+    _ = @import("storage/db/online_graph_receiver_test.zig");
+}

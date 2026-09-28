@@ -69,6 +69,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "online merge private port preserves source recovery errors through foreign runtime dispatch",
         "join planning",
         "public openapi contract module is generated and wired",
+        "public enrollment encoding preserves a signed u128 root without JSON rounding",
+        "store-root enrollment requires cluster admin and forwards only valid possession proof",
         "admin openapi contract module is generated and wired",
         "internal openapi contract module is generated and wired",
         "metadata openapi module generates extractor surface for routed endpoints",
@@ -236,6 +238,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx antfly scan reports a stale owner descriptor as temporarily unavailable",
         "httpx multi batch route uses the batch commit hook and public response contract",
         "httpx stable transaction commit durably hands off recovery before acknowledgement",
+        "public transaction preparation generation transition is retryable without outcome claims",
         "httpx shared registrar keeps root probes and rejects removed data aliases",
         "httpx storage maintenance routes call typed operations directly",
         "httpx antfly routes require auth and enforce admin middleware",
@@ -245,10 +248,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx hidden handoff receipt rejects public caller even in legacy internal mode",
         "httpx FK source control rejects missing service token in legacy internal mode",
         "hidden generation handoff receipt requires exact scoped read-index request",
+        "hidden generation handoff identity requires exact scoped read-index request",
         "api.sql_execution",
         "api.sql_pgwire",
         "api.sql_session",
         "api.sql_prepared",
+        "HTTP connection record",
+        "HTTP connection DISCARD",
+        "HTTP connection recovers",
+        "HTTP connection keeps",
+        "HTTP connection reconciles",
+        "HTTP connection publishes",
+        "direct public transaction routes exclude connection-owned sessions",
         "api.sql_catalog",
         "api.sql_truncate",
         "api.sql_schema_cache",
@@ -259,7 +270,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "relational row query statement",
         "relational row query coordinator",
         "httpx antfly schema update returns full table status after projection",
-        "httpx antfly schema update owns self partial support and rejects public index forgery",
+        "httpx antfly schema update owns self partial support and requires coordinated publication",
         "httpx schema patch merges at the authority and accepts version zero ETag",
         "schema ETags are strong and preserve version zero",
         "request context observes cancellation before deadline",
@@ -2075,11 +2086,42 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     hosted_initial_fk_test_mod.addImport("usermgr_storage", hosted_fk_usermgr_storage);
     const hosted_initial_fk_tests = b.addTest(.{
         .root_module = hosted_initial_fk_test_mod,
-        .filters = &.{ "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations", "mounted hosted FK parent owner is read-index ready" },
+        .filters = &.{ "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations", "mounted initial MATCH PARTIAL publication enforces constraints across restart", "hosted initial FK real services and facade retain all required capabilities" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-initial-fk-test", "Run mounted hosted initial-FK owner publication regression")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_initial_fk_tests).step);
+    const hosted_initial_fk_fault_tests = b.addTest(.{
+        .root_module = hosted_initial_fk_test_mod,
+        .filters = &.{ "mounted initial FK lost replies and cold owner restart before release", "hosted initial FK real services and facade retain all required capabilities" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-initial-fk-fault-test", "Run hosted initial CREATE lost-reply and cold owner release recovery")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_initial_fk_fault_tests).step);
+    const hosted_initial_fk_transfer_tests = b.addTest(.{
+        .root_module = hosted_initial_fk_test_mod,
+        .filters = &.{ "mounted initial FK hidden three voter owner transfers before release", "hosted initial FK real services and facade retain all required capabilities" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-initial-fk-transfer-test", "Run hidden initial-child three-voter Raft leadership transfer")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_initial_fk_transfer_tests).step);
+    const hosted_initial_fk_offline_tests = b.addTest(.{
+        .root_module = hosted_initial_fk_test_mod,
+        .filters = &.{ "mounted initial FK canceled offline replica returns and signs exact unlink ACK", "mounted initial FK published obsolete released replica retires without canceling current owner", "hosted initial FK real services and facade retain all required capabilities" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-initial-fk-offline-test", "Run canceled and published obsolete initial-child offline physical retirement")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_initial_fk_offline_tests).step);
+    // CI builds each linked fixture module once, then executes the installed
+    // binaries on independent recovery runners without a compiler or cache.
+    const hosted_initial_fk_ci_tests = b.addTest(.{
+        .name = "antfly-hosted-initial-fk-recovery",
+        .root_module = hosted_initial_fk_test_mod,
+        .filters = &.{ "mounted initial", "hosted initial FK real services and facade retain all required capabilities", "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const hosted_fk_recovery_install = b.step("antfly-hosted-fk-recovery-binaries", "Install prebuilt hosted FK recovery fixtures for bounded CI lanes");
+    hosted_fk_recovery_install.dependOn(&b.addInstallArtifact(hosted_initial_fk_ci_tests, .{}).step);
     const hosted_fk_drop_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_fk_drop_test_root.zig"),
         .target = target,
@@ -2100,18 +2142,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     hosted_fk_drop_test_mod.addImport("usermgr_storage", hosted_fk_drop_usermgr_storage);
     const hosted_fk_drop_tests = b.addTest(.{
         .root_module = hosted_fk_drop_test_mod,
-        .filters = &.{"mounted hosted external-parent FK DROP publishes after parent ACK"},
+        .filters = &.{ "mounted hosted external-parent FK DROP publishes after parent ACK", "mounted hosted external-parent FK TRUNCATE", "owner catalog busy without index debt keeps provisioning retry until full reconciliation", "empty activation page validates source catalog without probing external parents" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-fk-drop-test", "Run mounted external-parent FK DROP retirement and restart")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_drop_tests).step);
+    b.step("antfly-api-hosted-fk-truncate-test", "Run mounted external-parent FK generation retirement and restart")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_drop_tests).step);
     const hosted_graph_truncate_tests = b.addTest(.{
         .root_module = hosted_fk_drop_test_mod,
-        .filters = &.{"mounted hosted graph TRUNCATE seals and CASCADE retires FK cohort across restart"},
+        .filters = &.{"mounted hosted graph TRUNCATE"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-api-hosted-graph-truncate-test", "Run mounted graph TRUNCATE seal and restart diagnostic")
+    b.step("antfly-api-hosted-graph-truncate-test", "Run public graph TRUNCATE seal and cold-restart recovery")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_graph_truncate_tests).step);
+    const hosted_truncate_fk_ci_tests = b.addTest(.{
+        .name = "antfly-hosted-truncate-fk-recovery",
+        .root_module = hosted_fk_drop_test_mod,
+        .filters = &.{ "mounted hosted external-parent FK DROP publishes after parent ACK", "mounted hosted external-parent FK TRUNCATE", "mounted hosted graph TRUNCATE", "owner catalog busy without index debt keeps provisioning retry until full reconciliation", "empty activation page validates source catalog without probing external parents" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    hosted_fk_recovery_install.dependOn(&b.addInstallArtifact(hosted_truncate_fk_ci_tests, .{}).step);
     const hosted_self_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_self_fk_test_root.zig"),
         .target = target,
@@ -2130,41 +2181,49 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     hosted_self_fk_usermgr_storage.addImport("antfly_root", hosted_self_fk_test_mod);
     hosted_self_fk_usermgr_storage.addImport("antfly_platform", antfly_imports.platform);
     hosted_self_fk_test_mod.addImport("usermgr_storage", hosted_self_fk_usermgr_storage);
-    const hosted_self_fk_guard_tests = b.addTest(.{
+    const hosted_self_fk_retry_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
-        .filters = &.{ "mounted hosted self-FK public admission remains guarded", "public ordinary self-FK publication remains guarded before metadata admission", "self-FK diagnostic retries only a proven durable precommit abort" },
+        .filters = &.{"self-FK retries only a proven durable precommit abort"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-api-hosted-self-fk-guard-test", "Run mounted public self-FK admission guard regression")
-        .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_guard_tests).step);
+    b.step("antfly-api-hosted-self-fk-retry-test", "Run self-FK proven durable precommit retry regression")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_retry_tests).step);
     const hosted_self_fk_diagnostic_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
-        .filters = &.{"mounted hosted self-FK ADD DROP restart diagnostic"},
+        .filters = &.{"mounted hosted self-FK ADD DROP restart"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-api-hosted-self-fk-diagnostic", "Opt-in mounted self-FK ADD/DROP/restart diagnostic; requires a bounded guard lift")
+    b.step("antfly-api-hosted-self-fk-test", "Run mounted public self-FK ADD/DROP/restart")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_diagnostic_tests).step);
     const hosted_self_fk_fault_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
         .filters = &.{"mounted hosted self-FK publication resumes after lost owner and metadata replies"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-api-hosted-self-fk-fault-diagnostic", "Opt-in mounted self-FK publication lost-reply recovery; requires a bounded guard lift")
+    b.step("antfly-api-hosted-self-fk-fault-test", "Run mounted self-FK publication lost-reply recovery")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_fault_tests).step);
     const hosted_self_fk_metadata_restart_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
         .filters = &.{"mounted hosted self-FK resumes after metadata and owner cold restart at parent ACK"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-api-hosted-self-fk-metadata-restart-diagnostic", "Opt-in mounted self-FK metadata and owner cold restart at parent ACK; requires a bounded guard lift")
+    b.step("antfly-api-hosted-self-fk-metadata-restart-test", "Run mounted self-FK metadata and owner cold restart at parent ACK")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_metadata_restart_tests).step);
     const hosted_self_fk_leader_transfer_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
         .filters = &.{"mounted hosted self-FK survives three-voter owner leadership transfer at ADD and DROP ACK"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-api-hosted-self-fk-leader-transfer-diagnostic", "Opt-in mounted three-voter self-FK ADD/DROP owner leadership transfer; requires a bounded guard lift")
+    b.step("antfly-api-hosted-self-fk-leader-transfer-test", "Run mounted three-voter self-FK ADD/DROP owner leadership transfer")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_leader_transfer_tests).step);
+    const hosted_self_fk_ci_tests = b.addTest(.{
+        .name = "antfly-hosted-self-fk-recovery",
+        .root_module = hosted_self_fk_test_mod,
+        // Exact positive proofs: never include the old guard-on assertions.
+        .filters = &.{ "mounted hosted self-FK ADD DROP restart", "mounted hosted self-FK publication resumes after lost owner and metadata replies", "mounted hosted self-FK resumes after metadata and owner cold restart at parent ACK", "mounted hosted self-FK survives three-voter owner leadership transfer at ADD and DROP ACK" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    hosted_fk_recovery_install.dependOn(&b.addInstallArtifact(hosted_self_fk_ci_tests, .{}).step);
     const lib_api_standalone_backup_restore_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{
@@ -2254,7 +2313,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-staged-restore-portable-terminal-test", "Prove large portable staged restore reaches durable publication").dependOn(&addFilteredTestRunArtifact(b, staged_restore_portable_terminal_tests).step);
     const rewrite_driver_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
-        .filters = &.{ "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners", "restore immutable rewrite failures are terminal", "restore cutover readiness waits without exponential retry" },
+        .filters = &.{ "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners", "staged restore native handoff", "restore immutable rewrite failures are terminal", "restore cutover readiness waits without exponential retry" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-rewrite-driver-test", "Run real retained-source rewrite, hidden owner recovery and failed-tail cancellation").dependOn(&addFilteredTestRunArtifact(b, rewrite_driver_tests).step);
@@ -2285,7 +2344,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_transactions_docid_tests = run_api_transactions_docid_tests,
         .run_api_table_writes_docid_tests = run_api_table_writes_docid_tests,
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_self_fk_guard_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_ci_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_ci_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_ci_tests }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

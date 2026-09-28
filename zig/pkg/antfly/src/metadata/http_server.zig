@@ -2071,9 +2071,17 @@ pub const MetadataHttpServer = struct {
         // This transport authenticates the calling service, not a setting
         // administrator. Never infer an admin grant from request JSON.
         const authority = @import("../system_catalog/setting_authority.zig");
-        const admin_grant = parsed.value == .setting_mutate or parsed.value == .policy_definition_mutate or parsed.value == .policy_publication_mutate or parsed.value == .policy_publication_begin or parsed.value == .fk_generation_publication_begin or parsed.value == .fk_generation_publication_mutate or parsed.value == .fk_initial_create_begin or parsed.value == .fk_initial_create_mutate;
+        const admin_grant = parsed.value.requiresAdministrativeGrant();
         const fk_publication_read = parsed.value == .fk_generation_publication_status or parsed.value == .fk_generation_publication_work or parsed.value == .fk_generation_publication_decision or parsed.value == .fk_generation_publication_source_decision or parsed.value == .fk_initial_create_prepare or parsed.value == .fk_initial_child_decision or parsed.value == .fk_initial_create_status or parsed.value == .fk_generation_table_locked or parsed.value == .fk_initial_create_work or parsed.value == .fk_initial_parent_decision;
-        if (admin_grant or fk_publication_read or parsed.value == .setting_snapshot or parsed.value == .policy_snapshot or parsed.value == .policy_install_snapshot or parsed.value == .policy_publication_status or parsed.value == .policy_publication_work) {
+        // The status stamp contains no principal or policy body, but it still
+        // requires a real service token. In migration mode the host accepts
+        // tokenless legacy internal calls; this operation must not use that
+        // exception. A supplied token is verified by the host middleware even
+        // during migration.
+        if (parsed.value == .policy_publication_status and
+            ctx.header(@import("../api/internal_service_auth.zig").header_name) == null)
+            return ctx.status(403).text("policy publication status requires an authenticated service");
+        if (admin_grant or parsed.value.requiresSettingAuthorityReadGrant()) {
             if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null) return ctx.status(403).text("setting authority requires an authenticated service");
             authority.verify(
                 self.setting_authority_secret orelse return ctx.status(403).text("setting authority unavailable"),
@@ -2095,7 +2103,7 @@ pub const MetadataHttpServer = struct {
         context.row_policy_install_authority = parsed.value == .policy_install_snapshot or parsed.value == .policy_publication_status or parsed.value == .policy_publication_work or parsed.value == .policy_publication_mutate or parsed.value == .policy_publication_begin;
         context.fk_generation_publication_authority = fk_publication_read or parsed.value == .fk_generation_publication_begin or parsed.value == .fk_generation_publication_mutate or parsed.value == .fk_initial_create_begin or parsed.value == .fk_initial_create_mutate;
         const callback = self.source.vtable.system_catalog orelse return ctx.status(426).text("catalog upgrade required");
-        const identity_reader = if (parsed.value != .mutate and parsed.value != .setting_mutate and parsed.value != .policy_definition_mutate and parsed.value != .policy_publication_mutate and parsed.value != .policy_publication_begin and parsed.value != .fk_generation_publication_begin and parsed.value != .fk_generation_publication_mutate and parsed.value != .fk_initial_create_begin and parsed.value != .fk_initial_create_mutate)
+        const identity_reader = if (!parsed.value.isMutation())
             self.source.vtable.catalog_identity orelse return ctx.status(426).text("catalog identity upgrade required")
         else
             null;
@@ -5312,6 +5320,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     const Fixture = struct {
         reads: usize = 0,
         replace_identity: bool = false,
+        status_reads: usize = 0,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return error.TestUnexpectedResult;
         }
@@ -5330,8 +5339,14 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
                     "11111111111111111111111111111111".*,
             };
         }
-        fn catalog(_: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, _: system_catalog.Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: system_catalog.Call) ![]u8 {
             try context.ensureActive();
+            if (call == .policy_publication_status) {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.status_reads += 1;
+                try std.testing.expect(context.row_policy_install_authority);
+                try std.testing.expect(!context.setting_admin);
+            }
             return alloc.dupe(u8, "{}");
         }
     };
@@ -5368,6 +5383,31 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
             try std.testing.expectEqualStrings("11111111111111111111111111111111", response.headers.get("x-antfly-catalog-metadata-incarnation").?);
         }
     }
+    // The principal-independent publication stamp needs a service token, but
+    // no body-bound setting grant. A tokenless legacy-migration request cannot
+    // acquire even this narrow read authority.
+    const status_body = try std.json.Stringify.valueAlloc(alloc, system_catalog.Call{ .policy_publication_status = 7 }, .{});
+    defer alloc.free(status_body);
+    var status_request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
+    defer status_request.deinit();
+    try status_request.setBody(status_body);
+    try status_request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+    try status_request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+    try status_request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+    var unauthenticated_ctx = httpx.Context.init(alloc, std.testing.io, &status_request);
+    defer unauthenticated_ctx.deinit();
+    var unauthenticated = try server.metadataSystemCatalog(&unauthenticated_ctx);
+    defer unauthenticated.deinit();
+    try std.testing.expectEqual(@as(u16, 403), unauthenticated.status.code);
+    try std.testing.expectEqual(@as(usize, 0), fixture.status_reads);
+    vtable.catalog_identity = Fixture.identity;
+    try status_request.headers.append(@import("../api/internal_service_auth.zig").header_name, "host-verified-service-token");
+    var authenticated_ctx = httpx.Context.init(alloc, std.testing.io, &status_request);
+    defer authenticated_ctx.deinit();
+    var authenticated = try server.metadataSystemCatalog(&authenticated_ctx);
+    defer authenticated.deinit();
+    try std.testing.expectEqual(@as(u16, 200), authenticated.status.code);
+    try std.testing.expectEqual(@as(usize, 1), fixture.status_reads);
     // A caller cannot smuggle the native setting-admin capability through
     // the service-authenticated catalog JSON route.
     const admin_body = try std.json.Stringify.valueAlloc(alloc, system_catalog.Call{ .setting_mutate = .{ .drop = "app.tenant" } }, .{});

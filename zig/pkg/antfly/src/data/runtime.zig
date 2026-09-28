@@ -31,6 +31,7 @@ const internal_service_auth = @import("../api/internal_service_auth.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const process_memory_budget = @import("../common/process_memory_budget.zig");
 const runtime_status = @import("../api/runtime_status.zig");
+const artifact_publication_dispatch = @import("../storage/artifact_publication_dispatch.zig");
 const metadata_runtime_status_protocol = @import("../metadata/runtime_status_protocol.zig");
 const api_http_test_runtime = if (@import("builtin").is_test) @import("../api/http_test_runtime.zig") else struct {};
 
@@ -1069,6 +1070,8 @@ const DataPublicHttpRuntime = struct {
 const DataDescriptorFactory = struct {
     alloc: std.mem.Allocator,
     fallback_store: *raft_engine.core.MemoryStorage,
+    retirement_root: ?[]const u8 = null,
+    retirement_io: ?std.Io = null,
     peer_sets: std.AutoHashMapUnmanaged(u64, []u64) = .empty,
     initial_voter_sets: std.AutoHashMapUnmanaged(u64, []u64) = .empty,
     group_stores: std.AutoHashMapUnmanaged(u64, *raft_engine.core.MemoryStorage) = .empty,
@@ -1099,8 +1102,25 @@ const DataDescriptorFactory = struct {
             .vtable = &.{
                 .build_descriptor = buildDescriptor,
                 .free_descriptor = freeDescriptor,
+                .accepts_record = acceptsRecord,
             },
         };
+    }
+
+    fn acceptsRecord(ptr: *anyopaque, record: antfly.raft.ReplicaRecord) bool {
+        const self: *DataDescriptorFactory = @ptrCast(@alignCast(ptr));
+        return !(self.blocksRetiredReplica(record) catch return false);
+    }
+
+    fn blocksRetiredReplica(self: *DataDescriptorFactory, record: antfly.raft.ReplicaRecord) !bool {
+        const root = self.retirement_root orelse return false;
+        const io = self.retirement_io orelse return error.BackendRuntimeUnavailable;
+        return @import("fk_retirement_worker.zig").blocksReplica(self.alloc, io, root, .{
+            .group_id = record.group_id,
+            .replica_id = record.replica_id,
+            .node_id = record.local_node_id,
+            .root_generation = record.initial_fk_root_generation,
+        });
     }
 
     fn replacePeerSets(
@@ -1233,6 +1253,11 @@ const RaftTableApplyStateMachine = struct {
         RetainedEffectsCursorMismatch,
         InvalidRetainedEffectsAdmission,
         InvalidOnlineSourceCommand,
+        InvalidArtifactCatalogCommand,
+        ArtifactCatalogEpochChanged,
+        ArtifactCatalogScopeChanged,
+        RowPolicyTopologyUnsupported,
+        OnlineMergeArtifactTailsUnsupported,
         OnlineSourceScopeChanged,
         InvalidSourceSnapshot,
         SourceSnapshotCutMismatch,
@@ -1311,6 +1336,11 @@ const RaftTableApplyStateMachine = struct {
                 if (err == @field(@import("../api/relational_integrity_errors.zig").Error, field.name)) return @field(ExpectedApplyFailure, field.name);
             }
             return switch (err) {
+                error.InvalidArtifactCatalogCommand => .InvalidArtifactCatalogCommand,
+                error.ArtifactCatalogEpochChanged => .ArtifactCatalogEpochChanged,
+                error.ArtifactCatalogScopeChanged => .ArtifactCatalogScopeChanged,
+                error.RowPolicyTopologyUnsupported => .RowPolicyTopologyUnsupported,
+                error.OnlineMergeArtifactTailsUnsupported => .OnlineMergeArtifactTailsUnsupported,
                 error.InvalidMergePage => .InvalidMergePage,
                 error.MergePageSequenceGap => .MergePageSequenceGap,
                 error.MergePageRequired => .MergePageRequired,
@@ -1354,6 +1384,11 @@ const RaftTableApplyStateMachine = struct {
                 if (self == @field(ExpectedApplyFailure, field.name)) return @field(@import("../api/relational_integrity_errors.zig").Error, field.name);
             }
             return switch (self) {
+                .InvalidArtifactCatalogCommand => error.InvalidArtifactCatalogCommand,
+                .ArtifactCatalogEpochChanged => error.ArtifactCatalogEpochChanged,
+                .ArtifactCatalogScopeChanged => error.ArtifactCatalogScopeChanged,
+                .RowPolicyTopologyUnsupported => error.RowPolicyTopologyUnsupported,
+                .OnlineMergeArtifactTailsUnsupported => error.OnlineMergeArtifactTailsUnsupported,
                 .InvalidMergePage => error.InvalidMergePage,
                 .MergePageSequenceGap => error.MergePageSequenceGap,
                 .MergePageRequired => error.MergePageRequired,
@@ -1417,6 +1452,7 @@ const RaftTableApplyStateMachine = struct {
     /// Borrowed from the managed host, which applies the raw projection first.
     /// Its exact-index arbitration receipt also survives a delegate retry.
     topology_apply_store: ?*DataRaftApplyStore = null,
+
     applied_mutex: std.atomic.Mutex = .unlocked,
     applied_indexes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     retry_apply_checkpoints: std.AutoHashMapUnmanaged(u64, RetryApplyCheckpoint) = .empty,
@@ -1444,6 +1480,15 @@ const RaftTableApplyStateMachine = struct {
     read_barriers_retired_total: std.atomic.Value(u64) = .init(0),
     read_barriers_active: std.atomic.Value(u64) = .init(0),
     test_faults: TestFaults = .{},
+
+    fn admitMembership(ptr: *anyopaque, context: raft_engine.core.ProposalAdmission.Context) anyerror!void {
+        const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
+        const admission = @import("merge_membership_admission.zig");
+        if (!try admission.needsObservation(self.alloc, context.proposed_entries)) return;
+        const store = self.topology_apply_store orelse return error.MembershipChangeFenced;
+        const observation = store.observeMergeMembership(self.alloc, context.group_id) catch return error.MembershipChangeFenced;
+        try admission.check(self.alloc, observation, context);
+    }
 
     fn init(
         alloc: std.mem.Allocator,
@@ -2066,6 +2111,7 @@ const RaftTableApplyStateMachine = struct {
                                 @errorName(err),
                             });
                         } else if (err == error.RaftApplyWriterUnavailable or
+                            err == error.ArtifactCatalogDrift or
                             err == error.RetainedEffectsFull or
                             err == error.RowPolicyReadersActive or
                             err == error.OnlineSourcePinPending or
@@ -5224,6 +5270,13 @@ pub const DataServer = struct {
     /// Serializes desired-state snapshots while allowing the Raft progress
     /// thread to continue during blocking restore and catalog durability I/O.
     data_raft_reconcile_mutex: std.atomic.Mutex = .unlocked,
+    initial_fk_retirement_running: std.atomic.Value(bool) = .init(false),
+    initial_fk_retirement_last_at_ms: u64 = 0,
+    initial_fk_retirement_deadline_ns: u64 = 0,
+    initial_fk_retirement_recovery_cursor: @import("fk_retirement_worker.zig").RecoveryCursor = .{},
+    initial_fk_retirement_gc_cursor: @import("fk_retirement_worker.zig").RecoveryCursor = .{},
+    initial_fk_retirement_cursor: [256]u8 = @splat(0),
+    initial_fk_retirement_cursor_len: usize = 0,
     local_transition_mutex: std.atomic.Mutex = .unlocked,
     replicated_transition_action_lanes: TransitionActionLanes = .{},
     /// Protected by data_raft_mutex. Restart requires election in a new term,
@@ -5313,6 +5366,7 @@ pub const DataServer = struct {
     // Preparation may own up to 16 MiB per transaction. Bound concurrency as
     // well as queued observation bytes, independent of local shard count.
     relational_ttl_queue: antfly.db.coordinated_ttl.Queue = .{ .max_jobs = 4 },
+    artifact_publication_queue: artifact_publication_dispatch.Queue = .{},
     relational_ttl_completed: std.atomic.Value(u64) = .init(0),
     relational_ttl_expired: std.atomic.Value(u64) = .init(0),
     relational_ttl_failed: std.atomic.Value(u64) = .init(0),
@@ -5981,6 +6035,7 @@ pub const DataServer = struct {
         _ = owner_source.withRestoreDescriptorRecovery(.{ .ptr = self, .recover_fn = recoverRestoreDescriptor });
         _ = owner_source.withRemoteContent(self.api_server_cfg.remote_content);
         _ = owner_source.withCoordinatedTtl(.{ .ptr = self, .expire_fn = expireRelationalRows });
+        _ = owner_source.withArtifactPublications(.{ .ptr = self, .enqueue_fn = enqueueArtifactPublication });
         _ = owner_source.withSecretStore(self.api_server_cfg.secret_store);
         if (comptime linked_storage) {
             if (self.storageKernelContextHandle()) |handle|
@@ -6025,9 +6080,243 @@ pub const DataServer = struct {
                 return error.ReplicaCatalogUnavailable;
             }
         }
-        const owner_source = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
-        observation.record = try owner_source.readInitialChildRetirementRecord(alloc, group_id);
+        if (comptime linked_storage) {
+            const owner_source = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+            observation.record = try owner_source.readInitialChildRetirementRecord(alloc, group_id);
+        } else {
+            const group_path = try std.fmt.allocPrint(alloc, "{s}/group-{d}", .{ self.write_source.replica_root_dir, group_id });
+            defer alloc.free(group_path);
+            observation.record = try self.readColdInitialFkRecord(alloc, group_path);
+        }
         return observation;
+    }
+
+    fn prepareInitialFkRetirementOwner(self: *DataServer) !void {
+        // A physical implementation already owns native routes and runtime.
+        // Only the linked consumer requires an opaque storage owner source.
+        if (comptime linked_storage) _ = try self.ensureKernelOwnerSource();
+    }
+
+    fn readColdInitialFkRecord(self: *DataServer, alloc: std.mem.Allocator, group_path: []const u8) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+        if (comptime linked_storage) {
+            const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+            return try owner.readColdInitialChildRetirementRecordAtPath(alloc, group_path);
+        } else {
+            const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+            const io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+            const path = try std.fs.path.join(alloc, &.{ group_path, "table-db" });
+            defer alloc.free(path);
+            _ = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => return null,
+                else => return err,
+            };
+            var db = try antfly.db.DB.open(alloc, path, .{
+                .backend_runtime = runtime,
+                .open_mode = .query_readonly,
+                .primary_only_readonly = true,
+                .start_index_workers = false,
+                .start_optional_runtimes = false,
+            });
+            defer db.close();
+            return try db.readInitialChildPublicationRecord();
+        }
+    }
+
+    fn cancelColdInitialFkRecord(self: *DataServer, alloc: std.mem.Allocator, group_path: []const u8, expected: @import("../storage/db/relational_initial_child_publication.zig").Record, cancel_revision: u64) !void {
+        if (comptime linked_storage) {
+            const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+            return owner.cancelColdInitialChildRetirementAtPath(alloc, group_path, expected, cancel_revision);
+        } else {
+            const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+            const io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+            const path = try std.fs.path.join(alloc, &.{ group_path, "table-db" });
+            defer alloc.free(path);
+            _ = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => return,
+                else => return err,
+            };
+            var db = try antfly.db.DB.open(alloc, path, .{ .backend_runtime = runtime, .open_mode = .writer, .start_index_workers = false, .start_optional_runtimes = false });
+            defer db.close();
+            try db.cancelColdInitialChildForRetirement(expected, cancel_revision);
+        }
+    }
+
+    fn acquireInitialFkRetirement(ptr: *anyopaque, _: @import("fk_retirement_worker.zig").Ticket) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (!self.data_raft_reconcile_mutex.tryLock()) return error.ReplicaRetirementRecoveryInProgress;
+    }
+
+    fn releaseInitialFkRetirement(ptr: *anyopaque, _: @import("fk_retirement_worker.zig").Ticket) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        self.data_raft_reconcile_mutex.unlock();
+    }
+
+    fn initialFkReplicaMatches(record: antfly.raft.ReplicaRecord, ticket: @import("fk_retirement_worker.zig").Ticket) bool {
+        return record.group_id == ticket.replica.group_id and record.replica_id == ticket.replica.replica_id and
+            record.local_node_id == ticket.replica.node_id and record.initial_fk_root_generation == ticket.replica.root_generation;
+    }
+
+    fn observeInitialFkRetirement(ptr: *anyopaque, ticket: @import("fk_retirement_worker.zig").Ticket, group_path: []const u8) !@import("fk_retirement_worker.zig").Observation {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const worker = @import("fk_retirement_worker.zig");
+        const raft = self.data_raft orelse return error.RaftRuntimeUnavailable;
+        var point = blk: {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            break :blk (try raft.host.http_host.host.readReplicaCatalogRecord(self.alloc, ticket.replica.group_id)) orelse
+                return error.ReplicaCatalogUnavailable;
+        };
+        defer point.deinit(self.alloc);
+        const replica: ?worker.ReplicaIdentity = if (point.record) |record| .{
+            .group_id = record.group_id,
+            .replica_id = record.replica_id,
+            .node_id = record.local_node_id,
+            .root_generation = record.initial_fk_root_generation,
+        } else null;
+        return .{ .replica = replica, .publication = try self.readColdInitialFkRecord(self.alloc, group_path) };
+    }
+
+    fn quiesceInitialFkRetirement(ptr: *anyopaque, ticket: @import("fk_retirement_worker.zig").Ticket, action: @import("fk_retirement_worker.zig").Action) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const raft = self.data_raft orelse return error.RaftRuntimeUnavailable;
+        {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            var point = (try raft.host.http_host.host.readReplicaCatalogRecord(self.alloc, ticket.replica.group_id)) orelse
+                return error.ReplicaCatalogUnavailable;
+            defer point.deinit(self.alloc);
+            const record = point.record orelse return error.InitialFkRetirementProofUnavailable;
+            if (!initialFkReplicaMatches(record, ticket)) return error.InitialFkRetirementWorkChanged;
+            try raft.host.http_host.host.retireReplicaPreservingCatalog(ticket.replica.group_id);
+            try raft.host.apply(.{ .replica_intent = .{ .remove_group = ticket.replica.group_id } });
+        }
+        // Recompute the next authoritative placement pass; stale cached hidden
+        // intents must not recreate a retired exact generation after ACK.
+        self.freeCachedDataRaftLocalIntents();
+        try self.liveRuntimeWriteSource().withQuiescedInitialFkReplica(self.alloc, ticket.replica.group_id, .{
+            .child_table_id = ticket.replica.child_table_id,
+            .plan_id = ticket.replica.plan_id,
+            .plan_digest = ticket.replica.plan_digest,
+        }, .{ .ptr = action.ptr, .run = action.run });
+    }
+
+    fn cancelHiddenInitialFkRetirement(ptr: *anyopaque, ticket: @import("fk_retirement_worker.zig").Ticket, group_path: []const u8, expected: @import("../storage/db/relational_initial_child_publication.zig").Record) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try self.cancelColdInitialFkRecord(self.alloc, group_path, expected, ticket.cancel_revision);
+    }
+
+    fn removeInitialFkRetirementCatalog(ptr: *anyopaque, ticket: @import("fk_retirement_worker.zig").Ticket) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const raft = self.data_raft orelse return error.RaftRuntimeUnavailable;
+        lockAtomic(&self.data_raft_mutex);
+        defer self.data_raft_mutex.unlock();
+        var point = (try raft.host.http_host.host.readReplicaCatalogRecord(self.alloc, ticket.replica.group_id)) orelse
+            return error.ReplicaCatalogUnavailable;
+        defer point.deinit(self.alloc);
+        const record = point.record orelse return;
+        // An unlinked journal is sufficient to ACK its old generation. Never
+        // remove a replacement admitted after that durable unlink boundary.
+        if (!initialFkReplicaMatches(record, ticket)) return;
+        try raft.host.http_host.host.retireReplicaPreservingCatalog(ticket.replica.group_id);
+        try raft.host.apply(.{ .replica_intent = .{ .remove_group = ticket.replica.group_id } });
+        _ = try raft.host.http_host.host.commitReplicaCatalog(point.token, &.{}, &.{ticket.replica.group_id});
+    }
+
+    fn acknowledgeInitialFkRetirement(ptr: *anyopaque, signed: @import("../metadata/fk_initial_retirement_auth.zig").SignedReceipt) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const remote = self.remote_metadata orelse return error.MetadataUnavailable;
+        const wire = @import("../metadata/fk_initial_retirement_wire.zig");
+        const request: wire.AckRequest = .{ .signed = signed };
+        const bytes = try RemoteMetadataSource.remoteSystemCatalog(remote, self.alloc, .{ .cancellation = .fromAtomic(&self.background_jobs_shutdown), .deadline_ns = @min(self.initial_fk_retirement_deadline_ns, platform_time.monotonicNs() +| 100 * std.time.ns_per_ms) }, .{ .fk_initial_retirement_ack = request });
+        defer self.alloc.free(bytes);
+        var response = try std.json.parseFromSlice(wire.AckResponse, self.alloc, bytes, .{});
+        defer response.deinit();
+        try response.value.validate(request);
+    }
+
+    fn continueInitialFkRetirement(ptr: *anyopaque) bool {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return !self.background_jobs_shutdown.load(.acquire) and platform_time.monotonicNs() < self.initial_fk_retirement_deadline_ns;
+    }
+
+    fn runInitialFkRetirementRound(self: *DataServer) !void {
+        if (self.data_raft == null or !self.store_registration_confirmed) return;
+        const remote = self.remote_metadata orelse return;
+        const registration = self.store_registration orelse return;
+        if (self.initial_fk_retirement_running.swap(true, .acq_rel)) return;
+        defer self.initial_fk_retirement_running.store(false, .release);
+        const now = self.backgroundMonotonicMs();
+        if (self.initial_fk_retirement_last_at_ms != 0 and now -| self.initial_fk_retirement_last_at_ms < 5000) return;
+        self.initial_fk_retirement_last_at_ms = now;
+        self.initial_fk_retirement_deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_s;
+        var snapshot = (try RemoteMetadataSource.remoteLinearizableSnapshot(remote, .{ .cancellation = .fromAtomic(&self.background_jobs_shutdown), .deadline_ns = self.initial_fk_retirement_deadline_ns })) orelse return error.MetadataUnavailable;
+        defer freeAdminSnapshotOwned(self.alloc, &snapshot);
+        const root_incarnation = self.confirmedHiddenInitialStoreRoot(&snapshot, registration);
+        if (root_incarnation == 0) return;
+        const metadata_incarnation = try RemoteMetadataSource.requireValidMetadataIncarnation(snapshot.status.metadata_incarnation);
+        const runtime = try self.ensureBackendRuntime();
+        const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+        const root = try @import("../storage/db/root_signing_identity.zig").load(self.alloc, io, self.write_source.replica_root_dir);
+        if (root.root_incarnation != root_incarnation) return error.StoreRootIdentityUnconfirmed;
+        const registered = for (snapshot.stores) |store| {
+            if (store.store_id == registration.store_id and store.node_id == registration.node_id) break store;
+        } else return error.StoreRootIdentityUnconfirmed;
+        if (!std.mem.eql(u8, &registered.replica_root_public_key, &root.public_key)) return error.StoreRootSigningIdentityUnconfirmed;
+        try self.prepareInitialFkRetirementOwner();
+        const wire = @import("../metadata/fk_initial_retirement_wire.zig");
+        const page_request: wire.PageRequest = .{
+            .store_id = registration.store_id,
+            .root_incarnation = root_incarnation,
+            .limit = 8,
+            .after_key = if (self.initial_fk_retirement_cursor_len == 0) null else self.initial_fk_retirement_cursor[0..self.initial_fk_retirement_cursor_len],
+        };
+        const signed_page = try wire.SignedPageRequest.sign(.{
+            .metadata_incarnation = metadata_incarnation,
+            .node_id = registration.node_id,
+            .store_id = registration.store_id,
+            .root_incarnation = root_incarnation,
+            .public_key = root.public_key,
+        }, self.reporter_incarnation, page_request, root.seed);
+        // Page authorization proves enrollment before any local destructive
+        // action, including replay of a durable prepared journal.
+        const bytes = RemoteMetadataSource.remoteSystemCatalog(remote, self.alloc, .{ .cancellation = .fromAtomic(&self.background_jobs_shutdown), .deadline_ns = self.initial_fk_retirement_deadline_ns }, .{ .fk_initial_retirement_signed_page = signed_page }) catch |err| switch (err) {
+            // Enrollment is intentionally an administrator action. Ordinary
+            // stores without hidden replicas need not enroll, so this is an
+            // inactive maintenance lane, not an operational failure.
+            error.StoreRootEnrollmentChanged => return,
+            else => return err,
+        };
+        defer self.alloc.free(bytes);
+        var page = try std.json.parseFromSlice(wire.PageResponse, self.alloc, bytes, .{});
+        defer page.deinit();
+        try page.value.validate(snapshot.status.metadata_group_id, page_request);
+        var worker: @import("fk_retirement_worker.zig").Worker = .{
+            .alloc = self.alloc,
+            .io = io,
+            .replica_root_dir = self.write_source.replica_root_dir,
+            .node_id = registration.node_id,
+            .store_id = registration.store_id,
+            .reporter_incarnation = self.reporter_incarnation,
+            .metadata_incarnation = metadata_incarnation,
+            .root = root,
+            .continue_work = .{ .ptr = self, .check = continueInitialFkRetirement },
+            .recovery_cursor = &self.initial_fk_retirement_recovery_cursor,
+            .gc_cursor = &self.initial_fk_retirement_gc_cursor,
+            .callbacks = .{ .ptr = self, .acquire = acquireInitialFkRetirement, .release = releaseInitialFkRetirement, .observe = observeInitialFkRetirement, .cancel_hidden = cancelHiddenInitialFkRetirement, .quiesce = quiesceInitialFkRetirement, .remove_catalog_exact = removeInitialFkRetirementCatalog, .acknowledge = acknowledgeInitialFkRetirement },
+        };
+        _ = worker.recover(8) catch |err| blk: {
+            std.log.warn("initial FK retirement recovery deferred err={s}", .{@errorName(err)});
+            break :blk 0;
+        };
+        for (page.value.items) |ticket| worker.process(ticket) catch |err| {
+            std.log.warn("initial FK retirement deferred group={d} err={s}", .{ ticket.replica.group_id, @errorName(err) });
+        };
+        _ = worker.collectTrash(.{}) catch |err| blk: {
+            std.log.warn("initial FK retirement trash collection deferred err={s}", .{@errorName(err)});
+            break :blk @import("fk_retirement_worker.zig").Worker.GcResult{};
+        };
+        self.initial_fk_retirement_cursor_len = if (page.value.next_key) |next| next.len else 0;
+        if (page.value.next_key) |next| @memcpy(self.initial_fk_retirement_cursor[0..next.len], next);
     }
 
     fn fetchRowPolicyInstallSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../system_catalog/policies.zig").InstallRequest) ![]u8 {
@@ -6070,6 +6359,7 @@ pub const DataServer = struct {
     pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
         var api_server_cfg = self.api_server_cfg;
+        if (self.remote_metadata != null) api_server_cfg.configureRemoteCatalogPublicationAuthority();
         if (self.data_request_lifecycle_hook != null) {
             if (api_server_cfg.query_result_lifecycle_hook != null)
                 return error.AmbiguousQueryResultLifecycleOwner;
@@ -6315,6 +6605,160 @@ pub const DataServer = struct {
         const ttl_port: antfly.db.coordinated_ttl.Port = .{ .ptr = self, .expire_fn = expireRelationalRows };
         _ = self.write_source.withCoordinatedTtl(ttl_port);
         if (self.data_raft_apply) |apply_sm| _ = apply_sm.write_source.withCoordinatedTtl(ttl_port);
+    }
+
+    fn enqueueArtifactPublication(ptr: *anyopaque, group_id: u64, namespace: [24]u8, command: []const u8) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        const runtime = self.backend_runtime orelse return error.ArtifactCatalogDrift;
+        if (runtime.durable_jobs.executesInline()) return error.ArtifactCatalogDrift;
+        const io = runtime.io() orelse return error.ArtifactCatalogDrift;
+        if (self.haWriteGate()) |gate| try gate.check();
+        if (self.group_leadership_source) |leadership| if (!leadership.isLocalLeader(group_id)) return error.NotLeader;
+        const recovery = try @import("../storage/db/artifact_publication_transport.zig").RecoveryHint.decode(command);
+        const class: artifact_publication_dispatch.Queue.Class = if (recovery != null or @import("../storage/db/artifact_publication_transport_codec.zig").controlAdmissionHint(command)) .control else .producer;
+        const proposal = (try self.artifact_publication_queue.reserveClass(io, self.alloc, group_id, namespace, command, class)) orelse return;
+        errdefer self.artifact_publication_queue.release(io, proposal);
+        const job = try self.alloc.create(ArtifactPublicationJob);
+        errdefer self.alloc.destroy(job);
+        job.* = .{ .server = self, .proposal = proposal, .io = io };
+        try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = job, .run = runArtifactPublicationJob, .deinit = deinitArtifactPublicationJob });
+    }
+
+    const ArtifactPublicationJob = struct {
+        server: *DataServer,
+        proposal: *artifact_publication_dispatch.Queue.Job,
+        io: std.Io,
+        owns_proposal: bool = true,
+        upload_root: ?[32]u8 = null,
+        publication_digest: [32]u8 = @splat(0),
+        next_chunk: usize = 0,
+        table_name: ?[]u8 = null,
+    };
+
+    fn runArtifactPublicationJob(ptr: *anyopaque) !void {
+        const job: *ArtifactPublicationJob = @ptrCast(@alignCast(ptr));
+        const self = job.server;
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (self.haWriteGate()) |gate| try gate.check();
+        const publication = @import("../storage/db/artifact_publication.zig");
+        const codec = @import("../storage/db/artifact_publication_transport_codec.zig");
+        const transport = @import("../storage/db/artifact_publication_transport.zig");
+        // Resolve from current authoritative routing only after leaving the
+        // producer stack. The job owns no resident DB or cache lease.
+        const expected_namespace = publication.namespaceFromBytes(job.proposal.namespace);
+        if (job.table_name) |table_name| {
+            // Successor slices revalidate one compact route, not an entire
+            // admin catalog per pair of chunks. No routing snapshot is kept
+            // across network waits or a scheduling handoff.
+            const route_snapshot = try antfly.public_api.table_catalog.routedGroupIdSnapshotUntil(self.alloc, self.write_source.catalog, table_name, job.proposal.group_id, null);
+            const route = route_snapshot.route orelse return error.IdentityNamespaceMismatch;
+            if (route.identity_namespace.table_id != expected_namespace.table_id or
+                route.identity_namespace.shard_id != expected_namespace.shard_id or
+                route.identity_namespace.range_id != expected_namespace.range_id) return error.IdentityNamespaceMismatch;
+        } else {
+            var snapshot = try self.write_source.catalog.adminSnapshot();
+            defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
+            const range = findRangeByGroupId(snapshot.ranges, job.proposal.group_id) orelse return error.IdentityNamespaceMismatch;
+            if (!identityNamespaceFromRange(range).eql(expected_namespace)) return error.IdentityNamespaceMismatch;
+            const table = findTableById(snapshot.tables, range.table_id) orelse return error.TableNotFound;
+            job.table_name = try self.alloc.dupe(u8, table.name);
+        }
+        const table_name = job.table_name.?;
+        // Until the native publication apply path is installed, do not
+        // substitute a Raft-shaped receipt for a standalone owner's clock.
+        if (self.data_raft == null) return error.ArtifactCatalogDrift;
+        if (try transport.RecoveryHint.decode(job.proposal.command)) |hint| {
+            if (!std.mem.eql(u8, &hint.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = hint.request(), .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            return;
+        }
+        const count = (job.proposal.command.len + codec.chunk_bytes - 1) / codec.chunk_bytes;
+        // The queue already owns the compact bytes. Hash and send one bounded
+        // chunk at a time; no whole-command JSON/base64 expansion is allocated.
+        if (job.upload_root == null) {
+            // Decode/hash once per owned attempt, not once per scheduling
+            // slice. Successors retain only this compact root and cursor.
+            var decoded = try codec.decodeBorrowed(self.alloc, job.proposal.command);
+            defer decoded.deinit();
+            const command = decoded.command;
+            // decodeBorrowed already validates structure and authenticates
+            // publication_digest against all command bytes. Reuse that digest
+            // instead of hashing a maximum-size payload two more times here.
+            if (!std.mem.eql(u8, &command.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
+            if (job.proposal.command.len <= codec.chunk_bytes) {
+                try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = command, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+                return;
+            }
+            var hashes: [codec.max_chunks]transport.Digest = undefined;
+            for (0..count) |ordinal| {
+                const offset = ordinal * codec.chunk_bytes;
+                hashes[ordinal] = transport.chunkDigest(ordinal, job.proposal.command[offset..@min(offset + codec.chunk_bytes, job.proposal.command.len)]);
+            }
+            const begin: transport.Request = .{ .action = .begin, .namespace = command.namespace, .publication_digest = command.publication_digest, .command_digest = command.publication_digest, .encoded_len = @intCast(job.proposal.command.len), .chunk_hashes = hashes[0..count], .control = command.mode != .publish };
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = begin, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            job.upload_root = begin.proposedManifest().root();
+            job.publication_digest = command.publication_digest;
+        }
+        const root = job.upload_root.?;
+        const base64 = try self.alloc.alloc(u8, std.base64.standard.Encoder.calcSize(codec.chunk_bytes));
+        defer self.alloc.free(base64);
+        var slice_chunks: usize = 0;
+        while (job.next_chunk < count) {
+            if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+            if (slice_chunks == 2) {
+                // Tail submission yields the maintenance lane while keeping
+                // the same queue admission and owned bytes. On pressure keep
+                // this exact cursor; never restart a completed upload prefix.
+                const runtime = self.backend_runtime orelse return error.Canceled;
+                if (!runtime.durable_jobs.isAccepting()) return error.Canceled;
+                const owner = try self.dataServerBackgroundOwnerId(runtime);
+                if (submitArtifactPublicationSuccessor(job, runtime, owner)) return;
+                try job.io.sleep(.fromMilliseconds(10), .awake);
+                // A full scheduler may count this running job against its
+                // admission limit. Progress in place after yielding rather
+                // than waiting forever for our own slot to become free.
+                slice_chunks = 0;
+                continue;
+            }
+            const ordinal = job.next_chunk;
+            const offset = ordinal * codec.chunk_bytes;
+            const chunk = job.proposal.command[offset..@min(offset + codec.chunk_bytes, job.proposal.command.len)];
+            const encoded = std.base64.standard.Encoder.encode(base64, chunk);
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = job.proposal.namespace, .publication_digest = job.publication_digest, .manifest_root = root, .ordinal = @intCast(ordinal), .chunk_base64 = encoded }, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            job.next_chunk += 1;
+            slice_chunks += 1;
+        }
+        try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = .{ .action = .finalize, .namespace = job.proposal.namespace, .publication_digest = job.publication_digest, .manifest_root = root }, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+    }
+
+    fn submitArtifactPublicationSuccessor(job: *ArtifactPublicationJob, runtime: *backend_runtime_mod.BackendRuntime, owner: u64) bool {
+        const self = job.server;
+        const successor = self.alloc.create(ArtifactPublicationJob) catch return false;
+        successor.* = job.*;
+        job.owns_proposal = false;
+        runtime.durable_jobs.submit(.{
+            .owner_id = owner,
+            .class = .maintenance,
+            .ptr = successor,
+            .run = runArtifactPublicationJob,
+            .deinit = deinitArtifactPublicationJob,
+        }) catch {
+            job.owns_proposal = true;
+            self.alloc.destroy(successor);
+            return false;
+        };
+        return true;
+    }
+
+    fn deinitArtifactPublicationJob(ptr: *anyopaque) void {
+        const job: *ArtifactPublicationJob = @ptrCast(@alignCast(ptr));
+        const self = job.server;
+        if (job.owns_proposal) {
+            if (job.table_name) |name| self.alloc.free(name);
+            self.artifact_publication_queue.release(job.io, job.proposal);
+        }
+        self.alloc.destroy(job);
     }
 
     fn expireRelationalRows(ptr: *anyopaque, request: antfly.db.coordinated_ttl.Request) !u32 {
@@ -8483,6 +8927,9 @@ pub const DataServer = struct {
         // Durable cleanup epochs survive transient allocation/queue failures;
         // the control loop is their allocation-free watchdog.
         self.write_source.maintainDroppedTableRecovery();
+        self.runInitialFkRetirementRound() catch |err| {
+            std.log.warn("initial FK retirement maintenance deferred err={s}", .{@errorName(err)});
+        };
         self.maintainHATerminalReclamation(now_ns);
         if (self.haStandbyReplicationRetryDue(now_ns)) {
             if (self.runHAStandbyReplicationRound()) |_| {
@@ -8757,11 +9204,14 @@ pub const DataServer = struct {
             apply_sm.deinit();
             self.alloc.destroy(apply_sm);
         }
+        // Any explicitly constructed owner belongs to DataServer, independent
+        // of the compiler unit's storage boundary. Native reconciliation does
+        // not construct one, but teardown must honor ownership if present.
+        if (self.kernel_owner_source) |owner_source| {
+            owner_source.deinit();
+            self.alloc.destroy(owner_source);
+        }
         if (comptime linked_storage) {
-            if (self.kernel_owner_source) |owner_source| {
-                owner_source.deinit();
-                self.alloc.destroy(owner_source);
-            }
             if (self.owner_apply_control_lease) |*lease| lease.release();
             self.owner_apply_control_lease = null;
             if (self.storage_kernel_context) |*context| context.deinit();
@@ -8809,6 +9259,7 @@ pub const DataServer = struct {
         // Owner jobs drained before caches; native callbacks have now stopped
         // too, so no admission can race this final assertion/reclamation.
         self.relational_ttl_queue.deinit();
+        self.artifact_publication_queue.deinit();
         if (self.owned_incoming_graph_route_store) |*store| store.deinit();
         if (self.owned_incoming_graph_route_backend) |*backend| backend.close();
         if (self.remote_metadata) |remote_metadata| {
@@ -8820,6 +9271,8 @@ pub const DataServer = struct {
             self.alloc.destroy(executor);
             self.distributed_read_http_executor = null;
         }
+        self.initial_fk_retirement_recovery_cursor.deinit();
+        self.initial_fk_retirement_gc_cursor.deinit();
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.query_io_impl) |*io_impl| io_impl.deinit();
         self.ha_admin_server = null;
@@ -9964,14 +10417,6 @@ pub const DataServer = struct {
         try context.ensureActive();
         try request.validate();
         if (request.ownerGroup() != group_id) return error.OnlineSourceScopeChanged;
-        // The artifact catalog is still replica-local. Even a singleton group
-        // can add a learner after admission, so a point-in-time ConfState
-        // probe cannot certify the source and receiver for the lifetime of an
-        // online merge. Keep distributed document and relational merges on the
-        // guarded ordinary path until a Raft-ordered catalog and membership
-        // barrier covers both groups. Native standalone rewrites are separate.
-        if (request.scope.fence.role == .merge_source)
-            return onlineMergeRaftIneligibleAdmission(alloc, request);
         // Capture leader authority and every applying member, including joint
         // voters and learners. Never hold the host mutex across network I/O.
         const authority = blk: {
@@ -10002,6 +10447,9 @@ pub const DataServer = struct {
             // merge should be selected. A positively observed older peer is.
             if (!try onlineMergePeerEligible(version)) protocol_supported = false;
         }
+        // Preview only: the persisted metadata attempt pins this inventory.
+        // The actual payload is committed atomically with source admission or
+        // receiver acceptance, never as an independently expiring seal.
         // The owner read performs ReadIndex before observing durable counters.
         const json = try source.onlineMergeIo(alloc, group_id, table_name, request, context);
         defer alloc.free(json);
@@ -10114,19 +10562,35 @@ pub const DataServer = struct {
         const retirement = @import("../storage/db/relational_integrity_generation_retirement.zig");
         try context.ensureActive();
         try input.validate(group_id);
-        const leader = blk: {
+        const raft_leader = blk: {
             lockAtomic(&self.data_raft_mutex);
             defer self.data_raft_mutex.unlock();
-            const raft = self.data_raft orelse return error.GroupLeaderUnavailable;
+            const raft = self.data_raft orelse break :blk null;
             if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
             const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
-            break :blk .{ .node_id = raft.host.http_host.host.cfg.local_node_id, .term = status.hard.current_term };
+            break :blk @as(?struct { node_id: u64, term: u64 }, .{ .node_id = raft.host.http_host.host.cfg.local_node_id, .term = status.hard.current_term });
         };
-        try self.waitDataReadSafeWithCancellation(group_id, "restore-parent-activation", 30_000, context.cancellation);
+        if (raft_leader != null) try self.waitDataReadSafeWithCancellation(group_id, "restore-parent-activation", 30_000, context.cancellation);
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
         const read_source = self.read_source.source();
+        const owner_node = if (raft_leader) |leader| leader.node_id else blk: {
+            _ = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+            var identity_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" }, .read_index)) orelse return error.GenerationRetirementPending;
+            defer identity_response.deinit(scratch);
+            const identity = try std.json.parseFromSliceLeaky(@import("../storage/db/relational_integrity_topology_contract.zig").Identity, scratch, identity_response.json, .{});
+            if (!identity.namespace.eql(input.fence.namespace) or identity.generation_handoff_receipt_authority != .native) return error.UnsupportedEmptyGenerationAuthority;
+            var snapshot = (try self.status_source.linearizableSnapshot(context)) orelse return error.RestoreStagingScopeChanged;
+            defer self.status_source.freeAdminSnapshot(&snapshot);
+            var local_owner: ?u64 = null;
+            for (snapshot.placement_intents) |intent| {
+                if (intent.record.group_id != group_id) continue;
+                if (local_owner != null or intent.record.local_node_id == 0) return error.RestoreStagingScopeChanged;
+                local_owner = intent.record.local_node_id;
+            }
+            break :blk local_owner orelse return error.RestoreStagingScopeChanged;
+        };
         const activation = blk: {
             var response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"parent_activation\"}" }, .read_index)) orelse return error.GenerationRetirementPending;
             defer response.deinit(scratch);
@@ -10134,7 +10598,7 @@ pub const DataServer = struct {
             if (!status.fence.eql(input.fence)) return error.IntegrityTopologyChanged;
             const encoded = try retirement.encodePending(scratch, status.fence, status.plan_digest, status.entries);
             const pending = try retirement.Pending.decode(encoded);
-            const authority_request: staging.AuthorityRequest = .{ .node_id = leader.node_id, .plan_id = input.plan_id, .include_plan = true, .owner_group = group_id, .receipt = if (input.acknowledge) .{ .state = .activating, .owner_group = group_id } else null };
+            const authority_request: staging.AuthorityRequest = .{ .node_id = owner_node, .plan_id = input.plan_id, .include_plan = true, .owner_group = group_id, .receipt = if (input.acknowledge) .{ .state = .activating, .owner_group = group_id } else null };
             var authority = try self.status_source.getRestoreStagingAuthority(alloc, authority_request, context);
             defer authority.deinit(alloc);
             _ = try authority.parentActivationDecision(alloc, authority_request, input.fence, pending);
@@ -10148,10 +10612,14 @@ pub const DataServer = struct {
         // Activation keeps the parent write fence. An acknowledgement is
         // authorized only after metadata has published the new child cohort;
         // it atomically releases the fence and records an idempotent receipt.
-        if (!activation.already_completed or input.acknowledge) try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_topology = .{ .action = if (input.acknowledge) .acknowledge_parent_retirement else .activate_parent_retirement, .fence = input.fence, .parent_activation = .{ .plan_id = input.plan_id, .plan_digest = activation.plan_digest, .publication_digest = publication_digest } } }, .{
-            .discovery = .cached,
-            .required_local_term = leader.term,
-        });
+        if (!activation.already_completed or input.acknowledge) {
+            const batch: antfly.db.types.BatchRequest = .{ .relational_topology = .{ .action = if (input.acknowledge) .acknowledge_parent_retirement else .activate_parent_retirement, .fence = input.fence, .parent_activation = .{ .plan_id = input.plan_id, .plan_digest = activation.plan_digest, .publication_digest = publication_digest } } };
+            if (raft_leader) |leader| {
+                try self.proposeRaftBatchGroup(alloc, group_id, table_name, batch, .{ .discovery = .cached, .required_local_term = leader.term });
+            } else {
+                _ = (try self.kernel_owner_source.?.writeSource().batchGroupLocal(alloc, group_id, table_name, batch)) orelse return error.GenerationRetirementPending;
+            }
+        }
         // A lost acknowledgement is recovered from the owner-local replicated
         // receipt, not by trusting a repeated coordinator claim.
         var response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"parent_activation\"}" }, .read_index)) orelse return error.RestoreValidationPending;
@@ -10192,21 +10660,37 @@ pub const DataServer = struct {
         }
     }
 
+    fn fkGenerationControlTerm(self: *DataServer, group_id: u64, context: antfly.public_api.operation.RequestContext) !?u64 {
+        try context.ensureActive();
+        const term = blk: {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse break :blk null;
+            if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
+            const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
+            break :blk @as(?u64, status.hard.current_term);
+        };
+        if (term != null) {
+            try self.waitDataReadSafeWithCancellation(group_id, "FK-generation", 30_000, context.cancellation);
+        } else if (self.api_server_cfg.deployment_mode != .standalone or self.kernel_owner_source == null or
+            self.ha_cfg.internal_primary != null or self.ha_cfg.standby_owner != null or
+            self.ha_cfg.standby_replication != null or self.ha_promoted_primary != null)
+            return error.UnsupportedOperation;
+        return term;
+    }
+
+    fn applyFkGenerationControl(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: antfly.db.types.BatchRequest, term: ?u64) !void {
+        if (term) |value| return self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{ .discovery = .cached, .required_local_term = value });
+        return (self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable).applyFkGenerationNative(alloc, group_id, table_name, req);
+    }
+
     fn fkGenerationParentControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_fk_generation_publication.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_fk_generation_publication.Receipt {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const publication = @import("../metadata/fk_generation_publication.zig");
         const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
         try context.ensureActive();
         try request.validate(group_id);
-        const leader_term = blk: {
-            lockAtomic(&self.data_raft_mutex);
-            defer self.data_raft_mutex.unlock();
-            const raft = self.data_raft orelse return error.GroupLeaderUnavailable;
-            if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
-            const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
-            break :blk status.hard.current_term;
-        };
-        try self.waitDataReadSafeWithCancellation(group_id, "FK-generation-parent", 30_000, context.cancellation);
+        const leader_term = try self.fkGenerationControlTerm(group_id, context);
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
@@ -10300,7 +10784,7 @@ pub const DataServer = struct {
         if (request.action == .stage and !already_completed and (prior.fence == null or !prior.fence.?.eql(decision.fence))) {
             if (decision.fence.role == .child_generation_dual) return error.GenerationAdmissionPending;
             // Admission is durable before the staged accepted-generation CAS.
-            try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .begin, .fence = decision.fence } }, .{ .discovery = .cached, .required_local_term = leader_term });
+            try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .begin, .fence = decision.fence } }, leader_term);
         }
         const action: @FieldType(@import("../storage/db/relational_integrity_topology_contract.zig").Command, "action") = switch (request.action) {
             .stage => .stage_child_generation,
@@ -10311,7 +10795,7 @@ pub const DataServer = struct {
         // Once the metadata activating decision is observed, client
         // cancellation cannot abort the irreversible parent switch. A lost
         // response is recovered from this replicated owner receipt.
-        if (!already_completed) try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_topology = .{ .action = action, .fence = decision.fence, .child_generations = transitions } }, .{ .discovery = .cached, .required_local_term = leader_term });
+        if (!already_completed) try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = action, .fence = decision.fence, .child_generations = transitions } }, leader_term);
         var status_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"generation_publication\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
         defer status_response.deinit(scratch);
         const status = try std.json.parseFromSliceLeaky(admission.OwnerStatus, scratch, status_response.json, .{ .allocate = .alloc_always });
@@ -10348,15 +10832,7 @@ pub const DataServer = struct {
         const schema = @import("../schema/mod.zig");
         try context.ensureActive();
         try request.validate(group_id);
-        const leader_term = blk: {
-            lockAtomic(&self.data_raft_mutex);
-            defer self.data_raft_mutex.unlock();
-            const raft = self.data_raft orelse return error.GroupLeaderUnavailable;
-            if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
-            const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
-            break :blk status.hard.current_term;
-        };
-        try self.waitDataReadSafeWithCancellation(group_id, "FK-generation-source", 30_000, context.cancellation);
+        const leader_term = try self.fkGenerationControlTerm(group_id, context);
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
@@ -10440,7 +10916,7 @@ pub const DataServer = struct {
         if (!std.mem.eql(u8, observed_schema_json, if (request.action == .install and already_completed) decision.child_after.schema_json else decision.child_before.schema_json))
             return error.IntegrityCatalogChanged;
         if (request.action == .fence and !already_completed) {
-            try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .begin, .fence = decision.fence } }, .{ .discovery = .cached, .required_local_term = leader_term });
+            try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .begin, .fence = decision.fence } }, leader_term);
         }
         if (request.action == .fence) {
             var drained_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"status\"}", .fk_generation_source_control = true }, .read_index)) orelse return error.GenerationAdmissionPending;
@@ -10448,20 +10924,20 @@ pub const DataServer = struct {
             const topology_status = try std.json.parseFromSliceLeaky(@import("../storage/db/relational_integrity_topology_contract.zig").Status, scratch, drained_response.json, .{ .allocate = .alloc_always });
             if (topology_status.fence == null or !topology_status.fence.?.eql(decision.fence) or !topology_status.drained) return error.GenerationAdmissionPending;
         } else if (request.action == .install and !already_completed) {
-            try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .install_child_schema, .fence = decision.fence, .child_schema_install = .{
+            try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .install_child_schema, .fence = decision.fence, .child_schema_install = .{
                 .schema_json = decision.child_after.schema_json,
                 .before_schema_json_digest = before_schema_json_digest,
                 .schema_json_digest = schema_json_digest,
                 .before_catalog_digest = old_digest,
                 .after_catalog_digest = next_digest,
-            } } }, .{ .discovery = .cached, .required_local_term = leader_term });
+            } } }, leader_term);
         } else if (request.action == .cancel and !already_completed) {
             // A self-referential owner must roll back its staged parent
             // admission before the shared source fence can reopen writes.
             if (decision.fence.role == .child_generation_dual and
                 (prior.cancel_receipt == null or prior.completed == null or !prior.completed.?.eql(decision.fence)))
                 return error.GenerationAdmissionPending;
-            try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .cancel_child_generation_source, .fence = decision.fence } }, .{ .discovery = .cached, .required_local_term = leader_term });
+            try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .cancel_child_generation_source, .fence = decision.fence } }, leader_term);
         }
         var status_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"generation_publication\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
         defer status_response.deinit(scratch);
@@ -10682,7 +11158,7 @@ pub const DataServer = struct {
             (request.action == .release and status.phase != .released) or
             (request.action == .cancel and status.phase != .canceled) or
             (request.action == .provision and status.provision_term == 0)) return error.InitialChildPublicationChanged;
-        const receipt: antfly.public_api.relational_fk_generation_publication.InitialChildReceipt = .{
+        var receipt: antfly.public_api.relational_fk_generation_publication.InitialChildReceipt = .{
             .plan_id = request.plan_id,
             .child_table_id = request.child_table_id,
             .child_group_id = group_id,
@@ -10697,6 +11173,32 @@ pub const DataServer = struct {
             .applied_term = if (request.action == .provision) status.provision_term else status.phase_term,
             .applied_index = if (request.action == .provision) status.provision_index else status.phase_index,
         };
+        if (leader_term != null) {
+            const registration = self.store_registration orelse return error.StoreRegistrationUnavailable;
+            const runtime = try self.ensureBackendRuntime();
+            const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+            const root = try @import("../storage/db/root_signing_identity.zig").load(scratch, io, self.write_source.replica_root_dir);
+            var point = blk: {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                const raft = self.data_raft orelse return error.GroupLeaderUnavailable;
+                if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
+                const current = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
+                if (current.hard.current_term != leader_term.?) return error.GroupLeaderUnavailable;
+                break :blk (try raft.host.http_host.host.readReplicaCatalogRecord(scratch, group_id)) orelse return error.ReplicaCatalogUnavailable;
+            };
+            defer point.deinit(scratch);
+            const record = point.record orelse return error.ReplicaCatalogUnavailable;
+            if (record.local_node_id != registration.node_id or record.group_id != group_id or record.initial_fk_root_generation == 0)
+                return error.InitialChildPublicationChanged;
+            receipt.root_attestation = try (@import("../metadata/initial_child_root_attestation.zig").Attestation{
+                .identity = .{ .metadata_incarnation = decision.metadata_incarnation, .node_id = registration.node_id, .store_id = registration.store_id, .root_incarnation = root.root_incarnation, .public_key = root.public_key },
+                .reporter_incarnation = self.reporter_incarnation,
+                .replica_id = record.replica_id,
+                .root_generation = record.initial_fk_root_generation,
+                .signature = undefined,
+            }).sign(root, receipt.digest());
+        }
         try receipt.validate(request);
         return receipt;
     }
@@ -10716,14 +11218,20 @@ pub const DataServer = struct {
         };
         if (leader != null) {
             try self.waitDataReadSafeWithCancellation(group_id, "row-policy-install", 30_000, context.cancellation);
-        } else if (self.api_server_cfg.deployment_mode != .standalone or
-            self.ha_cfg.internal_primary != null or self.ha_cfg.standby_owner != null or
-            self.ha_cfg.standby_replication != null or self.ha_promoted_primary != null)
-        {
-            // Local owners lack a data-Raft log. Until policy phase changes
-            // participate in the hot-standby document outbox, promotion of a
-            // mirror could expose a prior unguarded owner. Never ACK one.
-            return error.RowPolicyUnsupported;
+        } else {
+            if (self.api_server_cfg.deployment_mode != .standalone or
+                self.ha_cfg.standby_owner != null or self.ha_cfg.standby_replication != null)
+                return error.RowPolicyUnsupported;
+            if (self.ha_cfg.internal_primary) |primary| {
+                const admin = self.ha_cfg.admin_context orelse return error.RowPolicyUnsupported;
+                const mirror = self.write_source.ha_async_mirror orelse return error.RowPolicyUnsupported;
+                if (admin.standby != null or admin.primary != primary or mirror.primary != primary or
+                    primary.identity.table_id != 0 or primary.identity.shard_id != 0)
+                    return error.RowPolicyUnsupported;
+                try self.ha_public_gate_state.checkWrite(self.ha_public_gate_state.currentGeneration());
+            } else if (self.ha_promoted_primary != null or self.write_source.ha_async_mirror != null) {
+                return error.RowPolicyUnsupported;
+            }
         }
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -11382,9 +11890,10 @@ pub const DataServer = struct {
         realtime_ns: u64,
     ) antfly.db.types.BatchRequest {
         var proposal_req = req;
-        // Source-bound merge pages carry certified per-row timestamps. Adding
-        // a wall-clock batch override invalidates their replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null) return proposal_req;
+        // Source-bound pages carry certified per-row timestamps. Ordered
+        // artifact admission is a catalog-only command with no row timestamp.
+        // A wall-clock override would change either command's replay contract.
+        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -11407,6 +11916,24 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.artifact_publication_transport != null) return @import("../common/data_raft_protocol.zig").batch_artifact_publication_transport_protocol_version;
+        const extended = @import("../common/data_raft_protocol.zig").batch_artifact_publication_protocol_version;
+        if (req.artifact_publication != null) return extended;
+        if (req.artifact_catalog) |command| if (command.binding.effect_protocol != 14) return extended;
+        if (req.online_source) |command| if (command == .admit) {
+            if (command.admit.artifact_catalog) |binding| if (binding.effect_protocol != 14) return extended;
+        };
+        if (req.merge_page) |page| if (page.source.artifact_catalog) |binding| if (binding.effect_protocol != 14) return extended;
+        if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| if (source.artifact_catalog) |binding| if (binding.effect_protocol != 14) return extended;
+        // Classify the new payload even when its authority binding is absent
+        // or malformed. An older decoder must not ignore vector effects and
+        // apply just the primary rows before native validation can reject it.
+        if (if (req.merge_page) |page| page.artifact_effects.len != 0 or
+            (if (page.chunk) |chunk| chunk.payload == .artifact else false) else false)
+            return data_raft_batch.artifact_catalog_protocol_version;
+        if (req.artifact_catalog != null or onlineMergeRaftBatchHasArtifactBarrier(req) or
+            (if (req.merge_page) |page| page.source.artifact_catalog != null else false))
+            return data_raft_batch.artifact_catalog_protocol_version;
         if (req.restore_staging != null or req.online_source != null or
             (if (req.merge_page) |page| page.source.retention != null else false) or
             (if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| source.retention != null else false else false))
@@ -11890,10 +12417,12 @@ pub const DataServer = struct {
         route: DataRaftBatchRoute,
         leader_wait_ns: u64,
     ) !void {
+        try @import("../storage/db/artifact_publication.zig").validateRequest(alloc, req);
+        try @import("../storage/db/artifact_publication_transport.zig").validateBatchRequest(req);
         // Do not allow a private/direct batch route to bypass the metadata
         // admission policy. This happens before a protocol barrier or a data
         // entry can be appended, so rejection is never an ambiguous outcome.
-        if (onlineMergeRaftBatchRequiresArtifactBarrier(req))
+        if (onlineMergeRaftBatchRequiresArtifactBarrier(req) and !onlineMergeRaftBatchHasArtifactBarrier(req))
             return error.OnlineMergeArtifactCatalogUncoordinated;
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         var proposal_req = req;
@@ -18206,10 +18735,16 @@ pub const DataServer = struct {
         const raft = self.data_raft orelse return;
         const factory = self.data_raft_factory orelse return;
         const registration = self.store_registration orelse return;
-        // Reconciliation can run before the public API listener is created.
-        // Its retirement preflight still needs the trusted cold owner reader;
-        // install it once before any desired-plan or journal side effect.
-        _ = try self.ensureKernelOwnerSource();
+        // Reconciliation can precede the public listener. Install the trusted
+        // retirement reader before any plan/journal side effect, without
+        // replacing native source ownership with a second opaque ABI owner.
+        if (comptime linked_storage) {
+            _ = try self.ensureKernelOwnerSource();
+        } else {
+            _ = self.write_source.withInitialChildRetirementReader(.{ .ptr = self, .read = readInitialChildRetirementObservation });
+            if (self.data_raft_apply) |apply_sm|
+                _ = apply_sm.write_source.withInitialChildRetirementReader(.{ .ptr = self, .read = readInitialChildRetirementObservation });
+        }
         const metadata_epoch = snapshot.status.metadata_epoch;
         const has_local_hidden_initial = for (snapshot.placement_intents) |intent| {
             if (intent.record.initial_fk_root_generation != 0 and
@@ -18370,6 +18905,7 @@ pub const DataServer = struct {
         }
         for (snapshot.placement_intents) |intent| {
             if (!localPlacementEligible(intent, registration, confirmed_hidden_root)) continue;
+            if (try factory.blocksRetiredReplica(intent.record)) continue;
             const voter_node_ids = placement_topology.initialVoters(intent.record.group_id) orelse
                 return error.MissingAuthoritativeBootstrapVoters;
             const learner_node_ids = placement_topology.learners(intent.record.group_id) orelse
@@ -19374,6 +19910,11 @@ pub const DataServer = struct {
 
     fn primePrivateInitialChildOwner(self: *DataServer, owner: @import("private_provisioning.zig").InitialOwner, confirmed_root: ?u128) !void {
         if (comptime !linked_storage) return error.InvalidInitialChildPublication;
+        if (self.data_raft != null) {
+            const runtime = try self.ensureBackendRuntime();
+            if (try @import("fk_retirement_worker.zig").blocksPlan(self.alloc, runtime.apiIo() orelse return error.BackendRuntimeUnavailable, self.write_source.replica_root_dir, owner.range.group_id, owner.descriptor.plan_id, owner.descriptor.plan_digest))
+                return error.InitialFkRetirementWorkChanged;
+        }
         if (confirmed_root) |expected| {
             if (expected == 0 or !self.store_registration_confirmed or
                 (try self.replicaRootIncarnation()) != expected)
@@ -22939,6 +23480,8 @@ pub const DataServer = struct {
 
                 data_raft_factory = try alloc.create(DataDescriptorFactory);
                 data_raft_factory.?.* = DataDescriptorFactory.init(alloc, data_raft_store.?);
+                data_raft_factory.?.retirement_root = cfg.replica_root_dir;
+                data_raft_factory.?.retirement_io = raft_backend_runtime.apiIo();
 
                 data_raft_apply = blk: {
                     const apply_sm = try alloc.create(RaftTableApplyStateMachine);
@@ -22989,6 +23532,7 @@ pub const DataServer = struct {
                             .listener_disabled = cfg.data_raft_listener_external,
                             .host = .{
                                 .descriptor_factory = data_raft_factory.?.iface(),
+                                .data_proposal_admission = .{ .ptr = data_raft_apply.?, .check = RaftTableApplyStateMachine.admitMembership },
                                 .runtime_hooks = .{
                                     .state_machine = data_raft_apply.?.stateMachine(),
                                 },
@@ -23059,91 +23603,160 @@ pub const DataServer = struct {
     }
 };
 
-test "ordinary unpublished placement does not require a private initial FK owner snapshot" {
-    const snapshot: antfly.metadata_api.AdminSnapshot = .{
-        .status = undefined,
-        .tables = &.{},
-        .ranges = &.{},
-        .stores = &.{},
-        .placement_intents = &.{},
-        .split_transitions = &.{},
-        .merge_transitions = &.{},
-    };
-    const ordinary = antfly.raft.PlacementIntent{ .record = .{ .group_id = 7, .replica_id = 1, .local_node_id = 9 } };
-    try std.testing.expect(!DataServer.needsPrivateInitialOwnerSnapshot(&snapshot, &.{ordinary}));
-    const hidden = antfly.raft.PlacementIntent{ .record = .{ .group_id = 8, .replica_id = 1, .local_node_id = 9, .initial_fk_root_generation = 4 } };
-    try std.testing.expect(DataServer.needsPrivateInitialOwnerSnapshot(&snapshot, &.{hidden}));
-}
-
-test "distributed online merge admission declines both owners and direct source proposals" {
-    const alloc = std.testing.allocator;
-    const contract = @import("../storage/db/online_merge_io_contract.zig");
-    const source_contract = @import("../storage/db/online_source_contract.zig");
-    const donor: @import("../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
-    const receiver: @import("../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 4, .range_id = 5 };
-    const unbound: source_contract.Scope = .{
-        .fence = .{ .transition_id = 7, .attempt = 0, .owner_group_id = 2, .peer_group_id = 4, .role = .merge_source, .namespace = donor, .catalog_digest = @splat(0) },
-        .receiver_namespace = receiver,
-        .consumer_epoch = 0,
-        .copy_attempt = .{},
-    };
-    for ([_]contract.Side{ .donor, .receiver }) |side| {
-        const request: contract.Request = .{ .scope = unbound, .operation = .{ .admission = side } };
-        try request.validate();
-        const bytes = try onlineMergeRaftIneligibleAdmission(alloc, request);
-        defer alloc.free(bytes);
-        var parsed = try std.json.parseFromSlice(contract.AdmissionFacts, alloc, bytes, .{});
-        defer parsed.deinit();
-        try std.testing.expect(!parsed.value.eligible);
-        try std.testing.expect(parsed.value.namespace.eql(if (side == .donor) donor else receiver));
+// These tests inspect private apply/admission state and belong to the physical
+// implementation partition, not to both linked test inventories.
+const activation_admission_tests = if (@import("builtin").is_test and implementation_tests_only) struct {
+    test "ordinary unpublished placement does not require a private initial FK owner snapshot" {
+        const snapshot: antfly.metadata_api.AdminSnapshot = .{
+            .status = undefined,
+            .tables = &.{},
+            .ranges = &.{},
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+        };
+        const ordinary = antfly.raft.PlacementIntent{ .record = .{ .group_id = 7, .replica_id = 1, .local_node_id = 9 } };
+        try std.testing.expect(!DataServer.needsPrivateInitialOwnerSnapshot(&snapshot, &.{ordinary}));
+        const hidden = antfly.raft.PlacementIntent{ .record = .{ .group_id = 8, .replica_id = 1, .local_node_id = 9, .initial_fk_root_generation = 4 } };
+        try std.testing.expect(DataServer.needsPrivateInitialOwnerSnapshot(&snapshot, &.{hidden}));
     }
-    var bound = unbound;
-    bound.consumer_epoch = 1;
-    bound.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
-    bound.fence.attempt = 1;
-    bound.fence.admission_epoch = 1;
-    bound.fence.catalog_digest = @splat(1);
-    try bound.validate();
-    const source_admit: antfly.db.types.BatchRequest = .{ .online_source = .{ .admit = .{ .scope = bound } } };
-    try std.testing.expect(onlineMergeRaftBatchRequiresArtifactBarrier(source_admit));
-    var server: DataServer = undefined;
-    try std.testing.expectError(error.OnlineMergeArtifactCatalogUncoordinated, server.proposeRaftBatchGroupWithLeaderWait(
-        alloc,
-        2,
-        "docs",
-        source_admit,
-        .{ .discovery = .cached },
-        data_raft_batch_leader_wait_ns,
-    ));
-    const online_checkpoint: antfly.db.types.BatchRequest = .{ .merge_checkpoint = .{
-        .kind = .begin_copy,
-        .transition_id = 7,
-        .donor_group_id = 2,
-        .receiver_group_id = 4,
-        .receiver_base_start = "m",
-        .receiver_base_end = "z",
-        .merged_start = "a",
-        .merged_end = "z",
-        .page_source = .{ .namespace = donor, .pin_digest = @splat(1), .applied_index = 9, .retention = .{ .epoch = 1, .after_sequence = 1 } },
-    } };
-    try std.testing.expect(onlineMergeRaftBatchRequiresArtifactBarrier(online_checkpoint));
-    try std.testing.expectError(error.OnlineMergeArtifactCatalogUncoordinated, server.proposeRaftBatchGroupWithLeaderWait(
-        alloc,
-        4,
-        "docs",
-        online_checkpoint,
-        .{ .discovery = .cached },
-        data_raft_batch_leader_wait_ns,
-    ));
-    var ordinary_checkpoint = online_checkpoint;
-    ordinary_checkpoint.merge_checkpoint.?.page_source = null;
-    try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(ordinary_checkpoint));
-    var rollback_accept = online_checkpoint;
-    rollback_accept.merge_checkpoint.?.kind = .accept;
-    rollback_accept.merge_checkpoint.?.page_source.?.integrity = .{ .catalog_digest = @splat(2), .generation_set = @splat(3) };
-    try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(rollback_accept));
-    try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(.{ .online_source = .{ .release = bound } }));
-    try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(.{}));
+
+    test "distributed online merge admission declines both owners and direct source proposals" {
+        const alloc = std.testing.allocator;
+        for ([_]anyerror{ error.InvalidArtifactCatalogCommand, error.ArtifactCatalogEpochChanged, error.ArtifactCatalogScopeChanged, error.RowPolicyTopologyUnsupported, error.OnlineMergeArtifactTailsUnsupported }) |rejection| {
+            const classified = RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(rejection) orelse return error.TestExpectedSemanticRejection;
+            try std.testing.expectEqual(rejection, classified.toError());
+        }
+        try std.testing.expect(RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.ArtifactCatalogDrift) == null);
+        try std.testing.expect(RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.ArtifactCatalogCorrupt) == null);
+        const contract = @import("../storage/db/online_merge_io_contract.zig");
+        const source_contract = @import("../storage/db/online_source_contract.zig");
+        const donor: @import("../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+        const receiver: @import("../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 4, .range_id = 5 };
+        const unbound: source_contract.Scope = .{
+            .fence = .{ .transition_id = 7, .attempt = 0, .admission_epoch = 0, .owner_group_id = 2, .peer_group_id = 4, .role = .merge_source, .namespace = donor, .catalog_digest = @splat(0) },
+            .receiver_namespace = receiver,
+            .consumer_epoch = 0,
+            .copy_attempt = .{},
+        };
+        for ([_]contract.Side{ .donor, .receiver }) |side| {
+            const request: contract.Request = .{ .scope = unbound, .operation = .{ .admission = side } };
+            try request.validate();
+            const bytes = try onlineMergeRaftIneligibleAdmission(alloc, request);
+            defer alloc.free(bytes);
+            var parsed = try std.json.parseFromSlice(contract.AdmissionFacts, alloc, bytes, .{});
+            defer parsed.deinit();
+            try std.testing.expect(!parsed.value.eligible);
+            try std.testing.expect(parsed.value.namespace.eql(if (side == .donor) donor else receiver));
+        }
+        var bound = unbound;
+        bound.consumer_epoch = 1;
+        bound.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+        bound.fence.attempt = 1;
+        bound.fence.admission_epoch = 1;
+        bound.fence.catalog_digest = @splat(1);
+        try bound.validate();
+        const source_admit: antfly.db.types.BatchRequest = .{ .online_source = .{ .admit = .{ .scope = bound } } };
+        try std.testing.expect(onlineMergeRaftBatchRequiresArtifactBarrier(source_admit));
+        var server: DataServer = undefined;
+        try std.testing.expectError(error.OnlineMergeArtifactCatalogUncoordinated, server.proposeRaftBatchGroupWithLeaderWait(
+            alloc,
+            2,
+            "docs",
+            source_admit,
+            .{ .discovery = .cached },
+            data_raft_batch_leader_wait_ns,
+        ));
+        const online_checkpoint: antfly.db.types.BatchRequest = .{ .merge_checkpoint = .{
+            .kind = .begin_copy,
+            .transition_id = 7,
+            .donor_group_id = 2,
+            .receiver_group_id = 4,
+            .receiver_base_start = "m",
+            .receiver_base_end = "z",
+            .merged_start = "a",
+            .merged_end = "z",
+            .page_source = .{ .namespace = donor, .pin_digest = @splat(1), .applied_index = 9, .retention = .{ .epoch = 1, .after_sequence = 1 } },
+        } };
+        try std.testing.expect(onlineMergeRaftBatchRequiresArtifactBarrier(online_checkpoint));
+        try std.testing.expectError(error.OnlineMergeArtifactCatalogUncoordinated, server.proposeRaftBatchGroupWithLeaderWait(
+            alloc,
+            4,
+            "docs",
+            online_checkpoint,
+            .{ .discovery = .cached },
+            data_raft_batch_leader_wait_ns,
+        ));
+        var ordinary_checkpoint = online_checkpoint;
+        ordinary_checkpoint.merge_checkpoint.?.page_source = null;
+        try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(ordinary_checkpoint));
+        var rollback_accept = online_checkpoint;
+        rollback_accept.merge_checkpoint.?.kind = .accept;
+        rollback_accept.merge_checkpoint.?.page_source.?.integrity = .{ .catalog_digest = @splat(2), .generation_set = @splat(3) };
+        try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(rollback_accept));
+        try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(.{ .online_source = .{ .release = bound } }));
+        try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(.{}));
+        const inventory = @import("../storage/db/artifact_inventory.zig");
+        const catalogs: inventory.Catalogs = .{};
+        const binding: inventory.Binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc) };
+        var admitted = source_admit;
+        admitted.online_source.?.admit.artifact_catalog = binding;
+        try std.testing.expect(!onlineMergeRaftBatchHasArtifactBarrier(admitted));
+        admitted.artifact_catalog = .{ .namespace = @splat(1), .binding = binding, .catalogs = catalogs };
+        try std.testing.expect(onlineMergeRaftBatchHasArtifactBarrier(admitted));
+        try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, DataServer.requiredRaftBatchProtocolVersion(admitted));
+        var extended_admission = admitted;
+        extended_admission.artifact_catalog.?.binding.effect_protocol = 15;
+        try std.testing.expectEqual(@as(u16, 15), DataServer.requiredRaftBatchProtocolVersion(extended_admission));
+        extended_admission = admitted;
+        extended_admission.artifact_catalog = null;
+        extended_admission.online_source.?.admit.artifact_catalog.?.effect_protocol = 15;
+        try std.testing.expectEqual(@as(u16, 15), DataServer.requiredRaftBatchProtocolVersion(extended_admission));
+        const invalid_publication: antfly.db.types.BatchRequest = .{ .artifact_publication = .{ .mode = .activate, .namespace = @splat(0), .authority_epoch = 0, .catalog_digest = @splat(0), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) } };
+        try std.testing.expectEqual(@as(u16, 15), DataServer.requiredRaftBatchProtocolVersion(invalid_publication));
+        try std.testing.expectError(error.InvalidBatchRequest, @import("../storage/db/artifact_publication.zig").validateRequest(alloc, invalid_publication));
+        const unbound_vector_page: antfly.db.types.BatchRequest = .{ .merge_page = .{
+            .source = online_checkpoint.merge_checkpoint.?.page_source.?,
+            .sequence = 1,
+            .phase = .tail,
+            .exhausted = false,
+            .digest = @splat(1),
+            .artifact_effects = &.{.{ .key = "untrusted", .value = null }},
+        } };
+        try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, DataServer.requiredRaftBatchProtocolVersion(unbound_vector_page));
+        var unbound_vector_chunk = unbound_vector_page;
+        unbound_vector_chunk.merge_page.?.artifact_effects = &.{};
+        unbound_vector_chunk.merge_page.?.chunk = .{
+            .payload = .artifact,
+            .row_key = "untrusted",
+            .timestamp = 0,
+            .total_bytes = 1,
+            .row_digest = @splat(1),
+            .offset = 0,
+            .data = "x",
+            .chunk_digest = @splat(2),
+        };
+        try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, DataServer.requiredRaftBatchProtocolVersion(unbound_vector_chunk));
+        admitted.artifact_catalog.?.binding.epoch += 1;
+        try std.testing.expect(!onlineMergeRaftBatchHasArtifactBarrier(admitted));
+        var accepted = rollback_accept;
+        accepted.merge_checkpoint.?.page_source.?.artifact_catalog = binding;
+        try std.testing.expect(onlineMergeRaftBatchRequiresArtifactBarrier(accepted));
+        try std.testing.expect(!onlineMergeRaftBatchHasArtifactBarrier(accepted));
+        accepted.artifact_catalog = .{ .namespace = @splat(2), .binding = binding, .catalogs = catalogs };
+        try std.testing.expect(onlineMergeRaftBatchHasArtifactBarrier(accepted));
+        accepted.artifact_catalog.?.binding.digest[0] ^= 1;
+        // Physical materialization generations belong to each owner. Only
+        // logical definitions must match across a donor/receiver boundary.
+        try std.testing.expect(onlineMergeRaftBatchHasArtifactBarrier(accepted));
+        accepted.artifact_catalog.?.binding.semantic_digest = @splat(0);
+        try std.testing.expect(!onlineMergeRaftBatchHasArtifactBarrier(accepted));
+    }
+} else struct {};
+
+comptime {
+    _ = activation_admission_tests;
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
@@ -23178,10 +23791,10 @@ fn onlineMergeRaftBatchRequiresArtifactBarrier(req: antfly.db.types.BatchRequest
         if (command == .admit and command.scope().fence.role == .merge_source) return true;
     }
     if (req.merge_checkpoint) |checkpoint| {
-        // A source-bound accept also establishes the exact receiver receipt
-        // before rollback of a pre-gate coordinated-integrity attempt. Only
-        // begin_copy starts an online transfer; keep cancellation available.
         if (checkpoint.kind == .begin_copy and checkpoint.page_source != null) return true;
+        if (checkpoint.kind == .accept) {
+            if (checkpoint.page_source) |source_identity| if (source_identity.artifact_catalog != null) return true;
+        }
     }
     // A merge page requires a previously committed receiver checkpoint with
     // the exact source/attempt. Allow those pre-gate attempts to drain.
@@ -23190,7 +23803,27 @@ fn onlineMergeRaftBatchRequiresArtifactBarrier(req: antfly.db.types.BatchRequest
 
 fn onlineMergePeerEligible(version: u16) !bool {
     if (version == 0) return error.GroupLeaderUnavailable;
-    return version >= data_raft_batch.source_pin_protocol_version;
+    return version >= data_raft_batch.artifact_catalog_protocol_version;
+}
+
+fn onlineMergeRaftBatchHasArtifactBarrier(req: antfly.db.types.BatchRequest) bool {
+    if (req.online_source) |command| {
+        if (command == .admit and command.scope().fence.role == .merge_source)
+            return command.admit.artifact_catalog != null and req.artifact_catalog != null and
+                std.meta.eql(command.admit.artifact_catalog.?, req.artifact_catalog.?.binding);
+    }
+    if (req.merge_checkpoint) |checkpoint| {
+        if (checkpoint.kind == .accept) {
+            if (checkpoint.page_source) |source_identity| {
+                const binding = source_identity.artifact_catalog orelse return false;
+                const install = req.artifact_catalog orelse return false;
+                return binding.compatible(install.binding);
+            }
+        } else if (checkpoint.kind == .begin_copy) {
+            if (checkpoint.page_source) |source_identity| return source_identity.artifact_catalog != null;
+        }
+    }
+    return false;
 }
 
 fn onlineMergeRevokeBatch(scope: @import("../storage/db/online_source_contract.zig").Scope, ordinary: ?@import("../storage/data_raft_projection_wire.zig").AppliedMergeSourceState) antfly.db.types.BatchRequest {
@@ -26158,10 +26791,7 @@ const RemoteMetadataSource = struct {
     }
 
     fn isSystemCatalogMutation(input: @import("../system_catalog/domain.zig").Call) bool {
-        return input == .mutate or input == .setting_mutate or input == .policy_definition_mutate or
-            input == .policy_publication_mutate or input == .policy_publication_begin or
-            input == .fk_generation_publication_begin or input == .fk_generation_publication_mutate or
-            input == .fk_initial_create_begin or input == .fk_initial_create_mutate;
+        return input.isMutation();
     }
 
     fn remoteSystemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
@@ -27250,6 +27880,7 @@ fn runtimeStatusReportFromLocalStatus(
         .status_generation = status.metadata.status_generation,
         .target_observation_revision = status.metadata.target_observation_revision,
         .target_observation_complete = status.metadata.target_observation_complete,
+        .schema_epoch = if (try antfly.metadata.table_provisioner.indexlessSchemaEpochRequired(alloc, table)) status.stats.schema_epoch else 0,
         .doc_count = controlPlaneDocumentCount(status.stats),
         .disk_bytes = status.disk_bytes,
         .disk_bytes_known = status.disk_bytes_known,
@@ -30909,7 +31540,10 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             .value = receiver_json,
         }} });
     }
-    for (&servers) |*server| try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
+    for (&servers) |*server| {
+        try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
+        if (comptime !linked_storage) try std.testing.expect(server.kernel_owner_source == null);
+    }
     if (vopr_io.firstCapabilityViolation()) |violation| {
         std.log.err("multi-owner DataServer VOPR pre-schedule capability violation operation={s}", .{
             @tagName(violation.operation),
@@ -31186,8 +31820,11 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             // fixture state.
             self.stage = 5;
             try self.exerciseRetiredReadSafetyBarrier();
+            self.stage = 42;
             try self.activateSplitTopology();
+            self.stage = 43;
             try self.transferAndWait(self.split_record.source_group_id, 1);
+            self.stage = 44;
             try self.transferAndWait(self.split_record.destination_group_id, 1);
             ops = self.servers[0].localShardOperationAdapter();
             self.stage = 50;
@@ -31245,7 +31882,9 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 .table_contract = self.split_record.table_contract,
             } });
             try self.waitForSplitFinalizedEverywhere();
+            self.stage = 64;
             try self.publishFinalizedSplitTopology();
+            self.stage = 65;
             if (coordinated) try self.writeSplitDelta(false);
 
             // Restart a physical owner after cutover, lead both resulting
@@ -35786,6 +36425,12 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(?u64, null), structuralRaftAppliedIndex(null, null));
         }
 
+        test "data runtime hosted FK retirement maintenance is disabled without Raft" {
+            var server: DataServer = undefined;
+            server.data_raft = null;
+            try server.runInitialFkRetirementRound();
+        }
+
         test "data runtime retirement scope survives post-drop snapshot removal" {
             const dropped_snapshot: antfly.metadata_api.AdminSnapshot = .{
                 .status = .{ .metadata_group_id = 9, .metadata_epoch = 2, .metrics = .{} },
@@ -39441,7 +40086,8 @@ fn consumerTests() type {
         test "online merge admission distinguishes unsupported peers and fences leader authority" {
             try std.testing.expectError(error.GroupLeaderUnavailable, onlineMergePeerEligible(0));
             try std.testing.expect(!try onlineMergePeerEligible(data_raft_batch.source_pin_protocol_version - 1));
-            try std.testing.expect(try onlineMergePeerEligible(data_raft_batch.source_pin_protocol_version));
+            try std.testing.expect(!try onlineMergePeerEligible(data_raft_batch.artifact_catalog_protocol_version - 1));
+            try std.testing.expect(try onlineMergePeerEligible(data_raft_batch.artifact_catalog_protocol_version));
             try validateOnlineMergeAdmissionAuthority(9, 9, 17, 17);
             try std.testing.expectError(error.GroupLeaderUnavailable, validateOnlineMergeAdmissionAuthority(0, 0, 17, 17));
             try std.testing.expectError(error.GroupLeaderUnavailable, validateOnlineMergeAdmissionAuthority(9, 10, 17, 17));
@@ -39521,6 +40167,39 @@ fn consumerTests() type {
             } } } };
             try std.testing.expectEqual(data_raft_batch.source_pin_protocol_version, DataServer.requiredRaftBatchProtocolVersion(source_request));
             try std.testing.expectEqual(@as(u64, 0), DataServer.materializeRaftBatchTimestamp(source_request, 999).timestamp_ns);
+            // Receiver acceptance has an artifact adjunct but no online_source
+            // command. It must remain valid across timestamp negotiation and
+            // the real Raft codec, just like donor admission and row pages.
+            const inventory = @import("../storage/db/artifact_inventory.zig");
+            const catalogs: inventory.Catalogs = .{};
+            const accept_request: antfly.db.types.BatchRequest = .{
+                .artifact_catalog = .{
+                    .namespace = @splat(0),
+                    .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc) },
+                    .catalogs = catalogs,
+                },
+                .merge_checkpoint = .{
+                    .kind = .accept,
+                    .transition_id = 1,
+                    .donor_group_id = 2,
+                    .receiver_group_id = 3,
+                    .receiver_base_start = "m",
+                    .receiver_base_end = "z",
+                    .merged_start = "a",
+                    .merged_end = "z",
+                },
+            };
+            try inventory.validateRequest(accept_request);
+            const accept_proposal = DataServer.raftBatchRequestForProtocol(accept_request, true, 999);
+            try std.testing.expectEqual(@as(u64, 0), accept_proposal.timestamp_ns);
+            try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, DataServer.requiredRaftBatchProtocolVersion(accept_proposal));
+            try inventory.validateRequest(accept_proposal);
+            const accept_bytes = try data_raft_batch.encode(alloc, "docs", accept_proposal);
+            defer alloc.free(accept_bytes);
+            var accept_decoded = try data_raft_batch.decode(alloc, accept_bytes);
+            defer accept_decoded.deinit(alloc);
+            try inventory.validateRequest(accept_decoded.batch.req);
+            try std.testing.expectEqualDeep(accept_proposal.artifact_catalog.?, accept_decoded.batch.req.artifact_catalog.?);
             page_request.merge_page.?.source.integrity = .{ .catalog_digest = @splat(2), .generation_set = @splat(3) };
             try std.testing.expectEqual(@as(u16, 12), DataServer.requiredRaftBatchProtocolVersion(page_request));
             try std.testing.expectEqual(@as(u16, 12), DataServer.requiredRaftBatchProtocolVersion(.{
@@ -43977,6 +44656,50 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "data runtime native FK retirement preserves source ownership and exact cold path" {
+            const alloc = std.testing.allocator;
+            const hidden = @import("../storage/db/relational_initial_child_publication.zig");
+            const table_catalog = @import("../storage/db/table_catalog.zig");
+            var runtime = try backend_runtime_mod.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+            defer runtime.deinit();
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const group_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retired-exact-root", .{tmp.sub_path});
+            defer alloc.free(group_path);
+            const path = try std.fs.path.join(alloc, &.{ group_path, "table-db" });
+            defer alloc.free(path);
+            const record: hidden.Record = .{ .phase = .hidden, .plan_id = @splat(1), .plan_digest = @splat(2), .namespace = .{ .table_id = 3, .shard_id = 4, .range_id = 5 }, .schema_version = 1, .row_count = 0, .schema_digest = @splat(3), .public_schema_json_digest = @splat(4), .catalog_digest = @splat(5), .provision_term = 7, .provision_index = 11 };
+            {
+                var db = try antfly.db.DB.open(alloc, path, .{ .backend_runtime = &runtime, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+                defer db.close();
+                var txn = try db.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                try txn.put(hidden.key, &try record.encode());
+                const catalog: table_catalog.Catalog = .{};
+                try txn.put(table_catalog.key, &catalog.encode());
+                try txn.commit();
+            }
+            // Only these fields belong to the native adapter. Accessing any
+            // other server/source state would violate its narrow ownership seam.
+            var server: DataServer = undefined;
+            server.backend_runtime_mutex = .unlocked;
+            server.backend_runtime = &runtime;
+            server.kernel_owner_source = null;
+            try server.prepareInitialFkRetirementOwner();
+            try std.testing.expect(server.kernel_owner_source == null);
+            try std.testing.expectEqualDeep(record, (try server.readColdInitialFkRecord(alloc, group_path)).?);
+            var stale = record;
+            stale.plan_digest = @splat(9);
+            try std.testing.expectError(error.InitialChildPublicationChanged, server.cancelColdInitialFkRecord(alloc, group_path, stale, 19));
+            try std.testing.expectEqualDeep(record, (try server.readColdInitialFkRecord(alloc, group_path)).?);
+            try server.cancelColdInitialFkRecord(alloc, group_path, record, 19);
+            try server.cancelColdInitialFkRecord(alloc, group_path, record, 19);
+            const canceled = (try server.readColdInitialFkRecord(alloc, group_path)).?;
+            try std.testing.expectEqual(hidden.Phase.canceled, canceled.phase);
+            try std.testing.expectEqual(@as(u64, 19), canceled.phase_index);
+            try std.testing.expect(server.kernel_owner_source == null);
+        }
+
         test "provisioned root re-pairs a changed metadata head without publishing mixed snapshots" {
             const Fake = struct {
                 const Pair = struct { head: u64, snapshot: u64, private_snapshot: ?u64 };
@@ -44988,6 +45711,110 @@ fn implementationTests() type {
             var trace: std.ArrayListUnmanaged(MultiOwnerReplayStep) = .empty;
             defer trace.deinit(std.testing.allocator);
             try runThreeDataServerReplicatedTransitionVoprHistory(true, std.testing.allocator, null, &trace);
+        }
+
+        test "data runtime ordered artifact upload handoff retains cursor and admission under pressure" {
+            const alloc = std.testing.allocator;
+            var runtime = try backend_runtime_mod.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+            defer runtime.deinit();
+            const original_lane = runtime.durable_jobs;
+            defer runtime.durable_jobs = original_lane;
+            const Lane = struct {
+                pending: ?backend_runtime_mod.Job = null,
+                drained: usize = 0,
+                fn submit(ptr: *anyopaque, job: backend_runtime_mod.Job) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.pending != null) return error.ConcurrencyUnavailable;
+                    self.pending = job;
+                }
+                fn drain(ptr: *anyopaque, _: u64) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    const job = self.pending orelse return;
+                    self.pending = null;
+                    std.testing.expectError(error.Canceled, job.run(job.ptr)) catch @panic("upload must cancel before routing on shutdown");
+                    job.deinit(job.ptr);
+                    self.drained += 1;
+                }
+                fn poll(_: *anyopaque, _: usize) !usize {
+                    return 0;
+                }
+            };
+            var lane: Lane = .{};
+            var server: DataServer = .{
+                .alloc = alloc,
+                .backend_runtime = &runtime,
+                .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+                .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-upload-handoff", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
+                .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-upload-handoff", antfly.public_api.table_catalog.emptyCatalogSource()),
+                .status_source = undefined,
+                .api_server_cfg = undefined,
+                .query_async_limit = .nothing,
+                .listener_cfg = undefined,
+            };
+            defer server.deinit();
+            runtime.durable_jobs = .{ .ptr = &lane, .vtable = &.{ .submit = Lane.submit, .drain_owner = Lane.drain, .close_owner = Lane.drain, .poll = Lane.poll } };
+            try DataServer.enqueueArtifactPublication(&server, 17, @splat(1), "owned command");
+            const queued: *DataServer.ArtifactPublicationJob = @ptrCast(@alignCast(lane.pending.?.ptr));
+            queued.upload_root = @splat(2);
+            queued.publication_digest = @splat(3);
+            queued.next_chunk = 4;
+            queued.table_name = try alloc.dupe(u8, "items");
+            const proposal = queued.proposal;
+            {
+                var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+                server.alloc = failing.allocator();
+                defer server.alloc = alloc;
+                try std.testing.expect(!DataServer.submitArtifactPublicationSuccessor(queued, &runtime, server.background_jobs_owner_id));
+                try std.testing.expect(queued.owns_proposal);
+                try std.testing.expectEqual(proposal, queued.proposal);
+                try std.testing.expectEqual(@as(usize, 4), queued.next_chunk);
+            }
+            try std.testing.expect(!DataServer.submitArtifactPublicationSuccessor(queued, &runtime, server.background_jobs_owner_id));
+            try std.testing.expect(queued.owns_proposal);
+            try std.testing.expectEqual(@as(usize, 4), queued.next_chunk);
+            const previous = lane.pending.?;
+            lane.pending = null;
+            try std.testing.expect(DataServer.submitArtifactPublicationSuccessor(queued, &runtime, server.background_jobs_owner_id));
+            try std.testing.expect(!queued.owns_proposal);
+            const successor: *DataServer.ArtifactPublicationJob = @ptrCast(@alignCast(lane.pending.?.ptr));
+            try std.testing.expect(successor.owns_proposal);
+            try std.testing.expectEqual(proposal, successor.proposal);
+            try std.testing.expectEqual(@as(usize, 4), successor.next_chunk);
+            try std.testing.expectEqualDeep(queued.upload_root, successor.upload_root);
+            try std.testing.expectEqualDeep(queued.publication_digest, successor.publication_digest);
+            previous.deinit(previous.ptr);
+            try std.testing.expectEqual(@as(usize, 1), server.artifact_publication_queue.jobs);
+            try std.testing.expectEqualStrings("owned command", successor.proposal.command);
+            try std.testing.expectEqualStrings("items", successor.table_name.?);
+            const recovery: @import("../storage/db/artifact_publication_transport.zig").RecoveryHint = .{ .namespace = @splat(1), .publication_digest = @splat(3), .root = @splat(2), .created_index = 7 };
+            const hint = recovery.encode();
+            // Scheduler refusal releases the control reservation without
+            // disturbing the in-flight producer's ownership or cursor.
+            try std.testing.expectError(error.ConcurrencyUnavailable, DataServer.enqueueArtifactPublication(&server, 17, recovery.namespace, &hint));
+            try std.testing.expectEqual(@as(usize, 1), server.artifact_publication_queue.jobs);
+            try std.testing.expectError(error.InvalidBatchRequest, DataServer.enqueueArtifactPublication(&server, 17, recovery.namespace, hint[0..99]));
+            const completed = lane.pending.?;
+            lane.pending = null;
+            completed.deinit(completed.ptr);
+            var producers: [6]*artifact_publication_dispatch.Queue.Job = undefined;
+            var producer_count: usize = 0;
+            defer for (producers[0..producer_count]) |producer| server.artifact_publication_queue.release(std.testing.io, producer);
+            for (&producers, 0..) |*producer, i| {
+                const bytes = [_]u8{@intCast(i)};
+                producer.* = (try server.artifact_publication_queue.reserve(std.testing.io, alloc, 17, recovery.namespace, &bytes)).?;
+                producer_count += 1;
+            }
+            try DataServer.enqueueArtifactPublication(&server, 17, recovery.namespace, &hint);
+            try DataServer.enqueueArtifactPublication(&server, 17, recovery.namespace, &hint); // deduplicated admission
+            try std.testing.expectEqual(@as(usize, 7), server.artifact_publication_queue.jobs);
+            try std.testing.expectEqual(@as(usize, 6), server.artifact_publication_queue.producer_bytes);
+            server.stopDataServerBackgroundJobs();
+            try std.testing.expectEqual(@as(usize, 1), lane.drained);
+            try std.testing.expectEqual(@as(usize, 6), server.artifact_publication_queue.jobs);
+            for (producers) |producer| server.artifact_publication_queue.release(std.testing.io, producer);
+            producer_count = 0;
+            try std.testing.expectEqual(@as(usize, 0), server.artifact_publication_queue.jobs);
+            try std.testing.expectEqual(@as(usize, 0), server.artifact_publication_queue.bytes);
         }
 
         test "data runtime coordinated ttl admission never reenters cache and drains with its owner" {

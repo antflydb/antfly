@@ -12,4 +12,8 @@ pub const lsm_backend = @import("storage/lsm_backend.zig");
 
 test {
     _ = hosted_initial_fk_e2e;
+    _ = @import("api/hosted_initial_fk_fault_e2e.zig");
+    _ = @import("api/hosted_initial_fk_transfer_e2e.zig");
+    _ = @import("api/hosted_initial_fk_offline_e2e.zig");
+    _ = @import("api/hosted_initial_fk_capabilities_test.zig");
 }

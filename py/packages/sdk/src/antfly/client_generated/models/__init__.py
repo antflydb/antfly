@@ -101,6 +101,7 @@ from .chunker_provider import ChunkerProvider
 from .classification_step_config import ClassificationStepConfig
 from .classification_transformation_result import ClassificationTransformationResult
 from .close_prepared_sql_response_200 import ClosePreparedSQLResponse200
+from .close_sql_connection_response_200 import CloseSQLConnectionResponse200
 from .cluster_backup_request import ClusterBackupRequest
 from .cluster_backup_request_format import ClusterBackupRequestFormat
 from .cluster_backup_response import ClusterBackupResponse
@@ -1179,6 +1180,8 @@ from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
 from .sql_column import SQLColumn
 from .sql_column_type import SQLColumnType
+from .sql_connection_open_request import SQLConnectionOpenRequest
+from .sql_connection_response import SQLConnectionResponse
 from .sql_diagnostic import SQLDiagnostic
 from .sql_mutation_outcome import SQLMutationOutcome
 from .sql_prepare_request import SQLPrepareRequest
@@ -1220,6 +1223,8 @@ from .storage_resource_exhausted_error_error import StorageResourceExhaustedErro
 from .storage_runtime_status import StorageRuntimeStatus
 from .storage_runtime_status_engine import StorageRuntimeStatusEngine
 from .storage_status import StorageStatus
+from .store_root_enrollment_identity import StoreRootEnrollmentIdentity
+from .store_root_enrollment_request import StoreRootEnrollmentRequest
 from .stream_transcription_audio_format import StreamTranscriptionAudioFormat
 from .stt_provider import STTProvider
 from .success_message import SuccessMessage
@@ -1307,6 +1312,7 @@ from .transaction_session_details_response import TransactionSessionDetailsRespo
 from .transaction_session_list_response import TransactionSessionListResponse
 from .transaction_session_read_snapshot import TransactionSessionReadSnapshot
 from .transaction_session_status import TransactionSessionStatus
+from .transaction_session_status_disposition import TransactionSessionStatusDisposition
 from .transaction_session_table_detail import TransactionSessionTableDetail
 from .transaction_stage_delete_request import TransactionStageDeleteRequest
 from .transaction_stage_read_request import TransactionStageReadRequest
@@ -1461,6 +1467,7 @@ __all__ = (
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
     "ClosePreparedSQLResponse200",
+    "CloseSQLConnectionResponse200",
     "ClusterBackupRequest",
     "ClusterBackupRequestFormat",
     "ClusterBackupResponse",
@@ -2527,6 +2534,8 @@ __all__ = (
     "SortProfileSortLifecycleState",
     "SQLColumn",
     "SQLColumnType",
+    "SQLConnectionOpenRequest",
+    "SQLConnectionResponse",
     "SQLDDLReceipt",
     "SQLDDLReceiptState",
     "SQLDiagnostic",
@@ -2568,6 +2577,8 @@ __all__ = (
     "StorageRuntimeStatus",
     "StorageRuntimeStatusEngine",
     "StorageStatus",
+    "StoreRootEnrollmentIdentity",
+    "StoreRootEnrollmentRequest",
     "StreamTranscriptionAudioFormat",
     "STTProvider",
     "SuccessMessage",
@@ -2655,6 +2666,7 @@ __all__ = (
     "TransactionSessionListResponse",
     "TransactionSessionReadSnapshot",
     "TransactionSessionStatus",
+    "TransactionSessionStatusDisposition",
     "TransactionSessionTableDetail",
     "TransactionStageDeleteRequest",
     "TransactionStageReadRequest",

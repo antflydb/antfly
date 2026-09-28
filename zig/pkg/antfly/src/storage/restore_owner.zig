@@ -382,10 +382,32 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                 const cache = &target.rewrite_tail_cache;
                 try cache.mutex.lock(env.io);
                 defer cache.mutex.unlock(env.io);
-                const assembled = try @import("rewrite_tail_spool.zig").receive(alloc, env.io, env.cache_path, input.scope, progress.sequence, chunk, cache, target.alloc, target.core.index_manager.resource_manager);
+                const assembled = @import("rewrite_tail_spool.zig").receive(alloc, env.io, env.cache_path, input.scope, progress.sequence, chunk, cache, target.alloc, target.core.index_manager.resource_manager) catch |err| {
+                    if (err == error.RestoreSpoolCorrupt) {
+                        try @import("rewrite_tail_spool.zig").resetCorruptCopy(alloc, env.io, env.cache_path, input.scope, chunk.sequence, cache);
+                        return error.StorageReadTemporarilyUnavailable;
+                    }
+                    return err;
+                };
                 tail_next = assembled.next;
                 if (assembled.frame) |frame| {
-                    var page = try @import("db/relational_rewrite_staging.zig").prepareTailVerified(target, alloc, input.scope, frame, program.?, input.max_rows, context.cancellation);
+                    // The spool cache and transformation have independent
+                    // lifetimes. Account temporary decoded rows and owned
+                    // output through proposal, not just the immutable cache.
+                    var budget = if (target.core.index_manager.resource_manager) |manager|
+                        @import("resource_manager.zig").BudgetedAllocator.init(manager, .relational_preparation_working_set, alloc, 1)
+                    else
+                        null;
+                    defer if (budget) |*tracked| tracked.deinit();
+                    const preparation_alloc = if (budget) |*tracked| tracked.allocator() else alloc;
+                    var page = @import("db/relational_rewrite_staging.zig").prepareTailVerified(target, preparation_alloc, input.scope, frame, program.?, input.max_rows, context.cancellation) catch |err| {
+                        if (err == error.RestoreSpoolCorrupt) {
+                            try @import("rewrite_tail_spool.zig").resetCorruptCopy(alloc, env.io, env.cache_path, input.scope, chunk.sequence, cache);
+                            return error.StorageReadTemporarilyUnavailable;
+                        }
+                        if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
+                        return err;
+                    };
                     defer page.deinit();
                     // The owned batch no longer needs compiled schemas. Do not
                     // pin program memory through a potentially slow proposal.

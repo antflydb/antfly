@@ -290,6 +290,13 @@ pub const RaftApplyStore = struct {
     pub fn captureProvisioningCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !restore_staging.ProvisioningProjection {
         return self.projectionWithAllocator(restore_staging.ProvisioningProjection, alloc, .{ .kind = .provisioning_catalog, .group_id = group_id });
     }
+    pub fn initialGroupReservation(self: *RaftApplyStore, metadata_group_id: u64, range_group_id: u64) !?fk_generation_publication.InitialGroupReservation {
+        return self.projection(?fk_generation_publication.InitialGroupReservation, .{
+            .kind = .fk_initial_group_reservation,
+            .group_id = metadata_group_id,
+            .arg0 = range_group_id,
+        });
+    }
     pub fn getRelationalTopologyProtocolActivationVersion(self: *RaftApplyStore, group_id: u64) !u16 {
         return self.projection(u16, .{ .kind = .relational_topology_protocol_activation_version, .group_id = group_id });
     }
@@ -486,6 +493,9 @@ pub const RaftApplyStore = struct {
     }
     pub fn fkInitialRetirementTicketPageJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_initial_retirement_wire.PageRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_retirement_page = request });
+    }
+    pub fn storeRootControlJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_initial_retirement_wire.Control) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .store_root_control = request });
     }
     pub fn fkInitialParentDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.DecisionRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_parent_decision = request });

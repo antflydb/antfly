@@ -15,11 +15,13 @@ pub const intent_encoded_len = 296;
 pub const receipt_encoded_len = 336;
 pub const Digest = [32]u8;
 
-/// The canceled replica's original process incarnation is intentionally part
+/// The obsolete replica's original process incarnation is intentionally part
 /// of the immutable historical identity. It is *not* the reporter fence: a
 /// restarted process on the same physical root may complete old work.
 pub const Ticket = struct {
     metadata_incarnation: incarnation.MetadataClusterIncarnation,
+    /// Terminal publication revision (canceled or published-obsolete). The
+    /// legacy field name is retained on the wire; Replica binds the reason.
     cancel_revision: u64,
     replica: retirement.Replica,
 

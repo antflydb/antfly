@@ -452,7 +452,7 @@ pub const Plan = struct {
         const parent = for (self.parents) |candidate| {
             if (candidate.table.table_id == receipt.parent_table_id) break candidate;
         } else return error.InvalidGenerationPublication;
-        for (parent.ranges) |range| if (range.group_id == receipt.parent_group_id) break else return error.InvalidGenerationPublication;
+        try requireReceiptRange(parent.ranges, receipt.parent_group_id);
         const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
         const transitions = try alloc.alloc(admission.Transition, parent.transitions.len);
         defer alloc.free(transitions);
@@ -724,7 +724,7 @@ pub const InitialCreatePlan = struct {
         const parent = for (self.parents) |candidate| {
             if (candidate.table.table_id == receipt.parent_table_id) break candidate;
         } else return error.InvalidGenerationPublication;
-        for (parent.ranges) |range| if (range.group_id == receipt.parent_group_id) break else return error.InvalidGenerationPublication;
+        try requireReceiptRange(parent.ranges, receipt.parent_group_id);
         const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
         const transitions = try alloc.alloc(admission.Transition, parent.transitions.len);
         defer alloc.free(transitions);
@@ -1151,6 +1151,26 @@ pub const InitialWork = struct {
         publish_child,
     };
 };
+
+fn requireReceiptRange(ranges: []const records.RangeRecord, group_id: u64) !void {
+    // Catalog ranges are in key order, not group-ID order. A receipt can
+    // belong to any range; a mismatch with the first range is not rejection.
+    for (ranges) |range| {
+        if (range.group_id == group_id) return;
+    }
+    return error.InvalidGenerationPublication;
+}
+
+test "FK generation publication parent receipts require membership across every owner range" {
+    const ranges: []const records.RangeRecord = &.{
+        .{ .table_id = 101, .group_id = 700, .start_key = "", .end_key = "m" },
+        .{ .table_id = 101, .group_id = 400, .start_key = "m", .end_key = "" },
+    };
+    try requireReceiptRange(ranges, 700);
+    try requireReceiptRange(ranges, 400);
+    try std.testing.expectError(error.InvalidGenerationPublication, requireReceiptRange(ranges, 500));
+    try std.testing.expectError(error.InvalidGenerationPublication, requireReceiptRange(&.{}, 700));
+}
 
 fn hasReceipt(receipts: []const Receipt, group_id: u64) bool {
     var low: usize = 0;

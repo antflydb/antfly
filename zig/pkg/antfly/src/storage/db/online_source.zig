@@ -24,7 +24,8 @@ pub const Command = contract.Command;
 const prefix = "\x00\x00__metadata__:online_source:";
 const snapshot_contract = @import("../source_snapshot.zig");
 const certificate_offset = 207;
-const checksum_offset = certificate_offset + snapshot_contract.encoded_size;
+const artifact_offset = certificate_offset + snapshot_contract.encoded_size;
+const checksum_offset = artifact_offset + 74;
 const encoded_size = checksum_offset + 32;
 pub const Phase = enum(u8) { retaining = 1, fenced = 2, released = 3 };
 pub const SnapshotPhase = enum(u8) { prepared = 1, pinned = 2, published = 3 };
@@ -47,6 +48,7 @@ pub const Progress = struct {
     snapshot_phase: SnapshotPhase = .prepared,
     local_seal_digest: [32]u8 = @splat(0),
     local_cleanup_complete: bool = false,
+    artifact_catalog: ?@import("artifact_inventory.zig").Binding = null,
 };
 
 fn key(slot: usize) [prefix.len + 1]u8 {
@@ -62,7 +64,7 @@ fn digest(bytes: []const u8) [32]u8 {
 }
 fn encode(value: Progress) [encoded_size]u8 {
     var bytes: [encoded_size]u8 = undefined;
-    @memcpy(bytes[0..4], "AOS4");
+    @memcpy(bytes[0..4], "AOS6");
     @memcpy(bytes[4..28], &value.namespace);
     std.mem.writeInt(u64, bytes[28..36], value.consumer_epoch, .little);
     @memcpy(bytes[36..68], &value.pin);
@@ -80,13 +82,29 @@ fn encode(value: Progress) [encoded_size]u8 {
     @memset(bytes[certificate_offset..checksum_offset], 0);
     if (value.published_certificate) |certificate| {
         const encoded = certificate.encode() catch unreachable; // Validated before atomic publication.
-        @memcpy(bytes[certificate_offset..checksum_offset], &encoded);
+        @memcpy(bytes[certificate_offset..artifact_offset], &encoded);
+    }
+    if (value.artifact_catalog) |binding| {
+        std.mem.writeInt(u64, bytes[artifact_offset..][0..8], binding.epoch, .little);
+        @memcpy(bytes[artifact_offset + 8 .. artifact_offset + 40], &binding.digest);
+        @memcpy(bytes[artifact_offset + 40 .. artifact_offset + 72], &binding.semantic_digest);
+        std.mem.writeInt(u16, bytes[artifact_offset + 72 .. checksum_offset], binding.effect_protocol, .little);
     }
     @memcpy(bytes[checksum_offset..encoded_size], &digest(bytes[0..checksum_offset]));
     return bytes;
 }
 fn decode(bytes: []const u8) !Progress {
-    if (bytes.len != encoded_size or !std.mem.eql(u8, bytes[0..4], "AOS4") or bytes[206] > 1 or
+    // Preserve authenticated, artifact-free progress from AOS4, which
+    // predates source catalog binding.
+    if (bytes.len == artifact_offset + 32 and std.mem.eql(u8, bytes[0..4], "AOS4")) {
+        if (!std.mem.eql(u8, bytes[artifact_offset..], &digest(bytes[0..artifact_offset]))) return error.OnlineSourceCorrupt;
+        var upgraded: [encoded_size]u8 = @splat(0);
+        @memcpy(upgraded[0..artifact_offset], bytes[0..artifact_offset]);
+        @memcpy(upgraded[0..4], "AOS6");
+        @memcpy(upgraded[checksum_offset..], &digest(upgraded[0..checksum_offset]));
+        return decode(&upgraded);
+    }
+    if (bytes.len != encoded_size or !std.mem.eql(u8, bytes[0..4], "AOS6") or bytes[206] > 1 or
         !std.mem.eql(u8, bytes[checksum_offset..encoded_size], &digest(bytes[0..checksum_offset]))) return error.OnlineSourceCorrupt;
     const result: Progress = .{
         .namespace = bytes[4..28].*,
@@ -100,11 +118,13 @@ fn decode(bytes: []const u8) !Progress {
         .cut_digest = bytes[101..133].*,
         .admitted_applied_index = std.mem.readInt(u64, bytes[133..141], .little),
         .snapshot_certificate = bytes[141..173].*,
-        .published_certificate = if (std.mem.allEqual(u8, bytes[certificate_offset..checksum_offset], 0)) null else snapshot_contract.Certificate.decode(bytes[certificate_offset..checksum_offset]) catch return error.OnlineSourceCorrupt,
+        .published_certificate = if (std.mem.allEqual(u8, bytes[certificate_offset..artifact_offset], 0)) null else snapshot_contract.Certificate.decode(bytes[certificate_offset..artifact_offset]) catch return error.OnlineSourceCorrupt,
+        .artifact_catalog = if (std.mem.allEqual(u8, bytes[artifact_offset..checksum_offset], 0)) null else .{ .epoch = std.mem.readInt(u64, bytes[artifact_offset..][0..8], .little), .digest = bytes[artifact_offset + 8 .. artifact_offset + 40].*, .semantic_digest = bytes[artifact_offset + 40 .. artifact_offset + 72].*, .effect_protocol = std.mem.readInt(u16, bytes[artifact_offset + 72 .. checksum_offset], .little) },
         .snapshot_phase = std.enums.fromInt(SnapshotPhase, bytes[173]) orelse return error.OnlineSourceCorrupt,
         .local_seal_digest = bytes[174..206].*,
         .local_cleanup_complete = bytes[206] == 1,
     };
+    if (result.artifact_catalog) |binding| if (!binding.valid()) return error.OnlineSourceCorrupt;
     if (result.consumer_epoch == 0 or result.admitted_applied_index == 0 or result.start > result.acknowledged or (result.local_cleanup_complete and result.phase != .released) or
         (result.phase == .fenced and result.acknowledged > result.through_sequence) or
         ((result.snapshot_phase == .prepared) != std.mem.allEqual(u8, &result.local_seal_digest, 0)) or
@@ -144,10 +164,22 @@ test "relational index system source publication retains full certificate and re
         .published_certificate = certificate,
         .snapshot_phase = .published,
         .local_seal_digest = @splat(4),
+        .artifact_catalog = .{ .epoch = 1, .digest = @splat(5), .semantic_digest = @splat(6), .effect_protocol = 15 },
     };
     var bytes = encode(progress);
     const recovered = try decode(&bytes);
     try std.testing.expect(certificate.eql(recovered.published_certificate.?));
+    try std.testing.expectEqualDeep(progress.artifact_catalog, recovered.artifact_catalog);
+    var old: [artifact_offset + 32]u8 = undefined;
+    @memcpy(old[0..artifact_offset], bytes[0..artifact_offset]);
+    @memcpy(old[0..4], "AOS4");
+    @memcpy(old[artifact_offset..], &digest(old[0..artifact_offset]));
+    const original = try decode(&old);
+    try std.testing.expect(original.artifact_catalog == null and certificate.eql(original.published_certificate.?));
+    std.mem.writeInt(u16, bytes[artifact_offset + 72 .. checksum_offset], 16, .little);
+    @memcpy(bytes[checksum_offset..], &digest(bytes[0..checksum_offset]));
+    try std.testing.expectError(error.OnlineSourceCorrupt, decode(&bytes));
+    bytes = encode(progress);
     // A valid outer checksum must not hide a mismatched certificate digest.
     bytes[141] ^= 1;
     @memcpy(bytes[checksum_offset..], &digest(bytes[0..checksum_offset]));
@@ -283,6 +315,23 @@ pub fn stagePinned(txn: anytype, scope: Scope, seal_digest: [32]u8) !void {
 /// The caller owns the native apply fence and commits this with its Raft/standby
 /// marker and outbox. For final_fence it must additionally check transaction
 /// drainage under that same apply fence before calling stage.
+fn directVectorMode(txn: anytype, binding: ?@import("artifact_inventory.zig").Binding) !bool {
+    const expected = binding orelse return false;
+    // Never silently admit the wider effect language into a direct-only
+    // retained journal. Extended capture must select its own admission path.
+    if (expected.effect_protocol != 14) return error.OnlineMergeArtifactTailsUnsupported;
+    const alloc = std.heap.page_allocator;
+    var ordered = (try @import("artifact_inventory.zig").load(alloc, txn)) orelse return error.ArtifactCatalogDrift;
+    defer ordered.deinit();
+    if (!std.meta.eql(ordered.value.command.binding, expected)) return error.ArtifactCatalogDrift;
+    const vectors = try @import("artifact_reconcile.zig").hasDirectVectors(alloc, ordered.value.command.catalogs);
+    if (vectors and !@import("online_vector_artifacts.zig").isEnabled()) return error.OnlineMergeArtifactTailsUnsupported;
+    // The certified effect language covers document-owned base artifacts,
+    // including explicit embeddings and values left by dropped indexes. It
+    // must not depend on whether a projection currently consumes those bytes.
+    return @import("online_vector_artifacts.zig").isEnabled();
+}
+
 pub fn stage(txn: anytype, command: Command, applied_index: u64) !void {
     try command.validate();
     // Snapshot certificates bind the source's explicit authority clock: Raft
@@ -293,7 +342,8 @@ pub fn stage(txn: anytype, command: Command, applied_index: u64) !void {
     if (command == .admit) {
         if (existing) |found| {
             if (found.progress.phase == .released) return error.OnlineSourceScopeChanged;
-            _ = try retained.admit(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), command.admit.limit);
+            if (!std.meta.eql(found.progress.artifact_catalog, command.admit.artifact_catalog)) return error.ArtifactCatalogDrift;
+            _ = try retained.admitWithDirectVectors(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), command.admit.limit, try directVectorMode(txn, command.admit.artifact_catalog));
             return;
         }
         try @import("../source_pin_state.zig").requireNoPrepared(txn, scope.namespace());
@@ -309,8 +359,8 @@ pub fn stage(txn: anytype, command: Command, applied_index: u64) !void {
                 cleanup_pending = cleanup_pending or old.phase == .released;
                 continue;
             };
-            const start = try retained.admit(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), command.admit.limit);
-            try txn.put(&key(slot), &encode(.{ .namespace = scope.namespace(), .consumer_epoch = scope.consumer_epoch, .pin = scope.pin(), .start = start, .acknowledged = start, .admitted_applied_index = applied_index }));
+            const start = try retained.admitWithDirectVectors(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), command.admit.limit, try directVectorMode(txn, command.admit.artifact_catalog));
+            try txn.put(&key(slot), &encode(.{ .namespace = scope.namespace(), .consumer_epoch = scope.consumer_epoch, .pin = scope.pin(), .start = start, .acknowledged = start, .admitted_applied_index = applied_index, .artifact_catalog = command.admit.artifact_catalog }));
             try txn.put(@import("../source_pin_state.zig").key, &(@import("../source_pin_state.zig").Prepared{ .namespace = scope.namespace(), .pin = scope.pin(), .applied_index = applied_index, .retained_start = start, .scope_bytes = try scope.encode() }).encode());
             return;
         }

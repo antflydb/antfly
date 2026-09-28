@@ -1038,6 +1038,10 @@ pub const RuntimeGroupStatusReport = struct {
     /// accepted replay target for the group. Heartbeat/activity freshness is
     /// intentionally independent from this convergence proof.
     target_observation_complete: bool = true,
+    /// Applied immutable relational schema version sampled from the same
+    /// storage-owner observation as index and identity facts. Zero is unknown
+    /// for older runtime-status wire profiles, not proof of an empty schema.
+    schema_epoch: u32 = 0,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
     disk_bytes_known: bool = false,
@@ -2722,6 +2726,7 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .status_generation = record.status_generation,
         .target_observation_revision = record.target_observation_revision,
         .target_observation_complete = record.target_observation_complete,
+        .schema_epoch = record.schema_epoch,
         .doc_count = record.doc_count,
         .disk_bytes = record.disk_bytes,
         .disk_bytes_known = record.disk_bytes_known,

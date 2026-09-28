@@ -31,6 +31,7 @@ test "FK initial create coordinator resumes hidden child and parent receipts" {
     var value: publication.InitialPublication = .{
         .plan = .{
             .id = @splat(1),
+            .retirement_scope = .hosted_store,
             .catalog_id = 3,
             .expected_catalog_revision = 1,
             .child = .{ .table_id = 7, .name = "table:3" },

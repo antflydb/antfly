@@ -2194,9 +2194,40 @@ def _exercise_online_document_merge(
             timeout_s=30.0,
             interval_s=0.25,
         )
-        assert actual is not None and all(
+        matches = actual is not None and all(
             actual.get(field) == value for field, value in expected.items()
-        ), f"restored online row mismatch {key!r}\n{cluster.debug_logs()}"
+        )
+        if not matches:
+            observations = []
+            for api_url in cluster.data_api_urls:
+                try:
+                    response = session.get(
+                        f"{api_url}/tables/{table_name}/documents/{key}", timeout=5
+                    )
+                    value = response.json() if response.status_code == 200 else None
+                    observations.append(
+                        {
+                            "url": api_url,
+                            "status": response.status_code,
+                            "keys": sorted(value) if isinstance(value, dict) else None,
+                            "title": value.get("title")
+                            if isinstance(value, dict)
+                            else None,
+                            "payload_length": len(value.get("payload", ""))
+                            if isinstance(value, dict)
+                            else None,
+                            "expected_payload_length": len(expected.get("payload", "")),
+                            "id": value.get("_id") if isinstance(value, dict) else None,
+                            "error": response.text[:256]
+                            if response.status_code != 200
+                            else None,
+                        }
+                    )
+                except (requests.RequestException, ValueError) as exc:
+                    observations.append({"url": api_url, "error": repr(exc)[:256]})
+            assert matches, (
+                f"restored online row mismatch {key!r}: {observations}\n{cluster.debug_logs()}"
+            )
     session.close()
     return table_name
 

@@ -12628,6 +12628,48 @@ pub const SQLColumnType = enum {
     }
 };
 
+pub const SQLConnectionOpenRequest = struct {
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "database", "database", true },
+        .{ "namespace", "namespace", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.database) |value| {
+            try jw.objectField("database");
+            try jw.write(value);
+        }
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const SQLConnectionResponse = struct {
+    connection_id: []const u8,
+    /// The owning API node. Zero denotes a standalone-local endpoint; send subsequent connection requests to that same endpoint. Otherwise route requests to the returned owning node.
+    owner_node_id: []const u8,
+    /// Idle-use deadline in Unix milliseconds. An attached active or uncertain transaction remains accessible for completion and reconciliation after this deadline; expiry never implies abort.
+    expires_at_ms: i64,
+    database: []const u8,
+    namespace: []const u8,
+};
+
 /// Durable DDL declaration receipt. admission_unknown means admission has not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL. Pending or invalid means the declaration committed but validation has not established an active constraint. Do not replay it. Inspect table constraint status using this immutable table identity and schema generation; a later generation supersedes this receipt.
 pub const SQLDDLReceipt = struct {
     database: []const u8,
@@ -12819,6 +12861,8 @@ pub const SQLPrepareRequest = struct {
     namespace: ?[]const u8 = null,
     /// Optional durable SQL session. Preparation binds its authenticated scope and current setting catalog under the session lease; execution must supply the same session.
     session_id: ?[]const u8 = null,
+    /// Optional idle HTTP SQL connection. Preparation binds to its current DISCARD generation; a transaction-bound preparation remains bound to session_id instead.
+    connection_id: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -12826,6 +12870,7 @@ pub const SQLPrepareRequest = struct {
         .{ "database", "database", true },
         .{ "namespace", "namespace", true },
         .{ "session_id", "session_id", true },
+        .{ "connection_id", "connection_id", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -12852,6 +12897,10 @@ pub const SQLPrepareRequest = struct {
             try jw.objectField("session_id");
             try jw.write(value);
         }
+        if (self.connection_id) |value| {
+            try jw.objectField("connection_id");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -12861,12 +12910,15 @@ pub const SQLPreparedExecutionRequest = struct {
     limit: ?i64 = null,
     /// Optional durable transaction session. Required when the resource was prepared against a session; otherwise independent of the prepared resource lifetime.
     session_id: ?[]const u8 = null,
+    /// Required for a connection-bound resource; DISCARD ALL closes it without affecting other clients' resources.
+    connection_id: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "parameters", "parameters", true },
         .{ "limit", "limit", true },
         .{ "session_id", "session_id", true },
+        .{ "connection_id", "connection_id", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -12889,6 +12941,10 @@ pub const SQLPreparedExecutionRequest = struct {
         }
         if (self.session_id) |value| {
             try jw.objectField("session_id");
+            try jw.write(value);
+        }
+        if (self.connection_id) |value| {
+            try jw.objectField("connection_id");
             try jw.write(value);
         }
         try jw.endObject();
@@ -12918,6 +12974,8 @@ pub const SQLRequest = struct {
     limit: ?i64 = null,
     /// Opaque SQL session identifier returned by a previous response.
     session_id: ?[]const u8 = null,
+    /// Durable idle HTTP connection. Its scope and settings are inherited; active transaction IDs cannot be bypassed by omitting session_id. DISCARD ALL requires this identity and is rejected while a transaction is active or uncertain.
+    connection_id: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -12927,6 +12985,7 @@ pub const SQLRequest = struct {
         .{ "namespace", "namespace", true },
         .{ "limit", "limit", true },
         .{ "session_id", "session_id", true },
+        .{ "connection_id", "connection_id", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -12959,6 +13018,10 @@ pub const SQLRequest = struct {
         }
         if (self.session_id) |value| {
             try jw.objectField("session_id");
+            try jw.write(value);
+        }
+        if (self.connection_id) |value| {
+            try jw.objectField("connection_id");
             try jw.write(value);
         }
         try jw.endObject();
@@ -14459,6 +14522,22 @@ pub const StorageStatus = struct {
     }
 };
 
+pub const StoreRootEnrollmentIdentity = struct {
+    metadata_incarnation: []const u8,
+    node_id: i64,
+    store_id: i64,
+    /// Decimal u128 string; never pass through a floating-point JSON number.
+    root_incarnation: []const u8,
+    /// Ed25519 public key in lowercase hex.
+    public_key: []const u8,
+};
+
+pub const StoreRootEnrollmentRequest = struct {
+    identity: StoreRootEnrollmentIdentity,
+    /// Ed25519 proof-of-possession signature in lowercase hex.
+    signature: []const u8,
+};
+
 pub const SuccessMessage = struct {
     message: ?[]const u8 = null,
 
@@ -15911,6 +15990,8 @@ pub const TransactionSessionDetailsResponse = struct {
     lease_expires_at: i64,
     lease_state: []const u8,
     sync_level: []const u8,
+    /// Durable read-only transaction outcome. outcome_unknown is not permission to replay a mutation with another ID.
+    disposition: []const u8,
     staged_table_count: i64,
     staged_read_count: i64,
     staged_write_count: i64,
@@ -15933,6 +16014,7 @@ pub const TransactionSessionDetailsResponse = struct {
         .{ "lease_expires_at", "lease_expires_at", false },
         .{ "lease_state", "lease_state", false },
         .{ "sync_level", "sync_level", false },
+        .{ "disposition", "disposition", false },
         .{ "staged_table_count", "staged_table_count", false },
         .{ "staged_read_count", "staged_read_count", false },
         .{ "staged_write_count", "staged_write_count", false },
@@ -15971,6 +16053,8 @@ pub const TransactionSessionDetailsResponse = struct {
         try jw.write(self.lease_state);
         try jw.objectField("sync_level");
         try jw.write(self.sync_level);
+        try jw.objectField("disposition");
+        try jw.write(self.disposition);
         try jw.objectField("staged_table_count");
         try jw.write(self.staged_table_count);
         try jw.objectField("staged_read_count");
@@ -16126,6 +16210,8 @@ pub const TransactionSessionStatus = struct {
     lease_expires_at: i64,
     lease_state: []const u8,
     sync_level: []const u8,
+    /// Durable read-only transaction outcome. outcome_unknown is not permission to replay a mutation with another ID.
+    disposition: []const u8,
     staged_table_count: i64,
     staged_read_count: i64,
     staged_write_count: i64,
@@ -16152,6 +16238,8 @@ pub const TransactionSessionStatus = struct {
         try jw.write(self.lease_state);
         try jw.objectField("sync_level");
         try jw.write(self.sync_level);
+        try jw.objectField("disposition");
+        try jw.write(self.disposition);
         try jw.objectField("staged_table_count");
         try jw.write(self.staged_table_count);
         try jw.objectField("staged_read_count");

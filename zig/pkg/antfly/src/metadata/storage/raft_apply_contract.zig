@@ -99,6 +99,9 @@ pub const StandaloneCatalogUpdate = struct {
     remove_tables: []const u64 = &.{},
     remove_ranges: []const u64 = &.{},
     auxiliary_json: ?[]const u8 = null,
+    /// An exact physical-root proof for native schema finalization, or a
+    /// binding-only first registration before any FK publication begins.
+    native_owner: ?@import("../standalone_native_owner.zig").Binding = null,
     import_catalog: ?@import("../../system_catalog/domain.zig").State = null,
     /// Applied in the same local transaction as the standalone revision and
     /// mirrored outbox. Mutually exclusive with an ordinary logical delta.
@@ -274,5 +277,6 @@ pub const CatalogProjectionRequest = union(enum) {
     fk_generation_table_locked: u64,
     fk_initial_create_work: u64,
     fk_initial_retirement_page: @import("../fk_initial_retirement_wire.zig").PageRequest,
+    store_root_control: @import("../fk_initial_retirement_wire.zig").Control,
     fk_initial_parent_decision: @import("../fk_generation_publication.zig").DecisionRequest,
 };

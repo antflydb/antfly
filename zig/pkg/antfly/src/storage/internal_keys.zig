@@ -94,6 +94,23 @@ pub const shared_pdf_consumer_kind: u8 = 0x42;
 /// diffs it on replay so a re-keyed mention tombstones the previously
 /// promoted document with a merged_into redirect instead of orphaning it.
 pub const promoted_keys_state_kind: u8 = 0x44;
+/// Ordered producer output-set inventory. Kept outside public artifact keys,
+/// but inside the owning document range for snapshot/retained transfer.
+pub const producer_stream_manifest_kind: u8 = 0x45;
+pub const producer_generation_row_kind: u8 = 0x46;
+pub const producer_generation_head_kind: u8 = 0x47;
+pub const producer_generation_state_kind: u8 = 0x48;
+pub const producer_generation_clock_kind: u8 = 0x49;
+/// Extraction output generations must not alias chunk streams with the same
+/// producer name. Their rows contain the extraction's named output directory.
+pub const extraction_stream_manifest_kind: u8 = 0x4a;
+pub const extraction_generation_row_kind: u8 = 0x4b;
+pub const extraction_generation_head_kind: u8 = 0x4c;
+pub const extraction_generation_state_kind: u8 = 0x4d;
+pub const extraction_generation_clock_kind: u8 = 0x4e;
+pub const extraction_generation_name_kind: u8 = 0x4f;
+pub const extraction_generation_ordinal_kind: u8 = 0x50;
+pub const extraction_generation_directory_kind: u8 = 0x51;
 /// Store-wide index of outstanding shared-PDF attempts. Recovery is independent
 /// of document existence and the current enrichment configuration.
 pub const shared_pdf_consumer_attempt_prefix = [_]u8{ replay_namespace, 0xff, 0x43 };
@@ -698,6 +715,21 @@ pub fn matchesGraphGlobalEdgeContenderIndexName(key: []const u8, index_name: []c
     if (!isGraphGlobalEdgeContenderKey(key)) return false;
     const doc_term = findComponentTerminator(key, 1) orelse return false;
     return componentEquals(key, doc_term + 2 + 1, index_name);
+}
+
+/// Move an authenticated contender into a receiver's physical incarnation.
+/// Logical edge/state hashes remain unchanged; only the fenced generation is
+/// owner-local. Tombstones use this same operation as live records.
+pub fn rebindGraphGlobalEdgeContenderKeyAlloc(alloc: Allocator, key: []const u8, source_generation: u64, receiver_generation: u64) ![]u8 {
+    if (!isGraphGlobalEdgeContenderKey(key) or source_generation == 0 or receiver_generation == 0)
+        return error.InvalidGraphEdgeContender;
+    const doc_end = (findComponentTerminator(key, 1) orelse unreachable) + 2;
+    const generation_offset = (findComponentTerminator(key, doc_end + 1) orelse unreachable) + 2;
+    if (std.mem.readInt(u64, key[generation_offset..][0..8], .big) != source_generation)
+        return error.GraphGenerationMismatch;
+    const rebound = try alloc.dupe(u8, key);
+    std.mem.writeInt(u64, rebound[generation_offset..][0..8], receiver_generation, .big);
+    return rebound;
 }
 
 pub fn artifactTypePrefixAlloc(alloc: Allocator, doc_key: []const u8, artifact_type: []const u8) ![]u8 {

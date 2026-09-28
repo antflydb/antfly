@@ -6870,6 +6870,9 @@ pub const MetadataAdminVoprSource = struct {
             .fk_generation_table_locked,
             .fk_initial_create_work,
             .fk_initial_retirement_page,
+            .store_root_enroll,
+            .fk_initial_retirement_signed_page,
+            .fk_initial_retirement_ack,
             .fk_initial_parent_decision,
             => return error.UnsupportedOperation,
             .write_validation_revision => try std.json.Stringify.valueAlloc(alloc, metadata_api.MetadataHead{

@@ -1,7 +1,6 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
-//! Opt-in mounted self-FK publication proof. The normal target checks the
-//! public guard; the diagnostic target is only run during a bounded guard lift.
+//! Mounted self-FK publication and recovery proof for the public SQL path.
 const std = @import("std");
 const platform = @import("antfly_platform");
 const metadata_runtime = @import("../metadata/runtime.zig");
@@ -24,7 +23,7 @@ fn deinitDriverIfLive(driver: *raft.ManagedProgressDriver, live: *bool) void {
 
 // A real second/third hosted data Raft voter, not another handle to the
 // first owner's process. Keep the server address stable while its drivers run.
-const DataPeer = struct {
+pub const DataPeer = struct {
     replica_root: []const u8,
     catalog: []const u8,
     server: data_runtime.DataServer,
@@ -34,7 +33,7 @@ const DataPeer = struct {
     control_live: bool = false,
     paused_fk: ?*http_server.ApiHttpServer = null,
 
-    fn create(alloc: std.mem.Allocator, process_alloc: std.mem.Allocator, io: std.Io, root: []const u8, metadata_uri: []const u8, node_id: u64, trusted_secret: []const u8, internal_secret: []const u8, issuer: []const u8) !*DataPeer {
+    pub fn create(alloc: std.mem.Allocator, process_alloc: std.mem.Allocator, io: std.Io, root: []const u8, metadata_uri: []const u8, node_id: u64, trusted_secret: []const u8, internal_secret: []const u8, issuer: []const u8) !*DataPeer {
         const peer = try alloc.create(DataPeer);
         errdefer alloc.destroy(peer);
         peer.raft_live = false;
@@ -65,7 +64,7 @@ const DataPeer = struct {
         return peer;
     }
 
-    fn destroy(peer: *DataPeer, alloc: std.mem.Allocator) void {
+    pub fn destroy(peer: *DataPeer, alloc: std.mem.Allocator) void {
         if (peer.paused_fk) |server| http_server.ApiHttpServer.FkGenerationPublicationTestDriver.resumeBackground(server);
         if (peer.control_live) peer.control_driver.deinit();
         if (peer.raft_live) peer.raft_driver.deinit();
@@ -107,6 +106,37 @@ fn sql(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []con
 fn table(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8) !http.HttpResponse {
     return request(alloc, transport, headers, base, "/db/v1/tables/nodes", .GET, null);
 }
+fn awaitConstraintCoverage(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, drivers: []const *const raft.ManagedProgressDriver) !void {
+    const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+    var last_status: u16 = 0;
+    var logged_unavailable = false;
+    while (platform.time.monotonicNs() < deadline) {
+        for (drivers) |driver| try driver.checkFailure();
+        var response = request(alloc, transport, headers, base, "/db/v1/tables/nodes/constraints/status", .GET, null) catch |err| switch (err) {
+            error.Timeout, error.ConnectionRefused, error.ConnectionResetByPeer => {
+                try io.sleep(.fromMilliseconds(100), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        defer response.deinit(alloc);
+        last_status = response.status;
+        if (response.status == 200) {
+            var parsed = try std.json.parseFromSlice(struct { state: []const u8, ranges: []const std.json.Value }, alloc, response.body, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            if (parsed.value.ranges.len > 0 and std.mem.eql(u8, parsed.value.state, "enforced")) return;
+        } else if (response.status != 409 and response.status != 503 and response.status != 504) {
+            std.debug.print("self-FK constraint coverage status={d} body={s}\n", .{ response.status, response.body });
+            return error.ConstraintCoverageUnavailable;
+        } else if (!logged_unavailable and response.status == 503) {
+            logged_unavailable = true;
+            std.debug.print("self-FK constraint coverage initially unavailable body={s}\n", .{response.body});
+        }
+        try io.sleep(.fromMilliseconds(100), .awake);
+    }
+    std.debug.print("self-FK constraint coverage timeout status={d}\n", .{last_status});
+    return error.ConstraintCoverageUnavailable;
+}
 fn batchOnce(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, body: []const u8) !http.HttpResponse {
     return batchOnceWithTimeout(alloc, transport, headers, base, body, 15_000);
 }
@@ -135,7 +165,7 @@ fn batchAfterDefiniteAbort(alloc: std.mem.Allocator, io: std.Io, transport: http
     unreachable;
 }
 
-test "self-FK diagnostic retries only a proven durable precommit abort" {
+test "self-FK retries only a proven durable precommit abort" {
     const Mode = enum { proven_abort, generic_unavailable, unknown_outcome, malformed, transport_failure };
     const Fake = struct {
         mode: Mode,
@@ -292,7 +322,7 @@ fn raftStatus(data: *data_runtime.DataServer, group_id: u64) ?@import("raft_engi
     return service.raftStatus(group_id);
 }
 
-fn awaitThreeVoters(io: std.Io, first: *data_runtime.DataServer, peers: [2]*DataPeer, group_id: u64) !u64 {
+pub fn awaitThreeVoters(io: std.Io, first: *data_runtime.DataServer, peers: [2]*DataPeer, group_id: u64) !u64 {
     const deadline = platform.time.monotonicNs() +| 20 * std.time.ns_per_s;
     while (platform.time.monotonicNs() < deadline) {
         const a = raftStatus(first, group_id);
@@ -518,7 +548,7 @@ fn awaitBuilderOwnerReadiness(alloc: std.mem.Allocator, io: std.Io, transport: h
     return error.BuilderOwnerReadinessTimeout;
 }
 
-fn transferOwnerLeadership(io: std.Io, first: *data_runtime.DataServer, peers: [2]*DataPeer, group_id: u64) !void {
+pub fn transferOwnerLeadership(io: std.Io, first: *data_runtime.DataServer, peers: [2]*DataPeer, group_id: u64) !void {
     const old_leader = try awaitThreeVoters(io, first, peers, group_id);
     const first_status = raftStatus(first, group_id) orelse return error.OwnerRaftStatusUnavailable;
     const candidate: *data_runtime.DataServer = if (first_status.id != old_leader) first else if ((raftStatus(&peers[0].server, group_id) orelse return error.OwnerRaftStatusUnavailable).id != old_leader) &peers[0].server else &peers[1].server;
@@ -553,6 +583,28 @@ fn printDropParentFailureState(alloc: std.mem.Allocator, metadata: *metadata_run
         std.debug.print("self-FK DROP publication phase={s} revision={d}\n", .{ @tagName(position.phase), position.revision })
     else |err|
         std.debug.print("self-FK DROP publication status_err={s}\n", .{@errorName(err)});
+    const source = http_server.StatusSource.fromMetadataHttpService(metadata.server.svc);
+    if (source.systemCatalog(alloc, .{ .fk_generation_publication_authority = true }, .{ .fk_generation_publication_status = table_id })) |encoded| {
+        defer alloc.free(encoded);
+        if (std.json.parseFromSlice(publication.Publication, alloc, encoded, .{ .ignore_unknown_fields = true })) |parsed_value| {
+            var parsed = parsed_value;
+            defer parsed.deinit();
+            const expected = parsed.value.plan.child_before;
+            var admin = metadata.server.svc.adminSnapshot() catch return;
+            defer metadata.server.svc.freeAdminSnapshot(&admin);
+            for (admin.tables) |current| if (current.table_id == table_id) {
+                std.debug.print("self-FK DROP metadata cut table_equal={} schema_equal={} read_schema_equal={} indexes_equal={} retirement_equal={} ranges={d}\n", .{
+                    @import("../metadata/table_manager.zig").tableDefinitionsEqual(current, expected),
+                    std.mem.eql(u8, current.schema_json, expected.schema_json),
+                    std.mem.eql(u8, current.read_schema_json, expected.read_schema_json),
+                    std.mem.eql(u8, current.indexes_json, expected.indexes_json),
+                    std.mem.eql(u8, current.relational_retirement_json, expected.relational_retirement_json),
+                    admin.ranges.len,
+                });
+                break;
+            };
+        } else |err| std.debug.print("self-FK DROP metadata cut decode_err={s}\n", .{@errorName(err)});
+    } else |err| std.debug.print("self-FK DROP metadata cut status_err={s}\n", .{@errorName(err)});
     const servers = [_]*data_runtime.DataServer{ first, &peers[0].server, &peers[1].server };
     for (servers, 0..) |server, index| {
         const node_id: u64 = 9 + @as(u64, @intCast(index));
@@ -688,11 +740,26 @@ fn inspectRecoveredOwner(alloc: std.mem.Allocator, metadata: *metadata_runtime.S
     return .{ .digest_matches = digest_matches, .schema_matches = schema_matches, .installed = installed, .activation_state = activation.value.state, .activation_schema_version = activation.value.schema_version };
 }
 
-fn awaitRecoveredOwnerReady(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, data: *data_runtime.DataServer, table_id: u64) !void {
+fn awaitRecoveredOwnerReady(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, data: *data_runtime.DataServer, table_id: u64, drivers: []const *const raft.ManagedProgressDriver) !void {
     const deadline = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
     var prior_state: ?@import("../storage/db/relational_integrity_activation_contract.zig").State = null;
     while (true) {
-        const observed = try inspectRecoveredOwner(alloc, metadata, data, table_id);
+        for (drivers) |driver| try driver.checkFailure();
+        const observed = inspectRecoveredOwner(alloc, metadata, data, table_id) catch |err| switch (err) {
+            error.StorageReadTemporarilyUnavailable,
+            error.StorageKernelOwnerTransitionRequired,
+            error.StorageKernelOwnerStaleDescriptor,
+            error.OwnerStatusUnavailable,
+            error.GroupLeaderUnavailable,
+            error.NotLeader,
+            error.ReadIndexTimeout,
+            => {
+                if (platform.time.monotonicNs() >= deadline) return err;
+                try io.sleep(.fromMilliseconds(20), .awake);
+                continue;
+            },
+            else => return err,
+        };
         if (prior_state == null or prior_state.? != observed.activation_state) {
             std.debug.print("self-FK recovered owner digest_match={} schema_match={} installed={} activation={s} activation_version={d}\n", .{ observed.digest_matches, observed.schema_matches, observed.installed, @tagName(observed.activation_state), observed.activation_schema_version });
             prior_state = observed.activation_state;
@@ -861,7 +928,7 @@ fn drivePublicationWithLostRepliesDiagnostic(
     return error.PublicationTimeout;
 }
 
-fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, leader_transfer: bool) !void {
+fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: bool) !void {
     const alloc = std.testing.allocator;
     const process_alloc = platform.allocator.processAllocator(alloc);
     const trusted_secret = "hosted-self-fk-trusted-v1";
@@ -995,15 +1062,6 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
     const add_statement = "ALTER TABLE nodes ADD CONSTRAINT self_parent FOREIGN KEY (parent_id) REFERENCES nodes(id)";
     var add = try sql(alloc, transport, &headers, metadata_uri, add_statement);
     defer add.deinit(alloc);
-    if (!activated) {
-        try std.testing.expectEqual(@as(u16, 501), add.status);
-        try std.testing.expect(std.mem.indexOf(u8, add.body, "0A000") != null);
-        try std.testing.expect(std.mem.indexOf(u8, add.body, "No schema publication was admitted") != null);
-        var unchanged = try table(alloc, transport, &headers, base);
-        defer unchanged.deinit(alloc);
-        try std.testing.expect(!try hasSelfFk(alloc, unchanged));
-        return;
-    }
     if (add.status != 202) std.debug.print("mounted self-FK ADD status={d} body={s}\n", .{ add.status, add.body });
     try std.testing.expectEqual(@as(u16, 202), add.status);
     if (lost_replies) {
@@ -1103,7 +1161,8 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
     var added = try table(alloc, transport, &headers, base);
     defer added.deinit(alloc);
     try std.testing.expect(try hasSelfFk(alloc, added));
-    if (restart_after_ack) try awaitRecoveredOwnerReady(alloc, io, &metadata, &data, table_id);
+    if (restart_after_ack) try awaitRecoveredOwnerReady(alloc, io, &metadata, &data, table_id, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
+    try awaitConstraintCoverage(alloc, io, transport, &headers, base, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
     if (lost_replies) {
         var absent = try request(alloc, transport, &headers, base, "/db/v1/tables/nodes/documents/during-fence", .GET, null);
         defer absent.deinit(alloc);
@@ -1224,6 +1283,10 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
         _ = try awaitThreeVoters(io, &data, .{ peers[0].?, peers[1].? }, restarted_physical.group_id);
     }
     try awaitRestartedLocalIntegrityCatalog(alloc, io, &data, restarted_physical.name, restarted_physical.group_id);
+    // Readiness is a distributed, epoch-fenced coverage fact, not merely a
+    // successful point read. Wait only on the read-only public status route;
+    // an unavailable write must never be replayed to probe activation.
+    try awaitConstraintCoverage(alloc, io, transport, &headers, restarted_base, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
     if (leader_transfer) {
         // The restarted endpoint may forward the final write to either
         // voter. Verify every current owner can serve a linearizable read
@@ -1237,22 +1300,18 @@ fn mountedSelfFk(activated: bool, lost_replies: bool, restart_after_ack: bool, l
     try std.testing.expectEqual(@as(u16, 201), released.status);
 }
 
-test "mounted hosted self-FK public admission remains guarded" {
-    try mountedSelfFk(false, false, false, false);
-}
-
-test "mounted hosted self-FK ADD DROP restart diagnostic" {
-    try mountedSelfFk(true, false, false, false);
+test "mounted hosted self-FK ADD DROP restart" {
+    try mountedSelfFk(false, false, false);
 }
 
 test "mounted hosted self-FK publication resumes after lost owner and metadata replies" {
-    try mountedSelfFk(true, true, false, false);
+    try mountedSelfFk(true, false, false);
 }
 
 test "mounted hosted self-FK resumes after metadata and owner cold restart at parent ACK" {
-    try mountedSelfFk(true, true, true, false);
+    try mountedSelfFk(true, true, false);
 }
 
 test "mounted hosted self-FK survives three-voter owner leadership transfer at ADD and DROP ACK" {
-    try mountedSelfFk(true, true, false, true);
+    try mountedSelfFk(true, false, true);
 }

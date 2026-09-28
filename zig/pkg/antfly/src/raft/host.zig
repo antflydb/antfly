@@ -120,6 +120,9 @@ pub fn stableRandomSeed(group_id: u64, local_node_id: u64) u64 {
 }
 
 pub const HostDeps = struct {
+    /// Installed on each data group, including groups restored from catalog.
+    /// Runs under the same owner serialization as all Raft append paths.
+    data_proposal_admission: ?raft_engine.core.ProposalAdmission = null,
     /// Borrowed synchronization and monotonic clock authority; must outlive the host. The default
     /// supports blocking mutex waits without allocating a worker pool.
     io: std.Io = std.Io.Threaded.global_single_threaded.io(),
@@ -497,6 +500,10 @@ pub const Host = struct {
         const factory = self.deps.descriptor_factory orelse return error.MissingReplicaDescriptorFactory;
         var descriptor = try factory.buildDescriptor(record);
         errdefer factory.freeDescriptor(self.alloc, &descriptor);
+        if (self.cfg.metadata_group_id == null or record.group_id != self.cfg.metadata_group_id.?) {
+            if (self.deps.data_proposal_admission) |admission|
+                descriptor.group.raft_config.proposal_admission = admission;
+        }
         // A descriptor factory may attach a scenario-local trace sink (for
         // example, VOPR's in-memory TLA export). Host configuration overrides
         // that sink explicitly; the build-wide stderr logger is only the
@@ -563,6 +570,10 @@ pub const Host = struct {
         const factory = self.deps.descriptor_factory orelse return error.MissingReplicaDescriptorFactory;
         var descriptor = try factory.buildDescriptor(record);
         errdefer factory.freeDescriptor(self.alloc, &descriptor);
+        if (self.cfg.metadata_group_id == null or record.group_id != self.cfg.metadata_group_id.?) {
+            if (self.deps.data_proposal_admission) |admission|
+                descriptor.group.raft_config.proposal_admission = admission;
+        }
         if (self.cfg.trace_logger) |trace_logger| {
             descriptor.group.raft_config.trace_logger = trace_logger;
         } else if (descriptor.group.raft_config.trace_logger == null and comptime build_options.with_tla) {
@@ -733,6 +744,12 @@ pub const Host = struct {
         if (self.runtime_host.group(group_id) == null) return error.UnknownGroup;
         try self.runtime_host.removeReplica(group_id);
         self.metrics.remove_replica_calls += 1;
+        self.clearBootstrapStatus(group_id);
+        _ = self.admission_conflicts.remove(group_id);
+    }
+
+    pub fn retireReplicaPreservingCatalog(self: *Host, group_id: u64) !void {
+        try self.runtime_host.retireReplicaPreservingCatalog(group_id);
         self.clearBootstrapStatus(group_id);
         _ = self.admission_conflicts.remove(group_id);
     }

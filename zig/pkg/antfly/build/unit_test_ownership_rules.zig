@@ -431,7 +431,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "public openapi contract module is generated and wired",
         .skip = &.{
-            "api.httpx_handler.test.httpx antfly schema update owns self partial support and rejects public index forgery",
+            "api.httpx_handler.test.httpx antfly schema update owns self partial support and requires coordinated publication",
             "api.httpx_handler.test.httpx antfly schema update returns full table status after projection",
             "api.httpx_handler.test.httpx relational row query mutation endpoints enforce exact versions and schema epochs",
             "api.httpx_handler.test.httpx schema patch merges at the authority and accepts version zero ETag",

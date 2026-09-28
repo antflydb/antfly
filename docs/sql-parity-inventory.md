@@ -276,7 +276,14 @@ from current SQL extraction is not repaired by naming this inventory check a ful
   the durable empty-generation barrier. Exact original SQL forms are compiled
   and admitted by the API fixture; the real staged-owner driver tests empty
   publication and recovery. External-parent FK retirement and graph cutover
-  remain guarded architecture gaps, not waived by those case dispositions.
+  now also pass strict-public mounted baseline/cold-recovery tests in the
+  installed `fk-truncate` CI binary, without admission overrides. These broader
+  activation proofs do not change the original case dispositions or counts;
+  SQL-owned sequence counters remain outside the current catalog model.
+  Native-only TRUNCATE owners now use durable native generation-handoff
+  receipts; the linked standalone activation suite covers external-parent FK
+  and graph publication after restart. This does not establish the complete
+  promoted-standby or asynchronous-artifact online-transfer fault matrix.
 - Joined/source UPDATE and DELETE, MERGE, lateral and recursive source cases
   require explicit current-engine mapping beyond ordinary DML component tests.
 - DDL's 384 entries include session commands, prepared statements, cursors,
