@@ -552,6 +552,7 @@ jobs:
           tools/test_audit_test_selection.py
           tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
+          tools/test_run_build_cache_contracts.py
           tools/test_run_test_partitions.py
           tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
@@ -960,6 +961,7 @@ jobs:
           tools/test_audit_test_selection.py
           tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
+          tools/test_run_build_cache_contracts.py
           tools/test_run_test_partitions.py
           tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
@@ -1169,10 +1171,14 @@ jobs:
       github.event_name == 'workflow_dispatch') &&
       inputs.validation_scope == 'all') ||
       github.event.schedule == '0 8 * * *') }}
-    name: zig-full / build-cache
+    name: zig-full / build-cache / ${{ matrix.shard }}
     needs: [admission, changes]
     runs-on: arc-antfly-heavy
-    timeout-minutes: 60
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [runtime, storage]
     env:
       ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
@@ -1221,21 +1227,34 @@ jobs:
           # /tmp counts toward the runner pod's 10 GiB ephemeral-storage limit.
           echo "TMPDIR=$ANTFLY_BUILD_CACHE_TMPDIR" >> "$GITHUB_ENV"
 
-      # Each test owns its temporary source overlay and local cache. Keep
-      # those isolated; only the normal global dependency cache is shared.
-      # Verbose output identifies the individual checks in the CI log.
+      # Each shard gets its own runner and PVC. The runtime shard keeps the
+      # complete cache-contract suite; the storage shard balances the slow
+      # host-generator contract with linked fixtures and storage ownership.
       - name: Test runtime compilation and cache contracts
+        if: matrix.shard == 'runtime'
         working-directory: zig
-        run: python3 -u -m unittest -v tools/test_runtime_cache.py tools/test_linked_tests.py
+        run: python3 -u -m tools.run_build_cache_contracts runtime
+
+      - name: Test host-generator and linked cache contracts
+        if: matrix.shard == 'storage'
+        working-directory: zig
+        run: python3 -u -m tools.run_build_cache_contracts storage
+
+      - name: Reclaim cache contracts before storage compilation
+        if: matrix.shard == 'storage'
+        run: |
+          du -sh "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR" || true
+          rm -rf -- "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 
       - name: Verify physical storage compilation ownership
+        if: matrix.shard == 'storage'
         working-directory: zig
         run: |
           cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:8])))')
           taskset -c "$cpus" python3 -u tools/check_storage_compilation.py --report storage-compilation.json
 
       - name: Upload storage compilation measurements
-        if: always()
+        if: ${{ always() && matrix.shard == 'storage' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: storage-compilation
