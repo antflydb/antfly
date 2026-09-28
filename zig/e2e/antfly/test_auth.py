@@ -28,13 +28,12 @@ from pathlib import Path
 
 import pytest
 import requests
-
 from conftest import (
     AUTH_BOOTSTRAP_PASSWORD,
     DEFAULT_ANTFLY_BIN,
     StatefulAntflyServer,
-    _standalone_stateful_command,
     _read_log_tail,
+    _standalone_stateful_command,
     antfly_public_api_url,
     lookup_key_path,
     maybe_preserve_tempdir,
@@ -51,7 +50,7 @@ AUTH_SETUP_RETRY_TIMEOUT_SECONDS = 30.0
 
 
 def _basic_auth(username: str, password: str) -> str:
-    raw = f"{username}:{password}".encode("utf-8")
+    raw = f"{username}:{password}".encode()
     return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
@@ -100,7 +99,7 @@ def _wait_until(predicate, timeout: float = 30.0, interval: float = 0.25):
     return None
 
 
-def _try_lookup(api: "AuthApi", table_name: str, key: str):
+def _try_lookup(api: AuthApi, table_name: str, key: str):
     try:
         return api.lookup_key(table_name, key)
     except requests.HTTPError as err:
@@ -113,7 +112,7 @@ def _try_lookup(api: "AuthApi", table_name: str, key: str):
 
 class AuthApi:
     def __init__(
-        self, base_url: str, server_ref: "StandaloneAuthServer | SplitAuthServer"
+        self, base_url: str, server_ref: StandaloneAuthServer | SplitAuthServer
     ):
         self.url = base_url.rstrip("/")
         self.auth_url = self._auth_url_from_db_url(self.url)
