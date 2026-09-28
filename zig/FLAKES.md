@@ -1,5 +1,23 @@
 # Zig runtime flakes
 
+## 2026-09-27: PR #885 CUDA build cancelled before qualification
+
+[PR #885 CUDA build job](https://github.com/antflydb/antfly/actions/runs/36345949010/job/108695038652)
+was cancelled in `Build CUDA-enabled E2E executable` after 88 minutes 56
+seconds in that step, near the job's 90-minute limit. Packaging and the L4
+qualification job did not run, so this attempt has no CUDA correctness result.
+The [previous approved run of this PR](https://github.com/antflydb/antfly/actions/runs/36298230764/job/108560988152)
+built the same CUDA code successfully in 70 minutes 25 seconds and passed its
+[L4 smoke job](https://github.com/antflydb/antfly/actions/runs/36298230764/job/108570816784).
+The sole intervening commit changed a nested pytest probe in
+`test_standalone_harness.py`, outside the CUDA build. The cancellation is
+therefore a build-duration failure rather than an observed GLiNER test
+failure. This comparison rules out the final test-harness commit as a cause;
+it does not measure whether the broader Decide branch affects baseline build
+time. The public job metadata has no compiler progress detail to identify why
+this build took longer. Compare bounded-build resource samples and cache state
+on another run before changing the timeout or the Decide implementation.
+
 ## 2026-09-26: L4 smoke model prefetch in run 36203548073
 
 [CI run 36203548073](https://github.com/antflydb/antfly/actions/runs/36203548073)
