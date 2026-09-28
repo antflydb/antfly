@@ -69,6 +69,30 @@ jobs:
       comment_id: ${{ inputs.comment_id }}
       suite: ${{ inputs.full_validation && 'full' || 'zig' }}
 
+  apache-source-build:
+    name: Apache-only source build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: admission
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: true
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils python3
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Build from Apache-only source tree
+        run: python3 scripts/ci/apache_source_build.py
+
   changes:
     if: >-
       ${{ !cancelled() &&
