@@ -461,20 +461,30 @@ instead of decomposing into primitives.
   active command frame before reading, so this is safe inside
   `training.executeFramed`'s framed forward/backward without further
   changes. No `[tokens, tokens]` tensor is materialized on either path, so
-  Metal jobs get the same `seq_len <= 8192` admission bound as CPU. Because
-  the op was first host-bridged throughout,
+  Metal jobs get the same `seq_len <= 8192` admission bound as CPU.
   `finetune/laya/job.zig` selects fused attention only when a split's
   layout actually needs it -- `exceedsDenseAttentionBound` re-checks the
   dense materialized-bias path's own `batch*L^2*heads` bound with
   `use_fused_attention=false` and takes fused only on
   `error.LayaTrainingAttentionLimitExceeded` -- or `Config.force_fused_attention`
   asks for it explicitly. Ordinary jobs (small states, the released
-  checkpoint's `max_len`) keep training on the on-device dense path on both
-  backends, unchanged from before this track; only long-state jobs beyond
-  the dense bound (or an explicit test) pay the host-bridge cost. A true
-  on-device Metal kernel (forward tiled online softmax plus a backward that
-  needs either atomics or a range-symmetry argument for the reverse
-  `dK`/`dV` pass over tree-packed rows) is open work; see Roadmap.
+  checkpoint's `max_len`) keep training on the dense path on both backends.
+  With the device kernels that is still the right default on Metal: full
+  resident Metal training steps on the released checkpoint (batch 1,
+  question packing, ReleaseFast, 2026-09-28) take the same time either way
+  until dense no longer fits, and fused is slower on short rows:
+
+  | Packed row | Dense step | Fused step |
+  | --- | --- | --- |
+  | `prof.json` (512-token budget) | 1,432 ms | 1,669 ms |
+  | 1.5k-2.5k tokens | 17.8 s | 18.0 s |
+  | about 3k tokens | 38.1 s | 38.0 s |
+
+  So the automatic switch past the dense bound no longer costs a
+  host-bridge slowdown, and there is no reason to prefer fused earlier.
+  States came from concatenated `td/train.jsonl` texts under a copy of the
+  checkpoint with `laya.max_len` 4096; medians exclude the first step.
+  Dropout on device (the decision head while training) remains open work.
 - **Admission.** `graph.validate` drops the quadratic bound when
   `use_fused_attention` and instead only checks `seq_len <= 8192`
   (ModernBERT's pretraining length, already `laya.max_len`'s ceiling).
