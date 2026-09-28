@@ -101,6 +101,8 @@ A staged source build excludes server implementation files from the Apache
 products' source tree. This supplements the static source check and catches
 hidden compile-time dependencies. Generated Snowball sources are retained with
 their upstream BSD license, independently of the first-party source list.
+The always-on PR license check uses a GitHub-hosted runner; the staged source
+build runs for same-repository PRs, merge queue checks, and pushes to `main`.
 
 `make license-check` checks repository-wide first-party header consistency and
 the Apache dependency boundary. The root and Zig Makefiles and CI use the same

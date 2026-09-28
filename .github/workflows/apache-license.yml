@@ -36,6 +36,9 @@ jobs:
 
   source-build:
     name: Apache-only source build
+    # The build executes PR code on an ARC runner. Forks receive the static
+    # required boundary check, while staged builds run on trusted branches.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     steps:
