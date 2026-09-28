@@ -39,7 +39,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .os_tag = .freestanding,
         .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory, .simd128 }),
     });
-    const build_options = storage_build.makeRootBuildOptions(b, .zig, false, false, false, false, false, false, false);
+    const build_options = storage_build.makeRootBuildOptions(b, false, false, false, false, false);
     const json_mod = b.createModule(.{ .root_source_file = b.path("lib/json/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     const httpx_mod = b.createModule(.{ .root_source_file = b.path("lib/httpx/src/httpx.zig"), .target = wasm_target, .optimize = optimize });
     httpx_mod.addImport("antfly-json", json_mod);

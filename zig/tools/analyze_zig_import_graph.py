@@ -109,9 +109,7 @@ API_KERNEL_IMPLEMENTATIONS = (
     "storage/db/mod.zig",
     "storage/db/db.zig",
     "storage/docstore.zig",
-    "storage/lmdb.zig",
-    "storage/lmdb_backend.zig",
-)
+        )
 
 # Authoritative compiler-report gate for the linked distributed/control unit.
 # These modules own physical local storage and must be compiled only by the

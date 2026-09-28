@@ -199,9 +199,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     if (platform_tests.one_shot_process) |process| platform_test_step.dependOn(process);
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, true, false);
-    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, true, false);
-    const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, false, true);
+    const build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, false);
+    const standalone_runtime_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, true, false);
+    const production_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, true);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
         .root_source_file = b.path("lib/raft/src/root.zig"),
@@ -796,30 +796,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     antfly_mod.addImport("vopr", vopr_mod);
     antfly_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
-    // Compatibility tests and standalone engine benchmarks still exercise the
-    // Zig port (and its C oracle) through the historical Antfly adapter.
-    const antfly_lmdb_fixture_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = sanitize_thread,
-    });
-    antfly_imports.configure(b, antfly_lmdb_fixture_mod, link_libc);
-    antfly_storage_build.configureLmdb(b, antfly_lmdb_fixture_mod, lmdb_engine_mod, false);
-    antfly_lmdb_fixture_mod.addImport("vopr", vopr_mod);
-    antfly_lmdb_fixture_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
-
-    const product_backend_boundary_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/production_backend_boundary_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    product_backend_boundary_mod.addImport("antfly-zig", antfly_mod);
-    const product_backend_boundary_tests = b.addExecutable(.{ .name = "product_backend_boundary_test", .root_module = product_backend_boundary_mod });
-    const run_product_backend_boundary_tests = b.addRunArtifact(product_backend_boundary_tests);
-    b.step("product-backend-boundary-test", "Reject legacy LMDB selections in the public Antfly package")
-        .dependOn(&run_product_backend_boundary_tests.step);
-
     const wasm = @import("pkg/antfly/build/wasm.zig").add(b, sentencepiece_proto_source);
     const wasm_step = b.step("wasm", "Build and install the unified Antfly WASM bundle");
     dependOnAll(wasm_step, wasm.install);
@@ -1239,7 +1215,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .openapi_root_check = openapi_root_check,
         .usermgr_mod = usermgr_mod,
         .antfly_imports = antfly_imports,
-        .antfly_mod = antfly_lmdb_fixture_mod,
+        .antfly_mod = antfly_mod,
         .embedded_mod = embedded_mod,
         .embedded_api_mod = embedded_api_mod,
         .antfly_embedded_pkg_mod = antfly_embedded_pkg_mod,
@@ -1383,7 +1359,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .lmdb_evented_async_io = lmdb_evented_async_io,
         .with_tla = with_tla,
         .antfly_imports = antfly_imports,
-        .antfly_mod = antfly_lmdb_fixture_mod,
+        .antfly_mod = antfly_mod,
         .antfly_test_mod = antfly_test_mod,
         .run_lib_ha_compat_tests = run_lib_ha_compat_tests,
         .compiled_recall_tests = compiled_recall_tests,

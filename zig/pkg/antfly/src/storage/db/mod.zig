@@ -98,7 +98,6 @@ pub const DocumentArtifactChildRangeDispatch = @import("antfly_source_root").ant
 pub const DocumentArtifactChildRangeDispatcher = @import("antfly_source_root").antfly_sources.physical_db.DocumentArtifactChildRangeDispatcher;
 pub const CommittedBatchEffectsObserver = @import("antfly_source_root").antfly_sources.physical_db.CommittedBatchEffectsObserver;
 pub const OpenOptions = @import("antfly_source_root").antfly_sources.physical_db.OpenOptions;
-pub const hasLegacyLmdbBackendSelection = @import("antfly_source_root").antfly_sources.physical_db.hasLegacyLmdbBackendSelection;
 pub const DenseNativeMigrationPolicySource = @import("antfly_source_root").antfly_sources.physical_db.DenseNativeMigrationPolicySource;
 pub const NativeRestoreOpenPlan = @import("antfly_source_root").antfly_sources.physical_db.NativeRestoreOpenPlan;
 pub const OpenMode = @import("antfly_source_root").antfly_sources.physical_db.OpenMode;
