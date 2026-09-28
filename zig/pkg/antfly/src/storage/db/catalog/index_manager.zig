@@ -21548,41 +21548,41 @@ pub const IndexManager = struct {
         defer task_alloc.free(deleted_docs);
         for (task.source, 0..) |source, i| deleted_docs[i] = source.deleted;
 
-        if (task.persistent.prepareMergedSegmentToFileWithAllocatorsAndDeletes(
-            task_alloc,
-            task.mergeAllocator(),
-            task.snapshot,
-            task.merge_indices,
-            deleted_docs,
-        )) |prepared| {
-            var output_bytes: u64 = 0;
-            for (prepared) |*segment| output_bytes +|= @intCast(segment.data.bytes().len);
-            logTextMergeTaskMemory("after_build", task, output_bytes);
-            task.discardSourceCleanPages();
-            logTextMergeTaskMemory("after_source_discard", task, output_bytes);
-            var result = TextMergeResult{
-                .prepared_segments = prepared,
-                .prepared_owner = task.persistent,
-                .owned_alloc = task.mergeAllocator(),
-                .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
-            };
-            errdefer result.deinit(alloc);
-            return result;
-        } else |err| switch (err) {
-            error.EmptySegment => return .{
-                .segments = &.{},
-                .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
-            },
-            error.Unsupported => {},
-            else => {
-                if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
-                if (builtin.os.tag != .freestanding) {
+        if (comptime builtin.os.tag != .freestanding) {
+            if (task.persistent.prepareMergedSegmentToFileWithAllocatorsAndDeletes(
+                task_alloc,
+                task.mergeAllocator(),
+                task.snapshot,
+                task.merge_indices,
+                deleted_docs,
+            )) |prepared| {
+                var output_bytes: u64 = 0;
+                for (prepared) |*segment| output_bytes +|= @intCast(segment.data.bytes().len);
+                logTextMergeTaskMemory("after_build", task, output_bytes);
+                task.discardSourceCleanPages();
+                logTextMergeTaskMemory("after_source_discard", task, output_bytes);
+                var result = TextMergeResult{
+                    .prepared_segments = prepared,
+                    .prepared_owner = task.persistent,
+                    .owned_alloc = task.mergeAllocator(),
+                    .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+                    .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
+                };
+                errdefer result.deinit(alloc);
+                return result;
+            } else |err| switch (err) {
+                error.EmptySegment => return .{
+                    .segments = &.{},
+                    .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+                    .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
+                },
+                error.Unsupported => {},
+                else => {
+                    if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
                     std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
-                }
-                return err;
-            },
+                    return err;
+                },
+            }
         }
 
         const merged = merger_mod.mergeSegmentsBounded(task_alloc, task.snapshot, task.merge_indices, .{

@@ -159,7 +159,7 @@ def _run_wait_workload(path: str, wait_mode: str) -> None:
             )
         for batch in batches:
             inserts = {key: {field: expand(value) for field, value in doc.items()} for key, doc in batch.items()}
-            request = {"inserts": inserts}
+            request: dict[str, object] = {"inserts": inserts}
             if wait_mode == "full_index":
                 request["sync_level"] = "full_index"
             db.batch_json(request)
