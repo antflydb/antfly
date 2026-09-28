@@ -122,8 +122,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const vopr_dep = b.dependency("vopr", .{ .target = target, .optimize = optimize });
     const vopr_mod = vopr_dep.module("vopr");
     const strip = b.option(bool, "strip", "Omit debug information from release artifacts") orelse false;
-    const lmdb_backend = b.option(LmdbBackend, "lmdb_backend", "Select the LMDB backend scaffold (c or zig)") orelse .zig;
-    const lmdb_evented_async_io = b.option(bool, "lmdb_evented_async_io", "Use std.Io.Evented for the Zig LMDB async_io backend") orelse false;
+    const lmdb_backend = b.option(LmdbBackend, "lmdb_backend", "Select the LMDB implementation for test and benchmark fixtures (c or zig)") orelse .zig;
+    const lmdb_evented_async_io = b.option(bool, "lmdb_evented_async_io", "Use std.Io.Evented for standalone Zig LMDB test and benchmark fixtures") orelse false;
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
@@ -199,9 +199,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     if (platform_tests.one_shot_process) |process| platform_test_step.dependOn(process);
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, true, false);
-    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, true, false);
-    const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, false, true);
+    const build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, false);
+    const standalone_runtime_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, true, false);
+    const production_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, true);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
         .root_source_file = b.path("lib/raft/src/root.zig"),
@@ -784,16 +784,15 @@ pub fn create(b: *std.Build) ?Artifacts {
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;
 
-    // Library module
+    // The public package has the same storage boundary as the linked server:
+    // LMDB is retained only by explicitly configured test/benchmark modules.
     const antfly_mod = b.addModule("antfly-zig", .{
         .root_source_file = b.path("pkg/antfly/src/root.zig"),
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
     });
-    // The full package exports simulation APIs as well as its runtime surface.
-    antfly_imports.configure(b, antfly_mod, link_libc);
-    antfly_storage_build.configureLmdb(b, antfly_mod, lmdb_engine_mod, false);
+    production_antfly_imports.configure(b, antfly_mod, link_libc);
     antfly_mod.addImport("vopr", vopr_mod);
     antfly_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
@@ -807,7 +806,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .vopr = vopr_mod,
         .optimize = optimize,
         .strip = strip,
-        .antfly_imports = antfly_imports,
+        .antfly_imports = production_antfly_imports,
         .antfly_mod = antfly_mod,
     });
     const embedded_mod = embedded.embedded_mod;

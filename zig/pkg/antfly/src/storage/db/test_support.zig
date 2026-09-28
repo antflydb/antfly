@@ -74,8 +74,6 @@ pub fn lockApply(db: anytype) void {
 }
 
 pub fn stressDenseBackend() hbc_mod.StorageBackend {
-    const raw = getenv("ANTFLY_STRESS_DENSE_BACKEND") orelse return .lsm;
-    if (std.ascii.eqlIgnoreCase(raw, "lmdb")) return .lmdb;
     return .lsm;
 }
 

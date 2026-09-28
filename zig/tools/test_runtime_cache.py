@@ -321,7 +321,7 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assertIn("FileNotFound", self.build("cache-vopr-tests", succeeds=False))
 
     def test_lmdb_cache_contracts(self):
-        source = self.own("zig/pkg/antfly/src/lmdb/root.zig")
+        source = self.own("zig/lib/lmdb/src/root.zig")
         source.write_bytes(
             source.read_bytes()
             + b"\npub const cache_test_revision: u8 = 1;\npub const cache_test_evented = build_options.lmdb_evented_async_io;\n"

@@ -20,9 +20,7 @@ const digest_c = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 const digest_d = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 fn walOptions() @import("../wal.zig").WalOptions {
-    // LMDB gives the corruption test a deterministic way to model a torn
-    // durable tail. Production uses the default durable WAL backend.
-    return .{ .backend = .lmdb };
+    return .{ .backend = .lsm };
 }
 
 fn writeFile(path: []const u8, body: []const u8) !void {

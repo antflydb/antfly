@@ -57,12 +57,12 @@ Antfly is a distributed key-value store and vector search engine built on a **mu
 
 ### Storage Layer
 
-**Native LSM and LMDB-Compatible Engines**
+**Native LSM Engine**
 
-Antfly's storage engine is implemented natively in Zig (`zig/pkg/antfly/src/storage`). Two engines are available: a native LSM-tree engine (`storage/lsm`) with a write-ahead log, table files, and background compaction, and an LMDB-compatible copy-on-write B-tree engine (`lmdb`). Each shard owns its own storage instance, providing:
+Antfly's storage engine is implemented natively in Zig (`zig/pkg/antfly/src/storage`). Shards use the native LSM-tree engine (`storage/lsm`) with a write-ahead log, table files, and background compaction. Each shard owns its own storage instance, providing:
 - Efficient data storage and retrieval
 - Fast range scans
-- Reliable crash recovery via write-ahead logging (LSM) or copy-on-write commits (LMDB)
+- Reliable crash recovery via write-ahead logging
 
 ### Consensus and Distribution
 

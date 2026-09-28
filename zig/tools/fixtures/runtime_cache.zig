@@ -72,7 +72,7 @@ pub fn build(b: *std.Build) void {
         }
         if (artifact.root_module.root_source_file) |source| switch (source) {
             .src_path => |path| {
-                if (artifact.kind.isTest() and artifact.filters.len == 0 and std.mem.endsWith(u8, path.sub_path, "/storage/lmdb.zig")) {
+                if (artifact.kind.isTest() and artifact.filters.len == 0 and std.mem.endsWith(u8, path.sub_path, "lib/lmdb/src/lmdb.zig")) {
                     artifact.root_module.root_source_file = b.addWriteFiles().add("lmdb_test.zig",
                         \\test "LMDB cache probe" {
                         \\    const lmdb = @import("lmdb_engine");
