@@ -17,6 +17,7 @@
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -142,6 +143,42 @@ class LitePackagingTests(unittest.TestCase):
                     )
                     metadata = archive.read("antfly_lite-1.2.3.dist-info/METADATA")
                     self.assertIn(b"License-Expression: Apache-2.0", metadata)
+
+            if sys.version_info >= (3, 11):
+                install_dir = root / "installed-wheel"
+                wheel = (
+                    root
+                    / "out/python"
+                    / "antfly_lite-1.2.3-py3-none-manylinux_2_28_x86_64.whl"
+                )
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "pip",
+                        "install",
+                        "--disable-pip-version-check",
+                        "--no-index",
+                        "--no-deps",
+                        "--platform",
+                        "manylinux_2_28_x86_64",
+                        "--target",
+                        str(install_dir),
+                        str(wheel),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                for location in (
+                    "_bin/antfly-lite",
+                    "_bin/antfly-inference",
+                    "_lib/antfly-inference",
+                ):
+                    installed = install_dir / "antfly_lite" / location
+                    self.assertTrue(
+                        os.access(installed, os.X_OK),
+                        f"{installed}: {oct(installed.stat().st_mode & 0o777)}",
+                    )
 
             npm_dir = root / "out/npm"
             npm_dir.mkdir()

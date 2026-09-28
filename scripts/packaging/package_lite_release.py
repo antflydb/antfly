@@ -24,6 +24,7 @@ import hashlib
 import io
 import json
 import shutil
+import stat
 import sys
 import tarfile
 import tempfile
@@ -133,7 +134,8 @@ def write_wheel(
     ) -> None:
         info = zipfile.ZipInfo(name)
         info.compress_type = zipfile.ZIP_DEFLATED
-        info.external_attr = (mode & 0xFFFF) << 16
+        info.create_system = 3
+        info.external_attr = (stat.S_IFREG | mode) << 16
         archive.writestr(info, data)
         digest = (
             base64.urlsafe_b64encode(hashlib.sha256(data).digest())
