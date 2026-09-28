@@ -28,7 +28,7 @@ in `CONTRIBUTING.md` does not change past contributions.
 ## Validation results
 
 The Apache-only source build runs in the Zig suite after pushes to `main`. Its local run
-removed 767 ELv2 server implementation files from the staged source and built
+removed the ELv2 server implementation files from the staged source and built
 the Lite CLI and standalone inference package successfully. The companion
 license boundary check runs on every PR independently of the admission-gated
 Zig test suites.
