@@ -54,14 +54,12 @@ const dense_idle_flush_min_bytes: u64 = 8 * mib;
 const durable_lsm_idle_flush_max_age_ns: u64 = 5 * 60 * std.time.ns_per_s;
 
 pub const PrimaryBackendKind = enum {
-    lmdb,
     mem,
     lsm_memory,
     lsm,
 };
 
 pub const PrimaryBackend = union(enum) {
-    lmdb,
     mem: mem_backend_mod.Options,
     lsm_memory: lsm_backend_mod.Options,
     lsm: lsm_backend_mod.Options,
@@ -390,7 +388,6 @@ pub const ResolvedOpenConfig = struct {
 
 pub fn primaryBackendKind(primary_backend: PrimaryBackend) PrimaryBackendKind {
     return switch (primary_backend) {
-        .lmdb => .lmdb,
         .mem => .mem,
         .lsm_memory => .lsm_memory,
         .lsm => .lsm,
@@ -400,7 +397,7 @@ pub fn primaryBackendKind(primary_backend: PrimaryBackend) PrimaryBackendKind {
 pub fn primaryBackendLsmStorage(primary_backend: PrimaryBackend) ?lsm_backend_mod.Storage {
     return switch (primary_backend) {
         .lsm => |opts| opts.storage,
-        .lmdb, .mem, .lsm_memory => null,
+        .mem, .lsm_memory => null,
     };
 }
 
@@ -471,13 +468,12 @@ pub fn splitLsmOptions(
             split_opts.background_executor = null;
             break :blk split_opts;
         },
-        .lmdb, .mem, .lsm_memory => null,
+        .mem, .lsm_memory => null,
     };
 }
 
 pub fn textMainBackendForPrimary(kind: PrimaryBackendKind) persistent_mod.MainBackend {
     return switch (kind) {
-        .lmdb => .lsm,
         .mem => .lsm_memory,
         .lsm_memory => .lsm_memory,
         .lsm => .lsm,
@@ -486,13 +482,12 @@ pub fn textMainBackendForPrimary(kind: PrimaryBackendKind) persistent_mod.MainBa
 
 pub fn denseStorageBackendForPrimary(kind: PrimaryBackendKind) hbc_mod.StorageBackend {
     return switch (kind) {
-        .lmdb, .mem, .lsm_memory, .lsm => .lsm,
+        .mem, .lsm_memory, .lsm => .lsm,
     };
 }
 
 pub fn graphReverseBackendForPrimary(kind: PrimaryBackendKind) graph_mod.ReverseBackend {
     return switch (kind) {
-        .lmdb => .lsm,
         .mem => .lsm_memory,
         .lsm_memory => .lsm_memory,
         .lsm => .lsm,
@@ -501,7 +496,6 @@ pub fn graphReverseBackendForPrimary(kind: PrimaryBackendKind) graph_mod.Reverse
 
 pub fn sparseBackendForPrimary(kind: PrimaryBackendKind) sparse_mod.SparseBackend {
     return switch (kind) {
-        .lmdb => .lsm,
         .mem => .lsm_memory,
         .lsm_memory => .lsm_memory,
         .lsm => .lsm,

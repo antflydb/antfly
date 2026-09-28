@@ -5035,31 +5035,18 @@ fn yieldToBackground() void {
 }
 
 const PrimaryStoreOpenPlan = union(enum) {
-    lmdb: struct {
-        map_size: usize,
-        no_sync: bool,
-        read_only: bool,
-    },
     mem: mem_backend_mod.Options,
     lsm_memory: lsm_backend_mod.Options,
     lsm: lsm_backend_mod.Options,
 };
 
 const SplitDestinationStorePlan = union(enum) {
-    lmdb,
     lsm: lsm_backend_mod.Options,
     unsupported,
 };
 
 fn primaryStoreOpenPlan(opts: db_config.CoreOpenOptions) PrimaryStoreOpenPlan {
     return switch (opts.primary_backend) {
-        .lmdb => .{
-            .lmdb = .{
-                .map_size = opts.map_size,
-                .no_sync = opts.no_sync,
-                .read_only = opts.read_only,
-            },
-        },
         .mem => |mem_opts| .{ .mem = mem_opts },
         .lsm_memory => |lsm_opts| .{ .lsm_memory = db_config.mergedLsmOptions(opts.storage, opts.lsm_cache, opts.resource_manager, opts.bind_cache_resource_manager, opts.no_sync, lsm_opts) },
         .lsm => |lsm_opts| .{ .lsm = db_config.mergedLsmOptions(opts.storage, opts.lsm_cache, opts.resource_manager, opts.bind_cache_resource_manager, opts.no_sync, lsm_opts) },
@@ -5080,7 +5067,7 @@ fn applyReadOnlyToPrimaryBackend(primary_backend: *PrimaryBackend) void {
     switch (primary_backend.*) {
         .lsm => |*lsm_opts| makeLsmOptionsReadOnly(lsm_opts),
         .lsm_memory => |*lsm_opts| makeLsmOptionsReadOnly(lsm_opts),
-        .lmdb, .mem => {},
+        .mem => {},
     }
 }
 
@@ -5094,7 +5081,6 @@ fn applyReadOnlyToIndexBackends(index_backends: *db_config.IndexBackendOptions) 
 
 fn splitDestinationStorePlan(self: *DB) SplitDestinationStorePlan {
     return switch (self.primary_backend) {
-        .lmdb => .lmdb,
         .lsm => |opts| .{ .lsm = db_config.splitLsmOptions(.{ .lsm = opts }, self.primary_lsm_storage, opts.cache).? },
         .mem, .lsm_memory => .unsupported,
     };
@@ -5126,17 +5112,7 @@ fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpen
         };
     }
 
-    const zpath = try alloc.dupeZ(u8, path);
-    defer alloc.free(zpath);
-
     return switch (primaryStoreOpenPlan(opts)) {
-        .lmdb => |lmdb_opts| .{
-            .store = try docstore_mod.DocStore.open(alloc, zpath, .{
-                .map_size = lmdb_opts.map_size,
-                .no_sync = lmdb_opts.no_sync,
-                .read_only = lmdb_opts.read_only,
-            }),
-        },
         .mem => |mem_opts| mem_blk: {
             const backend = try alloc.create(mem_backend_mod.Backend);
             errdefer alloc.destroy(backend);
@@ -6173,7 +6149,7 @@ pub const DB = struct {
                     primary_lsm_background_executor = makeLsmBackgroundExecutor(backend_runtime, backend_owner_id);
                     lsm_opts.background_executor = &primary_lsm_background_executor;
                 },
-                .lmdb, .mem => {},
+                .mem => {},
             }
             installIndexLsmReadRuntime(&effective_index_backends, backend_runtime);
             const core_opts: db_config.CoreOpenOptions = .{
@@ -6260,7 +6236,7 @@ pub const DB = struct {
             switch (stored_primary_backend) {
                 .lsm => |*lsm_opts| lsm_opts.background_executor = null,
                 .lsm_memory => |*lsm_opts| lsm_opts.background_executor = null,
-                .lmdb, .mem => {},
+                .mem => {},
             }
             const ha_standby_role = haWriteGateIsStandby(ha_write_gate);
             const start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers and !ha_standby_role;
@@ -6619,7 +6595,7 @@ pub const DB = struct {
     fn nativeRestorePrimaryStoragePublicationCompatible(primary_backend: PrimaryBackend) bool {
         return switch (primary_backend) {
             .lsm, .lsm_memory => |options| nativeRestoreStoragePublicationCompatible(options.storage),
-            .lmdb, .mem => true,
+            .mem => true,
         };
     }
 
@@ -67143,16 +67119,7 @@ const OpenedSplitDestinationStore = struct {
 };
 
 fn openSplitDestinationStore(self: *DB, dest_dir: []const u8) !OpenedSplitDestinationStore {
-    const dest_path_z = try self.alloc.dupeZ(u8, dest_dir);
-    defer self.alloc.free(dest_path_z);
-
     return switch (splitDestinationStorePlan(self)) {
-        .lmdb => .{
-            .store = try docstore_mod.DocStore.open(self.alloc, dest_path_z, .{
-                .no_sync = true,
-                .no_meta_sync = true,
-            }),
-        },
         .lsm => |split_opts| blk: {
             var dest_opts = split_opts;
             dest_opts.background_executor = null;
@@ -70860,8 +70827,6 @@ fn stressEnvUsize(name: [*:0]const u8, default_value: usize) usize {
 }
 
 fn stressDenseBackend() hbc_mod.StorageBackend {
-    const raw = getenv("ANTFLY_STRESS_DENSE_BACKEND") orelse return .lsm;
-    if (std.ascii.eqlIgnoreCase(raw, "lmdb")) return .lmdb;
     return .lsm;
 }
 
@@ -74933,7 +74898,7 @@ test "relational index schema declarations publish atomically and maintenance ba
 test "relational index build pages fence races resume after reopen and prove readiness" {
     const alloc = std.testing.allocator;
     const native = @import("../relational_index.zig");
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 2 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 2 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -75074,7 +75039,7 @@ test "relational index build pages fence races resume after reopen and prove rea
 test "relational index mutations follow primary batches transactions deletes and reopen" {
     const alloc = std.testing.allocator;
     const native = @import("../relational_index.zig");
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 2 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 2 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -75845,7 +75810,7 @@ test "owned db reconciles published schema indexes on its durable worker lane" {
 
 test "relational columnar dirty scans intersect query and shard bounds before decoding" {
     const alloc = std.testing.allocator;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -76011,7 +75976,7 @@ test "relational columnar range admission ignores unrelated mutation epochs" {
 
 test "relational columnar selected payload pages bound wide projection reads" {
     const alloc = std.testing.allocator;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -76104,7 +76069,7 @@ test "relational columnar selected payload pages bound wide projection reads" {
 
 test "relational columnar skew pages and sparse delta merges bound physical work" {
     const alloc = std.testing.allocator;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -76170,7 +76135,7 @@ test "relational columnar skew pages and sparse delta merges bound physical work
 
 test "relational columnar merge frontier skips tombstones and unread base pages" {
     const alloc = std.testing.allocator;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -76212,7 +76177,7 @@ test "relational columnar tombstone costing preserves narrow projection" {
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -76258,7 +76223,7 @@ test "relational columnar churn bounds retained payload storage and reads" {
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -76329,7 +76294,7 @@ test "relational columnar skewed partial payload reuse follows bytes not row cou
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -76369,7 +76334,7 @@ test "relational columnar shared pages bound alternating merges and survive recl
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -76463,7 +76428,7 @@ test "relational columnar row cursor skips artifact fanout and preserves binary 
     defer relational_columns.test_disable_deadline = false;
     defer relational_columns.test_owner_limit = null;
     for ([_]?usize{ null, 2 }) |owner_limit| {
-        for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
             relational_columns.test_owner_limit = owner_limit;
             var path_tmp = try TestDirectory.init("db");
             defer path_tmp.cleanup();
@@ -76651,7 +76616,7 @@ test "relational columnar scheduler keeps merge queue separate from due timers" 
 
 test "relational columnar bootstrap checkpoints coverage with fresh snapshots across restart" {
     const alloc = std.testing.allocator;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -76896,7 +76861,7 @@ test "relational columnar adaptive admission preserves age across hot updates an
 
 test "relational columnar overlays merge mutations in order without scanning clean primary rows" {
     const alloc = std.testing.allocator;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -76972,7 +76937,7 @@ test "relational columnar decoded cache preserves snapshots and releases visitor
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -77066,7 +77031,7 @@ fn seedColumnScanPlanRows(db: *DB, alloc: Allocator, row_count: usize) !void {
 
 test "relational columnar JSON numeric predicates preserve document semantics" {
     const alloc = std.testing.allocator;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -77121,7 +77086,7 @@ fn testColumnarSelection(comptime physical_plan: bool) !void {
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.initFast("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -77186,7 +77151,7 @@ test "relational columnar late materialization pins snapshots and releases visit
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -77242,7 +77207,7 @@ test "relational columnar sequential selection preserves dirty owners bounds and
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -77286,7 +77251,7 @@ test "relational columnar sequential selection pins snapshots and releases failu
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -77358,7 +77323,7 @@ fn testRelationalBoundScan(benchmark: bool) !void {
     const row_count: usize = if (benchmark) 768 else 2 * @import("column_read_cache.zig").max_rows;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -77411,7 +77376,7 @@ fn testRelationalBoundScan(benchmark: bool) !void {
 test "relational columnar prepared ownership aggregates and aborts atomically" {
     const payloads = @import("column_payloads.zig");
     const alloc = std.testing.allocator;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = db_config.primary_lsm_options_default } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = db_config.primary_lsm_options_default }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -77669,7 +77634,7 @@ test "relational columnar production LSM batched cold block read benchmark" {
 
 test "relational point projection lease benchmark" {
     const alloc = std.testing.allocator;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -77739,7 +77704,7 @@ test "relational columnar dense nested predicate benchmark" {
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -77799,7 +77764,7 @@ fn testRelationalDecodedReuse(comptime benchmark: bool) !void {
     const alloc = allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         for ([_]bool{ true, false }) |shared| {
             var path_tmp = try TestDirectory.initFast("db");
             defer path_tmp.cleanup();
@@ -78030,7 +77995,7 @@ test "relational durable preparation sizes workers from packed bytes" {
 }
 
 test "relational columnar cleanup resumes published pages without rebuilding or clearing racing writes" {
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend|
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend|
         try testRelationalCleanupBackend(backend);
 }
 
@@ -78113,7 +78078,7 @@ test "relational columnar clean coalescing preserves typed cells without primary
     var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
     defer std.debug.assert(allocator_state.deinit() == .ok);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.initFast("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -78275,7 +78240,7 @@ test "relational columnar wide retirement is bounded durable and backpressures p
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+    for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.init("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
@@ -84461,34 +84426,6 @@ test "db in-memory primary backends keep derived log off disk" {
         defer alloc.free(derived_log_path);
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(std.testing.io, derived_log_path, .{}));
     }
-}
-
-test "db can override change journal backend to lmdb" {
-    const alloc = std.testing.allocator;
-
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    defer cleanupTempDir(path);
-
-    {
-        var db = try DB.open(alloc, std.mem.span(path), .{
-            .primary_backend = .{ .lsm_memory = .{} },
-            .change_journal_backend = .lmdb,
-        });
-        defer db.close();
-
-        try db.batch(.{
-            .writes = &.{
-                .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
-            },
-        });
-    }
-
-    const change_journal_path = try std.fmt.allocPrint(alloc, "{s}/change_journal", .{std.mem.span(path)});
-    defer alloc.free(change_journal_path);
-    var dir = try std.Io.Dir.cwd().openDir(std.testing.io, change_journal_path, .{});
-    dir.close(std.testing.io);
 }
 
 test "db basic batch/get survives reopen with durable lsm primary backend" {
@@ -108088,68 +108025,6 @@ test "db read-only open modes reject catalog mutations before side effects" {
         try std.testing.expectError(error.ReadOnly, readonly.forceCompactTextIndexes());
         try std.testing.expectError(error.ReadOnly, readonly.bestEffortForceCompactTextIndexes());
     }
-}
-
-test "db query_readonly lmdb primary does not create missing database" {
-    const alloc = std.testing.allocator;
-
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    defer cleanupTempDir(path);
-
-    var readonly = DB.open(alloc, std.mem.span(path), .{
-        .primary_backend = .lmdb,
-        .open_mode = .query_readonly,
-        .ttl_cleanup = .{ .enabled = false },
-    }) catch |err| switch (err) {
-        error.UnsupportedPlatform => return,
-        error.FileNotFound, error.NotFound, error.LmdbUnexpected => return,
-        else => return err,
-    };
-    readonly.close();
-    return error.ExpectedReadonlyLmdbMissingOpenFailure;
-}
-
-test "db query_readonly lmdb primary rejects writes after readonly open" {
-    const alloc = std.testing.allocator;
-
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    defer cleanupTempDir(path);
-
-    {
-        var db = DB.open(alloc, std.mem.span(path), .{
-            .primary_backend = .lmdb,
-            .start_index_workers = false,
-            .ttl_cleanup = .{ .enabled = false },
-        }) catch |err| switch (err) {
-            error.UnsupportedPlatform => return,
-            else => return err,
-        };
-        defer db.close();
-
-        try db.batch(.{
-            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
-            .sync_level = .write,
-        });
-    }
-
-    var readonly = try DB.open(alloc, std.mem.span(path), .{
-        .primary_backend = .lmdb,
-        .open_mode = .query_readonly,
-        .ttl_cleanup = .{ .enabled = false },
-    });
-    defer readonly.close();
-
-    var result = (try readonly.lookup(alloc, "doc:a", .{})) orelse return error.MissingReadonlyLmdbDocument;
-    defer result.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
-    try std.testing.expectError(error.ReadOnly, readonly.batch(.{
-        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
-        .sync_level = .write,
-    }));
 }
 
 test "db writer_no_replay open defers pending derived replay until runUntilIdle" {
@@ -136174,42 +136049,6 @@ test "db native snapshot exports self-contained generation" {
     try std.testing.expectEqual(@as(u32, 1), parsed_manifest.value.primary.artifact_version);
 }
 
-test "db native snapshot rejects projections without immutable checkpoints" {
-    @import("../../test_error_logs.zig").expectErrorLogs(1);
-
-    const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    defer cleanupTempDir(path);
-    defer {
-        var snapshots_buf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(path)})) |snapshots| {
-            std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
-        } else |_| {}
-    }
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
-    // Install the physical backend before materializing the projection. DB
-    // config resolution deliberately couples backend overrides to their
-    // storage override, while this test needs a local LMDB generation.
-    db.core.index_manager.setDenseStorageBackend(.lmdb);
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
-    });
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:one", .value = "{\"embedding\":[1,0,0]}" }},
-        .sync_level = .full_index,
-    });
-    try std.testing.expectError(
-        error.NativeBackupProjectionBackendUnsupported,
-        db.snapshotNative("unsupported-projection-backend"),
-    );
-}
-
 test "db native snapshot rejects storage without atomic host generation publication" {
     @import("../../test_error_logs.zig").expectErrorLogs(1);
 
@@ -137243,15 +137082,6 @@ test "db native restore preserves primary generation and repairs only a missing 
         compatibility_path,
     )).?;
     defer compatibility.deinit();
-    var mismatch_options = OpenOptions{ .primary_backend = primary_backend };
-    mismatch_options.index_backends.dense_storage_backend = .lmdb;
-    try DB.classifyIncompatibleNativeProjections(
-        &compatibility,
-        mismatch_options,
-    );
-    try std.testing.expect(compatibility.projectionInvalid("dense_idx"));
-    try std.testing.expect(!compatibility.projectionInvalid("text_idx"));
-
     const damaged = for (parsed.value.artifacts) |artifact| {
         if (artifact.role == .projection and std.mem.eql(u8, artifact.projection_name, "dense_idx"))
             break artifact.path;

@@ -17,7 +17,6 @@ const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const mem_backend = @import("mem_backend.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
-const lmdb_backend = @import("lmdb_backend.zig");
 
 fn expectNamespaceStoreConformance(
     runtime: *backend_erased.NamespaceStore,
@@ -253,51 +252,6 @@ test "backend conformance: lsm backend durable reopen" {
             .flush_threshold = 2,
             .compact_threshold_runs = 4,
         });
-        defer backend.close();
-
-        var ns_runtime = try backend.runtimeNamespaceStore(std.testing.allocator);
-        defer ns_runtime.deinit();
-        try expectReopenedNamespaceState(&ns_runtime);
-
-        var bound_runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
-        defer bound_runtime.deinit();
-        try expectReopenedBoundState(&bound_runtime);
-    }
-}
-
-test "backend conformance: lmdb backend" {
-    var path_buf: [256]u8 = undefined;
-    const path = tmpPath(&path_buf, "lmdb");
-    defer cleanupTmp(path);
-
-    var backend = try lmdb_backend.Backend.open(std.testing.allocator, path, .{});
-    defer backend.close();
-
-    var ns_runtime = try backend.runtimeNamespaceStore(std.testing.allocator);
-    defer ns_runtime.deinit();
-    try expectNamespaceStoreConformance(&ns_runtime, true);
-
-    var bound_runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
-    defer bound_runtime.deinit();
-    try expectBoundStoreConformance(&bound_runtime);
-}
-
-test "backend conformance: lmdb backend durable reopen" {
-    var path_buf: [256]u8 = undefined;
-    const path = tmpPath(&path_buf, "lmdb-reopen");
-    defer cleanupTmp(path);
-
-    {
-        var backend = try lmdb_backend.Backend.open(std.testing.allocator, path, .{});
-        defer backend.close();
-
-        var runtime = try backend.runtimeNamespaceStore(std.testing.allocator);
-        defer runtime.deinit();
-        try seedDurableState(&runtime);
-    }
-
-    {
-        var backend = try lmdb_backend.Backend.open(std.testing.allocator, path, .{});
         defer backend.close();
 
         var ns_runtime = try backend.runtimeNamespaceStore(std.testing.allocator);

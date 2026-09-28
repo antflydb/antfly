@@ -4511,7 +4511,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lmdb_test_step = b.step("lmdb-test", "Run Zig LMDB port unit tests");
     lmdb_test_step.dependOn(&run_lmdb_unit_tests.step);
 
-    const storage_lmdb_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    const storage_lmdb_test_mod = makeLmdbModule(b, "lib/lmdb/src/lmdb.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     const storage_lmdb_unit_tests = b.addTest(.{
         .root_module = storage_lmdb_test_mod,
     });
@@ -4528,7 +4528,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const storage_lmdb_replay_step = b.step("lmdb-replay-fixtures", "Run only the LMDB replay fixture test");
     storage_lmdb_replay_step.dependOn(&run_storage_lmdb_replay_tests.step);
 
-    const lmdb_vopr_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb_vopr.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    const lmdb_vopr_test_mod = makeLmdbModule(b, "lib/lmdb/src/lmdb_vopr.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     lmdb_vopr_test_mod.addImport("vopr", vopr_mod);
     const lmdb_vopr_tests = b.addTest(.{
         .root_module = lmdb_vopr_test_mod,
@@ -4555,7 +4555,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const storage_lmdb_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const storage_lmdb_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, storage_lmdb_soak_build_options);
-    const storage_lmdb_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod, hash_mod);
+    const storage_lmdb_soak_test_mod = makeLmdbModule(b, "lib/lmdb/src/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod, hash_mod);
     const storage_lmdb_soak_tests = b.addTest(.{
         .root_module = storage_lmdb_soak_test_mod,
         .filters = &.{"LMDB sim soak stays green"},
@@ -4564,8 +4564,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const storage_lmdb_soak_step = b.step("lmdb-workload-soak", "Run only the legacy LMDB randomized workload soak");
     storage_lmdb_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
 
+    const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    docstore_test_mod.addImport("bloom", bloom_mod);
+    docstore_test_mod.addImport("antfly_pdf", pdf_mod);
+    docstore_test_mod.addImport("antfly_regex", options.antfly_imports.regex);
+    docstore_test_mod.addImport("antfly_schema_openapi", options.antfly_imports.schema_openapi);
+    options.antfly_imports.configure(b, docstore_test_mod, true);
     const docstore_unit_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = docstore_test_mod,
         .filters = &.{ "storage.docstore.", "storage.transactions." },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
@@ -4639,8 +4645,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     wal_test_mod.addImport("bloom", bloom_mod);
     wal_test_mod.addImport("structlog", structlog_mod);
     wal_test_mod.addImport("vopr", vopr_mod);
+    wal_test_mod.addImport("antfly_pdf", pdf_mod);
+    wal_test_mod.addImport("antfly_regex", options.antfly_imports.regex);
+    wal_test_mod.addImport("antfly_schema_openapi", options.antfly_imports.schema_openapi);
+    options.antfly_imports.configure(b, wal_test_mod, true);
     const wal_unit_tests = b.addTest(.{
         .root_module = wal_test_mod,
+        .filters = &.{"wal"},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4718,6 +4729,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     persistent_test_mod.addImport("antfly_reranking", reranking_mod);
     persistent_test_mod.addImport("structlog", structlog_mod);
     persistent_test_mod.addImport("vopr", vopr_mod);
+    options.antfly_imports.configure(b, persistent_test_mod, true);
     const persistent_rebuild_tests = b.addTest(.{
         .root_module = persistent_test_mod,
         .filters = &.{"persistent rebuild page"},
@@ -4727,6 +4739,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const persistent_unit_tests = b.addTest(.{
         .root_module = persistent_test_mod,
+        .filters = &.{"storage.persistent."},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const sim_fixture = @import("sim_fixture.zig");
+const sim_fixture = @import("storage_sim_fixture");
 
 pub const DifferentialAction = union(enum) {
     put_main: struct { key_index: u8, value_index: u16 },

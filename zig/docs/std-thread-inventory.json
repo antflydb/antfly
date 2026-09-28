@@ -969,7 +969,7 @@
       "source": "const producer_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"
     },
     {
-      "file": "zig/pkg/antfly/src/lmdb/env.zig",
+      "file": "zig/lib/lmdb/src/env.zig",
       "line": 182,
       "category": "runtime/library",
       "source": "self.thread = std.Thread.spawn(.{}, run, .{self}) catch |err| switch (err) {"
@@ -1563,13 +1563,13 @@
       "source": "thread.* = try std.Thread.spawn(.{}, Worker.run, .{ worker, worker_index });"
     },
     {
-      "file": "zig/pkg/antfly/src/storage/lmdb.zig",
+      "file": "zig/lib/lmdb/src/lmdb.zig",
       "line": 2536,
       "category": "test/helper",
       "source": "const writer_thread = try std.Thread.spawn(.{}, Worker.runWriter, .{&writer});"
     },
     {
-      "file": "zig/pkg/antfly/src/storage/lmdb.zig",
+      "file": "zig/lib/lmdb/src/lmdb.zig",
       "line": 2537,
       "category": "test/helper",
       "source": "const reader_thread = try std.Thread.spawn(.{}, Worker.runReader, .{&reader});"

@@ -8,7 +8,7 @@ const backups_api = @import("../../api/backups.zig");
 
 pub fn capture(alloc: std.mem.Allocator, db: anytype, db_path: []const u8, snapshot_token: []const u8, destination_root: []const u8) !void {
     switch (db.primary_backend) {
-        .lmdb, .lsm => {},
+        .lsm => {},
         .mem, .lsm_memory => return error.HASeedSnapshotUnsupportedBackend,
     }
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, snapshot_token });
