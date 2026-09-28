@@ -122,8 +122,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const vopr_dep = b.dependency("vopr", .{ .target = target, .optimize = optimize });
     const vopr_mod = vopr_dep.module("vopr");
     const strip = b.option(bool, "strip", "Omit debug information from release artifacts") orelse false;
-    const lmdb_backend = b.option(LmdbBackend, "lmdb_backend", "Select the LMDB backend scaffold (c or zig)") orelse .zig;
-    const lmdb_evented_async_io = b.option(bool, "lmdb_evented_async_io", "Use std.Io.Evented for the Zig LMDB async_io backend") orelse false;
+    const lmdb_backend = b.option(LmdbBackend, "lmdb_backend", "Select the LMDB implementation for test and benchmark fixtures (c or zig)") orelse .zig;
+    const lmdb_evented_async_io = b.option(bool, "lmdb_evented_async_io", "Use std.Io.Evented for standalone Zig LMDB test and benchmark fixtures") orelse false;
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
@@ -784,18 +784,41 @@ pub fn create(b: *std.Build) ?Artifacts {
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;
 
-    // Library module
+    // The public package has the same storage boundary as the linked server:
+    // LMDB is retained only by explicitly configured test/benchmark modules.
     const antfly_mod = b.addModule("antfly-zig", .{
         .root_source_file = b.path("pkg/antfly/src/root.zig"),
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
     });
-    // The full package exports simulation APIs as well as its runtime surface.
-    antfly_imports.configure(b, antfly_mod, link_libc);
-    antfly_storage_build.configureLmdb(b, antfly_mod, lmdb_engine_mod, false);
+    production_antfly_imports.configure(b, antfly_mod, link_libc);
     antfly_mod.addImport("vopr", vopr_mod);
     antfly_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+
+    // Compatibility tests and standalone engine benchmarks still exercise the
+    // Zig port (and its C oracle) through the historical Antfly adapter.
+    const antfly_lmdb_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    });
+    antfly_imports.configure(b, antfly_lmdb_fixture_mod, link_libc);
+    antfly_storage_build.configureLmdb(b, antfly_lmdb_fixture_mod, lmdb_engine_mod, false);
+    antfly_lmdb_fixture_mod.addImport("vopr", vopr_mod);
+    antfly_lmdb_fixture_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+
+    const product_backend_boundary_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/production_backend_boundary_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    product_backend_boundary_mod.addImport("antfly-zig", antfly_mod);
+    const product_backend_boundary_tests = b.addExecutable(.{ .name = "product_backend_boundary_test", .root_module = product_backend_boundary_mod });
+    const run_product_backend_boundary_tests = b.addRunArtifact(product_backend_boundary_tests);
+    b.step("product-backend-boundary-test", "Reject legacy LMDB selections in the public Antfly package")
+        .dependOn(&run_product_backend_boundary_tests.step);
 
     const wasm = @import("pkg/antfly/build/wasm.zig").add(b, sentencepiece_proto_source);
     const wasm_step = b.step("wasm", "Build and install the unified Antfly WASM bundle");
@@ -807,7 +830,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .vopr = vopr_mod,
         .optimize = optimize,
         .strip = strip,
-        .antfly_imports = antfly_imports,
+        .antfly_imports = production_antfly_imports,
         .antfly_mod = antfly_mod,
     });
     const embedded_mod = embedded.embedded_mod;
@@ -1216,7 +1239,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .openapi_root_check = openapi_root_check,
         .usermgr_mod = usermgr_mod,
         .antfly_imports = antfly_imports,
-        .antfly_mod = antfly_mod,
+        .antfly_mod = antfly_lmdb_fixture_mod,
         .embedded_mod = embedded_mod,
         .embedded_api_mod = embedded_api_mod,
         .antfly_embedded_pkg_mod = antfly_embedded_pkg_mod,
@@ -1360,7 +1383,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .lmdb_evented_async_io = lmdb_evented_async_io,
         .with_tla = with_tla,
         .antfly_imports = antfly_imports,
-        .antfly_mod = antfly_mod,
+        .antfly_mod = antfly_lmdb_fixture_mod,
         .antfly_test_mod = antfly_test_mod,
         .run_lib_ha_compat_tests = run_lib_ha_compat_tests,
         .compiled_recall_tests = compiled_recall_tests,

@@ -210,7 +210,7 @@ A stateless way to sync sorted records from an external source. Antfly's linear 
 
 ### LSM & SSTables
 
-Antfly's native storage engine (`zig/pkg/antfly/src/storage/lsm`) is a Zig LSM-tree implementation, with an alternative LMDB-compatible copy-on-write B-tree engine (`zig/pkg/antfly/src/lmdb`) also available. Each [shard](#sharding) has its own storage instance.
+Antfly's native storage engine (`zig/pkg/antfly/src/storage/lsm`) is a Zig LSM-tree implementation. Each [shard](#sharding) has its own storage instance. The Zig LMDB port (`zig/pkg/antfly/src/lmdb`) is retained as a separate compatibility and testing component, not as a production storage backend.
 
 **SSTables (Sorted String Tables)** are the immutable, sorted files that form the LSM engine's on-disk storage format. SSTables enable efficient range scans and merging. The LSM-tree architecture writes data to memory first, then flushes to SSTables, and periodically compacts them for efficiency.
 

@@ -39,8 +39,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .os_tag = .freestanding,
         .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory, .simd128 }),
     });
-    const lmdb_build_options = storage_build.makeLmdbBuildOptions(b, .zig, false, false);
-    const build_options = storage_build.makeRootBuildOptions(b, .zig, false, false, false, false, false, true, false);
+    const build_options = storage_build.makeRootBuildOptions(b, .zig, false, false, false, false, false, false, false);
     const json_mod = b.createModule(.{ .root_source_file = b.path("lib/json/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     const httpx_mod = b.createModule(.{ .root_source_file = b.path("lib/httpx/src/httpx.zig"), .target = wasm_target, .optimize = optimize });
     httpx_mod.addImport("antfly-json", json_mod);
@@ -51,7 +50,6 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .json = json_mod,
         .httpx = httpx_mod,
     });
-    const lmdb_engine_wasm_mod = storage_build.makeLmdbEngineModule(b, wasm_target, optimize, false, lmdb_build_options);
     const wasm_protobuf_mod = b.dependency("protobuf", .{ .target = wasm_target, .optimize = optimize }).module("protobuf");
     const wasm_handlebars_mod = b.dependency("handlebars", .{ .target = wasm_target, .optimize = optimize }).module("handlebars");
     const wasm_platform_mod = platform_build.createModule(b, .{
@@ -132,7 +130,6 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const embedded_wasm_deps = .{
         build_options,
         storage_build.createLiteOptions(b, false),
-        lmdb_engine_wasm_mod,
         json_mod,
         api.public,
         api.query,

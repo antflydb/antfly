@@ -5130,7 +5130,7 @@ fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpen
     defer alloc.free(zpath);
 
     return switch (primaryStoreOpenPlan(opts)) {
-        .lmdb => |lmdb_opts| .{
+        .lmdb => |lmdb_opts| if (!build_options.lmdb_enabled) return error.BackendUnavailable else .{
             .store = try docstore_mod.DocStore.open(alloc, zpath, .{
                 .map_size = lmdb_opts.map_size,
                 .no_sync = lmdb_opts.no_sync,
@@ -5182,6 +5182,16 @@ fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpen
             };
         },
     };
+}
+
+/// Legacy LMDB choices are retained only by explicit engine fixtures.
+pub fn hasLegacyLmdbBackendSelection(opts: OpenOptions) bool {
+    return opts.primary_backend == .lmdb or
+        opts.index_backends.text_main_backend == .lmdb or
+        opts.index_backends.dense_storage_backend == .lmdb or
+        opts.index_backends.sparse_backend == .lmdb or
+        opts.index_backends.graph_reverse_backend == .lmdb or
+        (opts.change_journal_backend != null and opts.change_journal_backend.? == .lmdb);
 }
 
 const ShadowState = struct {
@@ -6072,6 +6082,13 @@ pub const DB = struct {
                         try configurator.configure(path, &opts);
                     }
                 }
+            }
+            // The production package must reject legacy LMDB selections
+            // explicitly. DocStore.open otherwise maps its old LMDB entrypoint
+            // to LSM when LMDB support is compiled out, which could silently
+            // open a different store than the caller requested.
+            if (!build_options.lmdb_enabled and hasLegacyLmdbBackendSelection(opts)) {
+                return error.BackendUnavailable;
             }
             const runtime_alloc = backgroundRuntimeAllocator(alloc);
             var owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;

@@ -1,4 +1,10 @@
-# Zig LMDB Engine
+# Zig LMDB Port (Standalone)
+
+This is a historical design and roadmap document for the LMDB-compatible Zig
+port. Antfly's production storage backend is LSM; the port and vendored C
+oracle remain available for engine tests, fixtures, and benchmarks. References
+below to making LMDB the primary Antfly backend are historical, not the current
+product direction.
 
 This file is the canonical design and roadmap note for the Zig LMDB engine used
 by `antfly-zig`.
