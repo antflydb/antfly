@@ -30120,14 +30120,12 @@ pub const DB = struct {
     }
 
     pub fn drainScheduledTextMerges(self: *DB) !void {
-        if (comptime builtin.os.tag != .freestanding) {
-            if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-            var snapshot_replay = try self.acquireSnapshotReplayMutation();
-            defer snapshot_replay.release();
-            try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
-            try self.core.drainScheduledTextMerges();
-        }
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.core.drainScheduledTextMerges();
     }
 
     /// Internal search-kernel indexing boundary. Source documents are already
