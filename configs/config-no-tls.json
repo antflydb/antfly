@@ -7,7 +7,7 @@
   "log": { "level": "debug", "style": "terminal" },
   "cors": {
     "enabled": true,
-    "allowed_origins": ["*"],
+    "allowed_origins": ["http://localhost:8080", "http://127.0.0.1:8080"],
     "allowed_methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     "allowed_headers": ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"],
     "max_age": 3600

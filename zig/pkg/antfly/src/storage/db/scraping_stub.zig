@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+pub const data_uri = @import("antfly_data_uri");
 
 pub const DownloadedContent = struct {
     content_type: []u8,
@@ -60,8 +61,7 @@ pub const EmptyCredentialMap = struct {
 };
 
 pub fn dataUriDecodedSize(uri: []const u8) !usize {
-    _ = uri;
-    return 0;
+    return (try data_uri.parseRequired(uri)).decodedSize();
 }
 
 pub fn downloadContentOutcomeAllocWithHeaders(

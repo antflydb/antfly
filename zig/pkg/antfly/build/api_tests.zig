@@ -950,6 +950,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "hosted participant attempt deadline preserves the server outcome window",
             "hosted participant rediscovery retries only pre-decision leader unavailability",
             "distributed txn coordinator aborts only participants that may have begun",
+            "DistributedEntitySink deletes an old pinned copy while moving a key",
+            "DistributedEntitySink live replay preserves curator redirects and alias union",
+            "DistributedEntitySink upserts a merge transform per entity",
+            "DistributedEntitySink overwrites the redirect for a merged tombstone",
+            "DistributedEntitySink records a cross-table redirect",
             "DistributedEntitySink atomic promotion batch prefers stateless batch commit",
             "DistributedEntitySink commits a re-key across pinned physical tables atomically",
             "DistributedEntitySink batch commit remains compatible with transaction-only sources",
@@ -986,6 +991,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed txn bounds unresolved coordinator decision retries",
             "distributed txn propagates one absolute deadline through ambiguous decision recovery",
             "distributed txn participant fanout is bounded and concurrent",
+            "distributed txn acknowledgement windows batch only proven followers and preserve recovery debt",
+            "hosted participant bulk acknowledgements use typed transport and only definite legacy fallback",
+            "distributed txn bulk acknowledgement codec owns bounded participant identities and restore authority",
+            "distributed txn abort fanout preserves durable ordering contact evidence and bounded recovery",
             "distributed txn coordinator never aborts after durable commit decision",
             "distributed txn coordinator never restarts a transaction id on topology change",
             "db transaction recovery runtime resolves table-group participants through distributed txn resolver",
@@ -1571,6 +1580,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         lib_serverless_docid_runtime_filters,
     );
     const run_api_transactions_docid_tests = addFilteredTestRunArtifact(b, api_transactions_docid_tests);
+    b.step("antfly-api-transaction-commit-test", "Run routed transaction commit and entity promotion contracts").dependOn(&run_api_transactions_docid_tests.step);
     const write_implementation_tests = b.addTest(.{
         .name = "api-table-write-implementation-tests",
         .root_module = write_implementation_module,

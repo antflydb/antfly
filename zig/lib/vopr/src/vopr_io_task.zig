@@ -477,6 +477,9 @@ pub const Kernel = struct {
     pub fn groupAwait(self: *Kernel, public_group: *std.Io.Group, token: *anyopaque) !void {
         const group: *GroupState = @ptrCast(@alignCast(token));
         if (group.public != public_group) return error.InvalidVoprIoGroup;
+        // The last child can finish before its parked awaiter resumes. The
+        // group still belongs to that awaiter even when tasks is empty.
+        if (group.awaiter != null) return error.InvalidVoprIoGroup;
         while (group.tasks.items.len != 0) {
             const awaiter = self.currentTask() orelse return error.VoprIoAwaitOutsideTask;
             if (group.awaiter != null) return error.InvalidVoprIoGroup;
@@ -499,6 +502,7 @@ pub const Kernel = struct {
     pub fn groupCancel(self: *Kernel, public_group: *std.Io.Group, token: *anyopaque) !void {
         const group: *GroupState = @ptrCast(@alignCast(token));
         if (group.public != public_group) return error.InvalidVoprIoGroup;
+        if (group.awaiter != null) return error.InvalidVoprIoGroup;
         self.cancelGroupTasks(group);
         while (group.tasks.items.len != 0) {
             const awaiter = self.currentTask() orelse return error.VoprIoAwaitOutsideTask;
@@ -533,7 +537,7 @@ pub const Kernel = struct {
         token: *anyopaque,
     ) !void {
         const group: *GroupState = @ptrCast(@alignCast(token));
-        if (group.public != public_group or group.tasks.items.len != 0)
+        if (group.public != public_group or group.tasks.items.len != 0 or group.awaiter != null)
             return error.InvalidVoprIoGroup;
         self.destroyGroup(group);
     }

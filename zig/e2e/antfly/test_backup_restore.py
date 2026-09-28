@@ -576,6 +576,95 @@ def _assert_constraint_rejected(
         ) from exc
 
 
+def _assert_unique_claims_rejected(cluster, table, rows):
+    """Check every claim independently, with bounded transport ownership."""
+
+    def probe(ordinal, row):
+        # A shared candidate row would add unrelated intent contention. A
+        # separate session also avoids sharing requests' mutable pool state.
+        with requests.Session() as session:
+            session.headers["Connection"] = "close"
+            _assert_constraint_rejected(
+                cluster,
+                session,
+                table,
+                {f"8:duplicate:{ordinal}": {"id": row["id"]}},
+                "UniqueConstraintViolation",
+            )
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [
+            executor.submit(probe, ordinal, row) for ordinal, row in enumerate(rows)
+        ]
+        # Join every worker before the caller starts the next mutation. A
+        # failed probe propagates; combining claims in one rejected batch
+        # would allow a different surviving claim to hide a missing one.
+        for future in futures:
+            future.result()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_unique_claim_probes_are_independent_bounded_and_joined(monkeypatch, fail):
+    cluster = object()
+    lock = threading.Lock()
+    barrier = threading.Barrier(3)
+    sessions = []
+    observed = []
+    active = 0
+    peak = 0
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.closed = False
+            self.used = False
+            with lock:
+                sessions.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            self.closed = True
+
+    def rejected(owner, session, table, inserts, expected):
+        nonlocal active, peak
+        assert owner is cluster and table == "parents"
+        assert expected == "UniqueConstraintViolation"
+        assert session.headers == {"Connection": "close"}
+        assert not session.closed and not session.used
+        session.used = True
+        key, row = next(iter(inserts.items()))
+        with lock:
+            observed.append((key, row["id"]))
+            active += 1
+            peak = max(peak, active)
+        try:
+            if row["id"] < 3:
+                # A serial implementation cannot satisfy this barrier. Keep
+                # the watchdog finite so regressions fail without hanging.
+                barrier.wait(timeout=3)
+            if fail and row["id"] == 1:
+                raise AssertionError("claim probe failed")
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(requests, "Session", Session)
+    monkeypatch.setattr(sys.modules[__name__], "_assert_constraint_rejected", rejected)
+    rows = [{"id": value} for value in range(36)]
+    if fail:
+        with pytest.raises(AssertionError, match="claim probe failed"):
+            _assert_unique_claims_rejected(cluster, "parents", rows)
+    else:
+        _assert_unique_claims_rejected(cluster, "parents", rows)
+    assert peak == 3 and active == 0
+    assert len(observed) == 36
+    assert len({key for key, _ in observed}) == 36
+    assert {value for _, value in observed} == set(range(36))
+    assert all(session.closed and session.used for session in sessions)
+
+
 def _batch_cluster_docs_when_writable(
     cluster,
     session: requests.Session,
@@ -1075,8 +1164,24 @@ class ThreeByThreeBackupCluster:
             )
             self.metadata_procs.append(proc)
 
-        for url in self.metadata_admin_urls:
-            if not wait_for_server(url, path="/metadata/v1/status", timeout=30.0):
+        metadata_processes = [
+            (f"metadata-{i + 1}", proc) for i, proc in enumerate(self.metadata_procs)
+        ]
+
+        def metadata_ready(url):
+            return wait_for_server(
+                url,
+                path="/metadata/v1/status",
+                timeout=30.0,
+                processes=metadata_processes,
+            )
+
+        for url, live in zip(
+            self.metadata_admin_urls,
+            self._metadata_probe_executor.map(metadata_ready, self.metadata_admin_urls),
+            strict=True,
+        ):
+            if not live:
                 raise RuntimeError(
                     f"metadata server failed to start at {url}\n{self.debug_logs()}"
                 )
@@ -1103,9 +1208,24 @@ class ThreeByThreeBackupCluster:
                 ),
             )
             self.data_procs.append(proc)
-            if not wait_for_server(data_api_url, timeout=30.0):
+        # Every process starts before readiness joins. Preserve fresh roots and
+        # per-node leases while overlapping independent open/listener work.
+        processes = [(f"data-{i + 4}", proc) for i, proc in enumerate(self.data_procs)]
+        processes.extend(
+            (f"metadata-{i + 1}", proc) for i, proc in enumerate(self.metadata_procs)
+        )
+
+        def ready(url):
+            return wait_for_server(url, timeout=30.0, processes=processes)
+
+        for url, live in zip(
+            self.data_api_urls,
+            self._metadata_probe_executor.map(ready, self.data_api_urls),
+            strict=True,
+        ):
+            if not live:
                 raise RuntimeError(
-                    f"data server failed to start at {data_api_url}\n{self.debug_logs()}"
+                    f"data server failed to start at {url}\n{self.debug_logs()}"
                 )
 
         if not wait_until(
@@ -1523,26 +1643,24 @@ class ThreeByThreeBackupCluster:
         if not self._metadata_probe_executor_shutdown:
             self._metadata_probe_executor.shutdown(wait=True, cancel_futures=True)
             self._metadata_probe_executor_shutdown = True
-        self.port_reservations.close()
-        for proc in reversed(self.data_procs):
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-        self.data_procs = []
+        from process_lifecycle import stop_processes
 
-        for proc in reversed(self.metadata_procs):
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-        self.metadata_procs = []
+        # Data nodes finish before metadata stops. Within each role all nodes
+        # are signalled first; listener leases remain held until every exit.
+        failures = []
+        for attribute in ("data_procs", "metadata_procs"):
+            try:
+                stop_processes(list(reversed(getattr(self, attribute))))
+            except Exception as error:
+                failures.append(error)
+            else:
+                setattr(self, attribute, [])
+        if failures:
+            # Keep ownership, logs, roots and listener leases for unreaped
+            # processes. Still attempt both role stages before reporting.
+            maybe_preserve_tempdir(self.tempdir, failed=True)
+            raise ExceptionGroup("cluster shutdown failed", failures)
+        self.port_reservations.close()
 
         for handle in [*self.data_log_files, *self.metadata_log_files]:
             if not handle.closed:

@@ -1478,7 +1478,7 @@ pub fn compileGradientGraph(
             },
 
             // Ops not supported in the gradient path
-            .gather, .scatter_add, .conv_general => {
+            .gather, .scatter_add, .conv_general, .average_pool => {
                 return error.UnsupportedPrimitiveOp;
             },
 

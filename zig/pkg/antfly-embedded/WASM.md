@@ -235,6 +235,10 @@ Build the bundle and run its smoke test under Node:
 
 - `zig build wasm-test`
 
+The browser artifact uses ReleaseSafe to avoid LLVM inference miscompilation
+and browser limits on unoptimized functions. Use `-Dwasm-strip=true` to omit
+debug information from the distributable browser module.
+
 Artifacts are installed under:
 
 - `zig-out/antfly-wasm/`
@@ -248,10 +252,17 @@ The smoke uses:
 - close/reopen on the same host storage to prove text-index persistence
 - package client helper from `pkg/antfly-embedded/wasm_client.mjs`
 - host-provided remote template rendering for `remoteText`
+- a separate WASM fixture for 64-bit counters, compare-exchange, float16 distances,
+  secure host entropy, and freestanding clocks
+
+The JavaScript host supplies secure entropy through `crypto.getRandomValues`.
+Opening a database fails explicitly if secure entropy is unavailable; it never
+substitutes a predictable random generator.
 
 ## Validation
 
-- `zig build antfly-embedded-test --summary failures`
+- `zig build embedded-test --summary failures` (database/API lifecycle tests)
+- `zig build antfly-embedded-test --summary failures` (package compile surface)
 - `zig build wasm`
 - `zig build wasm-test`
 

@@ -6910,7 +6910,9 @@ pub const HostedProvisionedTableReadSource = struct {
         const group_id = fence.route.group_id;
         try checkLookupOptionsActive(opts);
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(opts)), group_id, routePolicyForConsistency(consistency))) orelse {
-            return null;
+            // A catalog route proves the group exists. Failure to discover a
+            // serving replica is availability, never an absence proof.
+            return error.StorageReadTemporarilyUnavailable;
         };
         defer route.deinit(alloc);
         try checkLookupOptionsActive(opts);
@@ -17022,6 +17024,7 @@ fn consumerTests() type {
                 certified_reads: usize = 0,
                 barrier_calls: usize = 0,
                 activity_active: usize = 0,
+                route_unavailable: bool = false,
                 fn readIndexBeforeAdmission(ptr: *anyopaque, _: u64, _: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     // Raft apply needs exclusive admission. A second barrier
@@ -17039,6 +17042,13 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     std.debug.assert(self.activity_active == 1);
                     self.activity_active -= 1;
+                }
+                fn resolveRoutes(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u64, _: table_router.RoutePolicy, _: table_router.RouteBudget) !?[]table_router.GroupRoute {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.route_unavailable) return null;
+                    const routes = try alloc.alloc(table_router.GroupRoute, 1);
+                    routes[0] = .local;
+                    return routes;
                 }
                 fn restoreScope(_: *anyopaque, _: []const u8, _: u64) !?[32]u8 {
                     return null;
@@ -17103,6 +17113,15 @@ fn consumerTests() type {
             _ = hosted.withLocalReadSource(.{ .ptr = &fixture, .strict_read_index_absence = true, .vtable = &.{ .lookup = unsupportedPhysicalTopLevelLookup, .scan = unsupportedPhysicalTopLevelScan, .query = unsupportedPhysicalTopLevelQuery, .lookup_group_local_routed = Fixture.lookup } });
             for (0..36) |_| try std.testing.expect((try hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
             try std.testing.expectEqual(@as(usize, 36), fixture.reads);
+            var unavailable_router = router;
+            var unavailable_vtable = router.vtable.*;
+            unavailable_vtable.resolve_group_routes = Fixture.resolveRoutes;
+            unavailable_router.vtable = &unavailable_vtable;
+            hosted.router = unavailable_router;
+            fixture.route_unavailable = true;
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, hosted.source().lookup(std.testing.allocator, "rows", "present", .{}, .read_index));
+            try std.testing.expectEqual(@as(usize, 36), fixture.reads);
+            hosted.router = router;
             // Pinned routing views expose a forwarding restore callback, not
             // a blanket declaration that ordinary rows belong to staging.
             var provisioned_view = ProvisionedTableReadSource.init("unused", catalog, raft_mod.read_gate.alreadyReadSafeBarrier());

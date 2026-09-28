@@ -31,7 +31,9 @@
 /// shadow-interval publication, and supports retained-source staged rewrites.
 /// Version 12 binds retained source Scope v2 to an explicit Raft/native
 /// authority. Older decoders must not reinterpret its clock or pin identity.
-/// Version 13 orders complete artifact inventories before online source admission.
+/// Version 13 batches coordinator acknowledgements. All applying replicas
+/// must cross the durable activation barrier before this command is admitted.
+pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// Version 14 includes typed direct-vector snapshot/tail payloads and their
 /// retained-transaction admission accounting. Ordered artifact merges require
 /// the complete decoder before admission, even for an empty first page.

@@ -3,6 +3,7 @@
 """Test measurement accounting without invoking a compiler."""
 
 import importlib.util
+import json
 import unittest
 import sys
 import tempfile
@@ -36,6 +37,99 @@ class BuildMemoryAccounting(unittest.TestCase):
 
 
 class BuildFailureEvidence(unittest.TestCase):
+    def test_contract_rollover_discards_both_caches_and_keeps_mutations(self):
+        expected = (
+            ("cold", set()),
+            ("warm", set()),
+            ("read coordination", {"antfly-runtime-distributed"}),
+            ("write coordination", {"antfly-runtime-distributed"}),
+            ("physical DB", {"antfly-storage-kernel"}),
+            ("physical local query", {"antfly-storage-kernel"}),
+            ("owner integration test", {"storage-owner-tests"}),
+            ("consumer test root", {"api-table-read-tests"}),
+            ("storage contract cold", set()),
+            ("storage contract warm", set()),
+            (
+                "storage contract",
+                {
+                    "antfly-storage-kernel",
+                    "antfly-runtime-distributed",
+                    "storage-owner-tests",
+                },
+            ),
+        )
+        seen = []
+        first_cache = None
+        first_global = None
+
+        def fake_build(command, cwd, *, progress):
+            nonlocal first_cache, first_global
+            label, rebuilt = expected[len(seen)]
+            local_cache = Path(command[command.index("--cache-dir") + 1])
+            global_cache = Path(command[command.index("--global-cache-dir") + 1])
+            self.assertEqual(local_cache.parent, cwd.parent.parent)
+            self.assertEqual(global_cache.parent, cwd.parent.parent)
+            if first_cache is None:
+                first_cache, first_global = local_cache, global_cache
+            else:
+                self.assertEqual(
+                    (local_cache, global_cache), (first_cache, first_global)
+                )
+            if label == "storage contract cold":
+                self.assertFalse(local_cache.exists())
+                self.assertTrue(global_cache.is_dir())
+                self.assertFalse((global_cache / "marker").exists())
+                self.assertIn(
+                    b"storage compilation ownership regression",
+                    (cwd / "pkg/antfly/src/api/table_reads.zig").read_bytes(),
+                )
+            local_cache.mkdir(exist_ok=True)
+            (local_cache / "marker").touch()
+            (global_cache / "marker").touch()
+            names = (
+                measurement.ARCHIVES
+                | measurement.CONSUMERS
+                | {
+                    "storage-owner-tests",
+                    "storage-owner-source-tests",
+                    "storage-owner-enrichment-tests",
+                }
+            )
+            output = []
+            for name in sorted(names):
+                kind = "test_obj" if name in measurement.CONSUMERS else "lib"
+                status = (
+                    "success"
+                    if label in {"cold", "storage contract cold"} or name in rebuilt
+                    else "cached"
+                )
+                output.append(f"compile {kind} {name} Debug native {status}")
+            if label in {"physical DB", "physical local query"}:
+                output.extend(
+                    f"compile exe {name} Debug native success"
+                    for name in measurement.CONSUMERS
+                )
+            seen.append(label)
+            return 0, "\n".join(output), {"wall_seconds": 0.0, "timed_out": False}
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["check_storage_compilation.py", "--report", str(report)],
+                ),
+                mock.patch.object(
+                    measurement, "measured_build", side_effect=fake_build
+                ),
+            ):
+                measurement.main()
+            self.assertEqual(seen, [name for name, _ in expected])
+            self.assertFalse(first_cache.exists())
+            self.assertFalse(first_global.exists())
+            self.assertEqual(len(json.loads(report.read_text())), len(expected))
+
     def test_timeout_preserves_output_and_measurements(self):
         with (
             tempfile.TemporaryDirectory() as directory,

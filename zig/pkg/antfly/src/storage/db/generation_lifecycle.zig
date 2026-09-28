@@ -1523,6 +1523,7 @@ fn waitForRetiredCleanupRetry(self: *RetiredGenerationCleanupBatch, delay_ms: i6
 }
 
 fn deleteRetiredGenerationPaths(alloc: Allocator, io: std.Io, paths: []const []const u8, parent: []const u8) !void {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     const lock_path = try std.fs.path.join(alloc, &.{ parent, retired_cleanup_lock_name });
     defer alloc.free(lock_path);
     const cleanup_lock = std.Io.Dir.cwd().createFile(io, lock_path, .{
@@ -1836,6 +1837,7 @@ fn acquirePublishedGenerationReadWithRuntimeAndIo(
     runtime: ?*background_runtime.BackendRuntime,
     io_override: ?std.Io,
 ) !?ReadLease {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     var fallback_io_impl: std.Io.Threaded = undefined;
     var fallback_io_owned = false;
     defer if (fallback_io_owned) fallback_io_impl.deinit();

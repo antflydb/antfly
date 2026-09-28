@@ -1094,14 +1094,7 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
                 assert response.status_code == 404, response.text
         # Probe every live tuple: routing hashes spread claims over all source
         # ranges, so row-only preservation cannot accidentally satisfy this.
-        for row in documents.values():
-            backups._assert_constraint_rejected(
-                cluster,
-                session,
-                parent,
-                {"8:duplicate": {"id": row["id"]}},
-                "UniqueConstraintViolation",
-            )
+        backups._assert_unique_claims_rejected(cluster, parent, documents.values())
         backups._assert_constraint_rejected(
             cluster,
             session,

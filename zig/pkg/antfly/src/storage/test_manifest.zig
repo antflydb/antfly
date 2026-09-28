@@ -21,6 +21,7 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("portable_wal.zig");
     _ = @import("relational_index.zig");
     _ = @import("db/relational_index_keys.zig");
     _ = @import("db/relational_index_plan.zig");

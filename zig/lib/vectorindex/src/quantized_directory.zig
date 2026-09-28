@@ -136,7 +136,7 @@ pub const AdmissionStats = struct {
         self.observeLeaf(count, .{ .unfiltered = scan_bytes, .filtered = scan_bytes });
     }
 
-    pub fn observeLeaf(self: *AdmissionStats, count: usize, scan_bytes: ScanBytes) void {
+    pub fn observeLeaf(self: *AdmissionStats, count: u64, scan_bytes: ScanBytes) void {
         self.max_leaf_vectors = @max(self.max_leaf_vectors, @as(u64, @intCast(count)));
         self.max_unfiltered_scan_bytes = @max(self.max_unfiltered_scan_bytes, scan_bytes.unfiltered);
         self.max_filtered_scan_bytes = @max(self.max_filtered_scan_bytes, scan_bytes.filtered);

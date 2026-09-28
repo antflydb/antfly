@@ -1477,20 +1477,31 @@ pub const UserManager = struct {
     }
 };
 
-pub fn ensureDefaultAdminUser(manager: *UserManager) !void {
+/// Bootstrap only from an operator-supplied credential. Existing credentials
+/// are preserved, except the legacy public admin:admin credential is retired.
+pub fn ensureDefaultAdminUser(manager: *UserManager, bootstrap_password: ?[]const u8) !void {
     var existing = manager.getUser("admin") catch |err| switch (err) {
         error.UserNotFound => {
             var admin_permission = [_]Permission{
                 try Permission.initOwned(manager.alloc, .@"*", "*", .admin),
             };
             defer admin_permission[0].deinit(manager.alloc);
-            var user = try manager.createUser("admin", "admin", &admin_permission);
+            var user = try manager.createUser("admin", try validatedBootstrapPassword(bootstrap_password), &admin_permission);
             user.deinit(manager.alloc);
             return;
         },
         else => return err,
     };
-    existing.deinit(manager.alloc);
+    defer existing.deinit(manager.alloc);
+    verifyPassword(existing.password_hash, "admin") catch return;
+    try manager.updatePassword("admin", try validatedBootstrapPassword(bootstrap_password));
+}
+
+fn validatedBootstrapPassword(password: ?[]const u8) ![]const u8 {
+    const value = password orelse return error.BootstrapAdminPasswordRequired;
+    // bcrypt rejects passwords over 72 bytes; never silently truncate them.
+    if (value.len < 12 or value.len > 72) return error.InvalidBootstrapAdminPassword;
+    return value;
 }
 
 pub fn initDefaultEnforcer(alloc: Allocator, adapter: casbin.Adapter) !casbin.Enforcer {
@@ -1995,10 +2006,34 @@ test "usermgr default admin seed is idempotent and grants admin" {
     );
     defer manager.deinit();
 
-    try ensureDefaultAdminUser(&manager);
-    try ensureDefaultAdminUser(&manager);
+    try std.testing.expectError(error.BootstrapAdminPasswordRequired, ensureDefaultAdminUser(&manager, null));
+    try std.testing.expectError(error.InvalidBootstrapAdminPassword, ensureDefaultAdminUser(&manager, "admin"));
+    try ensureDefaultAdminUser(&manager, "test-bootstrap-password");
+    try ensureDefaultAdminUser(&manager, null);
+    try ensureDefaultAdminUser(&manager, "different-bootstrap-password");
 
-    var authed = try manager.authenticateUser("admin", "admin");
+    try std.testing.expectError(error.InvalidPassword, manager.authenticateUser("admin", "admin"));
+    var authed = try manager.authenticateUser("admin", "test-bootstrap-password");
+    defer authed.deinit(alloc);
+    try std.testing.expect(try manager.enforce("admin", .@"*", "*", .admin));
+}
+
+test "usermgr bootstrap retires legacy default credentials without silently reopening access" {
+    const alloc = std.testing.allocator;
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try UserManager.init(alloc, store.iface(), try initDefaultEnforcer(alloc, policy_store.iface()));
+    defer manager.deinit();
+    const permissions = [_]Permission{.{ .resource_type = .@"*", .resource = @constCast("*"), .type = .admin }};
+    var legacy = try manager.createUser("admin", "admin", &permissions);
+    legacy.deinit(alloc);
+    try std.testing.expectError(error.BootstrapAdminPasswordRequired, ensureDefaultAdminUser(&manager, null));
+    try std.testing.expectError(error.InvalidBootstrapAdminPassword, ensureDefaultAdminUser(&manager, "admin"));
+    try ensureDefaultAdminUser(&manager, "replacement-admin-password");
+    try std.testing.expectError(error.InvalidPassword, manager.authenticateUser("admin", "admin"));
+    var authed = try manager.authenticateUser("admin", "replacement-admin-password");
     defer authed.deinit(alloc);
     try std.testing.expect(try manager.enforce("admin", .@"*", "*", .admin));
 }

@@ -82,7 +82,7 @@ const Payload = struct {
     bytes: u64,
 
     fn destroy(header: *@import("repository.zig").RunOwner, allocator: std.mem.Allocator) void {
-        const payload: *Payload = @fieldParentPtr("owner", header);
+        const payload: *Payload = @alignCast(@fieldParentPtr("owner", header));
         if (payload.parent) |parent| {
             if (payload.run.owns_bloom_filter) if (payload.run.bloom_filter) |*filter| filter.deinit(allocator);
             if (payload.run.table_index) |*index| index.deinit(allocator);

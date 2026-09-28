@@ -379,6 +379,16 @@ const StorageOwnerTransactionRecovery = struct {
         ));
     }
 
+    fn acknowledgeParticipants(ptr: *anyopaque, txn_id: transactions_mod.TxnId, owner_participant: []const u8, participants: []const []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.config.acknowledge_participants_fn orelse return error.UnsupportedOperation;
+        if (participants.len == 0 or participants.len > 64) return error.InvalidParticipant;
+        var members: [64]kernel_owner_abi.BorrowedBytes = undefined;
+        for (participants, members[0..participants.len]) |participant, *member| member.* = .fromSlice(participant);
+        const abi_txn_id = kernel_owner_abi.TxnId{ .bytes = txn_id };
+        try callbackStatus(callback(self.config.callback_ctx, &abi_txn_id, .fromSlice(owner_participant), &members, participants.len));
+    }
+
     fn cleanupTransaction(
         ptr: *anyopaque,
         txn_id: transactions_mod.TxnId,
@@ -410,6 +420,7 @@ const StorageOwnerTransactionRecovery = struct {
             .replicated_metadata = self.config.replicated_metadata != 0,
             .owns_recovery_fn = if (self.config.replicated_metadata != 0) ownsRecovery else null,
             .acknowledge_participant_fn = if (self.config.replicated_metadata != 0) acknowledgeParticipant else null,
+            .acknowledge_participants_fn = if (self.config.replicated_metadata != 0 and self.config.acknowledge_participants_fn != null) acknowledgeParticipants else null,
             .cleanup_transaction_fn = if (self.config.replicated_metadata != 0) cleanupTransaction else null,
         };
     }
@@ -1870,7 +1881,7 @@ pub fn HandleRegistryOf(comptime T: type) type {
         const Slot = struct {
             /// `generation << 1 | closing`. The slot is open for `generation`
             /// exactly when the closing bit is clear.
-            state: std.atomic.Value(u64) = .init(0),
+            state: @import("antfly_platform").atomic.Value(u64) = .init(0),
             /// Calls that have entered, or are trying to, for any generation.
             active: std.atomic.Value(u32) = .init(0),
             handle: std.atomic.Value(?*T) = .init(null),
@@ -1988,7 +1999,7 @@ pub fn HandleRegistryOf(comptime T: type) type {
             var spins: u32 = 0;
             while (slot.active.load(.seq_cst) != 0) : (spins +|= 1) {
                 if (spins < 64) {
-                    std.Thread.yield() catch {};
+                    @import("antfly_platform").time.yieldNow();
                 } else {
                     handleLockIo().sleep(.fromMicroseconds(500), .awake) catch {};
                 }
@@ -17843,4 +17854,37 @@ pub fn storageOwnerMergeArtifactsPage(owner_ptr: ?*anyopaque, request: *const ke
         return storageOwnerStatusFromError(err);
     out_result.* = .{ .ptr = encoded.ptr, .len = @intCast(encoded.len) };
     return .ok;
+}
+
+test "storage owner runtime status bulk recovery bridge preserves identities capability and debt" {
+    const Capture = struct {
+        calls: usize = 0,
+        result: kernel_owner_abi.Status = .ok,
+        fn acknowledge(ptr: ?*anyopaque, txn: *const kernel_owner_abi.TxnId, owner: kernel_owner_abi.BorrowedBytes, items: ?[*]const kernel_owner_abi.BorrowedBytes, len: usize) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            std.testing.expectEqual([_]u8{5} ** 16, txn.bytes) catch return .internal;
+            std.testing.expectEqualStrings("owner", owner.slice()) catch return .internal;
+            std.testing.expectEqual(@as(usize, 2), len) catch return .internal;
+            std.testing.expectEqualStrings("first", items.?[0].slice()) catch return .internal;
+            std.testing.expectEqualStrings("second", items.?[1].slice()) catch return .internal;
+            return self.result;
+        }
+    };
+    var capture: Capture = .{};
+    var bridge: StorageOwnerTransactionRecovery = undefined;
+    var owner_id = [_]u8{ 'o', 'w', 'n', 'e', 'r' };
+    bridge.owner_id = &owner_id;
+    bridge.config = .{ .callback_ctx = &capture, .replicated_metadata = 1, .acknowledge_participants_fn = Capture.acknowledge };
+    const config = bridge.dbConfig();
+    try std.testing.expect(config.acknowledge_participants_fn != null);
+    try StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{ "first", "second" });
+    for ([_]anyerror{ error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion, error.RaftBatchWriteOutcomeUnknown }) |err| {
+        capture.result = kernel_error_identity.statusFromError(err);
+        try std.testing.expectError(err, StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{ "first", "second" }));
+    }
+    try std.testing.expectError(error.InvalidParticipant, StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{}));
+    try std.testing.expectEqual(@as(usize, 4), capture.calls);
+    bridge.config.acknowledge_participants_fn = null;
+    try std.testing.expect(bridge.dbConfig().acknowledge_participants_fn == null);
 }

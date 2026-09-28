@@ -106,18 +106,13 @@ const Decoder = struct {
     }
 
     fn decodeEol(self: *Decoder) !void {
-        var n_bits_read: u32 = 0;
-        while (true) {
-            const bit = try self.nextBit();
-            n_bits_read += 1;
-            if (n_bits_read < 12) {
-                if (bit == 0) continue;
-            } else if (bit == 1) {
-                return;
-            }
-            self.bit_pos -= n_bits_read;
-            return error.MissingCcittEol;
-        }
+        const start = self.bit_pos;
+        // T.4 permits zero fill before the twelve-bit EOL marker. The first
+        // one bit must still follow at least eleven zero bits.
+        while (try self.nextBit() == 0) {}
+        if (self.bit_pos - start >= 12) return;
+        self.bit_pos = start;
+        return error.MissingCcittEol;
     }
 
     fn penColor(self: *const Decoder) u8 {

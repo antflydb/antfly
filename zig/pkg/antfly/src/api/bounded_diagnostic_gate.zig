@@ -17,7 +17,7 @@ const std = @import("std");
 /// Allocation-free global/category warning budget. Repeated failed requests or
 /// durable recovery slices emit at most one diagnostic per thirty seconds.
 pub const Gate = struct {
-    next_ns: std.atomic.Value(u64) = .init(0),
+    next_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn admit(self: *@This(), now_ns: u64) bool {
         const next = self.next_ns.load(.monotonic);

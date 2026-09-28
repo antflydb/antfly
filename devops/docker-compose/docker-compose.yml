@@ -3,9 +3,9 @@ services:
     image: ghcr.io/antflydb/antfly:latest
     command: ["standalone", "--host", "0.0.0.0", "--data-dir", "/antflydb", "--config", "/config.json"]
     ports:
-      - "8080:8080" # Public API port
-      # - "9090:9090" # MCP port
-      - "4200:4200" # Metrics port
+      - "127.0.0.1:8080:8080" # Public API port
+      # - "127.0.0.1:9090:9090" # MCP port
+      - "127.0.0.1:4200:4200" # Metrics port
     volumes:
       - ./antfly-data:/antflydb
       - ./config.json:/config.json:ro
@@ -25,7 +25,7 @@ services:
   ollama:
     image: ollama/ollama:latest
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ./ollama-data:/root/.ollama
       - ./entrypoint.sh:/entrypoint.sh
@@ -43,7 +43,7 @@ services:
     volumes:
       - ../prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
-      - "9090:9090" # Prometheus UI
+      - "127.0.0.1:9090:9090" # Prometheus UI
     restart: always
     networks:
       - antfly-network
@@ -52,7 +52,7 @@ services:
     image: grafana/grafana:latest
     container_name: grafana
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/datasources:/etc/grafana/provisioning/datasources

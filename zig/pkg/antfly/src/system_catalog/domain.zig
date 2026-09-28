@@ -1054,7 +1054,7 @@ pub fn httpStatus(err: anyerror) u16 {
         error.InvalidStoreRootEnrollment, error.InvalidInitialFkRetirementAck => 400,
         error.InitialChildRootReceiptChanged, error.InitialFkRetirementReporterChanged, error.InitialFkRetirementWorkChanged, error.InitialFkRetirementPublicationChanged, error.InitialFkRetirementReservationChanged => 409,
         error.UnsupportedOperation, error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.CatalogRoutingSnapshotTimeout, error.ResourceTemporarilyUnavailable => 503,
-        error.MetadataMutationOutcomeUnknown, error.NotLeader, error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded => 503,
+        error.MetadataMutationOutcomeUnknown, error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded => 503,
         else => 500,
     };
 }

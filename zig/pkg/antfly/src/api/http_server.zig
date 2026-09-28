@@ -13783,27 +13783,71 @@ pub const ApiHttpServer = struct {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const retry_io = self.sharedApiIo();
-        const start_ns = retryMonotonicNs(retry_io);
-        const retry_deadline_ns = table_catalog.RoutingBudget.initIo(null, retry_io).deadlineFrom(.{
+        const clock = table_catalog.RoutingBudget.initIo(null, retry_io);
+        const start_ns = clock.nowNs();
+        var retry_deadline_ns = clock.deadlineFrom(.{
             .deadline_ns = request.deadline_ns,
             .io = request.deadline_io,
         });
+        if (clock.deadlineFrom(.{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io })) |deadline|
+            retry_deadline_ns = if (retry_deadline_ns) |current| @min(current, deadline) else deadline;
+        const attempt_deadline_ns: ?u64 = if (retry_timeout_ns != 0)
+            @min(retry_deadline_ns orelse std.math.maxInt(u64), start_ns +| retry_timeout_ns)
+        else
+            retry_deadline_ns;
+        const Cancellation = struct {
+            request: CancellationToken,
+            options: ?CancellationToken,
+            fn check(ptr: *const anyopaque) bool {
+                const self_: *const @This() = @ptrCast(@alignCast(ptr));
+                return self_.request.isCancelled() or if (self_.options) |token| token.isCancelled() else false;
+            }
+        };
+        var cancellation = Cancellation{ .request = request.cancellation, .options = opts.cancellation };
+        var scoped = opts;
+        // The first ordinary read keeps its caller budget. The readiness
+        // ceiling applies only after a transient readiness failure, never to
+        // a successful long-running read admitted with a larger deadline.
+        scoped.execution_deadline_ns = retry_deadline_ns;
+        scoped.execution_io = clock.io;
+        scoped.cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = Cancellation.check };
+        var retrying = false;
+        var last_readiness_error: anyerror = error.StorageReadTemporarilyUnavailable;
         while (true) {
             try ensureTableOperationActive(request);
-            return source.lookup(alloc, table_name, key, opts, consistency) catch |err| switch (err) {
-                error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor => {
-                    const now_ns = retryMonotonicNs(retry_io);
-                    if (retry_timeout_ns == 0) return error.StorageReadTemporarilyUnavailable;
-                    const sleep_ns = boundedRetrySleepNs(
-                        retry_deadline_ns,
-                        now_ns,
-                        start_ns,
-                        retry_timeout_ns,
-                        retry_poll_ns,
-                    ) orelse return error.StorageReadTemporarilyUnavailable;
+            try ensureRequestActive(scoped.cancellation);
+            if (retryDeadlineExpired(retry_deadline_ns, clock.nowNs())) return error.DeadlineExceeded;
+            if (retrying and retryDeadlineExpired(attempt_deadline_ns, clock.nowNs())) return last_readiness_error;
+            return source.lookup(alloc, table_name, key, scoped, consistency) catch |err| switch (err) {
+                error.StorageReadTemporarilyUnavailable,
+                error.StorageKernelOwnerStaleDescriptor,
+                error.NotLeader,
+                error.LeaderUnavailable,
+                error.GroupLeaderUnavailable,
+                error.UnknownGroup,
+                error.ReadIndexTimeout,
+                error.TopologyChanged,
+                error.IdentityReadGenerationChanged,
+                error.DocIdentityNamespaceMismatch,
+                => {
+                    const terminal_error = if (err == error.StorageKernelOwnerStaleDescriptor) error.StorageReadTemporarilyUnavailable else err;
+                    const now_ns = clock.nowNs();
+                    if (retryDeadlineExpired(retry_deadline_ns, now_ns)) return error.DeadlineExceeded;
+                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return terminal_error;
                     if (sleep_ns == 0) return error.DeadlineExceeded;
-                    try sleepNsCancellable(retry_io, sleep_ns, request.cancellation);
+                    // Each iteration resolves a fresh fenced route and obtains
+                    // its own quorum/apply proof. No stale read fallback or
+                    // mutation replay is admitted by this readiness retry.
+                    retrying = true;
+                    last_readiness_error = terminal_error;
+                    scoped.execution_deadline_ns = attempt_deadline_ns;
+                    try sleepNsCancellable(retry_io, sleep_ns, scoped.cancellation);
                     continue;
+                },
+                error.Timeout, error.DeadlineExceeded => {
+                    if (retryDeadlineExpired(retry_deadline_ns, clock.nowNs())) return error.DeadlineExceeded;
+                    if (retrying and clock.nowNs() -| start_ns >= retry_timeout_ns) return error.StorageReadTemporarilyUnavailable;
+                    return err;
                 },
                 else => return err,
             };
@@ -18077,7 +18121,9 @@ pub const ApiHttpServer = struct {
         if (self.cfg.deployment_mode == .standalone) return (self.cfg.restore_owner orelse return error.RestoreValidationPending).execute(alloc, table_name, group_id, request, context);
         var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
         const router = self.cfg.session_router orelse fallback.router();
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.RestoreValidationPending;
+        // No route means no owner request was sent. Preserve that readiness
+        // classification instead of conflating it with an unknown owner write.
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
         defer route.deinit(alloc);
         switch (route) {
             .local => return (self.cfg.restore_owner orelse return error.RestoreValidationPending).execute(alloc, table_name, group_id, request, context),
@@ -18311,6 +18357,10 @@ pub const ApiHttpServer = struct {
         return switch (err) {
             error.RestoreStagingYield => error.RestoreStagingYield,
             error.RestoreStagingWait => error.RestoreStagingWait,
+            // Routing gaps also occur during global validation and cutover,
+            // after the rewrite driver has handed off. Their durable owner
+            // progress is still resumable within this same attempt.
+            error.GroupLeaderUnavailable => error.RestoreStagingWait,
             // Owner transitions can report StorageBusy while the pinned plan
             // is progressing. Retry the next cooperative slice on the same
             // durable attempt; a readiness fence uses the longer wait below.
@@ -22547,6 +22597,7 @@ pub const RestoreWorkerTestDriver = if (builtin.is_test) struct {
 test "staged restore worker publishes a dependency complete mixed native cohort" {
     try @import("restore_worker_fixture.zig").run(RestoreWorkerTestDriver, false);
     try @import("restore_worker_fixture.zig").run(RestoreWorkerTestDriver, true);
+    try @import("restore_worker_fixture.zig").runWithPolicy(RestoreWorkerTestDriver, false, null, null, .{ .validation_route_gaps = 3 });
 }
 
 test "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners" {
@@ -22791,6 +22842,11 @@ test "native restore validation uncertainty remains an asynchronous retry" {
 }
 
 test "busy staged restore owner retains its pinned attempt" {
+    const routed_wait = ApiHttpServer.stagedRestoreError(error.GroupLeaderUnavailable);
+    try std.testing.expectEqual(error.RestoreStagingWait, routed_wait);
+    try std.testing.expectEqual(restore_staging_wait_ns, restoreRetryDelayNs(routed_wait, 42, 8));
+    // Ambiguous owner writes retain the receipt-reconciliation retry path.
+    try std.testing.expectEqual(error.RestoreValidationPending, ApiHttpServer.stagedRestoreError(error.RaftBatchWriteOutcomeUnknown));
     try std.testing.expectEqual(
         @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreStagingWait),
         ApiHttpServer.stagedRestoreError(error.RestoreStagingWait),
@@ -29391,6 +29447,9 @@ test "api http point lookup retries bounded local readiness races" {
     const FakeReads = struct {
         attempts: u32 = 0,
         first_error: anyerror = error.StorageReadTemporarilyUnavailable,
+        observed_deadline: ?u64 = null,
+        fail_first: bool = true,
+        cancel_on_first: ?*std.atomic.Value(bool) = null,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{ .ptr = self, .vtable = &.{
@@ -29405,14 +29464,19 @@ test "api http point lookup retries bounded local readiness races" {
             alloc: std.mem.Allocator,
             table_name: []const u8,
             key: []const u8,
-            _: db_mod.types.LookupOptions,
+            options: db_mod.types.LookupOptions,
             _: raft_mod.ReadConsistency,
         ) anyerror!?table_reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("doc:1", key);
             self.attempts += 1;
-            if (self.attempts == 1) return self.first_error;
+            self.observed_deadline = options.execution_deadline_ns;
+            try std.testing.expect(options.cancellation != null);
+            if (self.fail_first and self.attempts == 1) {
+                if (self.cancel_on_first) |token| token.store(true, .release);
+                return self.first_error;
+            }
             return .{
                 .json = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
                 .version = 7,
@@ -29437,7 +29501,8 @@ test "api http point lookup retries bounded local readiness races" {
         }
     };
 
-    for ([_]anyerror{ error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor }) |first_error| {
+    const transient_errors = [_]anyerror{ error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.UnknownGroup, error.ReadIndexTimeout, error.TopologyChanged, error.IdentityReadGenerationChanged, error.DocIdentityNamespaceMismatch };
+    for (transient_errors) |first_error| {
         var reads = FakeReads{ .first_error = first_error };
         var server = ApiHttpServer.init(
             std.testing.allocator,
@@ -29459,6 +29524,7 @@ test "api http point lookup retries bounded local readiness races" {
         defer response.deinit(std.testing.allocator);
 
         try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+        try std.testing.expect(reads.observed_deadline != null);
         try std.testing.expectEqual(@as(u64, 7), response.version);
         try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", response.json);
     }
@@ -29476,6 +29542,42 @@ test "api http point lookup retries bounded local readiness races" {
         .{},
     ));
     try std.testing.expectEqual(@as(u32, 1), stale_reads.attempts);
+    for (transient_errors) |failure| {
+        var reads = FakeReads{ .first_error = failure };
+        const expected = if (failure == error.StorageKernelOwnerStaleDescriptor) error.StorageReadTemporarilyUnavailable else failure;
+        try std.testing.expectError(expected, read_only_server.lookupWithReadinessRetry(std.testing.allocator, reads.source(), "docs", "doc:1", .{}, .read_index, .{}));
+        try std.testing.expectEqual(@as(u32, 1), reads.attempts);
+    }
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, FakeStatus.source(), null, DummyWrites.source());
+    defer server.deinit();
+    var expired = FakeReads{};
+    try std.testing.expectError(error.DeadlineExceeded, server.lookupWithReadinessRetry(std.testing.allocator, expired.source(), "docs", "doc:1", .{ .execution_deadline_ns = 0 }, .read_index, .{}));
+    try std.testing.expectEqual(@as(u32, 0), expired.attempts);
+    var canceled: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectError(error.Cancelled, server.lookupWithReadinessRetry(std.testing.allocator, expired.source(), "docs", "doc:1", .{ .cancellation = CancellationToken.fromAtomic(&canceled) }, .read_index, .{}));
+    try std.testing.expectEqual(@as(u32, 0), expired.attempts);
+    canceled.store(false, .release);
+    var midflight = FakeReads{ .first_error = error.NotLeader, .cancel_on_first = &canceled };
+    try std.testing.expectError(error.Cancelled, server.lookupWithReadinessRetry(std.testing.allocator, midflight.source(), "docs", "doc:1", .{}, .read_index, .{ .cancellation = CancellationToken.fromAtomic(&canceled) }));
+    try std.testing.expectEqual(@as(u32, 1), midflight.attempts);
+    var bounded = FakeReads{ .first_error = error.UnknownGroup };
+    const deadline = platform_time.monotonicNs() + 10 * std.time.ns_per_ms;
+    try std.testing.expectError(error.DeadlineExceeded, server.lookupWithReadinessRetry(std.testing.allocator, bounded.source(), "docs", "doc:1", .{}, .read_index, .{ .deadline_ns = deadline }));
+    // The OS may deschedule this thread before source admission. Both zero
+    // and one attempt are valid; admitting a second attempt after expiry is not.
+    try std.testing.expect(bounded.attempts <= 1);
+    if (bounded.attempts == 1) try std.testing.expectEqual(@as(?u64, deadline), bounded.observed_deadline);
+    var ordinary = FakeReads{ .fail_first = false };
+    var ordinary_response = (try server.lookupWithReadinessRetry(std.testing.allocator, ordinary.source(), "docs", "doc:1", .{}, .read_index, .{})).?;
+    ordinary_response.deinit(std.testing.allocator);
+    try std.testing.expect(ordinary.observed_deadline == null);
+    const longer_deadline = platform_time.monotonicNs() + 60 * std.time.ns_per_s;
+    ordinary_response = (try server.lookupWithReadinessRetry(std.testing.allocator, ordinary.source(), "docs", "doc:1", .{ .execution_deadline_ns = longer_deadline }, .read_index, .{})).?;
+    ordinary_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u64, longer_deadline), ordinary.observed_deadline);
+    var validation = FakeReads{ .first_error = error.InvalidArgument };
+    try std.testing.expectError(error.InvalidArgument, server.lookupWithReadinessRetry(std.testing.allocator, validation.source(), "docs", "doc:1", .{}, .read_index, .{}));
+    try std.testing.expectEqual(@as(u32, 1), validation.attempts);
 }
 
 test "api http transient read retry honors expired request deadline before source query" {
@@ -55309,5 +55411,37 @@ test "system catalog identity failures remain unavailable across status adapters
         defer response.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u16, 503), response.status);
         try std.testing.expectEqualStrings("CatalogRoutingUnavailable", response.body);
+    }
+}
+
+test "system catalog public mutation retains admission proof across the HTTP adapter" {
+    const Fixture = struct {
+        err: anyerror,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn call(ptr: *anyopaque, _: std.mem.Allocator, _: api_operation.RequestContext, _: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.err;
+        }
+    };
+    var fixture = Fixture{ .err = error.NotLeader };
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .system_catalog = Fixture.call } }, null, null);
+    defer server.deinit();
+    for ([_]anyerror{ error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataMutationOutcomeUnknown }) |err| {
+        fixture.err = err;
+        var mutation = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = "/databases/owned", .content_type = "application/json", .body = "{}" });
+        defer mutation.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 503), mutation.status);
+        if (err == error.MetadataMutationOutcomeUnknown) {
+            try std.testing.expect(mutation.header(http_common.metadata_mutation_not_admitted_header) == null);
+            try std.testing.expectEqualStrings(metadata_http_routes.Routes.raft_mutation_outcome_unknown, mutation.header(metadata_http_routes.Routes.raft_mutation_outcome_header).?);
+        } else {
+            try std.testing.expectEqualStrings(http_common.metadata_mutation_not_admitted_value, mutation.header(http_common.metadata_mutation_not_admitted_header).?);
+            try std.testing.expectEqualStrings(metadata_http_routes.Routes.raft_mutation_outcome_not_proposed, mutation.header(metadata_http_routes.Routes.raft_mutation_outcome_header).?);
+        }
+        var read = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/databases/owned" });
+        defer read.deinit(std.testing.allocator);
+        try std.testing.expect(read.header(http_common.metadata_mutation_not_admitted_header) == null);
     }
 }

@@ -8928,6 +8928,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .owns = transactionRecoveryOwnsAdapter,
                 .resolve = transactionRecoveryResolveAdapter,
                 .acknowledge = transactionRecoveryAcknowledgeAdapter,
+                .acknowledge_many = acknowledgeRecoveryParticipants,
                 .cleanup = transactionRecoveryCleanupAdapter,
             },
         };
@@ -9062,6 +9063,7 @@ pub const ProvisionedTableWriteSource = struct {
             .replicated_metadata = replicated,
             .owns_recovery_fn = if (replicated) ownsRecovery else null,
             .acknowledge_participant_fn = if (replicated) acknowledgeRecoveryParticipant else null,
+            .acknowledge_participants_fn = if (replicated) acknowledgeRecoveryParticipants else null,
             .cleanup_transaction_fn = if (replicated) cleanupRecoveryTransaction else null,
         };
     }
@@ -9131,6 +9133,21 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_id = txn_id,
                 .participant = participant,
             } },
+        });
+    }
+
+    fn acknowledgeRecoveryParticipants(ptr: *anyopaque, txn_id: db_mod.types.TxnId, owner_participant: []const u8, participants: []const []const u8) !void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (participants.len == 0 or participants.len > 64) return error.InvalidParticipant;
+        const owner = distributed_txn.parseParticipantRef(owner_participant) orelse return error.InvalidParticipant;
+        const batcher = self.raft_batcher orelse return error.UnsupportedOperation;
+        // The Raft batcher rejects protocol-13 unavailability before ACK
+        // admission. Recovery alone decides whether singles are safe to use.
+        try batcher.batchGroup(std.heap.page_allocator, owner.group_id, owner.table_name, .{
+            .restore_staging_scope = owner.restore_staging_scope,
+            .restore_staging_plan_id = owner.restore_staging_plan_id,
+            .sync_level = .write,
+            .transaction = .{ .acknowledge_many = .{ .txn_id = txn_id, .participants = participants } },
         });
     }
 

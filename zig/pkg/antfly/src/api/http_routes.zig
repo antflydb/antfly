@@ -126,6 +126,7 @@ pub const Routes = struct {
     pub const txn_status_suffix = "/txn-status";
     pub const online_merge_io_suffix = "/online-merge-io";
     pub const txn_acknowledge_suffix = "/txn-acknowledge";
+    pub const txn_acknowledge_many_suffix = "/txn-acknowledge-many";
     pub const corrupt_embedding_artifact_suffix = "/corrupt-embedding-artifact";
     pub const group_db_median_key_suffix = "/db/median-key";
     pub const group_db_index_activation_suffix = "/db/index-activation";

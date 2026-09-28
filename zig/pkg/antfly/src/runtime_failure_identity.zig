@@ -728,6 +728,8 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_row_policy_receipt, .err = error.InvalidRowPolicyReceipt },
     .{ .status = .invalid_row_policy_bundle, .err = error.InvalidRowPolicyBundle },
     .{ .status = .row_policy_unsupported, .err = error.RowPolicyUnsupported },
+    .{ .status = .raft_batch_write_outcome_unknown, .err = error.RaftBatchWriteOutcomeUnknown },
+    .{ .status = .unsupported_raft_batch_protocol_version, .err = error.UnsupportedRaftBatchProtocolVersion },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {

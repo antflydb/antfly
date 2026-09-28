@@ -33,8 +33,8 @@ pub const MutationBarrier = struct {
     reader_mutex: std.atomic.Mutex = .unlocked,
     resource_mutex: std.atomic.Mutex = .unlocked,
     reader_count: usize = 0,
-    shared_waiters: std.atomic.Value(u64) = .init(0),
-    exclusive_waiters: std.atomic.Value(u64) = .init(0),
+    shared_waiters: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    exclusive_waiters: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub const SharedLease = struct {
         barrier: *MutationBarrier,

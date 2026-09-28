@@ -463,7 +463,7 @@ pub const IdentityVisibilityState = struct {
     nonvisible_generation: ?u64 = null,
     nonvisible_set: ?doc_set.ResolvedDocSet = null,
     nonvisible_overflow: bool = false,
-    nonvisible_entries: std.atomic.Value(u64) = .init(0),
+    nonvisible_entries: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn clearLive(self: *@This()) void {
         while (!self.live_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -2422,6 +2422,12 @@ pub const DBCore = struct {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         try manager.markParticipantResolvedExtraBatch(txn_id, participant, extra_batch);
+    }
+
+    pub fn markTransactionParticipantsResolvedExtraBatch(self: *DBCore, txn_id: transactions_mod.TxnId, participants: []const []const u8, extra_batch: transactions_mod.MutationExtraBatch) !void {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.markParticipantsResolvedExtraBatch(txn_id, participants, extra_batch);
     }
 
     pub fn cleanupTransactionMetadataIfEligible(

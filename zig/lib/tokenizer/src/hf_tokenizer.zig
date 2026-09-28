@@ -369,7 +369,7 @@ pub const HfTokenizer = struct {
         // Two independent bits materially reduce false second-hit admission.
         // Two rotating generations keep a one-shot scan from saturating the
         // filter forever.
-        generations: [2][bpe_doorkeeper_words]std.atomic.Value(u64) =
+        generations: [2][bpe_doorkeeper_words]@import("antfly_platform").atomic.Value(u64) =
             @splat(@splat(.{ .raw = 0 })),
         active_generation: std.atomic.Value(u8) = .init(0),
         observations: std.atomic.Value(usize) = .init(0),
@@ -384,9 +384,9 @@ pub const HfTokenizer = struct {
         bulk_slots: ?[]std.atomic.Value(usize) = null,
         bulk_slots_per_shard: usize = 0,
         used_bytes: std.atomic.Value(usize) = .init(0),
-        rejected_reservations: std.atomic.Value(u64) = .init(0),
-        rejected_admissions: std.atomic.Value(u64) = .init(0),
-        evictions: std.atomic.Value(u64) = .init(0),
+        rejected_reservations: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        rejected_admissions: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        evictions: @import("antfly_platform").atomic.Value(u64) = .init(0),
         resource_budget: ?BpeCacheResourceBudget = null,
         doorkeeper: BpeDoorkeeper = .{},
         reader_gate: std.atomic.Value(bool) = .init(false),
@@ -505,18 +505,18 @@ pub const HfTokenizer = struct {
     };
 
     const BpeProfileCounters = struct {
-        pretokens: std.atomic.Value(u64) = .init(0),
-        direct_hits: std.atomic.Value(u64) = .init(0),
-        hits: std.atomic.Value(u64) = .init(0),
-        misses: std.atomic.Value(u64) = .init(0),
-        probes: std.atomic.Value(u64) = .init(0),
-        key_bytes: std.atomic.Value(u64) = .init(0),
-        token_ids: std.atomic.Value(u64) = .init(0),
-        key_len_histogram: [33]std.atomic.Value(u64) =
+        pretokens: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        direct_hits: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        hits: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        misses: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        probes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        key_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        token_ids: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        key_len_histogram: [33]@import("antfly_platform").atomic.Value(u64) =
             @splat(.{ .raw = 0 }),
-        id_count_histogram: [9]std.atomic.Value(u64) =
+        id_count_histogram: [9]@import("antfly_platform").atomic.Value(u64) =
             @splat(.{ .raw = 0 }),
-        probe_histogram: [17]std.atomic.Value(u64) =
+        probe_histogram: [17]@import("antfly_platform").atomic.Value(u64) =
             @splat(.{ .raw = 0 }),
     };
 
@@ -2280,7 +2280,7 @@ pub const HfTokenizer = struct {
         published_stable_boundary_words: std.atomic.Value(usize) = .init(0),
         published_stable_boundary_bytes: std.atomic.Value(usize) = .init(0),
         published_text_bytes: std.atomic.Value(usize) = .init(0),
-        published_elapsed_ns: std.atomic.Value(u64) = .init(0),
+        published_elapsed_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
         published_cache_owner: std.atomic.Value(usize) =
             .init(invalid_worker_cache_owner),
 

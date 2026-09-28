@@ -13,6 +13,10 @@ order: 4
 
 ## The Result
 
+The authenticated examples use `ANTFLY_ADMIN_PASSWORD` for your provisioned
+administrator credential. See [secure deployment](https://github.com/antflydb/antfly/blob/main/docs/auth.md#secure-deployment)
+for setup; do not use the legacy `admin:admin` password.
+
 Every ticket written to your Postgres `tickets` table arrives in Antfly on its own, and one call returns the team that should own it, chosen from the resolved tickets that look most like it. Postgres stays the system of record throughout, with no migration and no export job:
 
 ```bash
@@ -80,7 +84,7 @@ antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --task
 
 ```bash
 curl -X PUT http://127.0.0.1:8080/db/v1/secrets/pg_dsn \
-  -u admin:admin \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{"value": "postgres://antfly:secret@db.internal:5432/support?sslmode=require"}'
 ```
@@ -93,7 +97,7 @@ Antfly has built-in change data capture. A `replication_sources` block on the ta
 
 ```bash
 curl -X POST http://127.0.0.1:8080/db/v1/tables/tickets \
-  -u admin:admin \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{
     "replication_sources": [

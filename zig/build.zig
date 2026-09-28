@@ -586,6 +586,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     inference_pjrt_mod.addImport("xla_proto", inference_pjrt_xla_proto_mod);
 
     const tokenizer = @import("lib/tokenizer/build_support.zig").create(b, .{
+        .platform = platform_mod,
         .root = b.path("lib/tokenizer"),
         .target = target,
         .optimize = optimize,
@@ -672,6 +673,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         "sentencepiece_proto",
         sentencepiece_proto_mod,
     );
+    hf_tokenizer_tests.root_module.addImport("antfly_platform", platform_mod);
     const run_hf_tokenizer_tests = b.addRunArtifact(hf_tokenizer_tests);
     const hf_tokenizer_test_step = b.step(
         "lib-tokenizer-test",

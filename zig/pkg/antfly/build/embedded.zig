@@ -281,6 +281,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     antfly_imports.storage_boundary.configure(capi_mod, false, false);
     capi_mod.addImport("antfly_source_root", capi_root_mod);
+    capi_mod.addImport("antfly_platform", platform_mod);
     const capi_options = b.addOptions();
     capi_options.addOption(bool, "linked_storage", false);
     // The inference runtime is always linked into libantfly (see

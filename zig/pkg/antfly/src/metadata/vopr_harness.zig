@@ -7269,7 +7269,7 @@ const VoprAuthManager = struct {
         );
         errdefer self.manager.deinit();
 
-        try usermgr.ensureDefaultAdminUser(&self.manager);
+        try usermgr.ensureDefaultAdminUser(&self.manager, "vopr-bootstrap-password");
         return self;
     }
 
@@ -11671,7 +11671,7 @@ test "metadata VOPR http cluster seeds default admin for auth-enabled public api
     try public_api.initLeaderBackedWithAuthInPlace(vopr_alloc, &cluster, roots, &auth_managers);
     defer public_api.deinit();
 
-    const admin_auth = try encodeBasicAuthorization(std.heap.page_allocator, "admin", "admin");
+    const admin_auth = try encodeBasicAuthorization(std.heap.page_allocator, "admin", "vopr-bootstrap-password");
     defer std.heap.page_allocator.free(admin_auth);
 
     for (public_api.api_base_uris) |base_uri| {
