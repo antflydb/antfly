@@ -711,6 +711,390 @@ pub fn segmentAttentionHost(
     return output;
 }
 
+/// Sorted, disjoint union of the (up to 3) ranges of every query in
+/// `brange[q_start*6 ..][0 .. cur_bq*6]` (one batch row's range table,
+/// `laya_tree`-style: `start, end` pairs, empty when equal). Shared by the
+/// training forward and backward sweeps below so both see identical tiling.
+fn mergeSegmentRanges(brange: []const u32, q_start: usize, cur_bq: usize, intervals: *[BLOCK_Q * 3][2]u32) usize {
+    var count: usize = 0;
+    for (0..cur_bq) |r| for (0..3) |j| {
+        const lo = brange[(q_start + r) * 6 + 2 * j];
+        const hi = brange[(q_start + r) * 6 + 2 * j + 1];
+        if (lo < hi) {
+            intervals[count] = .{ lo, hi };
+            count += 1;
+        }
+    };
+    std.mem.sort([2]u32, intervals[0..count], {}, struct {
+        fn less(_: void, a: [2]u32, b: [2]u32) bool {
+            return a[0] < b[0];
+        }
+    }.less);
+    var merged: usize = 0;
+    for (intervals[0..count]) |interval| {
+        if (merged > 0 and interval[0] <= intervals[merged - 1][1]) {
+            intervals[merged - 1][1] = @max(intervals[merged - 1][1], interval[1]);
+        } else {
+            intervals[merged] = interval;
+            merged += 1;
+        }
+    }
+    return merged;
+}
+
+/// 64-bit counter mix (splitmix64 finalizer), used only to derive a
+/// replayable attention-dropout keep/scale value from `(seed, batch, head,
+/// query, key)`. Independent of `ops/deberta_training_attention.zig`'s copy
+/// so `lib/linalg` has no dependency on `pkg/inference`.
+fn segmentAttentionMix(value: u64) u64 {
+    var x = value +% 0x9e3779b97f4a7c15;
+    x = (x ^ (x >> 30)) *% 0xbf58476d1ce4e5b9;
+    x = (x ^ (x >> 27)) *% 0x94d049bb133111eb;
+    return x ^ (x >> 31);
+}
+
+/// Replayable dropout keep/scale for one (batch, head, query, key) score.
+/// Returns `0` (dropped) or `1 / (1 - probability)` (kept, inverted-scaled).
+/// `probability <= 0` always keeps. The same `(seed, ...)` tuple reproduces
+/// the same value in the forward and the backward sweep, so no probability
+/// mask is ever persisted.
+pub fn segmentAttentionDropoutKeep(seed: u64, batch: usize, head: usize, num_heads: usize, seq_len: usize, query: usize, key: usize, probability: f32) f32 {
+    if (probability <= 0) return 1.0;
+    const index: u64 = (((@as(u64, batch) * num_heads + head) * seq_len + query) * seq_len + key);
+    const bits = segmentAttentionMix(seed ^ segmentAttentionMix(index));
+    const threshold: u64 = @intFromFloat(@as(f64, probability) * 4294967296.0);
+    return if ((bits >> 32) < threshold) 0 else 1.0 / (1.0 - probability);
+}
+
+pub const SegmentTrainingAttentionForward = struct {
+    /// `[batch*seq_len, num_heads*head_dim]`, token-major (matches the
+    /// natural QKV-linear layout: every token's heads are contiguous).
+    output: []f32,
+    /// Per-(batch, head, query) online-softmax statistics, `[batch*num_heads*seq_len]`.
+    /// `logsumexp = ln(row_sum) + row_max`. Saved so a caller (or the
+    /// backward sweep below) need not re-derive them from scratch, though
+    /// the backward sweep here recomputes them anyway (recompute, not
+    /// persisted activations) to keep peak memory at O(tokens), not O(tokens^2).
+    row_max: []f32,
+    row_sum: []f32,
+
+    pub fn deinit(self: *SegmentTrainingAttentionForward, a: std.mem.Allocator) void {
+        a.free(self.output);
+        a.free(self.row_max);
+        a.free(self.row_sum);
+    }
+};
+
+/// Flash-style training attention forward: tiled online softmax, `ranges` +
+/// `window` visibility (see `segmentAttentionHost`), and replayable dropout
+/// on the post-softmax probabilities (scaled to preserve expectation). Saves
+/// per-query `(row_max, row_sum)` instead of a `[tokens, tokens]` probability
+/// matrix; `head_dim` bytes per query, not `seq_len` ones.
+///
+/// `Q`, `K`, `V` are token-major `[batch*seq_len, num_heads*head_dim]`.
+/// `ranges` is `[batch*seq_len*6]` (u32 start/end pairs, per `laya_tree`),
+/// `positions` is `[batch*seq_len]` logical positions, shared by the query
+/// and key role since this is self-attention (`Q_len == K_len == seq_len`).
+pub fn segmentTrainingAttentionForwardHost(
+    allocator: std.mem.Allocator,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    ranges: []const u32,
+    positions: []const i32,
+    window: u32,
+    dropout_probability: f32,
+    dropout_seed: u64,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !SegmentTrainingAttentionForward {
+    if (batch == 0 or seq_len == 0 or num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
+    const hidden = try std.math.mul(usize, num_heads, head_dim);
+    const tokens = try std.math.mul(usize, batch, seq_len);
+    const total = try std.math.mul(usize, tokens, hidden);
+    if (Q.len != total or K.len != total or V.len != total or ranges.len != tokens * 6 or positions.len != tokens)
+        return error.InvalidAttentionShape;
+    for (ranges) |bound| if (bound > seq_len) return error.InvalidAttentionShape;
+
+    const output = try allocator.alloc(f32, total);
+    errdefer allocator.free(output);
+    const row_max = try allocator.alloc(f32, batch * num_heads * seq_len);
+    errdefer allocator.free(row_max);
+    const row_sum = try allocator.alloc(f32, batch * num_heads * seq_len);
+    errdefer allocator.free(row_sum);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const qh = try allocator.alloc(f32, BLOCK_Q * head_dim);
+    defer allocator.free(qh);
+    const kh = try allocator.alloc(f32, BLOCK_KV * head_dim);
+    defer allocator.free(kh);
+    const vh = try allocator.alloc(f32, BLOCK_KV * head_dim);
+    defer allocator.free(vh);
+    const oh = try allocator.alloc(f32, BLOCK_Q * head_dim);
+    defer allocator.free(oh);
+    const score_tile = try allocator.alloc(f32, BLOCK_Q * BLOCK_KV);
+    defer allocator.free(score_tile);
+    var rmax: [BLOCK_Q]f32 = undefined;
+    var rsum: [BLOCK_Q]f32 = undefined;
+    var intervals: [BLOCK_Q * 3][2]u32 = undefined;
+
+    for (0..batch) |b| {
+        const brange = ranges[b * seq_len * 6 ..][0 .. seq_len * 6];
+        const bpos = positions[b * seq_len ..][0..seq_len];
+        for (0..num_heads) |h| {
+            var q_start: usize = 0;
+            while (q_start < seq_len) : (q_start += BLOCK_Q) {
+                const cur_bq = @min(BLOCK_Q, seq_len - q_start);
+                for (0..cur_bq) |r| {
+                    const tok = b * seq_len + q_start + r;
+                    @memcpy(qh[r * head_dim ..][0..head_dim], Q[tok * hidden + h * head_dim ..][0..head_dim]);
+                    rmax[r] = -std.math.inf(f32);
+                    rsum[r] = 0;
+                }
+                @memset(oh[0 .. cur_bq * head_dim], 0);
+                const merged = mergeSegmentRanges(brange, q_start, cur_bq, &intervals);
+                for (intervals[0..merged]) |interval| {
+                    var kv_start: usize = interval[0];
+                    while (kv_start < interval[1]) {
+                        const kv_end = @min(kv_start + BLOCK_KV, interval[1]);
+                        const cur_bkv = kv_end - kv_start;
+                        for (0..cur_bkv) |kk| {
+                            const tok = b * seq_len + kv_start + kk;
+                            @memcpy(kh[kk * head_dim ..][0..head_dim], K[tok * hidden + h * head_dim ..][0..head_dim]);
+                            @memcpy(vh[kk * head_dim ..][0..head_dim], V[tok * hidden + h * head_dim ..][0..head_dim]);
+                        }
+                        const tile = score_tile[0 .. cur_bq * cur_bkv];
+                        gemm.sgemmTransBSequential(cur_bq, cur_bkv, head_dim, scale, qh[0 .. cur_bq * head_dim], kh[0 .. cur_bkv * head_dim], 0.0, tile);
+                        for (0..cur_bq) |r| {
+                            const qi = q_start + r;
+                            const own = brange[qi * 6 ..][0..6];
+                            const qp = bpos[qi];
+                            const row = tile[r * cur_bkv ..][0..cur_bkv];
+                            for (row, kv_start..) |*score, k| {
+                                const in_range = (k >= own[0] and k < own[1]) or (k >= own[2] and k < own[3]) or (k >= own[4] and k < own[5]);
+                                const near = window == std.math.maxInt(u32) or @abs(@as(i64, qp) - bpos[k]) <= window;
+                                if (!in_range or !near) score.* = -std.math.inf(f32);
+                            }
+                            var block_max: f32 = -std.math.inf(f32);
+                            for (row) |score| block_max = @max(block_max, score);
+                            const new_max = @max(rmax[r], block_max);
+                            if (new_max == -std.math.inf(f32)) {
+                                @memset(row, 0);
+                                continue;
+                            }
+                            if (rsum[r] != 0) {
+                                const rescale = @exp(rmax[r] - new_max);
+                                if (rescale != 1.0) {
+                                    for (oh[r * head_dim ..][0..head_dim]) |*o| o.* *= rescale;
+                                    rsum[r] *= rescale;
+                                }
+                            }
+                            var raw_sum: f32 = 0;
+                            for (row, kv_start..) |*score, k| {
+                                const numerator = @exp(score.* - new_max);
+                                raw_sum += numerator;
+                                const keep = segmentAttentionDropoutKeep(dropout_seed, b, h, num_heads, seq_len, qi, k, dropout_probability);
+                                score.* = numerator * keep;
+                            }
+                            rsum[r] += raw_sum;
+                            rmax[r] = new_max;
+                        }
+                        gemm.sgemmSequential(cur_bq, head_dim, cur_bkv, 1.0, tile, vh[0 .. cur_bkv * head_dim], 1.0, oh[0 .. cur_bq * head_dim]);
+                        kv_start = kv_end;
+                    }
+                }
+                for (0..cur_bq) |r| {
+                    const qi = q_start + r;
+                    const tok = b * seq_len + qi;
+                    const out_row = output[tok * hidden + h * head_dim ..][0..head_dim];
+                    const out_acc = oh[r * head_dim ..][0..head_dim];
+                    if (rsum[r] == 0) {
+                        @memset(out_row, 0);
+                    } else {
+                        const inv = 1.0 / rsum[r];
+                        for (out_row, out_acc) |*o, a| o.* = a * inv;
+                    }
+                    row_max[(b * num_heads + h) * seq_len + qi] = rmax[r];
+                    row_sum[(b * num_heads + h) * seq_len + qi] = rsum[r];
+                }
+            }
+        }
+    }
+    return .{ .output = output, .row_max = row_max, .row_sum = row_sum };
+}
+
+pub const SegmentTrainingAttentionGradient = struct {
+    dq: []f32,
+    dk: []f32,
+    dv: []f32,
+
+    pub fn deinit(self: *SegmentTrainingAttentionGradient, a: std.mem.Allocator) void {
+        a.free(self.dq);
+        a.free(self.dk);
+        a.free(self.dv);
+    }
+};
+
+/// Backward pass for `segmentTrainingAttentionForwardHost`. Recomputes the
+/// forward (output, `row_max`, `row_sum`) rather than requiring the caller
+/// to have kept them, then makes one more tiled sweep per query block that
+/// recomputes scores from `Q`/`K` to get exact per-key probabilities and
+/// accumulates `dQ`, `dK`, `dV`. Peak memory stays O(tokens): no
+/// `[tokens, tokens]` tensor is ever materialized, in either sweep.
+pub fn segmentTrainingAttentionBackwardHost(
+    allocator: std.mem.Allocator,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    dOut: []const f32,
+    ranges: []const u32,
+    positions: []const i32,
+    window: u32,
+    dropout_probability: f32,
+    dropout_seed: u64,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !SegmentTrainingAttentionGradient {
+    var fwd = try segmentTrainingAttentionForwardHost(allocator, Q, K, V, ranges, positions, window, dropout_probability, dropout_seed, batch, seq_len, num_heads, head_dim);
+    defer fwd.deinit(allocator);
+    const hidden = num_heads * head_dim;
+    const tokens = batch * seq_len;
+    const total = tokens * hidden;
+    if (dOut.len != total) return error.InvalidAttentionShape;
+
+    const dq = try allocator.alloc(f32, total);
+    errdefer allocator.free(dq);
+    @memset(dq, 0);
+    const dk = try allocator.alloc(f32, total);
+    errdefer allocator.free(dk);
+    @memset(dk, 0);
+    const dv = try allocator.alloc(f32, total);
+    errdefer allocator.free(dv);
+    @memset(dv, 0);
+
+    // delta[b,h,q] = dot(dOut_q, O_q) over head_dim -- O is already the
+    // final normalized output, so no extra normalization is needed here
+    // (contrast the two-pass online accumulation this would need if O were
+    // not already available).
+    const delta = try allocator.alloc(f32, batch * num_heads * seq_len);
+    defer allocator.free(delta);
+    for (0..batch) |b| {
+        for (0..num_heads) |h| {
+            for (0..seq_len) |qi| {
+                const tok = b * seq_len + qi;
+                const d_row = dOut[tok * hidden + h * head_dim ..][0..head_dim];
+                const o_row = fwd.output[tok * hidden + h * head_dim ..][0..head_dim];
+                var acc: f32 = 0;
+                for (d_row, o_row) |dv_, ov_| acc += dv_ * ov_;
+                delta[(b * num_heads + h) * seq_len + qi] = acc;
+            }
+        }
+    }
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const qh = try allocator.alloc(f32, BLOCK_Q * head_dim);
+    defer allocator.free(qh);
+    const doh = try allocator.alloc(f32, BLOCK_Q * head_dim);
+    defer allocator.free(doh);
+    const dq_acc = try allocator.alloc(f32, BLOCK_Q * head_dim);
+    defer allocator.free(dq_acc);
+    const kh = try allocator.alloc(f32, BLOCK_KV * head_dim);
+    defer allocator.free(kh);
+    const vh = try allocator.alloc(f32, BLOCK_KV * head_dim);
+    defer allocator.free(vh);
+    const dk_tile = try allocator.alloc(f32, BLOCK_KV * head_dim);
+    defer allocator.free(dk_tile);
+    const dv_tile = try allocator.alloc(f32, BLOCK_KV * head_dim);
+    defer allocator.free(dv_tile);
+    const score_tile = try allocator.alloc(f32, BLOCK_Q * BLOCK_KV);
+    defer allocator.free(score_tile);
+    const weighted_tile = try allocator.alloc(f32, BLOCK_Q * BLOCK_KV);
+    defer allocator.free(weighted_tile);
+    const dp_tile = try allocator.alloc(f32, BLOCK_Q * BLOCK_KV);
+    defer allocator.free(dp_tile);
+    const ds_tile = try allocator.alloc(f32, BLOCK_Q * BLOCK_KV);
+    defer allocator.free(ds_tile);
+    var intervals: [BLOCK_Q * 3][2]u32 = undefined;
+
+    for (0..batch) |b| {
+        const brange = ranges[b * seq_len * 6 ..][0 .. seq_len * 6];
+        const bpos = positions[b * seq_len ..][0..seq_len];
+        for (0..num_heads) |h| {
+            var q_start: usize = 0;
+            while (q_start < seq_len) : (q_start += BLOCK_Q) {
+                const cur_bq = @min(BLOCK_Q, seq_len - q_start);
+                for (0..cur_bq) |r| {
+                    const tok = b * seq_len + q_start + r;
+                    @memcpy(qh[r * head_dim ..][0..head_dim], Q[tok * hidden + h * head_dim ..][0..head_dim]);
+                    @memcpy(doh[r * head_dim ..][0..head_dim], dOut[tok * hidden + h * head_dim ..][0..head_dim]);
+                }
+                @memset(dq_acc[0 .. cur_bq * head_dim], 0);
+                const merged = mergeSegmentRanges(brange, q_start, cur_bq, &intervals);
+                for (intervals[0..merged]) |interval| {
+                    var kv_start: usize = interval[0];
+                    while (kv_start < interval[1]) {
+                        const kv_end = @min(kv_start + BLOCK_KV, interval[1]);
+                        const cur_bkv = kv_end - kv_start;
+                        for (0..cur_bkv) |kk| {
+                            const tok = b * seq_len + kv_start + kk;
+                            @memcpy(kh[kk * head_dim ..][0..head_dim], K[tok * hidden + h * head_dim ..][0..head_dim]);
+                            @memcpy(vh[kk * head_dim ..][0..head_dim], V[tok * hidden + h * head_dim ..][0..head_dim]);
+                        }
+                        gemm.sgemmTransBSequential(cur_bq, cur_bkv, head_dim, scale, qh[0 .. cur_bq * head_dim], kh[0 .. cur_bkv * head_dim], 0.0, score_tile[0 .. cur_bq * cur_bkv]);
+                        gemm.sgemmTransBSequential(cur_bq, cur_bkv, head_dim, 1.0, doh[0 .. cur_bq * head_dim], vh[0 .. cur_bkv * head_dim], 0.0, dp_tile[0 .. cur_bq * cur_bkv]);
+                        for (0..cur_bq) |r| {
+                            const qi = q_start + r;
+                            const own = brange[qi * 6 ..][0..6];
+                            const qp = bpos[qi];
+                            const stat_idx = (b * num_heads + h) * seq_len + qi;
+                            const rm = fwd.row_max[stat_idx];
+                            const rs = fwd.row_sum[stat_idx];
+                            const d_i = delta[stat_idx];
+                            for (0..cur_bkv) |kk| {
+                                const k = kv_start + kk;
+                                const in_range = (k >= own[0] and k < own[1]) or (k >= own[2] and k < own[3]) or (k >= own[4] and k < own[5]);
+                                const near = window == std.math.maxInt(u32) or @abs(@as(i64, qp) - bpos[k]) <= window;
+                                const idx = r * cur_bkv + kk;
+                                if (!in_range or !near or rs == 0) {
+                                    weighted_tile[idx] = 0;
+                                    ds_tile[idx] = 0;
+                                    continue;
+                                }
+                                const p = @exp(score_tile[idx] - rm) / rs;
+                                const keep = segmentAttentionDropoutKeep(dropout_seed, b, h, num_heads, seq_len, qi, k, dropout_probability);
+                                weighted_tile[idx] = p * keep;
+                                ds_tile[idx] = p * (keep * dp_tile[idx] - d_i);
+                            }
+                        }
+                        // dV_k += sum_i weighted_ik * dOut_i; dK_k += scale * sum_i dS_ik * Q_i.
+                        gemm.sgemmTransA(cur_bkv, head_dim, cur_bq, 1.0, weighted_tile[0 .. cur_bq * cur_bkv], doh[0 .. cur_bq * head_dim], 0.0, dv_tile[0 .. cur_bkv * head_dim]);
+                        gemm.sgemmTransA(cur_bkv, head_dim, cur_bq, scale, ds_tile[0 .. cur_bq * cur_bkv], qh[0 .. cur_bq * head_dim], 0.0, dk_tile[0 .. cur_bkv * head_dim]);
+                        for (0..cur_bkv) |kk| {
+                            const tok = b * seq_len + kv_start + kk;
+                            const dv_row = dv[tok * hidden + h * head_dim ..][0..head_dim];
+                            const dk_row = dk[tok * hidden + h * head_dim ..][0..head_dim];
+                            for (dv_row, dv_tile[kk * head_dim ..][0..head_dim]) |*o, partial| o.* += partial;
+                            for (dk_row, dk_tile[kk * head_dim ..][0..head_dim]) |*o, partial| o.* += partial;
+                        }
+                        // dQ_i += scale * sum_k dS_ik * K_k, accumulated across this q-block's key tiles.
+                        gemm.sgemmSequential(cur_bq, head_dim, cur_bkv, scale, ds_tile[0 .. cur_bq * cur_bkv], kh[0 .. cur_bkv * head_dim], 1.0, dq_acc[0 .. cur_bq * head_dim]);
+                        kv_start = kv_end;
+                    }
+                }
+                for (0..cur_bq) |r| {
+                    const tok = b * seq_len + q_start + r;
+                    @memcpy(dq[tok * hidden + h * head_dim ..][0..head_dim], dq_acc[r * head_dim ..][0..head_dim]);
+                }
+            }
+        }
+    }
+    return .{ .dq = dq, .dk = dk, .dv = dv };
+}
+
 pub fn crossAttentionHost(
     allocator: std.mem.Allocator,
     Q: []const f32,
@@ -1839,4 +2223,211 @@ test "segmentAttentionHost matches dense masked softmax with ranges, window, and
         };
         try std.testing.expect(worst < 1e-5);
     }
+}
+
+fn denseSegmentTrainingReferenceOutput(a: std.mem.Allocator, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, positions: []const i32, window: u32, batch: usize, seq_len: usize, heads: usize, hd: usize) ![]f32 {
+    const H = heads * hd;
+    const output = try a.alloc(f32, batch * seq_len * H);
+    for (0..batch) |b| {
+        const brange = ranges[b * seq_len * 6 ..][0 .. seq_len * 6];
+        const bpos = positions[b * seq_len ..][0..seq_len];
+        for (0..seq_len) |i| for (0..heads) |h| {
+            const own = brange[i * 6 ..][0..6];
+            const scores = try a.alloc(f32, seq_len);
+            defer a.free(scores);
+            var best: f32 = -std.math.inf(f32);
+            for (0..seq_len) |k| {
+                const visible = ((k >= own[0] and k < own[1]) or (k >= own[2] and k < own[3]) or (k >= own[4] and k < own[5])) and
+                    (window == std.math.maxInt(u32) or @abs(@as(i64, bpos[i]) - bpos[k]) <= window);
+                var dot: f32 = 0;
+                const qrow = Q[(b * seq_len + i) * H + h * hd ..][0..hd];
+                const krow = K[(b * seq_len + k) * H + h * hd ..][0..hd];
+                for (qrow, krow) |qv, kv| dot += qv * kv;
+                scores[k] = if (visible) dot / @sqrt(@as(f32, @floatFromInt(hd))) else -std.math.inf(f32);
+                best = @max(best, scores[k]);
+            }
+            var sum: f32 = 0;
+            for (scores) |*s| {
+                s.* = if (s.* == -std.math.inf(f32)) 0 else @exp(s.* - best);
+                sum += s.*;
+            }
+            const out_row = output[(b * seq_len + i) * H + h * hd ..][0..hd];
+            for (0..hd) |d| {
+                var want: f32 = 0;
+                if (sum != 0) for (0..seq_len) |k| {
+                    const vrow = V[(b * seq_len + k) * H + h * hd ..][0..hd];
+                    want += scores[k] / sum * vrow[d];
+                };
+                out_row[d] = want;
+            }
+        };
+    }
+    return output;
+}
+
+fn buildTreeRanges(a: std.mem.Allocator, batch: usize, seq_len: usize, trunk: usize, branch: usize) !struct { ranges: []u32, positions: []i32 } {
+    const ranges = try a.alloc(u32, batch * seq_len * 6);
+    const positions = try a.alloc(i32, batch * seq_len);
+    for (0..batch) |b| {
+        var i: usize = 0;
+        while (i < seq_len) : (i += 1) positions[b * seq_len + i] = @intCast(if (i < trunk) i else (i - trunk) % branch);
+        i = 0;
+        while (i < seq_len) : (i += 1) {
+            const r = ranges[(b * seq_len + i) * 6 ..][0..6];
+            if (i < trunk) {
+                r.* = .{ 0, @intCast(trunk), 0, 0, 0, 0 };
+            } else {
+                const own_start: u32 = @intCast(trunk + ((i - trunk) / branch) * branch);
+                r.* = .{ 0, @intCast(trunk), own_start, own_start + @as(u32, @intCast(branch)), 0, 0 };
+            }
+        }
+    }
+    return .{ .ranges = ranges, .positions = positions };
+}
+
+test "segmentTrainingAttentionForwardHost matches dense masked softmax (global, local window, and tree segments)" {
+    const a = std.testing.allocator;
+    const batch = 2;
+    const heads = 2;
+    const hd = 8;
+    const seq_len = 84; // trunk(20) + 4 branches of 16
+    const H = heads * hd;
+    var prng = std.Random.DefaultPrng.init(7);
+    const r = prng.random();
+    const Q = try a.alloc(f32, batch * seq_len * H);
+    defer a.free(Q);
+    const K = try a.alloc(f32, batch * seq_len * H);
+    defer a.free(K);
+    const V = try a.alloc(f32, batch * seq_len * H);
+    defer a.free(V);
+    for (Q) |*x| x.* = r.floatNorm(f32);
+    for (K) |*x| x.* = r.floatNorm(f32);
+    for (V) |*x| x.* = r.floatNorm(f32);
+
+    // Global (full) attention: every query sees every key.
+    {
+        const ranges = try a.alloc(u32, batch * seq_len * 6);
+        defer a.free(ranges);
+        const positions = try a.alloc(i32, batch * seq_len);
+        defer a.free(positions);
+        for (0..batch * seq_len) |i| {
+            ranges[i * 6 ..][0..6].* = .{ 0, seq_len, 0, 0, 0, 0 };
+            positions[i] = @intCast(i % seq_len);
+        }
+        var got = try segmentTrainingAttentionForwardHost(a, Q, K, V, ranges, positions, std.math.maxInt(u32), 0, 0, batch, seq_len, heads, hd);
+        defer got.deinit(a);
+        const want = try denseSegmentTrainingReferenceOutput(a, Q, K, V, ranges, positions, std.math.maxInt(u32), batch, seq_len, heads, hd);
+        defer a.free(want);
+        var worst: f32 = 0;
+        for (got.output, want) |gv, wv| worst = @max(worst, @abs(gv - wv));
+        try std.testing.expect(worst < 1e-4);
+    }
+    // Local sliding window, smaller than the sequence.
+    {
+        const ranges = try a.alloc(u32, batch * seq_len * 6);
+        defer a.free(ranges);
+        const positions = try a.alloc(i32, batch * seq_len);
+        defer a.free(positions);
+        for (0..batch * seq_len) |i| {
+            ranges[i * 6 ..][0..6].* = .{ 0, seq_len, 0, 0, 0, 0 };
+            positions[i] = @intCast(i % seq_len);
+        }
+        const window: u32 = 5;
+        var got = try segmentTrainingAttentionForwardHost(a, Q, K, V, ranges, positions, window, 0, 0, batch, seq_len, heads, hd);
+        defer got.deinit(a);
+        const want = try denseSegmentTrainingReferenceOutput(a, Q, K, V, ranges, positions, window, batch, seq_len, heads, hd);
+        defer a.free(want);
+        var worst: f32 = 0;
+        for (got.output, want) |gv, wv| worst = @max(worst, @abs(gv - wv));
+        try std.testing.expect(worst < 1e-4);
+    }
+    // Tree-packed segments: a shared trunk plus disjoint branches.
+    {
+        const tree = try buildTreeRanges(a, batch, seq_len, 20, 16);
+        defer a.free(tree.ranges);
+        defer a.free(tree.positions);
+        var got = try segmentTrainingAttentionForwardHost(a, Q, K, V, tree.ranges, tree.positions, std.math.maxInt(u32), 0, 0, batch, seq_len, heads, hd);
+        defer got.deinit(a);
+        const want = try denseSegmentTrainingReferenceOutput(a, Q, K, V, tree.ranges, tree.positions, std.math.maxInt(u32), batch, seq_len, heads, hd);
+        defer a.free(want);
+        var worst: f32 = 0;
+        for (got.output, want) |gv, wv| worst = @max(worst, @abs(gv - wv));
+        try std.testing.expect(worst < 1e-4);
+        // A single-segment row (query in the trunk) reproduces the dense
+        // full-visibility case exactly, matching Laya's unpacked-equivalence
+        // property (LAYA.md, "Segment attention").
+    }
+}
+
+fn segmentTrainingLoss(output: []const f32, dOut: []const f32) f32 {
+    var loss: f32 = 0;
+    for (output, dOut) |o, d| loss += o * d;
+    return loss;
+}
+
+test "segmentTrainingAttentionBackwardHost gradients match finite differences (with and without dropout)" {
+    const a = std.testing.allocator;
+    const batch = 2;
+    const heads = 2;
+    const hd = 4;
+    const seq_len = 20;
+    const H = heads * hd;
+    var prng = std.Random.DefaultPrng.init(13);
+    const r = prng.random();
+    const Q = try a.alloc(f32, batch * seq_len * H);
+    defer a.free(Q);
+    const K = try a.alloc(f32, batch * seq_len * H);
+    defer a.free(K);
+    const V = try a.alloc(f32, batch * seq_len * H);
+    defer a.free(V);
+    const dOut = try a.alloc(f32, batch * seq_len * H);
+    defer a.free(dOut);
+    for (Q) |*x| x.* = r.floatNorm(f32) * 0.5;
+    for (K) |*x| x.* = r.floatNorm(f32) * 0.5;
+    for (V) |*x| x.* = r.floatNorm(f32) * 0.5;
+    for (dOut) |*x| x.* = r.floatNorm(f32);
+
+    const tree = try buildTreeRanges(a, batch, seq_len, 6, 7); // trunk(6) + 2 branches of 7
+    defer a.free(tree.ranges);
+    defer a.free(tree.positions);
+
+    for ([_]struct { window: u32, dropout: f32 }{
+        .{ .window = std.math.maxInt(u32), .dropout = 0 },
+        .{ .window = 3, .dropout = 0 },
+        .{ .window = std.math.maxInt(u32), .dropout = 0.3 },
+    }) |case| {
+        var grad = try segmentTrainingAttentionBackwardHost(a, Q, K, V, dOut, tree.ranges, tree.positions, case.window, case.dropout, 0xC0FFEE, batch, seq_len, heads, hd);
+        defer grad.deinit(a);
+
+        const eps: f32 = 5e-3;
+        const checks = [_]usize{ 0, 3, 17, 41, 90, 130 };
+        for ([_][]f32{ Q, K, V }) |tensor| {
+            const analytic = if (tensor.ptr == Q.ptr) grad.dq else if (tensor.ptr == K.ptr) grad.dk else grad.dv;
+            for (checks) |idx| {
+                if (idx >= tensor.len) continue;
+                const original = tensor[idx];
+                tensor[idx] = original + eps;
+                var plus = try segmentTrainingAttentionForwardHost(a, Q, K, V, tree.ranges, tree.positions, case.window, case.dropout, 0xC0FFEE, batch, seq_len, heads, hd);
+                defer plus.deinit(a);
+                const loss_plus = segmentTrainingLoss(plus.output, dOut);
+                tensor[idx] = original - eps;
+                var minus = try segmentTrainingAttentionForwardHost(a, Q, K, V, tree.ranges, tree.positions, case.window, case.dropout, 0xC0FFEE, batch, seq_len, heads, hd);
+                defer minus.deinit(a);
+                const loss_minus = segmentTrainingLoss(minus.output, dOut);
+                tensor[idx] = original;
+                const numeric = (loss_plus - loss_minus) / (2 * eps);
+                const diff = @abs(numeric - analytic[idx]);
+                const tol = 2e-2 * @max(1.0, @abs(numeric));
+                try std.testing.expect(diff < tol);
+            }
+        }
+    }
+}
+
+test "segmentAttentionDropoutKeep is deterministic and disables at probability 0" {
+    for (0..50) |i| try std.testing.expectEqual(@as(f32, 1.0), segmentAttentionDropoutKeep(123, 0, 0, 2, 10, i % 10, (i * 3) % 10, 0));
+    const a = segmentAttentionDropoutKeep(999, 1, 0, 2, 10, 3, 7, 0.4);
+    const b = segmentAttentionDropoutKeep(999, 1, 0, 2, 10, 3, 7, 0.4);
+    try std.testing.expectEqual(a, b);
+    try std.testing.expect(a == 0 or @abs(a - 1.0 / 0.6) < 1e-6);
 }

@@ -566,6 +566,7 @@ pub fn prepareLayaResident(session: Session, control: ?InferenceExecutionControl
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     // Packed rows use the generic masked encoder, not the fused resident kernels.
     if (self.backend_type != .metal or self.arch_config != .modern_bert or self.arch_config.modern_bert.laya == null or isPackedLaya(self)) return;
+    if (!@import("../ops/laya_metal.zig").enabledFor(self.arch_config.modern_bert.laya.?)) return;
     const active = control orelse InferenceExecutionControl{};
     try active.check();
     var protection = if (control) |c| try c.enterUninterruptible(session.interruption()) else null;
@@ -707,6 +708,27 @@ pub fn inspectGgufModelForListing(
     return @as(?GgufInspectionReport, try buildGgufInspectionReportFromFile(allocator, arch_config, &file));
 }
 
+/// Whether a Laya checkpoint serves its linear weights as Q8_0 (LAYA.md 1d).
+fn layaQuantizesWeights(arch_config: ArchConfig) !bool {
+    if (arch_config != .modern_bert) return false;
+    const config = arch_config.modern_bert.laya orelse return false;
+    return try config.effectiveWeightQuantization() == .q8_0;
+}
+
+/// Load one dense Laya linear weight and quantize it to Q8_0 storage.
+fn layaQ8Weight(allocator: std.mem.Allocator, store: tensor_store_mod.TensorStore, full_name: []const u8, name: []const u8) !LoadedWeight {
+    var tensor_ref = try store.describeTensor(allocator, full_name);
+    defer tensor_ref.deinit(allocator);
+    var dense = try store.loadTensorRef(&tensor_ref);
+    defer dense.deinit();
+    const storage = try weight_source_mod.quantizeDenseQ8_0(allocator, &dense.tensor);
+    return .{
+        .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = name, .allocator = allocator, .owns_data = false, .owns_shape = false },
+        .quantized = true,
+        .quantized_storage = storage,
+    };
+}
+
 /// Create a native CPU session from a model directory.
 pub fn createNativeSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
     return createNativeSessionWithTaskOverride(allocator, model_path, null);
@@ -727,6 +749,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
     if (arch_config == .modern_bert) {
         if (arch_config.modern_bert.laya) |config| try @import("../models/laya.zig").validateWeights(store, config, arch_config.modern_bert);
     }
+    const laya_q8 = try layaQuantizesWeights(arch_config);
     if (arch_config == .gliner_boundary) {
         try validateNativeBoundaryWeights(allocator, mf, arch_config.gliner_boundary, store);
         // Reduced bundles retain their declared quantized storage. FP32
@@ -857,6 +880,14 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
                 .projection_mask = if (expert_coord != null) projectionMaskForWeightKey(key) else 0,
                 .placement = runtime.tier.planner.planForContext(cpu_plan_context, key, tensor_ref.byte_len),
             });
+            key_owned = false;
+            continue;
+        }
+
+        if (laya_q8 and @import("../models/laya.zig").quantizedLinear(full_name)) {
+            var weight = try layaQ8Weight(allocator, store, full_name, owned_key);
+            errdefer weight.deinit();
+            try resident_weights.put(allocator, owned_key, weight);
             key_owned = false;
             continue;
         }
@@ -2114,6 +2145,7 @@ fn createGpuHostedSessionWithTaskOverride(
             std.log.err("metal backend no longer supports eager dense resident loading", .{});
             return error.EagerDenseLoadUnsupported;
         } else {
+            const laya_q8 = try layaQuantizesWeights(arch_config);
             for (all_names) |full_name| {
                 if (try appendPackedMoeLazyWeights(allocator, &lazy_weights, tensor_store.?, arch_config, full_name, plan_context)) {
                     continue;
@@ -2144,6 +2176,7 @@ fn createGpuHostedSessionWithTaskOverride(
                     .projection_mask = if (expert_coord != null) projectionMaskForWeightKey(key) else 0,
                     .placement = runtime.tier.planner.planForContext(plan_context, key, tensor_ref.byte_len),
                     .prefer_dense = shouldKeepGpuHostedLazyWeightDense(backend_type, arch_config, key),
+                    .quantize_q8_0 = laya_q8 and @import("../models/laya.zig").quantizedLinear(full_name),
                 });
             }
             // Gemma 4 audio encoder tensors live in the projector GGUF. Keyed
@@ -8105,13 +8138,13 @@ fn isQwen3GenerativeRerankerFamily(family: gpt_arch.ModelFamily) bool {
 fn archHasLayaDecisions(ptr: *anyopaque) bool {
     if (comptime !build_options.enable_metal) return false;
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    return self.backend_type == .metal and self.arch_config == .modern_bert and self.arch_config.modern_bert.laya != null and !isPackedLaya(self) and @import("../ops/laya_metal.zig").enabled();
+    return self.backend_type == .metal and self.arch_config == .modern_bert and self.arch_config.modern_bert.laya != null and !isPackedLaya(self) and @import("../ops/laya_metal.zig").enabledFor(self.arch_config.modern_bert.laya.?);
 }
 
 fn archRunLayaDecisions(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?[]Tensor {
     if (comptime !build_options.enable_metal) return null;
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    if (self.backend_type != .metal or self.arch_config != .modern_bert or self.arch_config.modern_bert.laya == null or isPackedLaya(self) or !@import("../ops/laya_metal.zig").enabled()) return null;
+    if (self.backend_type != .metal or self.arch_config != .modern_bert or self.arch_config.modern_bert.laya == null or isPackedLaya(self) or !@import("../ops/laya_metal.zig").enabledFor(self.arch_config.modern_bert.laya.?)) return null;
     if (inputs.len != 4) return error.InvalidLayaInputs;
     const bi = try parseBertRunInputs(inputs[0..2]);
     const kinds = try validateI64Matrix(inputs[2], .{ bi.batch, 1 });
@@ -8226,7 +8259,7 @@ fn archRunImpl(
                 const markers = try validateI64Matrix(inputs[3], null);
                 if (markers.shape[0] != bi.batch) return error.InvalidLayaInputs;
                 if (comptime build_options.enable_metal) {
-                    if (self.backend_type == .metal and @import("../ops/laya_metal.zig").enabled()) {
+                    if (self.backend_type == .metal and @import("../ops/laya_metal.zig").enabledFor(cfg.laya.?)) {
                         const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
                         return @import("../ops/laya_metal.zig").run(compute, allocator, cfg, bi.input_ids, bi.attention_mask, kinds.values, markers.values, bi.batch, bi.seq_len, markers.shape[1], control, false);
                     }
@@ -9245,7 +9278,7 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
                     try layaCudaWorkspace(batch, input_seq, count, cfg.hidden_size, cfg.intermediate_size)
                 else
                     try std.math.mul(usize, 2, try whisperStageWorkspace(batch, input_seq, input_seq, cfg.hidden_size, @max(cfg.num_attention_heads, cfg.hidden_size / 64), cfg.hidden_size * 4));
-                if (comptime build_options.enable_metal) if (self.backend_type == .metal and @import("../ops/laya_metal.zig").enabled()) {
+                if (comptime build_options.enable_metal) if (self.backend_type == .metal and @import("../ops/laya_metal.zig").enabledFor(cfg.laya.?)) {
                     workspace_bytes = try @import("../ops/laya_metal.zig").workspaceBound(cfg, batch, input_seq, count);
                 };
                 break :blk count + @max(laya.n_act, 6);

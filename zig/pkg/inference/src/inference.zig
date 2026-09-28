@@ -122,6 +122,8 @@ test {
     _ = @import("finetune/laya/objective.zig");
     _ = @import("finetune/laya/training_test.zig");
     _ = @import("finetune/laya/training_packed_test.zig");
+    _ = @import("finetune/laya/fused_attention_test.zig");
+    _ = @import("ops/segment_training_attention.zig");
     _ = @import("finetune/laya/data.zig");
     _ = @import("finetune/laya/job.zig");
     _ = @import("finetune/laya/evaluate.zig");
@@ -131,6 +133,7 @@ test {
     _ = @import("pipelines/laya_packed_test.zig");
     _ = @import("pipelines/laya_packed_parity_test.zig");
     _ = @import("pipelines/laya_parity_test.zig");
+    _ = @import("pipelines/laya_quantized_test.zig");
     _ = @import("pipelines/laya_cuda_test.zig");
     _ = @import("extractors/laya.zig");
     _ = backends;

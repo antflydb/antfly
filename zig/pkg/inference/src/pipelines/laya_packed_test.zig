@@ -79,7 +79,7 @@ test "laya tree rows restart positions per branch and isolate siblings" {
     const tok = words.tokenizer();
     for ([_]model.PackingMode{ .question, .candidate }) |mode| {
         var cfg = model.Config{ .max_len = 128, .head_max_len = 48, .packing = .{ .mode = mode, .max_packed_len = 512 } };
-        const rows = try tree.build(a, tok, cfg, state_text, &questions);
+        const rows = try tree.build(a, tok, cfg, state_text, &questions, null);
         try std.testing.expectEqual(@as(usize, 1), rows.len);
         const row = rows[0];
         try tree.validate(row, cfg.max_len, cfg.packing.max_packed_len, cfg.maxOptions());
@@ -110,7 +110,7 @@ test "laya tree rows restart positions per branch and isolate siblings" {
         }
         // A tight physical budget splits questions across rows; each repeats the trunk.
         cfg.packing.max_packed_len = trunk + (row.ids.len - trunk) / 2;
-        const split = try tree.build(a, tok, cfg, state_text, &questions);
+        const split = try tree.build(a, tok, cfg, state_text, &questions, null);
         try std.testing.expect(split.len >= 2);
         var seen: usize = 0;
         for (split) |part| {
@@ -121,8 +121,36 @@ test "laya tree rows restart positions per branch and isolate siblings" {
         try std.testing.expectEqual(questions.len, seen);
         // A state that leaves no logical room for a branch is rejected, not truncated.
         cfg.max_len = trunk + 2;
-        try std.testing.expectError(error.ExtractionTextLimitExceeded, tree.build(a, tok, cfg, state_text, &questions));
+        try std.testing.expectError(error.ExtractionTextLimitExceeded, tree.build(a, tok, cfg, state_text, &questions, null));
     }
+}
+
+test "laya tree style override builds a joint branch under a candidate-mode config" {
+    // Two-stage choice (LAYA.md, roadmap 2b) needs a candidate-packed
+    // checkpoint to also serve one joint (question-style) branch over a
+    // shortlist of finalists. `build`'s style override must reproduce
+    // exactly what a pure question-mode config would build for the same
+    // questions, byte for byte.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    const candidate_cfg = model.Config{ .max_len = 128, .head_max_len = 48, .packing = .{ .mode = .candidate, .max_packed_len = 512 } };
+    const question_cfg = model.Config{ .max_len = 128, .head_max_len = 48, .packing = .{ .mode = .question, .max_packed_len = 512 } };
+    const joint = (try tree.build(a, tok, candidate_cfg, state_text, &questions, .question))[0];
+    const plain = (try tree.build(a, tok, question_cfg, state_text, &questions, null))[0];
+    try std.testing.expectEqualSlices(i64, plain.ids, joint.ids);
+    try std.testing.expectEqualSlices(i64, plain.positions, joint.positions);
+    try std.testing.expectEqualSlices(i64, plain.segments, joint.segments);
+    try std.testing.expectEqualSlices(i64, plain.parents, joint.parents);
+    try std.testing.expectEqualSlices(i64, plain.kinds, joint.kinds);
+    try std.testing.expectEqualSlices(i64, plain.anchors, joint.anchors);
+    try std.testing.expectEqualSlices(i64, plain.markers, joint.markers);
+    try std.testing.expectEqual(plain.width, joint.width);
+    // The default style still follows the config's own mode.
+    const default_style = (try tree.build(a, tok, candidate_cfg, state_text, &questions, null))[0];
+    try std.testing.expect(!std.mem.eql(i64, plain.ids, default_style.ids));
 }
 
 test "laya tree validation rejects cycles, crossed markers, and trunk kinds" {
@@ -131,7 +159,7 @@ test "laya tree validation rejects cycles, crossed markers, and trunk kinds" {
     const a = arena.allocator();
     var words = synthetic.WordTokenizer{};
     const cfg = model.Config{ .max_len = 128, .head_max_len = 48, .packing = .{ .mode = .question, .max_packed_len = 512 } };
-    const row = (try tree.build(a, words.tokenizer(), cfg, state_text, &questions))[0];
+    const row = (try tree.build(a, words.tokenizer(), cfg, state_text, &questions, null))[0];
     try tree.validate(row, cfg.max_len, cfg.packing.max_packed_len, cfg.maxOptions());
     var bad = try tree.own(a, row);
     @constCast(bad.parents)[1] = 2;
@@ -222,7 +250,7 @@ test "laya segment attention equals dense tree-masked attention on the session b
     const tok = words.tokenizer();
     var fixture = try Fixture.init(std.testing.allocator, "{\"mode\":\"candidate\"}");
     defer fixture.deinit(std.testing.allocator);
-    const row = (try tree.build(a, tok, fixture.cfg, state_text, &questions))[0];
+    const row = (try tree.build(a, tok, fixture.cfg, state_text, &questions, null))[0];
     const n = row.ids.len;
     const heads = 2;
     const hd = 32;
@@ -275,13 +303,13 @@ test "laya packed questions are isolated and share one exact trunk encoding" {
     for ([_][]const u8{ "{\"mode\":\"question\"}", "{\"mode\":\"candidate\"}" }) |packing| {
         var fixture = try Fixture.init(std.testing.allocator, packing);
         defer fixture.deinit(std.testing.allocator);
-        const all = (try tree.build(a, tok, fixture.cfg, state_text, &questions))[0];
+        const all = (try tree.build(a, tok, fixture.cfg, state_text, &questions, null))[0];
         const together = try runRow(a, &fixture, all);
         const shared = try trunkEncoding(a, &fixture, all);
         var worst: f32 = 0;
         var trunk_worst: f32 = 0;
         for (questions, 0..) |q, qi| {
-            const alone = (try tree.build(a, tok, fixture.cfg, state_text, &.{q}))[0];
+            const alone = (try tree.build(a, tok, fixture.cfg, state_text, &.{q}, null))[0];
             const single = try runRow(a, &fixture, alone);
             const labels = q.labels.len;
             worst = @max(worst, try maxError(single[0][0..labels], together[0][qi * all.width ..][0..labels]));
@@ -292,10 +320,190 @@ test "laya packed questions are isolated and share one exact trunk encoding" {
         try std.testing.expect(worst < 1e-5);
         try std.testing.expect(trunk_worst < 1e-5);
         // Decisions depend on the state: a different trunk changes the logits.
-        const other = (try tree.build(a, tok, fixture.cfg, "hello world", &questions))[0];
+        const other = (try tree.build(a, tok, fixture.cfg, "hello world", &questions, null))[0];
         const moved = try runRow(a, &fixture, other);
         try std.testing.expect(try maxError(together[0], moved[0]) > 1e-4);
     }
+}
+
+// Per-question upper layers (`packing.fuse_layers`, LAYA.md): one tree per
+// question, so questions stay isolated; fusing the whole stack is exactly the
+// question-aware trunk on each question alone; fusing changes the model.
+test "laya per-question upper layers isolate questions and reduce to the question-aware trunk" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    const stack = synthetic.layers + 2;
+    var aware = try Fixture.init(std.testing.allocator, "{\"mode\":\"question\",\"trunk_sees\":\"questions\"}");
+    defer aware.deinit(std.testing.allocator);
+    var plain = try Fixture.init(std.testing.allocator, "{\"mode\":\"question\"}");
+    defer plain.deinit(std.testing.allocator);
+    const unfused = try runRow(a, &plain, (try tree.build(a, tok, plain.cfg, state_text, &questions, null))[0]);
+    for ([_]usize{ 2, 3, stack }) |fuse| {
+        var fixture = try Fixture.init(std.testing.allocator, try std.fmt.allocPrint(a, "{{\"mode\":\"question\",\"fuse_layers\":{d}}}", .{fuse}));
+        defer fixture.deinit(std.testing.allocator);
+        const rows = try tree.build(a, tok, fixture.cfg, state_text, &questions, null);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        const all = rows[0];
+        try std.testing.expect(all.fused);
+        try std.testing.expectEqual(questions.len, tree.treeCount(all));
+        try tree.validate(all, fixture.cfg.max_len, fixture.cfg.packing.max_packed_len, fixture.cfg.maxOptions());
+        // Both layer sets' ranges agree with their visibility.
+        for ([_]tree.Row{ all, all.upper() }) |view| {
+            const bounds = try tree.ranges(a, view, 0);
+            for (0..view.ids.len) |q| for (0..view.ids.len) |k| {
+                var in_range = false;
+                for (0..3) |slot| in_range = in_range or (k >= bounds[q * 6 + 2 * slot] and k < bounds[q * 6 + 2 * slot + 1]);
+                try std.testing.expectEqual(view.visible(q, k), in_range);
+            };
+        }
+        const together = try runRow(a, &fixture, all);
+        var isolation: f32 = 0;
+        var reduction: f32 = 0;
+        var moved: f32 = 0;
+        for (questions, 0..) |q, qi| {
+            const labels = q.labels.len;
+            const got = together[0][qi * all.width ..][0..labels];
+            const single = try runRow(a, &fixture, (try tree.build(a, tok, fixture.cfg, state_text, &.{q}, null))[0]);
+            isolation = @max(isolation, try maxError(single[0][0..labels], got));
+            moved = @max(moved, try maxError(unfused[0][qi * all.width ..][0..labels], got));
+            if (fuse == stack) {
+                const alone = (try tree.build(a, tok, aware.cfg, state_text, &.{q}, null))[0];
+                reduction = @max(reduction, try maxError((try runRow(a, &aware, alone))[0][0..labels], got));
+            }
+        }
+        std.debug.print("Laya fuse_layers={d}: isolation max error={d}, vs question-aware trunk={d}, vs unfused={d}\n", .{ fuse, isolation, reduction, moved });
+        try std.testing.expect(isolation < 1e-5);
+        try std.testing.expect(reduction < 1e-5);
+        try std.testing.expect(moved > 1e-4);
+    }
+}
+
+// Multi-row batching (LAYA.md, "Segment attention"): several rows, from
+// different states, run as one physical row in one session call.
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
+
+test "laya multi-row coalescing isolates independent states and matches running them alone" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    const states = [_][]const u8{
+        state_text,
+        "hello world this is a different and much shorter state",
+        "a third state about invoices refunds and shipping delays",
+    };
+    for ([_][]const u8{ "{\"mode\":\"question\"}", "{\"mode\":\"candidate\"}" }) |packing| {
+        var fixture = try Fixture.init(std.testing.allocator, packing);
+        defer fixture.deinit(std.testing.allocator);
+        var sub_rows: [states.len]tree.Row = undefined;
+        var alone: [states.len][2][]f32 = undefined;
+        for (&sub_rows, &alone, states) |*row, *result, text| {
+            row.* = (try tree.build(a, tok, fixture.cfg, text, &questions, null))[0];
+            result.* = try runRow(a, &fixture, row.*);
+        }
+        const merged = try tree.coalesce(a, &sub_rows);
+        defer merged.deinit(a);
+        try std.testing.expectEqual(@as(usize, states.len), tree.treeCount(merged.row));
+        try tree.validate(merged.row, fixture.cfg.max_len, fixture.cfg.packing.max_packed_len, fixture.cfg.maxOptions());
+        // No token of one state's tree is visible from another's.
+        var offsets: [states.len]usize = undefined;
+        var running: usize = 0;
+        for (&offsets, sub_rows) |*offset, row| {
+            offset.* = running;
+            running += row.ids.len;
+        }
+        for (sub_rows, 0..) |row, ri| for (0..row.ids.len) |i| for (sub_rows, 0..) |other, rj| {
+            if (ri == rj) continue;
+            for (0..other.ids.len) |k| try std.testing.expect(!merged.row.visible(offsets[ri] + i, offsets[rj] + k));
+        };
+        // A batched call over all three states equals each row run alone.
+        const together = try runRow(a, &fixture, merged.row);
+        var worst: f32 = 0;
+        for (merged.row.question_index, merged.owners, 0..) |local, owner, k| {
+            const q = questions[local];
+            const labels = q.labels.len;
+            worst = @max(worst, try maxError(alone[owner][0][local * sub_rows[owner].width ..][0..labels], together[0][k * merged.row.width ..][0..labels]));
+            worst = @max(worst, try maxError(alone[owner][1][local * fixture.cfg.n_act ..][0..fixture.cfg.n_act], together[1][k * fixture.cfg.n_act ..][0..fixture.cfg.n_act]));
+        }
+        std.debug.print("Laya multi-row batching {s}: isolation and exactness max error={d}\n", .{ packing, worst });
+        try std.testing.expect(worst < 1e-5);
+    }
+}
+
+test "laya multi-row coalescing holds exactly with a dozen near-identical states" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    var fixture = try Fixture.init(std.testing.allocator, "{\"mode\":\"question\"}");
+    defer fixture.deinit(std.testing.allocator);
+    const state_count = 12;
+    var sub_rows: [state_count]tree.Row = undefined;
+    var alone: [state_count][2][]f32 = undefined;
+    for (&sub_rows, &alone, 0..) |*row, *result, i| {
+        const text = try std.fmt.allocPrint(a, "{s} case number {d}", .{ state_text, i });
+        row.* = (try tree.build(a, tok, fixture.cfg, text, questions[0..2], null))[0];
+        result.* = try runRow(a, &fixture, row.*);
+    }
+    const merged = try tree.coalesce(a, &sub_rows);
+    defer merged.deinit(a);
+    try std.testing.expectEqual(@as(usize, state_count), tree.treeCount(merged.row));
+    // This directly exercises forwardRow, bypassing the session's own
+    // max_packed_len budget (pipelines/laya.zig enforces that when grouping
+    // rows into batches); validate the row's structure against its own size.
+    try tree.validate(merged.row, fixture.cfg.max_len, merged.row.ids.len, fixture.cfg.maxOptions());
+    const together = try runRow(a, &fixture, merged.row);
+    var worst: f32 = 0;
+    for (merged.row.question_index, merged.owners, 0..) |local, owner, k| {
+        const q = questions[0..2][local];
+        const labels = q.labels.len;
+        worst = @max(worst, try maxError(alone[owner][0][local * sub_rows[owner].width ..][0..labels], together[0][k * merged.row.width ..][0..labels]));
+        worst = @max(worst, try maxError(alone[owner][1][local * fixture.cfg.n_act ..][0..fixture.cfg.n_act], together[1][k * fixture.cfg.n_act ..][0..fixture.cfg.n_act]));
+    }
+    std.debug.print("Laya multi-row batching, {d} near-identical states: max error={d}\n", .{ state_count, worst });
+    try std.testing.expect(worst < 1e-5);
+}
+
+test "laya packed pipeline batches many small states into fewer session calls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    var fixture = try Fixture.init(std.testing.allocator, "{\"mode\":\"question\"}");
+    defer fixture.deinit(std.testing.allocator);
+    const state_count = 12;
+    var tasks: std.ArrayListUnmanaged(pipeline.Task) = .empty;
+    for (0..state_count) |i| {
+        const text = try std.fmt.allocPrint(a, "{s} case number {d}", .{ state_text, i });
+        for (questions[0..2]) |q| try tasks.append(a, .{ .text = text, .question = q });
+    }
+    const result = try pipeline.execute(a, fixture.session, tok, fixture.cfg, tasks.items, null);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_LAYA_PACKED_BATCH", "0", 1));
+    const unbatched = try pipeline.execute(a, fixture.session, tok, fixture.cfg, tasks.items, null);
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_LAYA_PACKED_BATCH"));
+    std.debug.print("Laya multi-row batching: {d} states, batched chunks={d}, unbatched chunks={d}\n", .{ state_count, result.execution_chunks, unbatched.execution_chunks });
+    // Every state fits its own row well under the budget, so disabling
+    // batching falls back to one call per state; batching shares fewer calls
+    // across them without changing tokens processed or any decision.
+    try std.testing.expectEqual(@as(usize, state_count), unbatched.execution_chunks);
+    try std.testing.expect(result.execution_chunks < unbatched.execution_chunks);
+    try std.testing.expectEqual(unbatched.prompt_tokens, result.prompt_tokens);
+    var worst_prob: f32 = 0;
+    var worst_act: f32 = 0;
+    for (result.decisions, unbatched.decisions) |left, right| {
+        worst_prob = @max(worst_prob, try maxError(left.probabilities, right.probabilities));
+        worst_act = @max(worst_act, @abs(left.act_probability - right.act_probability));
+    }
+    std.debug.print("Laya multi-row batching: {d} states, worst probability error={d}, worst act error={d}\n", .{ state_count, worst_prob, worst_act });
+    try std.testing.expect(worst_prob < 1e-5);
+    try std.testing.expect(worst_act < 1e-5);
 }
 
 test "laya packed trunk cache reuses the state exactly across rows and requests" {
@@ -316,7 +524,7 @@ test "laya packed trunk cache reuses the state exactly across rows and requests"
         var worst: f32 = 0;
         // Miss (fills the cache), then hits with different question sets.
         for ([_][]const pipeline.Question{ &questions, questions[1..], questions[0..1] }) |subset| {
-            const row = (try tree.build(a, tok, fixture.cfg, state_text, subset))[0];
+            const row = (try tree.build(a, tok, fixture.cfg, state_text, subset, null))[0];
             const full = try runRow(a, &fixture, row);
             // One compute backend at a time: Metal sessions share one provider.
             const cb = try factory.getComputeBackend(fixture.session, std.testing.allocator);
@@ -372,7 +580,9 @@ test "laya packed pipeline groups shared states and preserves request order" {
         .{ .text = state_text, .question = questions[1] },
     };
     const result = try pipeline.execute(a, fixture.session, tok, fixture.cfg, &tasks, null);
-    try std.testing.expectEqual(@as(usize, 2), result.execution_chunks);
+    // Two states, each one row well under the 512-token budget: multi-row
+    // batching (LAYA.md, "Segment attention") shares one session call.
+    try std.testing.expectEqual(@as(usize, 1), result.execution_chunks);
     var unpacked_tokens: usize = 0;
     for (tasks, result.decisions) |task, decision| {
         try std.testing.expectEqualStrings(task.question.name, decision.name);
@@ -389,6 +599,67 @@ test "laya packed pipeline groups shared states and preserves request order" {
     const split = try pipeline.execute(a, fixture.session, tok, split_cfg, &tasks, null);
     try std.testing.expect(split.execution_chunks > result.execution_chunks);
     for (split.decisions, result.decisions) |left, right| try std.testing.expect(try maxError(left.probabilities, right.probabilities) < 1e-5);
+}
+
+test "laya two-stage choice blends a joint shortlist back into the stage-1 distribution" {
+    // LAYA.md, "Two-stage choice (roadmap 2b)". Reproduces stage 1 (the plain
+    // candidate row) and stage 2 (a joint branch over the two highest-probability
+    // options) independently, then checks `pipeline.execute`'s blended result
+    // against the mixture formula by hand.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    var fixture = try Fixture.init(std.testing.allocator, "{\"mode\":\"candidate\",\"two_stage\":{\"top_k\":2}}");
+    defer fixture.deinit(std.testing.allocator);
+    const q = questions[0]; // "tool": choice, 3 labels.
+    try std.testing.expect(q.labels.len > fixture.cfg.packing.two_stage.top_k);
+
+    const stage1_row = (try tree.build(a, tok, fixture.cfg, state_text, &.{q}, null))[0];
+    const stage1_raw = try runRow(a, &fixture, stage1_row);
+    const stage1 = try pipeline.decode(a, fixture.cfg, q, stage1_raw[0][0..q.labels.len], stage1_raw[1][0..fixture.cfg.n_act]);
+
+    // The two highest stage-1 probabilities are the finalists, ascending by index.
+    var order = [_]usize{ 0, 1, 2 };
+    std.mem.sort(usize, &order, stage1.probabilities, struct {
+        fn more(probs: []const f32, l: usize, r: usize) bool {
+            return probs[l] > probs[r];
+        }
+    }.more);
+    var finalists = order[0..2].*;
+    std.mem.sort(usize, &finalists, {}, std.sort.asc(usize));
+
+    const labels = try a.alloc([]const u8, 2);
+    const descriptions = try a.alloc([]const u8, 2);
+    for (finalists, labels, descriptions) |idx, *l, *d| {
+        l.* = q.labels[idx];
+        d.* = q.descriptions[idx];
+    }
+    const shortlist = pipeline.Question{ .name = q.name, .kind = q.kind, .instruction = q.instruction, .labels = labels, .descriptions = descriptions };
+    const stage2_row = (try tree.build(a, tok, fixture.cfg, state_text, &.{shortlist}, .question))[0];
+    const stage2_raw = try runRow(a, &fixture, stage2_row);
+    const stage2 = try pipeline.decode(a, fixture.cfg, shortlist, stage2_raw[0][0..2], stage2_raw[1][0..fixture.cfg.n_act]);
+
+    var mass: f32 = 0;
+    for (finalists) |idx| mass += stage1.probabilities[idx];
+    const expected = try a.dupe(f32, stage1.probabilities);
+    for (finalists, 0..) |idx, j| expected[idx] = mass * stage2.probabilities[j];
+
+    const result = try pipeline.execute(a, fixture.session, tok, fixture.cfg, &.{.{ .text = state_text, .question = q }}, null);
+    try std.testing.expectEqual(@as(usize, 1), result.decisions.len);
+    const worst = try maxError(expected, result.decisions[0].probabilities);
+    std.debug.print("Laya two-stage choice: blended vs manually-computed max error={d}, mass captured={d}\n", .{ worst, mass });
+    try std.testing.expect(worst < 1e-5);
+    var sum: f32 = 0;
+    for (result.decisions[0].probabilities) |p| sum += p;
+    try std.testing.expectApproxEqAbs(@as(f32, 1), sum, 1e-5);
+
+    // With top_k covering every option, stage 2 never runs and nothing changes.
+    var single_stage_cfg = fixture.cfg;
+    single_stage_cfg.packing.two_stage.top_k = q.labels.len;
+    const single_stage = try pipeline.execute(a, fixture.session, tok, single_stage_cfg, &.{.{ .text = state_text, .question = q }}, null);
+    try std.testing.expect(try maxError(stage1.probabilities, single_stage.decisions[0].probabilities) < 1e-5);
 }
 
 test "laya packed session rejects rows that break the tree contract" {
@@ -504,5 +775,61 @@ test "laya packed benchmark shared-state cost against unpacked" {
                 tokens[0],                                 tokens[1],
             });
         }
+    }
+    // Many-states case (step 1b'): a request with many distinct short states
+    // instead of many questions about one state. Multi-row batching (LAYA.md,
+    // "Segment attention") amortizes per-call overhead across states; compare
+    // against ANTFLY_LAYA_PACKED_BATCH=0, which falls back to one call per row.
+    const many_state_questions = 4;
+    for ([_]usize{ 16, 64 }) |state_count| {
+        const tasks = try s.alloc(pipeline.Task, state_count * many_state_questions);
+        for (0..state_count) |si| {
+            const text = try std.fmt.allocPrint(s, "{s} case {d}", .{ sentence, si });
+            for (0..many_state_questions) |qi| tasks[si * many_state_questions + qi] = .{ .text = text, .question = bench_questions[qi % bench_questions.len] };
+        }
+        var unpacked_time: [samples + 1]u64 = undefined;
+        var unpacked_tokens: usize = 0;
+        for (&unpacked_time) |*t| {
+            var request = std.heap.ArenaAllocator.init(a);
+            defer request.deinit();
+            const began = platform.time.monotonicNs();
+            const result = try pipeline.executeWithScratch(request.allocator(), a, unpacked, tok, unpacked_cfg, tasks, null, null);
+            t.* = platform.time.monotonicNs() - began;
+            unpacked_tokens = result.prompt_tokens;
+        }
+        std.mem.sort(u64, unpacked_time[1..], {}, std.sort.asc(u64));
+        var batched_time: [samples + 1]u64 = undefined;
+        var batched_chunks: usize = 0;
+        var batched_tokens: usize = 0;
+        for (&batched_time) |*t| {
+            var request = std.heap.ArenaAllocator.init(a);
+            defer request.deinit();
+            const began = platform.time.monotonicNs();
+            const result = try pipeline.executeWithScratch(request.allocator(), a, packed_session, tok, packed_cfg, tasks, null, null);
+            t.* = platform.time.monotonicNs() - began;
+            batched_chunks = result.execution_chunks;
+            batched_tokens = result.prompt_tokens;
+        }
+        std.mem.sort(u64, batched_time[1..], {}, std.sort.asc(u64));
+        try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_LAYA_PACKED_BATCH", "0", 1));
+        var unbatched_time: [samples + 1]u64 = undefined;
+        var unbatched_chunks: usize = 0;
+        for (&unbatched_time) |*t| {
+            var request = std.heap.ArenaAllocator.init(a);
+            defer request.deinit();
+            const began = platform.time.monotonicNs();
+            const result = try pipeline.executeWithScratch(request.allocator(), a, packed_session, tok, packed_cfg, tasks, null, null);
+            t.* = platform.time.monotonicNs() - began;
+            unbatched_chunks = result.execution_chunks;
+        }
+        std.mem.sort(u64, unbatched_time[1..], {}, std.sort.asc(u64));
+        try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_LAYA_PACKED_BATCH"));
+        std.debug.print("LAYA_PACKED_MANY_STATES {{\"backend\":\"{s}\",\"states\":{d},\"questions_per_state\":{d},\"unpacked_ms\":{d:.1},\"packed_batched_ms\":{d:.1},\"packed_unbatched_ms\":{d:.1},\"batched_chunks\":{d},\"unbatched_chunks\":{d},\"unpacked_tokens\":{d},\"packed_tokens\":{d}}}\n", .{
+            @tagName(unpacked.backend()),                                 state_count,
+            many_state_questions,                                         @as(f64, @floatFromInt(unpacked_time[1 + samples / 2])) / 1e6,
+            @as(f64, @floatFromInt(batched_time[1 + samples / 2])) / 1e6, @as(f64, @floatFromInt(unbatched_time[1 + samples / 2])) / 1e6,
+            batched_chunks,                                               unbatched_chunks,
+            unpacked_tokens,                                              batched_tokens,
+        });
     }
 }

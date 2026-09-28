@@ -466,6 +466,75 @@ pub const DebertaTrainingAttentionAttrs = struct {
     }
 };
 
+/// Version-1 flash-style training attention for Laya's segment (tree) and
+/// sliding-window visibility, without materializing a `[tokens, tokens]`
+/// score or probability tensor. Unlike `DebertaTrainingAttentionAttrs` there
+/// is no disentangled relative-position term; visibility is `ranges` (up to
+/// three contiguous key ranges per query, ancestor-segment style, see
+/// `laya_tree.Row.visible` and `ops.SegmentAttention`) intersected with an
+/// optional logical `window`. A plain dense global or local-window layer is
+/// the degenerate case where every query's one range is `[0, seq_len)`.
+///
+/// Forward leaves are packed `[Q;K;V]` (token-major, `[3*batch*seq_len,
+/// num_heads*head_dim]`) and physical i32 control: six seed/microbatch/
+/// replica limbs (as `DebertaTrainingAttentionAttrs`), `batch*seq_len`
+/// logical positions, then `batch*seq_len*6` range bounds. Dropout addresses
+/// `((b*heads+h)*seq_len+q)*seq_len+k`, replayed identically by the backward
+/// op, which recomputes scores per tile rather than reading a saved
+/// probability tensor.
+pub const SegmentTrainingAttentionAttrs = struct {
+    batch: u32,
+    seq_len: u32,
+    num_heads: u32,
+    head_dim: u32,
+    window: u32 = std.math.maxInt(u32),
+    dropout_probability: f32,
+    dropout_stream_id: u64,
+
+    pub const Layout = struct {
+        batch_tokens: i64,
+        hidden: i64,
+        qkv_rows: i64,
+        control_elements: i64,
+        gradient_rows: i64,
+
+        pub fn qkvShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.qkv_rows, self.hidden });
+        }
+        pub fn controlShape(self: Layout) Shape {
+            return Shape.init(.i32, &.{self.control_elements});
+        }
+        pub fn outputShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.batch_tokens, self.hidden });
+        }
+        pub fn gradientShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.gradient_rows, self.hidden });
+        }
+    };
+
+    /// Shape validation only. Each backend must separately admit physical
+    /// bytes, scratch, and dispatch work (which is now proportional to the
+    /// keys each query can see, not `seq_len^2`).
+    pub fn layout(self: SegmentTrainingAttentionAttrs) !Layout {
+        for ([_]u32{ self.batch, self.seq_len, self.num_heads, self.head_dim }) |dim|
+            if (dim == 0 or dim > std.math.maxInt(i32)) return error.InvalidSegmentTrainingAttentionShape;
+        if (!std.math.isFinite(self.dropout_probability) or self.dropout_probability < 0 or self.dropout_probability >= 1)
+            return error.InvalidSegmentTrainingAttentionShape;
+        const batch_tokens = try std.math.mul(i64, self.batch, self.seq_len);
+        const hidden = try std.math.mul(i64, self.num_heads, self.head_dim);
+        const qkv_rows = try std.math.mul(i64, 3, batch_tokens);
+        const ranges_elements = try std.math.mul(i64, batch_tokens, 6);
+        // 6 replay limbs (seed, micro_batch, replica) + 1 `apply_dropout`
+        // flag (see `segment_training_attention.zig`'s `ControlView`) +
+        // positions + ranges.
+        const control_elements = try std.math.add(i64, 7, try std.math.add(i64, batch_tokens, ranges_elements));
+        // Reject element-count overflow before Shape.numElements or VJP
+        // slicing can encounter a malformed manually assembled graph.
+        _ = try std.math.mul(i64, qkv_rows, hidden);
+        return .{ .batch_tokens = batch_tokens, .hidden = hidden, .qkv_rows = qkv_rows, .control_elements = control_elements, .gradient_rows = qkv_rows };
+    }
+};
+
 /// Training attention for the ModernBERT trunk without a materialized score
 /// tensor. Query row `i` (of `batch*seq_len`) may see key row `k` only when
 /// `k` lies in one of its three half-open ranges and, unless `window` is
@@ -721,6 +790,8 @@ pub const OpCode = union(enum) {
     fused_deberta_training_attention_backward_v1: DebertaTrainingAttentionAttrs,
     fused_modernbert_training_attention_v1: ModernBertTrainingAttentionAttrs,
     fused_modernbert_training_attention_backward_v1: ModernBertTrainingAttentionAttrs,
+    fused_segment_training_attention_v1: SegmentTrainingAttentionAttrs,
+    fused_segment_training_attention_backward_v1: SegmentTrainingAttentionAttrs,
     fused_relative_position_bias: RelativePositionBiasAttrs,
     fused_rope: RopeAttrs,
     fused_conv1d: Conv1dAttrs,

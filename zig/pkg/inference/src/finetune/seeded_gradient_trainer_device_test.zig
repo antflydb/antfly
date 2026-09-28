@@ -275,6 +275,35 @@ test "seeded gradient trainer resident Metal failures preserve authoritative epo
     const epoch = Epoch.capture(&trainer);
     try std.testing.expectError(error.TrainingTapeIdentityMismatch, trainer.submitResident(initial, 1, &.{}, null));
     try std.testing.expectError(error.Cancelled, trainer.submitResident(trainer.identity(), 1, first.incoming.items, .{ .check_fn = Cancel.apply }));
+    // A transaction encodes into one command batch; a rejected update must
+    // discard it and leave no frame open for later work.
+    const runtime = device.backend.provider_impl.raw_decode_runtime;
+    try std.testing.expect(!metal_runtime.hasActiveFrame(runtime));
+    {
+        const poisoned = try a.dupe(controller.ResidentGradient, second.incoming.items);
+        defer a.free(poisoned);
+        for (poisoned) |*gradient| if (gradient.value == .tensor) {
+            const shape = try cb.tensorShape(gradient.value.tensor, a);
+            defer a.free(shape);
+            const count = blk: {
+                var n: usize = 1;
+                for (shape) |dim| n *= @intCast(dim);
+                break :blk n;
+            };
+            const values = try a.alloc(f32, count);
+            defer a.free(values);
+            @memset(values, std.math.nan(f32));
+            const dims = try a.alloc(i32, shape.len);
+            defer a.free(dims);
+            for (shape, dims) |dim, *dst| dst.* = @intCast(dim);
+            const nan = try cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = values, .shape = dims } }, .{});
+            defer cb.free(nan);
+            gradient.value = .{ .tensor = nan };
+            try std.testing.expectError(error.NonFiniteTrainingUpdate, trainer.submitResident(trainer.identity(), 1, poisoned, null));
+            break;
+        } else return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(!metal_runtime.hasActiveFrame(runtime));
     try std.testing.expectError(error.TrainingStateFingerprintMismatch, trainer.restore(path, @splat(18), null));
     try std.testing.expectError(error.TrainingRestoreStateMismatch, trainer.restoreValidated(path, run_identity, null, .{ .context = null, .validate = Accept.apply, .expected_state_sha256 = @splat(0) }));
     try std.testing.expectError(error.Cancelled, trainer.restore(path, run_identity, .{ .check_fn = Cancel.apply }));

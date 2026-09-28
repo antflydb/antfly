@@ -37,9 +37,38 @@ pub const Report = struct {
     noul: ?Metrics,
     prompt_tokens: usize,
     seconds: f64,
+    /// Set only when `Options.top_k_recall` is given: the fraction of
+    /// `choice` decisions whose gold label is among the `top_k` highest
+    /// probabilities. Two-stage choice (LAYA.md, roadmap 2b) can only pick
+    /// the right answer in stage 2 when the shortlist contains it, so this
+    /// bounds what stage 2 can achieve on this model's distribution (run it
+    /// against a model with `two_stage` disabled to measure stage 1 alone).
+    top_k_recall: ?f64 = null,
 };
 
 const Scored = struct { kind: model.QuestionType, probabilities: []const f32, target: []const f32 };
+
+/// Fraction of `choice` items whose gold label (the target's argmax) is
+/// among the `k` highest probabilities. 0 (not 1, to fail loud) if there are
+/// no `choice` items.
+fn topKRecall(items: []const Scored, k: usize) f64 {
+    var hits: f64 = 0;
+    var total: f64 = 0;
+    for (items) |item| {
+        if (item.kind != .choice) continue;
+        total += 1;
+        var gold: usize = 0;
+        for (item.target, 0..) |t, i| if (t > item.target[gold]) {
+            gold = i;
+        };
+        var rank: usize = 0;
+        for (item.probabilities, 0..) |p, i| {
+            if (i != gold and p > item.probabilities[gold]) rank += 1;
+        }
+        if (rank < k) hits += 1;
+    }
+    return if (total > 0) hits / total else 0;
+}
 
 pub fn metrics(items: []const Scored) Metrics {
     var out = Metrics{ .decisions = items.len };
@@ -87,6 +116,9 @@ pub const Options = struct {
     backend: enum { native, metal } = .metal,
     /// Tasks per pipeline call; packed models group each case into one row.
     chunk: usize = 64,
+    /// When set, also report the fraction of `choice` decisions whose gold
+    /// label is among this many highest probabilities (`Report.top_k_recall`).
+    top_k_recall: ?usize = null,
 };
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Report {
@@ -102,7 +134,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Report {
     const tokenizer = try hf.HfTokenizer.loadFromBytes(gpa, try files.readFileFromDir(a, options.model_dir, "tokenizer.json"));
     const tok = tokenizer.tokenizer();
     defer tok.deinitTokenizer();
-    const bytes = try files.readFileMax(a, options.records_file, 64 * 1024 * 1024);
+    const bytes = try files.readFileMax(a, options.records_file, data.max_file_bytes);
     var tasks: std.ArrayListUnmanaged(pipeline.Task) = .empty;
     var targets: std.ArrayListUnmanaged([]const f32) = .empty;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -157,6 +189,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Report {
         .noul = by_kind[2],
         .prompt_tokens = prompt_tokens,
         .seconds = seconds,
+        .top_k_recall = if (options.top_k_recall) |k| topKRecall(scored, k) else null,
     };
 }
 
@@ -180,4 +213,19 @@ test "laya evaluation metrics: accuracy, soft CE, ECE, and ordinal MAE" {
     // Bins: 0.9 (correct), 0.6 (wrong), 0.5 (wrong).
     try std.testing.expectApproxEqAbs((0.1 + 0.6 + 0.5) / 3.0, m.ece, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), m.ordinal_mae.?, 1e-9);
+}
+
+test "laya top-k recall counts only choice items and ignores gold's own rank ties" {
+    const items = [_]Scored{
+        // Gold (index 2) is the top pick: within any k >= 1.
+        .{ .kind = .choice, .probabilities = &.{ 0.1, 0.2, 0.7 }, .target = &.{ 0, 0, 1 } },
+        // Gold (index 0) is third: needs k >= 3.
+        .{ .kind = .choice, .probabilities = &.{ 0.1, 0.5, 0.4 }, .target = &.{ 1, 0, 0 } },
+        // Non-choice kinds are excluded from the denominator.
+        .{ .kind = .score, .probabilities = &.{ 0.9, 0.1 }, .target = &.{ 1, 0 } },
+    };
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), topKRecall(&items, 1), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), topKRecall(&items, 2), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), topKRecall(&items, 3), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), topKRecall(items[2..2], 1), 1e-9);
 }

@@ -42,6 +42,7 @@ pub const elementwise_loss_math = @import("elementwise_loss_math.zig");
 pub const consistency_loss_math = @import("consistency_loss_math.zig");
 pub const listwise_loss_math = @import("listwise_loss_math.zig");
 pub const deberta_training_attention = @import("deberta_training_attention.zig");
+pub const segment_training_attention = @import("segment_training_attention.zig");
 
 pub const UnaryConsumeOp = enum {
     gelu,
@@ -2267,6 +2268,12 @@ pub const ComputeBackend = struct {
         /// must not fall back to the inference attention mask or host execution.
         debertaTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
         debertaTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, dO: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+        /// CPU only today (no device kernel): the encoder's global and
+        /// local-window layers and packed rows' tree segments all lower to
+        /// this. `null` means the training graph must fall back to the
+        /// dense-bias attention path (see `finetune/laya/graph.zig`).
+        segmentTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+        segmentTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
 
         /// ModernBERT training attention over packed [Q;K;V] with an i32
         /// range/position control; linear storage, replayed backward
@@ -2434,6 +2441,13 @@ pub const ComputeBackend = struct {
         residentTrainingNorm: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.NormInput, limits: resident_training.NormLimits, control: ?InferenceExecutionControl) anyerror!resident_training.NormSummary = null,
         residentTrainingValidate: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.ValidationInput, limits: resident_training.ValidationLimits, control: ?InferenceExecutionControl) anyerror!resident_training.ValidationSummary = null,
         residentTrainingInstruction: ?*const fn (ctx: *anyopaque, instruction: *const resident_program.Instruction, inputs: []const CT, limits: resident_program.Limits, control: ?InferenceExecutionControl) anyerror!CT = null,
+        /// Open a command batch owned by one resident training transaction.
+        /// Resident operations then encode into it instead of each submitting
+        /// and waiting; reductions that read results back synchronize it.
+        /// Returns false when the backend has no batching.
+        residentTrainingBeginBatch: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        /// Submit and wait for (commit) or discard (cancel) the open batch.
+        residentTrainingEndBatch: ?*const fn (ctx: *anyopaque, commit: bool) anyerror!void = null,
 
         /// Copy a tensor from another backend instance into this backend
         /// without host materialization when the two backends are compatible.
@@ -4076,6 +4090,26 @@ pub const ComputeBackend = struct {
         return output;
     }
 
+    pub fn segmentTrainingAttentionV1(self: *const ComputeBackend, qkv: CT, control_i32: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.segmentTrainingAttentionV1 orelse return error.SegmentTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, control_i32, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn segmentTrainingAttentionBackwardV1(self: *const ComputeBackend, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.segmentTrainingAttentionBackwardV1 orelse return error.SegmentTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, control_i32, dO, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
     pub fn modernBertTrainingAttentionV1(self: *const ComputeBackend, qkv: CT, control_i32: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs) !CT {
         _ = try attrs.layout();
         try self.checkExecutionControl();
@@ -4511,6 +4545,16 @@ pub const ComputeBackend = struct {
         errdefer self.free(result);
         try self.checkExecutionControl();
         return result;
+    }
+
+    pub fn residentTrainingBeginBatch(self: *const ComputeBackend) !bool {
+        const op = self.vtable.residentTrainingBeginBatch orelse return false;
+        return op(self.ptr);
+    }
+
+    pub fn residentTrainingEndBatch(self: *const ComputeBackend, commit: bool) !void {
+        const op = self.vtable.residentTrainingEndBatch orelse return;
+        return op(self.ptr, commit);
     }
 
     pub fn copyTensorFromBackend(self: *const ComputeBackend, src_backend: *const ComputeBackend, src_tensor: CT) !?CT {

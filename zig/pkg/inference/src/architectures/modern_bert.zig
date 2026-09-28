@@ -302,6 +302,28 @@ pub const Packed = struct {
     positions: []const i64,
     ranges: []const u32,
     key_positions: []const i32,
+    /// Per-question upper layers (Laya `packing.fuse_layers`): layers from
+    /// `upper_from` on attend with `upper_ranges` instead of `ranges`.
+    /// Layer indices count the encoder first, then any head layers.
+    upper_ranges: ?[]const u32 = null,
+    upper_from: usize = std.math.maxInt(usize),
+
+    /// The visibility layer `layer` attends with.
+    pub fn at(self: Packed, layer: usize) Packed {
+        var out = self;
+        if (self.upper_ranges) |upper| if (layer >= self.upper_from) {
+            out.ranges = upper;
+        };
+        return out;
+    }
+
+    /// The same row for a stack that starts `layers` deeper (the head after
+    /// the encoder).
+    pub fn after(self: Packed, layers: usize) Packed {
+        var out = self;
+        out.upper_from = self.upper_from -| layers;
+        return out;
+    }
 };
 
 /// Encode one tree-packed row. The result is `[seq_len, hidden]`.
@@ -453,7 +475,7 @@ fn forwardImpl(
             layer_idx,
             zero_bias,
             resident_slots,
-            packed_row,
+            if (packed_row) |row| row.at(layer_idx) else null,
             branches,
             capture,
         );

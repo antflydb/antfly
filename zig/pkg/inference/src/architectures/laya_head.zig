@@ -103,37 +103,47 @@ fn scoreHost(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32
     for (0..batch) |row| {
         const dst = features[row * (dim + 4) ..][0 .. dim + 4];
         @memcpy(dst[0..dim], host[anchors[row] * dim ..][0..dim]);
-        const z = logits[row * count ..][0..count];
-        var max: f32 = -std.math.inf(f32);
-        var valid: usize = 0;
-        for (z, markers[row * count ..][0..count]) |value, pos| {
-            max = @max(max, value);
-            valid += @intFromBool(pos >= 0);
-        }
-        var sum: f32 = 0;
-        for (z) |value| {
-            sum += @exp(value - max);
-        }
-        var first: f32 = 0;
-        var second: f32 = 0;
-        var entropy: f32 = 0;
-        for (z) |value| {
-            const p = @exp(value - max) / sum;
-            entropy -= p * @log(@max(p, 1e-9));
-            if (p > first) {
-                second = first;
-                first = p;
-            } else {
-                second = @max(second, p);
-            }
-        }
-        dst[dim] = first;
-        dst[dim + 1] = first - second;
-        dst[dim + 2] = entropy / @log(@as(f32, @floatFromInt(valid)));
-        dst[dim + 3] = @as(f32, @floatFromInt(valid)) / 255;
+        actionStats(logits[row * count ..][0..count], markers[row * count ..][0..count], dst[dim..][0..4]);
     }
     const f = try cb.fromFloat32Shape(features, &.{ @intCast(batch), @intCast(dim + 4) });
     defer cb.free(f);
+    return actionHead(cb, a, cfg, f, logits, batch, count, dim);
+}
+
+/// Top probability, margin, normalized entropy and option count of one
+/// decision's (masked) scorer logits; the action head's non-hidden features.
+fn actionStats(z: []const f32, markers: []const i64, dst: *[4]f32) void {
+    var max: f32 = -std.math.inf(f32);
+    var valid: usize = 0;
+    for (z, markers) |value, pos| {
+        max = @max(max, value);
+        valid += @intFromBool(pos >= 0);
+    }
+    var sum: f32 = 0;
+    for (z) |value| {
+        sum += @exp(value - max);
+    }
+    var first: f32 = 0;
+    var second: f32 = 0;
+    var entropy: f32 = 0;
+    for (z) |value| {
+        const p = @exp(value - max) / sum;
+        entropy -= p * @log(@max(p, 1e-9));
+        if (p > first) {
+            second = first;
+            first = p;
+        } else {
+            second = @max(second, p);
+        }
+    }
+    dst[0] = first;
+    dst[1] = first - second;
+    dst[2] = entropy / @log(@as(f32, @floatFromInt(valid)));
+    dst[3] = @as(f32, @floatFromInt(valid)) / 255;
+}
+
+/// Action logits from `[batch, dim + 4]` features, returned with `logits`.
+fn actionHead(cb: *const CB, a: std.mem.Allocator, cfg: Config, f: CT, logits: []const f32, batch: usize, count: usize, dim: usize) ![]Tensor {
     const act1 = try linear(cb, f, "act_head.0", batch, dim + 4, 256);
     defer cb.free(act1);
     const actg = try exactGelu(cb, act1);
@@ -193,23 +203,35 @@ pub fn captureTrunk(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: C
     cb.free(hidden);
 }
 
+/// Per-token question-type embeddings `[rows, dim]`; trunk tokens (kind -1)
+/// get zeros. Gathered on the backend from `[type_emb; 0]`.
+fn packedTypes(cb: *const CB, a: std.mem.Allocator, kinds: []const i64, dim: usize) !CT {
+    const type_weight = try cb.getWeight("model.type_emb.weight");
+    defer cb.free(type_weight);
+    const zeros = try a.alloc(f32, dim);
+    defer a.free(zeros);
+    @memset(zeros, 0);
+    const zero_row = try cb.fromFloat32Shape(zeros, &.{ 1, @intCast(dim) });
+    defer cb.free(zero_row);
+    // An in-stream join; Metal's axis-0 concat blits outside the ordered
+    // stream and could read the zero row before its upload lands.
+    const table = try modern.joinRows(cb, a, type_weight, 3, zero_row, 1, dim);
+    defer cb.free(table);
+    const ids = try a.alloc(i64, kinds.len);
+    defer a.free(ids);
+    for (kinds, ids) |kind, *id| {
+        if (kind > 2) return error.InvalidLayaInputs;
+        id.* = if (kind < 0) 3 else kind;
+    }
+    return cb.embeddingLookup(table, ids, ids.len, dim);
+}
+
 fn packedHead(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, segments: modern.Packed, kinds: []const i64, markers: []const i64, anchors: []const i64, width: usize, dim: usize, prefix: ?Prefix) ![]Tensor {
     const rows = kinds.len;
     const seq = rows + if (prefix) |p| p.rows else 0;
     const questions = anchors.len;
     if (rows == 0 or questions == 0 or width < 2 or width > cfg.maxOptions() or markers.len != questions * width or dim < 64 or dim % 64 != 0) return error.InvalidLayaInputs;
-    const type_weight = try cb.getWeight("model.type_emb.weight");
-    defer cb.free(type_weight);
-    const table = try cb.toFloat32(type_weight, a);
-    defer a.free(table);
-    if (table.len != 3 * dim) return error.InvalidLayaWeights;
-    const types = try a.alloc(f32, rows * dim);
-    defer a.free(types);
-    for (kinds, 0..) |kind, i| {
-        const dst = types[i * dim ..][0..dim];
-        if (kind < 0) @memset(dst, 0) else @memcpy(dst, table[@as(usize, @intCast(kind)) * dim ..][0..dim]);
-    }
-    const type_ct = try cb.fromFloat32Shape(types, &.{ @intCast(rows), @intCast(dim) });
+    const type_ct = try packedTypes(cb, a, kinds, dim);
     defer cb.free(type_ct);
     const mask = try a.alloc(i64, seq);
     defer a.free(mask);
@@ -329,7 +351,7 @@ fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []c
             joined[1] = try modern.joinRows(cb, a, p.values[layer], p.rows, v, rows, dim);
         }
         const attn = if (segments) |row|
-            try modern.packedAttention(cb, a, q, joined[0] orelse k, joined[1] orelse v, row, std.math.maxInt(u32), rows, seq, dim / 64, 64)
+            try modern.packedAttention(cb, a, q, joined[0] orelse k, joined[1] orelse v, row.at(layer), std.math.maxInt(u32), rows, seq, dim / 64, 64)
         else
             try cb.scaledDotProductAttention(q, k, v, mask, null, batch, seq, dim / 64, 64);
         defer cb.free(attn);

@@ -14,6 +14,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--backend")) {
             const value = args.next() orelse return usage();
             options.backend = std.meta.stringToEnum(@TypeOf(options.backend), value) orelse return usage();
+        } else if (std.mem.eql(u8, arg, "--top-k-recall")) {
+            const value = args.next() orelse return usage();
+            options.top_k_recall = std.fmt.parseInt(usize, value, 10) catch return usage();
         } else if (positional == 0) {
             options.model_dir = arg;
             positional += 1;
@@ -37,10 +40,14 @@ fn usage() error{InvalidArguments} {
 }
 fn help() void {
     std.debug.print(
-        \\usage: antfly inference finetune eval laya <model_dir> <records.jsonl> [--backend metal|native]
+        \\usage: antfly inference finetune eval laya <model_dir> <records.jsonl> [--backend metal|native] [--top-k-recall N]
         \\Scores a prepared Laya checkpoint on native training records through the
         \\serving pipeline (packed or unpacked per the model config, with its
         \\calibration). Prints accuracy, soft CE, ECE, and ordinal MAE as JSON.
+        \\--top-k-recall N also reports the fraction of choice decisions whose
+        \\gold label is among the N highest probabilities (bounds two-stage
+        \\choice's stage 2, LAYA.md roadmap 2b, run against a model with
+        \\packing.two_stage unset to measure stage 1 alone).
         \\
     , .{});
 }

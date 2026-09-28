@@ -73,6 +73,12 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
         // reintroduce quadratic owners. These versioned kernels have a VJP.
         if (n.op == .fused_deberta_training_attention_v1 or n.op == .fused_deberta_training_attention_backward_v1) continue;
         if (n.op == .fused_modernbert_training_attention_v1 or n.op == .fused_modernbert_training_attention_backward_v1) continue;
+        // Flash-style segment (tree/local/global) training attention: same
+        // reasoning as Deberta above -- a materialized alternate would
+        // discard `ranges`/`window`/replay semantics and reintroduce the
+        // quadratic `[tokens, tokens]` tensor this op exists to avoid.
+        // Differentiated by the custom VJP in `autodiff.zig`, not lowering.
+        if (n.op == .fused_segment_training_attention_v1 or n.op == .fused_segment_training_attention_backward_v1) continue;
         if (n.op.isFused() and n.vjp_alternate != null_node) {
             if (n.vjp_alternate == i) return error.CyclicGraph;
             redirect[i] = n.vjp_alternate;
