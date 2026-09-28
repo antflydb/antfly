@@ -142,8 +142,12 @@ class ReleaseLicenseTests(unittest.TestCase):
                                 " ".join(bundled_notices.split()),
                             )
                         if product == "server":
-                            license_map = archive.extractfile("./LICENSING.md").read().decode()
-                            for linked_file in re.findall(r"\]\(([^)]+)\)", license_map):
+                            license_map = (
+                                archive.extractfile("./LICENSING.md").read().decode()
+                            )
+                            for linked_file in re.findall(
+                                r"\]\(([^)]+)\)", license_map
+                            ):
                                 self.assertIn("./" + linked_file, archive.getnames())
                         self.assertEqual(
                             (ROOT / "scripts/apache_engine_files.txt").read_bytes(),
@@ -154,7 +158,9 @@ class ReleaseLicenseTests(unittest.TestCase):
                         if product == "server":
                             self.assertEqual(
                                 (ROOT / "LICENSE").read_bytes(),
-                                archive.extractfile("./LICENSES/Elastic-2.0.txt").read(),
+                                archive.extractfile(
+                                    "./LICENSES/Elastic-2.0.txt"
+                                ).read(),
                             )
                         self.assertEqual(
                             (ROOT / "LICENSES/Apache-2.0.txt").read_bytes(),
@@ -182,7 +188,12 @@ class ReleaseLicenseTests(unittest.TestCase):
                         )
                         self.assertEqual(
                             expected_binaries,
-                            {name for name in archive.getnames() if name in {"./antfly", "./antfly-lite", "./antfly-inference"}},
+                            {
+                                name
+                                for name in archive.getnames()
+                                if name
+                                in {"./antfly", "./antfly-lite", "./antfly-inference"}
+                            },
                         )
 
 
