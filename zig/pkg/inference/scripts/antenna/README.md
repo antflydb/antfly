@@ -146,6 +146,17 @@ ANTFLY_ANTENNA_DATA=<cache> python distill_pool.py --upstream <GLiNER2> --output
   --rows 120000 --entity-share 0.5 --wikipedia <wiki-articles-10k-v001.json>
 ```
 
+`--source NAME=ROWS` (repeatable) builds a sampled mix instead, adding pinned
+permissive sources (NuNER, MASSIVE, GoEmotions, SQuAD questions, DBpedia) for
+short utterances and a wide label and entity-type vocabulary:
+
+```sh
+ANTFLY_ANTENNA_DATA=<cache> python distill_pool.py --upstream <GLiNER2> --output <pool> \
+  --wikipedia <wiki-articles-10k-v001.json> --source nuner=100000 --source ag_news=30000 \
+  --source banking77=20000 --source wikipedia=30000 --source massive=20000 \
+  --source go_emotions=50000 --source squad=40000 --source dbpedia=25000
+```
+
 A ModernBERT-base job on resident Metal needs larger budgets than the job
 defaults, which are sized for the small DeBERTa checkpoint: for example
 `"memory": {"host_bytes": 6 GiB, "backend_bytes": 14 GiB, "combined_bytes":

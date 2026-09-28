@@ -153,10 +153,41 @@ PyTorch-distilled student within noise, except held-out classification
 (CLINC150 0.39 against 0.45; SST-5 0.26 against 0.24). MIT movie NER stays
 the weakest set (0.26).
 
+### Where the distilled trunk departs from the teacher
+
+The gap to gliner2.5-base with the same fine-tuning is 0.07-0.15 on
+classification and 0.03-0.13 on NER, largest held out. A probe measured
+run15's z-space error against the teacher per text source (200 test texts
+each, one per-dimension teacher std over the whole probe, word rows and
+marker rows apart), with each dataset's own schema and with a pool-style one:
+
+| Source | Words (own / pool schema) | Markers (own / pool schema) |
+| --- | --- | --- |
+| Wikipedia pool | - / 0.237 | - / 0.517 |
+| AG News | 0.219 / 0.228 | 0.667 / 0.489 |
+| Banking77 | 0.396 / 0.401 | 0.561 / 0.597 |
+| CLINC150 | 0.513 / 0.463 | 0.679 / 0.486 |
+| SST-5 | 0.424 / 0.353 | 0.858 / 0.518 |
+| CrossNER (5 domains) | 0.33-0.36 / 0.28-0.33 | 0.23-0.32 / 0.20-0.24 |
+| MIT restaurant | 0.470 / 0.393 | 0.268 / 0.200 |
+| MIT movie | 0.456 / 0.338 | 0.401 / 0.193 |
+
+Short utterances carry about twice the text error of news and Wikipedia
+(Banking77 too, though it is in the pool), classification markers far more
+than entity markers, and unseen label vocabularies (SST-5's sentiment scale,
+CLINC150's intents, MIT movie's types) more than the pool's. The worst
+sources are the worst evaluation sets.
+
+`distill_pool.py --source` now builds a mix that widens both halves: NuNER
+web sentences with their own free-form types (9,927 types after filtering),
+MASSIVE commands, GoEmotions comments, SQuAD questions and DBpedia abstracts
+with their intent, emotion and topic names, next to news, Banking77 and
+Wikipedia: 274,109 rows, median 19 words, 60% entity schemas. All sources
+are MIT, Apache 2.0 or CC BY(-SA); none is an evaluation set. Types with
+brackets or parentheses are dropped: the native schema compiler reserves them.
+
 ## Next
 
-- Widen the pool's query side: held-out classification (CLINC150, SST-5) is
-  the gap, and the Wikipedia pool widened only the text.
-- A second distillation epoch or a larger pool; run15's loss was still
-  falling (0.37 at 5,400 steps, 0.25 at the end).
+- Distill on the mixed pool (one epoch, 34,264 optimizer steps, run17),
+  rerun the probe, then stage 3.
 
