@@ -55,6 +55,16 @@
       "id": "darwin",
       "workflow": "diagnose-zig-arm64-bad-alloc.yml",
       "label": "ci:darwin-release"
+    },
+    {
+      "id": "full",
+      "workflow": "zig-tests.yml",
+      "label": "ci:full"
+    },
+    {
+      "id": "soak",
+      "workflow": "zig-vopr-pr.yml",
+      "label": "ci:soak"
     }
   ]
 }

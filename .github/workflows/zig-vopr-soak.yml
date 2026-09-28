@@ -56,10 +56,11 @@ defaults:
 concurrency:
   # Approved PR callers all have github.ref == refs/heads/main. Give each
   # qualification its own group: cancel-in-progress:false still lets a newer
-  # pending request replace an older pending request in the same group.
+  # pending request replace an older pending request in the same group. This
+  # applies to both qualification and approved full campaigns.
   # The caller already cancels superseded runs for the same PR. Keep scheduled
   # and manually dispatched soak campaigns serialized by ref as before.
-  group: vopr-soak-${{ inputs.qualification_only && github.run_id || github.ref }}-${{ inputs.diagnostic_trace || 'campaign' }}
+  group: vopr-soak-${{ (inputs.head_sha != '' || inputs.qualification_only) && github.run_id || github.ref }}-${{ inputs.diagnostic_trace || 'campaign' }}
   cancel-in-progress: false
 
 jobs:
