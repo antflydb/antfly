@@ -82,8 +82,21 @@ jobs:
             --wheel-dir dist/lite-packages/python \
             --npm-dir dist/lite-packages/npm
 
+      - name: Seal immutable Lite package snapshot
+        run: |
+          python scripts/release/lite_snapshot.py build \
+            --version "${{ inputs.version }}" \
+            --commit "${{ inputs.source_commit }}" \
+            --npm-dir dist/lite-packages/npm \
+            --wheel-dir dist/lite-packages/python \
+            --out-dir dist/lite-snapshot
+          python scripts/release/lite_snapshot.py verify \
+            --snapshot-dir dist/lite-snapshot \
+            --version "${{ inputs.version }}" \
+            --commit "${{ inputs.source_commit }}"
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: antfly-lite-package-snapshot
-          path: dist/lite-packages/
+          path: dist/lite-snapshot/
           if-no-files-found: error

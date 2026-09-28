@@ -4,7 +4,7 @@ order: 5
 sidebar: concepts
 description: How the embedded single-file profile of Antfly works, what it shares with a normal instance, and how data moves between the two
 prerequisites:
-  - "Antfly CLI built or installed"
+  - "Antfly Lite CLI built or installed"
 difficulty: intermediate
 estimatedTime: "20 min"
 tags: [lite, embedded, local-first, backup, migration]
@@ -21,8 +21,8 @@ tags: [lite, embedded, local-first, backup, migration]
 Antfly Lite is Antfly in one file. Documents, schemas, indexes, enrichments, and query-visible artifacts live in a local `.aflite` database that an application opens directly, with no server process. Choose Lite for development, desktop apps, edge workers, tests, and single-user deployments. Choose a normal instance when you need replication, shard placement, multi-node scaling, or cluster metadata. Everything else, from the index model to the query API, is the same code.
 
 ```bash
-antfly lite init app.aflite
-antfly lite status app.aflite
+antfly-lite lite init app.aflite
+antfly-lite lite status app.aflite
 ```
 
 `init` refuses to overwrite an existing path. `status` reports the storage identity and the inference state:
@@ -76,8 +76,8 @@ Requests are the same JSON shapes as the normal API, passed as files. A batch wr
 ```
 
 ```bash
-antfly lite batch app.aflite --file writes.json
-antfly lite lookup app.aflite --key doc:lite:1
+antfly-lite lite batch app.aflite --file writes.json
+antfly-lite lite lookup app.aflite --key doc:lite:1
 ```
 
 A key-range scan (`scan.json`):
@@ -92,7 +92,7 @@ A key-range scan (`scan.json`):
 ```
 
 ```bash
-antfly lite scan app.aflite --file scan.json
+antfly-lite lite scan app.aflite --file scan.json
 ```
 
 Indexes use the same logical model as a normal instance. A full-text index (`full-text-index.json`):
@@ -106,11 +106,11 @@ Indexes use the same logical model as a normal instance. A full-text index (`ful
 ```
 
 ```bash
-antfly lite index create app.aflite --file full-text-index.json
-antfly lite run-until-idle app.aflite
+antfly-lite lite index create app.aflite --file full-text-index.json
+antfly-lite lite run-until-idle app.aflite
 ```
 
-A query against it (`query.json`). Note that the `antfly lite` CLI's query JSON
+A query against it (`query.json`). Note that the `antfly-lite lite` CLI's query JSON
 takes a nested `match: {field, text}` object here, unlike the public `/db/v1`
 API's flat `match: {match: string, field: string}` shape used elsewhere in the
 docs:
@@ -128,10 +128,10 @@ docs:
 ```
 
 ```bash
-antfly lite query app.aflite --file query.json
+antfly-lite lite query app.aflite --file query.json
 ```
 
-Dense vector, sparse vector, graph, schema, and enrichment catalog operations are all available through the same `antfly lite` CLI and the embedded APIs.
+Dense vector, sparse vector, graph, schema, and enrichment catalog operations are all available through the same `antfly-lite lite` CLI and the embedded APIs.
 
 ## Inference Is Optional
 
@@ -149,7 +149,7 @@ The `mode` in the status `inference` block tells an application which path it is
 
 Applications that configure a remote provider or embed a local runtime mark it at open time. Status then reports `configured: true` with `remote_provider_configured: true` or `local_runtime_configured: true` and `local_runtime_available: true`, so bindings branch on status rather than on enrichment failures. The capabilities block also carries retrieval flags (`text_search`, `dense_vector_search`, `sparse_vector_search`, `hybrid_search`, `graph_search`, `caller_supplied_embeddings`) for the same purpose.
 
-`antfly lite run-until-idle app.aflite` drains whatever local maintenance work is available. Run it after writes and before a query or a backup when you want that work reflected.
+`antfly-lite lite run-until-idle app.aflite` drains whatever local maintenance work is available. Run it after writes and before a query or a backup when you want that work reflected.
 
 ## The Same API Over HTTP
 
@@ -165,9 +165,9 @@ HTTP serving uses the ELv2 standalone database server. The Apache Lite library a
 ## Backups, Snapshots, and Imports
 
 ```bash
-antfly lite backup app.aflite --out app.afb        # export is an alias
-antfly lite restore app.afb --out restored.aflite
-antfly lite snapshot app.aflite --out copy.aflite
+antfly-lite lite backup app.aflite --out app.afb        # export is an alias
+antfly-lite lite restore app.afb --out restored.aflite
+antfly-lite lite snapshot app.aflite --out copy.aflite
 ```
 
 `backup` writes a self-contained AFB2 bundle with the portable representation. Its manifest maps logical records to unique content digests, and a fixed trailer locates the digest index so a restore runs in bounded memory. A delta bundle, when a repository or export workflow supplies one, names the exact base-manifest digest it depends on and fails closed if that base is unavailable. `restore` creates a new Lite database from a bundle. `snapshot` copies a stable live checkpoint of the `.aflite` file itself, which is the right tool for local copies, test fixtures, and handing a database to another Lite application.
@@ -175,9 +175,9 @@ antfly lite snapshot app.aflite --out copy.aflite
 `import` loads a portable AFB1 or AFB2 bundle into a database that already exists:
 
 ```bash
-antfly lite init empty.aflite
-antfly lite import empty.aflite --from app.afb
-antfly lite import restored.aflite --from app.afb --replace
+antfly-lite lite init empty.aflite
+antfly-lite lite import empty.aflite --from app.afb
+antfly-lite lite import restored.aflite --from app.afb --replace
 ```
 
 `--replace` is required when the target holds data. Importing from another `.aflite` is a physical snapshot replacement, never a logical merge.
@@ -189,7 +189,7 @@ Both directions are logical backup and restore. The portable stream carries docu
 **Lite into a running instance.** `promote` opens the `.aflite` read-only, stages a portable backup, restores it into the target table, and leaves the Lite file in place:
 
 ```bash
-antfly lite promote app.aflite \
+antfly-lite lite promote app.aflite \
   --target http://127.0.0.1:8080 \
   --table docs \
   --connection archive-writer \
@@ -199,7 +199,7 @@ antfly lite promote app.aflite \
 `antfly restore --input app.aflite --table docs --connection archive-writer --location file:///tmp/antfly_backups --url http://127.0.0.1:8080` does the same thing through the normal restore command. Either way `--connection` and `--location` are required: the target server reads the staged backup through that named connection, from a shared `file://`, `s3://`, or `gs://` location it can reach. For a repeatable release or disaster-recovery workflow, make the `.afb` explicit first:
 
 ```bash
-antfly lite backup app.aflite --out app.afb
+antfly-lite lite backup app.aflite --out app.afb
 antfly restore \
   --input app.afb \
   --table docs \
@@ -220,7 +220,7 @@ antfly backup \
   --location file:///tmp/antfly_backups \
   --url http://127.0.0.1:8080
 
-antfly lite restore docs.afb --out docs.aflite
+antfly-lite lite restore docs.afb --out docs.aflite
 ```
 
 Lite is a single-node, single-shard source, so restoring into a normal instance maps it into the target table's placement model, and restoring the other way collapses the selected table into one file. This is how you build fixture databases, debug a production slice locally, or ship a seeded embedded application.
@@ -228,9 +228,9 @@ Lite is a single-node, single-shard source, so restoring into a normal instance 
 **After either direction**, drain and verify on the Lite side:
 
 ```bash
-antfly lite status docs.aflite
-antfly lite run-until-idle docs.aflite
-antfly lite check docs.aflite
+antfly-lite lite status docs.aflite
+antfly-lite lite run-until-idle docs.aflite
+antfly-lite lite check docs.aflite
 ```
 
 On a normal target, use its status and restore verification. The migration is complete when pending index and enrichment maintenance is drained or explicitly deferred. Caller-supplied artifacts arrive as stored data and stay queryable; deferred model-backed work stays pending until a runtime is available on the destination. Run `run-until-idle` before taking a migration backup when you want all locally available maintenance reflected in it.
@@ -344,9 +344,9 @@ Lite builds embed the local inference runtime, and status advertises it by defau
 ## Maintenance
 
 ```bash
-antfly lite check app.aflite      # integrity
-antfly lite compact app.aflite    # compact index work and reclaim space
-antfly lite vacuum app.aflite     # file-level vacuum only
+antfly-lite lite check app.aflite      # integrity
+antfly-lite lite compact app.aflite    # compact index work and reclaim space
+antfly-lite lite vacuum app.aflite     # file-level vacuum only
 ```
 
 For a production application, pair regular `.afb` backups with `check`.

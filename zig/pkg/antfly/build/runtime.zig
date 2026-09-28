@@ -146,7 +146,9 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
-            .pic = if (unit == .storage_kernel or unit == .enrichment_compute) true else null,
+            // These owners also link into the Apache libantfly shared ABI.
+            // Linux cannot relocate a non-PIC inference archive into it.
+            .pic = if (unit == .storage_kernel or unit == .enrichment_compute or unit == .inference) true else null,
         });
         var role_imports = production_antfly_imports;
         role_imports.boundary_profile = switch (unit) {

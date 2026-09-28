@@ -56,7 +56,12 @@ the bindings discover these artifacts without using the ELv2 server packages.
 `verify_lite_release.py` compares each wheel and npm package with its Lite
 archive and rejects server executables and ELv2 license files. The immutable
 package snapshot is produced by `.github/workflows/lite-package.yml` as part
-of the release build.
+of the release build. After a successful tagged release build, dispatch
+`.github/workflows/lite-release-publish.yml` on `main` with that tag and build
+run ID. It verifies the immutable tag, package hashes, and archive equivalence
+before publishing `antfly-lite` wheels to PyPI and `@antfly/lite` platform and
+selector packages to npm. The PyPI project and each npm package must have
+trusted publishing configured for this workflow in their registry settings.
 
 ## Verification
 

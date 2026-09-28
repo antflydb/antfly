@@ -29,7 +29,7 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 
 | Product | How it runs | License |
 |---------|-------------|---------|
-| [Antfly Lite](docs/guides/lite.mdx) | An embedded `.aflite` database through `libantfly`, Zig, Go, Python, Rust, TypeScript, or browser WASM; local file commands through `antfly lite` | [Apache 2.0](LICENSES/Apache-2.0.txt) |
+| [Antfly Lite](docs/guides/lite.mdx) | An embedded `.aflite` database through `libantfly`, Zig, Go, Python, Rust, TypeScript, or browser WASM; local file commands through `antfly-lite lite` | [Apache 2.0](LICENSES/Apache-2.0.txt) |
 | [Antfly inference](zig/pkg/inference) | In-process inference, browser WASM (wasm32/wasm64), or the independent `antfly-inference` executable and inference APIs | [Apache 2.0](LICENSES/Apache-2.0.txt) |
 | Antfly database server | `antfly standalone`, distributed clusters, or serverless deployment; database HTTP APIs and the dashboard | [ELv2](LICENSES/Elastic-2.0.txt) |
 
@@ -38,7 +38,7 @@ Build the Apache Lite CLI and native library from source:
 ```bash
 cd zig
 zig build lite -j1
-./zig-out/bin/antfly lite init app.aflite
+./zig-out/bin/antfly-lite lite init app.aflite
 ```
 
 The Lite build installs its CLI, `libantfly`, and the C header. To serve that file over HTTP, use the full database server executable:

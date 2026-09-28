@@ -41,6 +41,12 @@ verify_spec = importlib.util.spec_from_file_location(
 assert verify_spec and verify_spec.loader
 verifier = importlib.util.module_from_spec(verify_spec)
 verify_spec.loader.exec_module(verifier)
+snapshot_spec = importlib.util.spec_from_file_location(
+    "lite_snapshot_tested", ROOT / "scripts/release/lite_snapshot.py"
+)
+assert snapshot_spec and snapshot_spec.loader
+snapshot = importlib.util.module_from_spec(snapshot_spec)
+snapshot_spec.loader.exec_module(snapshot)
 
 
 class LitePackagingTests(unittest.TestCase):
@@ -159,6 +165,22 @@ class LitePackagingTests(unittest.TestCase):
                 )
             with mock.patch.object(verifier, "ROOT", root):
                 verifier.verify("1.2.3", archives, root / "out/python", npm_dir)
+            sealed = root / "snapshot"
+            commit = "a" * 40
+            snapshot.build("1.2.3", commit, npm_dir, root / "out/python", sealed)
+            snapshot.verify(sealed, "1.2.3", commit)
+            manifest_path = sealed / "lite-snapshot.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["artifacts"].append(manifest["artifacts"][0])
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "artifact set differs"):
+                snapshot.verify(sealed, "1.2.3", commit)
+            manifest["artifacts"].pop()
+            manifest_path.write_text(json.dumps(manifest))
+            wheel = next(sealed.glob("*.whl"))
+            wheel.write_bytes(wheel.read_bytes() + b"tampered")
+            with self.assertRaisesRegex(ValueError, "digest differs"):
+                snapshot.verify(sealed, "1.2.3", commit)
 
     def test_server_executable_is_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
