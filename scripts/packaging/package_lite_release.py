@@ -64,7 +64,7 @@ def extract_lite_archive(
         safe_extract(archive, dest)
     required = (
         dest / "antfly-lite",
-        dest / "antfly-inference",
+        dest / "antfly-inference-worker",
         dest / "lib" / lite_library_name(platform),
         dest / "include" / "antfly.h",
         dest / "LICENSE",
@@ -103,7 +103,7 @@ def populate_npm_package(platform: Platform, extracted: Path, version: str) -> P
         ignore=lambda d, n: {x for x in n if is_packaging_noise(Path(x))},
     )
     shutil.copy2(
-        extracted / "antfly-inference", package_dir / "lib" / "antfly-inference"
+        extracted / "antfly-inference-worker", package_dir / "lib" / "antfly-inference-worker"
     )
     shutil.copytree(extracted / "include", package_dir / "include")
     if (extracted / "share").is_dir():
@@ -169,8 +169,8 @@ def write_wheel(
                 )
         add_bytes(
             archive,
-            "antfly_embedded/_lib/antfly-inference",
-            (extracted / "antfly-inference").read_bytes(),
+            "antfly_embedded/_lib/antfly-inference-worker",
+            (extracted / "antfly-inference-worker").read_bytes(),
             0o755,
         )
         for name in ("LICENSE", "THIRD_PARTY_NOTICES.md"):

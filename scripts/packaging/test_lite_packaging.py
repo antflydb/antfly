@@ -79,7 +79,7 @@ class LitePackagingTests(unittest.TestCase):
                 (stage / "include").mkdir()
                 (stage / "LICENSES/third-party").mkdir(parents=True)
                 (stage / "antfly-lite").write_text("lite executable")
-                (stage / "antfly-inference").write_text("worker executable")
+                (stage / "antfly-inference-worker").write_text("worker executable")
                 (stage / "lib" / package.lite_library_name(platform)).write_text(
                     "apache native library"
                 )
@@ -123,7 +123,7 @@ class LitePackagingTests(unittest.TestCase):
                 self.assertTrue(
                     (npm / "lib" / package.lite_library_name(platform)).is_file()
                 )
-                self.assertTrue((npm / "lib/antfly-inference").is_file())
+                self.assertTrue((npm / "lib/antfly-inference-worker").is_file())
                 self.assertFalse((npm / "bin").exists())
                 self.assertTrue((npm / "LICENSES/third-party/example.txt").is_file())
                 wheel = (
@@ -133,7 +133,7 @@ class LitePackagingTests(unittest.TestCase):
                 )
                 with zipfile.ZipFile(wheel) as archive:
                     names = set(archive.namelist())
-                    self.assertIn("antfly_embedded/_lib/antfly-inference", names)
+                    self.assertIn("antfly_embedded/_lib/antfly-inference-worker", names)
                     self.assertIn(
                         "antfly_embedded/_lib/" + package.lite_library_name(platform), names
                     )
@@ -172,7 +172,7 @@ class LitePackagingTests(unittest.TestCase):
                     capture_output=True,
                 )
                 for location in (
-                    "_lib/antfly-inference",
+                    "_lib/antfly-inference-worker",
                 ):
                     installed = install_dir / "antfly_embedded" / location
                     self.assertTrue(
@@ -230,7 +230,7 @@ class LitePackagingTests(unittest.TestCase):
             for name in (
                 "antfly",
                 "antfly-lite",
-                "antfly-inference",
+                "antfly-inference-worker",
                 "include/antfly.h",
                 "THIRD_PARTY_NOTICES.md",
             ):

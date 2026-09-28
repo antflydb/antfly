@@ -317,9 +317,9 @@ fn callSegments(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []c
 /// other resolution step; see `resolveWorkerExecutable`.
 const worker_executable_env = "ANTFLY_INFERENCE_WORKER";
 const antfly_binary_name = if (builtin.target.os.tag == .windows) "antfly.exe" else "antfly";
-const inference_binary_name = if (builtin.target.os.tag == .windows) "antfly-inference.exe" else "antfly-inference";
+const inference_worker_binary_name = if (builtin.target.os.tag == .windows) "antfly-inference-worker.exe" else "antfly-inference-worker";
 const lite_binary_name = if (builtin.target.os.tag == .windows) "antfly-lite.exe" else "antfly-lite";
-const worker_binary_names = [_][]const u8{ inference_binary_name, lite_binary_name, antfly_binary_name };
+const worker_binary_names = [_][]const u8{ inference_worker_binary_name, lite_binary_name, antfly_binary_name };
 
 /// Layout shared by glibc, musl, and Darwin's libc; sufficient to recover the
 /// path of the image an address was loaded from.
@@ -404,7 +404,7 @@ fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
     }
     std.log.err(
         "no inference worker executable found for the embedded runtime; set {s} to the path " ++
-            "of an `antfly-inference`, `antfly-lite`, or `antfly` executable next to the loaded libantfly or on PATH",
+            "of an `antfly-inference-worker`, `antfly-lite`, or `antfly` executable next to the loaded libantfly or on PATH",
         .{worker_executable_env},
     );
     return error.InferenceWorkerExecutableNotConfigured;

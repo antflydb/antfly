@@ -1359,6 +1359,7 @@ class ReleasePromotionTests(unittest.TestCase):
             extras.mkdir()
             source.mkdir()
             (archives / "antfly_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(b"native")
+            (archives / "antfly-inference_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(b"inference")
             (extras / "antfly-cli-0.2.1.tgz").write_bytes(b"npm")
             (extras / "cli-snapshot.json").write_text(
                 json.dumps(
@@ -1457,12 +1458,36 @@ class ReleasePromotionTests(unittest.TestCase):
             )
             kinds = {artifact["kind"] for artifact in ledger["artifacts"]}
             self.assertIn("runtime-archive", kinds)
+            inference_archive = "antfly-inference_0.2.1_Linux_x86_64_gnu.tar.gz"
+            self.assertIn(
+                inference_archive,
+                {
+                    artifact["name"]
+                    for artifact in ledger["artifacts"]
+                    if artifact["kind"] == "runtime-archive"
+                },
+            )
+            self.assertIn(
+                inference_archive,
+                (output / "antfly_zig_checksums.txt").read_text(),
+            )
             self.assertIn("npm-package", kinds)
             self.assertIn("cli-manifest", kinds)
             self.assertIn("source-manifest", kinds)
             self.assertIn("release-spec", kinds)
             scopes = {artifact["scope"] for artifact in ledger["artifacts"]}
             self.assertEqual(scopes, {"runtime", "cli", "support"})
+
+            (archives / inference_archive).unlink()
+            missing_archive_argv = argv.copy()
+            missing_archive_argv[missing_archive_argv.index(str(output))] = str(
+                root / "missing-output"
+            )
+            with (
+                mock.patch.object(sys, "argv", missing_archive_argv),
+                self.assertRaisesRegex(SystemExit, "missing matching inference"),
+            ):
+                payload.main()
 
             verifier = load_module(
                 "verify_release_ledger_test", "verify_release_ledger.py"

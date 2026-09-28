@@ -511,7 +511,8 @@ jobs:
           set -euo pipefail
           mkdir -p dist/release-ledger dist/release-runtime dist/verified-cli-snapshot
           cp dist/release-payload/artifacts.json dist/release-ledger/artifacts.json
-          cp dist/release-payload/antfly_*.tar.gz dist/release-runtime/
+          cp dist/release-payload/antfly_*.tar.gz \
+            dist/release-payload/antfly-inference_*.tar.gz dist/release-runtime/
           cp dist/release-payload/*.tgz dist/release-payload/*.whl \
             dist/release-payload/cli-snapshot.json dist/verified-cli-snapshot/
           python scripts/release/verify_release_ledger.py \

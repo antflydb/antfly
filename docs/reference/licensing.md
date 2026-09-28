@@ -45,12 +45,14 @@ the same engine code.
 The embedded package, inference package, shared libraries, schema inputs, and
 generated OpenAPI contracts have explicit Apache licenses. Lite installation
 and inference installation carry license and third-party notices.
-`build_zig_release_archive.sh --product lite` selects the Apache license and
-Lite artifacts; the default server archive retains ELv2 and includes the
-Apache license for the shared engine and native library.
+`build_zig_release_archive.sh --product lite` packages the Apache Lite CLI,
+`libantfly`, and a private `antfly-inference-worker`. The `inference` product
+packages the real Apache `antfly-inference` CLI with commands such as `run`,
+`embed`, `generate`, and `pull`. The default server archive retains ELv2 and
+includes the Apache license for the shared engine and native library.
 
-The release build also creates `antfly-lite` and `antfly-inference` executables
-and Apache-only platform archives. `package_lite_release.py` assembles
+The release build creates separate Apache Lite and inference archives for each
+platform. `package_lite_release.py` assembles
 platform wheels for `antfly-embedded` and native npm packages for
 `@antfly/embedded`;
 the bindings discover these artifacts without using the ELv2 server packages.

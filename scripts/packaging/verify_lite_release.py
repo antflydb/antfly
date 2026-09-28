@@ -61,7 +61,7 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
             lib_name = lite_library_name(platform)
             library = source_bytes(f"./lib/{lib_name}")
             source_bytes("./antfly-lite")
-            worker = source_bytes("./antfly-inference")
+            worker = source_bytes("./antfly-inference-worker")
             require(
                 source_bytes("./LICENSE") == apache,
                 f"wrong archive license: {archive_path}",
@@ -81,7 +81,7 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
                 f"library mismatch: {wheel_path}",
             )
             require(
-                wheel.read("antfly_embedded/_lib/antfly-inference") == worker,
+                wheel.read("antfly_embedded/_lib/antfly-inference-worker") == worker,
                 f"worker mismatch: {wheel_path}",
             )
             require(
@@ -134,7 +134,7 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
                 npm_bytes(f"lib/{lib_name}") == library, f"library mismatch: {npm_path}"
             )
             require(
-                npm_bytes("lib/antfly-inference") == worker,
+                npm_bytes("lib/antfly-inference-worker") == worker,
                 f"worker mismatch: {npm_path}",
             )
             require(

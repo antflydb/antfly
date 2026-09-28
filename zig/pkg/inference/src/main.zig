@@ -297,11 +297,11 @@ pub fn main(init: std.process.Init) !void {
     const args = args_buf[0..args_len];
 
     if (args.len < 2) {
-        printUsage("inference");
+        printUsage("antfly-inference");
         return;
     }
 
-    return try runFromArgs(init, allocator, "antfly inference", args[1..]);
+    return try runFromArgs(init, allocator, "antfly-inference", args[1..]);
 }
 
 pub fn runFromArgs(
@@ -376,7 +376,7 @@ pub fn runFromArgs(
     } else if (std.mem.eql(u8, command, "convert")) {
         try inference.tabular.cli.convertMain(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "version")) {
-        printVersion();
+        printVersion(usage_name);
     } else {
         print("unknown command: {s}\n", .{command});
         printUsage(usage_name);
@@ -774,8 +774,8 @@ fn isPredictorPull(args: []const []const u8) bool {
     return false;
 }
 
-pub fn printVersion() void {
-    print("antfly inference v{s}\n", .{build_info.version()});
+pub fn printVersion(usage_name: []const u8) void {
+    print("{s} v{s}\n", .{ usage_name, build_info.version() });
     print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,

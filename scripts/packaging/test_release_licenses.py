@@ -35,6 +35,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "scripts/packaging/build_zig_release_archive.sh",
                 "scripts/packaging/create_reproducible_tar.py",
                 "scripts/packaging/lite-release-README.md",
+                "scripts/packaging/inference-release-README.md",
                 "scripts/apache_engine_files.txt",
                 "scripts/embedded_asset_licenses.json",
                 "LICENSE",
@@ -51,13 +52,14 @@ class ReleaseLicenseTests(unittest.TestCase):
                 ROOT / "LICENSES/third-party", root / "LICENSES/third-party"
             )
             (root / "zig/tools").mkdir(parents=True)
+            (root / "zig/pkg/inference").mkdir(parents=True)
             (root / "zig/tools/run_bounded_zig_build.py").write_text(
                 "import json, sys\n"
                 "from pathlib import Path\n"
                 "args = sys.argv[1:]\n"
                 "Path('build-args.json').write_text(json.dumps(args))\n"
                 "prefix = Path(args[args.index('--prefix') + 1])\n"
-                "for name in ('bin/antfly', 'bin/antfly-lite', 'lib/libantfly.dylib', 'include/antfly.h'):\n"
+                "for name in ('bin/antfly', 'bin/antfly-lite', 'bin/antfly-inference', 'lib/libantfly.dylib', 'include/antfly.h'):\n"
                 "    path = prefix / name\n"
                 "    path.parent.mkdir(parents=True, exist_ok=True)\n"
                 "    path.write_text('fixture artifact\\n')\n"
@@ -71,6 +73,7 @@ class ReleaseLicenseTests(unittest.TestCase):
             completions.chmod(0o755)
             for product, steps, license_name in (
                 ("lite", ["lite"], "LICENSES/Apache-2.0.txt"),
+                ("inference", [], "LICENSES/Apache-2.0.txt"),
                 ("server", ["antfly", "capi"], "LICENSE"),
             ):
                 with self.subTest(product=product):
@@ -100,7 +103,8 @@ class ReleaseLicenseTests(unittest.TestCase):
                         capture_output=True,
                         text=True,
                     )
-                    args = json.loads((root / "zig/build-args.json").read_text())
+                    build_dir = root / ("zig/pkg/inference" if product == "inference" else "zig")
+                    args = json.loads((build_dir / "build-args.json").read_text())
                     self.assertEqual(
                         steps,
                         [arg for arg in args if arg in ("lite", "antfly", "capi")],
@@ -113,12 +117,15 @@ class ReleaseLicenseTests(unittest.TestCase):
                         for name in (
                             "./LICENSES/Apache-2.0.txt",
                             "./THIRD_PARTY_NOTICES.md",
+                        ):
+                            self.assertIn(name, archive.getnames())
+                        for name in (
                             "./scripts/apache_engine_files.txt",
                             "./scripts/embedded_asset_licenses.json",
                             "./lib/libantfly.dylib",
                             "./include/antfly.h",
                         ):
-                            self.assertIn(name, archive.getnames())
+                            self.assertEqual(product != "inference", name in archive.getnames())
                         self.assertEqual(
                             product == "server",
                             "./LICENSES/Elastic-2.0.txt" in archive.getnames(),
@@ -149,12 +156,11 @@ class ReleaseLicenseTests(unittest.TestCase):
                                 r"\]\(([^)]+)\)", license_map
                             ):
                                 self.assertIn("./" + linked_file, archive.getnames())
-                        self.assertEqual(
-                            (ROOT / "scripts/apache_engine_files.txt").read_bytes(),
-                            archive.extractfile(
-                                "./scripts/apache_engine_files.txt"
-                            ).read(),
-                        )
+                        if product != "inference":
+                            self.assertEqual(
+                                (ROOT / "scripts/apache_engine_files.txt").read_bytes(),
+                                archive.extractfile("./scripts/apache_engine_files.txt").read(),
+                            )
                         if product == "server":
                             self.assertEqual(
                                 (ROOT / "LICENSE").read_bytes(),
@@ -184,7 +190,11 @@ class ReleaseLicenseTests(unittest.TestCase):
                         expected_binaries = (
                             {"./antfly"}
                             if product == "server"
-                            else {"./antfly-lite", "./antfly-inference"}
+                            else (
+                                {"./antfly-inference"}
+                                if product == "inference"
+                                else {"./antfly-lite", "./antfly-inference-worker"}
+                            )
                         )
                         self.assertEqual(
                             expected_binaries,
@@ -192,7 +202,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                                 name
                                 for name in archive.getnames()
                                 if name
-                                in {"./antfly", "./antfly-lite", "./antfly-inference"}
+                                in {"./antfly", "./antfly-lite", "./antfly-inference", "./antfly-inference-worker"}
                             },
                         )
 

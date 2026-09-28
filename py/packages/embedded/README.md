@@ -22,7 +22,7 @@ client). This package's import name is `antfly_embedded`.
 ## Installing libantfly
 
 Release platform wheels bundle the Apache-2.0 `libantfly` library and
-private `antfly-inference` worker. Installing this binding does not add
+private `antfly-inference-worker` helper. Installing this binding does not add
 `antfly-lite` or `antfly-inference` commands. Source checkouts and the
 pure-Python development wheel need a built copy of the shared library. At
 import time, `antfly_embedded`

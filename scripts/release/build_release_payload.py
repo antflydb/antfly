@@ -52,7 +52,7 @@ def copy_payload_file(src: Path, out_dir: Path) -> Path:
 
 def artifact_kind(path: Path) -> str:
     name = path.name
-    if name.startswith("antfly_") and name.endswith(".tar.gz"):
+    if name.startswith(("antfly_", "antfly-inference_")) and name.endswith(".tar.gz"):
         return "runtime-archive"
     if name.endswith("_checksums.txt"):
         return "checksums"
@@ -189,7 +189,7 @@ def main() -> int:
         "--archive-dir",
         type=Path,
         required=True,
-        help="directory containing antfly_*.tar.gz",
+        help="directory containing matching antfly_*.tar.gz and antfly-inference_*.tar.gz archives",
     )
     parser.add_argument(
         "--extra-dir",
@@ -229,9 +229,16 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     copied: list[Path] = []
-    archives = sorted(args.archive_dir.glob("antfly_*.tar.gz"))
-    if not archives:
+    server_archives = sorted(args.archive_dir.glob("antfly_*.tar.gz"))
+    if not server_archives:
         raise SystemExit(f"no antfly release archives found in {args.archive_dir}")
+    inference_archives = [
+        args.archive_dir / archive.name.replace("antfly_", "antfly-inference_", 1)
+        for archive in server_archives
+    ]
+    if any(not archive.is_file() for archive in inference_archives):
+        raise SystemExit("missing matching inference release archives")
+    archives = sorted([*server_archives, *inference_archives])
 
     for archive in archives:
         copied.append(copy_payload_file(archive, out_dir))
