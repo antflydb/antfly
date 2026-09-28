@@ -654,6 +654,11 @@ test "laya two-stage choice blends a joint shortlist back into the stage-1 distr
     var sum: f32 = 0;
     for (result.decisions[0].probabilities) |p| sum += p;
     try std.testing.expectApproxEqAbs(@as(f32, 1), sum, 1e-5);
+    // Each input token counts once: stage 2 adds its joint branch, not the
+    // state stage 1 already counted.
+    var stage2_branch: usize = 0;
+    for (stage2_row.kinds) |kind| stage2_branch += @intFromBool(kind != tree.trunk_kind);
+    try std.testing.expectEqual(stage1_row.ids.len + stage2_branch, result.prompt_tokens);
 
     // With top_k covering every option, stage 2 never runs and nothing changes.
     var single_stage_cfg = fixture.cfg;

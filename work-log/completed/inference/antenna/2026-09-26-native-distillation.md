@@ -190,4 +190,3 @@ brackets or parentheses are dropped: the native schema compiler reserves them.
 
 - Distill on the mixed pool (one epoch, 34,264 optimizer steps, run17),
   rerun the probe, then stage 3.
-

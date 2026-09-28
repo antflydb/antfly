@@ -104,8 +104,9 @@ pub const ControlView = struct {
 
 /// Allocation-free, strict decoder shared by the CPU op and Metal's
 /// host-bridged execution. Returned slices borrow the immutable physical
-/// i32 input; `ranges` values are checked to be `<= seq_len` (`laya_tree`'s
-/// half-open `start, end` convention, empty when equal).
+/// i32 input; `ranges` values are checked to be `<= seq_len` and each
+/// `start, end` pair ordered (`laya_tree`'s half-open convention, empty
+/// when equal).
 pub fn validateControl(attrs: Attrs, words: []align(1) const i32, options: Options) !ControlView {
     const layout = try attrs.layout();
     const count = std.math.cast(usize, layout.control_elements) orelse return error.InvalidSegmentTrainingAttentionControl;
@@ -117,6 +118,8 @@ pub fn validateControl(attrs: Attrs, words: []align(1) const i32, options: Optio
     for (range_words, 0..) |bound, i| {
         if (i % 4096 == 0) try options.check();
         if (bound < 0 or bound > attrs.seq_len) return error.InvalidSegmentTrainingAttentionControl;
+        // Each `start, end` pair must be ordered (empty when equal).
+        if (i % 2 == 1 and range_words[i - 1] > bound) return error.InvalidSegmentTrainingAttentionControl;
     }
     const replay = Replay{ .seed = decodeU64(words[0..2]), .micro_batch = decodeU64(words[2..4]), .replica = decodeU64(words[4..6]) };
     return .{ .replay = replay, .apply_dropout = words[6] != 0, .positions = positions, .ranges = range_words };
@@ -153,6 +156,7 @@ pub fn forward(a: Allocator, attrs: Attrs, qkv: []const f32, control: []align(1)
     defer host.deinit(a);
     const batch_tokens = std.math.cast(usize, layout.batch_tokens) orelse return error.InvalidSegmentTrainingAttentionShape;
     const hidden = std.math.cast(usize, layout.hidden) orelse return error.InvalidSegmentTrainingAttentionShape;
+    if (qkv.len != 3 * batch_tokens * hidden) return error.InvalidSegmentTrainingAttentionShape;
     const q = qkv[0 .. batch_tokens * hidden];
     const k = qkv[batch_tokens * hidden .. 2 * batch_tokens * hidden];
     const v = qkv[2 * batch_tokens * hidden .. 3 * batch_tokens * hidden];
@@ -185,7 +189,7 @@ pub fn backward(a: Allocator, attrs: Attrs, qkv: []const f32, control: []align(1
     defer host.deinit(a);
     const batch_tokens = std.math.cast(usize, layout.batch_tokens) orelse return error.InvalidSegmentTrainingAttentionShape;
     const hidden = std.math.cast(usize, layout.hidden) orelse return error.InvalidSegmentTrainingAttentionShape;
-    if (dout.len != batch_tokens * hidden) return error.InvalidSegmentTrainingAttentionShape;
+    if (qkv.len != 3 * batch_tokens * hidden or dout.len != batch_tokens * hidden) return error.InvalidSegmentTrainingAttentionShape;
     const q = qkv[0 .. batch_tokens * hidden];
     const k = qkv[batch_tokens * hidden .. 2 * batch_tokens * hidden];
     const v = qkv[2 * batch_tokens * hidden .. 3 * batch_tokens * hidden];
@@ -231,6 +235,28 @@ test "validateControl rejects out-of-range bounds and wrong lengths" {
     try std.testing.expectError(error.InvalidSegmentTrainingAttentionControl, validateControl(attrs, words[0..1], .{}));
     words[7 + 4] = 5; // out of range: > seq_len
     try std.testing.expectError(error.InvalidSegmentTrainingAttentionControl, validateControl(attrs, &words, .{}));
+    words[7 + 4] = 3; // start after end
+    words[7 + 5] = 1;
+    try std.testing.expectError(error.InvalidSegmentTrainingAttentionControl, validateControl(attrs, &words, .{}));
+    words[7 + 5] = 3; // empty is fine
+    _ = try validateControl(attrs, &words, .{});
+}
+
+test "forward and backward reject a qkv or dout of the wrong length" {
+    const a = std.testing.allocator;
+    const attrs = Attrs{ .batch = 1, .seq_len = 4, .num_heads = 1, .head_dim = 2, .dropout_probability = 0, .dropout_stream_id = 0 };
+    var words = [_]i32{0} ** (7 + 4 + 24);
+    for (0..4) |t| words[7 + 4 + t * 6 + 1] = 4;
+    const short = [_]f32{0} ** (3 * 4 * 2 - 1);
+    const long = [_]f32{0} ** (3 * 4 * 2 + 2);
+    const dout = [_]f32{0} ** (4 * 2);
+    for ([_][]const f32{ &short, &long }) |qkv| {
+        try std.testing.expectError(error.InvalidSegmentTrainingAttentionShape, forward(a, attrs, qkv, &words, .{}));
+        try std.testing.expectError(error.InvalidSegmentTrainingAttentionShape, backward(a, attrs, qkv, &words, &dout, .{}));
+    }
+    const exact = [_]f32{0} ** (3 * 4 * 2);
+    a.free(try forward(a, attrs, &exact, &words, .{}));
+    try std.testing.expectError(error.InvalidSegmentTrainingAttentionShape, backward(a, attrs, &exact, &words, dout[0..7], .{}));
 }
 
 test "validateControl decodes apply_dropout from word 6" {

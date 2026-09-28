@@ -125,9 +125,10 @@ pub fn validate(row: Row, max_len: usize, max_packed_len: usize, max_options: us
     for (row.segments[1..], 1..) |segment, i| {
         if (segment != row.segments[i - 1] and segment <= row.segments[i - 1]) return error.InvalidLayaPackedRow;
     }
-    for (row.parents) |first| {
+    for (0..row.parents.len) |first| {
+        // Count the segment itself: `ranges` has three slots per token.
         var depth: usize = 0;
-        var segment = first;
+        var segment: i64 = @intCast(first);
         while (segment >= 0) : (segment = row.parents[@intCast(segment)]) depth += 1;
         if (depth > 3) return error.InvalidLayaPackedRow;
     }
@@ -498,6 +499,15 @@ const Writer = struct {
         self.position += 1;
     }
 };
+
+test "laya tree validation accepts three levels and rejects a fourth" {
+    // trunk -> question -> candidate is the deepest layout `ranges` can cover.
+    const three = Row{ .ids = &.{ 1, 2, 3, 4, 5 }, .positions = &.{ 0, 1, 2, 3, 3 }, .segments = &.{ 0, 1, 2, 3, 3 }, .parents = &.{ -1, 0, 1, 1 }, .kinds = &.{ trunk_kind, 0, 0, 0, 0 }, .anchors = &.{1}, .markers = &.{ 2, 3 }, .question_index = &.{0}, .width = 2 };
+    try validate(three, 16, 16, 8);
+    // A fourth level would silently lose sight of its root in `ranges`.
+    const four = Row{ .ids = &.{ 1, 2, 3, 4, 5 }, .positions = &.{ 0, 1, 2, 3, 4 }, .segments = &.{ 0, 1, 2, 3, 4 }, .parents = &.{ -1, 0, 1, 2, 1 }, .kinds = &.{ trunk_kind, 0, 0, 0, 0 }, .anchors = &.{1}, .markers = &.{ 3, 4 }, .question_index = &.{0}, .width = 2 };
+    try std.testing.expectError(error.InvalidLayaPackedRow, validate(four, 16, 16, 8));
+}
 
 test "laya question-aware trunk ranges match visibility, and trees stay isolated" {
     const a = std.testing.allocator;

@@ -450,6 +450,13 @@ fn selectFinalists(a: std.mem.Allocator, probabilities: []const f32, top_k: usiz
     return out;
 }
 
+/// Tokens of a row outside its trunk(s).
+fn branchTokens(row: tree.Row) usize {
+    var count: usize = 0;
+    for (row.kinds) |kind| count += @intFromBool(kind != tree.trunk_kind);
+    return count;
+}
+
 /// Two-stage choice (LAYA.md, roadmap 2b). Stage 1 (`stage1`, already
 /// decoded) scored every option in its own candidate branch; this packs the
 /// surviving finalists into one joint branch off the same trunk (so they can
@@ -457,9 +464,9 @@ fn selectFinalists(a: std.mem.Allocator, probabilities: []const f32, top_k: usiz
 /// probability becomes the stage-1 mass captured by the shortlist times its
 /// stage-2 share of that mass, and every other option keeps its stage-1
 /// probability. The mix therefore still sums to 1. Always consumes `stage1`.
-/// Adds the joint branch's row length to `*tokens` (the trunk itself is not
-/// re-counted: a cache hit does not re-encode it, and a miss already counted
-/// it once for stage 1).
+/// `prompt_tokens` counts each input token once, so this adds only the joint
+/// branch's tokens to `*tokens`: the trunk is the same state stage 1 already
+/// counted, whether or not it is re-encoded here.
 fn refineTwoStage(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.mem.Allocator, session: Session, tok: Tokenizer, cfg: model.Config, text: []const u8, q: Question, stage1: Decision, control: ?Control, tokens: *usize) !Decision {
     errdefer a.free(stage1.probabilities);
     const finalists = try selectFinalists(plan, stage1.probabilities, cfg.packing.two_stage.top_k, cfg.packing.two_stage.mass_cutoff);
@@ -474,7 +481,7 @@ fn refineTwoStage(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.me
     const rows = try tree.build(plan, tok, cfg, text, &.{shortlist}, .question);
     if (rows.len != 1) return error.UnexpectedOutputShape;
     const row = rows[0];
-    tokens.* += row.ids.len;
+    tokens.* += branchTokens(row);
     const outputs = try runPackedRow(session, scratch, row, 1, control);
     defer {
         for (outputs) |*output| output.deinit();
