@@ -568,3 +568,10 @@ Mean CE / grad norm p50 / p95 per 2,000 steps: 1.106/3.4/85.1, 0.972/4.4/52.4, 0
 `openjev-val-2k.jsonl` (2,002 decisions, whole cases, seed 7 sample of converted validation, 3,001 converted):
 overall 0.664, choice 0.512, score 0.529, noul 0.790, soft CE 0.769, ECE 0.060.
 Label-prior baseline (train argmax by kind and label set): 0.600 (choice 0.466, score 0.300, noul 0.750); uniform CE 0.973.
+
+Layout control on `td/oj16k.jsonl` (14,009 Open-Jev decisions, whole cases, seed 11, + s0-train = 16,009), soft CE, seed 42:
+- `sp16` packed (704): train 5,791 s, 5,319 steps. s0-eval 0.463 (choice 0.386, score 0.418, noul 0.601), soft CE 1.122, ECE 0.043.
+  Open-Jev val 0.607 (0.461, 0.345, 0.757), soft CE 0.839, ECE 0.066.
+- `su16` unpacked, gradient_accumulation 3: train 16,468 s, 16,009 microbatches, peak 25.8 GB. s0-eval 0.607 (0.583, 0.546, 0.711),
+  soft CE 0.988, ECE 0.077. Open-Jev val 0.701 (0.528, 0.726, 0.808), soft CE 0.748, ECE 0.096.
+- Mean train CE by fifth: packed 0.942 0.830 0.870 0.848 0.893; unpacked 0.940 0.847 0.794 0.776 0.742.

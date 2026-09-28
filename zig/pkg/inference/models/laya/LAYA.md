@@ -981,6 +981,51 @@ run with `"objective": "soft_ce"`. Train time 7.2 h, peak 27.4 GB.
   validation. If unpacked learns Open-Jev much better, the layout is the
   bottleneck. If not, the recipe is.
 
+**Layout control (2026-09-27): the packed layout is the bottleneck.** Packed
+and unpacked were trained on the same 16,009-decision subset (`td/oj16k.jsonl`:
+14,009 Open-Jev decisions in whole cases, seed 11, plus `s0-train`).
+- Setup: soft CE, seed 42, one epoch.
+- Packed: `max_packed_len` 704, 5,319 rows. Unpacked: gradient accumulation 3,
+  5,336 optimizer steps. Both runs take about the same number of optimizer
+  steps.
+- Train time: packed 1.6 h, unpacked 4.6 h (peak 25.8 GB).
+
+| Eval | Layout | Overall | choice | score | noul | Soft CE | ECE |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Open-Jev val (2,002) | Label prior | 0.600 | 0.466 | 0.300 | 0.750 | | |
+| Open-Jev val (2,002) | Packed, 16k | 0.607 | 0.461 | 0.345 | 0.757 | 0.839 | 0.066 |
+| Open-Jev val (2,002) | Packed, 66k (above) | 0.664 | 0.512 | 0.529 | 0.790 | 0.769 | 0.060 |
+| Open-Jev val (2,002) | **Unpacked, 16k** | **0.701** | 0.528 | 0.726 | 0.808 | 0.748 | 0.096 |
+| `s0-eval` (760) | Packed, 16k | 0.463 | 0.386 | 0.418 | 0.601 | 1.122 | 0.043 |
+| `s0-eval` (760) | Unpacked, 16k | 0.607 | 0.583 | 0.546 | 0.711 | 0.988 | 0.077 |
+| `s0-eval` (760) | Unpacked, `s0-train` only (3 seeds) | 0.621 ± 0.020 | | | | | |
+
+**Reading.**
+- **Unpacked learns the same data much faster.**
+  - Unpacked on 16k beats packed on 66k (0.701 vs 0.664).
+  - Packed on 16k barely clears the label prior (0.607 vs 0.600).
+  - The gap is largest on `score` (0.726 vs 0.345). Those questions need the
+    state read *for* the question: which pixel, which ordinal rubric.
+- **Why, most likely:** a question-blind 28-layer trunk followed by a
+  two-layer head has little capacity to condition its reading of the state on
+  the question. The released weights were also trained with early fusion. More
+  data does not close that gap at this scale.
+- **Out-of-domain data does not help our eval with either layout.** Unpacked
+  on the 16k mix scores 0.607 on `s0-eval`, within noise of 0.621 on
+  `s0-train` alone. Packed stays at 0.46.
+- **So the scale hypothesis is rejected for this encoder.** Jev-style
+  reproductions that keep the state question-blind start from causal decoders.
+  Those never learned to depend on seeing the question, and they read
+  question-conditioned features from a deep model rather than a two-layer head.
+- **Options that keep caching and isolation:**
+  - Per-question upper layers: share and cache the lower trunk layers, and
+    fuse question and state in the top few layers per question (the variant
+    proposed under the question-aware trunk).
+  - A deeper head.
+  - A decoder base, as in MoJev.
+- The question-aware trunk (0.554) remains the best packed result, at the cost
+  of isolation.
+
 ### Candidate mode on Banking77 (step 0b)
 
 Measured 2026-09-26. `scripts/laya/prepare_laya_banking77.sh` downloads
@@ -2013,7 +2058,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 
 | Step | Retraining | Status | Gate |
 | --- | --- | --- | --- |
-| 0. Qualify packed accuracy | fine-tune | question mode **fails** the gate: 0.450 packed vs 0.621 unpacked over three seeds at equal budget (0.471 vs 0.671 on a larger recipe); distillation does not help (0.451); a question-aware trunk (`trunk_sees: "questions"`) reaches 0.554. 33× more data (Open-Jev, soft CE) leaves it at 0.464. Candidate mode: Banking77 0.819 mean over two seeds with soft CE | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
+| 0. Qualify packed accuracy | fine-tune | question mode **fails** the gate: 0.450 packed vs 0.621 unpacked over three seeds at equal budget (0.471 vs 0.671 on a larger recipe); distillation does not help (0.451); a question-aware trunk (`trunk_sees: "questions"`) reaches 0.554. 33× more data (Open-Jev, soft CE) leaves it at 0.464. A same-data control shows the packed layout itself learns slowly: on Open-Jev validation, unpacked 0.701 vs packed 0.607 at 16k decisions. Candidate mode: Banking77 0.819 mean over two seeds with soft CE | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
 | 1a. State cache across rows and requests | no | done (CPU and Metal) | Exact against the full row and the oracle; follow-up questions skip trunk projections and feed-forward work |
 | 1b. Segment attention | no | done (CPU and Metal); multi-row batching done (CPU and Metal, question and candidate modes) | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call: exact against running each row alone, isolated by construction; not yet composed with the trunk cache |
 | 1c. Metal and CUDA packed kernels | no | Metal: fused kernels not pursued (encoder GPU work dominates; device scoring gave 2–4% and was reverted after a race). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |
