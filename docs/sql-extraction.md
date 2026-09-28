@@ -2174,6 +2174,13 @@ following mechanisms are installed behind that gate:
   LSM; the writer still checks exact bytes and current receipt fences. This is
   automatic receipt reclamation, not automatic producer execution or stream
   completion.
+- The scoped unit chunk callback now takes its child range and placement from
+  the accepted typed unit payload, so its route is independent of the number
+  of chunks later produced. Chunk and unit range kinds remain distinct even
+  when they share the same range ID. A remote unit route is rejected before
+  chunking or publication until the routed child command path is available;
+  callers cannot supply an unverified route for a durable job. This does not
+  yet wire the automatic callback loop or dynamic child-range inspection.
 - Persisted unit encoding now lives in a shared typed payload contract rather
   than the runtime implementation. Ordered unit chunk callbacks decode through
   that contract once, bind document/producer/unit identity, reject provenance

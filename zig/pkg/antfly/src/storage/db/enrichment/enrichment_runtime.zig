@@ -20672,25 +20672,25 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
 /// owns enumeration of the accepted upstream inventory; success closes only
 /// this unit, never the extraction/document stream. No provider runs while a
 /// storage snapshot or catalog/apply lease is retained.
-fn publishOrderedUnitChunks(runtime: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, producer_name: []const u8, unit_key: []const u8, route: DocumentExtractionRangeRoute) !void {
-    return publishOrderedUnitChunksGeneration(runtime, parent_request, producer_name, unit_key, route, null);
+fn publishOrderedUnitChunks(runtime: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, producer_name: []const u8, unit_key: []const u8) !void {
+    return publishOrderedUnitChunksGeneration(runtime, parent_request, producer_name, unit_key, null);
 }
 
 /// Scoped outbox callbacks cannot silently rebind stale work to a new parent.
 /// Retirement is separate and requires a current accepted-result receipt.
-fn publishOrderedUnitJob(runtime: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, job: @import("../artifact_unit_jobs.zig").Job, route: DocumentExtractionRangeRoute) !void {
+fn publishOrderedUnitJob(runtime: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, job: @import("../artifact_unit_jobs.zig").Job) !void {
     if (!std.mem.eql(u8, parent_request.doc_key, job.document) or job.child.len == 0 or std.mem.allEqual(u8, &job.generation, 0)) return error.InvalidBatchRequest;
-    return publishOrderedUnitChunksGeneration(runtime, parent_request, job.child, job.unit, route, job.generation);
+    return publishOrderedUnitChunksGeneration(runtime, parent_request, job.child, job.unit, job.generation);
 }
 
-fn publishOrderedUnitChunksGeneration(runtime: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, producer_name: []const u8, unit_key: []const u8, route: DocumentExtractionRangeRoute, generation: ?ordered_publication.Digest) !void {
+fn publishOrderedUnitChunksGeneration(runtime: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, producer_name: []const u8, unit_key: []const u8, generation: ?ordered_publication.Digest) !void {
     var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
         resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
     else
         null;
     defer if (budget) |*tracked| tracked.deinit();
     const alloc = if (budget) |*tracked| tracked.allocator() else runtime.alloc;
-    return publishOrderedUnitChunksGenerationWithAllocator(runtime, alloc, parent_request, producer_name, unit_key, route, generation) catch |err| {
+    return publishOrderedUnitChunksGenerationWithAllocator(runtime, alloc, parent_request, producer_name, unit_key, generation) catch |err| {
         if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
         if (err == error.ArtifactCoverageBaselinePending) {
             var identity = (try @import("../artifact_ids.zig").decodeArtifactRefAlloc(alloc, unit_key)) orelse return error.InvalidBatchRequest;
@@ -20703,11 +20703,11 @@ fn publishOrderedUnitChunksGeneration(runtime: *EnrichmentRuntime, parent_reques
     };
 }
 
-fn publishOrderedUnitChunksWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, parent_request: enrichment_types.GeneratedEnrichmentRequest, producer_name: []const u8, unit_key: []const u8, route: DocumentExtractionRangeRoute) !void {
-    return publishOrderedUnitChunksGenerationWithAllocator(runtime, alloc, parent_request, producer_name, unit_key, route, null);
+fn publishOrderedUnitChunksWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, parent_request: enrichment_types.GeneratedEnrichmentRequest, producer_name: []const u8, unit_key: []const u8) !void {
+    return publishOrderedUnitChunksGenerationWithAllocator(runtime, alloc, parent_request, producer_name, unit_key, null);
 }
 
-fn publishOrderedUnitChunksGenerationWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, parent_request: enrichment_types.GeneratedEnrichmentRequest, producer_name: []const u8, unit_key: []const u8, route: DocumentExtractionRangeRoute, generation: ?ordered_publication.Digest) !void {
+fn publishOrderedUnitChunksGenerationWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, parent_request: enrichment_types.GeneratedEnrichmentRequest, producer_name: []const u8, unit_key: []const u8, generation: ?ordered_publication.Digest) !void {
     const publication = @import("../artifact_chunk_publication.zig");
     const inventory = @import("../artifact_chunk_manifest.zig");
     const enrichment_catalog = @import("../catalog/enrichment_catalog.zig");
@@ -20749,6 +20749,11 @@ fn publishOrderedUnitChunksGenerationWithAllocator(runtime: *EnrichmentRuntime, 
     defer if (parsed_unit) |*value| value.deinit();
     if (input.value) |raw| {
         parsed_unit = try @import("document_unit_payload.zig").decodeAlloc(alloc, raw, .{ .document = parent_request.doc_key, .producer = parent_request.artifact_name, .unit = identity.unit_id orelse return error.InvalidDocumentExtractionManifest });
+        // Chunk children inherit the accepted unit's range. This is stable
+        // across chunk-count changes and is authenticated by the parent head.
+        // Remote placement needs a routed publication transport before it may
+        // emit locally stamped child payloads.
+        if (parsed_unit.?.route.owner_group_id != 0 or !std.mem.eql(u8, parsed_unit.?.route.route_status, "local_committed")) return error.OnlineMergeArtifactTailsUnsupported;
         unit = parsed_unit.?.unit;
         fingerprint = parsed_unit.?.fingerprint;
         desired = if (config.chunker_json.len != 0)
@@ -20768,7 +20773,7 @@ fn publishOrderedUnitChunksGenerationWithAllocator(runtime: *EnrichmentRuntime, 
         const value = if (ordinal < desired.len) blk: {
             if (desired[ordinal].chunk_id != ordinal) return error.InvalidBatchRequest;
             if (!scratch.reset(.retain_capacity)) return error.OutOfMemory;
-            const raw = try buildDocumentUnitChunkPayloadAlloc(scratch.allocator(), parent_request.doc_key, unit_key, fingerprint, producer_name, parent_request.artifact_name, config.source_field, unit, desired[ordinal], true, route);
+            const raw = try buildDocumentUnitChunkPayloadAlloc(scratch.allocator(), parent_request.doc_key, unit_key, fingerprint, producer_name, parent_request.artifact_name, config.source_field, unit, desired[ordinal], true, parsed_unit.?.route);
             try builder.append(@intCast(ordinal), raw);
             break :blk try owned.dupe(u8, raw);
         } else null;
@@ -31430,30 +31435,29 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
         if (candidate.kind == .asset and std.mem.eql(u8, candidate.artifact_name, "units")) break candidate;
     } else return error.TestUnexpectedResult;
     request.doc_key = "doc";
-    const route: DocumentExtractionRangeRoute = .{ .range_id = "chunks-0" };
     // A durable generation-bound job must not fall back to a legacy unit row
     // after its selected parent disappeared. No provider/publication runs.
     const stale_job: @import("../artifact_unit_jobs.zig").Job = .{ .generation = @splat(42), .document = "doc", .child = "chunks", .unit = unit_key };
-    try std.testing.expectError(error.EnrichmentSourceChanged, publishOrderedUnitJob(runtime, request, stale_job, route));
+    try std.testing.expectError(error.EnrichmentSourceChanged, publishOrderedUnitJob(runtime, request, stale_job));
     try std.testing.expectEqual(@as(usize, 0), harness.calls);
     var foreign_job = stale_job;
     foreign_job.document = "foreign";
-    try std.testing.expectError(error.InvalidBatchRequest, publishOrderedUnitJob(runtime, request, foreign_job, route));
+    try std.testing.expectError(error.InvalidBatchRequest, publishOrderedUnitJob(runtime, request, foreign_job));
     // First pass reconstructs inventory without invoking the chunker.
-    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key, route));
+    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
     try harness.apply(&db, 5);
     const AllocationCheck = struct {
-        fn run(a: Allocator, worker: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, key: []const u8, routing: DocumentExtractionRangeRoute) !void {
-            publishOrderedUnitChunksWithAllocator(worker, a, parent_request, "chunks", key, routing) catch |err| {
+        fn run(a: Allocator, worker: *EnrichmentRuntime, parent_request: enrichment_types.GeneratedEnrichmentRequest, key: []const u8) !void {
+            publishOrderedUnitChunksWithAllocator(worker, a, parent_request, "chunks", key) catch |err| {
                 if (err == error.ArtifactPublicationPending) return;
                 return err;
             };
             return error.TestUnexpectedResult;
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ runtime, request, unit_key, route });
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ runtime, request, unit_key });
     harness.calls = 1;
-    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key, route));
+    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
     try harness.apply(&db, 6);
     const manifest_key = try manifest.scopedKeyAlloc(alloc, "doc", "chunks", "page-1");
     defer alloc.free(manifest_key);
@@ -31468,22 +31472,29 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, try read.get(key), .{});
         defer parsed.deinit();
         try std.testing.expectEqualStrings(unit_key, parsed.value.object.get("_parent_unit_key").?.string);
+        try std.testing.expectEqualStrings("units-0", parsed.value.object.get("_artifact_range_id").?.string);
+        try std.testing.expectEqualStrings("local_committed", parsed.value.object.get("_artifact_route_status").?.string);
         try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("provenance").?.object.get("page_number").?.integer);
     }
-    try publishOrderedUnitChunks(runtime, request, "chunks", unit_key, route);
+    try publishOrderedUnitChunks(runtime, request, "chunks", unit_key);
+    try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    const remote_unit = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, unit_fingerprint, "input", "text/plain", .{ .range_id = "units-0", .route_status = "remote_committed", .owner_group_id = 7002 });
+    defer alloc.free(remote_unit);
+    try Harness.parent(&db, unit_key, remote_unit, 7);
+    try std.testing.expectError(error.OnlineMergeArtifactTailsUnsupported, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
     try std.testing.expectEqual(@as(usize, 2), harness.calls);
     // Even an accepted fixture cannot bypass the typed unit contract. The
     // receiver will share this decoder; consumers must not propagate a stale
     // fingerprint or overwrite a previously accepted child set meanwhile.
     const corrupt_unit = try documentUnitPayloadAlloc(alloc, "doc", "units", unit, "wrong-fingerprint", "input", "text/plain", .{ .range_id = "units-0" });
     defer alloc.free(corrupt_unit);
-    try Harness.parent(&db, unit_key, corrupt_unit, 7);
-    try std.testing.expectError(error.InvalidDocumentExtractionManifest, publishOrderedUnitChunks(runtime, request, "chunks", unit_key, route));
+    try Harness.parent(&db, unit_key, corrupt_unit, 8);
+    try std.testing.expectError(error.InvalidDocumentExtractionManifest, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
     try std.testing.expectEqual(@as(usize, 2), harness.calls);
-    try Harness.parent(&db, unit_key, null, 8);
-    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key, route));
-    try harness.apply(&db, 9);
-    try publishOrderedUnitChunks(runtime, request, "chunks", unit_key, route);
+    try Harness.parent(&db, unit_key, null, 9);
+    try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
+    try harness.apply(&db, 10);
+    try publishOrderedUnitChunks(runtime, request, "chunks", unit_key);
     try std.testing.expectEqual(@as(usize, 3), harness.calls);
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
