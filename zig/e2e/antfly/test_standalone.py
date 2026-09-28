@@ -33,7 +33,7 @@ from urllib.parse import quote
 import pytest
 import requests
 
-from conftest import antfly_public_api_url, inference_public_api_url
+from conftest import antfly_public_api_url, inference_public_api_url, wait_for_server
 from helpers import assert_created_index, wait_until
 from port_reservations import LoopbackPortReservations
 
@@ -82,22 +82,10 @@ def _positive_timeout(name: str, default: float) -> float:
     return value
 
 
-def _wait_for_server(url: str, timeout_s: float = 30.0, path: str = "/status") -> bool:
-    deadline = time.monotonic() + timeout_s
-    consecutive_successes = 0
-    while time.monotonic() < deadline:
-        try:
-            response = requests.get(f"{url}{path}", timeout=2)
-            if response.ok:
-                consecutive_successes += 1
-                if consecutive_successes >= 2:
-                    return True
-            else:
-                consecutive_successes = 0
-        except requests.RequestException:
-            consecutive_successes = 0
-        time.sleep(0.25)
-    return False
+def _wait_for_server(
+    url: str, timeout_s: float = 30.0, path: str = "/status", *, processes=()
+) -> bool:
+    return wait_for_server(url, path=path, timeout=timeout_s, processes=processes)
 
 
 def _read_log_tail(path: Path, *, limit: int = 20000) -> str:
@@ -268,13 +256,15 @@ class EmbeddedInferenceStandaloneServer:
                 cwd=REPO_ROOT,
             ),
         )
-        if not _wait_for_server(self.url):
+        if not _wait_for_server(self.url, processes=[("server", self.proc)]):
             logs = _read_log_tail(self.log_path)
             self.stop()
             raise RuntimeError(
                 f"Standalone API server failed to start at {self.url}\n{logs}"
             )
-        if not _wait_for_server(self.public_url, path="/readyz"):
+        if not _wait_for_server(
+            self.public_url, path="/readyz", processes=[("server", self.proc)]
+        ):
             logs = _read_log_tail(self.log_path)
             self.stop()
             raise RuntimeError(

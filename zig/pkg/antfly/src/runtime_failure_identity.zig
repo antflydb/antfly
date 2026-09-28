@@ -666,6 +666,8 @@ const mappings = [_]Mapping{
     .{ .status = .vector_store_requires_empty_table, .err = error.VectorStoreRequiresEmptyTable },
     .{ .status = .vector_store_requires_local_single_shard_table, .err = error.VectorStoreRequiresLocalSingleShardTable },
     .{ .status = .vector_store_requires_offline_command, .err = error.VectorStoreRequiresOfflineCommand },
+    .{ .status = .raft_batch_write_outcome_unknown, .err = error.RaftBatchWriteOutcomeUnknown },
+    .{ .status = .unsupported_raft_batch_protocol_version, .err = error.UnsupportedRaftBatchProtocolVersion },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {

@@ -163,6 +163,7 @@ tla-trace-txn: tla-tools
 ifndef TRACE_FILES
 	$(error TRACE_FILES is required. Example: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson)
 endif
+	@python3 ../scripts/test_tla_filter_txn_trace.py
 	@set -e; \
 	validated=0; \
 	tmpfiles=""; tmpdirs=""; \

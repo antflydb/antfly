@@ -1802,3 +1802,583 @@ failed). Scoping those controls to schema-index work completed the identical
 three-metadata/three-data-node test in 30.24 s. Restore retains cancellation and
 ownership fences; index repair retains its scheduling quantum. The E2E proxy
 keeps the latency injection as a regression alongside the stalled status route.
+
+
+## 2026-09-26: PR #891 recovery and label-routed Autograph investigation
+
+[Run 36271592595](https://github.com/antflydb/antfly/actions/runs/36271592595)
+failed the FK merge `release-reply_loss` case during child-table seed admission,
+before its release fault. The retained data log reports an apply-wait timeout
+with a contended Raft mutex; the public batch returned `write unavailable`
+before a subsequent request exhausted the seed helper's remaining deadline.
+This evidence establishes an availability failure, not lost UNIQUE claims or
+retained references. The same run's schema rewrite `publication-coordinator`
+case reached validation but did not finish within its terminal wait.
+
+Inspection found an independent handoff defect: copying normalizes owner
+routing gaps to same-attempt waits, but validation, cutover, and publication
+used the generic job retry. Missing owner routes now retain their explicit
+`GroupLeaderUnavailable` classification, and staged execution parks the same
+pinned attempt for that condition. It does not invent a receipt or change
+ambiguous owner-write handling. The deterministic mixed-cohort regression
+injects repeated validation routing gaps and checks the original attempt
+through publication.
+
+The ordinary shard reported a failed label-routed Autograph case, but the run
+was cancelled before pytest's final failure summary and before server-log
+artifact upload. Its available console log contains no traceback. The E2E
+controller now flushes each failed report immediately, preserving the existing
+report and exit status; workers do not print duplicate reports.
+
+Native macOS arm64 ReleaseFast CPU reproduction used the repository's
+supervised regression loop with isolated clusters and retained failure roots.
+The label-routed Autograph case passed **200/200**, two workers with 100
+repetitions each, with no failures, errors, or skips. That cohort used the
+previously qualified executable named `antfly`, SHA-256
+`8e7e0d77b8012536d1e108221f1f5ade59a3845949e038b78b8dc49c4e2cb790`.
+It did not reproduce the cancelled job's failure, so it does not establish its
+cause. The initial recovery baseline passed four invocations of each selected
+case across two concurrent workers. Linux's slow-persistence signature remains
+distinct from a successful native soak.
+
+
+A longer FK baseline reproduced a different production failure: during retained
+reference probes, a data node exited after `store report worker deferred
+err=SocketUnconnected` and `data server round failed err=SocketUnconnected`.
+The HTTP executor boundary now normalizes that disconnected-socket variant to
+`ConnectionResetByPeer`. Raw control transport adapters use the same mapping.
+Delivery tracking remains uncertain and the boundary does not replay requests.
+The registered deterministic store-report regression covers registration and
+publication, completion-based backoff, and permanent errors after backoff. The
+failed baseline is retained and is not passing acceptance evidence.
+
+[Run 36274408215](https://github.com/antflydb/antfly/actions/runs/36274408215)
+also failed Python formatting and the secret follower forwarding integration
+fixture. Formatting is corrected. That fixture now gives each metadata node an
+independent production-cadence progress driver; one node's WAL sync cannot block
+its peer's ticker. Explicit unknown-outcome responses are reconciled through
+exact committed revision and value reads, without replaying PUT or DELETE.
+Arbitrary 503s fail. DELETE selects the current follower after PUT confirmation.
+
+The latest run also repeated schema rewrite `publication-coordinator` and added
+FK cascade `transaction_resolve-owner` admission failures. Preserved logs show
+uncommitted data Raft proposals, metadata leader unavailability, and native
+threads in `fsync`. The exact downloaded CI binary is stripped, so these stacks
+cannot establish a complete wait chain. These availability signatures remain
+under investigation; socket-error regression coverage does not by itself prove
+that slow-persistence recovery is fixed.
+
+
+The supplementary FK-cascade loop reproduced admission timeouts on the
+socket-corrected executable (four failures in 40 cases). Native macOS samples
+show metadata HTTP proposal waiters driving Raft WAL persistence inline. A
+request could own a slow Ready round while waiting for its own receipt, and
+compete with the dedicated cadence driver for the runtime lock.
+
+The managed metadata source now registers progress ownership for the driver's
+lifetime. Proposal, ReadIndex, and lifecycle waiters coalesce notifications to
+that owner instead of performing Ready persistence/apply on request threads.
+The driver drains notifications without advancing election time, prioritizes
+scheduled ticks, and releases notification ownership only after its task joins.
+Unmanaged service fixtures retain their request-driven fallback. Startup-refusal
+coverage checks that ownership is released; notification coverage checks that a
+burst of wakes does not accelerate ticks. A real accepted-proposal/ReadIndex
+regression checks that requests leave work pending until the owner drains it.
+The secret HTTP fixture now uses those production drivers, including injected
+post-commit uncertainty with exactly one PUT and DELETE.
+
+Earlier Autograph cohorts passed 200/200 on both baseline and socket-corrected
+binaries. Recovery cohorts run before the ownership change are preliminary
+measurements, not acceptance evidence for the new implementation. The captured
+wait chain identifies an ownership defect; arbitrary slow persistence still
+requires platform-specific qualification, and no deadline was increased.
+
+
+The ownership-only smoke run passed 8/8 FK merge and 8/8 schema rewrite but
+failed one of eight FK-cascade cases during replacement-parent deletion. This
+is not final recovery acceptance. The frozen ownership build (SHA-256
+`e42f143fbbb3c4dc1dd6234482167f54205b57e84160bd1bd32443856bb1d479`)
+passed label-routed Autograph **200/200**. Its interrupted recovery qualification
+had 16 passing FK merge, eight schema rewrite, and eight FK cascade cases; these
+counts are preliminary and do not replace the requested 200-case cohorts.
+
+The local 2PC admission path also performed a full control-snapshot refresh
+before checking an already-hosted leader. Those snapshots are fenced by the
+changing metadata epoch, including unrelated store reports. That refresh is not
+a transaction or range admission fence, yet a timeout becomes
+`LeaderUnavailable` before the data group is even inspected. Local admission
+now leaves this global refresh to control when local Raft leadership is
+confirmed; missing replicas still use bounded discovery. Proposal admission
+retains its topology fence, storage descriptor validation, and leadership
+recheck. Cancellation and expired budgets cannot take the fast path. A real
+single-node Raft regression injects metadata transport timeouts and checks that
+local routing avoids that transport while missing-group discovery still fails.
+The earlier failure logs alone do not identify which pre-admission phase timed
+out; the complete recovery fix requires fresh soak qualification.
+
+The local-refresh executable (SHA-256
+`6b2eebd45f0b5e45afb53eb612eb69a5ac903adc4038e3c75fb5714b1496936b`)
+passed Autograph **200/200**, but one of the first 16 FK-cascade cases again
+failed on replacement-parent deletion. The retained root is
+`antfly-zig-metadata-backup-e2e-v0ey4zpw`: all three metadata members reported
+term 1 and commit index 1123, with one leader and two followers. This recurrence
+does not establish an election stall. The interrupted recovery run is not
+acceptance evidence; phase-specific prepare/admission diagnostics are being
+used to identify the remaining failure before another full qualification.
+
+The phase-diagnostic executable (`6e2c20e4139ded7cc6ee65adac5281751e6d8a642bbf8734cce499c57ca08166`)
+passed a separate 40-case cascade loop, then reproduced the same late deletion
+failure in the eight-worker mixed-load run (`worker-2-case-3`, retained root
+`antfly-zig-metadata-backup-e2e-mc7lh7jr`). The interrupted cohort is not
+qualification. No instrumented metadata-refresh, protocol-marker or protocol
+preflight failure appeared. Native stacks identify the local participant worker,
+concurrent prepare forwarding, and abort delivery; forwarding admission needs
+its own phase diagnostic before attributing the failure to capacity pressure.
+
+The Debug diagnostic executable (`5c86d5d44d0c2ab76f20320df6320c0d07613973cc585436a535fb530ae1ff67`)
+reproduced two late cascade failures in the first sixteen cases. Both traces
+pair `phase=forward_capacity err=RequestForwardCapacityUnavailable` with
+participant `prepare` returning `LeaderUnavailable`. Retained roots include
+`antfly-zig-metadata-backup-e2e-z7w_2h8n` and
+`antfly-zig-metadata-backup-e2e-c0bw1z84`. This identifies local fan-out admission
+pressure, not missing Raft leadership, as the repeated abort trigger.
+
+Raft batch forwarding now parks before transport when its bounded forwarding
+lane cannot reserve the complete HTTP task graph. Admission retains the same
+absolute routing deadline, borrowed clock, cancellation and retirement-aware
+capacity accounting. It neither increases worker limits nor retries a mutation
+already sent. A deterministic VoprIo regression admits eight callers through a
+single-grant lane and checks deadline expiry, cancellation and lease recovery.
+Final qualification of this correction is pending.
+
+Review also moved protocol-activation lock release to the end of proposal
+admission. If leadership changes during preflight, the forwarding path must not
+hold that local coordination lock while waiting for capacity or a peer reply.
+The initial Debug qualification was stopped to include this cleanup; its partial
+counts are not acceptance evidence.
+
+The Debug executable from `d1f371f3346b18bc0fc817c4b609ca7c67ac81d0`
+(SHA-256 `d1e3453b09ef3f4113a37c30a03884c0b533ef87c30ba1b27c12fd10e19ac6c0`)
+passed label-routed Autograph **200/200**. The mixed recovery cohort stopped
+after **32 FK merge passes, 26 cascade passes, and 24 schema-rewrite passes
+with 8 schema-rewrite failures**; it does not qualify recovery. All schema
+failures occurred on the fourth schema repetition. Retained status observations
+show a same-term metadata quorum, while logs show slow persistence/apply and
+the job still running. The smaller two-worker schema-only Debug investigation
+passed four cases, taking 146–160 seconds each.
+
+Live leader samples show restore workers repeatedly awaiting ReadIndex and
+checkpoint barriers. Request-side wakes alone leave incoming Raft replies
+waiting for the periodic tick on otherwise idle peers. The host now notifies
+the registered progress owner after accepting an inbound batch or snapshot,
+and rearms progress when a bounded drain leaves messages queued. Notifications
+do not step Raft or advance election time. Registration discovers existing
+queue debt; removal synchronizes with callbacks before the driver is destroyed.
+All 132 metadata-service tests and the focused inbound queue/snapshot host
+regressions pass in Debug. The tests cover queue debt at registration, bounded
+drain rearming, retired callbacks, snapshots, and unchanged election time.
+Fresh soak qualification remains pending.
+
+The metadata inbound-wake executable (`43881588d74759e64e75638c74b8ee4bd182d5e1d108706a591d4158f3a48684`)
+passed the two-worker schema comparison **4/4**, with case durations of
+113–118 seconds. Owner-operation traces still cluster around 200 ms because
+the data Raft runtime retains its periodic-only progress source. The data
+driver now borrows the same host notification, with a separate Ready-only
+turn that never ticks. Accepted proposals, ReadIndex requests, campaigns and
+configuration changes notify after admission; peer batches and snapshots
+notify after enqueue. Notifications coalesce on the existing reserved driver
+and keep the original cadence and per-turn scheduling bounds. Manual hosts
+skip notification locking when no driver is registered. The real DataServer
+fixture covers ReadIndex wakes, callback retirement, and unchanged election
+time. Debug validation passes the 61-step native build, all 132 metadata
+contracts, ten data cadence/forwarding/protocol/read-barrier contracts, and the
+focused host regressions. The frozen macOS arm64 Debug CPU executable
+`c2fd237c241b287795dc7659ed93daf2da48772f62d0ec0a7d65017228acc1d1`
+passed **200/200 each** for FK merge `release-reply_loss`, schema rewrite
+`publication-coordinator`, FK cascade `transaction_resolve-owner`, and
+label-routed Autograph, with zero failures, errors, or skips. The three recovery
+selectors used four workers × 50 repetitions; Autograph used two × 100.
+These qualify the event-driven Raft progress changes before the subsequent
+apply-waiter and verification improvements below.
+
+The small-data FK merge case still averaged 45.2 seconds. A diagnostic breakdown
+found 5.7 seconds startup, 2.3 teardown, about 9.9 table setup/seed, 6.6 merge and
+row verification, 16.8 exhaustive constraint rejection, and 0.5 final cascade.
+Native samples show participant preparation rejecting claims during Raft apply,
+followed by durable abort cleanup. Requests poll applied indexes every 50 ms;
+remote transaction steps averaged 56–62 ms, repeating that delay across the
+protocol. Abort follower resolution and acknowledgment were also serial.
+
+Three paired diagnostic runs preserved every individual claim check, using
+independent candidate keys and sessions: one-worker verification took 15.198,
+14.615 and 13.711 seconds; three workers took 8.367, 9.301 and 9.262 seconds.
+These are phase timings alongside the recovery cohort, rather than a controlled
+end-to-end benchmark. Diagnostic runs are excluded from all 200-case counts.
+
+Apply completion now wakes request waiters through the borrowed Raft I/O clock
+and synchronization provider. Registrations have unique tokens, an 8,192-entry
+admission bound, and exact applied-index and term outcome proofs. Epoch/state
+rechecks close lost wakeups; group retirement wakes old requests, and index
+reuse cannot make an old request consume or cancel a replacement registration.
+Confirmed apply publication wakes writers before later fallible read-tracker
+work. Request cleanup also covers failure immediately after proposal admission.
+No request thread executes Raft progress, and deadlines or ambiguous-write
+classification are unchanged.
+
+Abort cleanup retains the mandatory durable coordinator-first edge. Followers
+resolve and then acknowledge through existing bounded participant fanout and
+preallocated coordination slots, with isolated task arenas. Uncertain resolution
+or acknowledgment retains durable recovery debt; fresh-ID contact evidence and
+retained-ID full-cohort recovery retain their distinct rules. The E2E helper
+checks every UNIQUE claim with three bounded workers, distinct candidate keys,
+and independent sessions, joining all workers before the final cascade.
+
+Debug validation passes the 58-step native build, three apply/retirement tests,
+13 transaction tests, and ten real-Raft cadence/forwarding/protocol/read-safety
+contracts. The deterministic tests cover prompt completion, already-complete
+work, unrelated wakes, deadlines, cancellation, group reuse, capacity exhaustion,
+coordinator reply loss, unconfirmed abort decisions, contact masks, retained
+cohorts, failed resolution, and failed acknowledgments. Nine Python verification
+and seed-helper contracts, Ruff lint/format, and diff checks pass.
+
+The subsequent apply-notification executable
+`8d0429ea50c12b59bc8056627f87c5b3eb2238e3fd8c092d0f0e795d706c8dd2`
+passed Autograph **200/200**, but its recovery qualification caught a schema
+rewrite document read returning 404 after the job reported success. The recovery
+cohort was stopped with 24 FK-merge passes, 22 schema passes plus one failure,
+and 21 cascade passes. These are superseded evidence, not final acceptance.
+An external request-tracing plugin reproduced the same signature twice: all
+three rewritten parent documents were readable through two nodes, while the
+first node returned 404 for every key. Tracing runs retain the original test
+assertions and are excluded from qualification counts.
+
+Compact table routing can observe published replacement groups before the
+independent cached peer directory includes their serving placements. A route
+miss now refreshes that exact peer generation once under the existing refresh
+mutex; concurrent callers reuse a superseding generation, active readers retain
+their old immutable view, and compact routing stays cached. Refresh retains the
+original deadline and cancellation. A catalog-known group with no serving route
+returns temporary unavailability rather than document absence. Warm routes and
+local leaders keep the existing fast path. Regression checks cover cache-TTL
+bypass on a miss, shared publication, reader lifetime, expiry, cancellation, and
+absence fencing. The apply-wake latency fixture drains runnable work before
+advancing virtual time; advancing directly to a deadline while a wake remains
+runnable models starvation rather than polling delay.
+
+The peer-refresh executable
+`639ab9d341010b152581aace463785660355c76b2609d35db8f8a06958a9102a`
+passed Autograph **200/200**, with 82 FK-merge, 80 schema-rewrite, and 79 cascade
+passes before a schema post-publication read returned 503 "group leader
+unavailable". The stopped cohort contains one schema failure and is superseded.
+Public point-read readiness previously retried storage installation races but
+returned leadership and group-activation races immediately. These read-only
+failures now use the same bounded readiness policy, resolving a fresh fenced
+route and obtaining a new quorum/apply proof for each attempt. The caller and
+lookup deadlines are intersected in the retry clock and propagated to each
+source attempt; both cancellation tokens remain active. Ordinary successful
+reads retain their caller budget; the five-second local readiness ceiling only
+applies after a transient failure. Read-only servers fail fast, and authoritative
+absence and validation errors remain final. No mutation is replayed and no
+read consistency is downgraded. Regression checks cover the transient error
+classes, expiry before source admission, cancellation during readiness,
+shorter caller deadlines, and unchanged read-only/validation behavior.
+
+Final qualification completed on 2026-09-27 using the frozen macOS arm64
+Debug CPU executable from native source
+`aa638bc6daa86f56baa6afd2082fd6dee87618b5`, SHA-256
+`4d5b223ac21dd2657ca6ca3c43d92f9065caf118bd02490cdb667c7d61387701`.
+All four exact cases passed **200/200 each**, with **zero failures, errors, or
+skips**. Both supervisors exited successfully; the executable hash was unchanged.
+Recovery used eight workers × 25 repetitions per selector; Autograph used two
+workers × 100. Superseded cohorts and diagnostic runs above are excluded.
+
+- FK merge: `test_online_fk_merge_preserves_shadow_claims_and_retained_references[release-reply_loss]` — **200/200**.
+- Schema rewrite: `test_schema_rewrite_recovers_dependency_cohort[publication-coordinator]` — **200/200**.
+- FK cascade: `test_fk_cascade_recovers_claims_references_and_rows[transaction_resolve-owner]` — **200/200**.
+- Autograph: `test_label_routed_autograph_promotes_events_and_entities` — **200/200**.
+
+The final Debug application build passed all 59 steps and all 344 API contracts.
+The focused apply/retirement/peer-refresh and transaction validation passed 19
+contracts; ten real-Raft integration contracts and 100 fresh-process apply-wake
+fixture runs passed. Nine Python claim-verification and seed-helper contracts
+also passed. This native qualification does not replace Linux CI coverage of
+runner-specific persistence timing.
+
+Reproduce from the repository root with the same Debug CPU executable:
+
+```sh
+export ANTFLY_BIN=/absolute/path/to/bin/antfly SKIP_BUILD=1
+ANTFLY_E2E_NATIVE_STACKS=1 ANTFLY_E2E_REGRESSION_WORKERS=8 \
+  ANTFLY_E2E_REGRESSION_REPEATS=25 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/recovery-soak \
+  bash scripts/ci/zig-e2e-regression-loop.sh \
+  'e2e/antfly/test_online_merge_recovery.py::test_online_fk_merge_preserves_shadow_claims_and_retained_references[release-reply_loss]' \
+  'e2e/antfly/test_relational_integrity_recovery.py::test_schema_rewrite_recovers_dependency_cohort[publication-coordinator]' \
+  'e2e/antfly/test_relational_integrity_recovery.py::test_fk_cascade_recovers_claims_references_and_rows[transaction_resolve-owner]'
+ANTFLY_E2E_REGRESSION_WORKERS=2 ANTFLY_E2E_REGRESSION_REPEATS=100 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/autograph-soak \
+  bash scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_autoschema.py::test_label_routed_autograph_promotes_events_and_entities
+```
+
+
+### 2026-09-27: Review follow-up
+
+A fresh review found a progress-driver stop/reset race and three regression
+tests absent from the normal test inventories. The driver now resets its wake
+before checking the persistent stop signal; a deterministic interleaving test
+covers both stop orderings and retained progress debt. The apply-waiter,
+peer-refresh, abort, shutdown, and repeated-miss contracts are all included in
+the default buckets.
+
+Route-miss refresh now stages a replacement while retaining the usable immutable
+peer cache. Failure leaves its contents and TTL unchanged; successful publication
+checks the original snapshot fence and head before replacing it atomically.
+Concurrent invalidation/publication wins over an older capture. One bounded
+miss-refresh record coalesces sequential unresolved misses across peer-view
+replacement, including failures. Its cooldown uses the borrowed clock, begins
+at completion, and is bypassed by compact routing revision or mutation
+invalidation. It preserves every caller's deadline and cancellation.
+
+Debug validation passes six focused peer-cache/apply contracts, 13 transaction
+contracts, 33 managed-progress contracts, and six Ready-continuation contracts.
+The final application/data build passed 55/55 steps; the merged CI scope checks
+passed 11 tests. Main's build-cache PVC fix (#895) is included. New executable
+qualification is pending; the earlier 200-case qualification above retains its
+original source and binary provenance.
+
+### 2026-09-27: Completion, acknowledgement, and immutable-view architecture
+
+The performance follow-up keeps the existing durability and admission proofs:
+
+- Apply/read notification epochs are owned by bounded per-group registrations
+  and parked waiters. Unrelated group progress does not wake a registered writer;
+  retirement wakes its group, and nonce/index reuse cannot consume an old result.
+- Follower resolutions join before bounded coordinator acknowledgement commands
+  are formed. Only proven resolutions are acknowledged; proposal acceptance and
+  uncertain delivery leave recovery debt. Commands contain at most 64 members
+  and require durable protocol-13 activation across the applying replica set.
+- A lazily migrated participant/resolution index replaces repeated growing-list
+  rewrites with bounded point updates and a completion-count marker. Membership,
+  legacy resolution evidence, indexed acknowledgements, and the Raft replay marker
+  publish atomically. Legacy single acknowledgements do not initiate migration;
+  cleanup deletes both indexed namespaces and legacy sidecars.
+- Peer and join-planning views have separate content revisions and compact
+  retained transfers. Snapshot owners pin immutable storage under the cache lock;
+  clones run after it is released. Peer publication preserves the independent
+  catalog slot, its age, and observed-head proof. Internal forwarding explicitly
+  reads the retained peer slot; full catalog/identity consumers retain their view.
+- Merge copying reads receiver acceptance from quorum/apply-proven receiver
+  state, rather than a lagging donor-local replica. A local receiver leader uses
+  the admitted transition contract and an exact owner lease; remote reads use
+  the authenticated read boundary.
+- E2E startup overlaps processes within each role stage. Shutdown signals every
+  process in a role before reaping against one shared deadline. Fresh fixture
+  roots, process/listener ownership, role ordering, and failure artifacts remain.
+
+Compatibility targets the actual `v0.2.x` branch (inspected at
+`1dbf5391431469fee7a1f5bfe9c0a844dfb72c07`), whose data-Raft protocol is 2 and
+whose metadata server has the original snapshot routes. Unsupported compact
+transfers fall back to those routes with the same caller budget, cancellation,
+and linearizable/eventual read semantics. Intermediate main implementations
+are not the compatibility target.
+
+The first architecture cohort, source
+`71d73f45539eec4613581bd1dd1e55a5b1d823dc`, executable SHA-256
+`67b05f5fd639e6c9b40785101e8e60bb01baa0a43daa1fa7f5eb8be4145b707c`,
+reproduced two merge failures: a post-merge UNIQUE probe returned
+`500 MetadataSnapshotUnavailable`. Compact peer publication had displaced the
+shared catalog snapshot, and internal forwarding still required that slot.
+Independent retained slots and explicit peer reads fix that cause; the ownership
+regression now verifies both views through publication and invalidation. The
+superseded cohort had six merge passes, two merge failures, one schema pass, and
+63 Autograph passes before both supervisors were intentionally stopped. None
+count toward the corrected executable's qualification.
+
+Native Debug CPU validation passes 174 routing/runtime contracts, 49 real-Raft
+implementation contracts, 50 storage transaction contracts (including migration,
+invalid-batch atomicity, replay and reopen), 96 transaction API contracts, 344 API
+contracts, 133 metadata contracts, and four Python lifecycle contracts. There
+are no failures, skips or allocation leaks in these native buckets. A service
+fixture with a 64 KiB schema serialized 73,826 bytes for the full snapshot,
+6,803 for peers, and 6,804 for planning. The acknowledgement regression packs
+130 eligible follower slots into three bounded commands and preserves debt on
+uncertain delivery. These operation/byte results do not establish latency gains.
+
+The independent-cache executable, source
+`7f76aff44c76b18dc34280e02a158331fa8ba880`, SHA-256
+`69e3b11336c2eca553d68ca5b7bc81a41ae541f9959b9b71427f1c5faf1e8a71`,
+passed 135 merge, 132 schema, 129 cascade, and 200 Autograph cases with no
+failures, errors, or skips before intentional supersession. Review found that
+remote bulk acknowledgements still used the legacy group-batch endpoint,
+which Raft servers disable. Recovery singles could hide this performance gap.
+These counts are not final qualification for the corrected transport.
+
+Bulk acknowledgements now use a private typed transaction endpoint that enters
+the canonical, protocol-gated group write path. v0.2.x's absent-route response
+falls back to its original single-acknowledgement endpoint; unsupported protocol
+activation is rejected before command admission. Invalid requests, lost replies,
+and explicit unknown-outcome headers retain recovery debt. Transport regressions
+cover those distinctions, bounded owned parsing and allocation failure cleanup.
+A live HTTP fixture verifies the typed route while the legacy batch route is
+disabled. No compatibility with intermediate main implementations is required.
+
+The corrected Debug CPU build passed **82/82 steps**, including the live HTTP
+regression, 96 transaction, 344 API, 49 Raft implementation, and 174 runtime
+contracts. It uses native source `b40ffbf1adc14f607bcda0d39bbf9007899d3046`,
+SHA-256 `cc83e2ca917aa949ba99c0d3fd1f0076be58e69538ec22afe977914772efb8cf`.
+This superseded executable passed 41 merge, 40 schema, 40 cascade, and 185
+Autograph cases without failures, errors, or skips before both supervisors were
+intentionally stopped to implement the two remaining performance gaps. These
+counts do not qualify the next executable.
+
+Forwarding now pins the immutable peer generation for routing preflight,
+endpoint lookup, and placement selection. It copies only the selected URI and
+examines only the selected group's placements. Read-health filtering and the
+original forwarding eligibility/order rules remain distinct; retained views
+survive replacement and invalidation. Regression checks verify no catalog
+result clones during warm production preflight or endpoint lookup and preserve
+cancellation, deadlines, and the background reconciliation wake.
+
+Background recovery now batches proven participant resolutions in bounded
+64-member acknowledgement windows through the canonical group write path.
+The typed owner callback is carried through version 66 of the native owner ABI.
+Shared failure ABI 55 preserves explicit protocol rejection and unknown write
+outcomes as distinct append-only statuses across that callback.
+Standalone recovery uses the same atomic indexed acknowledgement operation.
+Only explicit capability rejection selects legacy singles; lost replies retain
+recovery debt, including replies lost after a committed acknowledgement.
+Regressions preserve unresolved followers and the retained coordinator's self
+handoff. The fair-service forwarding fixture runs ready tasks before virtual
+time advancement, rather than making successful service depend on hash order.
+
+The corrected native Debug CPU build passes 73/73 steps, including 174 routing,
+49 Raft implementation, 96 transaction API, 51 storage transaction, and 31
+owner-source contracts. The C callback bridge passes its focused 15/15-step
+build, and the failure registry and released numeric-identity audits pass.
+
+The source `8d4407a2702431c394d364d2dcf44944c648e3cf` executable, SHA-256
+`fcdf2eafc316d8a23ab21944f67958ee8fb7a3b145e7dd99d67cb4b883afc702`,
+passed 50 merge, 48 schema, 44 cascade, and 200 Autograph runs. Cascade had one
+failure: after committed deletion and owner restart, rows were absent but a
+replacement parent returned `UniqueConstraintViolation`. Recovery was stopped;
+Autograph's supervisor exited successfully. These counts do not qualify the
+next executable.
+
+Participant semantic preparation interpreted the old physical claim before
+checking another transaction's unresolved exclusive release intent. A production
+DB regression deterministically reproduced the same false UNIQUE rejection.
+Integrity point and prefix reads now check exclusive intent ownership through
+the existing apply-fenced point probe before interpreting values. The owning
+transaction remains idempotently preparable, and shared parent guards remain
+compatible. Reusable lock-key scratch avoids per-read snapshots or record scans;
+reference upper bounds prevent unrelated successor locks from blocking an empty
+tuple. Commit/abort, shared-guard, reference contention, and prefix-isolation
+regressions protect these distinctions. The first corrected storage transaction
+suite passes 52/52 tests without skips or leaks; broader qualification is pending.
+
+Expanded native Debug CPU validation passes 73/73 build steps, including 83
+storage/integrity contracts, 174 routing, 49 Raft implementation, 96 transaction
+API, and 31 owner-source contracts, without skips or allocation leaks.
+
+Final native Debug CPU qualification used source
+`a6077ffbed792b48c8f2eab84b401724f5513f2e`, executable SHA-256
+`e6279aadb8f36dac25a33a29ccd80ada1580fc2023575a322f9903347caa8ad9`,
+with eight workers × 25 repetitions per recovery selector and two × 100 for
+Autograph. Exact selectors and reproduction commands are unchanged above;
+reports remain separate per executable. The merge, schema, cascade, and
+Autograph selectors each passed **200/200**, with zero failures, errors, or
+skips in all 800 XML reports. Both soak supervisors exited successfully.
+Recovery reports are in `/private/tmp/pr891-architecture-recovery-200-5` and
+Autograph reports are in `/private/tmp/pr891-architecture-autograph-200-5`.
+
+## 2026-09-26: Scheduled soak selectors, listener ownership, and promotion replay
+
+Scheduled run `36247286560` passed qualification, all five campaigns, and the
+corpus. Its cluster-restore jobs failed repeatedly on a renamed selector;
+production E2E also failed restore, Autograph, and large-catalog cases. The
+Autograph evidence verifier additionally expected an unparameterized test name,
+although that selector now produces both `prefix` and `exact_key` cases.
+
+The cluster-restore selector is now `test_backup_restore_discovers_leader_past_stalled_topology`.
+The regression loop collects all selectors before building or admitting workers,
+so a missing test fails once rather than consuming a whole soak. Evidence checks
+still require exact case inventories and reject failures, errors, and skips.
+
+A retained restore root logged `AddressInUse` and exited, while its fixture
+accepted another server's HTTP readiness. This permits an isolated restore
+to observe another fixture's catalog, matching the four-table contamination
+signature. Listener allocation now
+avoids the configured client ephemeral range and retains a cross-process
+advisory lease throughout handoff, child lifetime, pauses, and restarts. Readiness
+checks the owned process before and after HTTP; standalone also requires a bind
+log from the current process incarnation. Advisory leases coordinate fixtures;
+external listeners are still handled by failing startup, not by accepting their
+HTTP replies.
+
+A live Autograph promotion unconditionally removed destination redirects. Its
+remote commit can succeed before source promotion state is persisted, so replay
+could erase a curator's `merged_into` and `merged_into_table`. Live promotion now
+preserves redirect authority while unioning aliases; explicit re-key tombstones
+still update redirects. Physical moves exclude source-copy redirects while
+preserving destination curation under the existing version/digest predicates.
+The deterministic transform regression fails against the original sink, as does
+the cross-process handoff regression against the original port allocator.
+
+The catalog logs include a 17.5-second metadata WAL sync and transient leadership
+loss. Public catalog mutations now retain the existing Raft non-admission proof,
+including through the HTTP adapter. The exclusively owned resource helper retries
+only proven non-admission, observes unknown delivery/commit outcomes without
+replaying, and checks initial ownership and the final resource. It does not make
+slow storage fast or treat a read showing absence as permission to replay an
+uncertain create. Readiness, mutation, and observation retain finite deadlines.
+
+Local validation uses macOS arm64 ReleaseFast CPU builds. Linux scheduled-run
+validation remains required; successful native soaks alone do not establish that
+the original Linux persistence timing has disappeared.
+
+Final native evidence (macOS arm64, ReleaseFast CPU):
+
+- Python fixture and admission contracts: **129 passed**, one Linux-only live
+  port-range check skipped. Regression-loop supervisor contracts: **14 passed**.
+- Routed promotion/transaction contracts: **17 passed**. Catalog API contracts,
+  including the public HTTP admission-proof regression: **106 passed**.
+- Existing deterministic metadata WAL-stall recovery scenario: **1 passed**,
+  with a replacement leader, completed read barriers, and no continued term churn.
+- Standalone restore: **200/200 passed**, two workers × 50 repetitions × two cases.
+- Catalog: **100/100 passed**, 50 per normal/constrained profile.
+- Cluster restore: **40/40 passed**, 20 per normal/constrained profile; each
+  profile used two workers × five repetitions × two selectors.
+- Autograph: **300/300 passed**, 150 per normal/constrained profile; each
+  profile contains 50 prefix, 50 exact-key, and 50 data-restart cases.
+
+With the unchanged-main executable, native baselines passed **200/200**
+standalone restore cases and **12/12** catalog cases. They did not reproduce Linux's slow-WAL signature;
+the old-versus-new deterministic regressions provide the isolated defect proof.
+Earlier relocated-binary attempts with a renamed executable were invalid: the
+fixtures use its `antfly` basename to select the launch mode. Those attempts are
+excluded from every final count. The qualified profiles use a frozen executable
+named `antfly`, SHA-256
+`8e7e0d77b8012536d1e108221f1f5ade59a3845949e038b78b8dc49c4e2cb790`.
+
+Run the same bounded profiles from the repository root with a CPU executable
+whose filename is `antfly`:
+
+```sh
+export ANTFLY_BIN=/absolute/path/to/bin/antfly SKIP_BUILD=1
+export ANTFLY_E2E_REGRESSION_WORKERS=2
+ANTFLY_E2E_REGRESSION_REPEATS=50 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/restore-soak \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_backup_restore.py::test_cluster_restore_modes \
+  e2e/antfly/test_backup_restore.py::test_cluster_restore_modes_with_concurrent_observers
+ANTFLY_E2E_REGRESSION_REPEATS=25 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/autograph-soak \
+  scripts/ci/zig-e2e-autograph-soak.sh
+ANTFLY_E2E_REGRESSION_REPEATS=25 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/catalog-soak \
+  scripts/ci/zig-e2e-catalog-soak.sh
+ANTFLY_E2E_REGRESSION_REPEATS=5 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/cluster-restore-soak \
+  scripts/ci/zig-e2e-cluster-restore-soak.sh
+```

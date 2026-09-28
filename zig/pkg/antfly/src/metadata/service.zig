@@ -1378,6 +1378,9 @@ const MetadataRunRoundTrace = struct {
 const MetadataProposalProgressDriver = struct {
     lane: std.atomic.Mutex = .unlocked,
     wake_epoch: std.atomic.Value(u32) = .init(0),
+    owner_mutex: std.Io.Mutex = .init,
+    managed_owned: std.atomic.Value(bool) = .init(false),
+    managed_wake: ?@import("../raft/runtime_loop.zig").ProgressWake = null,
 
     const Lease = struct {
         driver: *MetadataProposalProgressDriver,
@@ -1389,7 +1392,35 @@ const MetadataProposalProgressDriver = struct {
         }
     };
 
+    fn registerManagedOwner(self: *MetadataProposalProgressDriver, wake: @import("../raft/runtime_loop.zig").ProgressWake) !void {
+        self.owner_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.owner_mutex.unlock(std.Options.debug_io);
+        if (self.managed_wake != null) return error.MetadataProgressAlreadyOwned;
+        self.managed_wake = wake;
+        self.managed_owned.store(true, .release);
+        self.notifyWaiters();
+    }
+
+    fn releaseManagedOwner(self: *MetadataProposalProgressDriver) void {
+        self.owner_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.owner_mutex.unlock(std.Options.debug_io);
+        self.managed_wake = null;
+        self.managed_owned.store(false, .release);
+        self.notifyWaiters();
+    }
+
+    fn notifyManagedOwner(self: *MetadataProposalProgressDriver) bool {
+        // Serialize only the borrowed notification's lifetime. Never hold
+        // this lock over Raft persistence, apply, or a proposal wait.
+        self.owner_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.owner_mutex.unlock(std.Options.debug_io);
+        const wake = self.managed_wake orelse return false;
+        wake.notify();
+        return true;
+    }
+
     fn tryAcquire(self: *MetadataProposalProgressDriver) ?Lease {
+        if (self.managed_owned.load(.acquire)) return null;
         if (!self.lane.tryLock()) return null;
         return .{ .driver = self };
     }
@@ -5514,7 +5545,11 @@ pub const MetadataService = struct {
                 .unavailable => return error.MetadataMutationOutcomeUnknown,
                 .pending => {},
             }
-            if (progress_driver_lease == null) {
+            if (self.proposal_progress_driver.managed_owned.load(.acquire)) {
+                if (progress_driver_lease) |*lease| lease.deinit();
+                progress_driver_lease = null;
+                _ = self.proposal_progress_driver.notifyManagedOwner();
+            } else if (progress_driver_lease == null) {
                 progress_driver_lease = self.proposal_progress_driver.tryAcquire();
             }
             const now_ns = platform_time.monotonicNs();
@@ -8077,7 +8112,11 @@ pub const MetadataHttpService = struct {
                 .unavailable => return error.MetadataMutationOutcomeUnknown,
                 .pending => {},
             }
-            if (progress_driver_lease == null) {
+            if (self.proposal_progress_driver.managed_owned.load(.acquire)) {
+                if (progress_driver_lease) |*lease| lease.deinit();
+                progress_driver_lease = null;
+                _ = self.proposal_progress_driver.notifyManagedOwner();
+            } else if (progress_driver_lease == null) {
                 progress_driver_lease = self.proposal_progress_driver.tryAcquire();
             }
             const now_ns = platform_time.monotonicNs();
@@ -8908,11 +8947,7 @@ pub const MetadataHttpService = struct {
                 if (!self.raft.host.http_host.host.isLocalLeader(
                     self.metadata_group_id,
                 )) return error.NotLeader;
-                if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftProgressOnly();
-                } else {
-                    try self.raft.runRaftProgressOnly();
-                }
+                _ = try self.runRequestRaftProgressLocked();
             }
             platform_clock.Clock.real().sleepMs(1);
         }
@@ -9010,11 +9045,7 @@ pub const MetadataHttpService = struct {
                 defer self.unlockRuntime();
                 if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id))
                     return error.NotLeader;
-                if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftProgressOnly();
-                } else {
-                    try self.raft.runRaftProgressOnly();
-                }
+                _ = try self.runRequestRaftProgressLocked();
             }
             platform_clock.Clock.real().sleepMs(1);
         }
@@ -9091,11 +9122,7 @@ pub const MetadataHttpService = struct {
                 if (!self.raft.host.http_host.host.isLocalLeader(
                     self.metadata_group_id,
                 )) return error.NotLeader;
-                if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftProgressOnly();
-                } else {
-                    try self.raft.runRaftProgressOnly();
-                }
+                _ = try self.runRequestRaftProgressLocked();
             }
             platform_clock.Clock.real().sleepMs(1);
         }
@@ -9629,14 +9656,50 @@ pub const MetadataHttpService = struct {
     /// Drains accepted proposals and inbound consensus work without becoming a
     /// second owner of election and heartbeat time.
     pub fn runRaftProgressOnly(self: *MetadataHttpService) !void {
+        if (self.proposal_progress_driver.notifyManagedOwner()) return;
         try self.ensureLifecycleListenerRegistered();
         self.lockRuntime();
         defer self.unlockRuntime();
+        _ = try self.runRequestRaftProgressLocked();
+    }
+
+    /// The managed driver is the sole Ready owner while registered. Requests
+    /// only coalesce wakeups; they cannot inherit persistence or tick work.
+    pub fn registerManagedProgressOwner(self: *MetadataHttpService, wake: @import("../raft/runtime_loop.zig").ProgressWake) !void {
+        try self.proposal_progress_driver.registerManagedOwner(wake);
+        errdefer self.proposal_progress_driver.releaseManagedOwner();
+        try self.raft.host.http_host.host.registerProgressWake(.{ .ptr = wake.ptr, .notify_fn = wake.notify_fn });
+    }
+
+    pub fn releaseManagedProgressOwner(self: *MetadataHttpService) void {
+        self.raft.host.http_host.host.releaseProgressWake();
+        self.proposal_progress_driver.releaseManagedOwner();
+    }
+
+    fn runRequestRaftProgressLocked(self: *MetadataHttpService) !bool {
+        if (self.proposal_progress_driver.notifyManagedOwner()) return false;
+        try self.runManagedRaftProgressLocked();
+        return true;
+    }
+
+    fn runManagedRaftProgressLocked(self: *MetadataHttpService) !void {
         if (self.raft.pending_updates.items.len > 0) {
             _ = try self.raft.syncPendingRaftProgressOnly();
         } else {
             try self.raft.runRaftProgressOnly();
         }
+    }
+
+    pub fn runManagedRaftProgressOnly(self: *MetadataHttpService) !void {
+        try self.ensureLifecycleListenerRegistered();
+        var diagnostics: MetadataRaftDiagnosticsSnapshot = .{};
+        self.lockRuntime();
+        {
+            defer self.unlockRuntime();
+            try self.runManagedRaftProgressLocked();
+            diagnostics = self.raftDiagnosticsSnapshotLocked();
+        }
+        if (diagnostics.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
     }
 
     pub fn listRaftQuarantinesForAdmin(
@@ -9798,11 +9861,7 @@ pub const MetadataHttpService = struct {
         self.lockRuntime();
         {
             defer self.unlockRuntime();
-            if (self.raft.pending_updates.items.len > 0) {
-                _ = try self.raft.syncPendingRaftProgressOnly();
-            } else {
-                try self.raft.runRaftProgressOnly();
-            }
+            _ = try self.runRequestRaftProgressLocked();
         }
         if (!try self.ensureMetadataIncarnation()) {
             self.probe_ready.store(false, .release);
@@ -10210,24 +10269,23 @@ pub const MetadataHttpService = struct {
                 next_request_ns = now_ns + linearizable_metadata_read_retry_ns;
             }
             var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
+            var drove_progress = false;
             self.lockRuntime();
             {
                 defer self.unlockRuntime();
-                // The cadence driver owns election and heartbeat time. A
-                // read waiter may drain inbound/Ready work, but ticking here
-                // makes the Raft clock run faster with concurrent read load.
-                if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftProgressOnly();
-                } else {
-                    try self.raft.runRaftProgressOnly();
-                }
+                // Registered runtimes coalesce a wake instead of persisting
+                // on the request thread. Standalone callers retain their
+                // fallback drain without advancing election time.
+                drove_progress = try self.runRequestRaftProgressLocked();
                 raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
                 latest_raft_diagnostics_snapshot = raft_diagnostics_snapshot;
             }
-            raft_rounds += 1;
-            if (raft_diagnostics_snapshot.last_runtime_round) |round| {
-                if (round.elapsed_ns > slowest_round.elapsed_ns) slowest_round = round;
-                logMetadataRaftRoundDiagnostics(round);
+            if (drove_progress) {
+                raft_rounds += 1;
+                if (raft_diagnostics_snapshot.last_runtime_round) |round| {
+                    if (round.elapsed_ns > slowest_round.elapsed_ns) slowest_round = round;
+                    logMetadataRaftRoundDiagnostics(round);
+                }
             }
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             try request.ensureActive();
@@ -10405,6 +10463,66 @@ pub const MetadataHttpService = struct {
             .projected_core_epoch = self.projected_core_epoch.load(.acquire),
             .transition_readiness_epoch = self.transition_readiness_epoch.load(.acquire),
         };
+    }
+
+    pub fn planningSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
+        var inputs = try self.captureTransitionReadinessInputs();
+        defer inputs.deinit(self.alloc);
+        var snapshot: metadata_api.AdminSnapshot = .{
+            .planning_view = true,
+            .status = try self.metadataStatus(),
+            .tables = &.{},
+            .ranges = &.{},
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+        };
+        errdefer self.freeAdminSnapshot(&snapshot);
+        const lease = lease: {
+            self.lockComponents();
+            defer self.unlockComponents();
+            self.catalog_projection_reader.lock();
+            defer self.catalog_projection_reader.unlock();
+            break :lease try self.catalog_projection_reader.validationLeaseLocked(self.alloc, self.metadata_group_id, self.catalogProjectionSource());
+        };
+        var catalog = lease;
+        defer catalog.deinit();
+        const source = catalog.snapshot();
+        var tables: std.ArrayListUnmanaged(metadata_table_manager.TableRecord) = .empty;
+        errdefer {
+            for (tables.items) |table| metadata_table_manager.freeTable(self.alloc, table);
+            tables.deinit(self.alloc);
+        }
+        try tables.ensureTotalCapacity(self.alloc, source.tables.len);
+        for (source.tables) |table| tables.appendAssumeCapacity(try metadata_table_manager.cloneTable(self.alloc, .{ .table_id = table.table_id, .name = table.name }));
+        snapshot.tables = try tables.toOwnedSlice(self.alloc);
+        // Ownership transferred; an error later must not free the table array twice.
+        tables = .empty;
+        snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, source.ranges);
+        snapshot.merged_group_statuses = try metadata_state.mergeHealthyGroupStatuses(self.alloc, snapshot.tables, snapshot.ranges, inputs.placement_intents, &.{}, inputs.stores, &.{}, &.{}, &.{}, &.{});
+        return snapshot;
+    }
+
+    pub fn peerSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
+        var inputs = try self.captureTransitionReadinessInputs();
+        defer inputs.deinit(self.alloc);
+        var snapshot: metadata_api.AdminSnapshot = .{
+            .peer_view = true,
+            .status = try self.metadataStatus(),
+            .tables = &.{},
+            .ranges = &.{},
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+        };
+        errdefer self.freeAdminSnapshot(&snapshot);
+        snapshot.stores = try cloneProjectedStoresOwned(self.alloc, inputs.stores);
+        snapshot.placement_intents = try cloneProjectedPlacementIntentsOwned(self.alloc, inputs.placement_intents);
+        snapshot.merged_group_statuses = try metadata_state.mergeHealthyGroupStatuses(self.alloc, &.{}, &.{}, snapshot.placement_intents, &.{}, snapshot.stores, &.{}, &.{}, &.{}, &.{});
+        snapshot.peer_view_revision = try @import("peer_view.zig").revision(self.alloc, snapshot);
+        return snapshot;
     }
 
     pub fn controlSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
@@ -20566,6 +20684,36 @@ test "metadata http service catalog cache is independent from volatile projectio
     try std.testing.expectEqual(live_raft.votes_rejected, fallback_status.metadata_raft_votes_rejected);
     try std.testing.expectEqual(live_raft.votes_unknown, fallback_status.metadata_raft_votes_unknown);
 
+    var large_schema: [65536]u8 = @splat(' ');
+    large_schema[0] = '{';
+    large_schema[1] = '}';
+    const table_receipt = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_table = .{ .table_id = 777, .name = "compact-view", .schema_json = &large_schema } });
+    try svc.waitForTransitionApplied(table_receipt);
+    const range_receipt = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_range = .{ .group_id = 77701, .table_id = 777, .start_key = "" } });
+    try svc.waitForTransitionApplied(range_receipt);
+    var full_view = try svc.controlSnapshot();
+    defer svc.freeAdminSnapshot(&full_view);
+    try std.testing.expectEqual(@as(usize, 1), full_view.tables.len);
+    var peers_view = try svc.peerSnapshot();
+    defer svc.freeAdminSnapshot(&peers_view);
+    var planning_view = try svc.planningSnapshot();
+    defer svc.freeAdminSnapshot(&planning_view);
+    try std.testing.expect(peers_view.peer_view and planning_view.planning_view);
+    try std.testing.expectEqual(@as(usize, 0), peers_view.tables.len);
+    try std.testing.expectEqual(@as(usize, 0), peers_view.ranges.len);
+    try std.testing.expectEqual(@as(usize, 1), planning_view.tables.len);
+    try std.testing.expectEqual(@as(usize, 0), planning_view.tables[0].schema_json.len);
+    try std.testing.expectEqual(@as(u64, 77701), planning_view.ranges[0].group_id);
+    const full_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, full_view, .{});
+    defer std.testing.allocator.free(full_bytes);
+    const peers_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, peers_view, .{});
+    defer std.testing.allocator.free(peers_bytes);
+    const planning_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, planning_view, .{});
+    defer std.testing.allocator.free(planning_bytes);
+    try std.testing.expect(peers_bytes.len * 10 < full_bytes.len);
+    try std.testing.expect(planning_bytes.len * 10 < full_bytes.len);
+    std.debug.print("compact-view bytes full={d} peers={d} planning={d}\n", .{ full_bytes.len, peers_bytes.len, planning_bytes.len });
+
     // Teardown closes callback admission permanently. A concurrent catalog
     // reader must observe cancellation instead of silently proceeding after
     // the listener pair was detached from Raft.
@@ -20698,6 +20846,61 @@ test "metadata http service linearizable reads leave elections to the cadence dr
     try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
     try svc.runLifecycleRound();
     try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+
+    const WakeProbe = struct {
+        calls: usize = 0,
+        fn notify(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var wake_probe = WakeProbe{};
+    try svc.registerManagedProgressOwner(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify });
+    defer svc.releaseManagedProgressOwner();
+    try std.testing.expectError(error.MetadataProgressAlreadyOwned, svc.registerManagedProgressOwner(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify }));
+    const applied_before = svc.raft.host.http_host.host.raftStatus(2910).?.applied_index;
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_table = .{ .table_id = 100, .name = "owned_progress" } });
+    try svc.runRaftProgressOnly();
+    try std.testing.expect(wake_probe.calls > 0);
+    // No managed driver has drained the notification yet. A request must not
+    // persist/apply this accepted proposal or ReadIndex on its own thread.
+    try std.testing.expectEqual(applied_before, svc.raft.host.http_host.host.raftStatus(2910).?.applied_index);
+    try std.testing.expectError(error.DeadlineExceeded, svc.ensureLinearizableReadWithContext(.{ .deadline_ns = platform_time.monotonicNs() + 20 * std.time.ns_per_ms }));
+    try std.testing.expectEqual(applied_before, svc.raft.host.http_host.host.raftStatus(2910).?.applied_index);
+    for (0..16) |_| {
+        try svc.runManagedRaftProgressOnly();
+        if (svc.raft.host.http_host.host.raftStatus(2910).?.applied_index >= receipt.index) break;
+    }
+    try svc.waitForTransitionApplied(receipt);
+    try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+    // A peer response must wake the same owner without request-side progress
+    // or waiting for an election tick. Removing ownership fences callbacks.
+    const inbound_before = wake_probe.calls;
+    const host = svc.raft.host.http_host.host;
+    const response = raft_engine.core.Message{
+        .msg_type = .heartbeat_response,
+        .from = 1,
+        .to = 1,
+        .term = host.raftStatus(2910).?.hard.current_term,
+    };
+    const inbound = raft_engine.runtime.transport_iface.PeerBatch{
+        .peer_id = 1,
+        .groups = &.{.{ .group_id = 2910, .messages = &.{response} }},
+    };
+    try host.enqueueInboundBatch(inbound);
+    try std.testing.expectEqual(inbound_before + 1, wake_probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), host.metrics.pending_inbound_messages);
+    try std.testing.expectEqual(before_read, host.runtime_host.virtualTimeMs());
+    try svc.runManagedRaftProgressOnly();
+    svc.releaseManagedProgressOwner();
+    const retired_calls = wake_probe.calls;
+    try host.enqueueInboundBatch(inbound);
+    try std.testing.expectEqual(retired_calls, wake_probe.calls);
+    // Registering again discovers debt accepted while no owner existed.
+    try svc.registerManagedProgressOwner(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify });
+    try std.testing.expectEqual(retired_calls + 1, wake_probe.calls);
+    try svc.runManagedRaftProgressOnly();
+    try std.testing.expectEqual(before_read, host.runtime_host.virtualTimeMs());
 }
 
 test "metadata http projected clone helpers clean up on allocation failure" {

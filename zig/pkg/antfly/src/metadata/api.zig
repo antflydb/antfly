@@ -255,6 +255,10 @@ pub const ReplicationSourceActionHint = struct {
 };
 
 pub const AdminSnapshot = struct {
+    /// Compact observational peer view. Never substitutes for a catalog view.
+    peer_view: bool = false,
+    planning_view: bool = false,
+    peer_view_revision: [32]u8 = @splat(0),
     status: MetadataStatus,
     reallocation_request: ?reallocation_request.ReallocationRequestRecord = null,
     tables: []table_manager.TableRecord,

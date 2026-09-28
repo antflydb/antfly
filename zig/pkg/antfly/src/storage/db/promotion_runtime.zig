@@ -275,10 +275,9 @@ fn processResolutionArtifactWithCatalog(
                 // byte-stable replay (a retried resolution window
                 // re-emits its artifact when the handoff marker did not
                 // land). The state row proves the earlier batch
-                // committed, so re-upserting adds nothing -- and the
-                // sink's live-promotion transform clears `merged_into`,
-                // so a repeat would silently undo a curator redirect
-                // that landed on this key between the two replays.
+                // committed, so re-upserting adds nothing. Avoid a remote
+                // write even though the sink's live transform is safe to
+                // replay across a curator redirect.
                 if (promotedRefMatches(previous, e)) continue;
             } else if (same_logical_key and previous.storage_table != null and e.doc_ref.storage_table != null) {
                 // A physical table move with the same logical key cannot use
@@ -1155,9 +1154,8 @@ test "processResolutionArtifact skips a byte-stable replay of an already-promote
 
     // A retried resolution window re-emits the identical artifact (its
     // handoff marker did not land). The entities are already durable, so the
-    // promoter must not run the live-promotion transform again: that
-    // transform clears `merged_into`, and a curator may have redirected one
-    // of these keys in the meantime.
+    // promoter must not issue redundant remote writes. Destination transforms
+    // remain replay-safe even when this source-side state has not landed.
     const puts_before_replay = map.put_count;
     try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
     try testing.expectEqual(puts_before_replay, map.put_count);

@@ -1030,9 +1030,12 @@ class MultiNodeScalingCluster:
                 )
             )
 
-        for url in self.metadata_urls:
+        for url, proc in zip(self.metadata_urls, self.metadata_procs):
             if not wait_for_server(
-                url, timeout=self.startup_timeout(30.0), path="/metadata/v1/status"
+                url,
+                timeout=self.startup_timeout(30.0),
+                path="/metadata/v1/status",
+                processes=[("metadata", proc)],
             ):
                 raise RuntimeError(
                     f"Metadata node failed to start at {url}\n{self.debug_logs()}"
@@ -1216,6 +1219,12 @@ class MultiNodeScalingCluster:
                 )
                 try:
                     response = requests.get(f"{url}{path}", timeout=request_timeout)
+                    # HTTP can have answered from a foreign listener while
+                    # our child lost its bind race. Never retire a pending
+                    # node after its owned process exits during the request.
+                    if proc is not None and proc.poll() is not None:
+                        consecutive_successes[node_id] = 0
+                        continue
                     if response.ok:
                         consecutive_successes[node_id] += 1
                         if consecutive_successes[node_id] >= 2:

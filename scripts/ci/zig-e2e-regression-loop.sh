@@ -76,6 +76,27 @@ else
   )
 fi
 
+# Collect every selector before compilation or parallel worker admission. A
+# renamed/missing test is a configuration error, not a flake to repeat all day.
+if [[ "${ANTFLY_E2E_REGRESSION_COLLECTED:-0}" != "1" ]]; then
+  for project in e2e/antfly e2e/inference; do
+    selectors=()
+    for test_name in "${tests[@]}"; do
+      case_project=e2e/antfly
+      if [[ "$test_name" == e2e/inference/* ]]; then case_project=e2e/inference; fi
+      if [[ "$case_project" == "$project" ]]; then selectors+=("$test_name"); fi
+    done
+    if ((${#selectors[@]} > 0)); then
+      (
+        cd "$repo_root/zig"
+        python3 "$script_dir/run_e2e_case.py" \
+          uv run --project "$project" pytest --collect-only -q "${selectors[@]}"
+      ) || exit "$?"
+    fi
+  done
+fi
+export ANTFLY_E2E_REGRESSION_COLLECTED=1
+
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   (
     cd "$repo_root/zig"

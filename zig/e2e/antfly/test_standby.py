@@ -274,7 +274,9 @@ class HAStandaloneNode:
                 env=env,
             ),
         )
-        if not wait_for_server(self.url, path="/readyz", timeout=30.0):
+        if not wait_for_server(
+            self.url, path="/readyz", timeout=30.0, processes=[("server", self.proc)]
+        ):
             logs = self.debug_logs()
             self.stop()
             raise RuntimeError(

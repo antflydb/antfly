@@ -85,6 +85,13 @@ pub const TxnAcknowledgeRequest = struct {
     restore_staging_plan_id: ?[16]u8 = null,
 };
 
+pub const TxnAcknowledgeManyRequest = struct {
+    txn_id: db_mod.types.TxnId,
+    participants: []const []const u8,
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
+};
+
 pub fn acknowledgeGroupLocalWithRequest(writes: table_writes.TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest, cancellation: db_mod.types.CancellationToken) !?void {
     try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
     if (req.restore_staging_scope != null) {
@@ -100,6 +107,26 @@ pub fn acknowledgeGroupLocalWithRequest(writes: table_writes.TableWriteSource, a
         return result;
     }
     return writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, req.txn_id, req.participant);
+}
+
+fn validateAcknowledgementMany(req: TxnAcknowledgeManyRequest) !void {
+    try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
+    if (req.restore_staging_scope != null and req.restore_staging_plan_id == null) return error.InvalidTxnRequest;
+    if (req.participants.len == 0 or req.participants.len > 64) return error.InvalidTxnRequest;
+    for (req.participants) |participant| if (parseParticipantRef(participant) == null) return error.InvalidTxnRequest;
+}
+
+pub fn acknowledgeManyGroupLocalWithRequest(writes: table_writes.TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest, cancellation: db_mod.types.CancellationToken) !?void {
+    try validateAcknowledgementMany(req);
+    try cancellation.check();
+    const result = try writes.batchGroupLocal(alloc, group_id, table_name, .{
+        .restore_staging_scope = req.restore_staging_scope,
+        .restore_staging_plan_id = req.restore_staging_plan_id,
+        .sync_level = .write,
+        .transaction = .{ .acknowledge_many = .{ .txn_id = req.txn_id, .participants = req.participants } },
+    });
+    try cancellation.check();
+    return result;
 }
 
 /// Hidden owner resolution retains its authenticated descriptor lookup identity
@@ -173,6 +200,7 @@ pub const ParticipantWorker = struct {
             table_name: []const u8,
             req: TxnAcknowledgeRequest,
         ) anyerror!void = null,
+        acknowledge_many_group: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest) anyerror!void = null,
         resolve_group_with_cancellation: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -254,6 +282,23 @@ pub const ParticipantWorker = struct {
     pub fn acknowledgeGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
         const acknowledge = self.vtable.acknowledge_group orelse return;
         try acknowledge(self.ptr, alloc, group_id, table_name, req);
+    }
+    pub fn acknowledgeManyGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest) !void {
+        if (req.participants.len == 0 or req.participants.len > 64) return error.InvalidTxnRequest;
+        if (self.vtable.acknowledge_many_group) |callback| {
+            const delivered = delivered: {
+                callback(self.ptr, alloc, group_id, table_name, req) catch |err| switch (err) {
+                    // Acknowledgements are idempotent. Mixed-version hosts retain
+                    // the original per-participant path; uncertain errors retain
+                    // recovery debt rather than asserting delivery.
+                    error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion => break :delivered false,
+                    else => return err,
+                };
+                break :delivered true;
+            };
+            if (delivered) return;
+        }
+        for (req.participants) |participant| try self.acknowledgeGroup(alloc, group_id, table_name, .{ .txn_id = req.txn_id, .participant = participant, .restore_staging_scope = req.restore_staging_scope, .restore_staging_plan_id = req.restore_staging_plan_id });
     }
 };
 
@@ -360,6 +405,7 @@ pub const HostedParticipantWorker = struct {
                 .status_group_scoped = statusGroupScoped,
                 .status_group_until = statusGroupUntil,
                 .acknowledge_group = acknowledgeGroup,
+                .acknowledge_many_group = acknowledgeManyGroup,
             },
         };
     }
@@ -439,6 +485,7 @@ pub const HostedParticipantWorker = struct {
         switch (route) {
             .local => {
                 const result = self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, try self.localPreDecisionContext(deadline_ns)) catch |err| {
+                    std.log.warn("transaction prepare candidate failed group_id={} node_id={} phase=local err={s}", .{ group_id, attempted_node_id, @errorName(err) });
                     if (!isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_prepare_group_local_with_pre_decision_context != null)) return err;
                     return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline_ns);
                 };
@@ -460,6 +507,7 @@ pub const HostedParticipantWorker = struct {
                     budget.client_timeout_ms,
                     budget.server_budget_ms,
                 ) catch |err| {
+                    std.log.warn("transaction prepare candidate failed group_id={} node_id={} phase=remote err={s}", .{ group_id, attempted_node_id, @errorName(err) });
                     if (!shouldTryAnotherPreDecisionAttempt(err, &delivery_tracker)) return err;
                     return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, body, deadline_ns);
                 };
@@ -780,6 +828,23 @@ pub const HostedParticipantWorker = struct {
         };
     }
 
+    fn acknowledgeManyGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        try validateAcknowledgementMany(req);
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => _ = (try acknowledgeManyGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .none)) orelse return error.UnknownGroup,
+            .remote => |remote| {
+                var client = self.httpClient(alloc);
+                const body = try encodeTxnAcknowledgeManyRequest(alloc, req);
+                defer alloc.free(body);
+                var response = try client.fetchGroupTxnAcknowledgeMany(remote.base_uri, group_id, table_name, body);
+                response.deinit(alloc);
+            },
+        }
+    }
+
     fn acknowledgeGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
@@ -1020,6 +1085,7 @@ pub const ExecuteOptions = struct {
 const ParticipantFanoutSlot = struct {
     err: ?anyerror = null,
     acknowledgement_err: ?anyerror = null,
+    acknowledgement_ready: bool = false,
     /// Begin failures other than a definite routing miss may have applied
     /// before their response failed and therefore require an abort delivery.
     may_have_transaction_state: bool = false,
@@ -1273,15 +1339,7 @@ fn executeMultiTableCommitOnce(
             if (trace_writer) |tw| {
                 tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
             }
-            if (begun_count > 0) abortParticipants(
-                alloc,
-                worker,
-                txn_id,
-                commit_version,
-                participants.items,
-                participant_ids,
-                if (options.retain_terminal) participants.items.len else begun_count,
-            ) catch {};
+            if (begun_count > 0) abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, if (options.retain_terminal) participants.items.len else begun_count, fanout_slots, options) catch {};
         }
     }
 
@@ -1345,15 +1403,7 @@ fn executeMultiTableCommitOnce(
             // prepared followers in an earlier execution: only fresh IDs can
             // use this invocation's contact evidence to elide phase two.
             abort_on_error = false;
-            try abortParticipants(
-                alloc,
-                worker,
-                txn_id,
-                commit_version,
-                participants.items,
-                participant_ids,
-                if (options.retain_terminal) participants.items.len else 1,
-            );
+            try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, if (options.retain_terminal) participants.items.len else 1, fanout_slots, options);
             std.log.warn("transaction begin failed table={s} group_id={} err={s}", .{
                 participant.table_name, participant.group_id, @errorName(err),
             });
@@ -1397,6 +1447,7 @@ fn executeMultiTableCommitOnce(
                 participant_ids,
                 fanout_slots,
                 options.retain_terminal,
+                options,
             );
             return switch (failure) {
                 error.UnknownGroup, error.PreDecisionNotProposed => .{ .conflict = participantUnavailableConflict(participants.items[participant_index], .begin) },
@@ -1417,7 +1468,7 @@ fn executeMultiTableCommitOnce(
                         tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
                     }
                     abort_on_error = false;
-                    try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                    try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                     return .{ .conflict = participantConflict(participant, err) };
                 },
                 error.UnknownGroup,
@@ -1430,7 +1481,7 @@ fn executeMultiTableCommitOnce(
                     // decision may an ephemeral caller start a fresh attempt.
                     // Failure to prove abort still propagates unchanged.
                     abort_on_error = false;
-                    try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                    try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                     return .{ .conflict = participantUnavailableConflict(participant, .prepare) };
                 },
                 else => {
@@ -1438,7 +1489,7 @@ fn executeMultiTableCommitOnce(
                         participant.table_name, participant.group_id, @errorName(err),
                     });
                     abort_on_error = false;
-                    try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                    try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                     return err;
                 },
             }
@@ -1460,7 +1511,7 @@ fn executeMultiTableCommitOnce(
             if (already_checked) continue;
             table_catalog.validateTransactionTopologyEpoch(alloc, catalog, participant.table_name, participant.topology_epoch) catch |err| {
                 abort_on_error = false;
-                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                 return err;
             };
         }
@@ -1507,7 +1558,7 @@ fn executeMultiTableCommitOnce(
                     });
                 }
                 abort_on_error = false;
-                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                 return .{ .conflict = participantDecisionConflict(participant, .resolve) };
             },
             error.TxnNotFound, error.InvalidTxnRecord => {
@@ -1523,7 +1574,7 @@ fn executeMultiTableCommitOnce(
                 // The decision participant has no durable transaction record,
                 // so no commit decision exists yet.
                 abort_on_error = false;
-                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                 return .{ .conflict = participantTornStateConflict(participant, .resolve) };
             },
             else => {
@@ -1574,7 +1625,7 @@ fn executeMultiTableCommitOnce(
                     },
                     .aborted => {
                         abort_on_error = false;
-                        try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                        try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
                         return .{ .conflict = participantDecisionConflict(participant, .resolve) };
                     },
                 }
@@ -1994,15 +2045,9 @@ const ResolveFollowerFanoutTask = struct {
             slot.propagation_pending = true;
             return;
         }
-        worker.acknowledgeGroup(arena.allocator(), coordinator.group_id, coordinator.table_name, .{
-            .restore_staging_scope = coordinator.restore_staging_scope,
-            .restore_staging_plan_id = coordinator.restore_staging_plan_id,
-            .txn_id = txn_id,
-            .participant = participant_id,
-        }) catch |err| {
-            slot.acknowledgement_err = err;
-            slot.propagation_pending = true;
-        };
+        slot.acknowledgement_ready = true;
+        _ = coordinator;
+        _ = participant_id;
     }
 };
 
@@ -2066,6 +2111,7 @@ fn runResolveFollowerFanout(
                 &slots[i],
             );
         }
+        acknowledgeFollowerWindow(worker, txn_id, participants, participant_ids, slots, start, end, true);
     }
 }
 
@@ -2372,6 +2418,19 @@ pub fn encodeTxnAcknowledgeRequest(alloc: std.mem.Allocator, req: TxnAcknowledge
         "{{\"txn_id\":\"{s}\",\"participant\":{f}",
         .{ &txn_hex, std.json.fmt(req.participant, .{}) },
     );
+    defer alloc.free(base);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, base);
+    try appendRestoreAuthority(alloc, &out, req.restore_staging_scope, req.restore_staging_plan_id);
+    try out.append(alloc, '}');
+    return out.toOwnedSlice(alloc);
+}
+
+pub fn encodeTxnAcknowledgeManyRequest(alloc: std.mem.Allocator, req: TxnAcknowledgeManyRequest) ![]u8 {
+    try validateAcknowledgementMany(req);
+    const txn_hex = encodeTxnIdHex(req.txn_id);
+    const base = try std.fmt.allocPrint(alloc, "{{\"txn_id\":\"{s}\",\"participants\":{f}", .{ &txn_hex, std.json.fmt(req.participants, .{}) });
     defer alloc.free(base);
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -2797,6 +2856,40 @@ pub fn freeTxnAcknowledgeRequest(alloc: std.mem.Allocator, req: *TxnAcknowledgeR
     req.* = undefined;
 }
 
+pub fn parseTxnAcknowledgeManyRequest(alloc: std.mem.Allocator, body: []const u8) !TxnAcknowledgeManyRequest {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidTxnRequest,
+    };
+    if (obj.get("participant") != null) return error.InvalidTxnRequest;
+    const values = obj.get("participants") orelse return error.InvalidTxnRequest;
+    if (values != .array or values.array.items.len == 0 or values.array.items.len > 64) return error.InvalidTxnRequest;
+    for (values.array.items) |value| if (value != .string or parseParticipantRef(value.string) == null) return error.InvalidTxnRequest;
+    const scope: ?[32]u8 = if (obj.get("restore_staging_scope")) |value| try integrity_wire.parseGenerationSet(value) else null;
+    const plan_id = try parseRestorePlan(obj, scope);
+    if ((scope == null) != (plan_id == null)) return error.InvalidTxnRequest;
+    const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
+    const participants = try alloc.alloc([]const u8, values.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (participants[0..initialized]) |participant| alloc.free(participant);
+        alloc.free(participants);
+    }
+    for (values.array.items, participants) |value, *participant| {
+        participant.* = try alloc.dupe(u8, value.string);
+        initialized += 1;
+    }
+    return .{ .txn_id = txn_id, .participants = participants, .restore_staging_scope = scope, .restore_staging_plan_id = plan_id };
+}
+
+pub fn freeTxnAcknowledgeManyRequest(alloc: std.mem.Allocator, req: *TxnAcknowledgeManyRequest) void {
+    for (req.participants) |participant| alloc.free(participant);
+    alloc.free(req.participants);
+    req.* = undefined;
+}
+
 pub fn parseTxnStatusResponse(alloc: std.mem.Allocator, body: []const u8) !TxnStatusResponse {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -3050,6 +3143,23 @@ fn abortParticipants(
     participant_ids: []const []const u8,
     attempted_count: usize,
 ) !void {
+    const slots = try alloc.alloc(ParticipantFanoutSlot, participants.len);
+    defer alloc.free(slots);
+    for (slots) |*slot| slot.reset();
+    return abortParticipantsWithOptions(alloc, worker, txn_id, timestamp, participants, participant_ids, attempted_count, slots, .{});
+}
+
+fn abortParticipantsWithOptions(
+    alloc: std.mem.Allocator,
+    worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    timestamp: u64,
+    participants: []const ParticipantTxn,
+    participant_ids: []const []const u8,
+    attempted_count: usize,
+    slots: []ParticipantFanoutSlot,
+    options: ExecuteOptions,
+) !void {
     if (participants.len == 0) return;
     std.debug.assert(participant_ids.len == participants.len);
     std.debug.assert(attempted_count > 0 and attempted_count <= participants.len);
@@ -3079,47 +3189,8 @@ fn abortParticipants(
         if (status != .aborted) return error.AbortDecisionNotDurable;
     };
 
-    // Once the coordinator decision is durable, follower delivery is
-    // idempotent recovery work and must not contradict that decision.
-    for (participants[1..], 1..) |participant, participant_index| {
-        if (participant_index < attempted_count) {
-            worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
-                .restore_staging_scope = participant.restore_staging_scope,
-                .restore_staging_plan_id = participant.restore_staging_plan_id,
-                .txn_id = txn_id,
-                .status = .aborted,
-                .commit_version = timestamp,
-                // An acknowledgement removes the participant from durable
-                // recovery, so phase two must be committed/applied first.
-                .sync_level = .write,
-            }) catch |err| {
-                // Continue notifying later participants. The durable
-                // coordinator record remains authoritative and recovery will
-                // retry any unavailable attempted participant.
-                std.log.warn("transaction abort delivery failed table={s} group_id={} err={s}", .{
-                    participant.table_name,
-                    participant.group_id,
-                    @errorName(err),
-                });
-                continue;
-            };
-        }
-        // Participants beyond attempted_count were never contacted. They have
-        // no transaction state or intents and are safe to acknowledge directly
-        // after the coordinator's abort decision is durable.
-        worker.acknowledgeGroup(alloc, coordinator.group_id, coordinator.table_name, .{
-            .restore_staging_scope = coordinator.restore_staging_scope,
-            .restore_staging_plan_id = coordinator.restore_staging_plan_id,
-            .txn_id = txn_id,
-            .participant = participant_ids[participant_index],
-        }) catch |err| {
-            std.log.warn("transaction abort acknowledgement deferred table={s} group_id={} err={s}", .{
-                participant.table_name,
-                participant.group_id,
-                @errorName(err),
-            });
-        };
-    }
+    // The coordinator decision must be durable before any independent cleanup.
+    runAbortFollowerFanout(worker, txn_id, timestamp, participants, participant_ids, attempted_count, false, slots, options);
 }
 
 fn abortParticipantsWithContactMask(
@@ -3129,15 +3200,16 @@ fn abortParticipantsWithContactMask(
     timestamp: u64,
     participants: []const ParticipantTxn,
     participant_ids: []const []const u8,
-    slots: []const ParticipantFanoutSlot,
+    slots: []ParticipantFanoutSlot,
     retained: bool,
+    options: ExecuteOptions,
 ) !void {
     if (participants.len == 0) return;
     std.debug.assert(participant_ids.len == participants.len and slots.len == participants.len);
     // Contact evidence is invocation-local, not transaction-local. In a
     // retained replay even a definitely unproposed BEGIN can have old intents.
     // Resolve the entire durable cohort; unavailable followers remain enlisted.
-    if (retained) return abortParticipants(alloc, worker, txn_id, timestamp, participants, participant_ids, participants.len);
+    if (retained) return abortParticipantsWithOptions(alloc, worker, txn_id, timestamp, participants, participant_ids, participants.len, slots, options);
 
     const coordinator = participants[0];
     worker.resolveGroup(alloc, coordinator.group_id, coordinator.table_name, .{
@@ -3153,41 +3225,108 @@ fn abortParticipantsWithContactMask(
         if (status != .aborted) return error.AbortDecisionNotDurable;
     };
 
-    for (participants[1..], 1..) |participant, participant_index| {
-        if (slots[participant_index].may_have_transaction_state) {
-            worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
-                .restore_staging_scope = participant.restore_staging_scope,
-                .restore_staging_plan_id = participant.restore_staging_plan_id,
-                .txn_id = txn_id,
-                .status = .aborted,
-                .commit_version = timestamp,
-                .sync_level = .write,
-            }) catch |err| {
-                // An explicitly missing record proves the failed begin did not
-                // create participant state. Other failures remain enlisted so
-                // durable coordinator recovery can redeliver the abort.
-                if (err != error.TxnNotFound) {
-                    std.log.warn("transaction abort delivery failed table={s} group_id={} err={s}", .{
-                        participant.table_name,
-                        participant.group_id,
-                        @errorName(err),
-                    });
-                    continue;
+    runAbortFollowerFanout(worker, txn_id, timestamp, participants, participant_ids, null, true, slots, options);
+}
+
+const AbortFollowerFanoutTask = struct {
+    fn run(
+        worker: ParticipantWorker,
+        coordinator: *const ParticipantTxn,
+        participant: *const ParticipantTxn,
+        participant_id: []const u8,
+        txn_id: db_mod.types.TxnId,
+        timestamp: u64,
+        resolve: bool,
+        allow_missing_state: bool,
+        slot: *ParticipantFanoutSlot,
+    ) void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        slot.reset();
+        if (resolve) worker.resolveGroup(arena.allocator(), participant.group_id, participant.table_name, .{
+            .restore_staging_scope = participant.restore_staging_scope,
+            .restore_staging_plan_id = participant.restore_staging_plan_id,
+            .txn_id = txn_id,
+            .status = .aborted,
+            .commit_version = timestamp,
+            .sync_level = .write,
+        }) catch |err| {
+            if (!allow_missing_state or err != error.TxnNotFound) {
+                slot.err = err;
+                return;
+            }
+        };
+        // Join the independently proven resolutions before constructing a
+        // bounded coordinator command. Failed followers retain recovery debt.
+        slot.acknowledgement_ready = true;
+        _ = coordinator;
+        _ = participant_id;
+    }
+};
+
+fn acknowledgeFollowerWindow(worker: ParticipantWorker, txn_id: db_mod.types.TxnId, participants: []const ParticipantTxn, participant_ids: []const []const u8, slots: []ParticipantFanoutSlot, start: usize, end: usize, committed: bool) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var ids: [64][]const u8 = undefined;
+    var indexes: [64]usize = undefined;
+    var count: usize = 0;
+    for (start..end) |i| {
+        if (!slots[i].acknowledgement_ready) continue;
+        ids[count] = participant_ids[i];
+        indexes[count] = i;
+        count += 1;
+        if (count == ids.len) {
+            worker.acknowledgeManyGroup(arena.allocator(), participants[0].group_id, participants[0].table_name, .{ .txn_id = txn_id, .participants = ids[0..count], .restore_staging_scope = participants[0].restore_staging_scope, .restore_staging_plan_id = participants[0].restore_staging_plan_id }) catch |err| {
+                for (indexes[0..count]) |index| {
+                    slots[index].acknowledgement_err = err;
+                    if (committed) slots[index].propagation_pending = true;
                 }
             };
+            count = 0;
         }
-        worker.acknowledgeGroup(alloc, coordinator.group_id, coordinator.table_name, .{
-            .restore_staging_scope = coordinator.restore_staging_scope,
-            .restore_staging_plan_id = coordinator.restore_staging_plan_id,
-            .txn_id = txn_id,
-            .participant = participant_ids[participant_index],
-        }) catch |err| {
-            std.log.warn("transaction abort acknowledgement deferred table={s} group_id={} err={s}", .{
-                participant.table_name,
-                participant.group_id,
-                @errorName(err),
-            });
-        };
+    }
+    if (count != 0) worker.acknowledgeManyGroup(arena.allocator(), participants[0].group_id, participants[0].table_name, .{ .txn_id = txn_id, .participants = ids[0..count], .restore_staging_scope = participants[0].restore_staging_scope, .restore_staging_plan_id = participants[0].restore_staging_plan_id }) catch |err| {
+        for (indexes[0..count]) |index| {
+            slots[index].acknowledgement_err = err;
+            if (committed) slots[index].propagation_pending = true;
+        }
+    };
+}
+
+fn runAbortFollowerFanout(
+    worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    timestamp: u64,
+    participants: []const ParticipantTxn,
+    participant_ids: []const []const u8,
+    attempted_count: ?usize,
+    allow_missing_state: bool,
+    slots: []ParticipantFanoutSlot,
+    options: ExecuteOptions,
+) void {
+    std.debug.assert(participants.len == participant_ids.len and participants.len == slots.len);
+    if (participants.len <= 1) return;
+    const width = fanoutWidth(options, participants.len - 1);
+    var start: usize = 1;
+    while (start < participants.len) : (start += width) {
+        const end = @min(start + width, participants.len);
+        var group: std.Io.Group = .init;
+        for (start..end) |i| {
+            // Copy contact evidence before the worker resets its result slot.
+            const resolve = if (attempted_count) |count| i < count else slots[i].may_have_transaction_state;
+            if (options.fanout_io) |io| {
+                group.concurrent(io, AbortFollowerFanoutTask.run, .{ worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i] }) catch
+                    AbortFollowerFanoutTask.run(worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i]);
+            } else {
+                AbortFollowerFanoutTask.run(worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i]);
+            }
+        }
+        if (options.fanout_io) |io| awaitFanout(&group, io);
+        acknowledgeFollowerWindow(worker, txn_id, participants, participant_ids, slots, start, end, false);
+    }
+    for (slots[1..], 1..) |slot, i| {
+        if (slot.err) |err| std.log.warn("transaction abort delivery failed table={s} group_id={} err={s}", .{ participants[i].table_name, participants[i].group_id, @errorName(err) });
+        if (slot.acknowledgement_err) |err| std.log.warn("transaction abort acknowledgement deferred table={s} group_id={} err={s}", .{ participants[0].table_name, participants[0].group_id, @errorName(err) });
     }
 }
 
@@ -3293,6 +3432,55 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!@import("builtin").is_test or @import("storage_source_options").control_only) return struct {};
     const Suite = struct {
+        test "distributed txn acknowledgement windows batch only proven followers and preserve recovery debt" {
+            const Recorder = struct {
+                batches: usize = 0,
+                singles: usize = 0,
+                members: usize = 0,
+                failure: ?anyerror = null,
+                fn worker(self: *@This()) ParticipantWorker {
+                    return .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status, .acknowledge_group = single, .acknowledge_many_group = many } };
+                }
+                fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+                fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+                fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {}
+                fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+                    return .pending;
+                }
+                fn single(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnAcknowledgeRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.singles += 1;
+                }
+                fn many(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnAcknowledgeManyRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.batches += 1;
+                    try std.testing.expect(req.participants.len <= 64);
+                    for (req.participants) |id| try std.testing.expect(!std.mem.eql(u8, id, "excluded"));
+                    if (self.failure) |err| return err;
+                    self.members += req.participants.len;
+                }
+            };
+            var recorder: Recorder = .{};
+            const participants: [132]ParticipantTxn = @splat(.{ .table_name = "docs", .group_id = 7, .topology_epoch = 1 });
+            var ids: [132][]const u8 = @splat("eligible");
+            ids[2] = "excluded";
+            var slots: [132]ParticipantFanoutSlot = @splat(.{ .acknowledgement_ready = true });
+            slots[2] = .{ .err = error.GroupLeaderUnavailable };
+            const txn: db_mod.types.TxnId = @splat(1);
+            acknowledgeFollowerWindow(recorder.worker(), txn, &participants, &ids, &slots, 1, slots.len, true);
+            try std.testing.expectEqual(@as(usize, 3), recorder.batches);
+            try std.testing.expectEqual(@as(usize, 130), recorder.members);
+            try std.testing.expectEqual(@as(usize, 0), recorder.singles);
+            recorder.failure = error.ConnectionRefused;
+            acknowledgeFollowerWindow(recorder.worker(), txn, &participants, &ids, &slots, 1, 4, true);
+            try std.testing.expectEqual(@as(?anyerror, error.ConnectionRefused), slots[1].acknowledgement_err);
+            try std.testing.expect(slots[1].propagation_pending and slots[3].propagation_pending);
+            try std.testing.expect(slots[2].acknowledgement_err == null);
+            try std.testing.expectEqual(@as(usize, 0), recorder.singles);
+            recorder.failure = error.UnsupportedOperation;
+            try recorder.worker().acknowledgeManyGroup(std.testing.allocator, 7, "docs", .{ .txn_id = txn, .participants = &.{ "one", "two" } });
+            try std.testing.expectEqual(@as(usize, 2), recorder.singles);
+        }
         test "distributed txn prepare preserves exact content observations" {
             const alloc = std.testing.allocator;
             const encoded = try encodeTxnPrepareRequest(alloc, .{
@@ -3533,6 +3721,123 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "hosted participant bulk acknowledgements use typed transport and only definite legacy fallback" {
+            const FakeRouter = struct {
+                fn iface() table_router.HostedGroupRouter {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .local_node_id = localNodeId,
+                            .local_status = localStatus,
+                            .group_leader_node_id = groupLeaderNodeId,
+                            .group_node_ids = groupNodeIds,
+                            .node_status = nodeStatus,
+                            .node_base_uri = nodeBaseUri,
+                        },
+                    };
+                }
+
+                fn localNodeId(_: *anyopaque) u64 {
+                    return 99;
+                }
+
+                fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+                    return .absent;
+                }
+
+                fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+                    return 1;
+                }
+
+                fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: table_router.RouteBudget) ![]u64 {
+                    return try alloc.dupe(u64, &.{ 1, 2, 3 });
+                }
+
+                fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
+                    return if (node_id >= 1 and node_id <= 3) .active else .absent;
+                }
+
+                fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+                    return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
+                }
+            };
+            const Executor = struct {
+                status: u16 = 200,
+                unknown: bool = false,
+                transport_failure: bool = false,
+                many: usize = 0,
+                singles: usize = 0,
+                fn iface(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    if (std.mem.endsWith(u8, req.uri, "/txn-acknowledge-many")) {
+                        self.many += 1;
+                        var decoded = try parseTxnAcknowledgeManyRequest(alloc, req.body);
+                        defer freeTxnAcknowledgeManyRequest(alloc, &decoded);
+                        try std.testing.expectEqual(@as(usize, 2), decoded.participants.len);
+                        try std.testing.expectEqualStrings("table2:00000004:docs:8", decoded.participants[0]);
+                        if (self.transport_failure) return error.ConnectionResetByPeer;
+                        if (self.unknown) return http_route_helpers.textResponseWithHeaders(alloc, self.status, "write outcome unknown", &.{.{ .name = internal_batch_forwarding.outcome_header, .value = internal_batch_forwarding.outcome_unknown_v1 }});
+                        return .{ .status = self.status };
+                    }
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, "/txn-acknowledge"));
+                    self.singles += 1;
+                    var decoded = try parseTxnAcknowledgeRequest(alloc, req.body);
+                    defer freeTxnAcknowledgeRequest(alloc, &decoded);
+                    try std.testing.expectEqualStrings(if (self.singles == 1) "table2:00000004:docs:8" else "table2:00000004:docs:9", decoded.participant);
+                    return .{ .status = 200 };
+                }
+            };
+            const req: TxnAcknowledgeManyRequest = .{ .txn_id = @splat(1), .participants = &.{ "table2:00000004:docs:8", "table2:00000004:docs:9" } };
+            for ([_]u16{ 200, 404, 405, 400 }) |status| {
+                var executor: Executor = .{ .status = status };
+                var hosted = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, executor.iface());
+                const result = hosted.worker().acknowledgeManyGroup(std.testing.allocator, 7, "docs", req);
+                if (status == 400) try std.testing.expectError(error.UnexpectedHttpStatus, result) else try result;
+                try std.testing.expectEqual(@as(usize, 1), executor.many);
+                try std.testing.expectEqual(@as(usize, if (status == 404 or status == 405) 2 else 0), executor.singles);
+            }
+            for ([_]u16{ 404, 405, 409 }) |status| {
+                var executor: Executor = .{ .status = status, .unknown = true };
+                var hosted = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, executor.iface());
+                try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, hosted.worker().acknowledgeManyGroup(std.testing.allocator, 7, "docs", req));
+                try std.testing.expectEqual(@as(usize, 1), executor.many);
+                try std.testing.expectEqual(@as(usize, 0), executor.singles);
+            }
+            var executor: Executor = .{ .transport_failure = true };
+            var hosted = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, executor.iface());
+            try std.testing.expectError(error.ConnectionResetByPeer, hosted.worker().acknowledgeManyGroup(std.testing.allocator, 7, "docs", req));
+            try std.testing.expectEqual(@as(usize, 0), executor.singles);
+        }
+
+        test "distributed txn bulk acknowledgement codec owns bounded participant identities and restore authority" {
+            const Harness = struct {
+                fn roundTrip(alloc: std.mem.Allocator) !void {
+                    const ids = [_][]const u8{ "table2:00000004:docs:8", "table2:00000004:docs:9", "table2:00000004:docs:8" };
+                    const encoded = try encodeTxnAcknowledgeManyRequest(alloc, .{ .txn_id = @splat(1), .participants = &ids, .restore_staging_scope = @splat(2), .restore_staging_plan_id = @splat(3) });
+                    defer alloc.free(encoded);
+                    var decoded = try parseTxnAcknowledgeManyRequest(alloc, encoded);
+                    defer freeTxnAcknowledgeManyRequest(alloc, &decoded);
+                    try std.testing.expectEqualSlices(u8, &([_]u8{1} ** 16), &decoded.txn_id);
+                    try std.testing.expectEqual([_]u8{2} ** 32, decoded.restore_staging_scope.?);
+                    try std.testing.expectEqual([_]u8{3} ** 16, decoded.restore_staging_plan_id.?);
+                    for (ids, decoded.participants) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.roundTrip, .{});
+            for ([_][]const u8{ "[]", "[1]", "[\"bad\"]" }) |participants| {
+                const malformed = try std.fmt.allocPrint(std.testing.allocator, "{{\"txn_id\":\"01010101010101010101010101010101\",\"participants\":{s}}}", .{participants});
+                defer std.testing.allocator.free(malformed);
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnAcknowledgeManyRequest(std.testing.allocator, malformed));
+            }
+            const oversized: [65][]const u8 = @splat("table2:00000004:docs:8");
+            try std.testing.expectError(error.InvalidTxnRequest, encodeTxnAcknowledgeManyRequest(std.testing.allocator, .{ .txn_id = @splat(1), .participants = &oversized }));
+            try std.testing.expectError(error.InvalidTxnRequest, parseTxnAcknowledgeManyRequest(std.testing.allocator, "{\"txn_id\":\"01010101010101010101010101010101\",\"participants\":[\"table2:00000004:docs:8\"],\"participant\":\"table2:00000004:docs:8\"}"));
+        }
+
         test "transaction attempt budgets follow the borrowed transport clock" {
             var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
             defer vopr_io.deinit();
@@ -4507,6 +4812,125 @@ fn consumerTests() type {
                 ),
             );
             try std.testing.expectEqual(@as(usize, 1), local_probe.calls);
+        }
+
+        test "distributed txn abort fanout preserves durable ordering contact evidence and bounded recovery" {
+            const vopr = @import("vopr");
+            const alloc = std.testing.allocator;
+            const Mode = enum { normal, lost_coordinator_reply, unconfirmed_coordinator, contact_mask, retained };
+            for ([_]Mode{ .normal, .lost_coordinator_reply, .unconfirmed_coordinator, .contact_mask, .retained }) |mode| {
+                var sim = try vopr.vopr_io.VoprIo.init(.{ .required = .of(&.{ .clock_read, .sleep, .task_scheduling, .synchronization }) });
+                defer sim.deinit();
+                const participants = [_]ParticipantTxn{
+                    .{ .table_name = "docs", .group_id = 1001, .topology_epoch = 1 },
+                    .{ .table_name = "docs", .group_id = 1002, .topology_epoch = 1 },
+                    .{ .table_name = "docs", .group_id = 1003, .topology_epoch = 1 },
+                    .{ .table_name = "docs", .group_id = 1004, .topology_epoch = 1 },
+                    .{ .table_name = "docs", .group_id = 1005, .topology_epoch = 1 },
+                };
+                const ids = [_][]const u8{ "1", "2", "3", "4", "5" };
+                var slots: [5]ParticipantFanoutSlot = @splat(.{ .may_have_transaction_state = true });
+                slots[1].may_have_transaction_state = false;
+                const Recorder = struct {
+                    io: std.Io,
+                    mode: Mode,
+                    participants: []const ParticipantTxn,
+                    ids: []const []const u8,
+                    slots: []ParticipantFanoutSlot,
+                    durable_coordinator: bool = false,
+                    active: usize = 0,
+                    peak: usize = 0,
+                    invoked: [5]bool = @splat(false),
+                    resolved: [5]bool = @splat(false),
+                    acknowledged: [5]bool = @splat(false),
+                    failure: ?anyerror = null,
+                    fn worker(self: *@This()) ParticipantWorker {
+                        return .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status, .acknowledge_group = acknowledge } };
+                    }
+                    fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+                    fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+                    fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, req: TxnResolveRequest) !void {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, req.status);
+                        try std.testing.expectEqual(db_mod.types.SyncLevel.write, req.sync_level);
+                        const i: usize = @intCast(group - 1001);
+                        self.invoked[i] = true;
+                        if (i == 0) {
+                            try self.io.sleep(.fromMilliseconds(5), .awake);
+                            if (self.mode == .unconfirmed_coordinator) return error.Timeout;
+                            self.durable_coordinator = true;
+                            if (self.mode == .lost_coordinator_reply) return error.Timeout;
+                            return;
+                        }
+                        try std.testing.expect(self.durable_coordinator);
+                        self.active += 1;
+                        defer self.active -= 1;
+                        self.peak = @max(self.peak, self.active);
+                        try self.io.sleep(.fromMilliseconds(2), .awake);
+                        if (i == 2) {
+                            if (self.mode == .contact_mask) {
+                                self.resolved[i] = true; // Definitely no participant state.
+                                return error.TxnNotFound;
+                            }
+                            return error.LeaderUnavailable;
+                        }
+                        self.resolved[i] = true;
+                    }
+                    fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        return if (self.durable_coordinator) .aborted else .pending;
+                    }
+                    fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, req: TxnAcknowledgeRequest) !void {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        try std.testing.expectEqual(@as(u64, 1001), group);
+                        try std.testing.expect(self.durable_coordinator);
+                        const i: usize = req.participant[0] - '1';
+                        if (!(self.mode == .contact_mask and i == 1)) try std.testing.expect(self.resolved[i]);
+                        if (i == 4) return error.TestAckLost;
+                        self.acknowledged[i] = true;
+                    }
+                    fn run(self: *@This()) void {
+                        const txn_id = parseTxnIdHex("00112233445566778899aabbccddeeff") catch unreachable;
+                        const options: ExecuteOptions = .{ .fanout_io = self.io, .max_parallel_participants = 2 };
+                        if (self.mode == .contact_mask or self.mode == .retained) {
+                            abortParticipantsWithContactMask(alloc, self.worker(), txn_id, 77, self.participants, self.ids, self.slots, self.mode == .retained, options) catch |err| {
+                                self.failure = err;
+                            };
+                        } else {
+                            abortParticipantsWithOptions(alloc, self.worker(), txn_id, 77, self.participants, self.ids, self.participants.len, self.slots, options) catch |err| {
+                                self.failure = err;
+                            };
+                        }
+                    }
+                };
+                var recorder = Recorder{ .io = sim.io(), .mode = mode, .participants = &participants, .ids = &ids, .slots = &slots };
+                _ = sim.io().async(Recorder.run, .{&recorder});
+                var enabled: vopr.transition.List = .{};
+                defer enabled.deinit(alloc);
+                var events: vopr.event.Sink = .{};
+                defer events.deinit(alloc);
+                while (!sim.scheduler().quiescent()) {
+                    enabled.items.clearRetainingCapacity();
+                    try sim.scheduler().enumerateReady(&enabled, alloc);
+                    try enabled.canonicalize();
+                    if (enabled.items.items.len == 0) return error.VoprAbortFanoutDeadlock;
+                    try sim.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+                }
+                if (mode == .unconfirmed_coordinator) {
+                    try std.testing.expectEqual(@as(?anyerror, error.AbortDecisionNotDurable), recorder.failure);
+                    try std.testing.expectEqual(@as(usize, 0), recorder.peak);
+                    for (recorder.invoked[1..]) |invoked| try std.testing.expect(!invoked);
+                } else {
+                    try std.testing.expectEqual(@as(?anyerror, null), recorder.failure);
+                    try std.testing.expectEqual(@as(usize, 2), recorder.peak);
+                    try std.testing.expectEqual(mode != .contact_mask, recorder.invoked[1]);
+                    try std.testing.expectEqual(mode == .contact_mask, recorder.acknowledged[2]);
+                    try std.testing.expect(recorder.acknowledged[1] and recorder.acknowledged[3]);
+                    try std.testing.expect(!recorder.acknowledged[4]);
+                    try std.testing.expectEqual(@as(?anyerror, error.TestAckLost), slots[4].acknowledgement_err);
+                }
+                try sim.ensureNoCapabilityViolation();
+            }
         }
 
         test "distributed txn participant fanout is bounded and concurrent" {

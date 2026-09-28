@@ -91,6 +91,7 @@ pub const ManagedHttpHostConfig = managed_host.ManagedHttpHostConfig;
 pub const ManagedHttpHostDeps = managed_host.ManagedHttpHostDeps;
 pub const ManagedSyncResult = managed_host.ManagedSyncResult;
 pub const ProgressSource = runtime_loop.ProgressSource;
+pub const ProgressWake = runtime_loop.ProgressWake;
 pub const RuntimeCadence = runtime_loop.RuntimeCadence;
 pub const ManagedProgressDriver = runtime_loop.ManagedProgressDriver;
 pub const MetadataUpdateSource = runtime_loop.MetadataUpdateSource;

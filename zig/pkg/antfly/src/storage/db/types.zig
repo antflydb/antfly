@@ -297,6 +297,12 @@ pub const TransactionMutation = union(enum) {
         txn_id: TxnId,
         participant: []const u8,
     },
+    /// A bounded coordinator acknowledgement set, replicated atomically after
+    /// each member has independently proved terminal resolution.
+    acknowledge_many: struct {
+        txn_id: TxnId,
+        participants: []const []const u8,
+    },
     /// Deterministic coordinator/participant metadata cleanup. The cutoff is
     /// carried in the command so every replica evaluates the same predicate.
     cleanup: struct {

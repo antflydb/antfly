@@ -49,6 +49,7 @@ pub const Source = struct {
             owner_participant: []const u8,
             participant: []const u8,
         ) anyerror!void,
+        acknowledge_many: ?*const fn (ptr: *anyopaque, txn_id: db_types.TxnId, owner_participant: []const u8, participants: []const []const u8) anyerror!void = null,
         cleanup: *const fn (
             ptr: *anyopaque,
             txn_id: db_types.TxnId,
@@ -83,6 +84,12 @@ pub const Source = struct {
         participant: []const u8,
     ) !void {
         return self.vtable.acknowledge(self.ptr, txn_id, owner_participant, participant);
+    }
+
+    pub fn acknowledgeMany(self: Source, txn_id: db_types.TxnId, owner_participant: []const u8, participants: []const []const u8) !void {
+        if (participants.len == 0 or participants.len > 64) return error.InvalidParticipant;
+        const callback = self.vtable.acknowledge_many orelse return error.UnsupportedOperation;
+        return callback(self.ptr, txn_id, owner_participant, participants);
     }
 
     pub fn cleanup(

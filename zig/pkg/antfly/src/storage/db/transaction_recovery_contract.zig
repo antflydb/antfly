@@ -45,6 +45,14 @@ pub const Config = struct {
         owner_participant: []const u8,
         participant: []const u8,
     ) anyerror!void = null,
+    /// Optional bounded coordinator ACK capability. Unsupported is a
+    /// pre-admission feature result; uncertain delivery must retain debt.
+    acknowledge_participants_fn: ?*const fn (
+        ctx: *anyopaque,
+        txn_id: transactions_mod.TxnId,
+        owner_participant: []const u8,
+        participants: []const []const u8,
+    ) anyerror!void = null,
     cleanup_transaction_fn: ?*const fn (
         ctx: *anyopaque,
         txn_id: transactions_mod.TxnId,

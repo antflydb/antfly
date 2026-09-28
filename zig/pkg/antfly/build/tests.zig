@@ -1894,6 +1894,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_runtime_default_filters = [_][]const u8{
         "http host reserves service workers through its runtime and rolls back overcommit",
         "managed raft progress driver advances independently and joins on stop",
+        "managed raft progress driver coalesces request wakes without accelerating ticks",
+        "managed raft progress driver retains stop across wake reset",
+        "managed raft progress driver releases source ownership after startup refusal",
         "managed raft progress driver publishes source failure",
         "managed raft progress driver reports a wedged round unhealthy",
         "managed raft progress driver ignores a completed observed generation",
@@ -2370,6 +2373,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "table workflow can drive real metadata service topology and split setup",
             "table workflow can drive placement intents through the real metadata control loop",
             "metadata http service catalog cache is independent from volatile projection traffic",
+            "metadata http service linearizable reads leave elections to the cadence driver",
             "lifecycle listener detach drains callbacks and preserves unrelated listeners",
             "metadata.table mutation routing forwards only to a routable remote leader",
             "metadata http client forwards table create and drop to the internal route",
@@ -2381,6 +2385,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "metadata http client preserves unrecognized server outcomes for forwarded table mutations",
             "metadata http client does not replay unmarked table mutation rejection proof",
             "metadata http client round-trips server endpoints",
+            "metadata http client v0.2 snapshot fallback preserves proof budget and cancellation",
             "stamped definition replacement falls back to v0.2 text route",
             "definition replacement does not replay an ambiguous admitted request",
             "routed table mutation",
@@ -2869,6 +2874,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_vopr_cli_registry_tests = b.addRunArtifact(vopr_cli_registry_tests);
     const vopr_registry_test_step = b.step("vopr-registry-test", "Record and exact-replay every context-free VOPR scenario through the CLI registry");
     vopr_registry_test_step.dependOn(&run_vopr_cli_registry_tests.step);
+
+    const abort_regression_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"distributed txn"},
+    });
+    const abort_regression_step = b.step("antfly-transaction-abort-test", "Run transaction coordinator and bounded abort regressions");
+    abort_regression_step.dependOn(&b.addRunArtifact(abort_regression_tests).step);
 
     const transaction_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -4415,6 +4427,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_runtime_test_step = b.step("antfly-raft-runtime-test", "Run focused managed Raft runtime tests");
     raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
     raft_runtime_test_step.dependOn(&run_raft_ready_continuation_tests.step);
+
+    const raft_host_progress_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "raft integration module compiles", "host drops stale inbound", "host queues live snapshot" },
+    });
+    b.step("antfly-raft-host-progress-test", "Run host progress notification and bounded inbound drain regressions").dependOn(&b.addRunArtifact(raft_host_progress_tests).step);
 
     const raft_restore_test_step = b.step("antfly-raft-restore-test", "Run focused Raft restore authority and restart tests");
     raft_restore_test_step.dependOn(&run_raft_restore_tests.step);

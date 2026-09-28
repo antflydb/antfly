@@ -130,6 +130,8 @@ pub const AdminSource = struct {
         restore_staging_authority: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, input: @import("restore_staging.zig").AuthorityRequest) anyerror!@import("restore_staging.zig").AuthorityResponse = null,
         runtime_topology: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataRuntimeTopology = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
+        planning_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
+        peer_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         control_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
@@ -614,6 +616,8 @@ pub const AdminSource = struct {
                 .runtime_topology = metadataHttpServiceRuntimeTopology,
                 .status = metadataHttpServiceStatus,
                 .control_snapshot = metadataHttpServiceControlSnapshot,
+                .peer_snapshot = metadataHttpServicePeerSnapshot,
+                .planning_snapshot = metadataHttpServicePlanningSnapshot,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .provisioning_snapshot = metadataHttpServiceProvisioningSnapshot,
                 .restore_staging_authority = metadataHttpServiceRestoreStagingAuthority,
@@ -1332,6 +1336,14 @@ pub const AdminSource = struct {
         return try svc.runtimeTopology();
     }
 
+    fn metadataHttpServicePlanningSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return svc.planningSnapshot();
+    }
+    fn metadataHttpServicePeerSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return svc.peerSnapshot();
+    }
     fn metadataHttpServiceControlSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return svc.controlSnapshot();
@@ -1841,6 +1853,8 @@ pub const MetadataHttpServer = struct {
     /// metadata operation layer.
     pub fn registerRoutes(self: *MetadataHttpServer, server: *httpx.Server) !void {
         try server.post(snapshot_transfer.path, httpx.Handler.bind(self, metadataSnapshotPage));
+        try server.post(snapshot_transfer.peer_path, httpx.Handler.bind(self, metadataPeerSnapshotPage));
+        try server.post(snapshot_transfer.planning_path, httpx.Handler.bind(self, metadataPlanningSnapshotPage));
         try server.get(routes.Routes.health, httpx.Handler.bind(self, metadataHealth));
         try server.get(routes.Routes.head, httpx.Handler.bind(self, metadataHead));
         try server.get(routes.Routes.capabilities, httpx.Handler.bind(self, metadataCapabilities));
@@ -2478,18 +2492,55 @@ pub const MetadataHttpServer = struct {
             else => metadataReadError(ctx, err),
         };
     }
+    fn metadataPeerSnapshotPage(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        if (self.source.vtable.peer_snapshot == null) return ctx.status(404).text("unsupported peer view");
+        return self.metadataSnapshotPageWithView(ctx, .peers) catch |err| switch (err) {
+            error.ResourceRequestTooLarge => ctx.status(413).text("peer view exceeds transfer budget"),
+            error.ResourceTemporarilyUnavailable => blk: {
+                try ctx.setHeader("Retry-After", "1");
+                break :blk ctx.status(503).text("peer view transfer capacity exhausted");
+            },
+            error.InvalidRequest => ctx.status(400).text("invalid peer view request"),
+            else => metadataReadError(ctx, err),
+        };
+    }
+
+    fn metadataPlanningSnapshotPage(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        if (self.source.vtable.planning_snapshot == null) return ctx.status(404).text("unsupported planning view");
+        return self.metadataSnapshotPageWithView(ctx, .planning) catch |err| switch (err) {
+            error.ResourceRequestTooLarge => ctx.status(413).text("planning view exceeds transfer budget"),
+            error.ResourceTemporarilyUnavailable => blk: {
+                try ctx.setHeader("Retry-After", "1");
+                break :blk ctx.status(503).text("planning view transfer capacity exhausted");
+            },
+            error.InvalidRequest => ctx.status(400).text("invalid planning view request"),
+            else => metadataReadError(ctx, err),
+        };
+    }
+
     fn metadataSnapshotPageImpl(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        return self.metadataSnapshotPageWithView(ctx, .catalog);
+    }
+
+    fn metadataSnapshotPageWithView(self: *MetadataHttpServer, ctx: *httpx.Context, view: enum { catalog, peers, planning }) !httpx.Response {
         var parsed = std.json.parseFromSlice(snapshot_transfer.Request, ctx.allocator, (try ctx.body()) orelse "{}", .{}) catch return error.InvalidRequest;
         defer parsed.deinit();
         var request = parsed.value;
-        if (request.token == 0 and self.source.vtable.control_snapshot == null) request.control = false;
+        if (view != .catalog) request.control = true;
+        if (view == .catalog and request.token == 0 and self.source.vtable.control_snapshot == null) request.control = false;
         const transfer = self.transfers.lane(request);
         if (request.token == 0) {
             if (request.offset != 0 or request.release) return ctx.status(400).text("invalid snapshot offset");
             request.token = try transfer.reserve(self.alloc, platform_time.monotonicNs());
             errdefer transfer.cancel(self.alloc, request.token);
             try requestContext(ctx).ensureActive();
-            var snapshot = if (request.control) blk: {
+            var snapshot = if (view == .peers) blk: {
+                if (request.linearizable) _ = try self.source.linearizableHead(requestContext(ctx));
+                break :blk try self.source.vtable.peer_snapshot.?(self.source.ptr);
+            } else if (view == .planning) blk: {
+                if (request.linearizable) _ = try self.source.linearizableHead(requestContext(ctx));
+                break :blk try self.source.vtable.planning_snapshot.?(self.source.ptr);
+            } else if (request.control) blk: {
                 if (request.linearizable) _ = try self.source.linearizableHead(requestContext(ctx));
                 break :blk try self.source.vtable.control_snapshot.?(self.source.ptr);
             } else if (request.linearizable)

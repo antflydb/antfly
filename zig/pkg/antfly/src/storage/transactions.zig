@@ -84,6 +84,8 @@ const max_read_guards_per_transaction = 65_536;
 const schema_leases_prefix = "\x00\x00__txn_schema_leases__:";
 const records_prefix = "\x00\x00__txn_records__:";
 const participants_prefix = "\x00\x00__txn_participants__:";
+const participant_index_prefix = "\x00\x00__txn_participant_index_v1__:";
+const resolved_index_prefix = "\x00\x00__txn_resolved_index_v1__:";
 const resolved_participants_prefix = "\x00\x00__txn_resolved_participants__:";
 const ha_batch_outbox_prefix = "\x00\x00__txn_ha_batch_outbox__:";
 const ha_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
@@ -447,6 +449,38 @@ const txn_record_v6_size = 53;
 // ============================================================================
 // TxnManager
 // ============================================================================
+
+/// Apply-fenced semantic reads must not interpret physical bytes protected
+/// by another transaction's unresolved exclusive intent. Shared read guards
+/// remain compatible. Reuse one lock-key buffer and the caller's point probe;
+/// no transaction-record scan or mutable-store snapshot is needed.
+pub const IntentReadGuard = struct {
+    alloc: Allocator,
+    exclude_txn: ?TxnId,
+    lock_key: std.ArrayList(u8) = .empty,
+
+    pub fn init(alloc: Allocator, exclude_txn: ?TxnId) IntentReadGuard {
+        return .{ .alloc = alloc, .exclude_txn = exclude_txn };
+    }
+
+    pub fn deinit(self: *IntentReadGuard) void {
+        self.lock_key.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn check(self: *IntentReadGuard, view: anytype, user_key: []const u8) !void {
+        self.lock_key.clearRetainingCapacity();
+        try self.lock_key.appendSlice(self.alloc, intent_locks_prefix);
+        try self.lock_key.appendSlice(self.alloc, user_key);
+        const owner = view.get(self.lock_key.items) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        if (owner.len != @sizeOf(TxnId)) return TxnError.InvalidTxnRecord;
+        if (self.exclude_txn) |txn| if (std.mem.eql(u8, owner, &txn)) return;
+        return TxnError.IntentConflict;
+    }
+};
 
 pub const TxnManager = struct {
     store: backend_erased.Store,
@@ -1369,6 +1403,22 @@ pub const TxnManager = struct {
                 const txn_id = record_entry.key[records_prefix.len..][0..16].*;
                 const participant_key = makeSidecarKey(participants_prefix, txn_id);
                 const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
+                const index_key = makeSidecarKey(participant_index_prefix, txn_id);
+                if (read.get(&index_key)) |raw_index| {
+                    const indexed = try ParticipantIndex.decode(raw_index);
+                    const legacy = read.get(&resolved_key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (legacy != null) {
+                        const members = try resolvedParticipantsInRead(self.alloc, &read, txn_id);
+                        defer freeParticipantList(self.alloc, members);
+                        if (members.len > indexed.enlisted) return error.InvalidTxnRecord;
+                        if (members.len != indexed.enlisted) return true;
+                    } else if (indexed.resolved != indexed.enlisted) return true;
+                    entry = try cursor.next();
+                    continue;
+                } else |err| if (err != error.NotFound) return err;
                 const participant_count = try participantListCountInRead(&read, &participant_key);
                 const resolved_count = try participantListCountInRead(&read, &resolved_key);
                 if (resolved_count > participant_count) return TxnError.InvalidTxnRecord;
@@ -1445,6 +1495,8 @@ pub const TxnManager = struct {
         participant: []const u8,
         extra_batch: MutationExtraBatch,
     ) !void {
+        const index_key = makeSidecarKey(participant_index_prefix, txn_id);
+        if (try self.keyExists(&index_key)) return self.markParticipantsResolvedExtraBatch(txn_id, &.{participant}, extra_batch);
         // A replicated acknowledgement can be retried after the coordinator
         // has already cleaned the transaction. Do not recreate an orphaned
         // resolved-participants sidecar in that case, and reject corrupt
@@ -1493,34 +1545,125 @@ pub const TxnManager = struct {
         try self.applyBatch(writes.items, extra_batch.deletes, null);
     }
 
+    pub fn markParticipantsResolvedExtraBatch(self: *TxnManager, txn_id: TxnId, acknowledgements: []const []const u8, extra_batch: MutationExtraBatch) !void {
+        if (acknowledgements.len == 0 or acknowledgements.len > 64) return error.InvalidParticipant;
+        _ = try self.loadTransactionRecord(txn_id);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const index_key = makeSidecarKey(participant_index_prefix, txn_id);
+        const raw = self.getAlloc(scratch, &index_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        var indexed = if (raw) |bytes| try ParticipantIndex.decode(bytes) else ParticipantIndex{};
+        var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
+        var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
+        var enlisted: std.StringHashMapUnmanaged(void) = .empty;
+        if (raw == null) {
+            const participants = try self.getParticipants(scratch, txn_id);
+            for (participants) |participant| {
+                const member = try enlisted.getOrPut(scratch, participant);
+                if (member.found_existing) continue;
+                indexed.enlisted += 1;
+                const key = try scratch.dupe(u8, &makeParticipantIndexKey(participant_index_prefix, txn_id, participant));
+                try writes.append(scratch, .{ .key = key, .value = participant });
+            }
+        }
+        // Validate every member before any mutation. The immutable membership
+        // index replaces repeated cohort-sized decode and membership scans.
+        for (acknowledgements) |participant| {
+            if (raw == null) {
+                if (!enlisted.contains(participant)) return error.InvalidParticipant;
+            } else {
+                const key = makeParticipantIndexKey(participant_index_prefix, txn_id, participant);
+                const member = self.getAlloc(scratch, &key) catch |err| switch (err) {
+                    error.NotFound => return error.InvalidParticipant,
+                    else => return err,
+                };
+                if (!std.mem.eql(u8, member, participant)) return error.InvalidTxnRecord;
+            }
+        }
+        var resolved: std.StringHashMapUnmanaged(void) = .empty;
+        // A local resolution may atomically have used the legacy sidecar.
+        // Absorb it once, preserving all independently durable evidence.
+        const legacy_key = makeSidecarKey(resolved_participants_prefix, txn_id);
+        const legacy_members = try self.loadParticipantSet(scratch, resolved_participants_prefix, txn_id);
+        for (legacy_members) |participant| {
+            if (raw == null) {
+                if (!enlisted.contains(participant)) return error.InvalidTxnRecord;
+            } else {
+                const member_key = makeParticipantIndexKey(participant_index_prefix, txn_id, participant);
+                const member = self.getAlloc(scratch, &member_key) catch |err| switch (err) {
+                    error.NotFound => return error.InvalidTxnRecord,
+                    else => return err,
+                };
+                if (!std.mem.eql(u8, member, participant)) return error.InvalidTxnRecord;
+            }
+            try resolved.put(scratch, participant, {});
+        }
+        for (acknowledgements) |participant| try resolved.put(scratch, participant, {});
+        var members = resolved.keyIterator();
+        while (members.next()) |participant| {
+            const key = makeParticipantIndexKey(resolved_index_prefix, txn_id, participant.*);
+            const existing = self.getAlloc(scratch, &key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (existing) |value| {
+                if (!std.mem.eql(u8, value, participant.*)) return error.InvalidTxnRecord;
+            } else {
+                indexed.resolved += 1;
+                try writes.append(scratch, .{ .key = try scratch.dupe(u8, &key), .value = participant.* });
+            }
+        }
+        if (indexed.resolved > indexed.enlisted) return error.InvalidTxnRecord;
+        var encoded: [17]u8 = undefined;
+        indexed.encode(&encoded);
+        try writes.append(scratch, .{ .key = &index_key, .value = &encoded });
+        try writes.appendSlice(scratch, extra_batch.writes);
+        try deletes.append(scratch, &legacy_key);
+        try deletes.appendSlice(scratch, extra_batch.deletes);
+        // Membership migration, resolution entries, count proof and the Raft
+        // replay marker publish in one storage batch. No growing list rewrite.
+        try self.applyBatch(writes.items, deletes.items, null);
+    }
+
     pub fn getParticipants(self: *TxnManager, alloc: Allocator, txn_id: TxnId) ![][]u8 {
         return try self.loadParticipantSet(alloc, participants_prefix, txn_id);
     }
 
     pub fn getResolvedParticipants(self: *TxnManager, alloc: Allocator, txn_id: TxnId) ![][]u8 {
-        return try self.loadParticipantSet(alloc, resolved_participants_prefix, txn_id);
+        const index_key = makeSidecarKey(participant_index_prefix, txn_id);
+        if (!(try self.keyExists(&index_key))) return self.loadParticipantSet(alloc, resolved_participants_prefix, txn_id);
+        var read = try self.store.beginRead();
+        defer read.abort();
+        return resolvedParticipantsInRead(alloc, &read, txn_id);
     }
 
     pub fn getUnresolvedParticipants(self: *TxnManager, alloc: Allocator, txn_id: TxnId) ![][]u8 {
         const participants = try self.getParticipants(alloc, txn_id);
-        errdefer freeParticipantList(alloc, participants);
+        defer freeParticipantList(alloc, participants);
         const resolved = try self.getResolvedParticipants(alloc, txn_id);
         defer freeParticipantList(alloc, resolved);
 
+        var resolved_set: std.StringHashMapUnmanaged(void) = .empty;
+        defer resolved_set.deinit(alloc);
+        for (resolved) |participant| try resolved_set.put(alloc, participant, {});
         var unresolved = std.ArrayListUnmanaged([]u8).empty;
         errdefer {
             for (unresolved.items) |entry| alloc.free(entry);
             unresolved.deinit(alloc);
         }
 
-        outer: for (participants) |participant| {
-            for (resolved) |done| {
-                if (std.mem.eql(u8, participant, done)) continue :outer;
+        try unresolved.ensureTotalCapacity(alloc, participants.len);
+        for (participants) |participant| {
+            if (resolved_set.contains(participant)) {
+                continue;
             }
-            try unresolved.append(alloc, try alloc.dupe(u8, participant));
+            unresolved.appendAssumeCapacity(try alloc.dupe(u8, participant));
         }
 
-        freeParticipantList(alloc, participants);
         return try unresolved.toOwnedSlice(alloc);
     }
 
@@ -2224,6 +2367,14 @@ pub const TxnManager = struct {
         try deletes.append(self.alloc, &admission_key);
         try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &ha_batch_key, &ha_replay_key, &intent_keys_key, &schema_lease_key });
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
+        const member_prefix = makeSidecarKey(participant_index_prefix, txn_id);
+        const resolution_prefix = makeSidecarKey(resolved_index_prefix, txn_id);
+        const members = try self.scanPrefix(self.alloc, &member_prefix);
+        defer backend_scan.freeResults(self.alloc, members);
+        const resolutions = try self.scanPrefix(self.alloc, &resolution_prefix);
+        defer backend_scan.freeResults(self.alloc, resolutions);
+        for (members) |member| try deletes.append(self.alloc, member.key);
+        for (resolutions) |resolution| try deletes.append(self.alloc, resolution.key);
         try self.applyBatch(extra_batch.writes, deletes.items, null);
     }
 
@@ -2318,87 +2469,12 @@ pub const TxnManager = struct {
 
     fn traceWriteIntentSuccess(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent, predicates: []const VersionPredicate) void {
         const tw = self.trace_writer orelse return;
-        var write_keys_buf: [32][]const u8 = undefined;
-        var delete_keys_buf: [32][]const u8 = undefined;
-        var predicate_keys_buf: [32][]const u8 = undefined;
-        var wk: usize = 0;
-        var dk: usize = 0;
-        for (intents) |intent| {
-            if (intent.value != null) {
-                if (wk < write_keys_buf.len) {
-                    write_keys_buf[wk] = intent.key;
-                    wk += 1;
-                }
-            } else {
-                if (dk < delete_keys_buf.len) {
-                    delete_keys_buf[dk] = intent.key;
-                    dk += 1;
-                }
-            }
-        }
-        // TLA+ TxnReadSet = predicateKeys; include write keys since
-        // checkIntentConflicts checks intents on write keys too.
-        var pk: usize = 0;
-        for (predicates) |pred| {
-            if (pk < predicate_keys_buf.len) {
-                predicate_keys_buf[pk] = pred.key;
-                pk += 1;
-            }
-        }
-        for (intents) |intent| {
-            if (pk < predicate_keys_buf.len) {
-                predicate_keys_buf[pk] = intent.key;
-                pk += 1;
-            }
-        }
-        tw.traceEvent(&.{
-            .name = "WriteIntentOnShard",
-            .txn_id = txn_id,
-            .shard_id = self.shard_id,
-            .write_keys = write_keys_buf[0..wk],
-            .delete_keys = delete_keys_buf[0..dk],
-            .predicate_keys = predicate_keys_buf[0..pk],
-        });
+        emitWriteIntentTrace(self.alloc, tw, txn_id, self.shard_id, "WriteIntentOnShard", intents, predicates, null);
     }
 
     fn traceWriteIntentFails(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent, reason: []const u8) void {
         const tw = self.trace_writer orelse return;
-        var write_keys_buf: [32][]const u8 = undefined;
-        var delete_keys_buf: [32][]const u8 = undefined;
-        var predicate_keys_buf: [32][]const u8 = undefined;
-        var wk: usize = 0;
-        var dk: usize = 0;
-        for (intents) |intent| {
-            if (intent.value != null) {
-                if (wk < write_keys_buf.len) {
-                    write_keys_buf[wk] = intent.key;
-                    wk += 1;
-                }
-            } else {
-                if (dk < delete_keys_buf.len) {
-                    delete_keys_buf[dk] = intent.key;
-                    dk += 1;
-                }
-            }
-        }
-        // Include write keys as predicateKeys so TLA+ NoConflictingIntents
-        // can detect intent conflicts on those keys.
-        var pk: usize = 0;
-        for (intents) |intent| {
-            if (pk < predicate_keys_buf.len) {
-                predicate_keys_buf[pk] = intent.key;
-                pk += 1;
-            }
-        }
-        tw.traceEvent(&.{
-            .name = "WriteIntentFails",
-            .txn_id = txn_id,
-            .shard_id = self.shard_id,
-            .write_keys = write_keys_buf[0..wk],
-            .delete_keys = delete_keys_buf[0..dk],
-            .predicate_keys = predicate_keys_buf[0..pk],
-            .reason = reason,
-        });
+        emitWriteIntentTrace(self.alloc, tw, txn_id, self.shard_id, "WriteIntentFails", intents, &.{}, reason);
     }
 
     fn readTimestamp(self: *TxnManager, key: []const u8) !?u64 {
@@ -2413,6 +2489,102 @@ pub const TxnManager = struct {
         return std.mem.readInt(u64, val[0..8], .little);
     }
 };
+
+fn emitWriteIntentTrace(
+    alloc: std.mem.Allocator,
+    tw: tracing.AntflyTraceWriter,
+    txn_id: TxnId,
+    shard_id: []const u8,
+    name: []const u8,
+    intents: []const WriteIntent,
+    predicates: []const VersionPredicate,
+    reason: ?[]const u8,
+) void {
+    // Trace evidence must be complete. Failing the trace-enabled run is safer
+    // than silently validating a transaction with omitted keys.
+    var write_count: usize = 0;
+    for (intents) |intent| {
+        if (intent.value != null) write_count += 1;
+    }
+    const predicate_count = std.math.add(usize, intents.len, predicates.len) catch @panic("transaction trace key count overflow");
+    const total = std.math.add(usize, intents.len, predicate_count) catch @panic("transaction trace key count overflow");
+    const keys = alloc.alloc([]const u8, total) catch @panic("out of memory collecting transaction trace keys");
+    defer alloc.free(keys);
+    const write_keys = keys[0..write_count];
+    const delete_keys = keys[write_count..intents.len];
+    const predicate_keys = keys[intents.len..];
+    var wk: usize = 0;
+    var dk: usize = 0;
+    for (intents) |intent| {
+        if (intent.value != null) {
+            write_keys[wk] = intent.key;
+            wk += 1;
+        } else {
+            delete_keys[dk] = intent.key;
+            dk += 1;
+        }
+    }
+    // TLA+ TxnReadSet also includes write keys because admission checks them
+    // for conflicting intents. Keep every explicit predicate and intent key.
+    var pk: usize = 0;
+    for (predicates) |predicate| {
+        predicate_keys[pk] = predicate.key;
+        pk += 1;
+    }
+    for (intents) |intent| {
+        predicate_keys[pk] = intent.key;
+        pk += 1;
+    }
+    tw.traceEvent(&.{
+        .name = name,
+        .txn_id = txn_id,
+        .shard_id = shard_id,
+        .write_keys = write_keys,
+        .delete_keys = delete_keys,
+        .predicate_keys = predicate_keys,
+        .reason = reason,
+    });
+}
+
+test "transaction trace retains every key beyond the former 32-key limit" {
+    const Capture = struct {
+        write_count: usize = 0,
+        delete_count: usize = 0,
+        predicate_count: usize = 0,
+        last_predicate: []const u8 = "",
+
+        fn onTrace(ptr: *anyopaque, event: *const tracing.AntflyTracingEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.write_count = event.write_keys.len;
+            self.delete_count = event.delete_keys.len;
+            self.predicate_count = event.predicate_keys.len;
+            self.last_predicate = event.predicate_keys[event.predicate_keys.len - 1];
+        }
+    };
+    var capture = Capture{};
+    const writer = tracing.AntflyTraceWriter{
+        .ptr = &capture,
+        .vtable = &.{ .trace_event = Capture.onTrace },
+    };
+    var key_buffers: [65][16]u8 = undefined;
+    var intents: [65]WriteIntent = undefined;
+    for (&intents, 0..) |*intent, index| {
+        const key = try std.fmt.bufPrint(&key_buffers[index], "key-{d}", .{index});
+        intent.* = .{ .key = key, .value = if (index % 2 == 0) "value" else null };
+    }
+    var predicates: [5]VersionPredicate = undefined;
+    for (&predicates, 0..) |*predicate, index| predicate.* = .{ .key = intents[index].key };
+
+    emitWriteIntentTrace(std.testing.allocator, writer, @splat(0x42), "local", "WriteIntentOnShard", &intents, &predicates, null);
+    try std.testing.expectEqual(@as(usize, 33), capture.write_count);
+    try std.testing.expectEqual(@as(usize, 32), capture.delete_count);
+    try std.testing.expectEqual(@as(usize, 70), capture.predicate_count);
+    try std.testing.expectEqualStrings("key-64", capture.last_predicate);
+
+    emitWriteIntentTrace(std.testing.allocator, writer, @splat(0x42), "local", "WriteIntentFails", &intents, &.{}, "IntentConflict");
+    try std.testing.expectEqual(@as(usize, 65), capture.predicate_count);
+    try std.testing.expectEqualStrings("key-64", capture.last_predicate);
+}
 
 const RuntimeStoreHandle = struct {
     store: backend_erased.Store,
@@ -2460,6 +2632,76 @@ fn makeSidecarKey(comptime prefix: []const u8, txn_id: TxnId) [prefix.len + 16]u
     @memcpy(key_buf[0..prefix.len], prefix);
     @memcpy(key_buf[prefix.len..], &txn_id);
     return key_buf;
+}
+
+const ParticipantIndex = struct {
+    enlisted: u64 = 0,
+    resolved: u64 = 0,
+    fn decode(bytes: []const u8) !ParticipantIndex {
+        if (bytes.len != 17 or bytes[0] != 1) return error.InvalidTxnRecord;
+        const result: ParticipantIndex = .{ .enlisted = std.mem.readInt(u64, bytes[1..9], .little), .resolved = std.mem.readInt(u64, bytes[9..17], .little) };
+        if (result.resolved > result.enlisted) return error.InvalidTxnRecord;
+        return result;
+    }
+    fn encode(self: ParticipantIndex, bytes: *[17]u8) void {
+        bytes[0] = 1;
+        std.mem.writeInt(u64, bytes[1..9], self.enlisted, .little);
+        std.mem.writeInt(u64, bytes[9..17], self.resolved, .little);
+    }
+};
+
+fn makeParticipantIndexKey(comptime prefix: []const u8, txn_id: TxnId, participant: []const u8) [prefix.len + 16 + 32]u8 {
+    var key: [prefix.len + 16 + 32]u8 = undefined;
+    @memcpy(key[0..prefix.len], prefix);
+    @memcpy(key[prefix.len..][0..16], &txn_id);
+    std.crypto.hash.sha2.Sha256.hash(participant, key[prefix.len + 16 ..][0..32], .{});
+    return key;
+}
+
+fn resolvedParticipantsInRead(alloc: Allocator, read: *backend_erased.ReadTxn, txn_id: TxnId) ![][]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    const legacy_key = makeSidecarKey(resolved_participants_prefix, txn_id);
+    const legacy = read.get(&legacy_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (legacy) |bytes| for (try decodeParticipantList(scratch, bytes)) |name| try names.put(scratch, name, {});
+    const prefix = makeSidecarKey(resolved_index_prefix, txn_id);
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var entry = try cursor.seekAtOrAfter(&prefix);
+    var count: u64 = 0;
+    while (entry) |row| {
+        if (!std.mem.startsWith(u8, row.key, &prefix)) break;
+        const expected = makeParticipantIndexKey(resolved_index_prefix, txn_id, row.value);
+        if (row.value.len == 0 or !std.mem.eql(u8, row.key, &expected)) return error.InvalidTxnRecord;
+        try names.put(scratch, try scratch.dupe(u8, row.value), {});
+        count += 1;
+        entry = try cursor.next();
+    }
+    const marker_key = makeSidecarKey(participant_index_prefix, txn_id);
+    const indexed = try ParticipantIndex.decode(try read.get(&marker_key));
+    if (count != indexed.resolved or names.count() > indexed.enlisted) return error.InvalidTxnRecord;
+    const result = try alloc.alloc([]u8, names.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |name| alloc.free(name);
+        alloc.free(result);
+    }
+    var it = names.keyIterator();
+    for (result) |*name| {
+        name.* = try alloc.dupe(u8, it.next().?.*);
+        initialized += 1;
+    }
+    std.mem.sort([]u8, result, {}, struct {
+        fn less(_: void, a: []u8, b: []u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.less);
+    return result;
 }
 
 fn readHasPrefix(read: *backend_erased.ReadTxn, prefix: []const u8) !bool {
@@ -4306,4 +4548,63 @@ test "retained terminal transactions honor the extended retry cutoff" {
     const resolved = try mgr.getResolvedParticipants(alloc, txn_id);
     defer freeParticipantList(alloc, resolved);
     try std.testing.expectEqual(@as(usize, 0), resolved.len);
+}
+
+test "transaction participant batch migrates legacy evidence atomically and cleans indexed membership" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var mgr = try TxnManager.init(alloc, &runtime);
+    defer mgr.deinit();
+    const txn: TxnId = @splat(41);
+    try mgr.initTransactionWithParticipants(txn, 100, &.{ "a", "b", "c" });
+    try mgr.markParticipantResolved(txn, "a");
+    try std.testing.expectError(error.InvalidParticipant, mgr.markParticipantsResolvedExtraBatch(txn, &.{ "b", "absent" }, .{}));
+    const index_key = makeSidecarKey(participant_index_prefix, txn);
+    try std.testing.expect(!(try mgr.keyExists(&index_key)));
+    try mgr.markParticipantsResolvedExtraBatch(txn, &.{ "b", "b" }, .{});
+    const first = try mgr.getResolvedParticipants(alloc, txn);
+    defer freeParticipantList(alloc, first);
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    try std.testing.expectEqualStrings("a", first[0]);
+    try std.testing.expectEqualStrings("b", first[1]);
+    try mgr.markParticipantsResolvedExtraBatch(txn, &.{ "b", "c" }, .{});
+    try mgr.markParticipantResolved(txn, "c");
+    const unresolved = try mgr.getUnresolvedParticipants(alloc, txn);
+    defer freeParticipantList(alloc, unresolved);
+    try std.testing.expectEqual(@as(usize, 0), unresolved.len);
+    const bytes = try mgr.getAlloc(alloc, &index_key);
+    defer alloc.free(bytes);
+    const index = try ParticipantIndex.decode(bytes);
+    try std.testing.expectEqual(@as(u64, 3), index.enlisted);
+    try std.testing.expectEqual(@as(u64, 3), index.resolved);
+    try mgr.deleteTransactionMetadata(txn);
+    try std.testing.expect(!(try mgr.keyExists(&index_key)));
+    const resolutions = try mgr.scanPrefix(alloc, &makeSidecarKey(resolved_index_prefix, txn));
+    defer backend_scan.freeResults(alloc, resolutions);
+    try std.testing.expectEqual(@as(usize, 0), resolutions.len);
+    try std.testing.expectError(error.TxnNotFound, mgr.markParticipantsResolvedExtraBatch(txn, &.{"a"}, .{}));
+}
+
+test "transaction participant batch releases migration allocations on every failure" {
+    const Check = struct {
+        fn run(failing: Allocator) !void {
+            const alloc = std.testing.allocator;
+            var backend = mem_backend.Backend.init(alloc, .{});
+            defer backend.close();
+            var runtime = try backend.runtimeStore(alloc, .{});
+            defer runtime.deinit();
+            var mgr = try TxnManager.init(alloc, &runtime);
+            defer mgr.deinit();
+            const txn: TxnId = @splat(42);
+            try mgr.initTransactionWithParticipants(txn, 100, &.{ "a", "b", "c" });
+            try mgr.markParticipantResolved(txn, "a");
+            mgr.alloc = failing;
+            defer mgr.alloc = alloc;
+            try mgr.markParticipantsResolvedExtraBatch(txn, &.{ "b", "c" }, .{});
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

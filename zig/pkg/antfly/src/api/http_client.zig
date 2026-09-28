@@ -3165,6 +3165,12 @@ pub const ApiHttpClient = struct {
         return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, null, null);
     }
 
+    pub fn fetchGroupTxnAcknowledgeMany(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8) !EmptyResponse {
+        // This private capability route is absent on v0.2.x. Only a definite
+        // unsupported response enables the worker's idempotent single-ACK path.
+        return fetchInternalPostEmptyWithCapabilities(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_many_suffix, body, null, null, true);
+    }
+
     pub fn fetchGroupOnlineMergeIo(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("online_merge_io.zig").contract.Request, timeout_ms: u32, cancellation: ?*const http_common.RequestCancellation) !QueryResponse {
         try request.validate();
         if (group_id != request.ownerGroup()) return error.OnlineSourceScopeChanged;
@@ -3352,6 +3358,20 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !EmptyResponse {
+        return fetchInternalPostEmptyWithCapabilities(self, base_uri, group_id, table_name, suffix_name, body, timeout_ms, cancellation, false);
+    }
+
+    fn fetchInternalPostEmptyWithCapabilities(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        suffix_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+        unsupported_route: bool,
+    ) !EmptyResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -3372,6 +3392,9 @@ pub const ApiHttpClient = struct {
             .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
+        if (unsupported_route) if (resp.header(internal_batch_forwarding.outcome_header)) |outcome| {
+            if (std.mem.eql(u8, outcome, internal_batch_forwarding.outcome_unknown_v1)) return error.RaftBatchWriteOutcomeUnknown;
+        };
         switch (resp.status) {
             200 => return .{},
             202 => {
@@ -3381,7 +3404,7 @@ pub const ApiHttpClient = struct {
                     return error.CommitVisibilityNotSatisfied;
                 return error.UnexpectedHttpStatus;
             },
-            404 => return error.UnknownGroup,
+            404 => return if (unsupported_route) error.UnsupportedOperation else error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupTxnResolveConflictError(resp.body),
             503 => return error.GroupLeaderUnavailable,

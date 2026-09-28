@@ -50,6 +50,7 @@ class RegressionEvidenceTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import os, sys, resource\n"
                 "from pathlib import Path\n"
+                "if '--collect-only' in sys.argv: print('stub collection'); sys.exit(4 if os.environ['STUB_JUNIT_MODE'] == 'collection-error' else 0)\n"
                 "path = next((arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--junitxml=')), None)\n"
                 "if path is None: print('stub invoked without junit'); sys.exit(0)\n"
                 "print('stub invoked with junit')\n"
@@ -94,6 +95,13 @@ class RegressionEvidenceTests(unittest.TestCase):
                 for p in reports.rglob("*.xml")
             }
 
+    def test_collection_failure_stops_before_workers_and_repetitions(self):
+        result, reports = self.run_loop(mode="collection-error", workers=2, repeats=3)
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertEqual(reports, {})
+        self.assertEqual(result.stdout.count("stub collection"), 1)
+        self.assertNotIn("E2E regression worker=", result.stdout)
+
     def test_inference_selector_uses_its_project_and_requires_passes(self):
         result, _ = self.run_loop(
             selector="e2e/inference/test_dictate.py::test_dictate_cleanup_rewrites_transcript"
@@ -127,6 +135,7 @@ class RegressionEvidenceTests(unittest.TestCase):
             uv = root / "uv"
             uv.write_text(
                 f"#!{sys.executable}\nimport subprocess, sys, time\n"
+                "if '--collect-only' in sys.argv: sys.exit(0)\n"
                 f"subprocess.Popen([sys.executable, {str(child)!r}])\n"
                 "time.sleep(60)\n"
             )
