@@ -4538,26 +4538,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const storage_lmdb_soak_step = b.step("lmdb-workload-soak", "Run only the legacy LMDB randomized workload soak");
     storage_lmdb_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
 
-    const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
-    docstore_test_mod.addImport("bloom", bloom_mod);
-    docstore_test_mod.addImport("antfly_pdf", pdf_mod);
     const docstore_unit_tests = b.addTest(.{
-        .root_module = docstore_test_mod,
+        .root_module = antfly_test_mod,
+        .filters = &.{ "storage.docstore.", "storage.transactions." },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    const run_docstore_unit_tests = b.addRunArtifact(docstore_unit_tests);
+    const run_docstore_unit_tests = addCuratedTestRunArtifact(b, docstore_unit_tests, &.{ "storage.docstore.", "storage.transactions." });
 
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
     const retained_effects_tests = b.addTest(.{
-        .root_module = docstore_test_mod,
-        .filters = &.{"retained"},
+        .root_module = antfly_test_mod,
+        .filters = &.{ "storage.docstore.", "storage.transactions." },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("docstore-retained-effects-test", "Run atomic source row retention, restart, bounds and GC regressions")
-        .dependOn(&addFilteredTestRunArtifact(b, retained_effects_tests).step);
+        .dependOn(&addCuratedTestRunArtifact(b, retained_effects_tests, &.{"retained"}).step);
     const retained_transaction_tests = b.addTest(.{
-        .root_module = docstore_test_mod,
+        .root_module = antfly_test_mod,
         .filters = &.{"storage.transactions."},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });

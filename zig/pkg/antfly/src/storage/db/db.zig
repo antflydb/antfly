@@ -36591,6 +36591,7 @@ pub const DB = struct {
         // See STATUS.md for the status-plane contract.
         if (!self.core.tryLockApplyShared()) {
             return .{
+                .indexes_available = false,
                 .async_indexing = self.snapshotAsyncIndexingStats(),
                 .doc_set_planning = self.snapshotDocSetPlanningStats(),
                 .visibility = self.snapshotVisibilityStats(),

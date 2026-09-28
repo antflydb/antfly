@@ -440,6 +440,8 @@ fn parseBatchRequestWithOptions(
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidBatchRequest;
     const root = parsed.value.object;
+    if (!allow_internal and (root.get("_graph_writes") != null or root.get("_graph_deletes") != null))
+        return error.InvalidBatchRequest;
 
     var page_effects: ?std.json.Parsed(MergePageEffects) = null;
     errdefer if (page_effects) |*effects| effects.deinit();
@@ -558,8 +560,11 @@ fn parseBatchRequestWithOptions(
         break :blk id;
     } else null;
     const graph_writes: []db_mod.types.GraphEdgeWrite = graph_writes: {
-        const value = root.get("_graph_writes") orelse break :graph_writes &.{};
-        if (!allow_internal) return error.InvalidBatchRequest;
+        if (root.get("_graph_writes") != null and root.get("graph_writes") != null) return error.InvalidBatchRequest;
+        const value = if (allow_internal)
+            root.get("_graph_writes") orelse root.get("graph_writes") orelse break :graph_writes &.{}
+        else
+            root.get("graph_writes") orelse break :graph_writes &.{};
         if (value == .null) break :graph_writes &.{};
         const parsed_graph_writes = try parseGraphWrites(alloc, value);
         errdefer freeGraphWrites(alloc, parsed_graph_writes);
@@ -568,8 +573,11 @@ fn parseBatchRequestWithOptions(
     errdefer freeGraphWrites(alloc, graph_writes);
 
     const graph_deletes: []db_mod.types.GraphEdgeDelete = graph_deletes: {
-        const value = root.get("_graph_deletes") orelse break :graph_deletes &.{};
-        if (!allow_internal) return error.InvalidBatchRequest;
+        if (root.get("_graph_deletes") != null and root.get("graph_deletes") != null) return error.InvalidBatchRequest;
+        const value = if (allow_internal)
+            root.get("_graph_deletes") orelse root.get("graph_deletes") orelse break :graph_deletes &.{}
+        else
+            root.get("graph_deletes") orelse break :graph_deletes &.{};
         if (value == .null) break :graph_deletes &.{};
         const parsed_graph_deletes = try parseGraphDeletes(alloc, value);
         errdefer freeGraphDeletes(alloc, parsed_graph_deletes);
@@ -2033,6 +2041,18 @@ fn consumerTests() type {
             defer owned.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(usize, 1), owned.writes.len);
             try std.testing.expectEqual(@as(usize, 1), owned.deletes.len);
+        }
+
+        test "public batch parser accepts individual graph edge mutations" {
+            var owned = try parseBatchRequest(std.testing.allocator,
+                \\{"graph_writes":[{"index_name":"graph","source":"node:a","target":"node:b","edge_type":"KNOWS","metadata_json":"{\"uuid\":\"1\"}"}],"graph_deletes":[{"index_name":"graph","source":"node:a","target":"node:c","edge_type":"KNOWS"}]}
+            );
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 1), owned.req.graph_writes.len);
+            try std.testing.expectEqualStrings("node:b", owned.req.graph_writes[0].target);
+            try std.testing.expectEqualStrings("{\"uuid\":\"1\"}", owned.req.graph_writes[0].metadata_json);
+            try std.testing.expectEqual(@as(usize, 1), owned.req.graph_deletes.len);
+            try std.testing.expectEqualStrings("node:c", owned.req.graph_deletes[0].target);
         }
 
         test "public batch parser rejects non-object documents while internal replay remains opaque" {

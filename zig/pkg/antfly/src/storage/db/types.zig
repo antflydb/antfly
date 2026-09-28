@@ -3457,6 +3457,8 @@ pub const DBStats = struct {
     schema_index_state: []const u8 = "none",
     doc_count: u64 = 0,
     index_count: u32 = 0,
+    /// False when operational stats skipped index inventory under apply-lock contention.
+    indexes_available: bool = true,
     indexes: []DBIndexStats = &.{},
     repair_degraded: bool = false,
     repair_issue_count: u64 = 0,

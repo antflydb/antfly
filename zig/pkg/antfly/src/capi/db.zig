@@ -2463,6 +2463,7 @@ const JsonScanResult = struct {
 const JsonDBStats = struct {
     doc_count: u64,
     index_count: u32,
+    indexes_available: bool,
     indexes: []JsonDBIndexStats,
     repair_degraded: bool,
     repair_issue_count: u64,
@@ -2479,6 +2480,11 @@ const JsonDBStats = struct {
 const JsonDBIndexStats = struct {
     name: []const u8,
     kind: []const u8,
+    replay_applied_sequence: u64,
+    replay_target_sequence: u64,
+    replay_catch_up_required: bool,
+    catch_up_active: bool,
+    catch_up_phase: []const u8,
     doc_count: u64,
     term_count: u64,
     edge_count: u64,
@@ -8249,6 +8255,39 @@ test "storage owner runtime status does not wait behind apply writer" {
     try std.testing.expectEqual(@as(u64, 0), response.len);
 }
 
+test "lite status marks index inventory unavailable during apply contention" {
+    const alloc = std.testing.allocator;
+    var test_tmp = try TestDirectory.init("lite-index-status-busy");
+    defer test_tmp.cleanup();
+    const path = try tempTestPath(alloc, test_tmp.path(), "db");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+
+    var handle = Handle{ .alloc = std.heap.c_allocator, .db = try db_mod.DB.open(alloc, path, .{}) };
+    defer handle.db.close();
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
+
+    var status: capi.Buffer = .{};
+    {
+        handle.db.core.lockApplyExclusive();
+        defer handle.db.core.unlockApplyExclusive();
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_status_json(handle_id, &status));
+        defer antfly_buffer_free(&status);
+        try std.testing.expect(std.mem.indexOf(u8, status.ptr.?[0..status.len], "\"indexes_available\":false") != null);
+        var stats: capi.Buffer = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(handle_id, &stats));
+        defer antfly_buffer_free(&stats);
+        try std.testing.expect(std.mem.indexOf(u8, stats.ptr.?[0..stats.len], "\"indexes_available\":false") != null);
+    }
+
+    status = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_status_json(handle_id, &status));
+    try std.testing.expect(std.mem.indexOf(u8, status.ptr.?[0..status.len], "\"indexes_available\":true") != null);
+    antfly_buffer_free(&status);
+}
+
 test "storage owner runtime status distinguishes absent and busy source vectors" {
     const alloc = std.testing.allocator;
     var test_tmp = try TestDirectory.init("storage-owner-source-status-busy");
@@ -11045,6 +11084,11 @@ fn dbIndexStatsProjectionAlloc(alloc: Allocator, stats: db_mod.types.DBStats) ![
         indexes[i] = .{
             .name = item.name,
             .kind = @tagName(item.kind),
+            .replay_applied_sequence = item.replay_applied_sequence,
+            .replay_target_sequence = item.replay_target_sequence,
+            .replay_catch_up_required = item.replay_catch_up_required,
+            .catch_up_active = item.catch_up_active,
+            .catch_up_phase = @tagName(item.catch_up_phase),
             .doc_count = item.doc_count,
             .term_count = item.term_count,
             .edge_count = item.edge_count,
@@ -11067,6 +11111,7 @@ fn jsonDBStatsProjection(stats: db_mod.types.DBStats, indexes: []JsonDBIndexStat
     return JsonDBStats{
         .doc_count = stats.doc_count,
         .index_count = stats.index_count,
+        .indexes_available = stats.indexes_available,
         .indexes = indexes,
         .repair_degraded = stats.repair_degraded,
         .repair_issue_count = stats.repair_issue_count,
