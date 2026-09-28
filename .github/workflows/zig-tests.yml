@@ -3,6 +3,10 @@ name: Zig Tests
 on:
   workflow_call:
     inputs:
+      full_validation:
+        description: Run full Zig and E2E suites for an approved PR
+        type: boolean
+        default: false
       pr_number:
         type: string
         default: ''
@@ -63,7 +67,7 @@ jobs:
       base_sha: ${{ inputs.base_sha }}
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
-      suite: zig
+      suite: ${{ inputs.full_validation && 'full' || 'zig' }}
 
   changes:
     if: >-
@@ -138,6 +142,17 @@ jobs:
           [ -n "$keep" ]
           HELPER
           chmod +x "$helper"
+
+          if [[ "${{ inputs.full_validation }}" == "true" ]]; then
+            {
+              echo "zig_tests=true"
+              echo "e2e=true"
+              echo "model_check=true"
+              echo "trace_validate=true"
+              echo "backup_s3=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if [[ "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "workflow_dispatch" ]]; then
             if [[ "${{ inputs.validation_scope }}" == "inference-e2e" ]]; then
@@ -361,6 +376,7 @@ jobs:
       ( needs.changes.outputs.zig_tests == 'true' ||
       needs.changes.outputs.model_check == 'true' ||
       needs.changes.outputs.trace_validate == 'true' ) ) ||
+      inputs.full_validation ||
       github.event_name == 'merge_group' ||
       (github.event_name == 'push' &&
       github.ref == 'refs/heads/main') ||
@@ -368,7 +384,7 @@ jobs:
       github.event_name == 'workflow_dispatch') &&
       inputs.validation_scope == 'all') ||
       github.event.schedule == '0 8 * * *') }}
-    name: ${{ (inputs.pr_number != '' || github.event.schedule == '0 3 * * 0') && 'zig-base / arm64-codec' || 'zig-full / arm64-codec' }}
+    name: ${{ ((inputs.pr_number != '' && !inputs.full_validation) || github.event.schedule == '0 3 * * 0') && 'zig-base / arm64-codec' || 'zig-full / arm64-codec' }}
     needs: [admission, changes]
     runs-on: arc-antfly-arm64-runtime
     timeout-minutes: 20
@@ -437,6 +453,7 @@ jobs:
     if: >-
       ${{ !cancelled() &&
       success() &&
+      !inputs.full_validation &&
       needs.admission.result == 'success' &&
       (inputs.pr_number == '' ||
       github.run_attempt == 1) &&
@@ -862,7 +879,8 @@ jobs:
       needs.admission.result == 'success' &&
       (inputs.pr_number == '' ||
       github.run_attempt == 1) &&
-      (github.event_name == 'merge_group' ||
+      (inputs.full_validation ||
+      github.event_name == 'merge_group' ||
       (github.event_name == 'push' &&
       github.ref == 'refs/heads/main') ||
       ((inputs.pr_number == '' &&
@@ -1143,7 +1161,8 @@ jobs:
       needs.admission.result == 'success' &&
       (inputs.pr_number == '' ||
       github.run_attempt == 1) &&
-      (github.event_name == 'merge_group' ||
+      (inputs.full_validation ||
+      github.event_name == 'merge_group' ||
       (github.event_name == 'push' &&
       github.ref == 'refs/heads/main') ||
       ((inputs.pr_number == '' &&
@@ -1223,6 +1242,7 @@ jobs:
   zig-base:
     if: >-
       ${{ !cancelled() &&
+      !inputs.full_validation &&
       needs.admission.result == 'success' &&
       (inputs.pr_number == '' ||
       github.run_attempt == 1) &&
@@ -1255,7 +1275,8 @@ jobs:
       (inputs.pr_number == '' ||
       github.run_attempt == 1) &&
       (always() &&
-      ( github.event_name == 'merge_group' ||
+      ( inputs.full_validation ||
+      github.event_name == 'merge_group' ||
       (github.event_name == 'push' &&
       github.ref == 'refs/heads/main') ||
       ((inputs.pr_number == '' &&
@@ -1300,7 +1321,7 @@ jobs:
       # The PR E2E artifact is also the release-packaging smoke artifact. Build
       # the partitioned graph once, test that exact binary, and reuse its
       # distributed PIC archive for both public C API packaging shapes.
-      ANTFLY_CI_ZIG_OPTIMIZE: ReleaseFast
+      ANTFLY_CI_ZIG_OPTIMIZE: ${{ inputs.full_validation && 'ReleaseSafe' || 'ReleaseFast' }}
       ANTFLY_CI_ZIG_STRIP: "true"
       ANTFLY_CI_BUILD_CAPI: "true"
     steps:
@@ -1350,7 +1371,7 @@ jobs:
 
   e2e-base-plan:
     if: >-
-      ${{ !cancelled() && success() && needs.admission.result == 'success' &&
+      ${{ !cancelled() && success() && !inputs.full_validation && needs.admission.result == 'success' &&
       inputs.pr_number != '' && github.run_attempt == 1 && needs.changes.outputs.e2e == 'true' }}
     name: e2e-base / plan
     needs: [admission, changes]
@@ -1390,6 +1411,7 @@ jobs:
   e2e-base-tests:
     if: >-
       ${{ !cancelled() &&
+      !inputs.full_validation &&
       needs.admission.result == 'success' &&
       (inputs.pr_number == '' ||
       github.run_attempt == 1) &&
@@ -1724,6 +1746,7 @@ jobs:
   e2e-base:
     if: >-
       ${{ !cancelled() &&
+      !inputs.full_validation &&
       needs.admission.result == 'success' &&
       (inputs.pr_number == '' ||
       github.run_attempt == 1) &&
@@ -1774,6 +1797,7 @@ jobs:
     if: >-
       ${{ !cancelled() &&
       success() &&
+      !inputs.full_validation &&
       needs.admission.result == 'success' &&
       (inputs.pr_number == '' ||
       github.run_attempt == 1) &&
@@ -1847,15 +1871,17 @@ jobs:
       (inputs.pr_number == '' ||
       github.run_attempt == 1) &&
       (always() &&
-      needs.e2e-full-build.result == 'success' &&
-      (github.event_name == 'merge_group' ||
+      (needs.e2e-full-build.result == 'success' ||
+      (inputs.full_validation && needs.e2e-base-build.result == 'success')) &&
+      (inputs.full_validation ||
+      github.event_name == 'merge_group' ||
       (github.event_name == 'push' &&
       github.ref == 'refs/heads/main') ||
       (inputs.pr_number == '' &&
       github.event_name == 'workflow_dispatch') ||
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full / ${{ matrix.suite }}
-    needs: [admission, changes, e2e-full-build]
+    needs: [admission, changes, e2e-base-build, e2e-full-build]
     runs-on: ${{ matrix.suite == 'antfly' && 'arc-antfly-heavy-runtime' || 'arc-antfly-heavy' }}
     timeout-minutes: 150
     strategy:
@@ -1934,11 +1960,11 @@ jobs:
       - name: Download E2E executable
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: antfly-e2e-full-${{ github.run_id }}
+          name: antfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full
 
       - name: Install E2E executable
-        run: tar -xzf "${RUNNER_TEMP}/antfly-e2e-full/antfly-e2e-full.tar.gz" -C zig
+        run: tar -xzf "${RUNNER_TEMP}/antfly-e2e-full/antfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}.tar.gz" -C zig
 
       - name: Report inference memory baseline
         if: matrix.suite == 'inference'
@@ -2065,20 +2091,27 @@ jobs:
       (inputs.pr_number == '' ||
       github.run_attempt == 1) &&
       (always() &&
-      (github.event_name == 'merge_group' ||
+      (inputs.full_validation ||
+      github.event_name == 'merge_group' ||
       (github.event_name == 'push' &&
       github.ref == 'refs/heads/main') ||
       (inputs.pr_number == '' &&
       github.event_name == 'workflow_dispatch') ||
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full
-    needs: [admission, changes, e2e-full-build, e2e-full-tests]
+    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-full-tests, e2e-base-low-fd]
     runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify full E2E suites
         env:
-          BUILD_RESULT: ${{ needs.e2e-full-build.result }}
+          BUILD_RESULT: ${{ inputs.full_validation && needs.e2e-base-build.result || needs.e2e-full-build.result }}
           TEST_RESULT: ${{ needs.e2e-full-tests.result }}
+          LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}
+          REQUIRE_LOW_FD: ${{ inputs.full_validation && inputs.pr_number != '' }}
         run: |
+          set -euo pipefail
           test "$BUILD_RESULT" = "success"
           test "$TEST_RESULT" = "success"
+          if [[ "$REQUIRE_LOW_FD" == "true" ]]; then
+            test "$LOW_FD_RESULT" = "success"
+          fi
