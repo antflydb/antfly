@@ -57,7 +57,7 @@ Validates that the distributed transaction implementation conforms to `AntflyTra
 
 - `TraceAntflyTransaction.tla` -- Trace refinement spec
 - `TraceAntflyTransaction.cfg` -- TLC configuration (checks `TraceMatched` and 5 safety invariants)
-- `../../scripts/tla-filter-txn-trace.py` -- Filters transaction traces for spec compatibility
+- `../../scripts/tla-filter-txn-trace.py` -- Retains only key-connected transaction components whose complete lifecycles fit the current model. A multi-shard or recovery lifecycle cannot be dropped alone: its pending intents or committed writes could explain another transaction's observed conflict. Those components await explicit multi-shard/recovery modeling; independent components remain checked. Malformed trace JSON fails validation.
 
 ## Makefile Targets
 
