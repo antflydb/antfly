@@ -1064,6 +1064,7 @@ question's own copy of the state.
 | --- | ---: | ---: | ---: | ---: |
 | Packed | 0.607 | 0.463 | 5,319 | 1.6 h |
 | Fused, K = 10 (head + top 8 encoder layers) | 0.601 | 0.457 | 8,858 | 3.0 h |
+| Fused, K = 30 (whole stack) | 0.605 | 0.476 | 8,858 | 3.2 h |
 | Unpacked | 0.701 | 0.607 | 16,009 decisions | 4.6 h |
 
 Fusing the top 10 layers buys nothing on either eval. Per kind, K = 10 scores:
@@ -1075,7 +1076,27 @@ fifth) and ended similar (0.90 vs 0.89). The upper layers had to adapt to
 states that suddenly see a question placed *after* them. The released weights
 learned the reverse order (question first).
 
-Next: K = 30, the whole stack, which bounds what this family can reach.
+Fusing the whole stack (K = 30) barely helps either:
+- Open-Jev val 0.605 (choice 0.442, score 0.363, noul 0.762), soft CE 0.835.
+- `s0-eval` 0.476 (choice 0.461, score 0.385, noul 0.614), soft CE 1.090.
+- Training loss by fifth: 1.10, 0.99, 1.03, 0.94, 0.88.
+
+K = 30 is exactly the question-aware trunk with one question per tree. Every
+layer fuses state and question, yet it still trails unpacked by 0.10 on
+Open-Jev and 0.13 on `s0-eval`. So question-blind lower layers are not what
+costs the packed layouts their accuracy.
+
+**Inference (ours):** what is left between K = 30 and unpacked is layout, not
+fusion.
+- Unpacked puts the question and options *first* (`[CLS] head [SEP] options
+  [SEP] state [SEP]`); every packed layout puts the state first.
+- RoPE therefore sees the opposite relative order between question and state
+  tokens from the one the released weights were trained on.
+- The recipe differs too (gradient accumulation 3 vs one packed row per
+  step), but step counts match.
+- A cheap test that keeps caching: give the trunk fixed positions after the
+  full head budget (`head_max_len`), so that every question sits *before* the
+  state in position space, as in the released layout.
 
 ### Candidate mode on Banking77 (step 0b)
 

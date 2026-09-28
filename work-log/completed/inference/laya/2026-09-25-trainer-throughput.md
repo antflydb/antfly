@@ -580,3 +580,5 @@ Per-question upper layers `sf16k10` (fuse_layers 10, max_packed_len 704, oj16k, 
 train 10,623 s, 8,858 rows. s0-eval 0.457 (choice 0.395, score 0.398, noul 0.596), soft CE 1.112, ECE 0.028.
 Open-Jev val 0.601 (0.441, 0.363, 0.755), soft CE 0.830, ECE 0.056.
 Mean train CE by fifth: 1.095 1.000 1.000 0.965 0.904 (packed sp16: 0.942 0.830 0.870 0.848 0.893).
+`sf16k30` (fuse_layers 30): train 11,573 s. s0-eval 0.476 (0.461, 0.385, 0.614), soft CE 1.090, ECE 0.028.
+Open-Jev val 0.605 (0.442, 0.363, 0.762), soft CE 0.835, ECE 0.052. Train CE by fifth: 1.096 0.986 1.026 0.943 0.881.
