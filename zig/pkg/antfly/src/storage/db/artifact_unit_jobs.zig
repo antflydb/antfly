@@ -65,8 +65,8 @@ const DocumentPosition = struct {
         return raw;
     }
 
-    fn load(txn: anytype, selected: DocumentScope) !DocumentPosition {
-        const raw = txn.get(&selected) catch |err| if (err == error.NotFound) return .{} else return err;
+    fn loadOptional(txn: anytype, selected: DocumentScope) !?DocumentPosition {
+        const raw = txn.get(&selected) catch |err| if (err == error.NotFound) return null else return err;
         if (raw.len != 117 or !std.mem.eql(u8, raw[0..4], "AUDW") or raw[52] > 1 or
             !std.mem.eql(u8, raw[85..], &checksum(&selected, raw[0..85]))) return error.ArtifactCatalogCorrupt;
         const revision = std.mem.readInt(u64, raw[4..12], .little);
@@ -74,6 +74,10 @@ const DocumentPosition = struct {
         if (count == 0 or std.mem.allEqual(u8, raw[20..52], 0) or (revision == 0 and raw[52] != 0) or
             (raw[52] == 0 and !std.mem.allEqual(u8, raw[53..85], 0))) return error.ArtifactCatalogCorrupt;
         return .{ .revision = revision, .scopes = count, .generation = raw[20..52].*, .after = if (raw[52] == 0) null else raw[53..85].* };
+    }
+
+    fn load(txn: anytype, selected: DocumentScope) !DocumentPosition {
+        return (try loadOptional(txn, selected)) orelse .{};
     }
 };
 
@@ -107,7 +111,9 @@ pub const DocumentTurn = struct {
 pub fn prepareDocumentTurn(txn: anytype, root: u128, document: []const u8) !?DocumentTurn {
     const authority = (try publication.authority(txn)) orelse return null;
     const selected_document = try documentScope(root, authority, document);
-    const previous = try DocumentPosition.load(txn, selected_document);
+    // Most required-work documents have no scoped child jobs. Keep that path
+    // to one point read; only an admitted nonempty directory needs a cursor.
+    const previous = (try DocumentPosition.loadOptional(txn, selected_document)) orelse return null;
     var seek: DirectoryKey = undefined;
     @memcpy(seek[0..selected_document.len], &selected_document);
     seek[selected_document.len] = 1;
@@ -278,9 +284,11 @@ pub const Job = struct {
 
 pub const WorkPage = struct {
     arena: std.heap.ArenaAllocator,
-    items: []const struct { key: JobKey, job: Job },
+    items: []const Item,
     after: ?JobKey,
     at_end: bool,
+
+    pub const Item = struct { key: JobKey, raw: []const u8, job: Job };
 
     pub fn deinit(self: *WorkPage) void {
         self.arena.deinit();
@@ -325,7 +333,7 @@ pub fn scan(alloc: std.mem.Allocator, txn: anytype, selected: Scope, after: ?Job
         // Rebase the verified slices into one owned allocation; do not hash
         // and parse the same potentially large identity a second time.
         const job: Job = .{ .generation = decoded.generation, .document = raw[48..][0..decoded.document.len], .child = raw[48 + decoded.document.len ..][0..decoded.child.len], .unit = raw[48 + decoded.document.len + decoded.child.len ..][0..decoded.unit.len] };
-        try items.append(owned, .{ .key = selected_job, .job = job });
+        try items.append(owned, .{ .key = selected_job, .raw = raw, .job = job });
         next = selected_job;
         bytes +|= cost;
         if (items.items.len == limits.visits or bytes >= limits.bytes) break;
@@ -534,6 +542,18 @@ pub fn RetirementSession(comptime Txn: type) type {
             if (!std.mem.eql(u8, &self.selected, selected_job[0..scope_bytes])) return error.ArtifactCatalogDrift;
             const raw = self.txn.get(&selected_job) catch |err| if (err == error.NotFound) return null else return err;
             return self.prepareDecoded(alloc, selected_job, raw, try Job.decode(selected_job, raw));
+        }
+
+        /// The bounded worker page already owns these bytes in this pinned
+        /// snapshot. Revalidate its framing without a second LSM point read;
+        /// the writer still compares the exact record before deletion.
+        pub fn preparePageItem(self: *@This(), alloc: std.mem.Allocator, item: WorkPage.Item) !?Retirement {
+            const decoded = try Job.decode(item.key, item.raw);
+            if (!std.meta.eql(decoded.generation, item.job.generation) or
+                !std.mem.eql(u8, decoded.document, item.job.document) or
+                !std.mem.eql(u8, decoded.child, item.job.child) or
+                !std.mem.eql(u8, decoded.unit, item.job.unit)) return error.ArtifactCatalogCorrupt;
+            return self.prepareDecoded(alloc, item.key, item.raw, decoded);
         }
     };
 }

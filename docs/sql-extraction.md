@@ -2165,6 +2165,15 @@ following mechanisms are installed behind that gate:
   has invalidated the old receipt; present jobs still require the current
   catalog, authority, and accepted-result fences. Callback selection and
   execution remain the activation boundary.
+- Required-work maintenance now visits one document's scoped outbox after
+  native input closure, checks up to eight jobs per child against receiver-local
+  accepted or obsolete receipts, and checkpoints retirement with both fair
+  cursors. Pending callbacks remain queued. Documents without an outbox use a
+  point lookup and never open a physical worker cursor. Job preparation reuses
+  the bounded page's owned bytes instead of refetching each record from the
+  LSM; the writer still checks exact bytes and current receipt fences. This is
+  automatic receipt reclamation, not automatic producer execution or stream
+  completion.
 - Persisted unit encoding now lives in a shared typed payload contract rather
   than the runtime implementation. Ordered unit chunk callbacks decode through
   that contract once, bind document/producer/unit identity, reject provenance

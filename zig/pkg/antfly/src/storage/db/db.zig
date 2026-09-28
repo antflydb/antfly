@@ -35769,6 +35769,55 @@ pub const DB = struct {
         try dispatcher.submit(namespace, encoded.?);
     }
 
+    /// One bounded receiver-local pass over a document's scoped outbox. Only
+    /// accepted or obsolete receipts retire jobs; pending callbacks retain
+    /// their slots. The pinned read is gone before the writer fence; the
+    /// immutable plan remains pinned for the maintenance turn.
+    pub fn advanceArtifactUnitReceiptPage(self: *DB, scratch: Allocator, document: []const u8, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot) !bool {
+        const unit_jobs = @import("artifact_unit_jobs.zig");
+        var document_turn: ?unit_jobs.DocumentTurn = null;
+        var work: ?unit_jobs.WorkTurn = null;
+        defer if (work) |*turn| turn.deinit();
+        var retirements: std.ArrayListUnmanaged(unit_jobs.Retirement) = .empty;
+        defer {
+            for (retirements.items) |*retirement| retirement.deinit();
+            retirements.deinit(scratch);
+        }
+        {
+            var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+            defer read.abort();
+            document_turn = try unit_jobs.prepareDocumentTurn(&read, self.root_incarnation, document);
+            const turn = document_turn orelse return false;
+            if (turn.selected) |selected| {
+                work = try unit_jobs.prepareTurn(scratch, &read, self.root_incarnation, selected, .{ .visits = 8 });
+            }
+            if (work != null and work.?.page.items.len != 0) {
+                const child = work.?.page.items[0].job.child;
+                if (unit_jobs.retirementSession(scratch, &read, self.root_incarnation, document, child, plan)) |session_value| {
+                    var session = session_value;
+                    defer session.deinit();
+                    for (work.?.page.items) |item| {
+                        if (!std.mem.eql(u8, item.job.document, document) or !std.mem.eql(u8, item.job.child, child)) return error.ArtifactCatalogCorrupt;
+                        if (try session.preparePageItem(scratch, item)) |prepared| {
+                            var retirement = prepared;
+                            errdefer retirement.deinit();
+                            try retirements.append(scratch, retirement);
+                        }
+                    }
+                } else |err| switch (err) {
+                    error.ArtifactPublicationPending, error.EnrichmentSourceChanged => {},
+                    else => return err,
+                }
+            }
+        }
+        const pointers = try scratch.alloc(*const unit_jobs.Retirement, retirements.items.len);
+        defer scratch.free(pointers);
+        for (retirements.items, pointers) |*retirement, *pointer| pointer.* = retirement;
+        const work_ptr: ?*const unit_jobs.WorkTurn = if (work) |*turn| turn else null;
+        try self.finishArtifactUnitWorkPage(&document_turn.?, work_ptr, pointers);
+        return true;
+    }
+
     fn advanceArtifactProducerWorkPageWithAllocator(self: *DB, scratch: Allocator) !bool {
         var plan = try self.core.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
@@ -35834,7 +35883,10 @@ pub const DB = struct {
             // It also runs for catalogs with no generated provider templates.
             const native_progress = try @import("artifact_native_stream.zig").advance(scratch, self.core.store, self.root_incarnation, item.document, plan.plan());
             more_dispatch = more_dispatch or native_progress == .progress;
-            if (native_progress == .closed) try self.enqueueArtifactCompletion(scratch, item.document, plan.plan());
+            if (native_progress == .closed) {
+                _ = try self.advanceArtifactUnitReceiptPage(scratch, item.document, plan.plan());
+                try self.enqueueArtifactCompletion(scratch, item.document, plan.plan());
+            }
             if (!item.dispatch_complete and plan.plan().generated_templates.len != 0) {
                 const requests = try dispatch.prepare(plan.plan().generated_templates, item.next_template, item.document, &refs);
                 var ctx = self.batchContext();

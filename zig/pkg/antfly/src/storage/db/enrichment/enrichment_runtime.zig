@@ -4362,6 +4362,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .deadline_clock = config.clock orelse platform_clock.Clock.real(),
             .activity_epoch = newActivityEpoch(config, config.clock orelse platform_clock.Clock.real()),
             .config = .{
+                .root_incarnation = config.root_incarnation,
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
