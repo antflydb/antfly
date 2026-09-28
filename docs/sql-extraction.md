@@ -2151,8 +2151,8 @@ following mechanisms are installed behind that gate:
   concurrent live-child count changes. Document-key hashing is prepared before
   the apply lock; final counter/directory fences use fixed-size keys and values.
   Root/epoch GC handles both registries.
-  Automatic callback/retirement execution and accepted child-route selection
-  remain the next integration boundary; the directory cannot certify output.
+  The directory itself grants no acceptance evidence; the replay worker and
+  receiver-verified retirement paths below consume it.
   Validation: 200 ordered-artifact tests pass with zero failures or leaks,
   including sibling retry fairness, binary document isolation, behind-cursor
   admission, current-key retirement, joint-cursor reopen, concurrent count
@@ -2179,8 +2179,19 @@ following mechanisms are installed behind that gate:
   of chunks later produced. Chunk and unit range kinds remain distinct even
   when they share the same range ID. A remote unit route is rejected before
   chunking or publication until the routed child command path is available;
-  callers cannot supply an unverified route for a durable job. This does not
-  yet wire the automatic callback loop or dynamic child-range inspection.
+  callers cannot supply an unverified route for a durable job. Dynamic
+  child-range inspection and routed remote publication remain open.
+- Generated replay wakes now select one child and a bounded four-job page from
+  the durable directory. The runtime clones the parent template and releases
+  the read snapshot and plan before invoking each generation-fenced callback;
+  a stable DB-owned context commits both fair cursors under the ordinary HA,
+  snapshot, and apply gates. The replay remains pending while the document has
+  any queued jobs, including on a wrap turn, and receiver-verified maintenance
+  retires them. A restart fixture checks the document-only wake and refusal of
+  the durable turn commit without cursor advancement or job loss. This wires
+  local callbacks but does not complete remote child placement, large staged
+  outputs, all-required stream closure, or the distributed activation fault
+  matrix.
 - Persisted unit encoding now lives in a shared typed payload contract rather
   than the runtime implementation. Ordered unit chunk callbacks decode through
   that contract once, bind document/producer/unit identity, reject provenance

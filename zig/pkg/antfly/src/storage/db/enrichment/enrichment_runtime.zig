@@ -242,6 +242,10 @@ pub const GeneratedRecordWriter = *const fn (
     source_guards: []const GeneratedSourceGuard,
     fence: ?GeneratedWriteFence,
 ) anyerror!GeneratedRecordCommit;
+pub const ArtifactUnitTurnCommit = struct {
+    ptr: *anyopaque,
+    commit: *const fn (*anyopaque, ?*const @import("../artifact_unit_jobs.zig").DocumentTurn, ?*const @import("../artifact_unit_jobs.zig").WorkTurn) anyerror!void,
+};
 pub const RequestFailure = struct {
     kind: enrichment_types.GeneratedEnrichmentKind,
     index_name: []const u8,
@@ -4220,6 +4224,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     owns_store: bool,
     artifact_store: ?*docstore_mod.DocStore = null,
     artifact_publication_dispatcher: ?ordered_publication.Dispatcher = null,
+    artifact_unit_turn_commit: ?ArtifactUnitTurnCommit = null,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
@@ -4718,6 +4723,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     owns_store: bool,
     artifact_store: ?*docstore_mod.DocStore = null,
     artifact_publication_dispatcher: ?ordered_publication.Dispatcher = null,
+    artifact_unit_turn_commit: ?ArtifactUnitTurnCommit = null,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
@@ -11144,6 +11150,75 @@ test "prepared document cache prepares unrelated PDF keys concurrently" {
     try std.testing.expectEqual(@as(usize, 2), FakePreparation.peak.load(.acquire));
 }
 
+/// The durable replay wake carries only the document. Resolve one fair child
+/// and an owned bounded job page from the root-local directory, then release
+/// both the physical read and compiled plan before any provider invocation.
+pub fn servicePendingArtifactUnitJobs(runtime: *EnrichmentRuntime, document: []const u8, guard: ForegroundCatchUpGuard) !void {
+    const store = runtime.artifact_store orelse return;
+    const commit = runtime.artifact_unit_turn_commit orelse return;
+    if (runtime.artifact_publication_dispatcher == null or runtime.config.root_incarnation == 0) return;
+    const unit_jobs = @import("../artifact_unit_jobs.zig");
+    var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+        resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
+    else
+        null;
+    defer if (budget) |*tracked| tracked.deinit();
+    const work_alloc = if (budget) |*tracked| tracked.allocator() else runtime.alloc;
+    var document_turn: ?unit_jobs.DocumentTurn = null;
+    var work: ?unit_jobs.WorkTurn = null;
+    defer if (work) |*turn| turn.deinit();
+    var parent_request: ?enrichment_types.GeneratedEnrichmentRequest = null;
+    defer if (parent_request) |request| enrichment_types.freeGeneratedRequest(runtime.alloc, request);
+    {
+        var read = try store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer read.abort();
+        document_turn = try unit_jobs.prepareDocumentTurn(&read, runtime.config.root_incarnation, document);
+        const selected = (document_turn orelse return).selected;
+        if (selected) |scope| {
+            work = unit_jobs.prepareTurn(work_alloc, &read, runtime.config.root_incarnation, scope, .{ .visits = 4 }) catch |err| {
+                if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+            if (work.?.page.items.len != 0) {
+                const job = work.?.page.items[0].job;
+                if (!std.mem.eql(u8, job.document, document)) return error.ArtifactCatalogCorrupt;
+                var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+                defer plan.release();
+                const completion = if (plan.plan().completion_plan) |*value| value else return error.ArtifactCatalogDrift;
+                const child = try completion.unitChild(job.child);
+                const ordinal = child.parent_template orelse return error.ArtifactPublicationPending;
+                if (ordinal >= plan.plan().generated_templates.len) return error.ArtifactCatalogDrift;
+                var parent = plan.plan().generated_templates[ordinal];
+                parent.doc_key = document;
+                parent_request = try enrichment_types.cloneGeneratedRequest(runtime.alloc, parent);
+            }
+        }
+    }
+    var first_error: ?anyerror = null;
+    if (work) |*turn| {
+        for (turn.page.items) |item| {
+            try guard.check();
+            if (!std.mem.eql(u8, item.job.document, document) or
+                !std.mem.eql(u8, item.job.child, turn.page.items[0].job.child)) return error.ArtifactCatalogCorrupt;
+            publishOrderedUnitJob(runtime, parent_request.?, item.job) catch |err| switch (err) {
+                // An admitted command is not an accepted result. Keep the job
+                // until receiver-verified retirement observes its receipt.
+                error.ArtifactPublicationPending, error.ArtifactCoverageBaselinePending, error.OnlineMergeArtifactTailsUnsupported => {},
+                error.EnrichmentSourceChanged => {},
+                else => if (first_error == null) {
+                    first_error = err;
+                },
+            };
+        }
+    }
+    const work_ptr: ?*const unit_jobs.WorkTurn = if (work) |*turn| turn else null;
+    try commit.commit(commit.ptr, &document_turn.?, work_ptr);
+    if (first_error) |err| return err;
+    // A wrapped or exhausted page still belongs to a nonempty durable outbox.
+    // Only receipt-checked retirement removes its last directory entry.
+    return error.ArtifactPublicationPending;
+}
+
 fn processPendingDocumentGroup(
     runtime: *EnrichmentRuntime,
     pending: enrichment_worker.PendingDocumentGroup,
@@ -11157,6 +11232,7 @@ fn processPendingDocumentGroup(
     guard: ForegroundCatchUpGuard,
 ) !void {
     try guard.check();
+    try servicePendingArtifactUnitJobs(runtime, pending.doc_key, guard);
     const planned = try getOrCreatePlannedRequests(runtime, pending.doc_key, request_plan_cache);
     var prepared_sources = PreparedDocumentSourceCache.init(runtime);
     defer prepared_sources.deinit();

@@ -2312,6 +2312,8 @@ const ProfiledApplyLock = struct {
 
 const EnrichmentAppendContext = struct {
     alloc: Allocator,
+    root_incarnation: u128 = 0,
+    read_only: bool = false,
     artifact_publication_dispatcher: ?ArtifactPublicationDispatcher = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     store: *docstore_mod.DocStore,
@@ -7872,6 +7874,8 @@ pub const DB = struct {
         const resources = self.core.batchExecutionResources();
         append_ctx.* = .{
             .alloc = self.runtime_alloc,
+            .root_incarnation = self.root_incarnation,
+            .read_only = openModeRequiresReadOnlyBackends(self.open_mode),
             .clock = runtime_cfg.clock orelse self.backend_runtime.clock(),
             .store = resources.store,
             .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
@@ -7926,6 +7930,7 @@ pub const DB = struct {
         // source owner before any later fallible initialization so exactly one
         // side destroys the providers on both success and error paths.
         runtime.artifact_publication_dispatcher = self.artifact_publication_dispatcher;
+        runtime.artifact_unit_turn_commit = .{ .ptr = append_ctx, .commit = commitArtifactUnitTurnFromEnrichment };
         enrichment_cfg.dense_embedder = null;
         enrichment_cfg.sparse_embedder = null;
         enrichment_cfg.asset_producer = null;
@@ -62944,6 +62949,29 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     defer batch_ctx.apply_mutex.unlockExclusive();
     try applyDerivedBatchContext(&batch_ctx, applied_batch);
     return sequence;
+}
+
+fn commitArtifactUnitTurnFromEnrichment(ptr: *anyopaque, document: ?*const @import("artifact_unit_jobs.zig").DocumentTurn, work: ?*const @import("artifact_unit_jobs.zig").WorkTurn) !void {
+    const owner: *EnrichmentAppendContext = @ptrCast(@alignCast(ptr));
+    if (owner.read_only) return error.ReadOnly;
+    if (owner.root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
+    if (document == null and work == null) return error.InvalidBatchRequest;
+    if (document) |selected| if (work) |turn| {
+        if (selected.selected == null or !std.mem.eql(u8, &selected.selected.?, &turn.selected)) return error.InvalidBatchRequest;
+    };
+    var ctx = owner.batchContext();
+    var ha_mutation = acquireHAMutationSharedContext(&ctx);
+    defer if (ha_mutation) |*lease| lease.release();
+    try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    var snapshot_replay = try acquireSnapshotReplayContext(&ctx);
+    defer if (snapshot_replay) |*lease| lease.release();
+    try lockApplyForPortableRuntimeContext(&ctx);
+    defer ctx.apply_mutex.unlockExclusive();
+    var writer = try ctx.store.beginWriteTxn();
+    errdefer writer.abort();
+    if (work) |turn| _ = try turn.stage(&writer, owner.root_incarnation);
+    if (document) |turn| try turn.stage(&writer, owner.root_incarnation);
+    try writer.commit();
 }
 
 const ResolutionHandoffDocStoreSink = struct {

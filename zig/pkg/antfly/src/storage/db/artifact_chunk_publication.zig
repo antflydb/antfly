@@ -1897,6 +1897,47 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         // A lost retirement reply remains idempotent after a newer accepted
         // parent generation has invalidated the old receipt's proof.
         try std.testing.expect(!try db.retireArtifactUnitJob(&obsolete_job));
+        const NoopDispatch = struct {
+            calls: usize = 0,
+            fn enqueue(ptr: *anyopaque, _: publication.Namespace, _: []const u8) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.calls += 1;
+            }
+        };
+        var dispatched = NoopDispatch{};
+        db.artifact_publication_dispatcher = .{ .ptr = &dispatched, .enqueue = NoopDispatch.enqueue };
+        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+        const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+        const before_worker = blk: {
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            break :blk (try unit_jobs.prepareDocumentTurn(&reader, db.root_incarnation, "doc")).?.expected_revision;
+        };
+        {
+            const original = runtime.artifact_unit_turn_commit;
+            defer runtime.artifact_unit_turn_commit = original;
+            const Refuse = struct {
+                fn commit(_: *anyopaque, _: ?*const unit_jobs.DocumentTurn, _: ?*const unit_jobs.WorkTurn) !void {
+                    return error.TestTurnCommitRefused;
+                }
+            };
+            runtime.artifact_unit_turn_commit = .{ .ptr = &dispatched, .commit = Refuse.commit };
+            try std.testing.expectError(error.TestTurnCommitRefused, @import("enrichment/enrichment_runtime.zig").servicePendingArtifactUnitJobs(runtime, "doc", .{}));
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            try std.testing.expectEqual(before_worker, (try unit_jobs.prepareDocumentTurn(&reader, db.root_incarnation, "doc")).?.expected_revision);
+            _ = try reader.get(&wake_admission.jobs[0].key);
+        }
+        // The replay wake carries only the document. Obsolete generation jobs
+        // are skipped without provider I/O, while the fair turn is durable and
+        // the replay stays pending until receipt retirement removes the queue.
+        try std.testing.expectError(error.ArtifactPublicationPending, @import("enrichment/enrichment_runtime.zig").servicePendingArtifactUnitJobs(runtime, "doc", .{}));
+        try std.testing.expectEqual(@as(usize, 0), dispatched.calls);
+        {
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            try std.testing.expectEqual(before_worker + 1, (try unit_jobs.prepareDocumentTurn(&reader, db.root_incarnation, "doc")).?.expected_revision);
+        }
         var stale = blk: {
             var reader = try db.core.store.beginReadTxn();
             defer reader.abort();
