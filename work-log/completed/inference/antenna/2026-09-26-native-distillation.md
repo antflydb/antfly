@@ -119,11 +119,44 @@ Native training now matches upstream's trainer on real data, which the
 earlier CUDA-only parity campaign (scripts/gliner25/LOSS_PARITY_FOLLOWUP.md)
 never established for CPU or Metal.
 
+### Native distillation after the fix
+
+The neck fit now runs on the job's backend (300 rows in about a minute on
+resident Metal instead of 45 s per microbatch on the CPU; explained variance
+0.51-0.52). Both runs start from the identity-neck student with gliner2.5-base's
+heads, batch 4 x accumulation 2, encoder lr 3e-5, neck lr 1e-4, warmup 10%,
+distillation weight 1, no heads:
+
+| Mean (in-domain / held-out) | Optimizer steps | Classification | NER F1 |
+| --- | --- | --- | --- |
+| 80k pool (news and banking), run14 | 8,000 | 0.603 / 0.353 | 0.323 / 0.285 |
+| Wikipedia pool (118,800 rows, 1 epoch), run15 | 14,850 | 0.624 / 0.359 | 0.435 / 0.379 |
+| PyTorch stage 2 (for reference) | 14,000 | 0.662 / 0.378 | 0.449 / 0.364 |
+
+The Wikipedia run scored low at 3,000 steps (0.381 / 0.249 and 0.146 / 0.183)
+while its longer warmup ended, then matched run14's final NER by 6,000. Its held-out NER is
+above PyTorch stage 2's; classification stays 0.02-0.04 short. Run15 took 10.6
+hours on the Studio.
+
+### Native end to end: stage 3 from the native student
+
+Stage 3 from run15's student with the job used for the fixed native stage 3
+(pilot rows, hard labels, 2 epochs, resident Metal), run16:
+
+| Mean (in-domain / held-out) | Classification | NER F1 |
+| --- | --- | --- |
+| native stage 3 from PyTorch stage 2 | 0.743 / 0.345 | 0.684 / 0.511 |
+| native stage 3 from native distillation (run16) | 0.740 / 0.316 | 0.696 / 0.497 |
+
+Distillation and fine-tuning both native now reach the same place as the
+PyTorch-distilled student within noise, except held-out classification
+(CLINC150 0.39 against 0.45; SST-5 0.26 against 0.24). MIT movie NER stays
+the weakest set (0.26).
+
 ## Next
 
-- Rerun native feature distillation (the full recipe from an identity neck)
-  on the fixed binary; the pre-fix run is void.
-- Run the neck fit on the job's backend: on the CPU it takes about 45 s per
-  microbatch, which limited the fit to 64 rows and overfit the neck.
-- Widen the text pool beyond news and banking queries for held-out quality.
+- Widen the pool's query side: held-out classification (CLINC150, SST-5) is
+  the gap, and the Wikipedia pool widened only the text.
+- A second distillation epoch or a larger pool; run15's loss was still
+  falling (0.37 at 5,400 steps, 0.25 at the end).
 
