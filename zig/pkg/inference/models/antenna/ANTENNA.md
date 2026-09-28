@@ -611,10 +611,11 @@ Laya's gradient parity against PyTorch holds with it (2.1e-6 CPU and Metal),
 as does the ModernBERT boundary encoder's (1.3e-5 CPU, 1.4e-5 Metal). A
 4,096-token step runs on Metal past the old 64Mi score cap. On the released
 Laya checkpoint, a resident Metal step at 2,048 tokens takes 25 s fused
-against 65 s materialized. The materialized profile stays the default; Laya
-selects `attention: fused_v1`, and the ModernBERT boundary encoder uses it
-under `replay_tiled_v1`. With head dropout above 0, Laya's decision head
-still materializes its attention.
+against 65 s materialized. The materialized profile stays the default; the
+ModernBERT boundary encoder uses it under `replay_tiled_v1`. Laya now trains
+with the tree-packing branch's segment attention op, whose dropout-free calls
+run on these Metal kernels (7.2x the host bridge at 2,048 tokens; see
+`models/laya/LAYA.md`).
 
 ## Risks and open questions
 
