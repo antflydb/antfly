@@ -8391,27 +8391,32 @@ pub const DB = struct {
                 else => return err,
             };
             defer transactions_mod.freeParticipantList(self.alloc, unresolved);
+            var acknowledged: [64][]const u8 = undefined;
+            var acknowledged_count: usize = 0;
             for (unresolved) |participant| {
                 recovery_stats.notification_attempts += 1;
-                if (config.local_participant) |local| {
-                    if (std.mem.eql(u8, local, participant)) {
-                        self.markTransactionParticipantResolved(txn.txn_id, participant) catch |err| switch (err) {
-                            transactions_mod.TxnError.TxnNotFound => {},
-                            else => return err,
-                        };
-                        recovery_stats.notification_successes += 1;
-                        continue;
-                    }
-                }
-                resolve_participant(resolver_ctx, txn.txn_id, participant, txn.status, txn.commit_version) catch {
+                const is_local = if (config.local_participant) |local| std.mem.eql(u8, local, participant) else false;
+                if (!is_local) resolve_participant(resolver_ctx, txn.txn_id, participant, txn.status, txn.commit_version) catch {
                     recovery_stats.notification_failures += 1;
                     continue;
                 };
-                self.markTransactionParticipantResolved(txn.txn_id, participant) catch |err| switch (err) {
+                acknowledged[acknowledged_count] = participant;
+                acknowledged_count += 1;
+                if (acknowledged_count == acknowledged.len) {
+                    self.markTransactionParticipantsResolved(txn.txn_id, acknowledged[0..acknowledged_count]) catch |err| switch (err) {
+                        transactions_mod.TxnError.TxnNotFound => {},
+                        else => return err,
+                    };
+                    recovery_stats.notification_successes += acknowledged_count;
+                    acknowledged_count = 0;
+                }
+            }
+            if (acknowledged_count != 0) {
+                self.markTransactionParticipantsResolved(txn.txn_id, acknowledged[0..acknowledged_count]) catch |err| switch (err) {
                     transactions_mod.TxnError.TxnNotFound => {},
                     else => return err,
                 };
-                recovery_stats.notification_successes += 1;
+                recovery_stats.notification_successes += acknowledged_count;
             }
         }
 
@@ -27173,7 +27178,7 @@ pub const DB = struct {
         var integrity_effects: ?integrity_mod.Effects = null;
         defer if (integrity_effects) |*effects| effects.deinit();
         if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or integrity_catalog != null) {
-            var integrity_read = try integrity_mod.CurrentView.init(self.core.store);
+            var integrity_read = try integrity_mod.CurrentView.initForTransaction(self.core.store, preparation_alloc, txn_id);
             defer integrity_read.deinit();
             // Shadow claims must remain unobservable even to a participant
             // whose stale route happens to name this receiver. Check before
@@ -28198,6 +28203,15 @@ pub const DB = struct {
         try self.core.markTransactionParticipantResolved(txn_id, participant);
     }
 
+    pub fn markTransactionParticipantsResolved(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8) !void {
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.core.markTransactionParticipantsResolvedExtraBatch(txn_id, participants, .{});
+    }
+
     pub fn markReplicatedTransactionParticipantResolvedAtRaftEntry(
         self: *DB,
         txn_id: transactions_mod.TxnId,
@@ -28215,6 +28229,25 @@ pub const DB = struct {
         self.core.markTransactionParticipantResolvedExtraBatch(
             txn_id,
             participant,
+            .{ .writes = &.{marker} },
+        ) catch |err| switch (err) {
+            transactions_mod.TxnError.TxnNotFound => try self.core.store.putBatch(&.{marker}, &.{}),
+            else => return err,
+        };
+    }
+
+    pub fn markReplicatedTransactionParticipantsResolvedAtRaftEntry(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8, identity: RaftAppliedEntryIdentity) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+            .already_applied => return,
+            .apply => {},
+        }
+        var value_buf: [raft_applied_entry_value_len]u8 = undefined;
+        const marker = raftAppliedEntryWrite(identity, &value_buf);
+        self.core.markTransactionParticipantsResolvedExtraBatch(
+            txn_id,
+            participants,
             .{ .writes = &.{marker} },
         ) catch |err| switch (err) {
             transactions_mod.TxnError.TxnNotFound => try self.core.store.putBatch(&.{marker}, &.{}),
@@ -140629,5 +140662,113 @@ test "source vector migration converts legacy ANN generations in both modes" {
         var result = try migrated.search(alloc, .{ .index_name = "model", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });
         defer result.deinit();
         try std.testing.expectEqualStrings("a", result.hits[0].id);
+    }
+}
+
+test "db transaction batched acknowledgement migration preserves legacy replay and survives reopen" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-ack-index");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
+    defer cleanupTempDir(path_tmp.path().ptr);
+    var db = try DB.open(alloc, path, .{ .start_index_workers = false });
+    var opened = true;
+    defer if (opened) db.close();
+    const txn: transactions_mod.TxnId = @splat(53);
+    const prefix = "\x00\x00__txn_participant_index_v1__:";
+    var index_key: [prefix.len + 16]u8 = undefined;
+    @memcpy(index_key[0..prefix.len], prefix);
+    @memcpy(index_key[prefix.len..], &txn);
+    _ = try db.beginReplicatedTransactionAtRaftEntry(txn, 10000, 10000, &.{ "a", "b", "c" }, false, false, .{ .term = 3, .index = 1 });
+    try db.markReplicatedTransactionParticipantResolvedAtRaftEntry(txn, "a", .{ .term = 3, .index = 2 });
+    {
+        var read = try db.core.store.beginProbeTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(&index_key));
+    }
+    try std.testing.expectError(error.InvalidParticipant, db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(txn, &.{ "b", "absent" }, .{ .term = 3, .index = 3 }));
+    try std.testing.expectEqual(@as(u64, 2), (try db.raftAppliedEntry()).?.index);
+    try db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(txn, &.{"b"}, .{ .term = 3, .index = 3 });
+    // Exact replay is fenced before payload admission, preserving the durable
+    // marker together with the indexed membership and migrated resolution.
+    try db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(txn, &.{"absent"}, .{ .term = 3, .index = 3 });
+    db.close();
+    opened = false;
+    db = try DB.open(alloc, path, .{ .start_index_workers = false });
+    opened = true;
+    try std.testing.expectEqual(@as(u64, 3), (try db.raftAppliedEntry()).?.index);
+    const pending = try db.getUnresolvedTransactionParticipants(alloc, txn);
+    defer transactions_mod.freeParticipantList(alloc, pending);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqualStrings("c", pending[0]);
+    try db.markReplicatedTransactionParticipantResolvedAtRaftEntry(txn, "c", .{ .term = 3, .index = 4 });
+    const complete = try db.getUnresolvedTransactionParticipants(alloc, txn);
+    defer transactions_mod.freeParticipantList(alloc, complete);
+    try std.testing.expectEqual(@as(usize, 0), complete.len);
+}
+
+test "db transaction integrity contention precedes stale claim semantics" {
+    const alloc = std.testing.allocator;
+    for ([_]transactions_mod.TxnStatus{ .committed, .aborted }) |decision| {
+        var directory = try TestDirectory.init("claim-contention");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{
+            .start_optional_runtimes = false,
+            .start_index_workers = false,
+            .identity_namespace = .{ .table_id = 100, .shard_id = 101 },
+        });
+        defer db.close();
+        try db.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        );
+        const integrity = @import("relational_integrity.zig");
+        const catalog_mod = @import("relational_integrity_catalog.zig");
+        const raw = (try db.core.getStoreValue(alloc, catalog_mod.key)).?;
+        defer alloc.free(raw);
+        var catalog = try catalog_mod.decode(alloc, raw);
+        defer catalog.deinit();
+        const generation_set = @import("relational_integrity_activation.zig").generationSet(catalog);
+        var view = db.core.acquireSchemaView().?;
+        defer view.release();
+        var plan = try @import("relational_index_keys.zig").TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
+        defer plan.deinit();
+        var tuple: std.ArrayList(u8) = .empty;
+        defer tuple.deinit(alloc);
+        _ = try plan.appendValues(alloc, &tuple, &.{.{ .integer = 17 }});
+        const address = try integrity.Address.init(catalog.find(.unique, "pk").?.generation, tuple.items);
+        const seed = try db.beginTransactionWithId(@splat(71), 10);
+        try db.writeTransaction(seed, .{
+            .relational_schema_version = 1,
+            .relational_integrity_generation_set = generation_set,
+            .writes = &.{.{ .key = "parent", .value = "{\"id\":17}" }},
+            .integrity_commands = &.{.{ .address = address, .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "parents", .parent_key = "parent", .schema_version = 1 } } }},
+        });
+        try db.commitTransaction(seed, 11);
+        const release = try db.beginTransactionWithId(@splat(72), 12);
+        const release_request: types.TransactionIntentRequest = .{
+            .relational_schema_version = 1,
+            .relational_integrity_generation_set = generation_set,
+            .deletes = &.{"parent"},
+            .integrity_commands = &.{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parents", .parent_key = "parent" } } }},
+        };
+        try db.writeTransaction(release, release_request);
+        // Own intents remain idempotently preparable. Another transaction must
+        // see recoverable contention before decoding the old physical claim.
+        try db.writeTransaction(release, release_request);
+        const candidate = try db.beginTransactionWithId(@splat(73), 13);
+        const replacement: types.TransactionIntentRequest = .{
+            .relational_schema_version = 1,
+            .relational_integrity_generation_set = generation_set,
+            .writes = &.{.{ .key = "replacement", .value = "{\"id\":17}" }},
+            .integrity_commands = &.{.{ .address = address, .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "parents", .parent_key = "replacement", .schema_version = 1 } } }},
+        };
+        try std.testing.expectError(error.IntentConflict, db.writeTransaction(candidate, replacement));
+        try db.resolveTransactionIntents(release, decision, 20);
+        if (decision == .committed) {
+            try db.writeTransaction(candidate, replacement);
+            try db.commitTransaction(candidate, 21);
+        } else {
+            try std.testing.expectError(error.UniqueConstraintViolation, db.writeTransaction(candidate, replacement));
+        }
     }
 }

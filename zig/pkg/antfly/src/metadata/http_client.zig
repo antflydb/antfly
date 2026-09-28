@@ -278,7 +278,24 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn fetchPagedSnapshot(self: *MetadataHttpClient, base_uri: []const u8, control: bool, linearizable: bool, budget: ?RequestBudget) !std.json.Parsed(metadata_api.AdminSnapshot) {
-        const uri = try join(self.alloc, base_uri, snapshot_transfer.path);
+        return self.fetchPagedSnapshotAt(base_uri, control, linearizable, budget, snapshot_transfer.path) catch |err| switch (err) {
+            // v0.2.x has the original snapshot routes, not retained transfers.
+            // Preserve the caller's proof and budget on this read-only fallback.
+            error.UnsupportedOperation => if (linearizable) self.fetchLinearizableSnapshot(base_uri, budget) else self.fetchSnapshotWithBudget(base_uri, budget),
+            else => return err,
+        };
+    }
+
+    pub fn fetchPagedPeerSnapshot(self: *MetadataHttpClient, base_uri: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.AdminSnapshot) {
+        return self.fetchPagedSnapshotAt(base_uri, true, false, budget, snapshot_transfer.peer_path);
+    }
+
+    pub fn fetchPagedPlanningSnapshot(self: *MetadataHttpClient, base_uri: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.AdminSnapshot) {
+        return self.fetchPagedSnapshotAt(base_uri, true, false, budget, snapshot_transfer.planning_path);
+    }
+
+    fn fetchPagedSnapshotAt(self: *MetadataHttpClient, base_uri: []const u8, control: bool, linearizable: bool, budget: ?RequestBudget, path: []const u8) !std.json.Parsed(metadata_api.AdminSnapshot) {
+        const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
         var request: snapshot_transfer.Request = .{ .control = control, .linearizable = linearizable };
         defer if (request.token != 0) {
@@ -2725,6 +2742,51 @@ fn consumerTests() type {
             _ = try client.fetchLinearizableHead("http://127.0.0.1:9000");
             try std.testing.expectEqual(@as(usize, 1), executor.public_calls);
             try std.testing.expectEqual(@as(usize, 1), executor.internal_calls);
+        }
+
+        test "metadata http client v0.2 snapshot fallback preserves proof budget and cancellation" {
+            const Capture = struct {
+                linearizable: bool,
+                cancel_probe: bool = false,
+                cancellation: *http_common.RequestCancellation,
+                probes: usize = 0,
+                legacy_reads: usize = 0,
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(req.timeout_ms.? <= 1000);
+                    if (std.mem.endsWith(u8, req.uri, snapshot_transfer.path)) {
+                        self.probes += 1;
+                        if (self.cancel_probe) self.cancellation.cancel();
+                        return .{ .status = 404, .body = try alloc.dupe(u8, "unknown route") };
+                    }
+                    self.legacy_reads += 1;
+                    if (self.linearizable) {
+                        try std.testing.expectEqual(@TypeOf(req.method).POST, req.method);
+                        try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_linearizable_snapshot));
+                    } else {
+                        try std.testing.expectEqual(@TypeOf(req.method).GET, req.method);
+                        try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.admin_snapshot));
+                    }
+                    return .{ .status = 200, .body = try alloc.dupe(u8, "{\"status\":{\"metadata_group_id\":91,\"metadata_epoch\":3,\"metrics\":{}},\"tables\":[],\"ranges\":[],\"stores\":[],\"placement_intents\":[],\"split_transitions\":[],\"merge_transitions\":[]}") };
+                }
+            };
+            for ([_]bool{ false, true }) |linearizable| for ([_]bool{ false, true }) |cancel_probe| {
+                var cancellation: http_common.RequestCancellation = .{};
+                var capture: Capture = .{ .linearizable = linearizable, .cancel_probe = cancel_probe, .cancellation = &cancellation };
+                var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &capture, .vtable = &.{ .execute = Capture.execute } });
+                const budget: RequestBudget = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s, .cancellation = &cancellation };
+                const result = client.fetchPagedSnapshot("http://metadata.invalid", true, linearizable, budget);
+                if (cancel_probe) {
+                    try std.testing.expectError(error.Cancelled, result);
+                    try std.testing.expectEqual(@as(usize, 0), capture.legacy_reads);
+                } else {
+                    var parsed = try result;
+                    defer parsed.deinit();
+                    try std.testing.expectEqual(@as(u64, 91), parsed.value.status.metadata_group_id);
+                    try std.testing.expectEqual(@as(usize, 1), capture.legacy_reads);
+                }
+                try std.testing.expectEqual(@as(usize, 1), capture.probes);
+            };
         }
 
         test "metadata http client paged snapshot bounds admission and releases after cancellation" {

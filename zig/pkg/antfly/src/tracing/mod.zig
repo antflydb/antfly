@@ -26,4 +26,5 @@ test {
     // File ownership is part of the normal Raft unit gate too. Without an
     // explicit import its tests are discovered only when TLA logging is used.
     _ = @import("trace_file.zig");
+    _ = antfly_trace_writer;
 }

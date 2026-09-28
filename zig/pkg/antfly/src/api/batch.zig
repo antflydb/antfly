@@ -1012,6 +1012,17 @@ fn parseBatchRequestWithOptions(
                 .commit_version = try parseInternalU64(object.get("commit_version") orelse return error.InvalidBatchRequest),
             } };
         }
+        if (std.mem.eql(u8, phase_value.string, "acknowledge_many")) {
+            const values = object.get("participants") orelse return error.InvalidBatchRequest;
+            if (values != .array or values.array.items.len == 0 or values.array.items.len > 64) return error.InvalidBatchRequest;
+            transaction_participants = try alloc.alloc([]const u8, values.array.items.len);
+            for (values.array.items, 0..) |participant_item, i| {
+                if (participant_item != .string or participant_item.string.len == 0) return error.InvalidBatchRequest;
+                transaction_participants[i] = try alloc.dupe(u8, participant_item.string);
+                transaction_participants_initialized += 1;
+            }
+            break :transaction .{ .acknowledge_many = .{ .txn_id = txn_id, .participants = transaction_participants } };
+        }
         if (std.mem.eql(u8, phase_value.string, "acknowledge")) {
             const participant_value = object.get("participant") orelse return error.InvalidBatchRequest;
             if (participant_value != .string or participant_value.string.len == 0) return error.InvalidBatchRequest;
@@ -1057,7 +1068,7 @@ fn parseBatchRequestWithOptions(
     if (relational_topology != null and (transaction != null or writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0 or integrity.len != 0 or integrity_commands != null or relational_activation != null or relational_retirement != null or relational_index_maintenance != null or split_checkpoint != null or split_replication != null or split_transition != null or merge_checkpoint != null or merge_replication != null or merge_source_transition != null)) return error.InvalidBatchRequest;
     if (relational_topology != null and (relational_schema_version != null or relational_integrity_generation_set != null or relational_repair)) return error.InvalidBatchRequest;
     if (transaction) |mutation| switch (mutation) {
-        .begin, .resolve, .acknowledge, .cleanup => if (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0)
+        .begin, .resolve, .acknowledge, .acknowledge_many, .cleanup => if (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0)
             return error.InvalidBatchRequest,
         .prepare => {},
     };
@@ -1531,6 +1542,11 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
                 try writer.print("\"phase\":\"acknowledge\",\"txn_id\":\"{s}\",\"participant\":{f}", .{
                     &txn_hex, std.json.fmt(ack.participant, .{}),
                 });
+            },
+            .acknowledge_many => |ack| {
+                if (ack.participants.len == 0 or ack.participants.len > 64) return error.InvalidBatchRequest;
+                const txn_hex = std.fmt.bytesToHex(ack.txn_id, .lower);
+                try writer.print("\"phase\":\"acknowledge_many\",\"txn_id\":\"{s}\",\"participants\":{f}", .{ &txn_hex, std.json.fmt(ack.participants, .{}) });
             },
             .cleanup => |cleanup| {
                 const txn_hex = std.fmt.bytesToHex(cleanup.txn_id, .lower);
@@ -2015,6 +2031,15 @@ fn consumerTests() type {
                 else => return error.TestUnexpectedResult,
             };
             try std.testing.expectEqualStrings("table2:4:docs:group:8", ack.participant);
+
+            const many_encoded = try encodeBatchRequest(alloc, .{ .transaction = .{ .acknowledge_many = .{ .txn_id = txn_id, .participants = &.{ "table2:4:docs:group:8", "table2:4:docs:group:9" } } } });
+            defer alloc.free(many_encoded);
+            var many_decoded = try parseInternalBatchRequest(alloc, many_encoded);
+            defer many_decoded.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), many_decoded.req.transaction.?.acknowledge_many.participants.len);
+            try std.testing.expectEqualStrings("table2:4:docs:group:9", many_decoded.req.transaction.?.acknowledge_many.participants[1]);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, many_encoded));
+            try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .transaction = .{ .acknowledge_many = .{ .txn_id = txn_id, .participants = &.{} } } }));
 
             const cleanup_encoded = try encodeBatchRequest(alloc, .{
                 .transaction = .{ .cleanup = .{
