@@ -1503,6 +1503,34 @@ class ReleasePromotionTests(unittest.TestCase):
             verifier = load_module(
                 "verify_release_ledger_test", "verify_release_ledger.py"
             )
+            runtime = root / "runtime"
+            runtime.mkdir()
+            for name in runtime_names:
+                (runtime / name).write_bytes((output / name).read_bytes())
+            runtime_argv = [
+                "verify_release_ledger.py",
+                "--ledger",
+                str(output / "artifacts.json"),
+                "--payload-dir",
+                str(runtime),
+                "--scope",
+                "runtime",
+                "--tag",
+                "v0.2.1",
+                "--commit",
+                COMMIT,
+                "--ledger-sha256",
+                verifier.sha256(output / "artifacts.json"),
+            ]
+            with mock.patch.object(sys, "argv", runtime_argv):
+                self.assertEqual(verifier.main(), 0)
+            (runtime / "antfly-lite_0.2.1_Linux_x86_64_gnu.tar.gz").unlink()
+            with (
+                mock.patch.object(sys, "argv", runtime_argv),
+                self.assertRaisesRegex(SystemExit, "release runtime scope mismatch"),
+            ):
+                verifier.main()
+
             promotion = root / "promotion"
             promotion.mkdir()
             promoted_package = promotion / "antfly-cli-0.2.1.tgz"
