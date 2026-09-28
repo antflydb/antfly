@@ -7095,6 +7095,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 );
                 return self.boundaryOwnedTensor(output);
             },
+            .fused_modernbert_training_attention_v1, .fused_modernbert_training_attention_backward_v1 => |attrs| {
+                const backward = instruction.op == .fused_modernbert_training_attention_backward_v1;
+                return self.modernBertTrainingAttention(tensors[0], inputs[1], if (backward) tensors[2] else null, attrs, control);
+            },
             .reshape, .stop_gradient, .convert_dtype => return self.residentTrainingReshape(inputs[0], shape, limits.primitive, false),
             .gather => {
                 const source = instruction.inputs[0];
@@ -7165,10 +7169,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             .dot_general => blk: {
                 const dot = geometry.dot.?;
+                // The device kernels read the left operand as [rows, contracting]
+                // and take the right operand's contracting axis: 0 for
+                // [contracting, columns], 1 for [columns, contracting]. A
+                // transposed left operand has no kernel; never run it as if it
+                // were untransposed.
+                if (dot.lhs_transposed) return error.UnsupportedResidentProgramInstruction;
+                const rhs_contract_axis: u32 = if (dot.rhs_transposed) 1 else 0;
                 const output = if (instruction.inputs[0].rank_ == 2)
-                    try metal_runtime.decoderRuntimeDotGeneral2DF32Device(self.provider_impl, tensors[0], tensors[1], dot.rows, dot.columns, dot.contracting, 0)
+                    try metal_runtime.decoderRuntimeDotGeneral2DF32Device(self.provider_impl, tensors[0], tensors[1], dot.rows, dot.columns, dot.contracting, rhs_contract_axis)
                 else
-                    try metal_runtime.decoderRuntimeDotGeneralBatchedF32Device(self.provider_impl, tensors[0], tensors[1], dot.batch, dot.rows, dot.columns, dot.contracting, 0, shape);
+                    try metal_runtime.decoderRuntimeDotGeneralBatchedF32Device(self.provider_impl, tensors[0], tensors[1], dot.batch, dot.rows, dot.columns, dot.contracting, rhs_contract_axis, shape);
                 break :blk output orelse return error.UnsupportedResidentProgramInstruction;
             },
             else => return error.UnsupportedResidentProgramInstruction,
@@ -7247,6 +7258,37 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const n_grad = try native_ctx.cb.segmentTrainingAttentionBackwardV1(n_qkv, n_control, n_dout, attrs);
         defer native_ctx.cb.free(n_grad);
         return self.exportCtFromHostNative(&native_ctx, n_grad, null);
+    }
+
+    /// ModernBERT training attention on device. The control's retained host
+    /// copy (every physical i32 upload keeps one) proves each range stays
+    /// inside its row before a kernel reads it. Unlike the strict resident
+    /// instructions this may join an active command frame (Laya's framed
+    /// trainer); the output view keeps the kernel scratch alive.
+    fn modernBertTrainingAttention(self: *MetalCompute, qkv: MetalTensor, control_ct: CT, d_out: ?MetalTensor, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) !CT {
+        if (control) |active| try active.check();
+        const control_buf = toBuf(control_ct);
+        const storage = control_buf.resident_index_storage orelse return error.UnsupportedResidentTrainingIndexProof;
+        _ = try @import("modernbert_training_attention.zig").validateControl(attrs, storage.values);
+        const control_tensor = control_buf.metal_tensor orelse return error.ResidentTrainingRequiresDeviceTensor;
+        const output = try metal_runtime.decoderRuntimeModernBertTrainingAttentionV1Device(self.provider_impl, qkv, control_tensor, d_out, attrs, control);
+        return self.boundaryOwnedTensor(output);
+    }
+
+    fn modernBertTrainingAttentionV1Op(ctx: *anyopaque, qkv_ct: CT, control_i32: CT, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
+        defer qkv.deinit();
+        return self.modernBertTrainingAttention(qkv, control_i32, null, attrs, control);
+    }
+
+    fn modernBertTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv_ct: CT, control_i32: CT, d_out_ct: CT, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
+        defer qkv.deinit();
+        var d_out = try self.ownedDeviceMetalTensorFromCt(d_out_ct);
+        defer d_out.deinit();
+        return self.modernBertTrainingAttention(qkv, control_i32, d_out, attrs, control);
     }
 
     fn residentTrainingPrimitiveOp(ctx: *anyopaque, request: *const ops.resident_training.Request, limits: ops.resident_training.Limits, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
@@ -30600,6 +30642,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // native hooks would cast this Metal context to NativeCompute.
         vt.debertaTrainingAttentionV1 = debertaTrainingAttentionV1Op;
         vt.debertaTrainingAttentionBackwardV1 = debertaTrainingAttentionBackwardV1Op;
+        vt.modernBertTrainingAttentionV1 = modernBertTrainingAttentionV1Op;
+        vt.modernBertTrainingAttentionBackwardV1 = modernBertTrainingAttentionBackwardV1Op;
         // Host-bridged (no device kernel yet); see segmentTrainingAttentionV1Op.
         vt.segmentTrainingAttentionV1 = segmentTrainingAttentionV1Op;
         vt.segmentTrainingAttentionBackwardV1 = segmentTrainingAttentionBackwardV1Op;

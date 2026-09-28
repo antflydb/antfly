@@ -2275,6 +2275,12 @@ pub const ComputeBackend = struct {
         segmentTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
         segmentTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
 
+        /// ModernBERT training attention over packed [Q;K;V] with an i32
+        /// range/position control; linear storage, replayed backward
+        /// returning packed [dQ;dK;dV]. See ops/modernbert_training_attention.zig.
+        modernBertTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+        modernBertTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+
         /// Optional destructive softmax over the last dimension. When this
         /// returns a tensor, the backend may have reused `input`'s storage, so
         /// callers must only use it when `input` is at last use.
@@ -4098,6 +4104,26 @@ pub const ComputeBackend = struct {
         _ = try attrs.layout();
         try self.checkExecutionControl();
         const op = self.vtable.segmentTrainingAttentionBackwardV1 orelse return error.SegmentTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, control_i32, dO, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn modernBertTrainingAttentionV1(self: *const ComputeBackend, qkv: CT, control_i32: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.modernBertTrainingAttentionV1 orelse return error.ModernBertTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, control_i32, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn modernBertTrainingAttentionBackwardV1(self: *const ComputeBackend, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.modernBertTrainingAttentionBackwardV1 orelse return error.ModernBertTrainingAttentionProfileUnavailable;
         const output = try op(self.ptr, qkv, control_i32, dO, attrs, self.execution_control);
         errdefer self.free(output);
         try self.checkExecutionControl();

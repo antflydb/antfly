@@ -29,12 +29,17 @@ pub const Backbone = enum {
     base,
     small,
     multi,
+    /// Any ModernBERT or mmBERT encoder, identified by its encoder config
+    /// (`model_type: modernbert`) rather than by `model_name`. Its tensor
+    /// inventory is derived from the config. Training only.
+    modern_bert,
 
     pub fn modelName(self: Backbone) []const u8 {
         return switch (self) {
             .base => "microsoft/deberta-v3-base",
             .small => "microsoft/deberta-v3-xsmall",
             .multi => "microsoft/mdeberta-v3-base",
+            .modern_bert => "",
         };
     }
 };
@@ -169,6 +174,11 @@ pub const HeadConfig = struct {
     }
 };
 
+/// DeBERTa-v3 is the only encoder of released GLiNER2.5 checkpoints and the
+/// only one inference and export support. ModernBERT is a training-only
+/// encoder for now (zig/pkg/inference/models/antenna/ANTENNA.md).
+pub const EncoderFamily = enum { deberta, modern_bert };
+
 pub const EncoderConfig = struct {
     hidden_size: u32,
     intermediate_size: u32,
@@ -176,11 +186,20 @@ pub const EncoderConfig = struct {
     num_attention_heads: u32,
     vocab_size: u32,
     max_position_embeddings: u32,
+    /// DeBERTa relative-position buckets; 0 for ModernBERT.
     position_buckets: u32,
     layer_norm_eps: f32,
     hidden_dropout_prob: f32,
     attention_probs_dropout_prob: f32,
     pad_token_id: u32,
+    family: EncoderFamily = .deberta,
+    // ModernBERT only: split-half RoPE for global and local layers, the local
+    // sliding window (total width, so each side sees half), and the global
+    // layer period.
+    global_rope_theta: f32 = 0,
+    local_rope_theta: f32 = 0,
+    local_attention_window: u32 = 0,
+    global_attn_every_n_layers: u32 = 0,
 
     pub fn toDeberta(self: EncoderConfig) deberta.Config {
         return .{
@@ -197,6 +216,14 @@ pub const EncoderConfig = struct {
     }
 };
 
+/// An Antenna GLiNER neck: a learned map from the trunk's final hidden states
+/// into the space the boundary heads read, applied to every token before
+/// routing. It lets a trunk distilled against another encoder's feature space
+/// keep that encoder's heads. Declared as the top-level `antenna_neck`; only
+/// ModernBERT checkpoints carry one.
+pub const Neck = enum { none, linear };
+pub const neck_prefix = "gliner_neck";
+
 pub const Config = struct {
     version: u32,
     architecture_version: u32,
@@ -204,6 +231,7 @@ pub const Config = struct {
     backbone: Backbone,
     head: HeadConfig,
     encoder: EncoderConfig,
+    neck: Neck = .none,
 };
 
 /// Detect from executable architecture metadata, never from repository names.
@@ -259,13 +287,17 @@ pub fn parseConfig(allocator: std.mem.Allocator, bytes: []const u8, encoder_byte
     const version = try requiredU32(obj, "config_version", false);
     const arch_version = try requiredU32(obj, "architecture_version", false);
     if (version != config_version or arch_version != architecture_version) return error.UnsupportedGlinerBoundaryVersion;
-    const max_len = try requiredU32(obj, "max_len", false);
+    // A ModernBERT encoder is identified by its own config; `model_name` is
+    // free text for it (upstream saves `max_len: null`, no word limit).
+    const modern_encoder = try encoderIsModernBert(allocator, encoder_bytes);
+    const unlimited = modern_encoder and if (obj.get("max_len")) |value| value == .null else false;
+    const max_len = if (unlimited) 0 else try requiredU32(obj, "max_len", false);
     const model_name = obj.get("model_name") orelse return error.InvalidGlinerBoundaryConfig;
     if (model_name != .string) return error.InvalidGlinerBoundaryConfig;
-    const backbone: Backbone = blk: {
+    const backbone: Backbone = if (modern_encoder) .modern_bert else blk: {
         inline for (std.meta.fields(Backbone)) |field| {
             const candidate: Backbone = @enumFromInt(field.value);
-            if (std.mem.eql(u8, model_name.string, candidate.modelName())) break :blk candidate;
+            if (candidate != .modern_bert and std.mem.eql(u8, model_name.string, candidate.modelName())) break :blk candidate;
         }
         return error.UnsupportedGlinerBoundaryEncoder;
     };
@@ -273,8 +305,15 @@ pub fn parseConfig(allocator: std.mem.Allocator, bytes: []const u8, encoder_byte
     if (head_value != .object) return error.InvalidGlinerBoundaryConfig;
     const head = try parseHeadConfig(head_value.object);
     try head.validate();
-    const encoder = try parseEncoderConfig(allocator, encoder_bytes, backbone);
-    return .{ .version = version, .architecture_version = arch_version, .max_len = max_len, .backbone = backbone, .head = head, .encoder = encoder };
+    const encoder = if (modern_encoder) try parseModernBertEncoderConfig(allocator, encoder_bytes) else try parseEncoderConfig(allocator, encoder_bytes, backbone);
+    const neck: Neck = if (obj.get("antenna_neck")) |value| switch (value) {
+        .null => .none,
+        .string => |name| std.meta.stringToEnum(Neck, name) orelse return error.UnsupportedGlinerBoundaryConfiguration,
+        else => return error.InvalidGlinerBoundaryConfig,
+    } else .none;
+    if (neck != .none and !modern_encoder) return error.UnsupportedGlinerBoundaryConfiguration;
+    // Without a word limit, the encoder's position limit bounds the words.
+    return .{ .version = version, .architecture_version = arch_version, .max_len = if (unlimited) encoder.max_position_embeddings else max_len, .backbone = backbone, .head = head, .encoder = encoder, .neck = neck };
 }
 
 pub fn parseHeadConfig(obj: std.json.ObjectMap) !HeadConfig {
@@ -353,6 +392,52 @@ fn parseEncoderConfig(allocator: std.mem.Allocator, bytes: []const u8, backbone:
         result.num_attention_heads != expected_hidden / 64 or result.num_hidden_layers != 12 or
         result.vocab_size != expected_vocab or result.max_position_embeddings != 512 or result.position_buckets != 256)
         return error.UnsupportedGlinerBoundaryEncoder;
+    return result;
+}
+
+fn encoderIsModernBert(allocator: std.mem.Allocator, bytes: []const u8) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| return configError(err);
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGlinerBoundaryConfig;
+    const value = parsed.value.object.get("model_type") orelse return error.InvalidGlinerBoundaryConfig;
+    return value == .string and std.mem.eql(u8, value.string, "modernbert");
+}
+
+/// Hugging Face ModernBERT (and mmBERT) encoder config. Only the bias-free,
+/// exact-GELU, dropout-free layout the training trunk implements is accepted.
+fn parseModernBertEncoderConfig(allocator: std.mem.Allocator, bytes: []const u8) !EncoderConfig {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| return configError(err);
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGlinerBoundaryConfig;
+    const obj = parsed.value.object;
+    try requireString(obj, "model_type", "modernbert");
+    try requireString(obj, "hidden_activation", "gelu");
+    inline for (.{ "norm_bias", "attention_bias", "mlp_bias" }) |name| try requireBool(obj, name, false);
+    inline for (.{ "attention_dropout", "embedding_dropout", "mlp_dropout" }) |name|
+        if (try requiredF32(obj, name) != 0) return error.UnsupportedGlinerBoundaryEncoder;
+    // RoPE scaling would change the rotation the trunk applies.
+    if (obj.get("rope_scaling")) |value| if (value != .null) return error.UnsupportedGlinerBoundaryEncoder;
+    const result = EncoderConfig{
+        .hidden_size = try requiredU32(obj, "hidden_size", false),
+        .intermediate_size = try requiredU32(obj, "intermediate_size", false),
+        .num_hidden_layers = try requiredU32(obj, "num_hidden_layers", false),
+        .num_attention_heads = try requiredU32(obj, "num_attention_heads", false),
+        .vocab_size = try requiredU32(obj, "vocab_size", false),
+        .max_position_embeddings = try requiredU32(obj, "max_position_embeddings", false),
+        .position_buckets = 0,
+        .layer_norm_eps = try requiredF32(obj, "norm_eps"),
+        .hidden_dropout_prob = 0,
+        .attention_probs_dropout_prob = 0,
+        .pad_token_id = try requiredU32(obj, "pad_token_id", true),
+        .family = .modern_bert,
+        .global_rope_theta = try requiredF32(obj, "global_rope_theta"),
+        .local_rope_theta = try requiredF32(obj, "local_rope_theta"),
+        .local_attention_window = try requiredU32(obj, "local_attention", false),
+        .global_attn_every_n_layers = try requiredU32(obj, "global_attn_every_n_layers", false),
+    };
+    if (result.hidden_size % result.num_attention_heads != 0 or (result.hidden_size / result.num_attention_heads) % 2 != 0 or
+        result.pad_token_id >= result.vocab_size or result.layer_norm_eps <= 0 or result.global_rope_theta <= 0 or result.local_rope_theta <= 0)
+        return error.InvalidGlinerBoundaryConfig;
     return result;
 }
 
@@ -508,4 +593,81 @@ test "gliner boundary retains precise consistency weight and rejects nonfinite d
     try std.testing.expect(head.consistency_loss_weight != @as(f64, @as(f32, @floatCast(head.consistency_loss_weight))));
     head.consistency_loss_weight = std.math.nan(f64);
     try std.testing.expectError(error.InvalidGlinerBoundaryConfig, head.validate());
+}
+
+const modern_encoder_json =
+    \\{"attention_bias":false,"attention_dropout":0.0,"embedding_dropout":0.0,"global_attn_every_n_layers":2,"global_rope_theta":160000.0,"hidden_activation":"gelu","hidden_size":32,"intermediate_size":48,"local_attention":8,"local_rope_theta":10000.0,"max_position_embeddings":512,"mlp_bias":false,"mlp_dropout":0.0,"model_type":"modernbert","norm_bias":false,"norm_eps":1e-05,"num_attention_heads":4,"num_hidden_layers":3,"pad_token_id":0,"vocab_size":394}
+;
+
+/// The published base config with a free-text model name and `max_len: null`,
+/// as upstream saves a boundary extractor built on a non-DeBERTa encoder.
+fn modernConfigBytes(a: std.mem.Allocator) ![]u8 {
+    const base = try loadFixture(a, .base, "config.json");
+    defer a.free(base);
+    const renamed = try std.mem.replaceOwned(u8, a, base, "\"microsoft/deberta-v3-base\"", "\"tiny-modernbert-fixture\"");
+    defer a.free(renamed);
+    return std.mem.replaceOwned(u8, a, renamed, "\"max_len\": 4096", "\"max_len\": null");
+}
+
+test "gliner boundary parses a ModernBERT encoder from its own config and bounds words by its positions" {
+    const a = std.testing.allocator;
+    const bytes = try modernConfigBytes(a);
+    defer a.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"max_len\": null") != null);
+    const config = try parseConfig(a, bytes, modern_encoder_json);
+    try std.testing.expectEqual(Backbone.modern_bert, config.backbone);
+    try std.testing.expectEqual(EncoderFamily.modern_bert, config.encoder.family);
+    try std.testing.expectEqual(@as(u32, 512), config.max_len);
+    try std.testing.expectEqual(@as(u32, 0), config.encoder.position_buckets);
+    try std.testing.expectEqual(@as(u32, 8), config.encoder.local_attention_window);
+    try std.testing.expectEqual(@as(u32, 2), config.encoder.global_attn_every_n_layers);
+    try std.testing.expectEqual(@as(f32, 160000), config.encoder.global_rope_theta);
+    try std.testing.expectEqual(@as(f32, 1e-5), config.encoder.layer_norm_eps);
+    // A DeBERTa encoder still needs a numeric word limit and a published name.
+    const base_encoder = try loadFixture(a, .base, "encoder_config.json");
+    defer a.free(base_encoder);
+    try std.testing.expectError(error.InvalidGlinerBoundaryConfig, parseConfig(a, bytes, base_encoder));
+    for ([_][2][]const u8{
+        .{ "\"mlp_dropout\":0.0", "\"mlp_dropout\":0.1" },
+        .{ "\"norm_bias\":false", "\"norm_bias\":true" },
+        .{ "\"hidden_activation\":\"gelu\"", "\"hidden_activation\":\"gelu_new\"" },
+        .{ "\"num_attention_heads\":4", "\"num_attention_heads\":32" }, // head_dim 1 is odd
+        .{ "\"max_position_embeddings\":512", "\"max_position_embeddings\":512,\"rope_scaling\":{\"type\":\"linear\"}" },
+    }) |change| {
+        errdefer std.debug.print("ModernBERT encoder change: {s}\n", .{change[1]});
+        const encoder = try std.mem.replaceOwned(u8, a, modern_encoder_json, change[0], change[1]);
+        defer a.free(encoder);
+        try std.testing.expect(!std.mem.eql(u8, encoder, modern_encoder_json));
+        if (parseConfig(a, bytes, encoder)) |_| return error.TestExpectedError else |_| {}
+    }
+}
+
+test "gliner boundary reads an Antenna neck only on a ModernBERT checkpoint" {
+    const a = std.testing.allocator;
+    const bytes = try modernConfigBytes(a);
+    defer a.free(bytes);
+    try std.testing.expectEqual(Neck.none, (try parseConfig(a, bytes, modern_encoder_json)).neck);
+    for ([_]struct { []const u8, ?Neck }{
+        .{ "\"antenna_neck\": \"linear\"", .linear },
+        .{ "\"antenna_neck\": null", .none },
+        .{ "\"antenna_neck\": \"mlp\"", null },
+        .{ "\"antenna_neck\": true", null },
+    }) |case| {
+        const replacement = try std.fmt.allocPrint(a, "\"max_len\": null, {s}", .{case[0]});
+        defer a.free(replacement);
+        const necked = try std.mem.replaceOwned(u8, a, bytes, "\"max_len\": null", replacement);
+        defer a.free(necked);
+        if (case[1]) |want| {
+            try std.testing.expectEqual(want, (try parseConfig(a, necked, modern_encoder_json)).neck);
+        } else if (parseConfig(a, necked, modern_encoder_json)) |_| return error.TestExpectedError else |_| {}
+    }
+    // Published DeBERTa checkpoints never carry a neck.
+    const base_config = try loadFixture(a, .base, "config.json");
+    defer a.free(base_config);
+    const base_encoder = try loadFixture(a, .base, "encoder_config.json");
+    defer a.free(base_encoder);
+    const necked_base = try std.mem.replaceOwned(u8, a, base_config, "\"max_len\":", "\"antenna_neck\": \"linear\", \"max_len\":");
+    defer a.free(necked_base);
+    try std.testing.expect(!std.mem.eql(u8, necked_base, base_config));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryConfiguration, parseConfig(a, necked_base, base_encoder));
 }

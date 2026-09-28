@@ -17,6 +17,7 @@ each family are under `work-log/completed/inference/<family>/`.
 | GLiNER2.5 | [../scripts/gliner25/README.md](../scripts/gliner25/README.md) | Development tools, fixture policy, and the CPU ([BENCHMARK.md](../scripts/gliner25/BENCHMARK.md)) and Metal ([METAL_BENCHMARK.md](../scripts/gliner25/METAL_BENCHMARK.md)) comparison harnesses; no design doc yet, see the GLiNER2 docs above for the shared runtime |
 | BitNet | [bitnet/BITNET.md](bitnet/BITNET.md) | BitNet-style GGUF support: tensor types, current state, and work items |
 | Laya | [laya/LAYA.md](laya/LAYA.md) | Typed decisions: tree-packed execution (shared state trunk, question and candidate branches), its evidence, training methodology, and verification |
+| Antenna | [antenna/ANTENNA.md](antenna/ANTENNA.md) | Proposed multi-head encoder (extraction, classification, decisions, embeddings, chunking) on ModernBERT/mmBERT, distilled from GLiNER2.5-Decide and GLiNER2.5; decisions, distillation recipe, and gated plan |
 | LayoutDoc | [layoutdoc/LAYOUTDOC.md](layoutdoc/LAYOUTDOC.md) | Native LayoutDoc document-classification runtime, HTTP API, probe CLIs, and parity fixtures |
 
 Family directory names follow `scripts/<family>/` and `src/architectures/`.

@@ -72,6 +72,7 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
         // A materialized alternate would discard replay/control semantics and
         // reintroduce quadratic owners. These versioned kernels have a VJP.
         if (n.op == .fused_deberta_training_attention_v1 or n.op == .fused_deberta_training_attention_backward_v1) continue;
+        if (n.op == .fused_modernbert_training_attention_v1 or n.op == .fused_modernbert_training_attention_backward_v1) continue;
         // Flash-style segment (tree/local/global) training attention: same
         // reasoning as Deberta above -- a materialized alternate would
         // discard `ranges`/`window`/replay semantics and reintroduce the

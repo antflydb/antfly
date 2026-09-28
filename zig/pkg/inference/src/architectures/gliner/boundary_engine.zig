@@ -182,11 +182,13 @@ pub fn plan(config: *const boundary.Config, prepared: *const processor.PreparedB
         encoder.num_attention_heads == 0 or encoder.hidden_size % encoder.num_attention_heads != 0 or
         encoder.intermediate_size == 0 or encoder.intermediate_size > std.math.maxInt(i32) or
         encoder.num_hidden_layers == 0 or encoder.vocab_size == 0 or
-        encoder.max_position_embeddings == 0 or encoder.position_buckets == 0 or
+        encoder.max_position_embeddings == 0 or (encoder.family == .deberta and encoder.position_buckets == 0) or
         !std.math.isFinite(encoder.layer_norm_eps) or encoder.layer_norm_eps <= 0 or config.max_len == 0)
         return error.InvalidGlinerBoundaryConfig;
     const b = prepared.samples.len;
     const s = prepared.sequence_length;
+    // RoPE encoders are not used past their pretraining length.
+    if (encoder.family == .modern_bert and s > encoder.max_position_embeddings) return error.ResourceLimitExceeded;
     const limits = options.limits;
     if (b == 0 or s == 0) return error.InvalidInputShape;
     if (b > limits.max_batch or b > std.math.maxInt(i32) or
@@ -356,6 +358,7 @@ const CombinedControl = struct {
 /// All returned states are owned; the full subword tensor is released here.
 pub fn encodeNative(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const boundary.Config, prepared: *const processor.PreparedBatch, options: Options) !Result {
     if (cb.kind() != .native) return error.UnsupportedGlinerBoundaryBackend;
+    if (config.encoder.family != .deberta) return error.UnsupportedGlinerBoundaryEncoder;
     try cb.checkExecutionControl();
     const checked = try plan(config, prepared, options);
     var combined = CombinedControl{ .first = cb.execution_control, .second = options.control };
