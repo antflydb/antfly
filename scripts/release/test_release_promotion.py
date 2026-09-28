@@ -1359,8 +1359,12 @@ class ReleasePromotionTests(unittest.TestCase):
             extras.mkdir()
             source.mkdir()
             (archives / "antfly_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(b"native")
-            (archives / "antfly-lite_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(b"lite")
-            (archives / "antfly-inference_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(b"inference")
+            (archives / "antfly-lite_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(
+                b"lite"
+            )
+            (archives / "antfly-inference_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(
+                b"inference"
+            )
             (extras / "antfly-cli-0.2.1.tgz").write_bytes(b"npm")
             (extras / "cli-snapshot.json").write_text(
                 json.dumps(

@@ -52,7 +52,9 @@ def copy_payload_file(src: Path, out_dir: Path) -> Path:
 
 def artifact_kind(path: Path) -> str:
     name = path.name
-    if name.startswith(("antfly_", "antfly-lite_", "antfly-inference_")) and name.endswith(".tar.gz"):
+    if name.startswith(
+        ("antfly_", "antfly-lite_", "antfly-inference_")
+    ) and name.endswith(".tar.gz"):
         return "runtime-archive"
     if name.endswith("_checksums.txt"):
         return "checksums"
@@ -240,7 +242,9 @@ def main() -> int:
         ]
         missing = [archive.name for archive in matching if not archive.is_file()]
         if missing:
-            raise SystemExit(f"missing matching {product} release archives: {', '.join(missing)}")
+            raise SystemExit(
+                f"missing matching {product} release archives: {', '.join(missing)}"
+            )
         product_archives.extend(matching)
     archives = sorted([*server_archives, *product_archives])
 
