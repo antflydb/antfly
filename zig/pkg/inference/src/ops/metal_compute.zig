@@ -7212,8 +7212,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return residentTrainingInstructionOp(ctx, &instruction, &.{ qkv, relative, control_i32, d_out }, .{}, control);
     }
 
-    /// Host-bridged, not an on-device kernel (see `models/laya/LAYA.md`,
-    /// "Long states"): downloads `qkv`/`control` (draining any active frame
+    /// Without active dropout this runs on the ModernBERT device kernels
+    /// (`segmentAttentionOnDevice`). Otherwise it is host-bridged (see
+    /// `models/laya/LAYA.md`, "Long states"): downloads `qkv`/`control` (draining any active frame
     /// first -- `MetalTensor.toHostSlice` already flushes it, so this is
     /// safe mid-`executeFramed`), runs the exact same tiled CPU kernel used
     /// by the native backend (`ops/segment_training_attention.zig`), and
@@ -7224,6 +7225,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (control) |c| try c.check();
         _ = try attrs.layout();
+        if (try self.segmentAttentionOnDevice(qkv, control_i32, null, attrs, control)) |output| return output;
         var native_ctx = try HostFallbackNative.init(self.allocator);
         defer native_ctx.deinit();
         const qkv_shape = toBuf(qkv).logical_shape;
@@ -7243,6 +7245,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (control) |c| try c.check();
         _ = try attrs.layout();
+        if (try self.segmentAttentionOnDevice(qkv, control_i32, d_out, attrs, control)) |output| return output;
         var native_ctx = try HostFallbackNative.init(self.allocator);
         defer native_ctx.deinit();
         const qkv_shape = toBuf(qkv).logical_shape;
@@ -7258,6 +7261,49 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const n_grad = try native_ctx.cb.segmentTrainingAttentionBackwardV1(n_qkv, n_control, n_dout, attrs);
         defer native_ctx.cb.free(n_grad);
         return self.exportCtFromHostNative(&native_ctx, n_grad, null);
+    }
+
+    /// Segment attention without active dropout is the ModernBERT training
+    /// attention (same visibility, window, scale and empty-row contract) with
+    /// row-relative ranges, so it runs on those device kernels. Returns null,
+    /// leaving the host bridge to run it, when dropout applies, the control
+    /// has no retained host copy, or its ranges overlap (the ModernBERT
+    /// kernels require disjoint ranges; the segment kernels do not).
+    fn segmentAttentionOnDevice(self: *MetalCompute, qkv_ct: CT, control_ct: CT, d_out_ct: ?CT, attrs: @import("ml").graph.SegmentTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) !?CT {
+        const segment = @import("segment_training_attention.zig");
+        const modernbert = @import("modernbert_training_attention.zig");
+        // The device kernels hold one head row per 128-lane threadgroup.
+        if (!self.provider_impl.hasDecoderRuntime() or attrs.head_dim > 128) return null;
+        const storage = toBuf(control_ct).resident_index_storage orelse return null;
+        const view = try segment.validateControl(attrs, storage.values, .{ .control = control });
+        if (view.apply_dropout and attrs.dropout_probability > 0) return null;
+        const device_attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs = .{
+            .batch = attrs.batch,
+            .seq_len = attrs.seq_len,
+            .num_heads = attrs.num_heads,
+            .head_dim = attrs.head_dim,
+            .window = attrs.window,
+        };
+        const tokens = view.positions.len;
+        const words = try self.allocator.alloc(i32, tokens * 7);
+        defer self.allocator.free(words);
+        for (0..tokens) |q| {
+            const row_start: i32 = @intCast((q / attrs.seq_len) * attrs.seq_len);
+            for (words[q * 6 ..][0..6], view.ranges[q * 6 ..][0..6]) |*dst, bound| dst.* = row_start + bound;
+        }
+        for (words[tokens * 6 ..], view.positions) |*dst, position| dst.* = position;
+        _ = modernbert.validateControl(device_attrs, words) catch |err| switch (err) {
+            error.InvalidModernBertTrainingAttentionControl => return null,
+            else => return err,
+        };
+        const shape = [_]i32{@intCast(tokens * 7)};
+        const device_control = try self.residentTrainingUpload(i32, words, &shape, .{}, true);
+        defer freeOp(self, device_control);
+        var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
+        defer qkv.deinit();
+        var d_out: ?MetalTensor = if (d_out_ct) |value| try self.ownedDeviceMetalTensorFromCt(value) else null;
+        defer if (d_out) |*value| value.deinit();
+        return try self.modernBertTrainingAttention(qkv, device_control, d_out, device_attrs, control);
     }
 
     /// ModernBERT training attention on device. The control's retained host
@@ -30644,7 +30690,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.debertaTrainingAttentionBackwardV1 = debertaTrainingAttentionBackwardV1Op;
         vt.modernBertTrainingAttentionV1 = modernBertTrainingAttentionV1Op;
         vt.modernBertTrainingAttentionBackwardV1 = modernBertTrainingAttentionBackwardV1Op;
-        // Host-bridged (no device kernel yet); see segmentTrainingAttentionV1Op.
+        // Device kernels without active dropout, host bridge otherwise; see
+        // segmentTrainingAttentionV1Op.
         vt.segmentTrainingAttentionV1 = segmentTrainingAttentionV1Op;
         vt.segmentTrainingAttentionBackwardV1 = segmentTrainingAttentionBackwardV1Op;
         vt.causalSelfAttention = causalSelfAttentionOp;

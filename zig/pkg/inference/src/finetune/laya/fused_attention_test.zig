@@ -465,7 +465,7 @@ test "fused segment attention gradients match dense across a multi-tile packed r
     try gradientDivergence(a, &cb, cfg, &examples, 11);
 }
 
-test "fused segment attention matches the dense graph on Metal (host-bridged)" {
+test "fused segment attention matches the dense graph on Metal" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -486,4 +486,110 @@ test "fused segment attention matches the dense graph on Metal (host-bridged)" {
     var worst: f32 = 0;
     for (dense, fused) |d, f| worst = @max(worst, @abs(d - f));
     try std.testing.expect(worst < 2e-3);
+}
+
+/// Row-relative tree control for `SegmentTrainingAttentionAttrs`: replay
+/// limbs, the dropout flag, positions, then ranges. Row 0 is a 40-token trunk
+/// with four 10-token branches (each sees the trunk and itself); row 1 has 60
+/// valid tokens and padding, whose rows see nothing.
+fn treeControl(a: std.mem.Allocator, seq_len: usize, apply_dropout: bool) ![]i32 {
+    const tokens = 2 * seq_len;
+    const words = try a.alloc(i32, 7 + tokens * 7);
+    @memset(words, 0);
+    words[0] = 11;
+    words[2] = 3;
+    words[6] = @intFromBool(apply_dropout);
+    const positions = words[7..][0..tokens];
+    const ranges = words[7 + tokens ..];
+    for (0..seq_len) |i| {
+        const own = ranges[i * 6 ..][0..6];
+        if (i < 40) {
+            positions[i] = @intCast(i);
+            own[0..2].* = .{ 0, 40 };
+        } else {
+            const start: i32 = @intCast(40 + (i - 40) / 10 * 10);
+            positions[i] = @intCast(40 + (i - 40) % 10);
+            own[0..4].* = .{ 0, 40, start, start + 10 };
+        }
+        const padded = (seq_len + i) * 6;
+        positions[seq_len + i] = @intCast(i);
+        if (i < 60) ranges[padded..][0..2].* = .{ 0, 60 };
+    }
+    return words;
+}
+
+fn segmentOp(a: std.mem.Allocator, cb: *const ops.ComputeBackend, attrs: ml.SegmentTrainingAttentionAttrs, qkv_values: []const f32, control_words: []const i32, d_out_values: []const f32) ![2][]f32 {
+    const tokens: i32 = @intCast(attrs.batch * attrs.seq_len);
+    const hidden: i32 = @intCast(attrs.num_heads * attrs.head_dim);
+    const qkv = try cb.fromFloat32Shape(qkv_values, &.{ 3 * tokens, hidden });
+    defer cb.free(qkv);
+    const control = (try cb.fromInt32Shape(control_words, &.{@intCast(control_words.len)})).?;
+    defer cb.free(control);
+    const d_out = try cb.fromFloat32Shape(d_out_values, &.{ tokens, hidden });
+    defer cb.free(d_out);
+    const forward = try cb.segmentTrainingAttentionV1(qkv, control, attrs);
+    defer cb.free(forward);
+    const backward = try cb.segmentTrainingAttentionBackwardV1(qkv, control, d_out, attrs);
+    defer cb.free(backward);
+    const forward_values = try cb.toFloat32(forward, a);
+    errdefer a.free(forward_values);
+    return .{ forward_values, try cb.toFloat32(backward, a) };
+}
+
+test "fused segment attention runs on the Metal device kernels without dropout and matches the CPU op" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fixture = try MetalFixture.init(a);
+    defer fixture.deinit();
+    const metal_cb = fixture.backend.computeBackend();
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cpu_cb = compute.computeBackend();
+
+    const seq_len = 80;
+    const heads = 2;
+    const head_dim = 32;
+    const tokens = 2 * seq_len;
+    var prng = std.Random.DefaultPrng.init(7);
+    const qkv = try a.alloc(f32, 3 * tokens * heads * head_dim);
+    defer a.free(qkv);
+    for (qkv) |*v| v.* = prng.random().floatNorm(f32);
+    const d_out = try a.alloc(f32, tokens * heads * head_dim);
+    defer a.free(d_out);
+    for (d_out) |*v| v.* = prng.random().floatNorm(f32);
+
+    // Global and local layers, then a dropout call that must use the host bridge.
+    for ([_]struct { window: u32, dropout: f32, device: bool }{
+        .{ .window = std.math.maxInt(u32), .dropout = 0, .device = true },
+        .{ .window = 4, .dropout = 0, .device = true },
+        .{ .window = std.math.maxInt(u32), .dropout = 0.1, .device = false },
+    }) |case| {
+        const attrs = ml.SegmentTrainingAttentionAttrs{
+            .batch = 2,
+            .seq_len = seq_len,
+            .num_heads = heads,
+            .head_dim = head_dim,
+            .window = case.window,
+            .dropout_probability = case.dropout,
+            .dropout_stream_id = 5,
+        };
+        const control = try treeControl(a, seq_len, case.dropout > 0);
+        defer a.free(control);
+        const expected = try segmentOp(a, &cpu_cb, attrs, qkv, control, d_out);
+        defer for (expected) |values| a.free(values);
+        const before = @import("../../backends/metal_tensor.zig").memoryStatsSnapshot();
+        const actual = try segmentOp(a, &metal_cb, attrs, qkv, control, d_out);
+        defer for (actual) |values| a.free(values);
+        const after = @import("../../backends/metal_tensor.zig").memoryStatsSnapshot();
+        // segmentOp downloads its two results; the host bridge also downloads its inputs.
+        const result_bytes: u64 = (tokens * heads * head_dim + 3 * tokens * heads * head_dim) * 4;
+        const downloaded = after.host_mirror_download_bytes - before.host_mirror_download_bytes;
+        if (case.device) try std.testing.expect(downloaded <= result_bytes) else try std.testing.expect(downloaded > result_bytes);
+        for (expected, actual) |want, got| {
+            try std.testing.expectEqual(want.len, got.len);
+            for (want, got) |w, g| try std.testing.expectApproxEqAbs(w, g, 2e-4);
+        }
+    }
 }
