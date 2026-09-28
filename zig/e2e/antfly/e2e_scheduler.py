@@ -1156,6 +1156,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
 
 
 _duration_history: DurationHistory | None = None
+_DURATION_OWNER_PID = "ANTFLY_E2E_DURATION_OWNER_PID"
 _failure_reporter = None
 _duration_report_totals: dict[str, float] = {}
 _duration_phase_totals: dict[str, dict[str, float]] = {}
@@ -1209,8 +1210,18 @@ def pytest_configure(config: pytest.Config) -> None:
             "and --e2e-process-slots remain enforced; remove the explicit "
             f"--dist={dist} override or use scripts/ci/zig-antfly-e2e-pytest.sh"
         )
-    if not hasattr(config, "workerinput"):
+    # Child pytest processes used by harness tests inherit the duration path.
+    # Only the original controller may publish observations for that path;
+    # xdist workers already report their durations through the controller.
+    owner_pid = os.environ.get(_DURATION_OWNER_PID)
+    if not hasattr(config, "workerinput") and owner_pid in (None, str(os.getpid())):
+        os.environ[_DURATION_OWNER_PID] = str(os.getpid())
         _duration_history = DurationHistory(Path(config.getoption("e2e_duration_file")))
+        _duration_report_totals = {}
+        _duration_phase_totals = {}
+        _executed_duration_nodeids = set()
+    else:
+        _duration_history = None
         _duration_report_totals = {}
         _duration_phase_totals = {}
         _executed_duration_nodeids = set()
