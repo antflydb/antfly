@@ -176,9 +176,12 @@ test "resident training Metal admission rejects invalid indices storage shapes a
     const bad = (try cb.fromInt32Shape(&.{-4}, &.{1})).?;
     defer cb.free(bad);
     try std.testing.expectError(error.IndexOutOfBounds, cb.primGather(source, bad, 0, &.{ 3, 2 }));
-    try std.testing.expectError(error.UnsupportedResidentTrainingPrimitive, cb.primGather(source, good, 1, &.{ 3, 2 }));
+    // Bounds are checked against the gathered axis, not axis 0.
+    try std.testing.expectError(error.IndexOutOfBounds, cb.primGather(source, good, 1, &.{ 3, 2 }));
     try std.testing.expectError(error.UnsupportedResidentTrainingPrimitive, cb.primTranspose(good, &.{0}, &.{3}));
-    try std.testing.expectError(error.UnsupportedTensorType, cb.add(good, good));
+    const doubled = try cb.add(good, good);
+    defer cb.free(doubled);
+    try expectInts(&cb, doubled, &.{ 0, 2, 4 });
     try std.testing.expectError(error.InvalidResidentTrainingShape, cb.fromInt32Shape(&.{1}, &.{2}));
     try std.testing.expectError(error.InvalidResidentTrainingShape, cb.snapshotTensorShape(source, &.{7}));
     try std.testing.expectError(error.ResourceLimitExceeded, cb.residentTrainingPrimitive(&.{ .scatter_add = .{
