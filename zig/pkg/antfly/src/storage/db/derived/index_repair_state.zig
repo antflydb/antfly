@@ -13,6 +13,7 @@
 //! never observe one without the other.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
@@ -446,6 +447,7 @@ pub fn loadOrCreate(alloc: Allocator, path: []const u8, root_generation: u64) !S
 }
 
 pub fn loadOrCreateAt(alloc: Allocator, location: Location, root_generation: u64) !State {
+    if (builtin.os.tag == .freestanding) return error.DurableIndexRepairStateUnavailable;
     var guard = try acquire(location.lock_key);
     defer guard.release();
     return loadUnlockedAt(alloc, location) catch |err| switch (err) {
@@ -464,6 +466,7 @@ pub fn load(alloc: Allocator, path: []const u8) !State {
 }
 
 pub fn loadAt(alloc: Allocator, location: Location) !State {
+    if (builtin.os.tag == .freestanding) return error.FileNotFound;
     var guard = try acquire(location.lock_key);
     defer guard.release();
     return try loadUnlockedAt(alloc, location);
@@ -508,6 +511,7 @@ pub fn resetForRootGenerationWithIntentsAt(
     root_generation: u64,
     intents: []const IndexRepairIntent,
 ) !State {
+    if (builtin.os.tag == .freestanding) return error.DurableIndexRepairStateUnavailable;
     var guard = try acquire(location.lock_key);
     defer guard.release();
     var old = try loadUnlockedAt(alloc, location);
@@ -556,6 +560,7 @@ pub fn putEntryAt(
     expected: ?ExpectedTransition,
     entry: Entry,
 ) !u64 {
+    if (builtin.os.tag == .freestanding) return error.DurableIndexRepairStateUnavailable;
     try validateEntry(entry);
     if (!entry.intent.identity().eql(expected_identity)) return error.ReplicaIdentityMismatch;
 
@@ -652,6 +657,7 @@ pub fn removeEntryAndPinAt(
     expected_identity: ReplicaIdentity,
     expected: ExpectedTransition,
 ) !u64 {
+    if (builtin.os.tag == .freestanding) return error.DurableIndexRepairStateUnavailable;
     var guard = try acquire(location.lock_key);
     defer guard.release();
     var state = try loadUnlockedAt(alloc, location);

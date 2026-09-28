@@ -338,7 +338,10 @@ pub const WAL = struct {
     commit_scheduler: storage_sim.CompletionScheduler,
     // WAL's synchronous API has no scheduling dependency. This context parks
     // callers without starting executor workers; all condition users share it.
-    sync_io: std.Io = std.Io.Threaded.global_single_threaded.io(),
+    sync_io: std.Io = if (@import("builtin").os.tag == .freestanding)
+        .failing
+    else
+        std.Io.Threaded.global_single_threaded.io(),
     mutex: std.Io.Mutex = .init,
     completed: std.Io.Condition = .init,
     coordinator_active: bool = false,

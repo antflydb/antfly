@@ -1122,7 +1122,11 @@ pub const BackendRuntime = struct {
             deinitIoLane(self.alloc, io_impl);
         }
         if (self.pdf_render_executor.swap(null, .acq_rel)) |executor| {
-            executor.destroy();
+            if (comptime builtin.os.tag == .freestanding) {
+                unreachable;
+            } else {
+                executor.destroy();
+            }
         }
         if (self.control_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
@@ -1847,15 +1851,18 @@ pub const BackendRuntimeHandle = struct {
     }
 
     pub fn initManualWithOwnedFilesystemIo(alloc: Allocator) !BackendRuntimeHandle {
-        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-        const filesystem_io = try initIoLane(alloc, threaded_io_limits.backend_runtime_durable_background);
-        errdefer deinitIoLane(alloc, filesystem_io);
-        var handle = try init(alloc, .{
-            .backend = .manual,
-            .filesystem_io = filesystem_io.io(),
-        });
-        handle.owned_filesystem_io = filesystem_io;
-        return handle;
+        if (comptime builtin.os.tag == .freestanding) {
+            return error.UnsupportedPlatform;
+        } else {
+            const filesystem_io = try initIoLane(alloc, threaded_io_limits.backend_runtime_durable_background);
+            errdefer deinitIoLane(alloc, filesystem_io);
+            var handle = try init(alloc, .{
+                .backend = .manual,
+                .filesystem_io = filesystem_io.io(),
+            });
+            handle.owned_filesystem_io = filesystem_io;
+            return handle;
+        }
     }
 
     pub fn deinit(self: *BackendRuntimeHandle) void {

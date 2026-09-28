@@ -11266,7 +11266,10 @@ pub const IndexManager = struct {
     }
 
     pub fn checkpointIo(self: *const IndexManager) std.Io {
-        return self.io orelse std.Io.Threaded.global_single_threaded.io();
+        return self.io orelse if (comptime builtin.os.tag == .freestanding)
+            .failing
+        else
+            std.Io.Threaded.global_single_threaded.io();
     }
 
     /// Binds rebuild cursors to the same storage backend as their index kind.
@@ -11351,7 +11354,7 @@ pub const IndexManager = struct {
         try self.prepareStorageForFreshCatalogEntry(store, stored_cfg);
         try self.provisionConfiguredIndexDirDurable(stored_cfg);
 
-        const create_fresh_native_v2 = if (comptime @TypeOf(store) == *docstore_mod.DocStore)
+        const create_fresh_native_v2 = if (comptime @TypeOf(store) == *docstore_mod.DocStore and builtin.os.tag != .freestanding)
             self.freshDenseNativeV2Permitted(stored_cfg)
         else
             false;
@@ -11387,7 +11390,7 @@ pub const IndexManager = struct {
         errdefer {
             self.removeInMemory(stored_cfg.name);
         }
-        if (comptime @TypeOf(store) == *docstore_mod.DocStore) {
+        if (comptime @TypeOf(store) == *docstore_mod.DocStore and builtin.os.tag != .freestanding) {
             if (fresh_native_generation) |*generation| {
                 try self.completeFreshDenseNativeGeneration(
                     store,
@@ -19755,13 +19758,17 @@ pub const IndexManager = struct {
         defer self.alloc.free(relative_active_path);
         const active_path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, relative_active_path });
         errdefer self.alloc.free(active_path);
-        _ = try index_generation_manifest.validateReady(
-            self.alloc,
-            active_path,
-            null,
-            cfg.name,
-            types.indexConfigHash(cfg),
-        );
+        if (comptime builtin.os.tag == .freestanding) {
+            return error.UnsupportedPlatform;
+        } else {
+            _ = try index_generation_manifest.validateReady(
+                self.alloc,
+                active_path,
+                null,
+                cfg.name,
+                types.indexConfigHash(cfg),
+            );
+        }
         self.alloc.free(canonical_path);
         return active_path;
     }
@@ -29363,6 +29370,7 @@ fn isPrimaryDocumentCandidate(key: []const u8) bool {
 
 fn newCoverageGeneration(runtime_io: ?std.Io) !u64 {
     if (runtime_io) |io| return try coverage_identity.generate(io);
+    if (builtin.os.tag == .freestanding) return try coverage_identity.generate(.failing);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try coverage_identity.generate(io_impl.io());

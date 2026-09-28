@@ -4829,7 +4829,7 @@ const ExperimentalPostingCheckpointBuild = struct {
     staging_store: posting_segment_store_mod.Store,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     io: std.Io,
-    owned_io: ?std.Io.Threaded = null,
+    owned_io: ?(if (builtin.os.tag == .freestanding) void else std.Io.Threaded) = null,
     projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource = null,
     projection_revision: u64 = 0,
     /// Hard recovery-debt enforcement and graceful close can promote an
@@ -5044,7 +5044,9 @@ const ExperimentalPostingCheckpointBuild = struct {
 
     fn deinit(self: *ExperimentalPostingCheckpointBuild) void {
         self.awaitCompletion();
-        if (self.owned_io) |*io_impl| io_impl.deinit();
+        if (comptime builtin.os.tag != .freestanding) {
+            if (self.owned_io) |*io_impl| io_impl.deinit();
+        }
         if (self.staged_rebase) |generation| generation.release();
         if (self.rebase_source) |generation| generation.release();
         if (self.staged_readers) |readers| readers.release();
@@ -6898,7 +6900,10 @@ pub const HBCIndex = struct {
     }
 
     fn runtimeIo(self: *const HBCIndex) std.Io {
-        return self.runtime_io orelse std.Io.Threaded.global_single_threaded.io();
+        return self.runtime_io orelse if (comptime builtin.os.tag == .freestanding)
+            .failing
+        else
+            std.Io.Threaded.global_single_threaded.io();
     }
 
     fn releaseCompleteCoverageFlightRef(self: *HBCIndex, flight: *CompleteCoverageFlight) void {
