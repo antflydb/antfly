@@ -26,7 +26,7 @@ pub fn fromHashBits(bits: u64) u64 {
 pub fn generate(io: std.Io) !u64 {
     while (true) {
         var bits: u64 = 0;
-        try io.randomSecure(std.mem.asBytes(&bits));
+        try @import("antfly_platform").entropy.fill(io, std.mem.asBytes(&bits));
         if (fromBits(bits)) |generation| return generation;
     }
 }

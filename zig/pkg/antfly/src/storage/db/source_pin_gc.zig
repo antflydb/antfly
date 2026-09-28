@@ -108,6 +108,7 @@ fn openRelative(io: std.Io, root: []const u8, relative: []const u8, work: *Work)
 /// charged independently. A bounded fsync/cursor epilogue is mandatory after
 /// mutations. Logical SST bytes are never mistaken for payload I/O.
 pub fn advance(alloc: std.mem.Allocator, io: std.Io, root: []const u8, cursor: *Cursor, work: *Work) !bool {
+    if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
     try Cursor.validate(cursor.bytes());
     while (!work.exhausted(io)) {
         if (!work.charge(io, root.len + cursor.len + 128)) return false;

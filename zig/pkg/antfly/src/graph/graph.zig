@@ -4523,7 +4523,7 @@ pub const GraphIndex = struct {
                 while (leaf_index < graph_metric_build_max_partition_pages) : (leaf_index += 1) {
                     if (active) |work| {
                         if (leaf_index >= work.count) break;
-                        if (work.counts[leaf_index] == 0) continue;
+                        if (work.counts[@intCast(leaf_index)] == 0) continue;
                     }
                     const leaf = try self.metricBuildPage(&batch, metric_name, job_id, phase, iteration, graph_metric_build_summary_leaf_base + leaf_index) orelse {
                         if (active != null) return error.InvalidGraphMetricBuildManifest;
@@ -10956,7 +10956,7 @@ pub const GraphIndex = struct {
             if (self.target_chunk == chunk) return;
             @memset(&self.targets, std.math.maxInt(u16));
             for (slots, 0..) |slot, i| if (slot / vector_chunk.entries == chunk) {
-                self.targets[slot % vector_chunk.entries] = @intCast(i);
+                self.targets[@intCast(slot % vector_chunk.entries)] = @intCast(i);
             };
             self.target_chunk = chunk;
         }
@@ -10976,7 +10976,7 @@ pub const GraphIndex = struct {
             const value = rank * damping;
             if (!std.math.isFinite(value) or value < 0) return error.InvalidGraphMetricScore;
             if (target / vector_chunk.entries != chunk) return error.InvalidGraphMetricBuildManifest;
-            const index = scratch.targets[target % vector_chunk.entries];
+            const index = scratch.targets[@intCast(target % vector_chunk.entries)];
             if (index == std.math.maxInt(u16)) continue;
             const sum = fold.sums[index] + value;
             fold.corrections[index] += if (@abs(fold.sums[index]) >= @abs(value)) (fold.sums[index] - sum) + value else (value - sum) + fold.sums[index];

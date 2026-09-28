@@ -354,7 +354,8 @@ fn elapsedNs(start_ns: u64) u64 {
 }
 
 pub fn lockBackend(comptime BackendType: type, backend: *BackendType) bool {
-    if (builtin.os.tag == .freestanding) return false;
+    // Continuations release and reacquire this mutex even on one-thread hosts.
+    // Skipping acquisition breaks reclamation and publication ownership.
     if (@hasField(BackendType, "mu")) {
         if (backend.mu.tryLock()) return true;
         const started_ns = if (@hasDecl(BackendType, "recordBackendLockWait"))
@@ -2671,8 +2672,8 @@ fn getCurrentPointRetainedLocked(
         const view = try RunReadView.pin(backend, runtimeScratchAllocator(allocator));
         defer view.release(backend);
         if (view.directory()) |directory| {
-            unlockBackend(BackendType, backend, builtin.os.tag != .freestanding);
-            defer if (builtin.os.tag != .freestanding) {
+            unlockBackend(BackendType, backend, @hasField(BackendType, "mu"));
+            defer if (@hasField(BackendType, "mu")) {
                 _ = lockBackend(BackendType, backend);
             };
             if (builtin.is_test) if (test_current_point_unlocked_hook) |hook| try hook(backend);
@@ -3226,8 +3227,8 @@ fn readManySortedCurrentWithLayoutLocked(
     const LocalCursor = MergeCursor(BackendType, State);
 
     if (layout.read_view.directory()) |directory| {
-        unlockBackend(BackendType, backend, builtin.os.tag != .freestanding);
-        defer if (builtin.os.tag != .freestanding) {
+        unlockBackend(BackendType, backend, @hasField(BackendType, "mu"));
+        defer if (@hasField(BackendType, "mu")) {
             _ = lockBackend(BackendType, backend);
         };
         if (builtin.is_test) if (test_current_point_unlocked_hook) |hook| try hook(backend);

@@ -314,9 +314,9 @@ pub const Reader = struct {
     root_offset: usize,
     block_count: usize,
     entry_count: usize,
-    verified_indexes: []std.atomic.Value(u64),
-    verified_leaf_data: []std.atomic.Value(u64),
-    verified_metadata_data: []std.atomic.Value(u64),
+    verified_indexes: []@import("antfly_platform").atomic.Value(u64),
+    verified_leaf_data: []@import("antfly_platform").atomic.Value(u64),
+    verified_metadata_data: []@import("antfly_platform").atomic.Value(u64),
 
     pub fn init(alloc: Allocator, data: []const u8) !Reader {
         if (data.len < header_size + footer_size or !std.mem.eql(u8, data[0..4], &magic)) return error.CorruptedVectorDirectory;
@@ -331,15 +331,15 @@ pub const Reader = struct {
         const block_count = std.math.cast(usize, readU64(footer, 8)) orelse return error.CorruptedVectorDirectory;
         const verification_words = std.math.divCeil(usize, block_count, @bitSizeOf(u64)) catch
             return error.CorruptedVectorDirectory;
-        const verified_indexes = try alloc.alloc(std.atomic.Value(u64), verification_words);
+        const verified_indexes = try alloc.alloc(@import("antfly_platform").atomic.Value(u64), verification_words);
         errdefer alloc.free(verified_indexes);
-        const verified_leaf_data = try alloc.alloc(std.atomic.Value(u64), verification_words);
+        const verified_leaf_data = try alloc.alloc(@import("antfly_platform").atomic.Value(u64), verification_words);
         errdefer alloc.free(verified_leaf_data);
-        const verified_metadata_data = try alloc.alloc(std.atomic.Value(u64), verification_words);
+        const verified_metadata_data = try alloc.alloc(@import("antfly_platform").atomic.Value(u64), verification_words);
         errdefer alloc.free(verified_metadata_data);
-        for (verified_indexes) |*word| word.* = std.atomic.Value(u64).init(0);
-        for (verified_leaf_data) |*word| word.* = std.atomic.Value(u64).init(0);
-        for (verified_metadata_data) |*word| word.* = std.atomic.Value(u64).init(0);
+        for (verified_indexes) |*word| word.* = @import("antfly_platform").atomic.Value(u64).init(0);
+        for (verified_leaf_data) |*word| word.* = @import("antfly_platform").atomic.Value(u64).init(0);
+        for (verified_metadata_data) |*word| word.* = @import("antfly_platform").atomic.Value(u64).init(0);
         var reader: Reader = .{
             .alloc = alloc,
             .data = data,
@@ -747,13 +747,13 @@ fn countPresence(bitmap: []const u8, count: usize) usize {
     return total;
 }
 
-fn isVerified(words: []std.atomic.Value(u64), block_index: usize) bool {
+fn isVerified(words: []@import("antfly_platform").atomic.Value(u64), block_index: usize) bool {
     const word = block_index / @bitSizeOf(u64);
     const mask = @as(u64, 1) << @intCast(block_index % @bitSizeOf(u64));
     return words[word].load(.acquire) & mask != 0;
 }
 
-fn markVerified(words: []std.atomic.Value(u64), block_index: usize) void {
+fn markVerified(words: []@import("antfly_platform").atomic.Value(u64), block_index: usize) void {
     const word = block_index / @bitSizeOf(u64);
     const mask = @as(u64, 1) << @intCast(block_index % @bitSizeOf(u64));
     _ = words[word].fetchOr(mask, .release);

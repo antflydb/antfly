@@ -1852,7 +1852,7 @@ pub fn HandleRegistryOf(comptime T: type) type {
         const Slot = struct {
             /// `generation << 1 | closing`. The slot is open for `generation`
             /// exactly when the closing bit is clear.
-            state: std.atomic.Value(u64) = .init(0),
+            state: @import("antfly_platform").atomic.Value(u64) = .init(0),
             /// Calls that have entered, or are trying to, for any generation.
             active: std.atomic.Value(u32) = .init(0),
             handle: std.atomic.Value(?*T) = .init(null),
@@ -1970,7 +1970,7 @@ pub fn HandleRegistryOf(comptime T: type) type {
             var spins: u32 = 0;
             while (slot.active.load(.seq_cst) != 0) : (spins +|= 1) {
                 if (spins < 64) {
-                    std.Thread.yield() catch {};
+                    @import("antfly_platform").time.yieldNow();
                 } else {
                     handleLockIo().sleep(.fromMicroseconds(500), .awake) catch {};
                 }

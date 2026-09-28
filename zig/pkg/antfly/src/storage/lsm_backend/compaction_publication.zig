@@ -107,7 +107,7 @@ pub const Job = struct {
         return self.base.at(if (i < self.plan.source_len) self.plan.sourceIndex(i) else self.plan.targetIndex(i - self.plan.source_len));
     }
 
-    fn admitNames(self: *Job, bytes: usize) !void {
+    fn admitNames(self: *Job, bytes: u64) !void {
         if (self.reservation) |*lease| try lease.growBoundedOversized(bytes, 1);
     }
 

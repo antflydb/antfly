@@ -389,7 +389,7 @@ pub const DocStore = struct {
     alloc: Allocator,
     /// Process-local wake hint, published only after successful row/schema
     /// commits. Durable mutation IDs and timers remain the restart authority.
-    columnar_revision: std.atomic.Value(u64) = .init(0),
+    columnar_revision: @import("antfly_platform").atomic.Value(u64) = .init(0),
     // 0 unknown, 1 no retention catalog, 2 catalog may exist. Admission marks
     // this before its commit; an aborted admission merely leaves a safe probe.
     retained_effects_cache: std.atomic.Value(u8) = .init(0),

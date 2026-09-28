@@ -2500,7 +2500,7 @@ fn selectDirectoryPlanOffLock(backend: anytype, l0_limit: usize, l0_only: bool, 
     var snapshot = Snapshot{ .allocator = backend.allocator, .options = backend.options, .planner_seed = backend.planner_seed, .directory = directory };
     // Reserve distinct candidate tickets before allowing another planner in.
     backend.planner_seed +%= 8;
-    const io: ?std.Io = if (snapshot.options.read_runtime) |runtime| runtime.io else null;
+    const io: ?std.Io = if (snapshot.options.read_runtime) |runtime| runtime.getIo() else null;
     runtime_mod.unlockBackend(BackendType, backend, true);
     const result = selectDirectoryPlanBudgeted(&snapshot, l0_limit, l0_only, max_bytes, allow_oversized, stats, .{ .max_inputs = directory.count(), .resumable = true, .io = io });
     _ = runtime_mod.lockBackend(BackendType, backend);

@@ -221,6 +221,7 @@ pub fn build(b: *std.Build) void {
     const tokenizer_proto_source = tokenizer_build.generateSentencePieceProto(b, tokenizer_protobuf.artifact("protoc-zig"), b.path(b.pathJoin(&.{ shared_lib_root, "lib/tokenizer" })));
     const tokenizer_proto = tokenizer_build.createSentencePieceProtoModule(b, tokenizer_proto_source, tokenizer_protobuf.module("protobuf"));
     const tokenizer = tokenizer_build.create(b, .{
+        .platform = configured_platform_mod,
         .root = b.path(b.pathJoin(&.{ shared_lib_root, "lib/tokenizer" })),
         .target = target,
         .optimize = optimize,
@@ -1686,6 +1687,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     hf_tok_tests.root_module.addImport("sentencepiece_proto", sentencepiece_proto_mod);
+    hf_tok_tests.root_module.addImport("antfly_platform", configured_platform_mod);
     const run_hf_tok_tests = b.addRunArtifact(hf_tok_tests);
 
     const tok_test_step = b.step("test-tokenizer", "Run tokenizer tests");

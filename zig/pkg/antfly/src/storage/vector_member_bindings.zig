@@ -30,7 +30,7 @@ pub const Cache = struct {
     count: usize,
     manager: ?*resources.ResourceManager,
     reclaimer: ?u64 = null,
-    resident_bytes: std.atomic.Value(u64) = .init(0),
+    resident_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
     stripes: [stripe_count]Stripe = @splat(.{}),
 
     pub fn create(alloc: Allocator, count: usize, manager: ?*resources.ResourceManager) !*Cache {

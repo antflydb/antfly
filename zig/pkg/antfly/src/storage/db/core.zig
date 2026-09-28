@@ -463,7 +463,7 @@ pub const IdentityVisibilityState = struct {
     nonvisible_generation: ?u64 = null,
     nonvisible_set: ?doc_set.ResolvedDocSet = null,
     nonvisible_overflow: bool = false,
-    nonvisible_entries: std.atomic.Value(u64) = .init(0),
+    nonvisible_entries: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn clearLive(self: *@This()) void {
         while (!self.live_mutex.tryLock()) std.atomic.spinLoopHint();

@@ -4,7 +4,7 @@ const std = @import("std");
 
 pub const Signal = struct {
     mutex: std.atomic.Mutex = .unlocked,
-    epoch: std.atomic.Value(u64) = .init(0),
+    epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
     ready: std.Io.Event = .unset,
     io: ?std.Io = null,
 

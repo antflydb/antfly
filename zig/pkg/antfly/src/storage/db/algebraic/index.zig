@@ -3072,7 +3072,7 @@ pub const Index = struct {
     hll_observation_mutex: std.atomic.Mutex = .unlocked,
     hll_pending_observations: std.StringHashMapUnmanaged(u64) = .empty,
     hll_pending_observation_bytes: usize = 0,
-    hll_dropped_observations: std.atomic.Value(u64) = .init(0),
+    hll_dropped_observations: @import("antfly_platform").atomic.Value(u64) = .init(0),
     // Coalesces dirty notifications into at most one queued/running maintenance
     // job. The persisted dirty/progress keys remain the source of truth.
     hll_maintenance_scheduled: std.atomic.Value(bool) = .init(false),
