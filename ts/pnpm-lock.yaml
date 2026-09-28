@@ -741,6 +741,22 @@ importers:
       vitest:
         specifier: ^4.1.9
         version: 4.1.9(@opentelemetry/api@1.9.1)(@types/node@25.9.3)(@vitest/coverage-v8@4.1.9)(@vitest/ui@4.1.9)(jsdom@29.1.1)(msw@2.14.6(@types/node@25.9.3)(typescript@5.9.3))(vite@8.0.16(@types/node@25.9.3)(esbuild@0.27.7)(jiti@2.7.0)(tsx@4.22.4)(yaml@2.9.0))
+    optionalDependencies:
+      '@antfly/lite-darwin-arm64':
+        specifier: workspace:*
+        version: link:../lite-darwin-arm64
+      '@antfly/lite-linux-arm64':
+        specifier: workspace:*
+        version: link:../lite-linux-arm64
+      '@antfly/lite-linux-x64':
+        specifier: workspace:*
+        version: link:../lite-linux-x64
+
+  packages/lite-darwin-arm64: {}
+
+  packages/lite-linux-arm64: {}
+
+  packages/lite-linux-x64: {}
 
   packages/sdk:
     dependencies:

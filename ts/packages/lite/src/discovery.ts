@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 export type LibrarySource =
   | "ANTFLY_LIBRARY"
   | "ANTFLY_LIB_DIR"
-  | "cli-package"
+  | "lite-package"
   | "source-tree"
   | "system";
 
@@ -59,16 +59,16 @@ export function platformLibraryFileName(platform: NodeJS.Platform): string | und
   }
 }
 
-/** The @antfly/cli-<platform> package that ships a matching prebuilt libantfly, if any. */
-export function cliPlatformPackageName(
+/** The Apache @antfly/lite-<platform> package that ships libantfly. */
+export function litePlatformPackageName(
   platform: NodeJS.Platform,
   arch: string
 ): string | undefined {
   if (platform === "darwin" && arch === "arm64") {
-    return "@antfly/cli-darwin-arm64";
+    return "@antfly/lite-darwin-arm64";
   }
   if (platform === "linux" && (arch === "arm64" || arch === "x64")) {
-    return `@antfly/cli-linux-${arch}`;
+    return `@antfly/lite-linux-${arch}`;
   }
   return undefined;
 }
@@ -80,7 +80,7 @@ export interface ResolveLibraryOptions {
   /** Directory to walk up from when looking for zig/zig-out/lib (a source checkout). Defaults to this package's own directory. */
   startDir?: string;
   existsSync?: (path: string) => boolean;
-  /** Like require.resolve; used to locate an installed @antfly/cli-<platform> package. */
+  /** Like require.resolve; used to locate an installed @antfly/lite-<platform> package. */
   resolve?: (specifier: string) => string;
 }
 
@@ -119,7 +119,7 @@ function findUp(
  *
  * 1. `ANTFLY_LIBRARY` env var: an exact file path.
  * 2. `ANTFLY_LIB_DIR` env var: a directory containing the platform library file.
- * 3. The installed `@antfly/cli-<platform>` package's `lib/` directory.
+ * 3. The installed `@antfly/lite-<platform>` package's `lib/` directory.
  * 4. `zig/zig-out/lib/` found by walking up from this package (a source checkout).
  * 5. The bare system loader name, resolved by the OS's shared library search
  *    path (LD_LIBRARY_PATH / DYLD_LIBRARY_PATH / PATH / rpath).
@@ -156,18 +156,18 @@ export function resolveLibrary(options: ResolveLibraryOptions = {}): ResolvedLib
     return { path: candidate, source: "ANTFLY_LIB_DIR" };
   }
 
-  const packageName = cliPlatformPackageName(platform, arch);
+  const packageName = litePlatformPackageName(platform, arch);
   if (packageName) {
     try {
       const resolve = options.resolve ?? createRequire(import.meta.url).resolve;
       const packageJsonPath = resolve(`${packageName}/package.json`);
       const candidate = join(dirname(packageJsonPath), "lib", fileName);
       if (existsSync(candidate)) {
-        return { path: candidate, source: "cli-package" };
+        return { path: candidate, source: "lite-package" };
       }
     } catch {
       // Platform package not installed (it's an optionalDependency of
-      // @antfly/cli, not of this package); fall through to other tiers.
+      // @antfly/lite); fall through to other tiers.
     }
   }
 

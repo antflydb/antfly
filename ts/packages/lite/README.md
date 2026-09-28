@@ -15,7 +15,8 @@ build for browser use; this package is unrelated to that build.
 pnpm add @antfly/lite
 ```
 
-You also need a built `libantfly` shared library at runtime -- see
+Published platform packages include the Apache-2.0 `libantfly` library and
+inference worker. Source checkouts can build the shared library with
 "Library discovery" below. From the `antfly` monorepo source tree, build it
 with `cd zig && zig build lite` (produces `zig/zig-out/lib/libantfly.*`);
 this package does not build it for you.
@@ -121,8 +122,7 @@ on this for anything but leak mitigation; it is not deterministic.
 2. **`ANTFLY_LIB_DIR`** environment variable -- a directory expected to
    contain the platform library file (see below). Throws if the file is
    missing from that directory.
-3. The installed **`@antfly/cli-<platform>`** package's `lib/` directory
-   (the same npm platform package the `@antfly/cli` installer uses),
+3. The installed Apache **`@antfly/lite-<platform>`** package's `lib/` directory,
    resolved via `require.resolve`.
 4. **`zig/zig-out/lib/`** found by walking up from this package's own
    directory -- for running against a local `antfly` monorepo source

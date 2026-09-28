@@ -412,7 +412,7 @@ def load_library() -> ctypes.CDLL:
     if path is None:
         raise LibraryNotFoundError(
             "libantfly shared library not found. Set ANTFLY_LIBRARY to its "
-            "path, ANTFLY_LIB_DIR to its directory, install antfly-cli, or "
+            "path, ANTFLY_LIB_DIR to its directory, install the native antfly-lite wheel, or "
             "build it at zig/zig-out/lib. See the antfly-lite README for "
             "the full discovery order."
         )

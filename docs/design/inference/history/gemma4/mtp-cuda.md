@@ -299,7 +299,7 @@ lifetime/barrier issue is isolated. After reverting, minimal API-validation
 smoke `pkg/inference/.debug/metal-command-20260507-215452` completed with
 `token_ids: 10979` and no new diagnostic reports.
 
-The native Metal GGUF route must not depend on MLX availability when Antfly inference is
+The native Metal GGUF route must not depend on MLX availability when Antfly Inference is
 built with both backends enabled. A later 4-token compiled whole-model smoke was
 failing before model execution with `MlxMetalUnavailable`; the long-term fix is
 to keep `.metal` sessions on the native Metal provider/stream path and reserve

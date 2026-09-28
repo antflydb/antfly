@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Keep product license bundles and their relative documentation links consistent.
+//! Install only Apache product and third-party notices for Lite artifacts.
 const std = @import("std");
 
 pub fn installApache(b: *std.Build, repo_root: std.Build.LazyPath, name: []const u8, directory: []const u8) *std.Build.Step {
@@ -21,9 +21,7 @@ pub fn installApache(b: *std.Build, repo_root: std.Build.LazyPath, name: []const
     step.dependOn(&primary.step);
     for ([_][]const u8{
         "LICENSES/Apache-2.0.txt",
-        "LICENSES/Elastic-2.0.txt",
         "THIRD_PARTY_NOTICES.md",
-        "LICENSING.md",
         "scripts/apache_engine_files.txt",
         "scripts/embedded_asset_licenses.json",
     }) |file| {

@@ -5626,6 +5626,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.persistent.",
             "storage.persistent_vopr.",
             "storage.portable_backup.",
+            "storage.portable_wal.",
             "storage.posting_segment_store.",
             "storage.resource_manager.",
             "storage.retained_effects.",

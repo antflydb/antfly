@@ -1,0 +1,30 @@
+{
+  "name": "@antfly/lite-linux-arm64",
+  "version": "0.0.0",
+  "description": "Apache-2.0 Antfly Lite and Inference native artifacts for linux-arm64",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antflydb/antfly.git",
+    "directory": "ts/packages/lite-linux-arm64"
+  },
+  "files": [
+    "bin",
+    "include",
+    "lib",
+    "share",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "LICENSES"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}

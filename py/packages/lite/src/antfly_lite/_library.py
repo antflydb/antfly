@@ -25,19 +25,15 @@ Discovery order (first match wins), documented in the antfly-lite README:
    platform-appropriate library file.
 3. A library bundled inside this package at ``antfly_lite/_lib/`` (for
    future platform-specific wheels; empty in the pure-Python wheel).
-4. The ``antfly_cli`` package's bundled ``lib/`` directory, if antfly-cli is
-   installed (its release wheels ship ``antfly_cli/lib/libantfly.*``
-   alongside the native ``antfly`` binary).
-5. ``zig/zig-out/lib`` found by walking up from this file's location
+4. ``zig/zig-out/lib`` found by walking up from this file's location
    (development checkouts of the antfly monorepo).
-6. The system dynamic linker's search path, via
+5. The system dynamic linker's search path, via
    ``ctypes.util.find_library("antfly")``.
 """
 
 from __future__ import annotations
 
 import ctypes.util
-import importlib.util
 import os
 import platform
 from pathlib import Path
@@ -69,16 +65,6 @@ def _find_in_dir(directory: Path) -> Path | None:
     return None
 
 
-def _antfly_cli_lib_dir() -> Path | None:
-    try:
-        spec = importlib.util.find_spec("antfly_cli")
-    except (ImportError, ValueError):
-        return None
-    if spec is None or not spec.origin:
-        return None
-    return Path(spec.origin).resolve().parent / "lib"
-
-
 def _source_tree_lib_dir() -> Path | None:
     here = Path(__file__).resolve()
     for parent in here.parents:
@@ -104,12 +90,6 @@ def find_library() -> Path | None:
     bundled = _find_in_dir(Path(__file__).resolve().parent / "_lib")
     if bundled is not None:
         return bundled
-
-    cli_lib_dir = _antfly_cli_lib_dir()
-    if cli_lib_dir is not None:
-        found = _find_in_dir(cli_lib_dir)
-        if found is not None:
-            return found
 
     source_lib_dir = _source_tree_lib_dir()
     if source_lib_dir is not None:

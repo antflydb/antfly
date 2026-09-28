@@ -49,6 +49,15 @@ and inference installation carry license and third-party notices.
 Lite artifacts; the default server archive retains ELv2 and includes the
 Apache license for the shared engine and native library.
 
+The release build also creates `antfly-lite` and `antfly-inference` executables
+and Apache-only platform archives. `package_lite_release.py` assembles
+platform wheels for `antfly-lite` and native npm packages for `@antfly/lite`;
+the bindings discover these artifacts without using the ELv2 server packages.
+`verify_lite_release.py` compares each wheel and npm package with its Lite
+archive and rejects server executables and ELv2 license files. The immutable
+package snapshot is produced by `.github/workflows/lite-package.yml` as part
+of the release build.
+
 ## Verification
 
 ```sh

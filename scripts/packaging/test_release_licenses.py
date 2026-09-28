@@ -34,6 +34,7 @@ class ReleaseLicenseTests(unittest.TestCase):
             for name in (
                 "scripts/packaging/build_zig_release_archive.sh",
                 "scripts/packaging/create_reproducible_tar.py",
+                "scripts/packaging/lite-release-README.md",
                 "scripts/apache_engine_files.txt",
                 "scripts/embedded_asset_licenses.json",
                 "LICENSE",
@@ -56,7 +57,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "args = sys.argv[1:]\n"
                 "Path('build-args.json').write_text(json.dumps(args))\n"
                 "prefix = Path(args[args.index('--prefix') + 1])\n"
-                "for name in ('bin/antfly', 'lib/libantfly.dylib', 'include/antfly.h'):\n"
+                "for name in ('bin/antfly', 'bin/antfly-lite', 'lib/libantfly.dylib', 'include/antfly.h'):\n"
                 "    path = prefix / name\n"
                 "    path.parent.mkdir(parents=True, exist_ok=True)\n"
                 "    path.write_text('fixture artifact\\n')\n"
@@ -111,15 +112,21 @@ class ReleaseLicenseTests(unittest.TestCase):
                         )
                         for name in (
                             "./LICENSES/Apache-2.0.txt",
-                            "./LICENSES/Elastic-2.0.txt",
                             "./THIRD_PARTY_NOTICES.md",
-                            "./LICENSING.md",
                             "./scripts/apache_engine_files.txt",
                             "./scripts/embedded_asset_licenses.json",
                             "./lib/libantfly.dylib",
                             "./include/antfly.h",
                         ):
                             self.assertIn(name, archive.getnames())
+                        self.assertEqual(
+                            product == "server",
+                            "./LICENSES/Elastic-2.0.txt" in archive.getnames(),
+                        )
+                        self.assertEqual(
+                            product == "server",
+                            "./LICENSING.md" in archive.getnames(),
+                        )
                         bundled_notices = (
                             archive.extractfile("./THIRD_PARTY_NOTICES.md")
                             .read()
@@ -134,21 +141,21 @@ class ReleaseLicenseTests(unittest.TestCase):
                                 " ".join(notice.read_text().split()),
                                 " ".join(bundled_notices.split()),
                             )
-                        license_map = (
-                            archive.extractfile("./LICENSING.md").read().decode()
-                        )
-                        for linked_file in re.findall(r"\]\(([^)]+)\)", license_map):
-                            self.assertIn("./" + linked_file, archive.getnames())
+                        if product == "server":
+                            license_map = archive.extractfile("./LICENSING.md").read().decode()
+                            for linked_file in re.findall(r"\]\(([^)]+)\)", license_map):
+                                self.assertIn("./" + linked_file, archive.getnames())
                         self.assertEqual(
                             (ROOT / "scripts/apache_engine_files.txt").read_bytes(),
                             archive.extractfile(
                                 "./scripts/apache_engine_files.txt"
                             ).read(),
                         )
-                        self.assertEqual(
-                            (ROOT / "LICENSE").read_bytes(),
-                            archive.extractfile("./LICENSES/Elastic-2.0.txt").read(),
-                        )
+                        if product == "server":
+                            self.assertEqual(
+                                (ROOT / "LICENSE").read_bytes(),
+                                archive.extractfile("./LICENSES/Elastic-2.0.txt").read(),
+                            )
                         self.assertEqual(
                             (ROOT / "LICENSES/Apache-2.0.txt").read_bytes(),
                             archive.extractfile("./LICENSES/Apache-2.0.txt").read(),
@@ -167,6 +174,15 @@ class ReleaseLicenseTests(unittest.TestCase):
                         self.assertEqual(
                             product == "server",
                             "./completions/antfly.bash" in archive.getnames(),
+                        )
+                        expected_binaries = (
+                            {"./antfly"}
+                            if product == "server"
+                            else {"./antfly-lite", "./antfly-inference"}
+                        )
+                        self.assertEqual(
+                            expected_binaries,
+                            {name for name in archive.getnames() if name in {"./antfly", "./antfly-lite", "./antfly-inference"}},
                         )
 
 

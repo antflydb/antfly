@@ -20,9 +20,9 @@ client). This package's import name is `antfly_lite`.
 
 ## Installing libantfly
 
-This package does not build or bundle `libantfly` itself (yet -- future
-releases may ship platform wheels with a bundled library). You need a built
-or installed copy of the shared library and, at import time, `antfly_lite`
+Release platform wheels bundle the Apache-2.0 `libantfly` library and
+`antfly-inference` worker. Source checkouts and the pure-Python development
+wheel need a built copy of the shared library. At import time, `antfly_lite`
 locates it using this order (first match wins):
 
 1. **`ANTFLY_LIBRARY`** environment variable: an explicit path to the shared
@@ -32,17 +32,10 @@ locates it using this order (first match wins):
    guessing.
 2. **`ANTFLY_LIB_DIR`** environment variable: a directory containing the
    platform-appropriate library file.
-3. A library bundled inside this package at `antfly_lite/_lib/` (reserved
-   for future platform-specific wheels; empty in the current pure-Python
-   wheel).
-4. The **`antfly-cli`** package's bundled `lib/` directory, if `antfly-cli`
-   is installed. Antfly CLI release wheels ship `antfly_cli/bin/antfly`,
-   `antfly_cli/include/antfly.h`, and `antfly_cli/lib/libantfly.*` together,
-   so installing `antfly-cli` alongside `antfly-lite` is a convenient way to
-   get a matching library without a separate download.
-5. **`zig/zig-out/lib`**, found by walking up from this package's own
+3. The wheel's bundled `antfly_lite/_lib/` directory.
+4. **`zig/zig-out/lib`**, found by walking up from this package's own
    location -- for development checkouts of the `antfly` monorepo.
-6. The system dynamic linker's search path, via
+5. The system dynamic linker's search path, via
    `ctypes.util.find_library("antfly")`.
 
 Platform library names: `libantfly.dylib` (macOS), `libantfly.so` (Linux),

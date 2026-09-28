@@ -1511,7 +1511,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         },
     });
     const run_lite_main_tests = addFilteredTestRunArtifact(b, lite_main_tests);
-    const install_lite_main = b.addInstallArtifact(lite_main, .{ .dest_sub_path = antfly_bin_name });
+    const install_lite_main = b.addInstallArtifact(lite_main, .{ .dest_sub_path = "antfly-lite" });
 
     const lite_step = b.step("lite", "Build and install the Antfly Lite CLI and libantfly C ABI");
     lite_step.dependOn(&install_lite_main.step);

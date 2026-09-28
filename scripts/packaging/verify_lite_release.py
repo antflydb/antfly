@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Verify that packaged Lite artifacts contain the matching Apache runtime."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import tarfile
+import zipfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts" / "release"))
+from release_channels import normalize_release_version, python_version_from_release  # noqa: E402
+
+from package_cli_release import PACKAGE_PLATFORMS, lite_library_name  # noqa: E402
+from package_lite_release import archive_name  # noqa: E402
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> None:
+    version = normalize_release_version(version)
+    python_version = python_version_from_release(version)
+    apache = (ROOT / "LICENSES/Apache-2.0.txt").read_bytes()
+    for platform in PACKAGE_PLATFORMS:
+        archive_path = archive_dir / archive_name(version, platform)
+        with tarfile.open(archive_path, "r:gz") as source:
+            names = {name.removeprefix("./"): name for name in source.getnames()}
+            require("antfly" not in names, f"server executable in {archive_path}")
+            require(
+                "LICENSES/Elastic-2.0.txt" not in names,
+                f"ELv2 license in {archive_path}",
+            )
+
+            def source_bytes(name: str) -> bytes:
+                actual_name = names.get(name.removeprefix("./"))
+                require(actual_name is not None, f"missing {name} in {archive_path}")
+                member = source.extractfile(actual_name)
+                require(member is not None, f"missing {name} in {archive_path}")
+                return member.read()
+
+            lib_name = lite_library_name(platform)
+            library = source_bytes(f"./lib/{lib_name}")
+            lite = source_bytes("./antfly-lite")
+            worker = source_bytes("./antfly-inference")
+            require(
+                source_bytes("./LICENSE") == apache,
+                f"wrong archive license: {archive_path}",
+            )
+            require(
+                source_bytes("./LICENSES/Apache-2.0.txt") == apache,
+                f"wrong archive license bundle: {archive_path}",
+            )
+
+        wheel_path = (
+            wheel_dir
+            / f"antfly_lite-{python_version}-py3-none-{platform.wheel_platform}.whl"
+        )
+        with zipfile.ZipFile(wheel_path) as wheel:
+            require(
+                wheel.read(f"antfly_lite/_lib/{lib_name}") == library,
+                f"library mismatch: {wheel_path}",
+            )
+            require(
+                wheel.read("antfly_lite/_lib/antfly-inference") == worker,
+                f"worker mismatch: {wheel_path}",
+            )
+            require(
+                wheel.read("antfly_lite/_bin/antfly-lite") == lite,
+                f"Lite executable mismatch: {wheel_path}",
+            )
+            require(
+                wheel.read(f"antfly_lite-{python_version}.dist-info/LICENSE") == apache,
+                f"wrong wheel license: {wheel_path}",
+            )
+            require(
+                wheel.read(
+                    f"antfly_lite-{python_version}.dist-info/LICENSES/Apache-2.0.txt"
+                )
+                == apache,
+                f"wrong wheel license bundle: {wheel_path}",
+            )
+            require(
+                b"License-Expression: Apache-2.0"
+                in wheel.read(f"antfly_lite-{python_version}.dist-info/METADATA"),
+                f"wrong wheel metadata: {wheel_path}",
+            )
+            require(
+                not any(name.startswith("antfly_cli/") for name in wheel.namelist()),
+                f"server package in {wheel_path}",
+            )
+
+        package_name = platform.npm_package_dir.replace("cli-", "lite-")
+        npm_path = npm_dir / f"antfly-{package_name}-{version}.tgz"
+        with tarfile.open(npm_path, "r:gz") as npm:
+
+            def npm_bytes(name: str) -> bytes:
+                member = npm.extractfile("package/" + name)
+                require(member is not None, f"missing {name} in {npm_path}")
+                return member.read()
+
+            manifest = json.loads(npm_bytes("package.json"))
+            require(
+                manifest["name"] == f"@antfly/{package_name}",
+                f"wrong npm package: {npm_path}",
+            )
+            require(
+                manifest["license"] == "Apache-2.0", f"wrong npm license: {npm_path}"
+            )
+            require(
+                npm_bytes(f"lib/{lib_name}") == library, f"library mismatch: {npm_path}"
+            )
+            require(
+                npm_bytes("lib/antfly-inference") == worker,
+                f"worker mismatch: {npm_path}",
+            )
+            require(
+                npm_bytes("bin/antfly-lite") == lite,
+                f"Lite executable mismatch: {npm_path}",
+            )
+            require(
+                npm_bytes("LICENSE") == apache, f"wrong npm license text: {npm_path}"
+            )
+            require(
+                npm_bytes("LICENSES/Apache-2.0.txt") == apache,
+                f"wrong npm license bundle: {npm_path}",
+            )
+
+    selector = npm_dir / f"antfly-lite-{version}.tgz"
+    with tarfile.open(selector, "r:gz") as npm:
+        member = npm.extractfile("package/package.json")
+        require(member is not None, f"missing package.json in {selector}")
+        manifest = json.load(member)
+        require(
+            manifest["name"] == "@antfly/lite" and manifest["license"] == "Apache-2.0",
+            f"wrong Lite selector: {selector}",
+        )
+        expected = {
+            f"@antfly/lite-{name}"
+            for name in ("darwin-arm64", "linux-arm64", "linux-x64")
+        }
+        require(
+            set(manifest["optionalDependencies"]) == expected,
+            f"wrong native dependencies: {selector}",
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--version", required=True)
+    parser.add_argument("--archive-dir", type=Path, required=True)
+    parser.add_argument("--wheel-dir", type=Path, required=True)
+    parser.add_argument("--npm-dir", type=Path, required=True)
+    args = parser.parse_args()
+    verify(args.version, args.archive_dir, args.wheel_dir, args.npm_dir)
+    print("Apache Lite and Inference release artifacts verified")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

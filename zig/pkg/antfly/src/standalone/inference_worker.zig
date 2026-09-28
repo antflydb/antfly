@@ -317,6 +317,9 @@ fn callSegments(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []c
 /// other resolution step; see `resolveWorkerExecutable`.
 const worker_executable_env = "ANTFLY_INFERENCE_WORKER";
 const antfly_binary_name = if (builtin.target.os.tag == .windows) "antfly.exe" else "antfly";
+const inference_binary_name = if (builtin.target.os.tag == .windows) "antfly-inference.exe" else "antfly-inference";
+const lite_binary_name = if (builtin.target.os.tag == .windows) "antfly-lite.exe" else "antfly-lite";
+const worker_binary_names = [_][]const u8{ inference_binary_name, lite_binary_name, antfly_binary_name };
 
 /// Layout shared by glibc, musl, and Darwin's libc; sufficient to recover the
 /// path of the image an address was loaded from.
@@ -378,8 +381,8 @@ fn findOnPathAlloc(alloc: std.mem.Allocator, io: std.Io, name: []const u8) !?[]u
 ///  2. The image this code was loaded from, via `dladdr`: for the statically
 ///     linked `antfly` binary this resolves to itself (unchanged behavior);
 ///     for a shared `libantfly`, it resolves to the `.dylib`/`.so`, next to
-///     which we look for a sibling `antfly` binary.
-///  3. `antfly` on `PATH`.
+///     which we look for a sibling Apache worker or server binary.
+///  3. An Apache worker, Lite binary, or server binary on `PATH`.
 fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
     if (platform.env.getenvSlice(worker_executable_env)) |override| {
         if (override.len == 0) return error.InferenceWorkerExecutableNotConfigured;
@@ -390,14 +393,18 @@ fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
         const basename = std.fs.path.basename(self_path);
         if (!isSharedLibraryName(basename)) return alloc.dupe(u8, self_path);
         const dir = std.fs.path.dirname(self_path) orelse ".";
-        const candidate = try std.fs.path.join(alloc, &.{ dir, antfly_binary_name });
-        if (fileExists(io, candidate)) return candidate;
-        alloc.free(candidate);
+        for (worker_binary_names) |name| {
+            const candidate = try std.fs.path.join(alloc, &.{ dir, name });
+            if (fileExists(io, candidate)) return candidate;
+            alloc.free(candidate);
+        }
     } else |_| {}
-    if (try findOnPathAlloc(alloc, io, antfly_binary_name)) |path| return path;
+    for (worker_binary_names) |name| {
+        if (try findOnPathAlloc(alloc, io, name)) |path| return path;
+    }
     std.log.err(
         "no inference worker executable found for the embedded runtime; set {s} to the path " ++
-            "of the `antfly` binary, or place an `antfly` binary next to the loaded libantfly or on PATH",
+            "of an `antfly-inference`, `antfly-lite`, or `antfly` executable next to the loaded libantfly or on PATH",
         .{worker_executable_env},
     );
     return error.InferenceWorkerExecutableNotConfigured;

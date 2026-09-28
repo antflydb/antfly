@@ -14,7 +14,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
-  cliPlatformPackageName,
+  litePlatformPackageName,
   LibraryNotFoundError,
   platformLibraryFileName,
   resolveLibrary,
@@ -35,17 +35,17 @@ describe("platformLibraryFileName", () => {
   });
 });
 
-describe("cliPlatformPackageName", () => {
+describe("litePlatformPackageName", () => {
   it("maps darwin/arm64", () => {
-    expect(cliPlatformPackageName("darwin", "arm64")).toBe("@antfly/cli-darwin-arm64");
+    expect(litePlatformPackageName("darwin", "arm64")).toBe("@antfly/lite-darwin-arm64");
   });
   it("maps linux/arm64 and linux/x64", () => {
-    expect(cliPlatformPackageName("linux", "arm64")).toBe("@antfly/cli-linux-arm64");
-    expect(cliPlatformPackageName("linux", "x64")).toBe("@antfly/cli-linux-x64");
+    expect(litePlatformPackageName("linux", "arm64")).toBe("@antfly/lite-linux-arm64");
+    expect(litePlatformPackageName("linux", "x64")).toBe("@antfly/lite-linux-x64");
   });
   it("returns undefined for unsupported combinations", () => {
-    expect(cliPlatformPackageName("darwin", "x64")).toBeUndefined();
-    expect(cliPlatformPackageName("win32", "x64")).toBeUndefined();
+    expect(litePlatformPackageName("darwin", "x64")).toBeUndefined();
+    expect(litePlatformPackageName("win32", "x64")).toBeUndefined();
   });
 });
 
@@ -94,20 +94,20 @@ describe("resolveLibrary", () => {
     ).toThrow(LibraryNotFoundError);
   });
 
-  it("falls back to the @antfly/cli-<platform> package's lib/ directory", () => {
+  it("falls back to the @antfly/lite-<platform> package's lib/ directory", () => {
     const result = resolveLibrary({
       platform: "darwin",
       arch: "arm64",
       env: {},
-      existsSync: (p) => p === "/pkg/cli-darwin-arm64/lib/libantfly.dylib",
+      existsSync: (p) => p === "/pkg/lite-darwin-arm64/lib/libantfly.dylib",
       resolve: (specifier) => {
-        expect(specifier).toBe("@antfly/cli-darwin-arm64/package.json");
-        return "/pkg/cli-darwin-arm64/package.json";
+        expect(specifier).toBe("@antfly/lite-darwin-arm64/package.json");
+        return "/pkg/lite-darwin-arm64/package.json";
       },
     });
     expect(result).toEqual({
-      path: "/pkg/cli-darwin-arm64/lib/libantfly.dylib",
-      source: "cli-package",
+      path: "/pkg/lite-darwin-arm64/lib/libantfly.dylib",
+      source: "lite-package",
     });
   });
 

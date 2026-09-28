@@ -21,7 +21,7 @@ usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-
 
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
-  antfly
+  antfly (server) or antfly-lite and antfly-inference (Lite)
   completions/ (server only)
   share/
   lib/
@@ -29,10 +29,10 @@ contains:
   README.md
   LICENSE
   THIRD_PARTY_NOTICES.md
-  LICENSING.md
+  LICENSING.md (server only)
   scripts/apache_engine_files.txt
   LICENSES/Apache-2.0.txt
-  LICENSES/Elastic-2.0.txt
+  LICENSES/Elastic-2.0.txt (server only)
 EOF
 }
 
@@ -277,14 +277,25 @@ run_zig_build_steps_with_retry() {
   fi
 )
 
-test -x "$prefix/bin/antfly"
+if [ "$product" = lite ]; then
+  binary_name=antfly-lite
+else
+  binary_name=antfly
+fi
+test -x "$prefix/bin/$binary_name"
 test -f "$prefix/include/antfly.h"
 if [ ! -f "$lite_lib_prefix_path" ]; then
   echo "missing Antfly C ABI library: $lite_lib_prefix_path" >&2
   find "$prefix" -maxdepth 3 -type f | sort >&2
   exit 1
 fi
-cp "$prefix/bin/antfly" "$stage/antfly"
+cp "$prefix/bin/$binary_name" "$stage/$binary_name"
+if [ "$product" = lite ]; then
+  # The Lite executable understands `inference _worker`. A second filename
+  # gives embedded hosts a dedicated Apache worker candidate without another
+  # native compile or a dependency on the ELv2 server executable.
+  cp "$prefix/bin/antfly-lite" "$stage/antfly-inference"
+fi
 if [ -d "$prefix/share" ]; then
   cp -R "$prefix/share" "$stage/share"
 fi
@@ -294,14 +305,20 @@ fi
 if [ -d "$prefix/include" ]; then
   cp -R "$prefix/include" "$stage/include"
 fi
-cp "$repo_root/README.md" "$stage/README.md"
-cp "$repo_root/LICENSING.md" "$stage/LICENSING.md"
+if [ "$product" = lite ]; then
+  cp "$repo_root/scripts/packaging/lite-release-README.md" "$stage/README.md"
+else
+  cp "$repo_root/README.md" "$stage/README.md"
+  cp "$repo_root/LICENSING.md" "$stage/LICENSING.md"
+fi
 mkdir -p "$stage/scripts"
 cp "$repo_root/scripts/apache_engine_files.txt" "$stage/scripts/apache_engine_files.txt"
 cp "$repo_root/scripts/embedded_asset_licenses.json" "$stage/scripts/embedded_asset_licenses.json"
 mkdir -p "$stage/LICENSES"
 cp "$repo_root/LICENSES/Apache-2.0.txt" "$stage/LICENSES/Apache-2.0.txt"
-cp "$repo_root/LICENSES/Elastic-2.0.txt" "$stage/LICENSES/Elastic-2.0.txt"
+if [ "$product" = server ]; then
+  cp "$repo_root/LICENSES/Elastic-2.0.txt" "$stage/LICENSES/Elastic-2.0.txt"
+fi
 cp -R "$repo_root/LICENSES/third-party" "$stage/LICENSES/third-party"
 if [ "$product" = lite ]; then
   cp "$repo_root/LICENSES/Apache-2.0.txt" "$stage/LICENSE"
@@ -318,6 +335,14 @@ python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
   --output "$out_dir/$archive_name" \
   --mtime "$source_date_epoch"
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
+grep -Fx "./$binary_name" "$work_root/archive-contents.txt" >/dev/null
+if [ "$product" = lite ]; then
+  grep -Fx "./antfly-inference" "$work_root/archive-contents.txt" >/dev/null
+  if grep -Fx './antfly' "$work_root/archive-contents.txt" >/dev/null; then
+    echo "Lite archive unexpectedly includes the server executable" >&2
+    exit 1
+  fi
+fi
 grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "./THIRD_PARTY_NOTICES.md" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null
@@ -326,7 +351,9 @@ if [ "$product" = server ]; then
   grep -Fx "./completions/antfly.zsh" "$work_root/archive-contents.txt" >/dev/null
   grep -Fx "./completions/antfly.fish" "$work_root/archive-contents.txt" >/dev/null
 fi
-grep -Fx "./LICENSES/Elastic-2.0.txt" "$work_root/archive-contents.txt" >/dev/null
+if [ "$product" = server ]; then
+  grep -Fx "./LICENSES/Elastic-2.0.txt" "$work_root/archive-contents.txt" >/dev/null
+fi
 grep -Fx "./LICENSES/Apache-2.0.txt" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "./scripts/apache_engine_files.txt" "$work_root/archive-contents.txt" >/dev/null
 echo "wrote $out_dir/$archive_name"

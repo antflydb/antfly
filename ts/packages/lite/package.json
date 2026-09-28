@@ -66,5 +66,10 @@
     "darwin",
     "linux",
     "win32"
-  ]
+  ],
+  "optionalDependencies": {
+    "@antfly/lite-darwin-arm64": "workspace:*",
+    "@antfly/lite-linux-arm64": "workspace:*",
+    "@antfly/lite-linux-x64": "workspace:*"
+  }
 }
