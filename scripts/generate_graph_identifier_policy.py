@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -172,6 +173,7 @@ def render_zig(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
         for case in policy["conformance_cases"]
     )
     return f"""// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -268,6 +270,7 @@ def render_go(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
         for case in policy["conformance_cases"]
     )
     return f"""// Copyright 2026 The Antfly Contributors
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -381,6 +384,7 @@ def render_python(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
         for case in policy["conformance_cases"]
     )
     return f'''# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -451,6 +455,7 @@ def render_typescript(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> 
         for case in policy["conformance_cases"]
     )
     return f"""// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -559,6 +564,7 @@ def render_rust(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
         for case in policy["conformance_cases"]
     )
     return f"""// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.

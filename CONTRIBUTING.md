@@ -213,4 +213,21 @@ See [RELEASE.md](RELEASE.md) for the Zig release pipeline.
 
 ## License
 
-Core Antfly code is licensed under [Elastic License 2.0 (ELv2)](LICENSE). The SDKs, shared libraries, inference runtime, TypeScript, Python, and Rust packages are Apache 2.0 — check individual LICENSE files.
+Antfly is a mixed-license repository. The embedded engine, Lite CLI, native library, inference runtime, and language bindings are Apache-2.0; the database server and orchestration remain ELv2. See [LICENSING.md](LICENSING.md) for the per-tree and per-file boundary before contributing.
+
+## Certificate of Origin and inbound licenses
+
+For new contributions, sign each commit with `git commit -s`. The sign-off
+certifies the [Developer Certificate of Origin 1.1](https://developercertificate.org/)
+for contributions to Apache-2.0 files. The sign-off must use the commit
+author's name and email. Contributions containing third-party material must
+retain its original notices and comply with its license.
+
+The inbound license for a first-party Apache-2.0 file is Apache-2.0. For a
+first-party ELv2 file, contributors submit their copyrightable changes under
+ELv2 **and** grant Antfly, Inc. permission to distribute those changes under
+Apache-2.0 if the file or an extracted shared component later moves to the
+Apache boundary. The file's current outbound license remains ELv2 until its
+license notice and the boundary map are changed. A sign-off on a contribution
+confirms the contributor has the right to make these grants. This policy
+applies prospectively; it does not supply rights for earlier contributions.

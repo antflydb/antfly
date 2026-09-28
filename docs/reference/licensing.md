@@ -67,6 +67,17 @@ before publishing `antfly-embedded` wheels to PyPI and the
 each npm package must have trusted publishing configured for this workflow in
 their registry settings.
 
+Before the first release, the PyPI account owner must configure a pending
+trusted publisher for project `antfly-embedded`, repository
+`antflydb/antfly`, workflow `lite-release-publish.yml`, and GitHub environment
+`pypi`. A pending publisher does not reserve the name: the first successful
+upload creates the project. The crates.io owner can publish the tested
+`registry-claims/antfly-embedded` and `registry-claims/antfly-embedded-sys`
+version `0.0.0` placeholders, then grant the Antfly organization ownership
+before publishing the functional Rust crates.
+Registry ownership and trusted-publisher settings cannot be established by a
+source commit; verify them in the registries before promoting a release.
+
 ## Verification
 
 ```sh

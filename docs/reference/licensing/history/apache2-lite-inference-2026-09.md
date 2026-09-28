@@ -5,7 +5,38 @@ Implemented from `origin/main` at
 This is historical validation evidence; see [licensing maintenance](../../licensing.md)
 and [LICENSING.md](../../../../LICENSING.md) for current policy.
 
+## Contributor provenance audit
+
+The author audit used non-merge commits reachable from `origin/main`, scoped to
+the Apache roots and exact shared-engine files classified by
+`scripts/license_headers.py` at the time of this review. It found 13 commits
+authored as `stinkbugaf` (including GitHub no-reply aliases), three as
+`andreasontrace@gmail.com`, five as `andrew.batz@visitingmedia.com`, and 18 as
+`codex@openai.com`. Of the latter, ten touch the narrower embedded/inference
+paths; the others touch Apache tooling or packages. The previously reported
+count of 11 Codex commits does not match this current path-scoped, non-merge
+query, so it must not be treated as a verified consent inventory.
+
+This is evidence of authorship and affected paths, **not** evidence of an
+Apache license grant or a DCO sign-off. The historical inbound rights for
+each contribution still need a separate review before representing a changed
+license boundary as cleared for release. The prospective contribution policy
+in `CONTRIBUTING.md` does not change past contributions.
+
 ## Validation results
+
+The Apache-only source build is now a standalone PR CI job. Its local run
+removed 767 ELv2 server implementation files from the staged source and built
+the Lite CLI and standalone inference package successfully. The companion
+license boundary check runs on every PR independently of the admission-gated
+Zig test suites.
+
+WASM PR #896's September 28 PR CI run passed its build and test shards but
+failed when merging E2E timing observations: a nested pytest probe in
+`test_standalone_harness.py` inherited the parent's duration file and emitted
+the same synthetic test ID in multiple lanes. This is a CI measurement issue,
+not a WASM compilation or runtime failure. The nested probe now clears the
+shard timing environment.
 
 - Lite CLI and `libantfly` built in Debug from a staged tree with the ELv2
   server implementations removed. The CLI lifecycle smoke passed, including

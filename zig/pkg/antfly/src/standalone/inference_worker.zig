@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -316,10 +317,9 @@ fn callSegments(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []c
 /// Explicit override for the worker executable. Takes priority over every
 /// other resolution step; see `resolveWorkerExecutable`.
 const worker_executable_env = "ANTFLY_INFERENCE_WORKER";
-const antfly_binary_name = if (builtin.target.os.tag == .windows) "antfly.exe" else "antfly";
 const inference_worker_binary_name = if (builtin.target.os.tag == .windows) "antfly-inference-worker.exe" else "antfly-inference-worker";
 const lite_binary_name = if (builtin.target.os.tag == .windows) "antfly-lite.exe" else "antfly-lite";
-const worker_binary_names = [_][]const u8{ inference_worker_binary_name, lite_binary_name, antfly_binary_name };
+const worker_binary_names = [_][]const u8{ inference_worker_binary_name, lite_binary_name };
 
 /// Layout shared by glibc, musl, and Darwin's libc; sufficient to recover the
 /// path of the image an address was loaded from.
@@ -381,8 +381,8 @@ fn findOnPathAlloc(alloc: std.mem.Allocator, io: std.Io, name: []const u8) !?[]u
 ///  2. The image this code was loaded from, via `dladdr`: for the statically
 ///     linked `antfly` binary this resolves to itself (unchanged behavior);
 ///     for a shared `libantfly`, it resolves to the `.dylib`/`.so`, next to
-///     which we look for a sibling Apache worker or server binary.
-///  3. An Apache worker, Lite binary, or server binary on `PATH`.
+///     which we look for a sibling Apache worker or Lite binary.
+///  3. An Apache worker or Lite binary on `PATH`.
 fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
     if (platform.env.getenvSlice(worker_executable_env)) |override| {
         if (override.len == 0) return error.InferenceWorkerExecutableNotConfigured;
@@ -404,7 +404,7 @@ fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
     }
     std.log.err(
         "no inference worker executable found for the embedded runtime; set {s} to the path " ++
-            "of an `antfly-inference-worker`, `antfly-lite`, or `antfly` executable next to the loaded libantfly or on PATH",
+            "of an `antfly-inference-worker` or `antfly-lite` executable next to the loaded libantfly or on PATH",
         .{worker_executable_env},
     );
     return error.InferenceWorkerExecutableNotConfigured;

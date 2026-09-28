@@ -333,13 +333,13 @@ Every handle is safe to share across threads (Python, Rust) or concurrent promis
 
 ## Building from Source
 
-From the `zig` directory, `zig build lite` installs the Lite-only CLI as `zig-out/bin/antfly` together with the `libantfly` library and its C header. It links the Apache local engine, enrichment, and inference archives without the database server runtime, and runs no tests. For the full Antfly CLI with the Lite commands and the C library, use the existing targets:
+From the `zig` directory, `zig build lite` installs the Lite-only CLI as `zig-out/bin/antfly-lite` together with the `libantfly` library and its C header. It links the Apache local engine, enrichment, and inference archives without the database server runtime, and runs no tests. For the full Antfly CLI with the Lite commands and the C library, use the existing targets:
 
 ```bash
 zig build antfly capi
 ```
 
-Lite builds embed the local inference runtime, and status advertises it by default (`-Dlite-local-inference-runtime=false` hides it). Builds with Metal (the macOS default), CUDA, ONNX, or PJRT run all local inference, CPU models included, in an `antfly inference _worker` child process that starts when a local-runtime handle opens. A host process other than the `antfly` binary must set `ANTFLY_INFERENCE_WORKER` or ship `antfly` next to `libantfly` or on `PATH`. `zig build wasm` builds and installs the embedded database and inference WASM bundle, and `zig build wasm-test` runs its Node smoke test. `zig build lite-test` runs the Lite backend, CLI, C ABI, Go binding, embedded example, and packaging checks in one pass.
+Lite builds embed the local inference runtime, and status advertises it by default (`-Dlite-local-inference-runtime=false` hides it). Builds with Metal (the macOS default), CUDA, ONNX, or PJRT run all local inference, CPU models included, in an `inference _worker` child process that starts when a local-runtime handle opens. A host process using `libantfly` must set `ANTFLY_INFERENCE_WORKER` or ship `antfly-inference-worker` or `antfly-lite` next to `libantfly` or on `PATH`. `zig build wasm` builds and installs the embedded database and inference WASM bundle, and `zig build wasm-test` runs its Node smoke test. `zig build lite-test` runs the Lite backend, CLI, C ABI, Go binding, embedded example, and packaging checks in one pass.
 
 ## Maintenance
 

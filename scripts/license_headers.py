@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -314,7 +315,6 @@ def strip_existing_antfly_header(text: str, path: Path) -> tuple[str, int]:
         body = line[len(prefix) :].strip()
         if (
             body == "limitations."
-            or body.startswith("SPDX-License-Identifier:")
             or body == "except in compliance with the Elastic License 2.0."
             or body == "Licensed under the Elastic License 2.0 (ELv2)."
         ):

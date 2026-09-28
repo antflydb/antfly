@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -85,7 +86,7 @@ class Antfly < Formula
   version "{args.version}"
   # Recover from older formulae that inferred version 64 from arm64 archives.
   version_scheme 1
-  license "Elastic-2.0"
+  license all_of: ["Elastic-2.0", "Apache-2.0"]
 
   if OS.mac?
     if Hardware::CPU.arm?

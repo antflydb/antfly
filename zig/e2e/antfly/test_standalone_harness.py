@@ -1,4 +1,5 @@
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Elastic-2.0
 #
 # Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 # except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -110,7 +111,13 @@ def test_last(cli_server, setup_probe):
         ANTFLY_E2E_PRESERVE_ROOT="1" if preservation == "always" else "0",
         ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE=("1" if preservation == "failure" else "0"),
     )
+    nested_duration_file = tmp_path / "nested-durations.json"
+    env["ANTFLY_E2E_DURATION_FILE"] = str(nested_duration_file)
     env.pop("PYTEST_ADDOPTS", None)
+    # The nested probe is not a CI shard. Inheriting the parent duration file
+    # records its synthetic node IDs in every shard and makes aggregation fail.
+    env.pop("ANTFLY_E2E_DURATION_FILE", None)
+    env.pop("ANTFLY_E2E_SHARD_PLAN", None)
     result = subprocess.run(
         [
             sys.executable,
@@ -132,6 +139,7 @@ def test_last(cli_server, setup_probe):
         timeout=30,
     )
     output = result.stdout + result.stderr
+    assert not nested_duration_file.exists(), output
     assert "INTERNALERROR" not in output, output
     assert result.returncode == (0 if failure_phase == "none" else 1), output
     if failure_phase != "none":
