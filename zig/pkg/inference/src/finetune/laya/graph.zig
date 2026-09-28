@@ -85,6 +85,13 @@ pub const Inputs = struct {
     /// unconditionally like the three bias inputs above; unused (and
     /// unfed) unless `use_fused_attention`.
     segment_control: Id,
+    /// The same four visibility inputs for the per-question upper layers
+    /// (Laya `packing.fuse_layers`): each state copy also sees its question.
+    /// Unused (and unfed) unless the config fuses layers.
+    upper_encoder_bias: Id,
+    upper_local_bias: Id,
+    upper_head_bias: Id,
+    upper_segment_control: Id,
 };
 pub const Dropout = struct { node: Id, probability: f32 };
 pub const Built = struct {
@@ -229,7 +236,8 @@ pub fn validate(cfg: modern.Config, l: Layout, head_dropout: f32, lora: ?Lora, u
         !std.math.isFinite(cfg.layer_norm_eps) or cfg.layer_norm_eps <= 0 or
         l.batch == 0 or l.batch > 128 or l.sequence == 0 or l.sequence > (if (lc.packing.enabled()) lc.packing.max_packed_len else lc.max_len) or
         l.questions < l.batch or l.questions > 512 or (!lc.packing.enabled() and l.questions != l.batch) or
-        l.options < 2 or l.options > lc.maxOptions() or !std.math.isFinite(head_dropout) or head_dropout < 0 or head_dropout >= 1)
+        l.options < 2 or l.options > lc.maxOptions() or !std.math.isFinite(head_dropout) or head_dropout < 0 or head_dropout >= 1 or
+        lc.packing.fuse_layers > cfg.num_hidden_layers + lc.head_layers)
         return error.InvalidLayaTrainingLayout;
     if (lora) |cfg2| {
         if (cfg2.rank == 0 or cfg2.rank > 1024 or !std.math.isFinite(cfg2.alpha) or cfg2.alpha <= 0 or
@@ -275,12 +283,17 @@ pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f3
         .local_bias = try b.parameter("__laya_local_bias", Shape.init(.f32, &.{ l.batch * nh, l.sequence, l.sequence })),
         .head_bias = try b.parameter("__laya_head_bias", Shape.init(.f32, &.{ l.batch * hh, l.sequence, l.sequence })),
         .segment_control = try b.parameter("__laya_segment_control", Shape.init(.i32, &.{7 + n + n * 6})),
+        .upper_encoder_bias = try b.parameter("__laya_upper_encoder_bias", Shape.init(.f32, &.{ l.batch * nh, l.sequence, l.sequence })),
+        .upper_local_bias = try b.parameter("__laya_upper_local_bias", Shape.init(.f32, &.{ l.batch * nh, l.sequence, l.sequence })),
+        .upper_head_bias = try b.parameter("__laya_upper_head_bias", Shape.init(.f32, &.{ l.batch * hh, l.sequence, l.sequence })),
+        .upper_segment_control = try b.parameter("__laya_upper_segment_control", Shape.init(.i32, &.{7 + n + n * 6})),
         .rope = .{
             .{ try b.parameter("__laya_rope_global_cos", table), try b.parameter("__laya_rope_global_sin", table) },
             .{ try b.parameter("__laya_rope_local_cos", table), try b.parameter("__laya_rope_local_sin", table) },
         },
     }, .logits = ml.null_node };
     errdefer result.deinit(b.graph.allocator);
+    const fuse_from = lc.packing.fuseFrom(cfg.num_hidden_layers + lc.head_layers);
     const embedding = try param(b, "encoder.embeddings.tok_embeddings", "weight", &.{ cfg.vocab_size, h });
     var x = try b.gather(embedding, result.inputs.ids, Shape.init(.f32, &.{ n, h }));
     x = try norm(b, x, "encoder.embeddings.norm", h, cfg.layer_norm_eps, false);
@@ -296,10 +309,13 @@ pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f3
         const q = try rope(b, try b.sliceLastDim(qkv, 0, h), tables, l, nh, h / nh);
         const k = try rope(b, try b.sliceLastDim(qkv, h, h * 2), tables, l, nh, h / nh);
         const v = try b.sliceLastDim(qkv, h * 2, h * 3);
+        const upper = layer >= fuse_from;
         const attn = if (use_fused_attention)
-            try fusedAttention(b, result.inputs.segment_control, q, k, v, l, nh, h / nh, if (global) std.math.maxInt(u32) else cfg.local_attention_window / 2, @as(u64, layer), 0)
+            try fusedAttention(b, if (upper) result.inputs.upper_segment_control else result.inputs.segment_control, q, k, v, l, nh, h / nh, if (global) std.math.maxInt(u32) else cfg.local_attention_window / 2, @as(u64, layer), 0)
         else
-            try attention(b, &result, q, k, v, if (global) result.inputs.encoder_bias else result.inputs.local_bias, l, nh, h / nh, 0);
+            try attention(b, &result, q, k, v, if (upper)
+                (if (global) result.inputs.upper_encoder_bias else result.inputs.upper_local_bias)
+            else if (global) result.inputs.encoder_bias else result.inputs.local_bias, l, nh, h / nh, 0);
         x = try b.add(x, try linear(b, &result, attn, try std.fmt.bufPrint(&names, "{s}.attn.Wo", .{prefix}), n, h, h, false, encoder_lora));
         const normed = try norm(b, x, try std.fmt.bufPrint(&names, "{s}.mlp_norm", .{prefix}), h, cfg.layer_norm_eps, false);
         const up = try linear(b, &result, normed, try std.fmt.bufPrint(&names, "{s}.mlp.Wi", .{prefix}), n, h, cfg.intermediate_size * 2, false, encoder_lora);
@@ -325,10 +341,11 @@ pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f3
             var lora_prefix: [160]u8 = undefined;
             qkv = try b.add(qkv, try loraDelta(b, &result, n1, try std.fmt.bufPrint(&lora_prefix, "{s}.self_attn.in_proj", .{prefix}), lora_cfg, n, h, h * 3));
         }
+        const upper = cfg.num_hidden_layers + layer >= fuse_from;
         const attn = if (use_fused_attention)
-            try fusedAttention(b, result.inputs.segment_control, try b.sliceLastDim(qkv, 0, h), try b.sliceLastDim(qkv, h, h * 2), try b.sliceLastDim(qkv, h * 2, h * 3), l, hh, 64, std.math.maxInt(u32), 1_000_000 + @as(u64, layer), head_dropout)
+            try fusedAttention(b, if (upper) result.inputs.upper_segment_control else result.inputs.segment_control, try b.sliceLastDim(qkv, 0, h), try b.sliceLastDim(qkv, h, h * 2), try b.sliceLastDim(qkv, h * 2, h * 3), l, hh, 64, std.math.maxInt(u32), 1_000_000 + @as(u64, layer), head_dropout)
         else
-            try attention(b, &result, try b.sliceLastDim(qkv, 0, h), try b.sliceLastDim(qkv, h, h * 2), try b.sliceLastDim(qkv, h * 2, h * 3), result.inputs.head_bias, l, hh, 64, head_dropout);
+            try attention(b, &result, try b.sliceLastDim(qkv, 0, h), try b.sliceLastDim(qkv, h, h * 2), try b.sliceLastDim(qkv, h * 2, h * 3), if (upper) result.inputs.upper_head_bias else result.inputs.head_bias, l, hh, 64, head_dropout);
         const proj = try linear(b, &result, attn, try std.fmt.bufPrint(&names, "{s}.self_attn.out_proj", .{prefix}), n, h, h, true, head_lora);
         x = try b.add(x, try drop(b, &result, proj, head_dropout));
         const n2 = try norm(b, x, try std.fmt.bufPrint(&names, "{s}.norm2", .{prefix}), h, 1e-5, true);

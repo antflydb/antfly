@@ -56,6 +56,11 @@ pub const Row = struct {
     /// still see only their ancestors. The trunk then depends on the
     /// question set, so it cannot be cached across rows.
     trunk_sees_tree: bool = false,
+    /// Per-question upper layers (`packing.fuse_layers`): every tree holds
+    /// exactly one question, and the fused layers attend as `upper()` does
+    /// (each state copy also sees its question). The layers below attend as
+    /// this row does, so every copy of a state encodes identically there.
+    fused: bool = false,
 
     pub fn questions(self: Row) usize {
         return self.anchors.len;
@@ -64,6 +69,15 @@ pub const Row = struct {
     pub fn deinit(self: Row, a: std.mem.Allocator) void {
         for ([_][]const i64{ self.ids, self.positions, self.segments, self.parents, self.kinds, self.anchors, self.markers }) |slice| a.free(slice);
         a.free(self.question_index);
+    }
+
+    /// The visibility of the fused upper layers: each trunk also sees its
+    /// tree, which holds one question. Views the same slices.
+    pub fn upper(self: Row) Row {
+        var out = self;
+        out.trunk_sees_tree = true;
+        out.fused = false;
+        return out;
     }
 
     /// True when `query` may attend to `key`.
@@ -117,6 +131,7 @@ pub fn validate(row: Row, max_len: usize, max_packed_len: usize, max_options: us
         while (segment >= 0) : (segment = row.parents[@intCast(segment)]) depth += 1;
         if (depth > 3) return error.InvalidLayaPackedRow;
     }
+    if (row.fused and (row.trunk_sees_tree or treeCount(row) != q)) return error.InvalidLayaPackedRow;
     for (row.anchors, 0..) |anchor, question| {
         if (anchor < 0 or anchor >= n) return error.InvalidLayaPackedRow;
         const anchor_segment: usize = @intCast(row.segments[@intCast(anchor)]);
@@ -208,8 +223,8 @@ pub fn coalesce(a: std.mem.Allocator, rows: []const Row) !Coalesced {
         segment_offset += r.parents.len;
         q_offset += r.questions();
     }
-    for (rows) |r| if (r.trunk_sees_tree != rows[0].trunk_sees_tree) return error.InvalidLayaPackedRow;
-    const row = try own(a, .{ .ids = ids, .positions = positions, .segments = segments, .parents = parents, .kinds = kinds, .anchors = anchors, .markers = markers, .question_index = question_index, .width = width, .trunk_sees_tree = rows[0].trunk_sees_tree });
+    for (rows) |r| if (r.trunk_sees_tree != rows[0].trunk_sees_tree or r.fused != rows[0].fused) return error.InvalidLayaPackedRow;
+    const row = try own(a, .{ .ids = ids, .positions = positions, .segments = segments, .parents = parents, .kinds = kinds, .anchors = anchors, .markers = markers, .question_index = question_index, .width = width, .trunk_sees_tree = rows[0].trunk_sees_tree, .fused = rows[0].fused });
     return .{ .row = row, .owners = owners };
 }
 
@@ -350,6 +365,32 @@ pub fn build(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, text: []co
         for (rows.items) |row| row.deinit(a);
         rows.deinit(a);
     }
+    if (cfg.packing.fuse_layers > 0) {
+        // Per-question upper layers: one tree per question, each with its own
+        // copy of the state, coalesced into as few rows as fit.
+        var first: usize = 0;
+        while (first < branches.len) {
+            var end = first;
+            var used: usize = 0;
+            while (end < branches.len and used + trunk + branches[end].physical <= cfg.packing.max_packed_len) : (end += 1) used += trunk + branches[end].physical;
+            const trees = try a.alloc(Row, end - first);
+            var made: usize = 0;
+            defer {
+                for (trees[0..made]) |t| t.deinit(a);
+                a.free(trees);
+            }
+            for (first..end) |i| {
+                trees[made] = try emit(a, tok, cfg, state, branches[i .. i + 1], trunk + branches[i].physical, style);
+                made += 1;
+            }
+            const merged = try coalesce(a, trees);
+            a.free(merged.owners);
+            errdefer merged.row.deinit(a);
+            try rows.append(a, merged.row);
+            first = end;
+        }
+        return rows.toOwnedSlice(a);
+    }
     var first: usize = 0;
     while (first < branches.len) {
         var end = first;
@@ -419,7 +460,7 @@ fn emit(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, state: []const 
         if (style == .question) w.put(special.sep_id, question_segment, kind);
     }
     std.debug.assert(w.at == total and segment == segment_count);
-    return own(a, .{ .ids = w.ids, .positions = w.positions, .segments = w.segments, .parents = parents, .kinds = w.kinds, .anchors = anchors, .markers = markers, .question_index = question_index, .width = width, .trunk_sees_tree = cfg.packing.trunk_sees_questions });
+    return own(a, .{ .ids = w.ids, .positions = w.positions, .segments = w.segments, .parents = parents, .kinds = w.kinds, .anchors = anchors, .markers = markers, .question_index = question_index, .width = width, .trunk_sees_tree = cfg.packing.trunk_sees_questions, .fused = cfg.packing.fuse_layers > 0 });
 }
 
 /// Copy a row into `a`, so a partially built row never leaks on error.
@@ -437,6 +478,7 @@ pub fn own(a: std.mem.Allocator, row: Row) !Row {
     }
     out.question_index = try a.dupe(usize, row.question_index);
     out.trunk_sees_tree = row.trunk_sees_tree;
+    out.fused = row.fused;
     return out;
 }
 

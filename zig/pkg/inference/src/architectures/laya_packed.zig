@@ -79,7 +79,9 @@ pub fn view(a: std.mem.Allocator, cfg: modern.Config, inputs: []const Tensor) !t
         .question_index = index,
         .width = width,
         .trunk_sees_tree = laya.packing.trunk_sees_questions,
+        .fused = laya.packing.fuse_layers > 0,
     };
+    if (laya.packing.fuse_layers > cfg.num_hidden_layers + laya.head_layers) return error.InvalidLayaConfig;
     try tree.validate(row, laya.max_len, laya.packing.max_packed_len, laya.maxOptions());
     for (ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidLayaInputs;
     return tree.own(a, row);
@@ -104,8 +106,10 @@ pub fn forwardRow(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: mode
     // their cost proportional to visible keys, so batching pays off without
     // the trunk cache; caching a forest of trunks is not implemented yet.
     if (tree.treeCount(row) != 1) return forwardFull(cb, a, cfg, laya, row);
-    // A trunk that sees its questions depends on the question set.
-    if (row.trunk_sees_tree) return forwardFull(cb, a, cfg, laya, row);
+    // A trunk that sees its questions depends on the question set. With
+    // per-question upper layers only the layers below are shared; caching
+    // them is not implemented yet.
+    if (row.trunk_sees_tree or row.fused) return forwardFull(cb, a, cfg, laya, row);
     const trunk = trunkRows(row) orelse return forwardFull(cb, a, cfg, laya, row);
     if (store.limit_bytes == 0 or trunk < store.min_tokens or trunk == row.ids.len) return forwardFull(cb, a, cfg, laya, row);
     const layers = cfg.num_hidden_layers + laya.head_layers;
@@ -251,12 +255,20 @@ fn forwardCached(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: moder
 pub fn forwardFull(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row) ![]Tensor {
     const segments = try tree.ranges(a, row, 0);
     defer a.free(segments);
+    const upper = if (row.fused) try tree.ranges(a, row.upper(), 0) else null;
+    defer if (upper) |u| a.free(u);
     const key_positions = try tree.positions32(a, row.positions);
     defer a.free(key_positions);
-    const packed_row: modern.Packed = .{ .positions = row.positions, .ranges = segments, .key_positions = key_positions };
+    const packed_row: modern.Packed = .{
+        .positions = row.positions,
+        .ranges = segments,
+        .key_positions = key_positions,
+        .upper_ranges = upper,
+        .upper_from = laya.packing.fuseFrom(cfg.num_hidden_layers + laya.head_layers),
+    };
     const encoded = try modern.forwardPackedCT(cb, a, cfg, row.ids, packed_row);
     defer cb.free(encoded);
-    return head.forwardPacked(cb, a, laya, encoded, packed_row, row.kinds, row.markers, row.anchors, row.width, cfg.hidden_size);
+    return head.forwardPacked(cb, a, laya, encoded, packed_row.after(cfg.num_hidden_layers), row.kinds, row.markers, row.anchors, row.width, cfg.hidden_size);
 }
 
 /// Peak transient bytes for one row: FFN and projection activations plus

@@ -351,7 +351,7 @@ fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []c
             joined[1] = try modern.joinRows(cb, a, p.values[layer], p.rows, v, rows, dim);
         }
         const attn = if (segments) |row|
-            try modern.packedAttention(cb, a, q, joined[0] orelse k, joined[1] orelse v, row, std.math.maxInt(u32), rows, seq, dim / 64, 64)
+            try modern.packedAttention(cb, a, q, joined[0] orelse k, joined[1] orelse v, row.at(layer), std.math.maxInt(u32), rows, seq, dim / 64, 64)
         else
             try cb.scaledDotProductAttention(q, k, v, mask, null, batch, seq, dim / 64, 64);
         defer cb.free(attn);

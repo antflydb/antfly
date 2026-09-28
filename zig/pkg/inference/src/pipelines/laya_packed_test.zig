@@ -326,6 +326,61 @@ test "laya packed questions are isolated and share one exact trunk encoding" {
     }
 }
 
+// Per-question upper layers (`packing.fuse_layers`, LAYA.md): one tree per
+// question, so questions stay isolated; fusing the whole stack is exactly the
+// question-aware trunk on each question alone; fusing changes the model.
+test "laya per-question upper layers isolate questions and reduce to the question-aware trunk" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    const stack = synthetic.layers + 2;
+    var aware = try Fixture.init(std.testing.allocator, "{\"mode\":\"question\",\"trunk_sees\":\"questions\"}");
+    defer aware.deinit(std.testing.allocator);
+    var plain = try Fixture.init(std.testing.allocator, "{\"mode\":\"question\"}");
+    defer plain.deinit(std.testing.allocator);
+    const unfused = try runRow(a, &plain, (try tree.build(a, tok, plain.cfg, state_text, &questions, null))[0]);
+    for ([_]usize{ 2, 3, stack }) |fuse| {
+        var fixture = try Fixture.init(std.testing.allocator, try std.fmt.allocPrint(a, "{{\"mode\":\"question\",\"fuse_layers\":{d}}}", .{fuse}));
+        defer fixture.deinit(std.testing.allocator);
+        const rows = try tree.build(a, tok, fixture.cfg, state_text, &questions, null);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        const all = rows[0];
+        try std.testing.expect(all.fused);
+        try std.testing.expectEqual(questions.len, tree.treeCount(all));
+        try tree.validate(all, fixture.cfg.max_len, fixture.cfg.packing.max_packed_len, fixture.cfg.maxOptions());
+        // Both layer sets' ranges agree with their visibility.
+        for ([_]tree.Row{ all, all.upper() }) |view| {
+            const bounds = try tree.ranges(a, view, 0);
+            for (0..view.ids.len) |q| for (0..view.ids.len) |k| {
+                var in_range = false;
+                for (0..3) |slot| in_range = in_range or (k >= bounds[q * 6 + 2 * slot] and k < bounds[q * 6 + 2 * slot + 1]);
+                try std.testing.expectEqual(view.visible(q, k), in_range);
+            };
+        }
+        const together = try runRow(a, &fixture, all);
+        var isolation: f32 = 0;
+        var reduction: f32 = 0;
+        var moved: f32 = 0;
+        for (questions, 0..) |q, qi| {
+            const labels = q.labels.len;
+            const got = together[0][qi * all.width ..][0..labels];
+            const single = try runRow(a, &fixture, (try tree.build(a, tok, fixture.cfg, state_text, &.{q}, null))[0]);
+            isolation = @max(isolation, try maxError(single[0][0..labels], got));
+            moved = @max(moved, try maxError(unfused[0][qi * all.width ..][0..labels], got));
+            if (fuse == stack) {
+                const alone = (try tree.build(a, tok, aware.cfg, state_text, &.{q}, null))[0];
+                reduction = @max(reduction, try maxError((try runRow(a, &aware, alone))[0][0..labels], got));
+            }
+        }
+        std.debug.print("Laya fuse_layers={d}: isolation max error={d}, vs question-aware trunk={d}, vs unfused={d}\n", .{ fuse, isolation, reduction, moved });
+        try std.testing.expect(isolation < 1e-5);
+        try std.testing.expect(reduction < 1e-5);
+        try std.testing.expect(moved > 1e-4);
+    }
+}
+
 // Multi-row batching (LAYA.md, "Segment attention"): several rows, from
 // different states, run as one physical row in one session call.
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

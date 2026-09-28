@@ -66,6 +66,11 @@ pub const Config = struct {
     /// Train a question-aware trunk (`packing.trunk_sees: "questions"`):
     /// state tokens also attend to their questions. Requires `packing`.
     trunk_sees_questions: bool = false,
+    /// Per-question upper layers (`packing.fuse_layers`): the top
+    /// `fuse_layers` layers of the encoder-plus-head stack run once per
+    /// question over its own copy of the state. Requires `packing:
+    /// .question`; 0 disables, otherwise at least 2 (see `model.Packing`).
+    fuse_layers: u32 = 0,
     /// Two-stage choice (roadmap 2b): only valid with `packing: .candidate`.
     /// Set to also train, alongside the ordinary candidate rows, one joint
     /// (question-style) row per eligible `choice` record over a sampled
@@ -133,6 +138,7 @@ pub fn validate(c: Config) !void {
     if (c.stop_after_microbatches == 0) return error.InvalidLayaJob;
     if (c.max_packed_len != null and (c.packing == null or c.packing.? == .none)) return error.InvalidLayaJob;
     if (c.trunk_sees_questions and (c.packing == null or c.packing.? == .none)) return error.InvalidLayaJob;
+    if (c.fuse_layers > 0 and ((c.packing orelse .none) != .question or c.trunk_sees_questions or c.fuse_layers < 2 or c.fuse_layers > model.max_fuse_layers)) return error.InvalidLayaJob;
     _ = try resolveLora(c.lora);
     if (c.two_stage_top_k) |k| {
         if ((c.packing orelse .none) != .candidate or k < 2 or k > model.max_packed_options) return error.InvalidLayaJob;
@@ -147,7 +153,7 @@ fn packing(c: Config, source: model.Config) !model.Packing {
     const length: usize = c.max_packed_len orelse @min(4 * source.max_len, model.max_packed_len_limit);
     if (length < source.max_len or length > model.max_packed_len_limit) return error.InvalidLayaJob;
     const two_stage: model.TwoStage = if (c.two_stage_top_k) |k| .{ .top_k = k, .mass_cutoff = c.two_stage_mass_cutoff orelse 0 } else .{};
-    return .{ .mode = mode, .max_packed_len = length, .two_stage = two_stage, .trunk_sees_questions = c.trunk_sees_questions };
+    return .{ .mode = mode, .max_packed_len = length, .two_stage = two_stage, .trunk_sees_questions = c.trunk_sees_questions, .fuse_layers = c.fuse_layers };
 }
 
 fn path(a: std.mem.Allocator, dir: []const u8, name: []const u8) ![]const u8 {
@@ -305,6 +311,7 @@ fn packingConfigJson(a: std.mem.Allocator, layout: model.Packing) !std.json.Valu
         try object.put(a, "two_stage", .{ .object = two_stage });
     }
     if (layout.trunk_sees_questions) try object.put(a, "trunk_sees", .{ .string = "questions" });
+    if (layout.fuse_layers > 0) try object.put(a, "fuse_layers", .{ .integer = layout.fuse_layers });
     return .{ .object = object };
 }
 
@@ -469,7 +476,10 @@ fn activationBytes(cfg: modern.Config, l: architecture.Layout, freeze_layers: u3
     const per_layer = try addBytes(try addBytes(hidden_bytes, mlp_bytes), attn_bytes);
     const forward_layers: usize = @intCast(cfg.num_hidden_layers);
     const backward_layers: usize = @intCast(cfg.num_hidden_layers - @min(freeze_layers, cfg.num_hidden_layers));
-    return mulBytes(per_layer, try addBytes(forward_layers, backward_layers));
+    // Per-question upper layers add the three upper dense biases.
+    const fused = if (cfg.laya) |lc| lc.packing.fuse_layers > 0 else false;
+    const upper_biases = if (fused and !use_fused_attention) try mulBytes(attn_elements, 3 * 4) else 0;
+    return addBytes(try mulBytes(per_layer, try addBytes(forward_layers, backward_layers)), upper_biases);
 }
 
 /// Fixed device overhead observed on the Apple M4 Max release trainer beyond

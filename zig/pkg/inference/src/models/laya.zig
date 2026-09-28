@@ -23,6 +23,9 @@ pub const max_packed_options = 255;
 /// Physical tokens per packed row. Segment attention keeps no `[L, L]` state;
 /// the bound keeps u32 kernel indexing and per-row staging modest.
 pub const max_packed_len_limit = 32768;
+/// Bound on `packing.fuse_layers`; checked against the real stack depth
+/// wherever the encoder config is known.
+pub const max_fuse_layers = 256;
 
 /// Tree-packed execution (zig/pkg/inference/models/laya/LAYA.md). The state is a
 /// shared trunk that attends only to itself; each question, and in candidate
@@ -62,9 +65,24 @@ pub const Packing = struct {
     /// their tree, restoring early fusion at the cost of trunk reuse
     /// (LAYA.md, "Question-aware trunk"). Default `"state"`.
     trunk_sees_questions: bool = false,
+    /// Per-question upper layers (LAYA.md, "Per-question upper layers"):
+    /// the top `fuse_layers` layers of the encoder-plus-head stack let each
+    /// question's copy of the state attend to that question. Rows then hold
+    /// one question per tree, so questions stay isolated, and the layers
+    /// below stay question-blind. 0 disables; question mode only. The top
+    /// layer's state output is never read (the scorer reads option markers),
+    /// so `fuse_layers` K gives questions K-1 layers of question-aware state
+    /// and must be at least 2.
+    fuse_layers: u32 = 0,
 
     pub fn enabled(self: Packing) bool {
         return self.mode != .none;
+    }
+
+    /// First layer of the encoder-plus-head stack (`layers` deep) that runs
+    /// per question; `layers` when fusion is off.
+    pub fn fuseFrom(self: Packing, layers: usize) usize {
+        return layers - @min(self.fuse_layers, layers);
     }
 };
 
@@ -158,13 +176,13 @@ fn parsePacking(value: std.json.Value, max_len: usize) !Packing {
     if (value != .object) return error.InvalidLayaConfig;
     var out = Packing{};
     for (value.object.keys()) |key| {
-        if (!std.mem.eql(u8, key, "mode") and !std.mem.eql(u8, key, "max_packed_len") and !std.mem.eql(u8, key, "two_stage") and !std.mem.eql(u8, key, "trunk_sees")) return error.InvalidLayaConfig;
+        if (!std.mem.eql(u8, key, "mode") and !std.mem.eql(u8, key, "max_packed_len") and !std.mem.eql(u8, key, "two_stage") and !std.mem.eql(u8, key, "trunk_sees") and !std.mem.eql(u8, key, "fuse_layers")) return error.InvalidLayaConfig;
     }
     const mode = value.object.get("mode") orelse return error.InvalidLayaConfig;
     if (mode != .string) return error.InvalidLayaConfig;
     out.mode = std.meta.stringToEnum(PackingMode, mode.string) orelse return error.InvalidLayaConfig;
     if (out.mode == .none) {
-        if (value.object.get("two_stage") != null or value.object.get("trunk_sees") != null) return error.InvalidLayaConfig;
+        if (value.object.get("two_stage") != null or value.object.get("trunk_sees") != null or value.object.get("fuse_layers") != null) return error.InvalidLayaConfig;
         return out;
     }
     out.max_packed_len = @min(4 * max_len, max_packed_len_limit);
@@ -182,6 +200,13 @@ fn parsePacking(value: std.json.Value, max_len: usize) !Packing {
         if (std.mem.eql(u8, v.string, "questions")) {
             out.trunk_sees_questions = true;
         } else if (!std.mem.eql(u8, v.string, "state")) return error.InvalidLayaConfig;
+    }
+    if (value.object.get("fuse_layers")) |v| {
+        // A state copy that saw its candidates would leak between sibling
+        // candidates, and a trunk that already sees every question has
+        // nothing left to fuse.
+        if (v != .integer or v.integer < 2 or v.integer > max_fuse_layers or out.mode != .question or out.trunk_sees_questions) return error.InvalidLayaConfig;
+        out.fuse_layers = @intCast(v.integer);
     }
     return out;
 }
@@ -208,7 +233,7 @@ fn parseTwoStage(value: std.json.Value) !TwoStage {
 
 test "laya packing config defaults, bounds, and rejects unknown fields" {
     const a = std.testing.allocator;
-    const cases = [_]struct { json: []const u8, mode: ?PackingMode, len: usize = 0 }{
+    const cases = [_]struct { json: []const u8, mode: ?PackingMode, len: usize = 0, fuse: u32 = 0 }{
         .{ .json = "{}", .mode = .none },
         .{ .json = "{\"packing\":{\"mode\":\"question\"}}", .mode = .question, .len = 2048 },
         .{ .json = "{\"packing\":{\"mode\":\"candidate\",\"max_packed_len\":1024}}", .mode = .candidate, .len = 1024 },
@@ -222,6 +247,14 @@ test "laya packing config defaults, bounds, and rejects unknown fields" {
         .{ .json = "{\"packing\":{\"mode\":\"none\",\"two_stage\":{\"top_k\":8}}}", .mode = null },
         .{ .json = "{\"packing\":{\"mode\":\"candidate\",\"two_stage\":{\"top_k\":1}}}", .mode = null },
         .{ .json = "{\"packing\":{\"mode\":\"candidate\",\"two_stage\":{\"top_k\":8,\"mass_cutoff\":1.5}}}", .mode = null },
+        // Per-question upper layers: question mode only, not with a trunk
+        // that already sees every question, and at least one layer.
+        .{ .json = "{\"packing\":{\"mode\":\"question\",\"fuse_layers\":4}}", .mode = .question, .len = 2048, .fuse = 4 },
+        .{ .json = "{\"packing\":{\"mode\":\"question\",\"fuse_layers\":0}}", .mode = null },
+        .{ .json = "{\"packing\":{\"mode\":\"question\",\"fuse_layers\":1}}", .mode = null },
+        .{ .json = "{\"packing\":{\"mode\":\"candidate\",\"fuse_layers\":2}}", .mode = null },
+        .{ .json = "{\"packing\":{\"mode\":\"none\",\"fuse_layers\":2}}", .mode = null },
+        .{ .json = "{\"packing\":{\"mode\":\"question\",\"fuse_layers\":2,\"trunk_sees\":\"questions\"}}", .mode = null },
     };
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, a, case.json, .{});
@@ -230,6 +263,7 @@ test "laya packing config defaults, bounds, and rejects unknown fields" {
             const cfg = try Config.parse(parsed.value);
             try std.testing.expectEqual(mode, cfg.packing.mode);
             try std.testing.expectEqual(case.len, cfg.packing.max_packed_len);
+            try std.testing.expectEqual(case.fuse, cfg.packing.fuse_layers);
             try std.testing.expectEqual(@as(usize, if (mode == .candidate) 255 else 20), cfg.maxOptions());
         } else try std.testing.expectError(error.InvalidLayaConfig, Config.parse(parsed.value));
     }
