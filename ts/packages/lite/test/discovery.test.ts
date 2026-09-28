@@ -14,8 +14,8 @@
 
 import { describe, expect, it } from "vitest";
 import {
-  litePlatformPackageName,
   LibraryNotFoundError,
+  litePlatformPackageName,
   platformLibraryFileName,
   resolveLibrary,
   UnsupportedPlatformError,

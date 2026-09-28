@@ -46,9 +46,9 @@ export {
   openWithOptions,
 } from "./database.js";
 export {
-  litePlatformPackageName,
   LibraryNotFoundError,
   type LibrarySource,
+  litePlatformPackageName,
   platformLibraryFileName,
   type ResolvedLibrary,
   resolveLibrary,
