@@ -88,10 +88,9 @@ pub const Config = struct {
     /// when the dense materialized-bias path would fit within its bound.
     /// Selected automatically regardless of this flag once any split's
     /// layout exceeds the dense `batch*L^2*heads` bound. Leave false for
-    /// ordinary jobs: the fused op is CPU-only today (see
-    /// `ops.ComputeBackend.segmentTrainingAttentionV1`), so a Metal job that
-    /// takes it runs attention host-bridged, which is correct but slower
-    /// than the on-device dense path.
+    /// ordinary jobs: on Metal the fused op runs on device kernels (without
+    /// dropout) but is no faster than the dense path while that fits, and
+    /// slower on short rows (models/laya/LAYA.md, "Long states").
     force_fused_attention: bool = false,
 };
 
