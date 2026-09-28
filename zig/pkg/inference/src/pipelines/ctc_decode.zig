@@ -32,6 +32,8 @@ pub fn decode(
     vocab_size: usize,
     char_dict: []const []const u8,
 ) !Result {
+    if (vocab_size == 0 or vocab_size - 1 != char_dict.len)
+        return error.InvalidCharacterDictionary;
     const required = time_steps * vocab_size;
     if (required == 0 or logits.len < required) {
         return .{
@@ -78,7 +80,7 @@ pub fn decode(
     errdefer out.deinit(allocator);
     for (indices.items) |idx| {
         const dict_idx = idx - 1;
-        if (dict_idx < char_dict.len) try out.appendSlice(allocator, char_dict[dict_idx]);
+        try out.appendSlice(allocator, char_dict[dict_idx]);
     }
 
     var avg_conf: f64 = 0;
@@ -107,14 +109,14 @@ pub fn decodeFromTensor(
     return decode(allocator, logits, time_steps, vocab_size, char_dict);
 }
 
-pub fn loadCharDictFile(allocator: std.mem.Allocator, path: []const u8) ![][]u8 {
+pub fn loadCharDictFile(allocator: std.mem.Allocator, path: []const u8, use_space_char: bool) ![][]u8 {
     const c_file = @import("../util/c_file.zig");
     const bytes = try c_file.readFileMax(allocator, path, 1024 * 1024);
     defer allocator.free(bytes);
-    return loadCharDictBytes(allocator, bytes);
+    return loadCharDictBytes(allocator, bytes, use_space_char);
 }
 
-pub fn loadCharDictBytes(allocator: std.mem.Allocator, bytes: []const u8) ![][]u8 {
+pub fn loadCharDictBytes(allocator: std.mem.Allocator, bytes: []const u8, use_space_char: bool) ![][]u8 {
     var dict = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (dict.items) |entry| allocator.free(entry);
@@ -125,7 +127,12 @@ pub fn loadCharDictBytes(allocator: std.mem.Allocator, bytes: []const u8) ![][]u
     while (it.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, "\r");
         if (line.len == 0) continue;
-        try dict.append(allocator, try allocator.dupe(u8, line));
+        try dict.ensureUnusedCapacity(allocator, 1);
+        dict.appendAssumeCapacity(try allocator.dupe(u8, line));
+    }
+    if (use_space_char) {
+        try dict.ensureUnusedCapacity(allocator, 1);
+        dict.appendAssumeCapacity(try allocator.dupe(u8, " "));
     }
 
     return try dict.toOwnedSlice(allocator);
@@ -153,14 +160,40 @@ test "decode collapses blanks and repeated indices" {
     try std.testing.expectApproxEqAbs(@as(f64, (0.9 + 0.9) / 2.0), result.confidence, 1e-6);
 }
 
+test "decode rejects unmapped vocabulary instead of dropping recognized characters" {
+    try std.testing.expectError(
+        error.InvalidCharacterDictionary,
+        decode(std.testing.allocator, &.{ 0, 0, 0, 1 }, 1, 4, &.{ "A", "B" }),
+    );
+}
+
 test "loadCharDictBytes trims windows newlines" {
     const allocator = std.testing.allocator;
-    const dict = try loadCharDictBytes(allocator, "a\r\nb\r\n");
+    const dict = try loadCharDictBytes(allocator, "a\r\nb\r\n", false);
     defer freeCharDict(allocator, dict);
 
     try std.testing.expectEqual(@as(usize, 2), dict.len);
     try std.testing.expectEqualStrings("a", dict[0]);
     try std.testing.expectEqualStrings("b", dict[1]);
+}
+
+test "CTC dictionary preserves spaces UTF8 and ownership across allocation failures" {
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const dict = try loadCharDictBytes(allocator, "a\r\né\r\n", true);
+            defer freeCharDict(allocator, dict);
+            const result = try decode(allocator, &.{
+                0, 1, 0, 0,
+                0, 0, 0, 1,
+                0, 0, 0, 1,
+                1, 0, 0, 0,
+                0, 0, 1, 0,
+            }, 5, 4, dict);
+            defer result.deinit();
+            try std.testing.expectEqualStrings("a é", result.text);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "decodeFromTensor validates output tensor shape" {

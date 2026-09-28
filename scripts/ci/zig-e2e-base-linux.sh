@@ -58,9 +58,9 @@ export ANTFLY_BIN="${ANTFLY_BIN:-./zig-out/bin/antfly}"
 # specific startup/open stall.
 e2e_suite="${ANTFLY_E2E_SUITE:-all}"
 case "$e2e_suite" in
-  all|antfly|antfly-recovery-0|antfly-recovery-1|inference) ;;
+  all|antfly|antfly-ordinary-0|antfly-ordinary-1|antfly-ordinary-2|antfly-recovery-0|antfly-recovery-1|antfly-recovery-2|inference) ;;
   *)
-    echo "ANTFLY_E2E_SUITE must be all, antfly, antfly-recovery-0, antfly-recovery-1, or inference; got: $e2e_suite" >&2
+    echo "ANTFLY_E2E_SUITE must be all, antfly, antfly-ordinary-[0-2], antfly-recovery-[0-2], or inference; got: $e2e_suite" >&2
     exit 2
     ;;
 esac
@@ -87,17 +87,22 @@ if [[ "$e2e_suite" != "inference" ]]; then
   # the local/default invocation complete, and let xdist retain its existing
   # per-runner process budget inside each lane.
   default_shard=all
-  if [[ "$e2e_suite" == antfly-recovery-* ]]; then default_shard="${e2e_suite#antfly-}"; fi
+  if [[ "$e2e_suite" == antfly-recovery-* || "$e2e_suite" == antfly-ordinary-* ]]; then default_shard="${e2e_suite#antfly-}"; fi
   PYTHONPATH="$script_dir${PYTHONPATH:+:$PYTHONPATH}" UV_PROJECT_ENVIRONMENT="$antfly_venv" \
     "$script_dir/zig-antfly-e2e-pytest.sh" -p zig_e2e_shard \
     --antfly-ci-shard "${ANTFLY_E2E_SHARD:-$default_shard}" "${antfly_args[@]}" || antfly_status=$?
 fi
 
+inference_report_args=()
+if [[ -n "${ANTFLY_E2E_REPORT_DIR:-}" ]]; then
+  mkdir -p "$ANTFLY_E2E_REPORT_DIR"
+  inference_report_args+=("--junitxml=$ANTFLY_E2E_REPORT_DIR/inference.xml")
+fi
 inference_status=0
 if [[ "$e2e_suite" == "inference" ]] || [[ "$e2e_suite" == "all" && "$run_inference" == "1" ]]; then
   UV_PROJECT_ENVIRONMENT="$inference_venv" uv run --project e2e/inference pytest -q --continue-on-collection-errors \
     -m "not slow and not multimodal and not model_integration and not browser_integration" \
-    e2e/inference || inference_status=$?
+    "${inference_report_args[@]}" e2e/inference || inference_status=$?
 fi
 
 overall_status=0

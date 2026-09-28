@@ -4738,6 +4738,30 @@ test "plain singleton reader output transfers its text buffer" {
     try std.testing.expectEqual(@as(usize, 0), results[0].text.len);
 }
 
+test "JSON Reader output preserves region metadata without transferring plain buffers" {
+    const allocator = std.testing.allocator;
+    const text = try allocator.dupe(u8, "first line\nsecond line");
+    const regions_json = try allocator.dupe(u8, "[{\"text\":\"first line\",\"bbox\":[1,2,3,4],\"coordinate_space\":\"image_pixels_top_left\"}]");
+    var results = [_]readers.Result{.{
+        .text = text,
+        .regions_json = regions_json,
+    }};
+    defer readers.deinitResult(allocator, &results[0]);
+
+    const output = try encodeReaderResults(allocator, "application/json", &results);
+    defer allocator.free(output);
+    try std.testing.expect(@intFromPtr(text.ptr) != @intFromPtr(output.ptr));
+    try std.testing.expectEqualStrings("first line\nsecond line", results[0].text);
+
+    var decoded = try std.json.parseFromSlice(std.json.Value, allocator, output, .{});
+    defer decoded.deinit();
+    try std.testing.expect(decoded.value == .array);
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.array.items.len);
+    const item = decoded.value.array.items[0];
+    try std.testing.expect(item == .object);
+    try std.testing.expectEqualStrings(regions_json, item.object.get("regions_json").?.string);
+}
+
 fn isJsonContentType(content_type: []const u8) bool {
     return std.mem.eql(u8, content_type, "application/json") or
         std.mem.endsWith(u8, content_type, "+json");

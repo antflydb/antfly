@@ -12,133 +12,248 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import shlex
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
 import zig_e2e_shard as shards
+from merge_e2e_durations import merge
+from summarize_e2e_timings import summarize
 
 
-def item(name, *, distributed=False):
+def item(name, distributed=False):
     return SimpleNamespace(
         nodeid=name,
-        fixturenames=["request", "wrapper", shards.DISTRIBUTED_FIXTURE]
-        if distributed
-        else ["request", "backup_api"],
+        fixturenames=[shards.DISTRIBUTED_FIXTURE] if distributed else ["backup_api"],
+    )
+
+
+def config(shard, plan=None):
+    values = {
+        "antfly_ci_shard": shard,
+        "antfly_ci_plan": plan,
+        "antfly_ci_plan_output": None,
+    }
+    return SimpleNamespace(
+        getoption=lambda name, default=None: values.get(name, default),
+        hook=SimpleNamespace(pytest_deselected=lambda **kw: None),
     )
 
 
 class ShardTests(unittest.TestCase):
-    def test_partition_is_exhaustive_disjoint_and_order_independent(self):
-        items = [
-            item(
-                f"e2e/antfly/test_future.py::test_new_case[{n}]", distributed=n % 3 != 0
+    def test_balanced_partition_preserves_groups_and_is_order_independent(self):
+        rows = [
+            (
+                f"test_a.py::test_{i}",
+                f"group-{i // 2}",
+                "ordinary" if i < 12 else "recovery",
+                float(i + 1),
             )
-            for n in range(120)
+            for i in range(24)
         ]
-        membership = {entry.nodeid: shards.shard_for_item(entry) for entry in items}
-        self.assertEqual(set(membership.values()), set(shards.SHARDS) - {"all"})
-        selected = {}
-        for shard in shards.SHARDS[1:]:
-            collected = list(reversed(items))
-            deselected = []
-            config = SimpleNamespace(
-                getoption=lambda name, shard=shard: shard,
-                hook=SimpleNamespace(
-                    pytest_deselected=lambda *, items, deselected=deselected: (
-                        deselected.extend(items)
-                    )
-                ),
+        plan = shards.balance_records(rows)
+        self.assertEqual(plan, shards.balance_records(list(reversed(rows))))
+        for i in range(0, 24, 2):
+            self.assertEqual(
+                plan["assignments"][rows[i][0]], plan["assignments"][rows[i + 1][0]]
             )
-            shards.pytest_collection_modifyitems(config, collected)
-            selected[shard] = {entry.nodeid for entry in collected}
-            self.assertEqual(len(collected) + len(deselected), len(items))
-            self.assertTrue(
-                all(membership[entry.nodeid] == shard for entry in collected)
-            )
-        self.assertEqual(set.union(*selected.values()), set(membership))
-        self.assertEqual(sum(map(len, selected.values())), len(items))
-
-    def test_new_nested_fixture_users_automatically_enter_recovery(self):
-        self.assertTrue(
-            shards.shard_for_item(
-                item("test_future.py::test_new", distributed=True)
-            ).startswith("recovery-")
+        self.assertEqual(len(plan["assignments"]), 24)
+        self.assertEqual(
+            set(plan["assignments"].values()),
+            {f"{family}-{i}" for family in ("ordinary", "recovery") for i in range(3)},
         )
-        # A unit test colocated with recovery tests must not start consuming a
-        # recovery lane merely because of its filename.
+        entries = [item(row[0], row[2] == "recovery") for row in rows]
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "plan.json"
+            path.write_text(json.dumps(plan))
+            selected = []
+            for shard in set(plan["assignments"].values()):
+                lane = list(reversed(entries))
+                shards.pytest_collection_modifyitems(config(shard, str(path)), lane)
+                selected.extend(i.nodeid for i in lane)
+            self.assertEqual(sorted(selected), sorted(i.nodeid for i in entries))
+            self.assertEqual(len(selected), len(set(selected)))
+            with self.assertRaisesRegex(ValueError, "collection differs"):
+                shards.pytest_collection_modifyitems(
+                    config("ordinary-0", str(path)), entries[:-1]
+                )
+
+    def test_balancing_accounts_for_long_cases(self):
+        rows = [
+            (str(i), str(i), "recovery", v)
+            for i, v in enumerate([300, 200, 100, 100, 100, 100])
+        ]
+        totals = shards.balance_records(rows)["estimated_seconds"]["recovery"]
+        self.assertLessEqual(max(totals), 300)
+
+    def test_duplicate_and_cross_family_groups_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            shards.balance_records(
+                [("a", "g", "ordinary", 1), ("a", "h", "ordinary", 1)]
+            )
+        with self.assertRaisesRegex(ValueError, "crosses"):
+            shards.balance_records(
+                [("a", "g", "ordinary", 1), ("b", "g", "recovery", 1)]
+            )
+
+    def test_legacy_workflow_keeps_its_complete_two_lane_partition(self):
+        entries = [item(f"test_a.py::test_{i}", i % 3 != 0) for i in range(120)]
+        selected = []
+        for shard in ("ordinary", "recovery-0", "recovery-1"):
+            lane = entries.copy()
+            shards.pytest_collection_modifyitems(config(shard), lane)
+            selected.extend(i.nodeid for i in lane)
+        self.assertEqual(sorted(selected), sorted(i.nodeid for i in entries))
         self.assertEqual(
             shards.shard_for_item(item("test_online_merge_recovery.py::test_codec")),
             "ordinary",
         )
+        for shard in ("ordinary-0", "recovery-2"):
+            with self.assertRaisesRegex(ValueError, "requires"):
+                shards.pytest_collection_modifyitems(config(shard), entries)
 
-    def test_collection_root_and_xdist_suffix_do_not_change_membership(self):
+    def test_identity_and_full_selection(self):
         names = (
-            "test_new.py::test_case[snapshot-owner]",
-            "e2e/antfly/test_new.py::test_case[snapshot-owner]",
-            "e2e/antfly/test_new.py::test_case[snapshot-owner]@antfly-process--test--123",
+            "test_a.py::test_a[x]",
+            "e2e/antfly/test_a.py::test_a[x]",
+            "e2e/antfly/test_a.py::test_a[x]@group",
         )
-        self.assertEqual(
-            len(
-                {shards.shard_for_item(item(name, distributed=True)) for name in names}
-            ),
-            1,
+        self.assertEqual(len({shards.shard_for_item(item(n, True)) for n in names}), 1)
+        entries = [item(n) for n in names]
+        before = entries.copy()
+        shards.pytest_collection_modifyitems(config("all"), entries)
+        self.assertEqual(entries, before)
+
+    def test_history_merge_preserves_other_lane_observations(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            baseline = root / "base.json"
+            base = {
+                "version": 1,
+                "tests": {
+                    "a": {"seconds": 1, "samples": 1},
+                    "b": {"seconds": 2, "samples": 1},
+                },
+            }
+            baseline.write_text(json.dumps(base))
+            observations = []
+            for node, seconds in [("a", 3), ("b", 4)]:
+                data = json.loads(json.dumps(base))
+                data["tests"][node] = {"seconds": seconds, "samples": 2}
+                path = root / f"{node}.json"
+                path.write_text(json.dumps(data))
+                observations.append(path)
+            result = merge(baseline, observations)
+            self.assertEqual(result["tests"]["a"]["seconds"], 3)
+            self.assertEqual(result["tests"]["b"]["seconds"], 4)
+            with self.assertRaisesRegex(ValueError, "multiple lanes"):
+                merge(baseline, [observations[0], observations[0]])
+
+    def test_history_merge_migrates_prefixed_seed_and_measured_keys(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            baseline = root / "base.json"
+            lane = root / "lane.json"
+            baseline.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "tests": {
+                            "e2e/antfly/test_a.py::test_case[a@b]": {
+                                "seconds": 350,
+                                "samples": 1,
+                            },
+                            "test_a.py::test_case[a@b]": {"seconds": 300, "samples": 2},
+                        },
+                    }
+                )
+            )
+            lane.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "tests": {
+                            "e2e/antfly/test_a.py::test_case[a@b]": {
+                                "seconds": 350,
+                                "samples": 1,
+                            },
+                            "test_a.py::test_case[a@b]": {"seconds": 240, "samples": 3},
+                        },
+                    }
+                )
+            )
+            result = merge(baseline, [lane])
+            self.assertEqual(
+                result["tests"],
+                {
+                    "test_a.py::test_case[a@b]": {"seconds": 240, "samples": 3},
+                },
+            )
+            self.assertEqual(
+                shards.canonical_nodeid("e2e/antfly/test_a.py::test_case[a@b]@group"),
+                "test_a.py::test_case[a@b]",
+            )
+
+    def test_summary_includes_setup_and_teardown_for_each_group(self):
+        plan = shards.balance_records(
+            [("a", "shared", "ordinary", 1), ("b", "shared", "ordinary", 1)]
         )
+        text = summarize(
+            plan,
+            {
+                "tests": {
+                    "a": {"setup": 2, "call": 3, "teardown": 4},
+                    "b": {"setup": 1, "call": 5, "teardown": 6},
+                }
+            },
+        )
+        self.assertIn("| `shared` | 3.00 | 8.00 | 10.00 |", text)
+        self.assertIn("| teardown | 10.00 |", text)
 
-    def test_all_is_an_unmodified_full_selection(self):
-        entries = [
-            item("test_a.py::test_a"),
-            item("test_b.py::test_b", distributed=True),
-        ]
-        original = entries.copy()
-        config = SimpleNamespace(getoption=lambda name: "all")
-        shards.pytest_collection_modifyitems(config, entries)
-        self.assertEqual(entries, original)
-
-    def test_workflow_requires_every_lane_and_uses_diskful_local_scratch(self):
-        root = Path(__file__).resolve().parents[2]
-        workflow = (root / ".github/workflows/zig-tests.yml").read_text()
-        base = workflow.split("  e2e-base-tests:\n", 1)[1].split("\n  e2e-base:\n", 1)[
+    def test_workflow_requires_all_shards_plan_and_fd_lane(self):
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/zig-tests.yml"
+        ).read_text()
+        base = workflow.split("  e2e-base-tests:\n", 1)[1].split(
+            "  e2e-base-low-fd:\n", 1
+        )[0]
+        for family in ("ordinary", "recovery"):
+            for i in range(3):
+                self.assertIn(f"shard: {family}-{i}", base)
+        self.assertNotIn("continue-on-error:", base)
+        self.assertIn('ANTFLY_E2E_PROCESS_WORKERS: "1"', base)
+        self.assertIn("ANTFLY_E2E_SHARD_PLAN=", base)
+        self.assertIn("if: always()", base)
+        self.assertNotIn("Run low-FD", base)
+        low_fd = workflow.split("  e2e-base-low-fd:\n", 1)[1].split("  e2e-base:\n", 1)[
             0
         ]
-        for shard in shards.SHARDS[1:]:
-            self.assertIn(f"shard: {shard}", base)
-        self.assertIn("ANTFLY_E2E_SHARD: ${{ matrix.shard }}", base)
-        self.assertIn('ANTFLY_E2E_PROCESS_SLOTS: "2"', base)
-        self.assertIn('ANTFLY_E2E_PROCESS_WORKERS: "1"', base)
-        self.assertNotIn("continue-on-error:", base)
         self.assertIn(
-            "needs: [admission, changes, e2e-base-build, e2e-base-tests]", workflow
+            "Retain failed low-FD server logs and cluster diagnostics", low_fd
         )
-        self.assertEqual(workflow.count('test_tmp="${RUNNER_TEMP}/antfly-e2e/'), 2)
-        self.assertNotIn('test_tmp="/mnt/cache/', workflow)
-        self.assertNotIn('test_tmp="/dev/shm/', workflow)
-
-    def test_sharding_changes_select_both_build_and_e2e_validation(self):
-        root = Path(__file__).resolve().parents[2]
-        workflow = (root / ".github/workflows/zig-tests.yml").read_text()
-        # The first two filters select Zig validation and E2E respectively.
-        # Python shard-only changes must not disappear behind the shell glob.
+        self.assertIn("if: failure()", low_fd)
+        self.assertIn("/native-stacks.txt", low_fd)
+        self.assertIn("/failure-diagnostics.json", low_fd)
+        self.assertIn("*.log", low_fd)
+        gate = workflow.split("  e2e-base:\n")[1].split("  e2e-full-build:\n")[0]
+        self.assertIn("e2e-base-plan, e2e-base-tests, e2e-base-low-fd]", gate)
+        self.assertIn('test "$LOW_FD_RESULT" = "success"', gate)
+        self.assertIn('test "$PLAN_RESULT" = "success"', gate)
         for block in workflow.split('if ! "$helper"')[1:3]:
-            command = block.split("\n          then", 1)[0]
-            pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
-            self.assertIn("scripts/ci/zig_e2e_shard.py", pathspecs)
-            self.assertIn("scripts/ci/test_zig_e2e_shard.py", pathspecs)
-
-    def test_prs_without_required_sharding_fail_closed(self):
-        root = Path(__file__).resolve().parents[2]
-        workflow = (root / ".github/workflows/zig-tests.yml").read_text()
-        self.assertIn(
-            '"$ANTFLY_E2E_SUITE" == antfly* && ! -f scripts/ci/zig_e2e_shard.py',
-            workflow,
-        )
-        guard = workflow.split('if [[ "$ANTFLY_E2E_SUITE" == antfly*', 1)[1].split(
-            "fi", 1
-        )[0]
-        self.assertIn("Merge origin/main", guard)
-        self.assertIn("exit 1", guard)
-        self.assertNotIn("exit 0", guard)
+            paths = shlex.split(
+                block.split("\n          then", 1)[0]
+                .split(" -- ", 1)[1]
+                .replace("\\\n", " ")
+            )
+            for name in (
+                "zig_e2e_shard.py",
+                "merge_e2e_durations.py",
+                "antfly_e2e_durations.json",
+            ):
+                self.assertIn("scripts/ci/" + name, paths)
 
 
 if __name__ == "__main__":

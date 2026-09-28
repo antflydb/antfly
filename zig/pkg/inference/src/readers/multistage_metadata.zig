@@ -27,6 +27,7 @@ pub const StageMetadata = struct {
     decoder_file: ?[]const u8 = null,
     post_processor: ?[]const u8 = null,
     char_dict_file: ?[]const u8 = null,
+    use_space_char: ?bool = null,
     processor_dir: ?[]const u8 = null,
 };
 
@@ -120,6 +121,10 @@ fn parseStage(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !StageMetad
     stage.processor_dir = try parseAssetPath(allocator, obj, "processor_dir");
     stage.stage_type = try parseMetadataString(allocator, obj, "type");
     stage.post_processor = try parseMetadataString(allocator, obj, "post_processor");
+    if (obj.get("use_space_char")) |value| {
+        if (value != .bool) return error.InvalidMetadata;
+        stage.use_space_char = value.bool;
+    }
 
     return stage;
 }
