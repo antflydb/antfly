@@ -4308,8 +4308,8 @@ pub const MetadataHttpNodeVopr = struct {
                     // A single, up-to-date candidate breaks synchronized
                     // election ties without continuously advancing terms on
                     // different replicas.
-                    self.cluster.campaignBestMetadataCandidate() catch |err| switch (err) {
-                        error.UnknownGroup => {},
+                    _ = self.cluster.campaignBestMetadataCandidate() catch |err| switch (err) {
+                        error.UnknownGroup => false,
                         else => return voprMutationError(err, operation_may_have_been_admitted),
                     };
                     for (0..16) |_| {
@@ -4810,27 +4810,46 @@ pub const MetadataHttpClusterVopr = struct {
         return .{ .cluster = self, .index = index };
     }
 
-    /// Break deterministic election lockstep without inventing authority. The
-    /// replica with the freshest log must campaign in a term strictly newer
-    /// than every observed candidate; otherwise a lagging replica that ticks
-    /// first can repeatedly consume the shared next term without ever being
-    /// eligible for an up-to-date quorum's votes.
-    pub fn campaignBestMetadataCandidate(self: *MetadataHttpClusterVopr) !void {
-        const candidate_index = bestMetadataElectionCandidateIndex(self) orelse
-            return error.UnknownGroup;
-        var max_observed_term: u64 = 0;
-        for (self.cluster.nodes, self.cluster.node_live) |*replica, live| {
-            if (!live) continue;
-            const status = replica.raftStatus(self.metadata_group_id) orelse continue;
-            max_observed_term = @max(max_observed_term, status.hard.current_term);
-        }
-        for (0..self.cluster.nodes.len + 2) |_| {
+    /// Break deterministic election lockstep without inventing authority.
+    /// Campaign the freshest eligible follower, then let the Raft driver
+    /// deliver its pre-vote responses. With pre-vote enabled, campaign() does
+    /// not advance the term synchronously. Leave an ongoing vote alone;
+    /// Raft's election timer owns any retry it needs.
+    pub fn campaignBestMetadataCandidate(self: *MetadataHttpClusterVopr) !bool {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
+        if (self.currentMetadataLeaderIndex() != null) return false;
+        var skipped = std.ArrayListUnmanaged(usize).empty;
+        defer skipped.deinit(self.alloc);
+        while (skipped.items.len < self.cluster.nodes.len) {
+            const candidate_index = bestMetadataElectionCandidateIndexLocked(self, skipped.items) orelse {
+                if (skipped.items.len == 0) return error.UnknownGroup;
+                return false;
+            };
             const status = self.cluster.node(candidate_index).raftStatus(self.metadata_group_id) orelse
                 return error.UnknownGroup;
-            if (status.hard.current_term > max_observed_term) return;
-            try self.cluster.node(candidate_index).campaignGroup(self.metadata_group_id);
+            switch (status.soft.role) {
+                // Restarting a vote discards the candidate's pending replies.
+                .pre_candidate, .candidate => return false,
+                .leader => {
+                    // This local leader lacks quorum support; try another replica.
+                    try skipped.append(self.alloc, candidate_index);
+                    continue;
+                },
+                .follower => {},
+            }
+            self.cluster.node(candidate_index).campaignGroup(self.metadata_group_id) catch |err| switch (err) {
+                // A committed membership change may make an applied voter
+                // ineligible. Try the next freshest follower instead.
+                error.NotPromotable => {
+                    try skipped.append(self.alloc, candidate_index);
+                    continue;
+                },
+                else => return err,
+            };
+            return true;
         }
-        return error.MetadataElectionTermDidNotAdvance;
+        return false;
     }
 
     pub fn backendRuntime(self: *MetadataHttpClusterVopr, index: usize) *db_mod.background_runtime.BackendRuntime {
@@ -5896,24 +5915,29 @@ fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterVopr) ?usize {
     return best_index;
 }
 
-fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterVopr) ?usize {
-    cluster.scheduler_gate.lock();
-    defer cluster.scheduler_gate.unlock();
+// The caller holds scheduler_gate through candidate selection and campaign.
+fn bestMetadataElectionCandidateIndexLocked(cluster: *MetadataHttpClusterVopr, skipped: []const usize) ?usize {
     var best_index: ?usize = null;
+    var best_last_term: u64 = 0;
     var best_last_index: u64 = 0;
     var best_commit: u64 = 0;
     var best_applied: u64 = 0;
     var best_term: u64 = 0;
     for (cluster.cluster.nodes, 0..) |*sim, index| {
         if (!cluster.cluster.node_live[index]) continue;
+        if (std.mem.indexOfScalar(usize, skipped, index) != null) continue;
         const status = sim.raftStatus(cluster.metadata_group_id) orelse continue;
+        if (std.mem.indexOfScalar(u64, status.conf_state.voters, status.id) == null and
+            std.mem.indexOfScalar(u64, status.conf_state.voters_outgoing, status.id) == null) continue;
         if (best_index == null or
-            status.last_index > best_last_index or
-            (status.last_index == best_last_index and status.hard.commit_index > best_commit) or
-            (status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index > best_applied) or
-            (status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index == best_applied and status.hard.current_term > best_term))
+            status.last_term > best_last_term or
+            (status.last_term == best_last_term and status.last_index > best_last_index) or
+            (status.last_term == best_last_term and status.last_index == best_last_index and status.hard.commit_index > best_commit) or
+            (status.last_term == best_last_term and status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index > best_applied) or
+            (status.last_term == best_last_term and status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index == best_applied and status.hard.current_term > best_term))
         {
             best_index = index;
+            best_last_term = status.last_term;
             best_last_index = status.last_index;
             best_commit = status.hard.commit_index;
             best_applied = status.applied_index;
