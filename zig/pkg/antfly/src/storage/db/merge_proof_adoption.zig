@@ -46,14 +46,14 @@ pub const Fence = struct {
     /// controls under the global writer lock and catches even a same-attempt
     /// cursor, catalog or source-cut replacement.
     pub fn matchesStored(self: *const Fence, txn: anytype) !bool {
-        const current_state = txn.get(merge.key) catch |err| switch (err) {
-            error.NotFound => return false,
-            else => return err,
+        const current_state = txn.get(merge.key) catch |err| {
+            if (err == error.NotFound) return false;
+            return err;
         };
         if (!std.mem.eql(u8, current_state, self.state_raw)) return false;
-        const current_progress = txn.get(pages.key) catch |err| switch (err) {
-            error.NotFound => return false,
-            else => return err,
+        const current_progress = txn.get(pages.key) catch |err| {
+            if (err == error.NotFound) return false;
+            return err;
         };
         return std.mem.eql(u8, current_progress, self.progress_raw);
     }
@@ -70,16 +70,16 @@ pub const Fence = struct {
 };
 
 pub fn loadFence(alloc: std.mem.Allocator, txn: anytype, receiver: Namespace, command: Command) !?Fence {
-    const state_raw = txn.get(merge.key) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
+    const state_raw = txn.get(merge.key) catch |err| {
+        if (err == error.NotFound) return null;
+        return err;
     };
     var state = try merge.decodeAlloc(alloc, state_raw);
     var state_owned = true;
     defer if (state_owned) state.deinit(alloc);
-    const progress_raw = txn.get(pages.key) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
+    const progress_raw = txn.get(pages.key) catch |err| {
+        if (err == error.NotFound) return null;
+        return err;
     };
     var progress = try pages.decode(alloc, progress_raw);
     var progress_owned = true;
