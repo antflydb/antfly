@@ -67,7 +67,7 @@ pub const ReceiverEffect = struct {
     input_position: ?publication.Position,
 };
 
-/// The certified source cut and APF2 body remain bound to an owned candidate
+/// The certified source cut and APF3 body remain bound to an owned candidate
 /// after the transfer buffer is released. This identity is not local producer
 /// authority; a later ordered command must still fence its active catalog.
 pub const DonorIdentity = struct {
@@ -86,7 +86,7 @@ pub const DonorIdentity = struct {
 };
 
 /// Off-lock candidate evidence for a receiver-local publication. Physical
-/// positions are captured from the destination, never copied from APF2. This
+/// positions are captured from the destination, never copied from APF3. This
 /// is not an adoption certificate: apply must revalidate it in its own writer
 /// transaction before staging receipts or activating a producer capability.
 pub const ReceiverCandidate = struct {
@@ -105,7 +105,7 @@ pub const ReceiverCandidate = struct {
 
 /// Return null when a donor read-set or selected output is no longer exact at
 /// the receiver. The caller can regenerate that stream instead of silently
-/// adopting a stale result. One proof is bounded by the APF2 block limit;
+/// adopting a stale result. One proof is bounded by the APF3 block limit;
 /// the arena owns all remapped keys after the source buffer is released.
 pub fn prepareReceiverCandidate(
     alloc: std.mem.Allocator,
@@ -326,7 +326,7 @@ fn readWord(reader: anytype, object: u32, offset: u64) !u32 {
     return std.mem.readInt(u32, &bytes, .little);
 }
 
-/// Locate one record without copying its potentially large APF2 body. A
+/// Locate one record without copying its potentially large APF3 body. A
 /// source-certificate verifier authenticates the complete object before the
 /// merge driver uses these offsets; the receiver validates the record again
 /// before granting any local adoption evidence.

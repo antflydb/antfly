@@ -14,10 +14,10 @@ const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
 
 pub const manifest_schema_version: u32 = 1;
-pub const afb_reader_version: u32 = 4;
+pub const afb_reader_version: u32 = 5;
 pub const base_afb_reader_version: u32 = 2;
 pub const source_generation_admission_reader_version: u32 = 3;
-pub const source_proof_reader_version: u32 = 4;
+pub const source_proof_reader_version: u32 = 5;
 pub const max_manifest_bytes: usize = 16 * 1024 * 1024;
 pub const max_objects: usize = 1_000_000;
 pub const max_path_bytes: usize = 4096;

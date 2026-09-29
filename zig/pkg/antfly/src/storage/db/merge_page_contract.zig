@@ -154,7 +154,7 @@ pub const Command = struct {
     /// binding declares the effect language; values never pass through JSON
     /// row mapping or asynchronous inference during transfer.
     artifact_effects: []const IntegrityEffect = &.{},
-    /// Inert APF2 source evidence. Unlike artifact effects, these records
+    /// Inert APF3 source evidence. Unlike artifact effects, these records
     /// never materialize an index or grant receiver-local acceptance.
     provenance_effects: []const IntegrityEffect = &.{},
 

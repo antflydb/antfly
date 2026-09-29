@@ -3773,6 +3773,9 @@ test "ordered artifact inventory source proof export restores inert selected evi
     try std.testing.expectError(error.SourceCopyRestoreUnsupported, validateSourceProofBatch(alloc, payload, &archive, null));
     archive.source_copy = .{ .scope = .{ .fence = .{ .role = .merge_source, .transition_id = 1, .attempt = 1, .peer_group_id = 4, .owner_group_id = 2, .namespace = identity, .catalog_digest = @splat(7) }, .receiver_namespace = .{ .table_id = 1, .shard_id = 4, .range_id = 5 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } }, .applied_index = 1, .retained_start = 0 };
     archive.saw_source_copy = true;
+    archive.min_afb_reader = backup_bundle.source_proof_reader_version - 1;
+    try std.testing.expectError(error.SourceCopyRestoreUnsupported, validateSourceProofBatch(alloc, payload, &archive, null));
+    archive.min_afb_reader = backup_bundle.source_proof_reader_version;
     try validateSourceProofBatch(alloc, payload, &archive, &destination);
     try std.testing.expectError(error.SourceSnapshotCorrupt, validateSourceProofBatch(alloc, payload, &archive, null));
     var batch = try source_proof_batch.Reader.init(payload);

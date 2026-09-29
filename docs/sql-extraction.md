@@ -1771,20 +1771,20 @@ following mechanisms are installed behind that gate:
   passes, including allocation faults, LSM apply, 129-proof paged retirement,
   binary range/resume, corrupted-reference rejection, pinned-reader preservation,
   and current-epoch isolation.
-  Accepted proof bodies now use APF2 v2, a compact checksummed binary record of
+  Accepted proof bodies now use APF3 v3, a compact checksummed binary record of
   the same bounded logical read set, historical output compare-and-swap guards,
   and output digests. Those output guards are kept distinct from causal inputs:
   receiver adoption must compare the imported postimage, not replay the donor's
-  pre-publication guard. APF2 removes JSON's
+  pre-publication guard. APF3 removes JSON's
   binary-key expansion so one legal proof fits within the AFB2 block ceiling;
   it does not itself add a portable proof block or confer receiver authority.
   The 206-case ordered-artifact target passes, including forged-field and
   allocation-failure codec tests.
-  Certified AFB2 source-copy snapshots now include APF2 proofs once per
+  Certified AFB2 source-copy snapshots now include APF3 proofs once per
   publication digest, plus a compact bitmap naming only output sources whose
   receipt still selects that proof at the immutable cut. Export checks the
   document index and source reference in that pinned cut. The source
-  certificate covers the new private block; AFB2 reader capability v4 rejects
+  certificate covers the new private block; AFB2 reader capability v5 rejects
   older decoders. One-pass and checkpointed import verify proof framing,
   checksum, source namespace, selected output ordinals and ordering, then
   store the bytes under an inert source-proof prefix, never donor receipt or
@@ -1795,7 +1795,7 @@ following mechanisms are installed behind that gate:
   retained-effect/tail provenance transfer remain open.
   Online merge now reads source proofs from certified AFB2 objects through the
   bounded positional descriptor and carries them in a distinct provenance
-  page/chunk payload, not vector/graph effects. The receiver validates APF2
+  page/chunk payload, not vector/graph effects. The receiver validates APF3
   before apply and commits only inert, source-pin-scoped evidence keys with
   the page receipt. A durable pending bit refuses the final tail certificate
   until receiver-local adoption is implemented; transferred donor bytes do
@@ -1806,7 +1806,7 @@ following mechanisms are installed behind that gate:
   snapshot publication and final-fence apply now reject a provenance-free
   certificate if producer authority activated after its immutable pin, so a
   late activation cannot turn a previously empty proof stream into an
-  apparently complete receiver cut. Import now also checks APF2 source order,
+  apparently complete receiver cut. Import now also checks APF3 source order,
   physical position namespace, artifact guard ownership, output key family,
   duplicate outputs, document ownership and the live scoped-producer guard
   rule before storing candidate bytes;
@@ -1820,11 +1820,13 @@ following mechanisms are installed behind that gate:
   A receiver-side writer-transaction verifier now repeats the exact primary,
   artifact-input, and selected-output checks against local physical revisions,
   including same-byte ABA changes. Candidate preparation also owns the source
-  pin, APF2 checksum, donor producer identity and selected-source bitmap after
+  pin, APF3 checksum, donor producer identity and selected-source bitmap after
   release of the transfer buffer. Preparation also requires the certified
-  donor binding to match the APF2 epoch/digest and the receiver's ordered
+  donor binding to match the APF3 epoch/digest and the receiver's ordered
   semantic catalog; writer revalidation repeats the receiver catalog and
-  active authority fence. No caller installs receipts from it yet.
+  active authority fence. APF3 can encode a receiver-owned adopted origin that
+  commits the donor pin, proof checksum and selected subset into a local
+  publication digest; no caller installs receipts from it yet.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups

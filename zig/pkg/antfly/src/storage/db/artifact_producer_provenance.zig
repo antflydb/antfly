@@ -5,6 +5,7 @@
 //! together with source receipts and the immutable source snapshot/tail.
 const std = @import("std");
 const publication = @import("artifact_publication.zig");
+const inventory = @import("artifact_inventory.zig");
 const binary = @import("relational_integrity_json.zig");
 const internal_keys = @import("../internal_keys.zig");
 pub const prefix = "\x00\x00__artifact_publication__:proof:";
@@ -17,8 +18,33 @@ pub const Effect = struct {
     value_bytes: u64,
 };
 
+/// Receiver-owned provenance of an adopted publication. Only the selected
+/// output subset is installed locally. Encoding this origin does not certify
+/// the donor cut: ordered adoption must verify the source proof first, then
+/// install local receipts without copying donor receipt or authority keys.
+pub const Origin = struct {
+    source_pin: publication.Digest,
+    namespace: publication.Namespace,
+    binding: inventory.Binding,
+    publication_digest: publication.Digest,
+    input_digest: publication.Digest,
+    proof_checksum: publication.Digest,
+    selected_bitmap: []const u8,
+};
+
+fn hashNumber(hash: *std.crypto.hash.Blake3, value: u64) void {
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, value, .little);
+    hash.update(&encoded);
+}
+
+fn hashBytes(hash: *std.crypto.hash.Blake3, value: []const u8) void {
+    hashNumber(hash, value.len);
+    hash.update(value);
+}
+
 pub const Proof = struct {
-    version: u8 = 2,
+    version: u8 = 3,
     namespace: publication.Namespace,
     authority_epoch: u64,
     catalog_digest: publication.Digest,
@@ -36,6 +62,47 @@ pub const Proof = struct {
     /// receiver adoption must compare the imported postimage instead.
     mutation_preconditions: []const publication.ArtifactSource = &.{},
     effects: []const Effect,
+    origin: ?Origin = null,
+
+    /// Adopted receipts use a receiver-local identity over the complete
+    /// logical inputs, selected postimage and certified donor lineage. Normal
+    /// producer publications retain their original Command.digest identity.
+    pub fn adoptionDigest(self: Proof) publication.Digest {
+        const origin = self.origin.?;
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly-artifact-adoption-v1\x00");
+        hash.update(&self.namespace);
+        hashNumber(&hash, self.authority_epoch);
+        hash.update(&self.catalog_digest);
+        hashNumber(&hash, @intFromEnum(self.producer_kind));
+        hashBytes(&hash, self.producer_name);
+        hashNumber(&hash, self.producer_generation);
+        hashBytes(&hash, self.producer_artifact_name);
+        hashBytes(&hash, self.producer_scope_key);
+        hash.update(&self.input_digest);
+        hashNumber(&hash, self.effects.len);
+        for (self.effects) |effect| {
+            hashNumber(&hash, @intFromEnum(effect.family));
+            hashBytes(&hash, effect.key);
+            hashNumber(&hash, effect.source_index);
+            hash.update(&.{@intFromBool(effect.value_digest != null)});
+            if (effect.value_digest) |digest| hash.update(&digest);
+            hashNumber(&hash, effect.value_bytes);
+        }
+        hash.update(&origin.source_pin);
+        hash.update(&origin.namespace);
+        hashNumber(&hash, origin.binding.epoch);
+        hash.update(&origin.binding.digest);
+        hash.update(&origin.binding.semantic_digest);
+        hashNumber(&hash, origin.binding.effect_protocol);
+        hash.update(&origin.publication_digest);
+        hash.update(&origin.input_digest);
+        hash.update(&origin.proof_checksum);
+        hashBytes(&hash, origin.selected_bitmap);
+        var result: publication.Digest = undefined;
+        hash.final(&result);
+        return result;
+    }
 
     pub fn jsonStringify(self: Proof, stream: anytype) @TypeOf(stream.*).Error!void {
         try binary.write(self, stream);
@@ -46,7 +113,7 @@ pub const Proof = struct {
     }
 
     pub fn validate(self: Proof) !void {
-        if (self.version != 2 or self.authority_epoch == 0 or (self.producer_generation == 0 and self.producer_kind != .resolver) or
+        if (self.version != 3 or self.authority_epoch == 0 or (self.producer_generation == 0 and self.producer_kind != .resolver) or
             self.producer_name.len == 0 or self.producer_artifact_name.len == 0 or
             self.sources.len == 0 or self.sources.len > publication.max_source_documents or
             self.artifact_sources.len > publication.max_source_documents or
@@ -54,9 +121,27 @@ pub const Proof = struct {
             self.effects.len > publication.max_mutations or !std.mem.eql(u8, &self.input_digest, &self.inputCommand().inputDigest())) return error.ArtifactCatalogCorrupt;
         for (self.effects) |effect| if (effect.source_index >= self.sources.len or
             (effect.value_digest == null and effect.value_bytes != 0)) return error.ArtifactCatalogCorrupt;
+        if (self.origin) |origin| {
+            if (!origin.binding.valid() or origin.binding.effect_protocol != 15 or
+                std.mem.allEqual(u8, &origin.source_pin, 0) or std.mem.allEqual(u8, &origin.binding.digest, 0) or
+                std.mem.allEqual(u8, &origin.proof_checksum, 0) or self.mutation_preconditions.len != 0 or
+                origin.selected_bitmap.len != (self.sources.len + 7) / 8) return error.ArtifactCatalogCorrupt;
+            var outputs = std.StaticBitSet(publication.max_source_documents).initEmpty();
+            for (self.effects) |effect| {
+                if (origin.selected_bitmap[effect.source_index / 8] & (@as(u8, 1) << @intCast(effect.source_index % 8)) == 0)
+                    return error.ArtifactCatalogCorrupt;
+                outputs.set(effect.source_index);
+            }
+            for (origin.selected_bitmap, 0..) |bits, byte_index| for (0..8) |bit_index| {
+                if (bits & (@as(u8, 1) << @intCast(bit_index)) == 0) continue;
+                const ordinal = byte_index * 8 + bit_index;
+                if (ordinal >= self.sources.len or !outputs.isSet(ordinal)) return error.ArtifactCatalogCorrupt;
+            };
+            if (!std.mem.eql(u8, &self.publication_digest, &self.adoptionDigest())) return error.ArtifactCatalogCorrupt;
+        }
     }
 
-    /// A transferred APF2 body is only candidate evidence. Before importing
+    /// A transferred APF3 body is only candidate evidence. Before importing
     /// it, recheck the canonical owner/key shape that local publication
     /// admission checked, without loading any large output value. Receiver
     /// input revisions and output bytes are validated again during adoption.
@@ -187,7 +272,7 @@ pub const Owned = struct {
 // AFB2 block without expanding binary keys into decimal JSON arrays. This is
 // a PR-only storage format; there is no deployed APF1 compatibility contract.
 pub const max_encoded_bytes = @import("artifact_publication_transport_codec.zig").max_encoded_bytes;
-const proof_magic = "APF2";
+const proof_magic = "APF3";
 
 fn proofAdd(size: *usize, amount: usize) !void {
     size.* = std.math.add(usize, size.*, amount) catch return error.TransactionTooLarge;
@@ -204,10 +289,14 @@ fn proofPositionSize(size: *usize, value: ?publication.Position) !void {
 }
 
 fn proofEncodedLength(proof: Proof) !usize {
-    var size: usize = 4 + 1 + 1 + 24 + 8 + 32 + 8 + 32 + 32 + 4 * 4 + 32;
+    var size: usize = 4 + 1 + 1 + 24 + 8 + 32 + 8 + 32 + 32 + 4 * 4 + 1 + 32;
     try proofBlobSize(&size, proof.producer_name);
     try proofBlobSize(&size, proof.producer_artifact_name);
     try proofBlobSize(&size, proof.producer_scope_key);
+    if (proof.origin) |origin| {
+        try proofAdd(&size, 32 + 24 + 8 + 32 + 32 + 4 + 32 + 32 + 32);
+        try proofBlobSize(&size, origin.selected_bitmap);
+    }
     for (proof.sources) |source| {
         try proofBlobSize(&size, source.document_key);
         try proofAdd(&size, 1 + 32 + 8);
@@ -275,6 +364,19 @@ pub fn encodeAlloc(alloc: std.mem.Allocator, proof: Proof) ![]u8 {
     writer.writeU32(@intCast(proof.artifact_sources.len));
     writer.writeU32(@intCast(proof.mutation_preconditions.len));
     writer.writeU32(@intCast(proof.effects.len));
+    writer.byte(@intFromBool(proof.origin != null));
+    if (proof.origin) |origin| {
+        writer.write(&origin.source_pin);
+        writer.write(&origin.namespace);
+        writer.writeU64(origin.binding.epoch);
+        writer.write(&origin.binding.digest);
+        writer.write(&origin.binding.semantic_digest);
+        writer.writeU32(origin.binding.effect_protocol);
+        writer.write(&origin.publication_digest);
+        writer.write(&origin.input_digest);
+        writer.write(&origin.proof_checksum);
+        writer.blob(origin.selected_bitmap);
+    }
     for (proof.sources) |source| {
         writer.blob(source.document_key);
         writer.byte(@intFromBool(source.exists));
@@ -348,7 +450,7 @@ pub fn decodeBorrowed(alloc: std.mem.Allocator, raw: []const u8) !Owned {
 }
 
 fn decode(alloc: std.mem.Allocator, raw: []const u8, copy_bytes: bool) !Owned {
-    if (raw.len < 4 + 1 + 1 + 24 + 8 + 32 + 8 + 32 + 32 + 4 * 7 + 32 or raw.len > max_encoded_bytes)
+    if (raw.len < 4 + 1 + 1 + 24 + 8 + 32 + 8 + 32 + 32 + 4 * 7 + 1 + 32 or raw.len > max_encoded_bytes)
         return error.ArtifactCatalogCorrupt;
     var digest: publication.Digest = undefined;
     std.crypto.hash.sha2.Sha256.hash(raw[0 .. raw.len - 32], &digest, .{});
@@ -373,6 +475,27 @@ fn decode(alloc: std.mem.Allocator, raw: []const u8, copy_bytes: bool) !Owned {
     const artifact_count = try cursor.readU32();
     const precondition_count = try cursor.readU32();
     const effect_count = try cursor.readU32();
+    const origin: ?Origin = if (try cursor.flag()) blk: {
+        const source_pin: publication.Digest = (try cursor.take(32))[0..32].*;
+        const donor_namespace: publication.Namespace = (try cursor.take(24))[0..24].*;
+        const donor_epoch = try cursor.readU64();
+        const donor_catalog: publication.Digest = (try cursor.take(32))[0..32].*;
+        const donor_semantic: publication.Digest = (try cursor.take(32))[0..32].*;
+        const protocol = try cursor.readU32();
+        if (protocol > std.math.maxInt(u16)) return error.ArtifactCatalogCorrupt;
+        const donor_publication: publication.Digest = (try cursor.take(32))[0..32].*;
+        const donor_input: publication.Digest = (try cursor.take(32))[0..32].*;
+        const donor_checksum: publication.Digest = (try cursor.take(32))[0..32].*;
+        break :blk .{
+            .source_pin = source_pin,
+            .namespace = donor_namespace,
+            .binding = .{ .epoch = donor_epoch, .digest = donor_catalog, .semantic_digest = donor_semantic, .effect_protocol = @intCast(protocol) },
+            .publication_digest = donor_publication,
+            .input_digest = donor_input,
+            .proof_checksum = donor_checksum,
+            .selected_bitmap = try cursor.blob(),
+        };
+    } else null;
     if (source_count == 0 or source_count > publication.max_source_documents or artifact_count > publication.max_source_documents or
         precondition_count > publication.max_source_documents - artifact_count or effect_count == 0 or effect_count > publication.max_mutations)
         return error.ArtifactCatalogCorrupt;
@@ -396,7 +519,7 @@ fn decode(alloc: std.mem.Allocator, raw: []const u8, copy_bytes: bool) !Owned {
         effect.* = .{ .family = family, .key = key_bytes, .source_index = source_index, .value_digest = value_digest, .value_bytes = try cursor.readU64() };
     }
     if (cursor.pos != cursor.bytes.len) return error.ArtifactCatalogCorrupt;
-    const proof: Proof = .{ .version = version, .namespace = namespace, .authority_epoch = epoch, .catalog_digest = catalog_digest, .producer_kind = producer_kind, .producer_name = producer_name, .producer_generation = generation, .producer_artifact_name = producer_artifact_name, .producer_scope_key = producer_scope_key, .publication_digest = publication_digest, .input_digest = input_digest, .sources = sources, .artifact_sources = artifact_sources, .mutation_preconditions = mutation_preconditions, .effects = effects };
+    const proof: Proof = .{ .version = version, .namespace = namespace, .authority_epoch = epoch, .catalog_digest = catalog_digest, .producer_kind = producer_kind, .producer_name = producer_name, .producer_generation = generation, .producer_artifact_name = producer_artifact_name, .producer_scope_key = producer_scope_key, .publication_digest = publication_digest, .input_digest = input_digest, .sources = sources, .artifact_sources = artifact_sources, .mutation_preconditions = mutation_preconditions, .effects = effects, .origin = origin };
     try proof.validate();
     return .{ .arena = arena, .proof = proof };
 }
@@ -1571,4 +1694,67 @@ test "ordered artifact inventory portable scoped proof requires its causal unit 
     proof.artifact_sources = (&guard)[0..1];
     proof.input_digest = proof.inputCommand().inputDigest();
     try proof.validatePortableShape(alloc);
+}
+
+test "ordered artifact inventory adopted proof binds certified origin and selected postimage" {
+    const alloc = std.testing.allocator;
+    const output = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(output);
+    const source = publication.Source{ .document_key = "doc", .content_digest = @splat(1), .timestamp = 7, .input_position = .{ .raft = .{ .term = 2, .index = 3 } } };
+    const effect = Effect{ .family = .base_vector, .key = output, .source_index = 0, .value_digest = @splat(4), .value_bytes = 8 };
+    var proof: Proof = .{
+        .namespace = @splat(9),
+        .authority_epoch = 3,
+        .catalog_digest = @splat(10),
+        .producer_kind = .index,
+        .producer_name = "model",
+        .producer_generation = 3,
+        .producer_artifact_name = "model",
+        .publication_digest = @splat(0),
+        .input_digest = undefined,
+        .sources = (&source)[0..1],
+        .artifact_sources = &.{},
+        .effects = (&effect)[0..1],
+        .origin = .{
+            .source_pin = @splat(7),
+            .namespace = @splat(8),
+            .binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3), .effect_protocol = 15 },
+            .publication_digest = @splat(4),
+            .input_digest = @splat(5),
+            .proof_checksum = @splat(6),
+            .selected_bitmap = &.{1},
+        },
+    };
+    proof.input_digest = proof.inputCommand().inputDigest();
+    proof.publication_digest = proof.adoptionDigest();
+    try proof.validatePortableShape(alloc);
+    const raw = try encodeAlloc(alloc, proof);
+    defer alloc.free(raw);
+    var decoded = try decodeAlloc(alloc, raw);
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(proof, decoded.proof);
+    var borrowed = try decodeBorrowed(alloc, raw);
+    defer borrowed.deinit();
+    try std.testing.expectEqualDeep(proof, borrowed.proof);
+    var forged = proof;
+    forged.origin.?.source_pin = @splat(11);
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, encodeAlloc(alloc, forged));
+    forged = proof;
+    forged.origin.?.selected_bitmap = &.{2};
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, encodeAlloc(alloc, forged));
+    const old_format = try alloc.dupe(u8, raw);
+    defer alloc.free(old_format);
+    @memcpy(old_format[0..4], "APF2");
+    std.crypto.hash.sha2.Sha256.hash(old_format[0 .. old_format.len - 32], old_format[old_format.len - 32 ..][0..32], .{});
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, decodeAlloc(alloc, old_format));
+    const AllocationCheck = struct {
+        fn run(a: std.mem.Allocator, logical: Proof) !void {
+            const encoded = try encodeAlloc(a, logical);
+            defer a.free(encoded);
+            var value = try decodeBorrowed(a, encoded);
+            defer value.deinit();
+            try std.testing.expectEqualDeep(logical, value.proof);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{proof});
 }
