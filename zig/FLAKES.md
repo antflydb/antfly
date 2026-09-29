@@ -1,5 +1,39 @@
 # Zig runtime flakes
 
+## 2026-09-29: progressive native publication across process restart
+
+[Main e2e-full run 36526714836, job 109286926408](https://github.com/antflydb/antfly/actions/runs/36526714836/job/109286926408)
+failed `test_progressive_publication_remains_queryable_across_process_restart`:
+after restart the index had 128 native vectors and 64 covered sources, while its
+artifact target was 160 vectors. Queryability remained false throughout the
+eight-second restore wait. The original assertion did not include the
+pre-restart status, so the log alone does not establish the exact pre-restart
+native count.
+
+The native posting WAL's immutable generation is the query and restart
+authority. Status, certificate validation, and checkpoint count writers
+previously read mutable HBC cardinality that could describe the next source
+capture. A sidecar count that was absent or ahead of the recovered native
+generation could then leave the earlier durable prefix unadmitted after open.
+All three paths now read the native serving view. Both the progressive query
+gate and status use boundary certificates. An open-time proof retains a
+nonempty older native WAL prefix when its source sequence covers the projection
+checkpoint, without allowing later status reads to certify a coincidentally
+matching live count or an ahead-of-sidecar WAL generation. The restart
+regression compares the durable serving vector count and only the source
+coverage represented by its two-chunk-per-document fixture; it also prints
+its pre-restart status on a restore timeout.
+
+The unchanged main-based binary passed 40/40 focused E2E invocations on four
+workers, so that local baseline did not reproduce the CI timing failure. The
+deterministic storage regression covers both an ahead-of-WAL sidecar through
+an actual DB reopen and an absent sidecar, and verifies that uncommitted live
+cardinality cannot inflate reported serving count or mint a certificate.
+The fixed, merged-main server binary (SHA-256
+`4ef98bc7f3e9d7c82afe83e61a796b64488d1b0a8ad882628a399334e7c2311c`)
+passed 200/200 focused E2E invocations with
+`scripts/ci/zig-e2e-regression-loop.sh` (four workers, 50 repeats each).
+
 ## 2026-09-25: physical storage compilation isolation and retained measurements
 
 [Main run 36200131260](https://github.com/antflydb/antfly/actions/runs/36200131260)

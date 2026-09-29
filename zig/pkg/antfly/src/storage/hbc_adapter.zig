@@ -18235,6 +18235,16 @@ pub const HBCIndex = struct {
         };
     }
 
+    /// Checkpoint sidecars must describe the same generation queries serve.
+    /// A missing native reader cannot be replaced with mutable HBC metadata.
+    pub fn servingActiveCountForCheckpoint(self: *HBCIndex) ?u64 {
+        if (self.experimentalPostingWalAuthoritative()) {
+            const snapshot = self.nativeServingSnapshot() orelse return null;
+            return snapshot.active_count;
+        }
+        return self.stats().active_count;
+    }
+
     /// Caller-owned, synchronous query scope. Catalog lifetime and primary
     /// identity/source snapshots are held by the DB owner outside this scope.
     pub const QuerySnapshot = struct {

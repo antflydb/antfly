@@ -2101,7 +2101,7 @@ pub const IndexManager = struct {
             applied_sequence: u64,
             generation: u64,
             config_hash: u64,
-            published_count: u64,
+            published_count: ?u64,
             native_count: u64,
             source_sequence: u64,
         } = null,
@@ -2152,7 +2152,10 @@ pub const IndexManager = struct {
             while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
             defer self.serving_certificate_mutex.unlock();
             if (self.matchesVerifiedServingCertificate(checkpoint, certified_count)) return true;
-            if (self.index.stats().active_count != certified_count) return false;
+            // Validate against the same generation that checkpoint writers
+            // and queries use, never an in-flight mutable HBC count.
+            const active_count = self.index.servingActiveCountForCheckpoint() orelse return false;
+            if (active_count != certified_count) return false;
             self.verified_serving_certificate = .{
                 .capture_incarnation = self.capture_incarnation,
                 .applied_sequence = checkpoint.applied_sequence,
@@ -2172,14 +2175,18 @@ pub const IndexManager = struct {
             return self.matchesVerifiedServingCertificate(checkpoint, certified_count);
         }
 
-        /// A native WAL generation loaded at open is durable even when a
-        /// newer sidecar count was written for an unfinished source window.
+        /// A native WAL generation loaded at open is durable even when its
+        /// optional sidecar count is absent or names an unfinished window.
         /// This fallback is minted only at open, never by a status read.
         pub fn validateRecoveredNativeServingCertificate(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) bool {
-            const certified_count = checkpoint.published_count orelse return false;
             const snapshot = self.index.nativeServingSnapshot() orelse return false;
-            if (snapshot.active_count == 0 or snapshot.active_count == certified_count or
-                snapshot.source_sequence < checkpoint.applied_sequence) return false;
+            if (snapshot.active_count == 0 or snapshot.source_sequence < checkpoint.applied_sequence) return false;
+            if (checkpoint.published_count) |certified_count| {
+                // The fallback only preserves an older durable prefix. A WAL
+                // generation ahead of its sidecar has not crossed that
+                // logical publication boundary.
+                if (snapshot.active_count >= certified_count) return false;
+            }
             while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
             defer self.serving_certificate_mutex.unlock();
             self.recovered_native_serving_certificate = .{
@@ -2187,19 +2194,18 @@ pub const IndexManager = struct {
                 .applied_sequence = checkpoint.applied_sequence,
                 .generation = checkpoint.generation,
                 .config_hash = checkpoint.config_hash,
-                .published_count = certified_count,
+                .published_count = checkpoint.published_count,
                 .native_count = snapshot.active_count,
                 .source_sequence = snapshot.source_sequence,
             };
             std.log.warn(
-                "dense serving sidecar ahead of recovered native WAL index={s} sidecar_vectors={} native_vectors={} source_sequence={}",
-                .{ self.config.name, certified_count, snapshot.active_count, snapshot.source_sequence },
+                "dense serving sidecar differs from recovered native WAL index={s} sidecar_vectors={?} native_vectors={} source_sequence={}",
+                .{ self.config.name, checkpoint.published_count, snapshot.active_count, snapshot.source_sequence },
             );
             return true;
         }
 
         pub fn hasRecoveredNativeServingCertificate(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) bool {
-            const certified_count = checkpoint.published_count orelse return false;
             while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
             const recovered = self.recovered_native_serving_certificate orelse {
                 self.serving_certificate_mutex.unlock();
@@ -2209,7 +2215,7 @@ pub const IndexManager = struct {
                 recovered.applied_sequence == checkpoint.applied_sequence and
                 recovered.generation == checkpoint.generation and
                 recovered.config_hash == checkpoint.config_hash and
-                recovered.published_count == certified_count;
+                recovered.published_count == checkpoint.published_count;
             self.serving_certificate_mutex.unlock();
             if (!matches) return false;
             const snapshot = self.index.nativeServingSnapshot() orelse return false;

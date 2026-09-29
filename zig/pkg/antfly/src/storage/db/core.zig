@@ -1104,7 +1104,7 @@ pub const DBCore = struct {
                 return;
             }
             const published_count = if (self.index_manager.denseIndex(index_name)) |entry|
-                entry.index.stats().active_count
+                entry.index.servingActiveCountForCheckpoint()
             else
                 null;
             try self.index_manager.checkpointLsmWalForManagedIndex(.{
@@ -1135,7 +1135,7 @@ pub const DBCore = struct {
                 .sequence = sequence,
                 .config_hash = config_hash,
                 .published_count = if (self.index_manager.denseIndex(index_name)) |entry|
-                    entry.index.stats().active_count
+                    entry.index.servingActiveCountForCheckpoint()
                 else
                     null,
             },
@@ -1154,7 +1154,7 @@ pub const DBCore = struct {
                 (checkpoint_with_identity.status == .clean or checkpoint_with_identity.status == .rebuilding))
             {
                 if (self.index_manager.denseIndex(index_name)) |entry| {
-                    checkpoint_with_identity.published_count = entry.index.stats().active_count;
+                    checkpoint_with_identity.published_count = entry.index.servingActiveCountForCheckpoint();
                 }
             }
             try self.index_manager.checkpointLsmWalForManagedIndex(.{

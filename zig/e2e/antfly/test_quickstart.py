@@ -2001,9 +2001,7 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         )
         assert __import__("time").monotonic() - restarted_at < 8.0
         assert after["milestones"]["queryable"]["blockers"] == []
-        assert (
-            after["source_coverage"]["covered"] >= before["source_coverage"]["covered"]
-        )
+        assert after["source_coverage"]["covered"] >= covered_sources
 
         # Startup may first expose the durable serving checkpoint while its
         # owner is still re-establishing convergence authority. That must not

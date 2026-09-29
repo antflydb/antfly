@@ -16961,24 +16961,26 @@ pub const DB = struct {
         return switch (cfg.kind) {
             .dense_vector => blk: {
                 const dense = self.core.index_manager.denseIndex(index_name) orelse break :blk .physical_index_unavailable;
-                const active_count = dense.index.stats().active_count;
+                const active_count = dense.index.servingActiveCountForCheckpoint() orelse break :blk .physical_index_unavailable;
                 if (active_count == 0) break :blk .empty_dense_publication;
-                if (checkpoint.published_count) |certified_count| {
-                    // A publication certificate proves the loaded HBC state
-                    // is exactly the snapshot committed at this checkpoint.
-                    // The live artifact target may be ahead while enrichment
-                    // is preparing the next replay window; that is completion
-                    // debt, not a reason to revoke the last safe snapshot.
-                    if (active_count != certified_count) break :blk .artifact_count_mismatch;
+                if (checkpoint.published_count != null) {
+                    // Only an open or publication boundary may certify this
+                    // checkpoint. A recovered older native WAL prefix remains
+                    // serviceable when its sidecar names an unfinished window.
+                    if (!dense.hasValidatedServingCertificate(checkpoint) and
+                        !dense.hasRecoveredNativeServingCertificate(checkpoint))
+                        break :blk .artifact_count_mismatch;
                 } else {
                     // v0.2/legacy checkpoints carry no physical certificate.
-                    // Preserve their conservative equality proof instead of
-                    // inferring safety from an unversioned cardinality.
-                    const expected_active_count = if (densePublicationTargetUsesArtifactCounter(dense))
-                        (try loadDenseArtifactTargetCounter(alloc, self.core.store, index_name)) orelse break :blk .artifact_counter_unavailable
-                    else
-                        produced;
-                    if (!denseCoverageMatchesTarget(active_count, expected_active_count)) break :blk .artifact_count_mismatch;
+                    // An opened native WAL can prove its durable prefix;
+                    // otherwise preserve the conservative equality proof.
+                    if (!dense.hasRecoveredNativeServingCertificate(checkpoint)) {
+                        const expected_active_count = if (densePublicationTargetUsesArtifactCounter(dense))
+                            (try loadDenseArtifactTargetCounter(alloc, self.core.store, index_name)) orelse break :blk .artifact_counter_unavailable
+                        else
+                            produced;
+                        if (!denseCoverageMatchesTarget(active_count, expected_active_count)) break :blk .artifact_count_mismatch;
+                    }
                 }
                 // Dirty posting centroids/payloads are bounded optimization
                 // debt. HBC searches them exactly until the maintenance lane
@@ -35316,11 +35318,11 @@ pub const DB = struct {
         for (self.core.index_manager.dense_indexes.items) |*entry| {
             const checkpoint = self.core.loadProjectionCheckpoint(self.alloc, entry.config.name) catch continue;
             if (!entry.validateServingCertificate(checkpoint)) {
-                // A newer sidecar may have observed an in-flight source
-                // window. On reopen, the native WAL's immutable generation
-                // still proves its earlier durable prefix. Record this only
-                // at the open boundary; status must never certify a later
-                // coincidental live count.
+                // An absent or newer sidecar may not describe the native
+                // WAL's immutable generation after an in-flight source
+                // window. On reopen it still proves a durable prefix. Record
+                // this only at the open boundary. Status must never certify
+                // a later coincidental live count.
                 _ = entry.validateRecoveredNativeServingCertificate(checkpoint);
             }
         }
@@ -35354,6 +35356,12 @@ pub const DB = struct {
                 if (!entry.hasValidatedServingCertificate(checkpoint) and
                     !entry.hasRecoveredNativeServingCertificate(checkpoint)) return false;
             } else if (item.coverage_produced_count != 0) {
+                const checkpoint: apply_state.ProjectionCheckpoint = .{
+                    .applied_sequence = item.projection_checkpoint_applied_sequence,
+                    .generation = item.projection_checkpoint_generation,
+                    .config_hash = item.projection_checkpoint_config_hash,
+                };
+                if (entry.hasRecoveredNativeServingCertificate(checkpoint)) return true;
                 if (self.core.index_manager.get(item.name)) |cfg| {
                     // Older checkpoints have no count certificate. For managed
                     // progressive indexes use the existing durable coverage
@@ -59449,9 +59457,14 @@ fn appliedSequenceUpdatesWithConfigHashes(
                 enriched[i].config_hash = types.indexConfigHash(cfg.*);
             }
         }
-        if (enriched[i].published_count == null) {
+        // Native batches publish their WAL watermark directly; their generic
+        // update never writes a count sidecar. Avoid pinning a read generation
+        // on every ingest batch just to discard that count below.
+        if (enriched[i].published_count == null and
+            !index_manager.densePostingWalAuthoritativeByName(update.index_name))
+        {
             if (index_manager.denseIndex(update.index_name)) |entry| {
-                enriched[i].published_count = entry.index.stats().active_count;
+                enriched[i].published_count = entry.index.servingActiveCountForCheckpoint();
             }
         }
     }
@@ -70342,8 +70355,9 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         current_checkpoint.config_hash != checkpoint.config_hash)
         return false;
     const current_expected_count = (try denseTargetCountForIndexContext(ctx, index_name)) orelse return false;
+    const serving_count = entry.index.servingActiveCountForCheckpoint() orelse return false;
     if (current_expected_count != expected_count or
-        entry.index.stats().active_count != current_expected_count or
+        serving_count != current_expected_count or
         entry.index.experimentalPostingDurableAppliedSequence() != applied_sequence or
         !ctx.index_manager.vectorBlockReadyForDenseIndexAtSequence(index_name, applied_sequence, current_expected_count))
         return false;
@@ -70353,7 +70367,7 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         .status = .clean,
         .generation = checkpoint.generation +| 1,
         .config_hash = checkpoint.config_hash,
-        .published_count = entry.index.stats().active_count,
+        .published_count = serving_count,
     };
     try ctx.index_manager.saveDenseProjectionCheckpointMetadata(index_name, clean_checkpoint);
     try apply_state.saveProjectionCheckpointWithSidecar(
@@ -115248,6 +115262,15 @@ test "db progressive managed admission serves a checkpointed partial generation"
         entry.index.published_active_count.store(target_before + 1, .release);
         defer entry.index.published_active_count.store(target_before, .release);
         try std.testing.expectEqual(target_before + 1, entry.index.stats().active_count);
+        try std.testing.expectEqual(target_before, entry.index.servingActiveCountForCheckpoint().?);
+        var ahead_checkpoint = certified_checkpoint;
+        ahead_checkpoint.published_count = target_before + 1;
+        try std.testing.expect(!entry.validateServingCertificate(ahead_checkpoint));
+        var unspecified_checkpoint = certified_checkpoint;
+        unspecified_checkpoint.published_count = null;
+        try db.core.saveProjectionCheckpoint(cfg.name, unspecified_checkpoint);
+        const written_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+        try std.testing.expectEqual(@as(?u64, target_before), written_checkpoint.published_count);
         const ahead_stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, ahead_stats);
         for (ahead_stats.indexes) |index_stats| {
@@ -115291,6 +115314,39 @@ test "db progressive managed admission serves a checkpointed partial generation"
             try std.testing.expectEqual(target_before, index_stats.doc_count);
         }
         entry.recovered_native_serving_certificate = null;
+        var older_checkpoint = certified_checkpoint;
+        older_checkpoint.published_count = target_before - 1;
+        try std.testing.expect(!entry.validateRecoveredNativeServingCertificate(older_checkpoint));
+
+        // Native posting authority also outlives an optional sidecar whose
+        // count was never written for the newest source boundary.
+        var missing_checkpoint = advanced_checkpoint;
+        missing_checkpoint.published_count = null;
+        try apply_state.saveProjectionCheckpointWithSidecar(
+            alloc,
+            db.core.index_manager.checkpointIo(),
+            db.core.store,
+            db.core.applied_sequence_checkpoint_path,
+            cfg.name,
+            missing_checkpoint,
+        );
+        try std.testing.expect(entry.validateRecoveredNativeServingCertificate(missing_checkpoint));
+        const missing_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, missing_stats);
+        for (missing_stats.indexes) |index_stats| {
+            if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+            try std.testing.expect(index_stats.serving_snapshot_ready);
+            try std.testing.expectEqual(target_before, index_stats.doc_count);
+        }
+        entry.recovered_native_serving_certificate = null;
+        try apply_state.saveProjectionCheckpointWithSidecar(
+            alloc,
+            db.core.index_manager.checkpointIo(),
+            db.core.store,
+            db.core.applied_sequence_checkpoint_path,
+            cfg.name,
+            advanced_checkpoint,
+        );
     }
     // A later live write can happen to reach the invalid certificate's
     // cardinality. Status may observe it, but only a publication boundary may
@@ -115677,8 +115733,20 @@ test "db progressive managed admission serves a checkpointed partial generation"
         try std.testing.expect(partial_record.next_retry_at_ms > currentTimeNs() / std.time.ns_per_ms);
     }
 
-    // The durable checkpoint and repair ownership are sufficient to restore
-    // the same partial generation as queryable after a process restart.
+    // Force a sidecar from the unfinished window across the real reopen.
+    // The immutable WAL prefix must remain queryable until the next complete
+    // publication supplies a matching count.
+    const restart_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    var mismatched_restart_checkpoint = restart_checkpoint;
+    mismatched_restart_checkpoint.published_count = target_before + 1;
+    try apply_state.saveProjectionCheckpointWithSidecar(
+        alloc,
+        db.core.index_manager.checkpointIo(),
+        db.core.store,
+        db.core.applied_sequence_checkpoint_path,
+        cfg.name,
+        mismatched_restart_checkpoint,
+    );
     db.close();
     db = try DB.open(alloc, std.mem.span(path), .{
         .start_optional_runtime_workers = false,
@@ -115687,6 +115755,14 @@ test "db progressive managed admission serves a checkpointed partial generation"
     });
     try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
     try std.testing.expect(!try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
+    const reopened_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, reopened_stats);
+    for (reopened_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+        try std.testing.expect(index_stats.serving_snapshot_ready);
+        try std.testing.expectEqual(target_before, index_stats.doc_count);
+    }
+    try db.core.saveProjectionCheckpoint(cfg.name, restart_checkpoint);
     {
         const entry = db.core.denseIndex(cfg.name) orelse return error.IndexNotFound;
         try std.testing.expect((try entry.index.postingBacklogStats()).hasMaintenanceDebt());
