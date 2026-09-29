@@ -193,7 +193,9 @@ pub const Builder = struct {
                 if (next.certificate.integrity == null) return error.InvalidSourceSnapshot;
                 try next.append(kind, "", payload);
             },
-            0x01, 0x02, 0x03, 0x10...0x17, 0x19, 0x1a, 0xf0 => try next.append(kind, "", payload),
+            // Source-copy graph ownership is an authenticated part of the
+            // logical cut, even though ordinary restore must reject it.
+            0x01, 0x02, 0x03, 0x10...0x17, 0x19, 0x1a, 0x1c, 0xf0 => try next.append(kind, "", payload),
             else => return error.InvalidSourceSnapshot,
         }
         self.* = next;
@@ -245,6 +247,28 @@ test "source snapshot malformed metadata never advances progress" {
     const before = builder.certificate;
     try std.testing.expectError(error.InvalidSourceSnapshot, builder.addBlock(0x18, &.{ 255, 255, 255, 255 }));
     try std.testing.expect(before.eql(builder.certificate));
+}
+
+test "source snapshot binds source graph ownership blocks to the transferable cut" {
+    const cut: Cut = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .applied_index = 1, .retained_start = 0 };
+    var first = try Builder.init(cut);
+    try first.addBlock(1, "{}");
+    try first.addBlock(0x1c, "graph ownership A");
+    try first.addBlock(0xff, &(@as([24]u8, @splat(0))));
+    const certificate = try first.finish();
+    const encoded = try certificate.encode();
+    try std.testing.expect(certificate.eql(try Certificate.decode(&encoded)));
+
+    var changed = try Builder.init(cut);
+    try changed.addBlock(1, "{}");
+    try changed.addBlock(0x1c, "graph ownership B");
+    try changed.addBlock(0xff, &(@as([24]u8, @splat(0))));
+    try std.testing.expect(!certificate.eql(try changed.finish()));
+
+    var omitted = try Builder.init(cut);
+    try omitted.addBlock(1, "{}");
+    try omitted.addBlock(0xff, &(@as([24]u8, @splat(0))));
+    try std.testing.expect(!certificate.eql(try omitted.finish()));
 }
 
 test "relational index system source snapshot integrity generation comes only from immutable manifest and binds content" {

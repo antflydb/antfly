@@ -80,8 +80,11 @@ recovery without replay-sequence reuse, owned preparation outside the apply
 lock, binary-safe catalog transport, and attempt-bound immutable source layouts.
 The graph transfer contract preserves source bytes for receipt verification and
 rebinds physical generations using separately authenticated receiver layouts;
-the wider source protocol is not advertised yet. Retained-transfer regressions
-pass 22 tests, including oversized frames, bounded spool caching, authenticated
+the wider source protocol is not advertised yet. Certified source-copy graph
+ownership blocks are included in the transferable source-cut digest; omitting
+or changing those bytes changes the certificate. Retained-transfer regressions
+pass 27 tests, including source-certificate block binding, oversized frames,
+bounded spool caching, authenticated
 cold reads, partial-copy corruption repair and restart at exact row boundaries.
 The compact publication upload codec and staging primitives now pass retry,
 ordered-age pruning, tombstone and allocation-failure checks. These primitives
