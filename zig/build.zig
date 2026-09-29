@@ -270,12 +270,15 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     });
-    sql_test_mod.addImport("sql_parser", sql_parser_mod);
-    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = b.args orelse &.{} });
+    // Native SQL fixtures import storage and API contracts whose unrelated
+    // transitive tests require different owner roots. Select the SQL and
+    // row-policy contract namespaces at compile time, while allowing explicit
+    // caller filters.
+    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "system_catalog.policies" }) });
     const run_sql_tests = b.addRunArtifact(sql_tests);
-    // These storage-independent owners must not inherit the multi-GiB claims
-    // reserved for the full database compilation and integration test roots.
-    sql_tests.step.max_rss = 1024 * 1024 * 1024;
+    // The native SQL contract corpus is larger than the parser-only owner but
+    // remains below the full database compilation and integration test roots.
+    sql_tests.step.max_rss = 1536 * 1024 * 1024;
     // The complete compiler/executor corpus includes exhaustive allocation-fault
     // runs (about 137 MiB process RSS in ReleaseSafe). This scheduling estimate
     // is independent of the executor's per-statement memory admission tests.
@@ -821,6 +824,16 @@ pub fn create(b: *std.Build) ?Artifacts {
         .platform_target = target,
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
+    // SQL shape fixtures reach native schema and storage contracts, but do not
+    // need the inference/API module graph of a full storage owner.
+    antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
+    sql_test_mod.addImport("sql_parser", sql_parser_mod);
+    sql_test_mod.addImport("antfly_platform", platform_mod);
+    sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    sql_test_mod.addImport("antfly_regex", regex_mod);
+    sql_test_mod.addImport("antfly_hash", hash_mod);
+    sql_test_mod.addImport("bloom", bloom_mod);
+    sql_test_mod.link_libc = link_libc;
     antfly_imports.storage_boundary.configureSources(storage_mod, false, false);
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;

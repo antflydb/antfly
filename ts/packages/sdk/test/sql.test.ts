@@ -180,6 +180,22 @@ describe("durable SQL prepared client", () => {
     expect(fetch.mock.calls[1][0]).toBe("http://localhost:8080/db/v1/sql/prepared/a%2Fb%3Fc%23d");
   });
 
+  it("closes connection-bound prepared resources with the connection header", async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response("{}"));
+    vi.stubGlobal("fetch", fetch);
+    const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+    const connectionId = "A".repeat(32);
+    await client.closePreparedSQL("resource", { connectionId });
+    expect(fetch.mock.calls[0][1]).toMatchObject({
+      method: "DELETE",
+      headers: { "X-Antfly-SQL-Connection-Id": connectionId },
+    });
+    await expect(client.closePreparedSQL("resource", { connectionId: "invalid" })).rejects.toThrow(
+      "connection ID"
+    );
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     "prepare",
     "execute",

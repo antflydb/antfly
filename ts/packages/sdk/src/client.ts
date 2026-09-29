@@ -636,7 +636,8 @@ export class AntflyClient {
     errorFactory?: (status: number, body: unknown) => Error | undefined,
     redirect?: RequestRedirect,
     method: "POST" | "DELETE" = "POST",
-    credentials?: RequestCredentials
+    credentials?: RequestCredentials,
+    extraHeaders?: Record<string, string>
   ): Promise<{ data?: T; text: string; status: number }> {
     const opts = normalizedWriteOptions(options);
     let encodedBody: string | undefined;
@@ -650,7 +651,7 @@ export class AntflyClient {
 
     const response = await fetch(this.url(path), {
       method,
-      headers: this.requestHeaders(),
+      headers: this.requestHeaders(extraHeaders),
       body: encodedBody,
       signal: opts.signal,
       ...(redirect ? { redirect } : {}),
@@ -827,7 +828,8 @@ export class AntflyClient {
     path: string,
     request: unknown,
     options?: WriteOptions,
-    method: "POST" | "DELETE" = "POST"
+    method: "POST" | "DELETE" = "POST",
+    extraHeaders?: Record<string, string>
   ): Promise<T | undefined> {
     const { data } = await this.postBoundedJSON<T>(
       path,
@@ -858,7 +860,8 @@ export class AntflyClient {
       },
       "error",
       method,
-      "omit"
+      "omit",
+      extraHeaders
     );
     return data;
   }
@@ -966,14 +969,22 @@ export class AntflyClient {
     );
   }
 
-  /** Release an owner-bound resource; already admitted executions may still finish. */
-  async closePreparedSQL(preparedId: string, options?: WriteOptions): Promise<void> {
+  /** Release an owner-bound resource; connection-bound resources require their connection ID. */
+  async closePreparedSQL(
+    preparedId: string,
+    options?: WriteOptions & { connectionId?: string }
+  ): Promise<void> {
     if (!preparedId) throw new Error("Prepared SQL resource ID is required");
+    if (options?.connectionId !== undefined && !/^[0-9a-fA-F]{32}$/.test(options.connectionId))
+      throw new Error("SQL connection ID must be 32 hexadecimal characters");
     const data = await this.sqlRequest<Record<string, never>>(
       `/db/v1/sql/prepared/${encodeURIComponent(preparedId)}`,
       undefined,
       options,
-      "DELETE"
+      "DELETE",
+      options?.connectionId !== undefined
+        ? { "X-Antfly-SQL-Connection-Id": options.connectionId }
+        : undefined
     );
     if (
       !data ||

@@ -48,6 +48,14 @@ def test_prepared_sql_lifecycle_preserves_owner_and_execution_shape():
         client.close_prepared_sql("a/b")
         assert request.call_args.args == ("DELETE", "/db/v1/sql/prepared/a%2Fb")
         assert request.call_args.kwargs["_max_response_bytes"] == 16 << 20
+        assert "X-Antfly-SQL-Connection-Id" not in request.call_args.kwargs["headers"]
+        connection_id = "A" * 32
+        client.close_prepared_sql("a/b", connection_id=connection_id)
+        assert request.call_args.kwargs["headers"]["X-Antfly-SQL-Connection-Id"] == connection_id
+        calls_before = request.call_count
+        with pytest.raises(AntflyException, match="connection ID"):
+            client.close_prepared_sql("a/b", connection_id="invalid")
+        assert request.call_count == calls_before
 
 
 @pytest.mark.parametrize("operation", ["prepare", "execute", "close"])

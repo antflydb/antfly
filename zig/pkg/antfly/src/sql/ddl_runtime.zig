@@ -276,21 +276,23 @@ test "SQL CREATE TABLE combines inline primary keys and named composite declarat
 
 test "SQL ALTER TABLE primary key marks every key column nonnullable with one unique declaration" {
     const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const schema_alloc = arena.allocator();
     var create = try @import("compiler.zig").compile(alloc, "CREATE TABLE items (tenant BIGINT, id BIGINT, note TEXT)", .{});
     defer create.deinit();
     const encoded = try createSchemaAlloc(alloc, create.statement.create_table);
     defer alloc.free(encoded);
-    var schema = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{ .parse_numbers = false });
-    defer schema.deinit();
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, schema_alloc, encoded, .{ .parse_numbers = false });
     var invalid = try @import("compiler.zig").compile(alloc, "ALTER TABLE items ADD CONSTRAINT bad_pk PRIMARY KEY (tenant, missing)", .{});
     defer invalid.deinit();
-    try std.testing.expectError(error.UndefinedColumn, @import("schema_ddl.zig").apply(alloc, &schema.value, invalid.statement.catalog_ddl));
-    try std.testing.expectEqual(true, schema.value.object.get("document_schemas").?.object.get("row").?.object.get("schema").?.object.get("properties").?.object.get("tenant").?.object.get("nullable").?.bool);
-    try std.testing.expect(schema.value.object.get("unique_constraints") == null);
+    try std.testing.expectError(error.UndefinedColumn, @import("schema_ddl.zig").apply(schema_alloc, &schema, invalid.statement.catalog_ddl));
+    try std.testing.expectEqual(true, schema.object.get("document_schemas").?.object.get("row").?.object.get("schema").?.object.get("properties").?.object.get("tenant").?.object.get("nullable").?.bool);
+    try std.testing.expect(schema.object.get("unique_constraints") == null);
     var alter = try @import("compiler.zig").compile(alloc, "ALTER TABLE items ADD CONSTRAINT items_pk PRIMARY KEY (tenant, id)", .{});
     defer alter.deinit();
-    try std.testing.expect(try @import("schema_ddl.zig").apply(alloc, &schema.value, alter.statement.catalog_ddl));
-    const row = schema.value.object.get("document_schemas").?.object.get("row").?.object.get("schema").?;
+    try std.testing.expect(try @import("schema_ddl.zig").apply(schema_alloc, &schema, alter.statement.catalog_ddl));
+    const row = schema.object.get("document_schemas").?.object.get("row").?.object.get("schema").?;
     const properties = row.object.get("properties").?.object;
     try std.testing.expectEqual(false, properties.get("tenant").?.object.get("nullable").?.bool);
     try std.testing.expectEqual(false, properties.get("id").?.object.get("nullable").?.bool);
@@ -299,14 +301,14 @@ test "SQL ALTER TABLE primary key marks every key column nonnullable with one un
     try std.testing.expectEqual(@as(usize, 2), required.len);
     try std.testing.expectEqualStrings("tenant", required[0].string);
     try std.testing.expectEqualStrings("id", required[1].string);
-    const uniques = schema.value.object.get("unique_constraints").?.array.items;
+    const uniques = schema.object.get("unique_constraints").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), uniques.len);
     try std.testing.expectEqualStrings("items_pk", uniques[0].object.get("name").?.string);
     try std.testing.expect(uniques[0].object.get("primary").?.bool);
     var second = try @import("compiler.zig").compile(alloc, "ALTER TABLE items ADD CONSTRAINT other_pk PRIMARY KEY (note)", .{});
     defer second.deinit();
-    try std.testing.expectError(error.SqlConstraintAlreadyExists, @import("schema_ddl.zig").apply(alloc, &schema.value, second.statement.catalog_ddl));
-    const final_json = try std.json.Stringify.valueAlloc(alloc, schema.value, .{});
+    try std.testing.expectError(error.SqlConstraintAlreadyExists, @import("schema_ddl.zig").apply(schema_alloc, &schema, second.statement.catalog_ddl));
+    const final_json = try std.json.Stringify.valueAlloc(alloc, schema, .{});
     defer alloc.free(final_json);
     var validated = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, final_json);
     defer validated.deinit(alloc);

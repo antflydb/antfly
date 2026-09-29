@@ -1353,6 +1353,22 @@ test "SQL grouped aggregation streams pages then applies HAVING ORDER OFFSET and
     try std.testing.expectEqualStrings("3", result.output.rows[0][2].string);
 }
 
+test "SQL high fanout join bounds candidate allocation churn" {
+    // Every row shares a hash key; the residual must inspect 65,536 pairs.
+    // Aggregation keeps result materialization out of the allocation measurement.
+    var backend: TestBackend = .{ .row_count = 256 };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*) FROM things a JOIN things b ON a.id = b.id AND a._id < b._id", .{});
+    defer compiled.deinit();
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var result = try execute(counting.allocator(), backend.coordinated(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("32640", result.output.rows[0][0].string);
+    // Allow headroom for incidental executor changes, but not one backing
+    // allocation per candidate/output row (68,120 before scratch reuse).
+    try std.testing.expect(counting.allocations < 4096);
+}
+
 test "SQL aggregate admission sizes TopK by observed groups rather than result cap" {
     var backend: TestBackend = .{ .row_count = 8 };
     var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*) FROM things", .{});

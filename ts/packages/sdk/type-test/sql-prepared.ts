@@ -17,6 +17,9 @@ const execute: SQLPreparedExecutionRequest = {
 const resource: Promise<SQLPreparedResponse> = client.prepareSQL(prepare);
 const result: Promise<SQLResponse> = client.executePreparedSQL("resource", execute);
 const closed: Promise<void> = client.closePreparedSQL("resource");
+const closedForConnection: Promise<void> = client.closePreparedSQL("resource", {
+  connectionId: "a".repeat(32),
+});
 const openConnection: Promise<SQLConnectionResponse> = client.openSQLConnection({
   database: "analytics",
 } satisfies SQLConnectionOpenRequest);
@@ -24,6 +27,7 @@ const closeConnection: Promise<void> = client.closeSQLConnection("a".repeat(32))
 void resource;
 void result;
 void closed;
+void closedForConnection;
 void openConnection;
 void closeConnection;
 

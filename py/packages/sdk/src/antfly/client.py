@@ -1021,11 +1021,21 @@ class AntflyClient:
             self._sql_request("POST", f"/db/v1/sql/prepared/{quote(prepared_id, safe='')}/execute", request.to_dict())
         )
 
-    def close_prepared_sql(self, prepared_id: str) -> None:
-        """Close a resource; already admitted executions may finish."""
-        self._sql_request("DELETE", f"/db/v1/sql/prepared/{quote(prepared_id, safe='')}", None)
+    def close_prepared_sql(self, prepared_id: str, *, connection_id: str | None = None) -> None:
+        """Close a resource; connection-bound resources require their connection ID."""
+        if connection_id is not None and (
+            not isinstance(connection_id, str)
+            or len(connection_id) != 32
+            or any(char not in "0123456789abcdefABCDEF" for char in connection_id)
+        ):
+            raise AntflyException("SQL connection ID must be 32 hexadecimal characters")
+        self._sql_request(
+            "DELETE", f"/db/v1/sql/prepared/{quote(prepared_id, safe='')}", None, connection_id=connection_id
+        )
 
-    def _sql_request(self, method: str, path: str, value: dict[str, Any] | None) -> dict[str, Any]:
+    def _sql_request(
+        self, method: str, path: str, value: dict[str, Any] | None, *, connection_id: str | None = None
+    ) -> dict[str, Any]:
         from .sql_transport import encode_sql_request
 
         try:
@@ -1036,7 +1046,10 @@ class AntflyClient:
             method,
             path,
             content=encoded,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                **({"X-Antfly-SQL-Connection-Id": connection_id} if connection_id is not None else {}),
+            },
             follow_redirects=False,
             _expected_status=200,
             _max_response_bytes=16 << 20,

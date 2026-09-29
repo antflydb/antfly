@@ -571,8 +571,6 @@ fn Engine(comptime Context: type) type {
                 return values;
             }
             fn nextJoin(self: *Iterator, alloc: Allocator, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) anyerror!?[]const Datum {
-                var candidate_arena = std.heap.ArenaAllocator.init(self.engine.context.alloc);
-                defer candidate_arena.deinit();
                 const kind = if (self.flipped_join and join.kind == .right) .left else join.kind;
                 const shared = self.recursive_id != null;
                 if (self.hash_join == null and shared) if (self.engine.static_hashes.get(self.node)) |cached| {
@@ -598,10 +596,14 @@ fn Engine(comptime Context: type) type {
                     if (self.probe) |*probe| {
                         while (try probe.next()) |match| {
                             try self.engine.checkpoint();
-                            _ = candidate_arena.reset(.free_all);
-                            const values = try self.combine(candidate_arena.allocator(), self.left_values, match.values);
+                            // A join iterator owns its candidate scratch for its full
+                            // lifetime. Reuse retained pages across output rows;
+                            // returned cells still reference the stable probe/build
+                            // rows, not this transient candidate allocation.
+                            _ = self.scratch.reset(.retain_capacity);
+                            const values = try self.combine(self.scratch.allocator(), self.left_values, match.values);
                             if (join.condition) |program| {
-                                const accepted = try program.evaluate(candidate_arena.allocator(), values, self.engine.context.parameters, .{});
+                                const accepted = try program.evaluate(self.scratch.allocator(), values, self.engine.context.parameters, .{});
                                 if (accepted.sql_null) continue;
                                 if (accepted.value != .bool) return error.SqlTypeMismatch;
                                 if (!accepted.value.bool) continue;

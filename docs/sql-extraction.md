@@ -64,6 +64,24 @@ The TypeScript connection helpers use generated request/response schemas and
 bounded, non-retrying SQL transport; the SDK SQL suite passes 30 tests.
 The complete TypeScript SDK suite passes 396 tests with one conditional bundle
 check skipped.
+Follow-up SQL gate repair: `zig build sql-test` now uses the scoped native SQL
+imports and compiles the SQL and row-policy contract namespaces by default;
+269 tests pass, including a high-fanout join allocation-budget regression.
+The parity-style `SQL original` filter passes 12 tests, rather than silently
+selecting none. Connection-bound prepared resources can now be closed by the
+Python and TypeScript SDKs with the required connection header; focused SQL
+SDK suites pass 22 and 31 tests respectively, with TypeScript typechecking.
+Full Python and TypeScript SDK suites pass 257 and 397 tests respectively
+(one conditional TypeScript bundle check skipped).
+The hash-join iterator reuses its candidate scratch across output rows. In a
+local ReleaseSafe A/B measurement of the 65,536-pair residual-join fixture,
+backing allocations fell from 68,120 to 2,585 (96.2%), cumulative allocated
+bytes from 123,311,135 to 96,572,855, and peak tracked memory remained about
+1.29 MB. The fixture aggregates its 32,640 matches to isolate join processing
+from result materialization. Reproduce the allocation budget with
+`zig build sql-test -Doptimize=ReleaseSafe -- --test-filter 'SQL high fanout join'`.
+These allocator measurements are not production-throughput evidence or a
+complete release gate.
 
 Direct-field dense/sparse vectors now have bounded, resumable snapshot transport
 and ordered tail coverage, including oversized historical base artifacts on
