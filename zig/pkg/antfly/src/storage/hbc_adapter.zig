@@ -4825,7 +4825,7 @@ const ExperimentalPostingCheckpointBuild = struct {
     staging_store: posting_segment_store_mod.Store,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     io: std.Io,
-    owned_io: ?std.Io.Threaded = null,
+    owned_io: ?(if (builtin.os.tag == .freestanding) void else std.Io.Threaded) = null,
     projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource = null,
     projection_revision: u64 = 0,
     /// Hard recovery-debt enforcement and graceful close can promote an
@@ -5040,7 +5040,9 @@ const ExperimentalPostingCheckpointBuild = struct {
 
     fn deinit(self: *ExperimentalPostingCheckpointBuild) void {
         self.awaitCompletion();
-        if (self.owned_io) |*io_impl| io_impl.deinit();
+        if (comptime builtin.os.tag != .freestanding) {
+            if (self.owned_io) |*io_impl| io_impl.deinit();
+        }
         if (self.staged_rebase) |generation| generation.release();
         if (self.rebase_source) |generation| generation.release();
         if (self.staged_readers) |readers| readers.release();
@@ -6892,7 +6894,10 @@ pub const HBCIndex = struct {
     }
 
     fn runtimeIo(self: *const HBCIndex) std.Io {
-        return self.runtime_io orelse std.Io.Threaded.global_single_threaded.io();
+        return self.runtime_io orelse if (comptime builtin.os.tag == .freestanding)
+            .failing
+        else
+            std.Io.Threaded.global_single_threaded.io();
     }
 
     fn releaseCompleteCoverageFlightRef(self: *HBCIndex, flight: *CompleteCoverageFlight) void {
@@ -23341,7 +23346,8 @@ test "hbc index close does not clear shared namespace bytes" {
     defer cache.deinit();
 
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
-    defer idx.close();
+    var idx_open = true;
+    defer if (idx_open) idx.close();
     idx.attachSharedCache(&cache);
     idx.setRetainedVectorCacheEnabled(true);
 
@@ -23349,9 +23355,13 @@ test "hbc index close does not clear shared namespace bytes" {
     const namespace = idx.cache_namespace;
     try std.testing.expect(cache.namespaceStats(namespace).total_bytes > 0);
 
-    var second = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
-    second.attachSharedCache(&cache);
-    second.close();
+    // LSM permits one writer for a root. Register a second cache owner
+    // directly to exercise shared namespace lifetime without opening a
+    // second writer for the same path.
+    try std.testing.expect(cache.registerNamespacePath(namespace, std.mem.span(path)));
+    defer cache.unregisterNamespacePath(namespace, std.mem.span(path));
+    idx.close();
+    idx_open = false;
 
     try std.testing.expect(cache.namespaceStats(namespace).total_bytes > 0);
     try std.testing.expect(cache.namespaceStats(namespace).vector.used_bytes > 0);
@@ -23375,18 +23385,14 @@ test "hbc shared cache releases unused namespace path registrations" {
     const namespace = first.cache_namespace;
     try std.testing.expectEqual(@as(usize, 1), cache.namespace_paths.get(namespace).?.active_owners);
 
-    var second = try HBCIndex.open(alloc, path, .{ .dims = 4 });
-    var second_open = true;
-    defer if (second_open) second.close();
-    second.attachSharedCache(&cache);
+    try std.testing.expect(cache.registerNamespacePath(namespace, std.mem.span(path)));
     try std.testing.expectEqual(@as(usize, 2), cache.namespace_paths.get(namespace).?.active_owners);
 
     first.close();
     first_open = false;
     try std.testing.expectEqual(@as(usize, 1), cache.namespace_paths.get(namespace).?.active_owners);
 
-    second.close();
-    second_open = false;
+    cache.unregisterNamespacePath(namespace, std.mem.span(path));
     try std.testing.expect(!cache.namespace_paths.contains(namespace));
     try std.testing.expect(!cache.namespace_stats.contains(namespace));
 }

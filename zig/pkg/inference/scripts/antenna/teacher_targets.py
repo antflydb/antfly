@@ -43,7 +43,11 @@ NER = ["crossner_ai", "crossner_literature", "crossner_music", "mit_restaurant"]
 
 
 def sigmoid(value: float) -> float:
-    return 1 / (1 + math.exp(-value)) if value >= 0 else math.exp(value) / (1 + math.exp(value))
+    return (
+        1 / (1 + math.exp(-value))
+        if value >= 0
+        else math.exp(value) / (1 + math.exp(value))
+    )
 
 
 def byte_offsets(text: str, start: int, end: int) -> tuple[int, int]:
@@ -56,53 +60,122 @@ def fits(args, splitter, text: str) -> bool:
     return len(list(splitter(text, lower=False))) <= args.max_words
 
 
-def classification_rows(args, datasets, classifier, split: str, rng: random.Random) -> list[dict[str, Any]]:
+def classification_rows(
+    args, datasets, classifier, split: str, rng: random.Random
+) -> list[dict[str, Any]]:
     from gliner2.classification import ClassificationConfig, ClassificationSchema
 
     rows = []
     for name, task in CLASSIFICATION.items():
-        records = [record for record in datasets.load_classification(name, split) if fits(args, classifier.model.processor.word_splitter, record["text"])]
+        records = [
+            record
+            for record in datasets.load_classification(name, split)
+            if fits(args, classifier.model.processor.word_splitter, record["text"])
+        ]
         rng.shuffle(records)
         names = list(datasets.label_names(name))
         for record in records[: args.per_dataset]:
-            gold = names[record["label"]] if isinstance(record["label"], int) else record["label"]
+            gold = (
+                names[record["label"]]
+                if isinstance(record["label"], int)
+                else record["label"]
+            )
             if len(names) > args.max_labels:
                 count = rng.randint(args.min_labels, args.max_labels)
-                labels = [gold] + rng.sample([label for label in names if label != gold], count - 1)
+                labels = [gold] + rng.sample(
+                    [label for label in names if label != gold], count - 1
+                )
                 rng.shuffle(labels)
             else:
                 labels = list(names)
-            schema = ClassificationSchema.from_dict({"version": 3, "tasks": {task: {"labels": labels, "min_labels": 1, "max_labels": 1}}})
-            scores = classifier.score(record["text"], schema, config=ClassificationConfig(max_len=args.max_words))
-            probabilities = [round(args.gold_weight * (label == gold) + (1 - args.gold_weight) * sigmoid(scores.tasks[task][label]), 6)
-                             for label in labels]
-            rows.append({"version": 1, "id": record["id"], "text": record["text"],
-                         "schema": {"classifications": [{"name": task, "labels": labels}]},
-                         "classifications": [{"task": task, "labels": [gold], "probabilities": probabilities}]})
+            schema = ClassificationSchema.from_dict(
+                {
+                    "version": 3,
+                    "tasks": {
+                        task: {"labels": labels, "min_labels": 1, "max_labels": 1}
+                    },
+                }
+            )
+            scores = classifier.score(
+                record["text"],
+                schema,
+                config=ClassificationConfig(max_len=args.max_words),
+            )
+            probabilities = [
+                round(
+                    args.gold_weight * (label == gold)
+                    + (1 - args.gold_weight) * sigmoid(scores.tasks[task][label]),
+                    6,
+                )
+                for label in labels
+            ]
+            rows.append(
+                {
+                    "version": 1,
+                    "id": record["id"],
+                    "text": record["text"],
+                    "schema": {"classifications": [{"name": task, "labels": labels}]},
+                    "classifications": [
+                        {"task": task, "labels": [gold], "probabilities": probabilities}
+                    ],
+                }
+            )
     return rows
 
 
-def entity_rows(args, datasets, extractor, splitter, split: str, rng: random.Random) -> list[dict[str, Any]]:
+def entity_rows(
+    args, datasets, extractor, splitter, split: str, rng: random.Random
+) -> list[dict[str, Any]]:
     rows = []
     for name in NER:
-        records = [record for record in datasets.load_ner(name, split) if fits(args, splitter, record["text"])]
+        records = [
+            record
+            for record in datasets.load_ner(name, split)
+            if fits(args, splitter, record["text"])
+        ]
         rng.shuffle(records)
         types = list(datasets.entity_types(name))
         for record in records[: args.per_dataset]:
             text = record["text"]
             if extractor is None:
-                spans = [(entity["start"], entity["end"], entity["type"]) for entity in record["entities"]]
+                spans = [
+                    (entity["start"], entity["end"], entity["type"])
+                    for entity in record["entities"]
+                ]
             else:
-                result = extractor.extract(text, {"entities": types}, threshold=args.entity_threshold,
-                                           include_spans=True, max_len=args.max_words)
+                result = extractor.extract(
+                    text,
+                    {"entities": types},
+                    threshold=args.entity_threshold,
+                    include_spans=True,
+                    max_len=args.max_words,
+                )
                 spans = []
                 for label, mentions in result.get("entities", {}).items():
                     for mention in mentions:
-                        spans.append((*byte_offsets(text, mention["start"], mention["end"]), label))
-            entities = [{"id": f"e{index}", "type": kind, "span": {"start": start, "end": end, "unit": "utf8_bytes"}}
-                        for index, (start, end, kind) in enumerate(sorted(set(spans)))]
-            rows.append({"version": 1, "id": record["id"], "text": text,
-                         "schema": {"entities": types}, "entities": entities})
+                        spans.append(
+                            (
+                                *byte_offsets(text, mention["start"], mention["end"]),
+                                label,
+                            )
+                        )
+            entities = [
+                {
+                    "id": f"e{index}",
+                    "type": kind,
+                    "span": {"start": start, "end": end, "unit": "utf8_bytes"},
+                }
+                for index, (start, end, kind) in enumerate(sorted(set(spans)))
+            ]
+            rows.append(
+                {
+                    "version": 1,
+                    "id": record["id"],
+                    "text": text,
+                    "schema": {"entities": types},
+                    "entities": entities,
+                }
+            )
     return rows
 
 
@@ -113,15 +186,33 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     from gliner2 import AutoExtractor
     from gliner2.classification import Classifier
 
-    teacher = AutoExtractor.from_pretrained(str(args.classifier), local_files_only=True, map_location="cpu",
-                                            use_flashdeberta=False).float().eval()
+    teacher = (
+        AutoExtractor.from_pretrained(
+            str(args.classifier),
+            local_files_only=True,
+            map_location="cpu",
+            use_flashdeberta=False,
+        )
+        .float()
+        .eval()
+    )
     classifier = Classifier(teacher)
     extractor = None
     if args.teacher_entities:
-        extractor = AutoExtractor.from_pretrained(str(args.teacher_entities), local_files_only=True, map_location="cpu",
-                                                  use_flashdeberta=False).float().eval()
+        extractor = (
+            AutoExtractor.from_pretrained(
+                str(args.teacher_entities),
+                local_files_only=True,
+                map_location="cpu",
+                use_flashdeberta=False,
+            )
+            .float()
+            .eval()
+        )
     rng = random.Random(args.seed)
-    rows = classification_rows(args, datasets, classifier, "train", rng) + entity_rows(args, datasets, extractor, teacher.processor.word_splitter, "train", rng)
+    rows = classification_rows(args, datasets, classifier, "train", rng) + entity_rows(
+        args, datasets, extractor, teacher.processor.word_splitter, "train", rng
+    )
     # The native job requires disjoint splits by text; datasets repeat texts.
     seen: set[str] = set()
     rows = [row for row in rows if not (row["text"] in seen or seen.add(row["text"]))]
@@ -132,27 +223,64 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         files = {}
         for split, items in splits.items():
             path = directory / f"{split}.jsonl"
-            path.write_text("".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in items), encoding="utf-8")
-            files[split] = {"path": path.name, "records": len(items), "sha256": oracle.sha256_file(path),
-                            "size_bytes": path.stat().st_size}
-        oracle.write_json(directory / "manifest.json", {
-            "dataset_format": "gliner_boundary_dataset.Row/version=1", "files": files,
-            "generator_sha256": oracle.sha256_file(Path(__file__)),
-            "datasets_module_sha256": oracle.sha256_file(Path(datasets.__file__)),
-            "classification_teacher": str(args.classifier), "entity_teacher": str(args.teacher_entities) if args.teacher_entities else "gold",
-            "gold_weight": args.gold_weight, "seed": args.seed, "per_dataset": args.per_dataset,
-            "label_sampling": [args.min_labels, args.max_labels], "classification_sets": CLASSIFICATION, "entity_sets": NER,
-            "provenance": provenance, "heldout_quality_claim": False,
-        })
+            path.write_text(
+                "".join(
+                    json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n"
+                    for item in items
+                ),
+                encoding="utf-8",
+            )
+            files[split] = {
+                "path": path.name,
+                "records": len(items),
+                "sha256": oracle.sha256_file(path),
+                "size_bytes": path.stat().st_size,
+            }
+        oracle.write_json(
+            directory / "manifest.json",
+            {
+                "dataset_format": "gliner_boundary_dataset.Row/version=1",
+                "files": files,
+                "generator_sha256": oracle.sha256_file(Path(__file__)),
+                "datasets_module_sha256": oracle.sha256_file(Path(datasets.__file__)),
+                "classification_teacher": str(args.classifier),
+                "entity_teacher": str(args.teacher_entities)
+                if args.teacher_entities
+                else "gold",
+                "gold_weight": args.gold_weight,
+                "seed": args.seed,
+                "per_dataset": args.per_dataset,
+                "label_sampling": [args.min_labels, args.max_labels],
+                "classification_sets": CLASSIFICATION,
+                "entity_sets": NER,
+                "provenance": provenance,
+                "heldout_quality_claim": False,
+            },
+        )
         oracle.verify_upstream_checkout(args.upstream)
-    return {"status": "built", "output": str(args.output.resolve()), **{k: v["records"] for k, v in files.items()}}
+    return {
+        "status": "built",
+        "output": str(args.output.resolve()),
+        **{k: v["records"] for k, v in files.items()},
+    }
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--upstream", type=Path, required=True)
-    parser.add_argument("--classifier", type=Path, required=True, help="GLiNER2.5-Decide checkpoint directory")
-    parser.add_argument("--teacher-entities", type=Path, help="extraction teacher (e.g. gliner2.5-base); gold spans if omitted")
+    parser.add_argument(
+        "--classifier",
+        type=Path,
+        required=True,
+        help="GLiNER2.5-Decide checkpoint directory",
+    )
+    parser.add_argument(
+        "--teacher-entities",
+        type=Path,
+        help="extraction teacher (e.g. gliner2.5-base); gold spans if omitted",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--per-dataset", type=int, default=1000)
     parser.add_argument("--min-labels", type=int, default=8)

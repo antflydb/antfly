@@ -286,6 +286,7 @@ const SegmentFileStore = struct {
     }
 
     fn mapFile(self: *SegmentFileStore, path: []const u8) ![]align(std.heap.page_size_min) u8 {
+        if (comptime builtin.os.tag == .freestanding) return error.Unsupported;
         const owner = self.storage_owner orelse return error.Unsupported;
         var permit = try owner.acquireFdPermit();
         defer permit.release();
@@ -308,19 +309,21 @@ const SegmentFileStore = struct {
         defer self.allocator.free(path);
         errdefer if (delete_final_on_error) self.delete(seg_id);
 
-        if (self.storage_owner) |owner| {
-            var admission = try NativeSegmentPublicationAdmission.init(owner);
-            defer admission.deinit();
-            var writer = try admission.beginAtomicWrite(self.allocator, path);
-            var active = true;
-            defer if (active) writer.abort();
-            try writer.appendSlice(bytes);
-            active = false;
-            writer.finish() catch |err| {
-                if (builtin.os.tag != .freestanding) std.log.warn("text segment atomic finish failed: {s}", .{@errorName(err)});
-                return err;
-            };
-            return .fromMapped(try admission.mapFile(path));
+        if (comptime builtin.os.tag != .freestanding) {
+            if (self.storage_owner) |owner| {
+                var admission = try NativeSegmentPublicationAdmission.init(owner);
+                defer admission.deinit();
+                var writer = try admission.beginAtomicWrite(self.allocator, path);
+                var active = true;
+                defer if (active) writer.abort();
+                try writer.appendSlice(bytes);
+                active = false;
+                writer.finish() catch |err| {
+                    std.log.warn("text segment atomic finish failed: {s}", .{@errorName(err)});
+                    return err;
+                };
+                return .fromMapped(try admission.mapFile(path));
+            }
         }
 
         var writer = try self.storage.beginAtomicWrite(self.allocator, path);
@@ -873,7 +876,10 @@ const meta_db_name = "meta";
 const deletions_db_name = "deletions";
 
 fn persistentStorageIo(runtime_io: ?std.Io) std.Io {
-    return runtime_io orelse std.Io.Threaded.global_single_threaded.io();
+    return runtime_io orelse if (comptime @import("builtin").os.tag == .freestanding)
+        .failing
+    else
+        std.Io.Threaded.global_single_threaded.io();
 }
 
 test "persistent storage contention yields through borrowed IO during cancellation cleanup" {
@@ -1469,14 +1475,16 @@ pub const PersistentIndex = struct {
                 } else if (segment_files) |*store| blk: {
                     const segment_path = try store.pathAlloc(seg_id);
                     defer store.allocator.free(segment_path);
-                    if (store.storage_owner != null) {
-                        break :blk index_mod.SegmentData.fromMapped(store.mapFile(segment_path) catch |err| switch (err) {
-                            error.FileNotFound => {
-                                try stale_active_ids.append(alloc, seg_id);
-                                continue;
-                            },
-                            else => return err,
-                        });
+                    if (comptime builtin.os.tag != .freestanding) {
+                        if (store.storage_owner != null) {
+                            break :blk index_mod.SegmentData.fromMapped(store.mapFile(segment_path) catch |err| switch (err) {
+                                error.FileNotFound => {
+                                    try stale_active_ids.append(alloc, seg_id);
+                                    continue;
+                                },
+                                else => return err,
+                            });
+                        }
                     }
                     const loaded = store.storage.readFileAlloc(alloc, segment_path, std.math.maxInt(usize)) catch |err| switch (err) {
                         error.FileNotFound => {
@@ -2129,7 +2137,7 @@ pub const PersistentIndex = struct {
         ctx: *anyopaque,
         build_fn: SegmentSinkBuildFn,
     ) !usize {
-        if (self.segment_files == null or self.segment_files.?.storage_owner == null) {
+        if (builtin.os.tag == .freestanding or self.segment_files == null or self.segment_files.?.storage_owner == null) {
             var sink_impl = segment_mod.MemorySegmentSink.init(self.alloc);
             errdefer sink_impl.deinit();
             var sink = sink_impl.sink();
@@ -3026,8 +3034,10 @@ pub const PersistentIndex = struct {
     }
 
     fn materializeSegmentData(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8) !index_mod.SegmentData {
-        if (self.segment_files) |*store| {
-            return try store.publish(seg_id, segment_bytes);
+        if (comptime @import("builtin").os.tag != .freestanding) {
+            if (self.segment_files) |*store| {
+                return try store.publish(seg_id, segment_bytes);
+            }
         }
         return index_mod.SegmentData.fromOwnedHeap(try self.alloc.dupe(u8, segment_bytes));
     }

@@ -228,6 +228,39 @@ Pass `busy_timeout=<seconds or datetime.timedelta>` to `create()`/`open()`
 to wait for another writer to close instead of failing immediately with
 `BusyError`, like `sqlite3_busy_timeout`.
 
+## Graph edges and index readiness
+
+`batch_json()` accepts `graph_writes` and `graph_deletes` for individual edges.
+Each operation names an existing graph index, source document, target document,
+and edge type. A write may also contain `weight`, `created_at`, `updated_at`,
+and `metadata_json` (a JSON string). These operations preserve the other edges
+on the source document. For example:
+
+```python
+db.batch_json({"graph_writes": [{
+    "index_name": "graph", "source": "node:a", "target": "node:b",
+    "edge_type": "KNOWS", "metadata_json": '{"uuid":"1"}',
+}]})
+db.batch_json({"graph_deletes": [{
+    "index_name": "graph", "source": "node:a", "target": "node:b",
+    "edge_type": "KNOWS",
+}]})
+```
+
+For document writes, omitting `_edges` preserves existing edges. Supplying
+`_edges.<index>` replaces that document's edge set for the index; an empty
+object or empty edge list clears it. `lookup()` returns stored document fields
+without `_edges`, so a lookup result cannot be used to replace the full edge
+set. Deleting a target document also removes its incident edges.
+
+`status()["stats"]["indexes"]` and `stats()["indexes"]` include
+`replay_applied_sequence` and `replay_target_sequence` for each index, along
+with `replay_catch_up_required`, `catch_up_active`, and `catch_up_phase`.
+These fields can be polled on an open handle to observe index progress.
+Check `indexes_available` in the same `stats` object before using the index
+list. If it is `false`, the apply lock was busy and that poll omitted the index
+inventory; retry until it is `true` or your own deadline expires.
+
 ## API overview
 
 - **Opening**: `create()`, `open()`, `open_readonly()`, `open_status_only()`,

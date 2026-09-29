@@ -10,8 +10,8 @@
   "qwen3-vl"
  ],
  "counts": {
-  "opKinds": 73,
-  "kernels": 456,
+  "opKinds": 74,
+  "kernels": 460,
   "routes": 25
  }
 }

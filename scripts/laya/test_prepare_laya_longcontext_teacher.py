@@ -15,7 +15,12 @@ class LayaLongContextTeacherTests(unittest.TestCase):
         self.assertEqual(teacher.shared_prefix_len([[1, 2, 3]]), 0)
 
     def test_prompt_puts_the_state_before_the_question(self):
-        record = {"text": "the state", "kind": "choice", "instruction": "which?", "labels": ["a", "b"]}
+        record = {
+            "text": "the state",
+            "kind": "choice",
+            "instruction": "which?",
+            "labels": ["a", "b"],
+        }
         prompt = teacher.build_prompt(record)
         self.assertLess(prompt.index("the state"), prompt.index("which?"))
 

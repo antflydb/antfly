@@ -55,7 +55,10 @@ CROSSNER_COMMIT = "2e7ba2a7798c961e3f29fbc51252c5a8d40224bf"
 
 CLASSIFICATION = ("banking77", "clinc150", "ag_news", "sst5", "typed_decisions")
 CROSSNER_DOMAINS = ("ai", "literature", "music", "politics", "science")
-NER = tuple(f"crossner_{domain}" for domain in CROSSNER_DOMAINS) + ("mit_restaurant", "mit_movie")
+NER = tuple(f"crossner_{domain}" for domain in CROSSNER_DOMAINS) + (
+    "mit_restaurant",
+    "mit_movie",
+)
 
 
 def _sources(name: str) -> dict[str, str]:
@@ -65,23 +68,49 @@ def _sources(name: str) -> dict[str, str]:
         return {"train": f"{base}/train.csv", "test": f"{base}/test.csv"}
     if name == "clinc150":
         base = f"{HF}/clinc/clinc_oos/resolve/{CLINC_REV}/plus"
-        return {split: f"{base}/{split}-00000-of-00001.parquet" for split in ("train", "validation", "test")}
+        return {
+            split: f"{base}/{split}-00000-of-00001.parquet"
+            for split in ("train", "validation", "test")
+        }
     if name == "ag_news":
         base = f"{HF}/fancyzhx/ag_news/resolve/{AG_NEWS_REV}/data"
-        return {split: f"{base}/{split}-00000-of-00001.parquet" for split in ("train", "test")}
+        return {
+            split: f"{base}/{split}-00000-of-00001.parquet"
+            for split in ("train", "test")
+        }
     if name == "sst5":
         base = f"{HF}/SetFit/sst5/resolve/{SST5_REV}"
-        return {"train": f"{base}/train.jsonl", "validation": f"{base}/dev.jsonl", "test": f"{base}/test.jsonl"}
+        return {
+            "train": f"{base}/train.jsonl",
+            "validation": f"{base}/dev.jsonl",
+            "test": f"{base}/test.jsonl",
+        }
     if name == "typed_decisions":
         base = f"{HF}/LocalLLaMA/typed-decisions/resolve/{TYPED_REV}/all"
-        return {split: f"{base}/{split}-00000-of-00001.parquet" for split in ("train", "test")}
-    if name.startswith("crossner_") and name[len("crossner_"):] in CROSSNER_DOMAINS:
-        base = f"{GITHUB}/zliucr/CrossNER/{CROSSNER_COMMIT}/ner_data/{name[len('crossner_'):]}"
-        return {"train": f"{base}/train.txt", "validation": f"{base}/dev.txt", "test": f"{base}/test.txt"}
+        return {
+            split: f"{base}/{split}-00000-of-00001.parquet"
+            for split in ("train", "test")
+        }
+    if name.startswith("crossner_") and name[len("crossner_") :] in CROSSNER_DOMAINS:
+        base = f"{GITHUB}/zliucr/CrossNER/{CROSSNER_COMMIT}/ner_data/{name[len('crossner_') :]}"
+        return {
+            "train": f"{base}/train.txt",
+            "validation": f"{base}/dev.txt",
+            "test": f"{base}/test.txt",
+        }
     if name in ("mit_restaurant", "mit_movie"):
-        repo, rev = ("tner/mit_restaurant", MIT_RESTAURANT_REV) if name == "mit_restaurant" else ("tner/mit_movie_trivia", MIT_MOVIE_REV)
+        repo, rev = (
+            ("tner/mit_restaurant", MIT_RESTAURANT_REV)
+            if name == "mit_restaurant"
+            else ("tner/mit_movie_trivia", MIT_MOVIE_REV)
+        )
         base = f"{HF}/{repo}/resolve/{rev}/dataset"
-        return {"train": f"{base}/train.json", "validation": f"{base}/valid.json", "test": f"{base}/test.json", "labels": f"{base}/label.json"}
+        return {
+            "train": f"{base}/train.json",
+            "validation": f"{base}/valid.json",
+            "test": f"{base}/test.json",
+            "labels": f"{base}/label.json",
+        }
     raise KeyError(f"unknown dataset: {name}")
 
 
@@ -93,7 +122,12 @@ if _PINS.exists():
 
 
 def cache_dir() -> Path:
-    return Path(os.environ.get("ANTFLY_ANTENNA_DATA", Path.home() / ".cache" / "antfly" / "antenna-datasets"))
+    return Path(
+        os.environ.get(
+            "ANTFLY_ANTENNA_DATA",
+            Path.home() / ".cache" / "antfly" / "antenna-datasets",
+        )
+    )
 
 
 def _fetch(url: str) -> bytes:
@@ -116,7 +150,10 @@ def _fetch(url: str) -> bytes:
 
 def source_pins(name: str) -> dict[str, dict[str, str]]:
     """Split -> {url, sha256} for provenance in reports."""
-    return {split: {"url": url, "sha256": hashlib.sha256(_fetch(url)).hexdigest()} for split, url in _sources(name).items()}
+    return {
+        split: {"url": url, "sha256": hashlib.sha256(_fetch(url)).hexdigest()}
+        for split, url in _sources(name).items()
+    }
 
 
 def splits(name: str) -> list[str]:
@@ -149,7 +186,12 @@ def _natural(identifier: str) -> str:
     return identifier.replace("_", " ").strip().lower()
 
 
-_AG_NEWS = {"World": "world", "Sports": "sports", "Business": "business", "Sci/Tech": "science and technology"}
+_AG_NEWS = {
+    "World": "world",
+    "Sports": "sports",
+    "Business": "business",
+    "Sci/Tech": "science and technology",
+}
 _SST5 = ["very negative", "negative", "neutral", "positive", "very positive"]
 
 
@@ -159,9 +201,14 @@ def label_names(name: str) -> list[str] | None:
         rows = csv.DictReader(io.StringIO(_fetch(_url(name, "train")).decode("utf-8")))
         return sorted({_natural(row["category"]) for row in rows})
     if name == "clinc150":
-        return ["out of scope" if raw == "oos" else _natural(raw) for raw in _parquet_label_names(_url(name, "test"), "intent")]
+        return [
+            "out of scope" if raw == "oos" else _natural(raw)
+            for raw in _parquet_label_names(_url(name, "test"), "intent")
+        ]
     if name == "ag_news":
-        return [_AG_NEWS[raw] for raw in _parquet_label_names(_url(name, "test"), "label")]
+        return [
+            _AG_NEWS[raw] for raw in _parquet_label_names(_url(name, "test"), "label")
+        ]
     if name == "sst5":
         return list(_SST5)
     if name == "typed_decisions":
@@ -177,7 +224,9 @@ def _typed_decisions(split: str) -> list[dict[str, Any]]:
             state = json.loads(state)
         except (TypeError, json.JSONDecodeError):
             pass
-        text = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
+        text = (
+            state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
+        )
         questions, gold = json.loads(case["questions"]), json.loads(case["gold"])
         for qid, question in questions.items():
             kind, criteria = question["type"], question.get("criteria")
@@ -192,17 +241,30 @@ def _typed_decisions(split: str) -> list[dict[str, Any]]:
                 keys = ["false", "true"]
                 descriptions = [str((criteria or {}).get(key) or "") for key in keys]
             else:
-                raise ValueError(f"unsupported typed-decisions question {case['id']}/{qid}")
+                raise ValueError(
+                    f"unsupported typed-decisions question {case['id']}/{qid}"
+                )
             probabilities = gold[qid]["probabilities"]
             target = [float(probabilities[key]) for key in keys]
             # Score levels are named by their description; choices and noul by key.
-            labels = descriptions if kind == "score" else [_natural(key) for key in keys]
+            labels = (
+                descriptions if kind == "score" else [_natural(key) for key in keys]
+            )
             best = max(range(len(keys)), key=lambda i: target[i])
-            records.append({
-                "id": f"{case['id']}/{qid}", "group_id": case["id"], "text": text,
-                "task": question["instructions"], "kind": kind, "keys": keys, "labels": labels,
-                "descriptions": descriptions, "target": target, "label": labels[best],
-            })
+            records.append(
+                {
+                    "id": f"{case['id']}/{qid}",
+                    "group_id": case["id"],
+                    "text": text,
+                    "task": question["instructions"],
+                    "kind": kind,
+                    "keys": keys,
+                    "labels": labels,
+                    "descriptions": descriptions,
+                    "target": target,
+                    "label": labels[best],
+                }
+            )
     return records
 
 
@@ -213,44 +275,147 @@ def load_classification(name: str, split: str) -> list[dict[str, Any]]:
         return _typed_decisions(split)
     if name == "banking77":
         rows = csv.DictReader(io.StringIO(_fetch(url).decode("utf-8")))
-        return [{"id": f"{name}/{split}/{i}", "text": row["text"], "label": _natural(row["category"])} for i, row in enumerate(rows)]
+        return [
+            {
+                "id": f"{name}/{split}/{i}",
+                "text": row["text"],
+                "label": _natural(row["category"]),
+            }
+            for i, row in enumerate(rows)
+        ]
     if name == "clinc150":
         names = label_names(name)
-        return [{"id": f"{name}/{split}/{i}", "text": row["text"], "label": names[row["intent"]]} for i, row in enumerate(_parquet(url))]
+        return [
+            {
+                "id": f"{name}/{split}/{i}",
+                "text": row["text"],
+                "label": names[row["intent"]],
+            }
+            for i, row in enumerate(_parquet(url))
+        ]
     if name == "ag_news":
         names = label_names(name)
-        return [{"id": f"{name}/{split}/{i}", "text": row["text"], "label": names[row["label"]]} for i, row in enumerate(_parquet(url))]
+        return [
+            {
+                "id": f"{name}/{split}/{i}",
+                "text": row["text"],
+                "label": names[row["label"]],
+            }
+            for i, row in enumerate(_parquet(url))
+        ]
     if name == "sst5":
-        lines = [json.loads(line) for line in _fetch(url).decode("utf-8").splitlines() if line.strip()]
-        return [{"id": f"{name}/{split}/{i}", "text": row["text"], "label": _SST5[row["label"]]} for i, row in enumerate(lines)]
+        lines = [
+            json.loads(line)
+            for line in _fetch(url).decode("utf-8").splitlines()
+            if line.strip()
+        ]
+        return [
+            {
+                "id": f"{name}/{split}/{i}",
+                "text": row["text"],
+                "label": _SST5[row["label"]],
+            }
+            for i, row in enumerate(lines)
+        ]
     raise KeyError(f"not a classification dataset: {name}")
 
 
 _CROSSNER_TYPES = {
-    "ai": ["algorithm", "conference", "country", "field", "location", "metrics", "misc", "organisation", "person",
-           "product", "programlang", "researcher", "task", "university"],
-    "literature": ["award", "book", "country", "event", "literarygenre", "location", "magazine", "misc",
-                   "organisation", "person", "poem", "writer"],
-    "music": ["album", "award", "band", "country", "event", "location", "misc", "musicalartist",
-              "musicalinstrument", "musicgenre", "organisation", "person", "song"],
-    "politics": ["country", "election", "event", "location", "misc", "organisation", "person", "politicalparty",
-                 "politician"],
-    "science": ["academicjournal", "astronomicalobject", "award", "chemicalcompound", "chemicalelement", "country",
-                "discipline", "enzyme", "event", "location", "misc", "organisation", "person", "protein",
-                "scientist", "theory", "university"],
+    "ai": [
+        "algorithm",
+        "conference",
+        "country",
+        "field",
+        "location",
+        "metrics",
+        "misc",
+        "organisation",
+        "person",
+        "product",
+        "programlang",
+        "researcher",
+        "task",
+        "university",
+    ],
+    "literature": [
+        "award",
+        "book",
+        "country",
+        "event",
+        "literarygenre",
+        "location",
+        "magazine",
+        "misc",
+        "organisation",
+        "person",
+        "poem",
+        "writer",
+    ],
+    "music": [
+        "album",
+        "award",
+        "band",
+        "country",
+        "event",
+        "location",
+        "misc",
+        "musicalartist",
+        "musicalinstrument",
+        "musicgenre",
+        "organisation",
+        "person",
+        "song",
+    ],
+    "politics": [
+        "country",
+        "election",
+        "event",
+        "location",
+        "misc",
+        "organisation",
+        "person",
+        "politicalparty",
+        "politician",
+    ],
+    "science": [
+        "academicjournal",
+        "astronomicalobject",
+        "award",
+        "chemicalcompound",
+        "chemicalelement",
+        "country",
+        "discipline",
+        "enzyme",
+        "event",
+        "location",
+        "misc",
+        "organisation",
+        "person",
+        "protein",
+        "scientist",
+        "theory",
+        "university",
+    ],
 }
 _CROSSNER_NATURAL = {
-    "academicjournal": "academic journal", "astronomicalobject": "astronomical object",
-    "chemicalcompound": "chemical compound", "chemicalelement": "chemical element",
-    "literarygenre": "literary genre", "misc": "miscellaneous", "musicalartist": "musical artist",
-    "musicalinstrument": "musical instrument", "musicgenre": "music genre", "organisation": "organization",
-    "politicalparty": "political party", "programlang": "programming language",
+    "academicjournal": "academic journal",
+    "astronomicalobject": "astronomical object",
+    "chemicalcompound": "chemical compound",
+    "chemicalelement": "chemical element",
+    "literarygenre": "literary genre",
+    "misc": "miscellaneous",
+    "musicalartist": "musical artist",
+    "musicalinstrument": "musical instrument",
+    "musicgenre": "music genre",
+    "organisation": "organization",
+    "politicalparty": "political party",
+    "programlang": "programming language",
 }
 
 
 def _raw_entity_types(name: str) -> list[str]:
     if name.startswith("crossner_"):
-        return list(_CROSSNER_TYPES[name[len("crossner_"):]])
+        return list(_CROSSNER_TYPES[name[len("crossner_") :]])
     if name in ("mit_restaurant", "mit_movie"):
         table = json.loads(_fetch(_sources(name)["labels"]))
         return sorted({tag[2:] for tag in table if tag != "O"})
@@ -302,26 +467,46 @@ def load_ner(name: str, split: str) -> list[dict[str, Any]]:
             cursor += len(token.encode("utf-8")) + 1
         entities, current = [], None
         for i, tag in enumerate(tags + ["O"]):
-            inside = tag.startswith("I-") and current is not None and current[2] == tag[2:]
+            inside = (
+                tag.startswith("I-") and current is not None and current[2] == tag[2:]
+            )
             if current is not None and not inside:
                 first, last, raw = current
-                entities.append({"start": starts[first], "end": starts[last] + len(tokens[last].encode("utf-8")),
-                                 "type": _natural_type(name, raw)})
+                entities.append(
+                    {
+                        "start": starts[first],
+                        "end": starts[last] + len(tokens[last].encode("utf-8")),
+                        "type": _natural_type(name, raw),
+                    }
+                )
                 current = None
             if tag.startswith("B-") or (tag.startswith("I-") and current is None):
                 if tag[2:] not in known:
-                    raise ValueError(f"{name}/{split}/{index}: unknown entity type {tag[2:]!r}")
+                    raise ValueError(
+                        f"{name}/{split}/{index}: unknown entity type {tag[2:]!r}"
+                    )
                 current = [i, i, tag[2:]]
             elif inside:
                 current[1] = i
-        records.append({"id": f"{name}/{split}/{index}", "text": " ".join(tokens), "tokens": tokens, "entities": entities})
+        records.append(
+            {
+                "id": f"{name}/{split}/{index}",
+                "text": " ".join(tokens),
+                "tokens": tokens,
+                "entities": entities,
+            }
+        )
     return records
 
 
 def pin(output: Path = _PINS) -> dict[str, str]:
     """Download every source and record its SHA-256 (run once when adding a source)."""
     names = CLASSIFICATION + NER
-    pins = {url: hashlib.sha256(_fetch(url)).hexdigest() for name in names for url in _sources(name).values()}
+    pins = {
+        url: hashlib.sha256(_fetch(url)).hexdigest()
+        for name in names
+        for url in _sources(name).values()
+    }
     output.write_text(json.dumps(dict(sorted(pins.items())), indent=2) + "\n")
     return pins
 
@@ -329,9 +514,19 @@ def pin(output: Path = _PINS) -> dict[str, str]:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--pin", action="store_true", help="download every source and write the SHA-256 pin file")
-    parser.add_argument("--summary", action="store_true", help="print record and label counts for every split")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--pin",
+        action="store_true",
+        help="download every source and write the SHA-256 pin file",
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="print record and label counts for every split",
+    )
     args = parser.parse_args()
     if args.pin:
         print(json.dumps({"pinned": len(pin())}))
@@ -340,11 +535,27 @@ if __name__ == "__main__":
             labels = label_names(name)
             for split in splits(name):
                 records = load_classification(name, split)
-                print(json.dumps({"name": name, "split": split, "records": len(records),
-                                  "labels": None if labels is None else len(labels)}))
+                print(
+                    json.dumps(
+                        {
+                            "name": name,
+                            "split": split,
+                            "records": len(records),
+                            "labels": None if labels is None else len(labels),
+                        }
+                    )
+                )
         for name in NER:
             for split in splits(name):
                 records = load_ner(name, split)
-                print(json.dumps({"name": name, "split": split, "records": len(records),
-                                  "entities": sum(len(r["entities"]) for r in records),
-                                  "types": len(entity_types(name))}))
+                print(
+                    json.dumps(
+                        {
+                            "name": name,
+                            "split": split,
+                            "records": len(records),
+                            "entities": sum(len(r["entities"]) for r in records),
+                            "types": len(entity_types(name)),
+                        }
+                    )
+                )

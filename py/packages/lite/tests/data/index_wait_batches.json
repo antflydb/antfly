@@ -1,0 +1,297 @@
+[
+  {
+    "node:0": {
+      "kind": "Episodic"
+    },
+    "node:1": {
+      "kind": "Episodic"
+    }
+  },
+  {
+    "node:2": {
+      "kind": "Entity",
+      "name_embedding": "VEC:node:2:name_embedding"
+    },
+    "node:3": {
+      "kind": "Entity",
+      "name_embedding": "VEC:node:3:name_embedding"
+    },
+    "node:4": {
+      "kind": "Entity",
+      "name_embedding": "VEC:node:4:name_embedding"
+    },
+    "node:5": {
+      "kind": "Entity",
+      "name_embedding": "VEC:node:5:name_embedding"
+    }
+  },
+  {
+    "edge:6": {
+      "kind": "MENTIONS"
+    },
+    "node:0": {
+      "kind": "Episodic",
+      "_edges": {
+        "graph": {
+          "MENTIONS": [
+            {
+              "target": "node:2",
+              "metadata": {
+                "uuid": "6"
+              }
+            },
+            {
+              "target": "node:3",
+              "metadata": {
+                "uuid": "7"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "edge:7": {
+      "kind": "MENTIONS"
+    },
+    "edge:8": {
+      "kind": "MENTIONS"
+    },
+    "node:1": {
+      "kind": "Episodic",
+      "_edges": {
+        "graph": {
+          "MENTIONS": [
+            {
+              "target": "node:4",
+              "metadata": {
+                "uuid": "8"
+              }
+            },
+            {
+              "target": "node:5",
+              "metadata": {
+                "uuid": "9"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "edge:9": {
+      "kind": "MENTIONS"
+    }
+  },
+  {
+    "edge:10": {
+      "kind": "RELATES_TO",
+      "fact_embedding": "VEC:edge:10:fact_embedding"
+    },
+    "node:2": {
+      "kind": "Entity",
+      "name_embedding": "VEC:node:2:name_embedding",
+      "_edges": {
+        "graph": {
+          "RELATES_TO": [
+            {
+              "target": "node:3",
+              "metadata": {
+                "uuid": "10"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "edge:11": {
+      "kind": "RELATES_TO",
+      "fact_embedding": "VEC:edge:11:fact_embedding"
+    },
+    "node:4": {
+      "kind": "Entity",
+      "name_embedding": "VEC:node:4:name_embedding",
+      "_edges": {
+        "graph": {
+          "RELATES_TO": [
+            {
+              "target": "node:5",
+              "metadata": {
+                "uuid": "11"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "node:12": {
+      "kind": "Entity",
+      "name_embedding": "VEC:node:12:name_embedding"
+    }
+  },
+  {
+    "node:13": {
+      "kind": "Entity",
+      "name_embedding": "VEC:node:13:name_embedding"
+    }
+  },
+  {
+    "node:14": {
+      "kind": "Entity",
+      "name_embedding": "VEC:node:14:name_embedding"
+    }
+  },
+  {
+    "node:15": {
+      "kind": "Entity",
+      "name_embedding": "VEC:node:15:name_embedding"
+    }
+  },
+  {
+    "node:16": {
+      "kind": "Community",
+      "name_embedding": "VEC:node:16:name_embedding"
+    }
+  },
+  {
+    "node:17": {
+      "kind": "Community",
+      "name_embedding": "VEC:node:17:name_embedding"
+    }
+  },
+  {
+    "edge:18": {
+      "kind": "RELATES_TO",
+      "fact_embedding": "VEC:edge:18:fact_embedding"
+    },
+    "node:12": {
+      "kind": "Entity",
+      "name_embedding": "VEC:node:12:name_embedding",
+      "_edges": {
+        "graph": {
+          "RELATES_TO": [
+            {
+              "target": "node:15",
+              "metadata": {
+                "uuid": "18"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "edge:19": {
+      "kind": "RELATES_TO",
+      "fact_embedding": "VEC:edge:19:fact_embedding"
+    },
+    "node:13": {
+      "kind": "Entity",
+      "name_embedding": "VEC:node:13:name_embedding",
+      "_edges": {
+        "graph": {
+          "RELATES_TO": [
+            {
+              "target": "node:15",
+              "metadata": {
+                "uuid": "19"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "edge:20": {
+      "kind": "RELATES_TO",
+      "fact_embedding": "VEC:edge:20:fact_embedding"
+    },
+    "node:14": {
+      "kind": "Entity",
+      "name_embedding": "VEC:node:14:name_embedding",
+      "_edges": {
+        "graph": {
+          "RELATES_TO": [
+            {
+              "target": "node:15",
+              "metadata": {
+                "uuid": "20"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "edge:21": {
+      "kind": "HAS_MEMBER"
+    },
+    "node:16": {
+      "kind": "Community",
+      "name_embedding": "VEC:node:16:name_embedding",
+      "_edges": {
+        "graph": {
+          "HAS_MEMBER": [
+            {
+              "target": "node:12",
+              "metadata": {
+                "uuid": "21"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "edge:22": {
+      "kind": "HAS_MEMBER"
+    },
+    "node:16": {
+      "kind": "Community",
+      "name_embedding": "VEC:node:16:name_embedding",
+      "_edges": {
+        "graph": {
+          "HAS_MEMBER": [
+            {
+              "target": "node:12",
+              "metadata": {
+                "uuid": "21"
+              }
+            },
+            {
+              "target": "node:13",
+              "metadata": {
+                "uuid": "22"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "edge:23": {
+      "kind": "HAS_MEMBER"
+    },
+    "node:17": {
+      "kind": "Community",
+      "name_embedding": "VEC:node:17:name_embedding",
+      "_edges": {
+        "graph": {
+          "HAS_MEMBER": [
+            {
+              "target": "node:14",
+              "metadata": {
+                "uuid": "23"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+]
