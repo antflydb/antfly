@@ -2096,6 +2096,15 @@ pub const IndexManager = struct {
             config_hash: u64,
             published_count: u64,
         } = null,
+        recovered_native_serving_certificate: ?struct {
+            capture_incarnation: u64,
+            applied_sequence: u64,
+            generation: u64,
+            config_hash: u64,
+            published_count: u64,
+            native_count: u64,
+            source_sequence: u64,
+        } = null,
         config: types.IndexConfig,
         field_name: []u8,
         dims: u32,
@@ -2161,6 +2170,51 @@ pub const IndexManager = struct {
             while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
             defer self.serving_certificate_mutex.unlock();
             return self.matchesVerifiedServingCertificate(checkpoint, certified_count);
+        }
+
+        /// A native WAL generation loaded at open is durable even when a
+        /// newer sidecar count was written for an unfinished source window.
+        /// This fallback is minted only at open, never by a status read.
+        pub fn validateRecoveredNativeServingCertificate(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) bool {
+            const certified_count = checkpoint.published_count orelse return false;
+            const snapshot = self.index.nativeServingSnapshot() orelse return false;
+            if (snapshot.active_count == 0 or snapshot.active_count == certified_count or
+                snapshot.source_sequence < checkpoint.applied_sequence) return false;
+            while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.serving_certificate_mutex.unlock();
+            self.recovered_native_serving_certificate = .{
+                .capture_incarnation = self.capture_incarnation,
+                .applied_sequence = checkpoint.applied_sequence,
+                .generation = checkpoint.generation,
+                .config_hash = checkpoint.config_hash,
+                .published_count = certified_count,
+                .native_count = snapshot.active_count,
+                .source_sequence = snapshot.source_sequence,
+            };
+            std.log.warn(
+                "dense serving sidecar ahead of recovered native WAL index={s} sidecar_vectors={} native_vectors={} source_sequence={}",
+                .{ self.config.name, certified_count, snapshot.active_count, snapshot.source_sequence },
+            );
+            return true;
+        }
+
+        pub fn hasRecoveredNativeServingCertificate(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) bool {
+            const certified_count = checkpoint.published_count orelse return false;
+            while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
+            const recovered = self.recovered_native_serving_certificate orelse {
+                self.serving_certificate_mutex.unlock();
+                return false;
+            };
+            const matches = recovered.capture_incarnation == self.capture_incarnation and
+                recovered.applied_sequence == checkpoint.applied_sequence and
+                recovered.generation == checkpoint.generation and
+                recovered.config_hash == checkpoint.config_hash and
+                recovered.published_count == certified_count;
+            self.serving_certificate_mutex.unlock();
+            if (!matches) return false;
+            const snapshot = self.index.nativeServingSnapshot() orelse return false;
+            return snapshot.source_sequence >= recovered.source_sequence and
+                snapshot.active_count >= recovered.native_count;
         }
     };
 

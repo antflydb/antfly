@@ -35315,7 +35315,14 @@ pub const DB = struct {
     fn validateOpenedDenseServingCertificates(self: *DB) void {
         for (self.core.index_manager.dense_indexes.items) |*entry| {
             const checkpoint = self.core.loadProjectionCheckpoint(self.alloc, entry.config.name) catch continue;
-            _ = entry.validateServingCertificate(checkpoint);
+            if (!entry.validateServingCertificate(checkpoint)) {
+                // A newer sidecar may have observed an in-flight source
+                // window. On reopen, the native WAL's immutable generation
+                // still proves its earlier durable prefix. Record this only
+                // at the open boundary; status must never certify a later
+                // coincidental live count.
+                _ = entry.validateRecoveredNativeServingCertificate(checkpoint);
+            }
         }
     }
 
@@ -35336,14 +35343,16 @@ pub const DB = struct {
         };
         if (!installed or self.observeResidentIndexAdmission(alloc, item.name, preloaded_repair_state) != .admitted) return false;
         if (item.kind == .dense_vector) {
+            const entry = self.core.denseIndex(item.name) orelse return false;
             if (item.projection_checkpoint_published_count) |certified| {
-                const entry = self.core.denseIndex(item.name) orelse return false;
-                if (!entry.hasValidatedServingCertificate(.{
+                const checkpoint: apply_state.ProjectionCheckpoint = .{
                     .applied_sequence = item.projection_checkpoint_applied_sequence,
                     .generation = item.projection_checkpoint_generation,
                     .config_hash = item.projection_checkpoint_config_hash,
                     .published_count = certified,
-                })) return false;
+                };
+                if (!entry.hasValidatedServingCertificate(checkpoint) and
+                    !entry.hasRecoveredNativeServingCertificate(checkpoint)) return false;
             } else if (item.coverage_produced_count != 0) {
                 if (self.core.index_manager.get(item.name)) |cfg| {
                     // Older checkpoints have no count certificate. For managed
@@ -35792,6 +35801,30 @@ pub const DB = struct {
         };
     }
 
+    const DenseServingCounts = struct { doc_count: u64, node_count: u64, root_node: u64, revision: u64 };
+
+    fn denseServingCounts(index: *hbc_mod.HBCIndex) DenseServingCounts {
+        if (index.nativeServingSnapshot()) |serving_snapshot| return .{
+            .doc_count = serving_snapshot.active_count,
+            .node_count = serving_snapshot.node_count,
+            .root_node = serving_snapshot.root_node,
+            .revision = serving_snapshot.publish_generation,
+        };
+        if (index.experimentalPostingWalAuthoritative()) return .{
+            .doc_count = 0,
+            .node_count = 0,
+            .root_node = 0,
+            .revision = 0,
+        };
+        const published = index.publishedStats();
+        return .{
+            .doc_count = published.stats.active_count,
+            .node_count = published.stats.node_count,
+            .root_node = published.stats.root_node,
+            .revision = published.generation,
+        };
+    }
+
     fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
         // These bytes enter compressed durable tables, so even a diagnostic
         // timestamp can change disk usage and subsequent placement decisions.
@@ -35808,10 +35841,10 @@ pub const DB = struct {
             };
         }
         if (index_manager.denseIndex(index_name)) |entry| {
-            const dense_stats = entry.index.stats();
+            const dense_stats = denseServingCounts(entry.index);
             return .{
                 .kind = .dense_vector,
-                .doc_count = dense_stats.active_count,
+                .doc_count = dense_stats.doc_count,
                 .node_count = dense_stats.node_count,
                 .root_node = dense_stats.root_node,
                 .updated_at_ns = now,
@@ -36449,10 +36482,10 @@ pub const DB = struct {
                 },
                 .dense_vector => {
                     if (self.core.denseIndex(item.name)) |entry| {
-                        const hbc_stats = entry.index.stats();
-                        item.doc_count = hbc_stats.active_count;
-                        item.node_count = hbc_stats.node_count;
-                        item.root_node = hbc_stats.root_node;
+                        const serving = denseServingCounts(entry.index);
+                        item.doc_count = serving.doc_count;
+                        item.node_count = serving.node_count;
+                        item.root_node = serving.root_node;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         item.hbc_posting.refresh_pending = entry.index.postingRefreshPending();
                     }
@@ -38285,12 +38318,11 @@ pub const DB = struct {
                 },
                 .dense_vector => {
                     if (self.core.denseIndex(cfg.name)) |entry| {
-                        const published = entry.index.publishedStats();
-                        const hbc_stats = published.stats;
-                        item.doc_count = hbc_stats.active_count;
-                        item.node_count = hbc_stats.node_count;
-                        item.root_node = hbc_stats.root_node;
-                        item.serving_snapshot_revision = published.generation;
+                        const serving = denseServingCounts(entry.index);
+                        item.doc_count = serving.doc_count;
+                        item.node_count = serving.node_count;
+                        item.root_node = serving.root_node;
+                        item.serving_snapshot_revision = serving.revision;
                         item.serving_snapshot_owner_id = self.backend_owner_id;
                         serving_observed = true;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
@@ -38545,10 +38577,10 @@ pub const DB = struct {
                 },
                 .dense_vector => {
                     if (self.core.denseIndex(cfg.name)) |entry| {
-                        const hbc_stats = entry.index.stats();
-                        item.doc_count = hbc_stats.active_count;
-                        item.node_count = hbc_stats.node_count;
-                        item.root_node = hbc_stats.root_node;
+                        const serving = denseServingCounts(entry.index);
+                        item.doc_count = serving.doc_count;
+                        item.node_count = serving.node_count;
+                        item.root_node = serving.root_node;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         item.hbc_posting = dbHbcPostingStats(try entry.index.postingBacklogStats(), entry.index.getWriteProfile());
                         item.hbc_posting.refresh_pending = entry.index.postingRefreshPending();
@@ -115221,6 +115253,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
         for (ahead_stats.indexes) |index_stats| {
             if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
             try std.testing.expect(index_stats.serving_snapshot_ready);
+            try std.testing.expectEqual(target_before, index_stats.doc_count);
         }
     }
 
@@ -115240,6 +115273,24 @@ test "db progressive managed admission serves a checkpointed partial generation"
     for (mismatched_stats.indexes) |index_stats| {
         if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
         try std.testing.expect(!index_stats.serving_snapshot_ready);
+    }
+    // Reopen may recover an older immutable native WAL prefix while a
+    // sidecar names a later unfinished source window. Only that explicit
+    // open-boundary proof may keep the older prefix queryable; the live
+    // mismatched certificate above remains closed.
+    {
+        const entry = db.core.denseIndex(cfg.name) orelse return error.IndexNotFound;
+        var advanced_checkpoint = certified_checkpoint;
+        advanced_checkpoint.published_count = target_before + 1;
+        try std.testing.expect(entry.validateRecoveredNativeServingCertificate(advanced_checkpoint));
+        const recovered_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, recovered_stats);
+        for (recovered_stats.indexes) |index_stats| {
+            if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+            try std.testing.expect(index_stats.serving_snapshot_ready);
+            try std.testing.expectEqual(target_before, index_stats.doc_count);
+        }
+        entry.recovered_native_serving_certificate = null;
     }
     // A later live write can happen to reach the invalid certificate's
     // cardinality. Status may observe it, but only a publication boundary may

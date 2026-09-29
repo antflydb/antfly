@@ -1909,7 +1909,8 @@ def test_progressive_publication_remains_queryable_across_process_restart(
                 )
             ):
                 return None
-            if int(status.get("searchable_vectors", 0)) <= 0:
+            searchable = int(status.get("searchable_vectors", 0))
+            if searchable <= 0:
                 return None
             # Restart from a genuinely observed partial checkpoint, not the
             # intentionally conservative handoff snapshot where last-known
@@ -1935,7 +1936,12 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         )
         incarnation = before["incarnation"]
         searchable_vectors = before["searchable_vectors"]
-        covered_sources = before["source_coverage"]["covered"]
+        # Each source produces two chunks. Source outcomes for the next
+        # window can be observed before its native posting WAL commits; only
+        # the immutable serving vectors are the restart baseline.
+        covered_sources = min(
+            before["source_coverage"]["covered"], searchable_vectors // 2
+        )
         assert 0 < covered_sources < len(documents)
         assert searchable_vectors > covered_sources
         assert before["source_coverage"]["pending"] > 0
@@ -1986,6 +1992,7 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         )
         assert after is not None, __import__("json").dumps(
             {
+                "before_restart": before,
                 "index": stateful_api.get_index(table_name, index_name),
                 "logs": stateful_api.debug_logs(),
             },
