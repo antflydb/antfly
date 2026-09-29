@@ -74,4 +74,6 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../../zig/ROADMAP.md).
 - [Apache Lite and inference licensing](../reference/licensing/history/apache2-lite-inference-2026-09.md) — implementation, review, packaging, and WASM validation.
 - [Laya qualification](inference/history/laya/qualification.md) — measured CPU/Metal accuracy and performance.
 - [Laya investigation](inference/history/laya/support-investigation.md) — original placement decisions and implementation follow-up.
+- [Laya implementation logs](inference/history/laya/README.md) — dated training and runtime evidence.
+- [Antenna implementation logs](inference/history/antenna/README.md) — baselines, pilot, and native distillation evidence.
 - [Relational indexes extraction](relational/history/indexes-extraction.md) — extraction ledger; current restore design is [here](relational-restore-architecture.md).

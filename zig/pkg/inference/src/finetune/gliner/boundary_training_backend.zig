@@ -361,6 +361,36 @@ pub const Bindings = struct {
     }
 };
 
+/// A standalone Metal compute for forward-only work outside a training owner
+/// (the Antenna neck fit). Tensors created on it must be freed before deinit.
+pub const ScratchMetal = struct {
+    allocator: Allocator,
+    owner: *MetalOwner,
+
+    pub fn init(a: Allocator) !ScratchMetal {
+        return .{ .allocator = a, .owner = try createMetal(a) };
+    }
+
+    pub fn computeBackend(self: *ScratchMetal) ops.ComputeBackend {
+        if (comptime !build_options.enable_metal) unreachable;
+        return self.owner.backend.computeBackend();
+    }
+
+    pub fn deinit(self: *ScratchMetal) void {
+        if (comptime build_options.enable_metal) {
+            const runtime = self.owner.backend.provider_impl.raw_decode_runtime;
+            if (metal_runtime.hasActiveFrame(runtime)) metal_runtime.cancelFrame(runtime) catch {};
+            if (metal_runtime.hasSubmittedFrame(runtime)) metal_runtime.waitFrame(runtime) catch {};
+            self.owner.backend.deinit();
+            metal.deinitSharedNativeProvider(&self.owner.store);
+            metal.deinitPrefetchQueue(&self.owner.store);
+            self.owner.store.lazy_weights.deinit(self.allocator);
+            self.allocator.destroy(self.owner);
+        }
+        self.* = undefined;
+    }
+};
+
 fn createMetal(a: Allocator) !*MetalOwner {
     if (comptime !build_options.enable_metal) return error.UnsupportedBoundaryTrainingBackend;
     if (!metal_runtime.metalDeviceAvailable()) return error.MetalDeviceUnavailable;

@@ -64,6 +64,8 @@ pub const Terms = struct {
     record_object: f32 = 0,
     record_field: f32 = 0,
     relation: f32 = 0,
+    /// Antenna feature distillation (boundary_distillation.zig), weighted.
+    distillation: f32 = 0,
     total: f32 = 0,
 };
 pub const Input = struct {

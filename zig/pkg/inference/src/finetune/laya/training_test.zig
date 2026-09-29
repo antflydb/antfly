@@ -56,8 +56,26 @@ test "laya training ReLU uses the PyTorch zero subgradient" {
 }
 
 test "laya training forward objective and every parameter gradient match PyTorch" {
+    try exerciseGradientParity(std.testing.allocator, false);
+}
+
+// Same reference fixture, but through the flash-style fused segment
+// attention graph (roadmap step 2c) instead of the dense materialized-bias
+// one. The reference gradients were computed against upstream's dense
+// attention; this checks the fused op does not move the relative L2 error
+// materially away from the dense path's (LAYA.md, "Verification":
+// 0.4-0.6% worst per-layer relative L2 on the released-model fixture).
+test "laya training forward objective and every parameter gradient match PyTorch (fused segment attention)" {
+    try exerciseGradientParity(std.testing.allocator, true);
+}
+
+fn exerciseGradientParity(a: std.mem.Allocator, use_fused_attention: bool) !void {
     const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
-    const a = std.testing.allocator;
+    // The fused kernel sums in a different tile order than the dense
+    // generic matmul/softmax path, so it earns a looser (but still tight)
+    // tolerance here rather than sharing the dense path's exact bound.
+    const abs_tol: f32 = if (use_fused_attention) 2e-3 else 2e-4;
+    const mismatch_scale: f32 = if (use_fused_attention) 0.02 else 0.002;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -78,13 +96,13 @@ test "laya training forward objective and every parameter gradient match PyTorch
     for (examples, ref.sequences, ref.targets) |*dst, seq, target| dst.* = .{ .ids = seq.ids, .markers = seq.markers, .kind = @enumFromInt(seq.qtype), .target = target[0..seq.markers.len] };
     const config_path = try std.fmt.allocPrint(scratch, "{s}/model/config.json", .{root});
     const config = try modern.parseConfig(scratch, try files.readFile(scratch, config_path));
-    var program = try train.Program.init(a, config, try train.layout(examples), 0);
+    var program = try train.Program.initFrozenFused(a, config, try train.bucketedLayout(examples, config), 0, 0, null, use_fused_attention);
     defer program.deinit();
     var weights = try safetensors.MMapReader.openFileAbsolute(a, try std.fmt.allocPrint(scratch, "{s}/model/model.safetensors", .{root}));
     defer weights.deinit();
     var expected_gradients = try safetensors.MMapReader.openFileAbsolute(a, try std.fmt.allocPrint(scratch, "{s}/gradients.safetensors", .{root}));
     defer expected_gradients.deinit();
-    const parameters = try train.parameters(scratch, &program.graph, &weights);
+    const parameters = try train.parameters(scratch, &program.graph, &weights, 0, null, 0);
     const originals = try scratch.alloc(run.Parameter, parameters.len);
     for (parameters, originals) |p, *o| o.* = .{ .name = p.name, .canonical_name = p.name, .dimensions = p.dimensions, .values = p.values, .kind = .original };
     var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
@@ -97,7 +115,7 @@ test "laya training forward objective and every parameter gradient match PyTorch
     var trainer = try train.controller.Trainer.init(a, cb, parameters, .{ .execution = execution, .limits = .{ .max_state_bytes = 16 * 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0.000025 } }, .{ .schedule = .{ .constant = 0.0001 } } } });
     defer trainer.deinit();
     var prng = std.Random.DefaultPrng.init(715);
-    const runtime = try train.inputs(scratch, cb, &program.graph, program.built, config, examples, prng.random(), false);
+    const runtime = try train.inputs(scratch, cb, &program.graph, program.built, config, examples, prng.random(), false, use_fused_attention);
     defer for (runtime) |input| cb.free(input.value);
     var binding = try trainer.bind(&program.graph, null);
     defer binding.deinit();
@@ -107,31 +125,41 @@ test "laya training forward objective and every parameter gradient match PyTorch
         try program.graph.markOutput(entry.node);
         try program.gradients.graph.markOutput(program.gradients.id_map[entry.node]);
     };
-    var forward = try interpreter.execute(a, &program.graph, cb, .{ .runtime_inputs = combined, .strict_integer_constants = true });
+    // The trainer's execution path (a batched command frame on Metal).
+    var forward = try train.executeFramed(a, &program.graph, cb, combined);
     defer forward.deinit(cb);
     if (trace) try compareTraces(scratch, root, &program, cb, forward.outputs[1..], "forward");
     const logits = try cb.toFloat32(forward.outputs[0], scratch);
-    const l = try train.layout(examples);
-    for (examples, ref.logits, 0..) |e, expected, row| for (0..e.target.len) |k| try std.testing.expectApproxEqAbs(expected[k], logits[row * l.options + k], 2e-4);
+    const l = try train.bucketedLayout(examples, config);
+    for (examples, ref.logits, 0..) |e, expected, row| for (0..e.target.len) |k| try std.testing.expectApproxEqAbs(expected[k], logits[row * l.options + k], abs_tol);
     const rows = try scratch.alloc(objective.Row, examples.len);
     for (rows, examples) |*row, e| row.* = .{ .kind = e.kind, .target = e.target };
-    const loss = try objective.evaluate(a, .{}, rows, l.options, logits, ref.noise);
+    // The PyTorch noise has the unpadded option width; the graph's options are
+    // bucketed. Score the unpadded logits and pad the cotangent back.
+    const width = (try train.layout(examples)).options;
+    const compact = try scratch.alloc(f32, examples.len * width);
+    for (0..examples.len) |row| @memcpy(compact[row * width ..][0..width], logits[row * l.options ..][0..width]);
+    const loss = try objective.evaluate(a, .{}, rows, width, compact, ref.noise);
     defer loss.deinit(a);
-    try std.testing.expectApproxEqAbs(ref.loss, loss.loss, 2e-4);
-    try std.testing.expectApproxEqAbs(ref.ce, loss.ce, 2e-4);
-    try std.testing.expectApproxEqAbs(ref.policy, loss.policy, 2e-4);
-    try std.testing.expectApproxEqAbs(ref.reward, loss.reward, 2e-4);
-    for (ref.cotangent, loss.gradient) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 2e-4);
+    const cotangent = try scratch.alloc(f32, logits.len);
+    @memset(cotangent, 0);
+    for (0..examples.len) |row| @memcpy(cotangent[row * l.options ..][0..width], loss.gradient[row * width ..][0..width]);
+    try std.testing.expectApproxEqAbs(ref.loss, loss.loss, abs_tol);
+    try std.testing.expectApproxEqAbs(ref.ce, loss.ce, abs_tol);
+    try std.testing.expectApproxEqAbs(ref.policy, loss.policy, abs_tol);
+    try std.testing.expectApproxEqAbs(ref.reward, loss.reward, abs_tol);
+    for (ref.cotangent, loss.gradient) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, abs_tol);
     const backward_inputs = try scratch.alloc(interpreter.RuntimeInput, combined.len + 1);
     for (combined, backward_inputs[0..combined.len]) |input, *dst| dst.* = .{ .node_id = program.gradients.id_map[input.node_id], .value = input.value };
-    const seed = try cb.fromFloat32Shape(loss.gradient, &.{ @intCast(l.batch), @intCast(l.options) });
+    const seed = try cb.fromFloat32Shape(cotangent, &.{ @intCast(l.questions), @intCast(l.options) });
     defer cb.free(seed);
     backward_inputs[combined.len] = .{ .node_id = program.gradients.id_map[program.seed], .value = seed };
-    var backward = try interpreter.execute(a, &program.gradients.graph, cb, .{ .runtime_inputs = backward_inputs, .strict_integer_constants = true });
+    var backward = try train.executeFramed(a, &program.gradients.graph, cb, backward_inputs);
     defer backward.deinit(cb);
     if (trace) try compareTraces(scratch, root, &program, cb, backward.outputs[program.wrt.len..], "backward");
     var worst: f32 = 0;
     var mismatches: usize = 0;
+    var worst_relative: f64 = 0;
     for (program.wrt, backward.outputs[0..program.wrt.len]) |id, output| {
         const name = program.graph.parameterName(program.graph.node(id));
         var expected_tensor = try expected_gradients.readTensor(name);
@@ -151,12 +179,13 @@ test "laya training forward objective and every parameter gradient match PyTorch
             expected_sq += @as(f64, want) * want;
         }
         worst = @max(worst, error_max);
-        if (error_max > 5e-5 + magnitude * 0.002) {
+        worst_relative = @max(worst_relative, @sqrt(error_sq / @max(expected_sq, 1e-30)));
+        if (error_max > 5e-5 + magnitude * mismatch_scale) {
             std.debug.print("Laya gradient mismatch {s}: error={d} scale={d} relative_l2={d}\n", .{ name, error_max, magnitude, @sqrt(error_sq / @max(expected_sq, 1e-30)) });
             mismatches += 1;
         }
     }
-    std.debug.print("Laya {s}: {d} gradient tensors, max absolute error={d}\n", .{ @tagName(execution), program.wrt.len, worst });
+    std.debug.print("Laya {s} fused_attention={} : {d} gradient tensors, max absolute error={d}, max relative L2 error={d}\n", .{ @tagName(execution), use_fused_attention, program.wrt.len, worst, worst_relative });
     try std.testing.expectEqual(@as(usize, 0), mismatches);
 }
 
@@ -205,15 +234,16 @@ test "laya training interrupted accumulation resumes to identical serving weight
         .head_lr = 0.001,
         .head_dropout = 0.1,
     };
-    try job.execute(a, io, c);
+    var admission = @import("../../runtime/tier/memory.zig").AdmissionController{};
+    try job.execute(a, io, c, &admission);
     const full_weights = try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" });
     c.output_dir = try std.fs.path.join(scratch, &.{ directory, "paused" });
     c.stop_after_microbatches = 1;
-    try job.execute(a, io, c);
+    try job.execute(a, io, c, &admission);
     c.resume_from = try std.fs.path.join(scratch, &.{ c.output_dir, "latest.safetensors" });
     c.output_dir = try std.fs.path.join(scratch, &.{ directory, "resumed" });
     c.stop_after_microbatches = null;
-    try job.execute(a, io, c);
+    try job.execute(a, io, c, &admission);
     const resumed_weights = try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" });
     const digest = @import("data.zig").digest;
     try std.testing.expectEqual(digest(try files.readFile(scratch, full_weights)), digest(try files.readFile(scratch, resumed_weights)));
@@ -223,6 +253,138 @@ test "laya training interrupted accumulation resumes to identical serving weight
     defer session.close();
     const exported = factory.getLayaConfig(session) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(f32, 1), exported.scale(.choice, 3));
+}
+
+test "laya training with frozen lower layers keeps them exact and trains the rest" {
+    const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
+    const job = @import("job.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const directory = try temp.dir.realPathFileAlloc(io, ".", scratch);
+    const c = job.Config{
+        .model_dir = try std.fs.path.join(scratch, &.{ root, "model" }),
+        .train_file = try std.fs.path.join(scratch, &.{ root, "train.jsonl" }),
+        .eval_file = try std.fs.path.join(scratch, &.{ root, "eval.jsonl" }),
+        .output_dir = try std.fs.path.join(scratch, &.{ directory, "frozen" }),
+        .backend = if (platform.env.getenv("ANTFLY_LAYA_METAL") != null) .metal else .cpu,
+        .epochs = 1,
+        .batch_size = 2,
+        .encoder_lr = 0.001,
+        .head_lr = 0.001,
+        .freeze_layers = 1,
+    };
+    var admission = @import("../../runtime/tier/memory.zig").AdmissionController{};
+    try job.execute(a, io, c, &admission);
+    var source = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ root, "model", "model.safetensors" }));
+    defer source.deinit();
+    var exported = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" }));
+    defer exported.deinit();
+    var frozen_count: usize = 0;
+    var trainable_moved = false;
+    var names = source.header.tensors.iterator();
+    while (names.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (!std.mem.startsWith(u8, name, "encoder.")) continue;
+        var before = try source.readTensor(name);
+        defer before.deinit();
+        var after = try exported.readTensor(name);
+        defer after.deinit();
+        const want = try train.floatValues(scratch, before);
+        const got = try train.floatValues(scratch, after);
+        if (train.frozen(name, c.freeze_layers, null)) {
+            frozen_count += 1;
+            try std.testing.expectEqualSlices(f32, want, got);
+        } else if (std.mem.startsWith(u8, name, "encoder.layers.") and !std.mem.eql(f32, want, got)) {
+            trainable_moved = true;
+        }
+    }
+    try std.testing.expect(frozen_count > 0);
+    try std.testing.expect(trainable_moved);
+}
+
+test "laya training with lora adapts only its targets, merges them at export, and resumes exactly" {
+    const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
+    const job = @import("job.zig");
+    const architecture = @import("graph.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const directory = try temp.dir.realPathFileAlloc(io, ".", scratch);
+    var c = job.Config{
+        .model_dir = try std.fs.path.join(scratch, &.{ root, "model" }),
+        .train_file = try std.fs.path.join(scratch, &.{ root, "train.jsonl" }),
+        .eval_file = try std.fs.path.join(scratch, &.{ root, "eval.jsonl" }),
+        .output_dir = try std.fs.path.join(scratch, &.{ directory, "lora" }),
+        .backend = if (platform.env.getenv("ANTFLY_LAYA_METAL") != null) .metal else .cpu,
+        .epochs = 1,
+        .batch_size = 2,
+        .encoder_lr = 0.01,
+        .head_lr = 0.01,
+        .lora = .{ .rank = 4, .alpha = 8, .targets = &.{ "encoder", "head" } },
+    };
+    const lora = architecture.Targets{ .encoder = true, .head = true };
+    var admission = @import("../../runtime/tier/memory.zig").AdmissionController{};
+    try job.execute(a, io, c, &admission);
+    var resume_state = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ c.output_dir, "latest.safetensors" }));
+    defer resume_state.deinit();
+    var saw_lora_a = false;
+    var saw_lora_b = false;
+    {
+        var names = resume_state.header.tensors.iterator();
+        while (names.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (std.mem.endsWith(u8, name, ".lora_A")) saw_lora_a = true;
+            if (std.mem.endsWith(u8, name, ".lora_B")) saw_lora_b = true;
+        }
+    }
+    // Adapters are ordinary optimizer-tracked parameters, so resume covers them.
+    try std.testing.expect(saw_lora_a);
+    try std.testing.expect(saw_lora_b);
+    var source = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ root, "model", "model.safetensors" }));
+    defer source.deinit();
+    var exported = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" }));
+    defer exported.deinit();
+    var adapted_weight = false;
+    var names = source.header.tensors.iterator();
+    while (names.next()) |entry| {
+        const name = entry.key_ptr.*;
+        // A merged checkpoint never carries the adapters themselves.
+        try std.testing.expect(!std.mem.endsWith(u8, name, ".lora_A"));
+        try std.testing.expect(!std.mem.endsWith(u8, name, ".lora_B"));
+        var before = try source.readTensor(name);
+        defer before.deinit();
+        var after = try exported.readTensor(name);
+        defer after.deinit();
+        const want = try train.floatValues(scratch, before);
+        const got = try train.floatValues(scratch, after);
+        if (architecture.isLoraWeight(name, lora)) {
+            if (!std.mem.eql(f32, want, got)) adapted_weight = true;
+        } else if (architecture.isLoraFrozen(name, lora)) {
+            // A targeted linear's bias is never part of the low-rank delta.
+            try std.testing.expectEqualSlices(f32, want, got);
+        }
+    }
+    try std.testing.expect(adapted_weight);
+    const full_weights = try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" });
+    c.output_dir = try std.fs.path.join(scratch, &.{ directory, "paused" });
+    c.stop_after_microbatches = 1;
+    try job.execute(a, io, c, &admission);
+    c.resume_from = try std.fs.path.join(scratch, &.{ c.output_dir, "latest.safetensors" });
+    c.output_dir = try std.fs.path.join(scratch, &.{ directory, "resumed" });
+    c.stop_after_microbatches = null;
+    try job.execute(a, io, c, &admission);
+    const resumed_weights = try std.fs.path.join(scratch, &.{ c.output_dir, "model", "model.safetensors" });
+    const digest = @import("data.zig").digest;
+    try std.testing.expectEqual(digest(try files.readFile(scratch, full_weights)), digest(try files.readFile(scratch, resumed_weights)));
 }
 
 test "laya finetuned export probabilities and tokenization match PyTorch" {
@@ -337,4 +499,33 @@ test "laya finetuned export probabilities and tokenization match PyTorch" {
         }
     }
     std.debug.print("Laya finetuned export backend={s}, max probability error={d}\n", .{ @tagName(session.backend()), worst });
+}
+
+test "laya frozen layers cover embeddings and the lowest encoder layers only" {
+    try std.testing.expect(!train.frozen("encoder.embeddings.tok_embeddings.weight", 0, null));
+    try std.testing.expect(train.frozen("encoder.embeddings.tok_embeddings.weight", 1, null));
+    try std.testing.expect(train.frozen("encoder.embeddings.norm.weight", 2, null));
+    try std.testing.expect(train.frozen("encoder.layers.1.attn.Wqkv.weight", 2, null));
+    try std.testing.expect(!train.frozen("encoder.layers.2.attn.Wqkv.weight", 2, null));
+    try std.testing.expect(!train.frozen("encoder.layers.12.mlp.Wo.weight", 2, null));
+    try std.testing.expect(!train.frozen("encoder.final_norm.weight", 22, null));
+    try std.testing.expect(!train.frozen("head.layers.0.attn.Wqkv.weight", 22, null));
+}
+
+test "laya lora freezes only its targeted linear weights and biases, on top of frozen layers" {
+    const architecture = @import("graph.zig");
+    const encoder_only = architecture.Lora{ .rank = 8, .alpha = 16, .targets = .{ .encoder = true } };
+    try std.testing.expect(train.frozen("encoder.layers.5.attn.Wqkv.weight", 0, encoder_only));
+    try std.testing.expect(!train.frozen("encoder.layers.5.attn_norm.weight", 0, encoder_only));
+    try std.testing.expect(!train.frozen("head.layers.0.self_attn.in_proj_weight", 0, encoder_only));
+    const head_only = architecture.Lora{ .rank = 8, .alpha = 16, .targets = .{ .head = true } };
+    try std.testing.expect(train.frozen("head.layers.0.self_attn.in_proj_weight", 0, head_only));
+    try std.testing.expect(train.frozen("head.layers.0.self_attn.in_proj_bias", 0, head_only));
+    try std.testing.expect(train.frozen("head.layers.0.linear1.weight", 0, head_only));
+    try std.testing.expect(!train.frozen("head.layers.0.norm1.weight", 0, head_only));
+    try std.testing.expect(!train.frozen("scorer.1.weight", 0, head_only));
+    try std.testing.expect(!train.frozen("type_emb.weight", 0, head_only));
+    // A layer frozen by freeze_layers stays frozen even inside a lora target.
+    try std.testing.expect(train.frozen("encoder.layers.0.attn.Wqkv.weight", 1, encoder_only));
+    try std.testing.expect(train.frozen("encoder.layers.0.attn.Wqkv.lora_A", 1, encoder_only) == false);
 }

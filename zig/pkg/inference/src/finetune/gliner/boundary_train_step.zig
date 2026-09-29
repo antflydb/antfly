@@ -50,6 +50,7 @@ const transfer = @import("boundary_training_transfer.zig");
 const decision_events = @import("boundary_training_decisions.zig");
 const BoundedAllocator = @import("../../runtime/bounded_allocator.zig").BoundedAllocator;
 const Control = @import("../../execution_control.zig").InferenceExecutionControl;
+const distillation = @import("boundary_distillation.zig");
 const Allocator = std.mem.Allocator;
 const Id = ml.NodeId;
 const Shape = ml.Shape;
@@ -75,6 +76,25 @@ pub const Capacities = struct {
     /// capacity shrinks or silent annotation truncation happen per microbatch.
     pool: ?u32 = null,
     gold_per_query: ?u32 = null,
+};
+/// Which objectives a plan carries. Feature distillation adds the routed
+/// (necked) encoder states as outputs, regressed onto a teacher's states
+/// supplied per step (`StepContext.distillation`). Without heads, no head is
+/// built or touched, so pure distillation leaves every head weight unchanged.
+pub const Objectives = struct {
+    heads: bool = true,
+    distillation: bool = false,
+};
+/// A teacher encoder's final states at this step's routes, flattened
+/// [batch * width, hidden] in the prepared batch's route order; rows the
+/// student's route masks exclude are ignored. Borrowed until run returns.
+pub const Distillation = struct {
+    text: []const f32 = &.{},
+    queries: []const f32 = &.{},
+    classifications: []const f32 = &.{},
+    parents: []const f32 = &.{},
+    weight: f32 = 1,
+    observer: ?distillation.Observer = null,
 };
 pub const Limits = struct {
     // This includes model/source and optimizer owners, beyond the generic
@@ -128,6 +148,8 @@ pub const StepContext = struct {
     /// Optional borrowed diagnostics; all decisions and replay seals retain
     /// their ordinary semantics. Observer errors abort and release the tape.
     decision_observer: ?decision_events.Observer = null,
+    /// Required exactly when the plan was built with distillation.
+    distillation: ?Distillation = null,
 };
 pub const GradientPresence = enum { computed, computed_zero, absent };
 pub const Presence = struct { parameter: Id, kind: GradientPresence };
@@ -151,7 +173,7 @@ pub const StepResult = struct {
         self.* = undefined;
     }
 };
-const Kind = enum { start, end, inside, pair, proposal, abstention, count, classification, record_object, record_assignment, relation };
+const Kind = enum { start, end, inside, pair, proposal, abstention, count, classification, record_object, record_assignment, relation, distill_text, distill_queries, distill_classifications, distill_parents };
 const Output = struct { kind: Kind, node: Id, group: usize = 0 };
 const RecordGroup = struct {
     sample: usize,
@@ -232,6 +254,7 @@ pub const Plan = struct {
     graph: *ml.Graph,
     config: model.Config,
     mode: Mode,
+    objectives: Objectives = .{},
     limits: Limits,
     pool_capacity: u32,
     gold_capacity: u32,
@@ -820,19 +843,27 @@ pub fn buildWithArithmetic(backing: Allocator, config: model.Config, prepared: *
 }
 
 pub fn buildWithTrainingArithmetic(backing: Allocator, config: model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema_mod.CompiledSchema, capacities: Capacities, mode: Mode, attention_profile: AttentionProfile, activation_profile: ActivationProfile, arithmetic: TrainingArithmetic, limits: Limits) !Plan {
+    return buildWithObjectives(backing, config, prepared, schemas, capacities, mode, attention_profile, activation_profile, arithmetic, .{}, limits);
+}
+
+pub fn buildWithObjectives(backing: Allocator, config: model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema_mod.CompiledSchema, capacities: Capacities, mode: Mode, attention_profile: AttentionProfile, activation_profile: ActivationProfile, arithmetic: TrainingArithmetic, plan_objectives: Objectives, limits: Limits) !Plan {
     if (limits.max_total_host_bytes == 0) return error.InvalidBoundaryTrainingStepOptions;
     const owner = try backing.create(HostOwner);
     errdefer backing.destroy(owner);
     owner.init(backing, limits.max_total_host_bytes);
-    return buildOwned(backing, owner, config, prepared, schemas, capacities, mode, attention_profile, activation_profile, arithmetic, limits) catch |err| {
+    return buildOwned(backing, owner, config, prepared, schemas, capacities, mode, attention_profile, activation_profile, arithmetic, plan_objectives, limits) catch |err| {
         std.debug.assert(owner.budget.live == 0);
         return owner.translate(err);
     };
 }
-fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema_mod.CompiledSchema, capacities: Capacities, mode: Mode, attention_profile: AttentionProfile, activation_profile: ActivationProfile, arithmetic: TrainingArithmetic, limits: Limits) !Plan {
+fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema_mod.CompiledSchema, capacities: Capacities, mode: Mode, attention_profile: AttentionProfile, activation_profile: ActivationProfile, arithmetic: TrainingArithmetic, plan_objectives: Objectives, limits: Limits) !Plan {
     const budget = &owner.budget;
     const a = budget.allocator();
     try check(limits.graph.control);
+    if (!plan_objectives.heads and !plan_objectives.distillation) return error.MissingBoundaryTrainingSupervision;
+    // Distillation targets the neck's output space, and recomputation
+    // regions end at the trunk; neither combination is supported yet.
+    if (plan_objectives.distillation and (mode != .training or activation_profile != .retained_v1)) return error.InvalidBoundaryTrainingStepOptions;
     try config.head.validate();
     if (config.head.candidate_pool != .shared or config.head.candidate_attention_layers != 0 or config.head.query_attention_layers != 0 or config.head.content_soft_max_pool)
         return error.UnsupportedBoundaryTrainingGraphOption;
@@ -877,7 +908,7 @@ fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepa
     var pool_input: ?candidate_graph.PoolInput = null;
     var relation_input: ?task_graph.RelationInput = null;
     var relation_capacity: u32 = 0;
-    if (layout.classifications != 0) {
+    if (plan_objectives.heads and layout.classifications != 0) {
         const count = try std.math.mul(u32, layout.batch, layout.classifications);
         const classified = if (arithmetic.input_gradients == .pytorch_v2)
             try classificationGroups(&g, encoder.nodes.classifications, schemas, layout.classifications)
@@ -885,7 +916,7 @@ fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepa
             try g.buildClassification(encoder.nodes.classifications, count);
         try outputAppend(a, &outputs, limits, .classification, classified, 0);
     }
-    if (layout.queries != 0) {
+    if (plan_objectives.heads and layout.queries != 0) {
         const input = graph_mod.Input{ .text = encoder.nodes.text, .queries = encoder.nodes.queries, .text_mask = try g.reshape(encoder.inputs.routes[@intFromEnum(encoder_graph.RouteKind.text)].valid, &.{ layout.batch, layout.words }), .query_mask = try g.reshape(encoder.inputs.routes[@intFromEnum(encoder_graph.RouteKind.queries)].valid, &.{ layout.batch, layout.queries }) };
         const deferred_query_heads = arithmetic.input_gradients == .pytorch_v2;
         var proposals = try g.buildProposalsWithQueryHeads(input, !deferred_query_heads);
@@ -973,8 +1004,17 @@ fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepa
             try outputAppend(a, &outputs, limits, .relation, relations_out.logits, 0);
         }
     }
+    if (plan_objectives.distillation) {
+        const routed = [_]struct { Kind, Id }{
+            .{ .distill_text, encoder.nodes.text },
+            .{ .distill_queries, encoder.nodes.queries },
+            .{ .distill_classifications, encoder.nodes.classifications },
+            .{ .distill_parents, encoder.nodes.parents },
+        };
+        for (routed) |entry| if (entry[1] != nil) try outputAppend(a, &outputs, limits, entry[0], entry[1], 0);
+    }
     if (outputs.items.len == 0) return error.MissingBoundaryTrainingSupervision;
-    try touchWeights(&g);
+    if (plan_objectives.heads) try touchWeights(&g);
     try g.check();
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly.gliner25.training.plan.v1");
@@ -1030,9 +1070,20 @@ fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepa
     }
     // Canonical JSON includes every numeric/semantic model switch, avoiding
     // undefined struct padding and platform-dependent object layouts.
-    const config_bytes = try std.json.Stringify.valueAlloc(a, config, .{});
+    // The pre-neck fields serialize exactly as before the neck existed, so
+    // existing plan identities (and their durable resumes) are unchanged.
+    const config_bytes = try std.json.Stringify.valueAlloc(a, .{ .version = config.version, .architecture_version = config.architecture_version, .max_len = config.max_len, .backbone = config.backbone, .head = config.head, .encoder = config.encoder }, .{});
     defer a.free(config_bytes);
     hash.update(config_bytes);
+    if (config.neck != .none) {
+        hash.update("\x00neck\x00");
+        hash.update(@tagName(config.neck));
+        hash.update("\x00");
+    }
+    if (!std.meta.eql(plan_objectives, Objectives{})) {
+        hash.update("\x00objectives\x00");
+        inline for (std.meta.fields(Objectives)) |field| appendHash(&hash, @intFromBool(@field(plan_objectives, field.name)));
+    }
     hash.update(@tagName(mode));
     inline for (std.meta.fields(encoder_graph.Layout)) |field| appendHash(&hash, @field(layout, field.name));
     appendHash(&hash, pool_capacity);
@@ -1053,7 +1104,7 @@ fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepa
     const owned_relations = try relations.toOwnedSlice(a);
     errdefer a.free(owned_relations);
     const owned_views = try proposal_views.toOwnedSlice(a);
-    return .{ .backing = backing, .host_owner = owner, .budget = budget, .allocator = a, .graph = graph, .config = config, .mode = mode, .limits = limits, .pool_capacity = pool_capacity, .gold_capacity = gold_capacity, .relation_capacity = relation_capacity, .input_gradient_profile = arithmetic.input_gradients, .encoder = encoder, .bindings = owned_bindings, .pool_input = pool_input, .relation_input = relation_input, .records = owned_records, .relations = owned_relations, .outputs = owned_outputs, .proposal_views = owned_views, .schema_fingerprints = schema_fingerprints, .fingerprint = hash.finalResult() };
+    return .{ .backing = backing, .host_owner = owner, .budget = budget, .allocator = a, .graph = graph, .config = config, .mode = mode, .objectives = plan_objectives, .limits = limits, .pool_capacity = pool_capacity, .gold_capacity = gold_capacity, .relation_capacity = relation_capacity, .input_gradient_profile = arithmetic.input_gradients, .encoder = encoder, .bindings = owned_bindings, .pool_input = pool_input, .relation_input = relation_input, .records = owned_records, .relations = owned_relations, .outputs = owned_outputs, .proposal_views = owned_views, .schema_fingerprints = schema_fingerprints, .fingerprint = hash.finalResult() };
 }
 
 fn relationInputs(g: *graph_mod.GraphBuilder, nodes: encoder_graph.RoutedNodes, relations: u32, pairs: u32) !task_graph.RelationInput {
@@ -1537,7 +1588,8 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
     if (targets.query_width != q or targets.word_width != w or targets.classification_width != plan.encoder.layout.classifications) return error.BoundaryGraphShapeMismatch;
     try validateDraws(context.injection_draws, try product(bq, plan.gold_capacity));
     try validateDraws(context.negative_query_draws, bq);
-    if (plan.mode == .training and q > 0) {
+    // Injection and negative-query draws feed the heads' candidate pool only.
+    if (plan.mode == .training and q > 0 and plan.objectives.heads) {
         if (active_scales.gold_injection > 0 and active_scales.gold_injection < 1 and context.injection_draws == null) return error.MissingBoundaryTrainingInjectionDraws;
         if (plan.config.head.negative_query_ratio > 0 and context.negative_query_draws == null) return error.MissingBoundaryTrainingQueryDraws;
     }
@@ -1773,7 +1825,7 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
     }
     var loss_limits = plan.limits.losses;
     loss_limits.control = control;
-    if (plan.encoder.layout.classifications != 0) {
+    if (plan.objectives.heads and plan.encoder.layout.classifications != 0) {
         loss_limits.max_work = work.available(plan.limits.losses.max_work);
         class_loss = try objectives.supervisedBceWithBackend(a, logits[try plan.outputIndex(.classification, 0)], targets.classification_targets, targets.classification_mask, plan.config.head.classification_loss_weight, loss_limits, if (cb.kind() == .cuda) .tensor_f32 else .reference_f64, binary_backend);
         try work.charge(class_loss.?.work);
@@ -1798,8 +1850,30 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
         coverage.proposed_gold_relations = geometry.covered;
         decision_hash.update(&geometry.fingerprint);
     }
+    var distilled: ?distillation.Result = null;
+    defer if (distilled) |*value| value.deinit();
+    if (plan.objectives.distillation) {
+        const teacher = context.distillation orelse return error.MissingBoundaryTrainingDistillation;
+        var groups = std.ArrayListUnmanaged(distillation.Group).empty;
+        for (plan.outputs, 0..) |output, index| {
+            const teacher_route: distillation.Route, const states: []const f32, const valid: []const bool = switch (output.kind) {
+                .distill_text => .{ .text, teacher.text, prepared.text_word_mask },
+                .distill_queries => .{ .queries, teacher.queries, prepared.query_marker_mask },
+                .distill_classifications => .{ .classifications, teacher.classifications, prepared.cls_marker_mask },
+                .distill_parents => .{ .parents, teacher.parents, prepared.parent_marker_mask },
+                else => continue,
+            };
+            try groups.append(scratch, .{ .route = teacher_route, .student = logits[index], .teacher = states, .valid = valid });
+        }
+        if (teacher.observer) |observer| try observer.observe(observer.ptr, plan.config.encoder.hidden_size, groups.items);
+        distilled = try distillation.zspaceMse(a, plan.config.encoder.hidden_size, groups.items, teacher.weight);
+        try work.charge(groups.items.len * plan.config.encoder.hidden_size);
+        terms.distillation = @floatCast(distilled.?.value);
+        terms.total += terms.distillation;
+    }
     if (!std.math.isFinite(terms.total)) return error.NonFiniteBoundaryTraining;
     const cotangents = try scratch.alloc(ops.CT, plan.outputs.len);
+    var distill_group: usize = 0;
     for (plan.outputs, cotangents) |output, *cotangent| {
         const gradient = switch (output.kind) {
             .start => span_loss.?.gradients.starts,
@@ -1813,6 +1887,10 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
             .record_object => records_loss.?.gradients[output.group].objects,
             .record_assignment => records_loss.?.gradients[output.group].assignments,
             .relation => relations_loss.?.gradient,
+            .distill_text, .distill_queries, .distill_classifications, .distill_parents => blk: {
+                distill_group += 1;
+                break :blk distilled.?.gradients[distill_group - 1];
+            },
         };
         if (cb.kind() != .cuda and (output.kind == .record_object or output.kind == .record_assignment)) for (gradient) |*value| {
             value.* *= plan.config.head.record_loss_weight;
@@ -1840,8 +1918,8 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
         const reached = std.mem.indexOfScalar(Id, backward.parameter_ids, parameter) != null;
         var kind: GradientPresence = if (reached) .computed else .absent;
         if (!class_supervision and std.mem.startsWith(u8, name, "classifier.")) kind = .absent;
-        if (q == 0 and !class_supervision) kind = .absent;
-        if (kind == .absent and isTouchParameter(name, plan.config.head)) kind = .computed_zero;
+        if (q == 0 and !class_supervision and !plan.objectives.distillation) kind = .absent;
+        if (kind == .absent and plan.objectives.heads and isTouchParameter(name, plan.config.head)) kind = .computed_zero;
         out.* = .{ .parameter = parameter, .kind = kind };
     }
     try work.charge(0);

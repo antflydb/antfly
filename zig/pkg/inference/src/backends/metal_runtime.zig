@@ -2993,6 +2993,41 @@ pub fn decoderRuntimeApplyRope(self: anytype, request: anytype) !?MetalTensor {
 /// is axis-major (`temporal`, `height`, `width`) with `token_count` values per
 /// axis. Unlike ordinary RoPE, the position is shared by all attention heads
 /// belonging to a token and selected per frequency pair using `sections`.
+/// Segment-masked attention over token-major device Q/K/V (see
+/// `ops.SegmentAttention`). Null when the runtime or geometry is unsupported.
+pub fn decoderRuntimeSegmentAttentionF32Device(self: anytype, q: MetalTensor, k: MetalTensor, v: MetalTensor, request: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!q.isDevice() or !k.isDevice() or !v.isDevice()) return null;
+    const hidden = std.math.mul(usize, request.num_heads, request.head_dim) catch return null;
+    if (q.elemCount() != request.queries * hidden or k.elemCount() != request.keys * hidden or v.elemCount() != request.keys * hidden) return null;
+    const shape = [_]i32{ @intCast(request.queries), @intCast(hidden) };
+    var output = try MetalTensor.deviceAllocate(runtime, request.queries * hidden * @sizeOf(f32), .private, &shape);
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_sdpa_segments_f32_device(
+        runtime,
+        q.deviceHandle(),
+        q.deviceByteOffset(),
+        k.deviceHandle(),
+        k.deviceByteOffset(),
+        v.deviceHandle(),
+        v.deviceByteOffset(),
+        request.ranges.ptr,
+        request.query_positions.ptr,
+        request.key_positions.ptr,
+        request.queries,
+        request.keys,
+        request.num_heads,
+        request.head_dim,
+        request.window,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc == 0) return output;
+    output.deinit();
+    return null;
+}
+
 pub fn decoderRuntimeApplyMrope(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -7116,6 +7151,19 @@ pub fn decoderRuntimeCastTypedDevice(self: anytype, input: MetalTensor, dtype: @
 }
 extern fn termite_metal_decode_runtime_cast_typed_device(runtime: ?*anyopaque, input: ?*anyopaque, input_offset: usize, output: ?*anyopaque, output_offset: usize, count: usize, source_dtype: u32, target_dtype: u32) c_int;
 
+/// f32 <-> IEEE half on the device. Half tensors use 2-byte `.i16` storage;
+/// only this cast interprets their bits.
+pub fn decoderRuntimeCastHalfDevice(self: anytype, input: MetalTensor, to_half: bool) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !input.isDevice()) return null;
+    if (input.dtype != (if (to_half) @import("metal_tensor.zig").DType.f32 else .i16)) return null;
+    var output = try MetalTensor.deviceAllocateTyped(std.heap.c_allocator, runtime, if (to_half) .i16 else .f32, .private, input.shape());
+    errdefer output.deinit();
+    if (input.elemCount() == 0) return output;
+    const rc = termite_metal_decode_runtime_cast_typed_device(runtime, input.deviceHandle(), input.deviceByteOffset(), output.deviceHandle(), output.deviceByteOffset(), input.elemCount(), if (to_half) 0 else 7, if (to_half) 7 else 0);
+    return finishDeviceOutput(&output, rc);
+}
+
 pub fn decoderRuntimeConvertDTypeF32Device(self: anytype, input: MetalTensor, kind: u32) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -7394,6 +7442,89 @@ pub fn decoderRuntimeFlorenceChannelAttentionF32Device(
         groups,
     );
     return finishDeviceOutput(&output_device, rc);
+}
+
+const modernbert_training_attention = @import("../ops/modernbert_training_attention.zig");
+
+/// POD ABI mirrored in metal_kernels.m and its MSL source.
+const ModernBertTrainingAttentionParams = extern struct {
+    tokens: u32,
+    seq_len: u32,
+    num_heads: u32,
+    head_dim: u32,
+    window: u32,
+    backward: u32,
+    scale: f32,
+    reserved0: u32 = 0,
+};
+comptime {
+    if (@sizeOf(ModernBertTrainingAttentionParams) != 32) @compileError("ModernBERT training attention Metal ABI mismatch");
+}
+
+/// ModernBERT training attention over device-resident packed [Q;K;V] and an
+/// i32 control the caller has validated (disjoint in-row ranges). Returns the
+/// output rows, or packed [dQ;dK;dV] when `d_out` is given. Output and scratch
+/// share one allocation and the result views it, so the scratch outlives any
+/// command frame the dispatch was encoded into.
+pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
+    self: anytype,
+    qkv: MetalTensor,
+    control_tensor: MetalTensor,
+    d_out: ?MetalTensor,
+    attrs: modernbert_training_attention.Attrs,
+    control: ?TrainingAttentionControl,
+) !MetalTensor {
+    if (!build_options.enable_metal) return error.UnsupportedModernBertTrainingAttentionProfile;
+    try trainingAttentionCheck(control);
+    const runtime = self.raw_decode_runtime orelse return error.UnsupportedModernBertTrainingAttentionProfile;
+    const layout = try attrs.layout();
+    const tokens: usize = @intCast(layout.tokens);
+    const hidden: usize = @intCast(layout.hidden);
+    const backward = d_out != null;
+    if (!qkv.isDevice() or qkv.dtype != .f32 or qkv.elemCount() != 3 * tokens * hidden or
+        !control_tensor.isDevice() or control_tensor.dtype != .i32 or control_tensor.elemCount() != 7 * tokens)
+        return error.InvalidModernBertTrainingAttentionShape;
+    if (d_out) |upstream| if (!upstream.isDevice() or upstream.dtype != .f32 or upstream.elemCount() != tokens * hidden)
+        return error.InvalidModernBertTrainingAttentionShape;
+    const output_elements = if (backward) 3 * tokens * hidden else tokens * hidden;
+    const output_bytes = try std.math.mul(usize, output_elements, @sizeOf(f32));
+    const total_bytes = try std.math.add(usize, output_bytes, try modernbert_training_attention.scratchBytes(attrs, backward));
+    const storage_shape = [_]i32{@intCast(total_bytes / @sizeOf(f32))};
+    var storage = try MetalTensor.deviceAllocate(runtime, total_bytes, .private, &storage_shape);
+    defer storage.deinit();
+    const params = ModernBertTrainingAttentionParams{
+        .tokens = @intCast(tokens),
+        .seq_len = attrs.seq_len,
+        .num_heads = attrs.num_heads,
+        .head_dim = attrs.head_dim,
+        .window = attrs.window,
+        .backward = @intFromBool(backward),
+        .scale = 1 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim))),
+    };
+    const rc = termite_metal_decode_runtime_modernbert_training_attention_v1(
+        runtime,
+        qkv.deviceHandle(),
+        qkv.deviceByteOffset(),
+        control_tensor.deviceHandle(),
+        control_tensor.deviceByteOffset(),
+        if (d_out) |upstream| upstream.deviceHandle() else null,
+        if (d_out) |upstream| upstream.deviceByteOffset() else 0,
+        storage.deviceHandle(),
+        storage.deviceByteOffset(),
+        storage.deviceHandle(),
+        storage.deviceByteOffset() + output_bytes,
+        &params,
+    );
+    switch (rc) {
+        0 => {},
+        -1 => return error.InvalidModernBertTrainingAttentionShape,
+        -2 => return error.UnsupportedModernBertTrainingAttentionProfile,
+        -5 => return error.MetalEncoderAllocationFailed,
+        else => return error.MetalModernBertTrainingAttentionFailed,
+    }
+    try trainingAttentionCheck(control);
+    const rows: i32 = @intCast(if (backward) 3 * tokens else tokens);
+    return storage.retainedView(0, output_bytes, &.{ rows, @intCast(hidden) });
 }
 
 const training_attention_device = @import("../ops/deberta_training_attention_device.zig");
@@ -18069,6 +18200,7 @@ pub extern fn termite_metal_decode_runtime_reserve_graph_plan_slot(
 pub extern fn termite_metal_decode_runtime_commit_graph_plan(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_buffer_alloc(runtime: ?*RawMetalDecodeRuntime, length: usize, storage_mode: c_int) ?*anyopaque;
 pub extern fn termite_metal_buffer_release(handle: ?*anyopaque) void;
+extern fn termite_metal_decode_runtime_release_buffer(runtime: ?*RawMetalDecodeRuntime, handle: ?*anyopaque) void;
 pub extern fn termite_metal_buffer_contents(handle: ?*anyopaque) ?*anyopaque;
 pub extern fn termite_metal_buffer_upload(
     runtime: ?*RawMetalDecodeRuntime,
@@ -19125,6 +19257,39 @@ pub extern fn termite_metal_decode_runtime_apply_rope_device(
     theta: f32,
     freq_scale: f32,
     consecutive_pairs: u32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_modernbert_training_attention_v1(
+    runtime: ?*RawMetalDecodeRuntime,
+    qkv_handle: ?*anyopaque,
+    qkv_offset: usize,
+    control_handle: ?*anyopaque,
+    control_offset: usize,
+    dout_handle: ?*anyopaque,
+    dout_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+    scratch_handle: ?*anyopaque,
+    scratch_offset: usize,
+    params: *const ModernBertTrainingAttentionParams,
+) c_int;
+pub extern fn termite_metal_decode_runtime_sdpa_segments_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    q_handle: ?*anyopaque,
+    q_offset: usize,
+    k_handle: ?*anyopaque,
+    k_offset: usize,
+    v_handle: ?*anyopaque,
+    v_offset: usize,
+    ranges: [*c]const u32,
+    query_positions: [*c]const i32,
+    key_positions: [*c]const i32,
+    queries: usize,
+    keys: usize,
+    num_heads: usize,
+    head_dim: usize,
+    window: u32,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
@@ -44808,6 +44973,34 @@ test "metal native decoder runtime f16 MPS linear transitions from planned encod
     for (input_data, actual) |expected, got| {
         try std.testing.expectApproxEqAbs(expected, got, 2e-3);
     }
+}
+
+test "metal in-frame buffer reuse never hands a host-writable buffer to a private request" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+    const runtime = provider.raw_decode_runtime;
+
+    // A shared buffer released inside a frame may still be written by queued
+    // commands of its previous owner. Uploads into shared storage are an
+    // immediate memcpy, so reusing it in the same frame would let those
+    // queued writes land over the new owner's data.
+    try beginFrame(runtime);
+    const shared = termite_metal_buffer_alloc(runtime, 512, 0) orelse return error.UnexpectedNull;
+    termite_metal_decode_runtime_release_buffer(runtime, shared);
+    const private = termite_metal_buffer_alloc(runtime, 512, 1) orelse return error.UnexpectedNull;
+    try std.testing.expect(private != shared);
+    // Private buffers are only written by commands in queue order, so their
+    // same-frame reuse stays enabled.
+    termite_metal_decode_runtime_release_buffer(runtime, private);
+    const reused = termite_metal_buffer_alloc(runtime, 512, 1) orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(private, reused);
+    termite_metal_decode_runtime_release_buffer(runtime, reused);
+    try cancelFrame(runtime);
 }
 
 test "metal native decoder runtime activation scratch pool and hidden state" {
