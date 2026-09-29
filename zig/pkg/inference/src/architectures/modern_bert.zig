@@ -366,7 +366,8 @@ pub const Capture = struct {
 };
 
 /// Encode only the branch tokens of a packed row whose trunk occupies rows
-/// `0..prefix_rows` with positions `0..prefix_rows-1`. `packed_row.positions`
+/// `0..prefix_rows` at contiguous positions (the ones the cached keys were
+/// captured at; `packed_row.key_positions` must agree). `packed_row.positions`
 /// covers the branch tokens; its masks cover the whole row. The result is
 /// `[branch tokens, hidden]` and equals those rows of `forwardPackedCT`.
 pub fn forwardBranchesCT(
@@ -387,13 +388,15 @@ pub fn forwardBranchesCT(
     return forwardImpl(cb, allocator, config, branch_ids, mask, 1, seq_len, packed_row, branches, null);
 }
 
-/// The unpacked encoder forward, also copying each layer's keys (after RoPE)
-/// and values to `capture`. Used to fill the packed-trunk cache.
+/// The unpacked encoder forward at logical positions `first_position..`,
+/// also copying each layer's keys (after RoPE) and values to `capture`. Used
+/// to fill the packed-trunk cache.
 pub fn forwardCapturingCT(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     config: Config,
     input_ids: []const i64,
+    first_position: usize,
     capture: Capture,
 ) !CT {
     if (capture.layers() != config.num_hidden_layers or @max(capture.values.len, capture.value_tensors.len) != config.num_hidden_layers) return error.InvalidInputShape;
@@ -409,9 +412,10 @@ pub fn forwardCapturingCT(
     defer allocator.free(key_positions);
     const ranges = try allocator.alloc(u32, 6 * n);
     defer allocator.free(ranges);
+    if (first_position + n > config.max_position_embeddings) return error.InvalidInputShape;
     for (positions, key_positions, 0..) |*p, *k, i| {
-        p.* = @intCast(i);
-        k.* = @intCast(i);
+        p.* = @intCast(first_position + i);
+        k.* = @intCast(first_position + i);
         ranges[6 * i ..][0..6].* = .{ 0, @intCast(n), 0, 0, 0, 0 };
     }
     return forwardImpl(cb, allocator, config, input_ids, mask, 1, n, .{ .positions = positions, .ranges = ranges, .key_positions = key_positions }, null, capture);

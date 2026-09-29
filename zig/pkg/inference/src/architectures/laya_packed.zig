@@ -99,28 +99,32 @@ const Laya = @import("../models/laya.zig").Config;
 /// Encoder and decision head for one validated row. With a cache on the CPU
 /// backend, the trunk's per-layer keys and values are reused across rows and
 /// requests, and only the branch tokens are encoded (laya_trunk_cache.zig).
-pub fn forwardRow(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row, cache: ?*trunk_cache.Cache) ![]Tensor {
+pub fn forwardRow(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row, cache: ?*trunk_cache.Cache) anyerror![]Tensor {
     const store = cache orelse return forwardFull(cb, a, cfg, laya, row);
-    // A multi-row batch (pipelines/laya.zig, laya_tree.coalesce) packs
-    // several states' trees into one row. Segment attention already keeps
-    // their cost proportional to visible keys, so batching pays off without
-    // the trunk cache; caching a forest of trunks is not implemented yet.
-    if (tree.treeCount(row) != 1) return forwardFull(cb, a, cfg, laya, row);
     // A trunk that sees its questions depends on the question set. With
     // per-question upper layers only the layers below are shared; caching
     // them is not implemented yet.
     if (row.trunk_sees_tree or row.fused) return forwardFull(cb, a, cfg, laya, row);
-    const trunk = trunkRows(row) orelse return forwardFull(cb, a, cfg, laya, row);
+    // A multi-row batch (pipelines/laya.zig, laya_tree.coalesce) packs
+    // several states' trees into one row. A cold batch runs as one call:
+    // segment attention keeps its cost proportional to visible keys. Once
+    // any of its trunks is cached, each tree runs on its own so hot trunks
+    // are reused rather than re-encoded (and cold ones fill the cache).
+    if (tree.treeCount(row) != 1) {
+        return if (anyTrunkCached(a, cfg, laya, row, store)) forwardTrees(cb, a, cfg, laya, row, store) else forwardFull(cb, a, cfg, laya, row);
+    }
+    const layout = trunkRows(row) orelse return forwardFull(cb, a, cfg, laya, row);
+    const trunk = layout.tokens;
     if (store.limit_bytes == 0 or trunk < store.min_tokens or trunk == row.ids.len) return forwardFull(cb, a, cfg, laya, row);
     const layers = cfg.num_hidden_layers + laya.head_layers;
-    const key = trunk_cache.Cache.key(row.ids[0..trunk], layers, cfg.hidden_size);
+    const key = trunk_cache.Cache.keyAt(row.ids[0..trunk], layers, cfg.hidden_size, layout.first_position);
     // The entry's bytes and admission lease are reserved before encoding;
     // a trunk that cannot fit runs uncached, and a concurrent miss on the
     // same state waits for this fill rather than repeating it.
     const entry = switch (try store.lookup(key, trunk, layers, cfg.hidden_size, !deviceCache(cb))) {
         .hit => |hit| hit,
         .fill => |created| blk: {
-            fillTrunk(cb, a, cfg, laya, row.ids[0..trunk], created, store.allocator) catch |err| {
+            fillTrunk(cb, a, cfg, laya, row.ids[0..trunk], layout.first_position, created, store.allocator) catch |err| {
                 store.abandon(created);
                 return err;
             };
@@ -133,14 +137,70 @@ pub fn forwardRow(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: mode
     return forwardCached(cb, a, cfg, laya, row, entry);
 }
 
-/// Trunk length when the trunk is exactly rows `0..T` at positions `0..T-1`.
-fn trunkRows(row: tree.Row) ?usize {
+/// Whether any tree of a multi-tree row has its trunk in `store`.
+fn anyTrunkCached(a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row, store: *trunk_cache.Cache) bool {
+    const trees = tree.split(a, row) catch return false;
+    defer {
+        for (trees) |t| t.deinit(a);
+        a.free(trees);
+    }
+    const layers = cfg.num_hidden_layers + laya.head_layers;
+    for (trees) |t| {
+        const layout = trunkRows(t.row) orelse continue;
+        if (store.contains(trunk_cache.Cache.keyAt(t.row.ids[0..layout.tokens], layers, cfg.hidden_size, layout.first_position))) return true;
+    }
+    return false;
+}
+
+/// `forwardRow` per tree of a multi-tree row, with the outputs put back in
+/// the row's question order (`laya_tree.split` keeps its width).
+fn forwardTrees(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, row: tree.Row, store: *trunk_cache.Cache) anyerror![]Tensor {
+    const trees = try tree.split(a, row);
+    defer {
+        for (trees) |t| t.deinit(a);
+        a.free(trees);
+    }
+    const questions = row.questions();
+    const logits = try a.alloc(f32, questions * row.width);
+    defer a.free(logits);
+    const acts = try a.alloc(f32, questions * laya.n_act);
+    defer a.free(acts);
+    for (trees) |t| {
+        const outputs = try forwardRow(cb, a, cfg, laya, t.row, store);
+        defer {
+            for (outputs) |*output| output.deinit();
+            a.free(outputs);
+        }
+        const tree_logits = outputs[0].asFloat32();
+        const tree_acts = outputs[1].asFloat32();
+        if (tree_logits.len != t.questions.len * row.width or tree_acts.len != t.questions.len * laya.n_act) return error.InvalidLayaInputs;
+        for (t.questions, 0..) |q, i| {
+            @memcpy(logits[q * row.width ..][0..row.width], tree_logits[i * row.width ..][0..row.width]);
+            @memcpy(acts[q * laya.n_act ..][0..laya.n_act], tree_acts[i * laya.n_act ..][0..laya.n_act]);
+        }
+    }
+    const result = try a.alloc(Tensor, 2);
+    errdefer a.free(result);
+    result[0] = try Tensor.initFloat32(a, "logits", &.{ @intCast(questions), @intCast(row.width) }, logits);
+    errdefer result[0].deinit();
+    result[1] = try Tensor.initFloat32(a, "action_logits", &.{ @intCast(questions), @intCast(laya.n_act) }, acts);
+    return result;
+}
+
+const TrunkRows = struct { tokens: usize, first_position: usize };
+
+/// Trunk length and first position when the trunk is exactly rows `0..T` at
+/// contiguous positions (`0..T-1`, or after the question budget with
+/// `packing.question_first`).
+fn trunkRows(row: tree.Row) ?TrunkRows {
+    if (row.ids.len == 0 or row.segments[0] != 0 or row.positions[0] < 0) return null;
+    const first = row.positions[0];
     var trunk: usize = 0;
     while (trunk < row.ids.len and row.segments[trunk] == 0) : (trunk += 1) {
-        if (row.positions[trunk] != trunk) return null;
+        if (row.positions[trunk] != first + @as(i64, @intCast(trunk))) return null;
     }
     for (row.segments[trunk..]) |segment| if (segment == 0) return null;
-    return if (trunk == 0) null else trunk;
+    return .{ .tokens = trunk, .first_position = @intCast(first) };
 }
 
 /// Trunk tensors stay on Metal devices across requests; elsewhere they are
@@ -164,7 +224,7 @@ const DeviceTrunk = if (build_options.enable_metal) struct {
 
 /// Encode the trunk alone (it never attends to a branch) and keep every
 /// encoder and head layer's keys and values in `entry`, at its precision.
-fn fillTrunk(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, ids: []const i64, entry: *trunk_cache.Entry, cache_allocator: std.mem.Allocator) !void {
+fn fillTrunk(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Config, laya: Laya, ids: []const i64, first_position: usize, entry: *trunk_cache.Entry, cache_allocator: std.mem.Allocator) !void {
     const n = cfg.num_hidden_layers;
     if (comptime build_options.enable_metal) if (deviceCache(cb)) {
         const tensors = try a.alloc(?ops.CT, 2 * entry.layers);
@@ -173,7 +233,7 @@ fn fillTrunk(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Co
         defer for (tensors) |tensor| if (tensor) |t| cb.free(t);
         const keys = tensors[0..entry.layers];
         const values = tensors[entry.layers..];
-        const encoded = try modern.forwardCapturingCT(cb, a, cfg, ids, .{ .key_tensors = keys[0..n], .value_tensors = values[0..n] });
+        const encoded = try modern.forwardCapturingCT(cb, a, cfg, ids, first_position, .{ .key_tensors = keys[0..n], .value_tensors = values[0..n] });
         defer cb.free(encoded);
         try head.captureTrunk(cb, a, laya, encoded, ids.len, cfg.hidden_size, .{ .key_tensors = keys[n..], .value_tensors = values[n..] });
         const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -208,7 +268,7 @@ fn fillTrunk(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: modern.Co
         k.* = scratch[(2 * layer) * width ..][0..width];
         v.* = scratch[(2 * layer + 1) * width ..][0..width];
     }
-    const encoded = try modern.forwardCapturingCT(cb, a, cfg, ids, .{ .keys = keys[0..n], .values = values[0..n] });
+    const encoded = try modern.forwardCapturingCT(cb, a, cfg, ids, first_position, .{ .keys = keys[0..n], .values = values[0..n] });
     defer cb.free(encoded);
     try head.captureTrunk(cb, a, laya, encoded, ids.len, cfg.hidden_size, .{ .keys = keys[n..], .values = values[n..] });
     for (0..2 * entry.layers) |slot| entry.store(slot, scratch[slot * width ..][0..width]);

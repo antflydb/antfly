@@ -229,6 +229,61 @@ pub fn coalesce(a: std.mem.Allocator, rows: []const Row) !Coalesced {
     return .{ .row = row, .owners = owners };
 }
 
+/// One tree of a validated (possibly coalesced) row, as a row of its own,
+/// with `questions` naming which of the source row's questions it holds, in
+/// order. Keeps the source `width`, so its outputs line up with the source's.
+pub const Tree = struct {
+    row: Row,
+    questions: []usize,
+
+    pub fn deinit(self: Tree, a: std.mem.Allocator) void {
+        self.row.deinit(a);
+        a.free(self.questions);
+    }
+};
+
+/// Split a validated row into its trees, the inverse of `coalesce`. Trees
+/// are contiguous in tokens and segments. Caller owns the result.
+pub fn split(a: std.mem.Allocator, row: Row) ![]Tree {
+    var out: std.ArrayListUnmanaged(Tree) = .empty;
+    errdefer {
+        for (out.items) |t| t.deinit(a);
+        out.deinit(a);
+    }
+    var t0: usize = 0;
+    while (t0 < row.ids.len) {
+        const s0: usize = @intCast(row.segments[t0]);
+        var t1 = t0 + 1;
+        // The next tree starts at the next token of a different root segment.
+        while (t1 < row.ids.len and (row.parents[@intCast(row.segments[t1])] != -1 or row.segments[t1] == row.segments[t0])) t1 += 1;
+        const s1: usize = if (t1 < row.ids.len) @intCast(row.segments[t1]) else row.parents.len;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const segments = try scratch.alloc(i64, t1 - t0);
+        for (segments, row.segments[t0..t1]) |*dst, seg| dst.* = seg - @as(i64, @intCast(s0));
+        const parents = try scratch.alloc(i64, s1 - s0);
+        for (parents, row.parents[s0..s1]) |*dst, parent| dst.* = if (parent == -1) -1 else parent - @as(i64, @intCast(s0));
+        var picked: std.ArrayListUnmanaged(usize) = .empty;
+        for (row.anchors, 0..) |anchor, q| if (anchor >= t0 and anchor < t1) try picked.append(scratch, q);
+        const anchors = try scratch.alloc(i64, picked.items.len);
+        const markers = try scratch.alloc(i64, picked.items.len * row.width);
+        const question_index = try scratch.alloc(usize, picked.items.len);
+        for (picked.items, 0..) |q, i| {
+            anchors[i] = row.anchors[q] - @as(i64, @intCast(t0));
+            for (row.markers[q * row.width ..][0..row.width], markers[i * row.width ..][0..row.width]) |marker, *dst| dst.* = if (marker == -1) -1 else marker - @as(i64, @intCast(t0));
+            question_index[i] = row.question_index[q];
+        }
+        const tree_row = try own(a, .{ .ids = row.ids[t0..t1], .positions = row.positions[t0..t1], .segments = segments, .parents = parents, .kinds = row.kinds[t0..t1], .anchors = anchors, .markers = markers, .question_index = question_index, .width = row.width, .trunk_sees_tree = row.trunk_sees_tree, .fused = row.fused });
+        errdefer tree_row.deinit(a);
+        const questions = try a.dupe(usize, picked.items);
+        errdefer a.free(questions);
+        try out.append(a, .{ .row = tree_row, .questions = questions });
+        t0 = t1;
+    }
+    return out.toOwnedSlice(a);
+}
+
 /// Visible key ranges of tokens `first..` for `ops.SegmentAttention`: the
 /// `[start, end)` extent of each token's segment and of its ancestors, three
 /// pairs per token (unused pairs empty). Requires a validated row.
@@ -511,6 +566,26 @@ const Writer = struct {
         self.position += 1;
     }
 };
+
+test "laya tree split undoes coalesce" {
+    const a = std.testing.allocator;
+    const one = Row{ .ids = &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, .positions = &.{ 0, 1, 2, 3, 4, 2, 3, 4 }, .segments = &.{ 0, 0, 1, 1, 1, 2, 2, 2 }, .parents = &.{ -1, 0, 0 }, .kinds = &.{ trunk_kind, trunk_kind, 0, 0, 0, 1, 1, 1 }, .anchors = &.{ 2, 5 }, .markers = &.{ 3, 4, -1, 6, 7, -1 }, .question_index = &.{ 0, 1 }, .width = 3 };
+    const two = Row{ .ids = &.{ 9, 10, 11, 12 }, .positions = &.{ 0, 1, 1, 2 }, .segments = &.{ 0, 1, 1, 1 }, .parents = &.{ -1, 0 }, .kinds = &.{ trunk_kind, 2, 2, 2 }, .anchors = &.{1}, .markers = &.{ 1, 2, 3 }, .question_index = &.{0}, .width = 3 };
+    const merged = try coalesce(a, &.{ one, two });
+    defer merged.deinit(a);
+    const trees = try split(a, merged.row);
+    defer {
+        for (trees) |t| t.deinit(a);
+        a.free(trees);
+    }
+    try std.testing.expectEqual(@as(usize, 2), trees.len);
+    for (trees, [_]Row{ one, two }, [_][]const usize{ &.{ 0, 1 }, &.{2} }) |t, want, questions| {
+        try std.testing.expectEqualSlices(usize, questions, t.questions);
+        inline for (.{ "ids", "positions", "segments", "parents", "kinds", "anchors", "markers" }) |name| try std.testing.expectEqualSlices(i64, @field(want, name), @field(t.row, name));
+        try std.testing.expectEqualSlices(usize, want.question_index, t.row.question_index);
+        try validate(t.row, 16, 16, 8);
+    }
+}
 
 test "laya tree validation accepts three levels and rejects a fourth" {
     // trunk -> question -> candidate is the deepest layout `ranges` can cover.

@@ -326,10 +326,63 @@ test "laya packed questions are isolated and share one exact trunk encoding" {
     }
 }
 
+// A batched row of several states runs as one call while cold; once any of
+// its trunks is cached it runs per tree, reusing hot trunks, with the same
+// decisions. Also prints the latency of a fully hot batch both ways.
+test "laya packed multi-state rows reuse cached trunks and match the batched forward" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    var fixture = try Fixture.init(std.testing.allocator, "{\"mode\":\"question\"}");
+    defer fixture.deinit(std.testing.allocator);
+    const texts = [_][]const u8{ state_text, "hello world how are you today my friend", "the quick brown fox jumps over the lazy dog again and again", "please escalate this ticket because the customer is very upset" };
+    var rows: [texts.len]tree.Row = undefined;
+    for (&rows, texts) |*row, text| row.* = (try tree.build(a, tok, fixture.cfg, text, &questions, null))[0];
+    const merged = try tree.coalesce(a, &rows);
+    const batched = try runRow(a, &fixture, merged.row);
+    var cache = @import("../architectures/laya_trunk_cache.zig").Cache.init(std.testing.allocator, 64 << 20);
+    cache.min_tokens = 1;
+    cache.setPrecision(.f32);
+    defer cache.deinit();
+    const cb = try factory.getComputeBackend(fixture.session, a);
+    defer cb.deinit();
+    const Run = struct {
+        fn once(alloc: std.mem.Allocator, backend: anytype, fx: *const Fixture, row: tree.Row, store: ?*@import("../architectures/laya_trunk_cache.zig").Cache) ![]f32 {
+            const outputs = try packed_arch.forwardRow(backend, alloc, fx.encoder, fx.cfg, row, store);
+            defer {
+                for (outputs) |*output| output.deinit();
+                alloc.free(outputs);
+            }
+            return alloc.dupe(f32, outputs[0].asFloat32());
+        }
+    };
+    // Cold: one batched call, nothing cached.
+    try std.testing.expect(try maxError(batched[0], try Run.once(a, &cb, &fixture, merged.row, &cache)) < 1e-5);
+    try std.testing.expectEqual(@as(usize, 0), cache.snapshot().entries);
+    // Warm one state; the batch now runs per tree, hitting that trunk and
+    // filling the rest.
+    _ = try Run.once(a, &cb, &fixture, rows[1], &cache);
+    try std.testing.expect(try maxError(batched[0], try Run.once(a, &cb, &fixture, merged.row, &cache)) < 1e-5);
+    const stats = cache.snapshot();
+    try std.testing.expectEqual(texts.len, stats.entries);
+    try std.testing.expect(stats.hits >= 1);
+    // Fully hot: per-tree cached vs one uncached batched call.
+    const repeats = 5;
+    const platform = @import("antfly_platform");
+    const began = platform.time.monotonicNs();
+    for (0..repeats) |_| _ = try Run.once(a, &cb, &fixture, merged.row, null);
+    const middle = platform.time.monotonicNs();
+    for (0..repeats) |_| _ = try Run.once(a, &cb, &fixture, merged.row, &cache);
+    const uncached_ns = middle - began;
+    const cached_ns = platform.time.monotonicNs() - middle;
+    std.debug.print("Laya multi-state hot batch: batched uncached {d} us, per-tree cached {d} us\n", .{ uncached_ns / repeats / 1000, cached_ns / repeats / 1000 });
+}
+
 // Question-first positions (`packing.question_first`, LAYA.md): branches
 // start at position 0 and the trunk after the question budget; questions stay
-// isolated, and a cache-enabled forward (which cannot reuse this trunk yet)
-// matches the uncached one exactly.
+// isolated, and the trunk cache reuses the shifted trunk exactly.
 test "laya question-first positions put every question before the state" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -353,19 +406,28 @@ test "laya question-first positions put every question before the state" {
             worst = @max(worst, try maxError(single[0][0..q.labels.len], together[0][qi * all.width ..][0..q.labels.len]));
         }
         try std.testing.expect(worst < 1e-5);
+        // The trunk cache encodes the state at its shifted positions: a miss
+        // fills it, a hit reuses it, and both match the uncached forward.
         var cache = @import("../architectures/laya_trunk_cache.zig").Cache.init(std.testing.allocator, 64 << 20);
         cache.min_tokens = 1;
+        cache.setPrecision(.f32);
         defer cache.deinit();
         const cb = try factory.getComputeBackend(fixture.session, a);
         defer cb.deinit();
-        const cached = try packed_arch.forwardRow(&cb, a, fixture.encoder, fixture.cfg, all, &cache);
-        defer {
-            for (cached) |*output| output.deinit();
-            a.free(cached);
+        var cache_error: f32 = 0;
+        for (0..2) |_| {
+            const cached = try packed_arch.forwardRow(&cb, a, fixture.encoder, fixture.cfg, all, &cache);
+            defer {
+                for (cached) |*output| output.deinit();
+                a.free(cached);
+            }
+            cache_error = @max(cache_error, try maxError(together[0], cached[0].asFloat32()));
         }
-        const cache_error = try maxError(together[0], cached[0].asFloat32());
+        const stats = cache.snapshot();
+        try std.testing.expectEqual(@as(u64, 1), stats.misses);
+        try std.testing.expectEqual(@as(u64, 1), stats.hits);
         std.debug.print("Laya question-first {s}: isolation max error={d}, cached vs uncached={d}\n", .{ packing, worst, cache_error });
-        try std.testing.expect(cache_error < 1e-6);
+        try std.testing.expect(cache_error < 1e-5);
         // Moving the questions ahead of the state changes the model's view.
         var plain_cfg = fixture.cfg;
         plain_cfg.packing.question_first = false;
@@ -568,7 +630,7 @@ test "laya packed trunk cache reuses the state exactly across rows and requests"
         defer cache.deinit();
         // The synthetic state is short; cache it anyway.
         cache.min_tokens = 1;
-        cache.precision = precision;
+        cache.setPrecision(precision);
         var worst: f32 = 0;
         // Miss (fills the cache), then hits with different question sets.
         for ([_][]const pipeline.Question{ &questions, questions[1..], questions[0..1] }) |subset| {
