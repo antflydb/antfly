@@ -15,7 +15,7 @@
 
 const host = @import("raft/host.zig");
 const managed_host = @import("raft/managed_host.zig");
-const catalog = @import("antfly_replica_catalog");
+const catalog = @import("raft/storage/catalog.zig");
 
 test {
     _ = host;

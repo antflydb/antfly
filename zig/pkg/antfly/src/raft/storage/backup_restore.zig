@@ -520,7 +520,7 @@ pub fn applyBackupRestoreFromRecord(
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
     group_id: u64,
-    restore: @import("antfly_replica_catalog").BackupRestoreBootstrapRecord,
+    restore: @import("catalog.zig").BackupRestoreBootstrapRecord,
 ) !void {
     return try applyBackupRestoreFromRecordWithOptions(alloc, replica_root_dir, group_id, restore, .{});
 }
@@ -529,7 +529,7 @@ pub fn applyBackupRestoreFromRecordWithOptions(
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
     group_id: u64,
-    restore: @import("antfly_replica_catalog").BackupRestoreBootstrapRecord,
+    restore: @import("catalog.zig").BackupRestoreBootstrapRecord,
     open_options: backups_api.OpenOptions,
 ) !void {
     try restore.validate();
@@ -1381,7 +1381,7 @@ test "backup restore bootstrap adopts an exact imported generation while repair 
         return error.TestUnexpectedResult;
     defer resident_read.deinit();
 
-    const exact: @import("antfly_replica_catalog").BackupRestoreBootstrapRecord = .{
+    const exact: @import("catalog.zig").BackupRestoreBootstrapRecord = .{
         .backup_id = "backup-1701",
         .artifact_backup_id = "artifact-1701",
         .location = "s3://backup/antfly",

@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const raft_engine = @import("raft_engine");
-const catalog = @import("antfly_replica_catalog");
+const catalog = @import("catalog.zig");
 const host = @import("../host.zig");
 const state_machine = @import("../state_machine/mod.zig");
 const storage_mod = @import("mod.zig");

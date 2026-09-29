@@ -1339,8 +1339,8 @@ test "metadata reconciler detects learner membership changes" {
 }
 
 fn snapshotBootstrapEqual(
-    a: ?@import("antfly_replica_catalog").SnapshotBootstrapRecord,
-    b: ?@import("antfly_replica_catalog").SnapshotBootstrapRecord,
+    a: ?@import("../raft/storage/catalog.zig").SnapshotBootstrapRecord,
+    b: ?@import("../raft/storage/catalog.zig").SnapshotBootstrapRecord,
 ) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
@@ -1352,7 +1352,7 @@ fn snapshotBootstrapEqual(
 }
 
 test "metadata reconciler normalizes versioned snapshot uri without a new wire tag" {
-    const legacy_wire: @import("antfly_replica_catalog").SnapshotBootstrapRecord = .{
+    const legacy_wire: @import("../raft/storage/catalog.zig").SnapshotBootstrapRecord = .{
         .from_node_id = 7,
         .term = 11,
         .snapshot_id = "snap-91",
@@ -1364,8 +1364,8 @@ test "metadata reconciler normalizes versioned snapshot uri without a new wire t
 }
 
 fn backupRestoreBootstrapEqual(
-    a: ?@import("antfly_replica_catalog").BackupRestoreBootstrapRecord,
-    b: ?@import("antfly_replica_catalog").BackupRestoreBootstrapRecord,
+    a: ?@import("../raft/storage/catalog.zig").BackupRestoreBootstrapRecord,
+    b: ?@import("../raft/storage/catalog.zig").BackupRestoreBootstrapRecord,
 ) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
@@ -9715,8 +9715,8 @@ test "metadata reconciler marks restore-active placements with fetch_snapshot un
     try std.testing.expectEqual(@as(usize, 2), plan.placement_upserts.len);
     const first = findPlacementIntent(plan.placement_upserts, 4901, 1).?;
     const second = findPlacementIntent(plan.placement_upserts, 4901, 2).?;
-    try std.testing.expectEqual(@import("antfly_replica_catalog").ReplicaBootstrapMode.persisted, first.record.bootstrap_mode);
-    try std.testing.expectEqual(@import("antfly_replica_catalog").ReplicaBootstrapMode.fetch_snapshot, second.record.bootstrap_mode);
+    try std.testing.expectEqual(@import("../raft/storage/catalog.zig").ReplicaBootstrapMode.persisted, first.record.bootstrap_mode);
+    try std.testing.expectEqual(@import("../raft/storage/catalog.zig").ReplicaBootstrapMode.fetch_snapshot, second.record.bootstrap_mode);
     try std.testing.expect(second.record.backup_restore_bootstrap != null);
     try std.testing.expectEqualStrings("snap1", second.record.backup_restore_bootstrap.?.backup_id);
     try std.testing.expectEqualStrings("file:///tmp/backups", second.record.backup_restore_bootstrap.?.location);

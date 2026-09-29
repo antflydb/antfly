@@ -17,7 +17,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const raft_engine = @import("raft_engine");
 const tracing = @import("../tracing/mod.zig");
-pub const catalog = @import("antfly_replica_catalog");
+pub const catalog = @import("storage/catalog.zig");
 const backup_restore = @import("storage/backup_restore.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const peer_resolver = @import("peer_resolver.zig");
@@ -2917,7 +2917,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
 
     const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
     const backups_api = @import("../api/backups.zig");
-    const storage_mod = @import("antfly_replica_catalog");
+    const storage_mod = @import("storage/catalog.zig");
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

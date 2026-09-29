@@ -69,7 +69,6 @@ SOURCE_MODULES = {
     "antfly_inference_bridge": ("zig/pkg/inference/src/host/bridge.zig",),
     "antfly_inference_provider_failure": ("zig/pkg/inference/src/host/provider_failure.zig",),
     "antfly_runtime_fs": ("zig/lib/runtime/src/fs.zig",),
-    "antfly_replica_catalog": ("zig/pkg/antfly-embedded/src/replica/catalog.zig",),
     "antfly_provision_contract": ("zig/pkg/antfly-embedded/src/metadata/provision_contract.zig",),
     "antfly_read_state_observer": ("zig/lib/raft/src/read_state_observer.zig",),
     "antfly_inference_worker_wire": ("zig/pkg/inference/src/host/worker_wire.zig",),

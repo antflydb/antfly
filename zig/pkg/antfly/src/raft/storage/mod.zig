@@ -14,7 +14,7 @@
 // limitations.
 
 const std = @import("std");
-pub const catalog = @import("antfly_replica_catalog");
+pub const catalog = @import("catalog.zig");
 pub const ReplicaBootstrapMode = catalog.ReplicaBootstrapMode;
 pub const ReplicaRecord = catalog.ReplicaRecord;
 pub const ReplicaCatalog = catalog.ReplicaCatalog;

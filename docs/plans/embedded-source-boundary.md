@@ -9,7 +9,7 @@ through declared Zig modules.
 ## Intended ownership
 
 - `zig/pkg/antfly-embedded`: embedded engine, local database and API surfaces,
-  Antfly inference provider adapters, C ABI, Lite CLI, shared protocol types,
+  Antfly inference provider adapters, C ABI, Lite CLI, shared local contracts,
   and their build owner.
 - `zig/pkg/inference`: native inference engine, host, worker, and CLI.
 - `zig/pkg/antfly`: ELv2 server orchestration, distributed coordination,
@@ -86,9 +86,30 @@ the Apache-only staged tree and run the server read-gate, metadata, restore,
 and standalone suites. The boundary check should reject an embedded import
 of `pkg/antfly` and a duplicate copy of any moved source file.
 
-The first layer now has named owners: the replica catalog lives in
-`pkg/antfly-embedded/src/replica`, the provisioning result contract in
-`pkg/antfly-embedded/src/metadata`, the read-state observer in `lib/raft`, and
-portable filesystem helpers in `lib/runtime`. The remaining local metadata and
-backup implementations still depend on Apache storage/API files under
-`pkg/antfly`; those dependencies must move before their consumers can.
+The replica catalog remains in `pkg/antfly/src/raft/storage`: it serves
+distributed replica bootstrap and restore, not Lite's C ABI. The provisioning
+result contract lives in `pkg/antfly-embedded/src/metadata`, the read-state
+observer in `lib/raft`, and portable filesystem helpers in `lib/runtime`. The
+remaining local metadata and backup implementations still depend on Apache
+storage/API files under `pkg/antfly`; those dependencies must move before their
+consumers can.
+
+## OpenAPI ownership
+
+Keep `specs/openapi` as the authored schema tree, organized by API surface.
+`openapi.yaml` is the joined **public** server API: database/auth, inference,
+and extensions. The `/admin/v1` and `/internal/v1` specifications remain
+separate because they have different audiences and security contracts; they
+should not be folded into the public SDK/documentation spec.
+
+Generated Zig modules should follow their consumers rather than the location
+of the authored YAML. Put embedded database and provider contracts under
+`pkg/antfly-embedded`, inference API contracts under `pkg/inference`, and
+server-only admin, internal, and authority/route modules under `pkg/antfly`.
+Move any types genuinely shared between embedded and server into a small
+Apache schema owner instead of copying or generating the same type twice.
+The code-generation build support currently in
+`pkg/antfly-embedded/build/codegen.zig` orchestrates all three products, so
+move that build support to a neutral build directory when splitting generated
+destinations. Keep one deterministic generation/check step across all outputs
+and assert that Lite/C API/inference never imports server-only modules.

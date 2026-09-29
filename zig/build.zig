@@ -727,14 +727,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     runtime_fs_mod.addImport("antfly_platform", platform_mod);
-    const replica_catalog_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/replica/catalog.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    replica_catalog_mod.addImport("antfly_runtime_fs", runtime_fs_mod);
-    replica_catalog_mod.addImport("antfly_platform", platform_mod);
-    replica_catalog_mod.addImport("raft_engine", raft_engine_mod);
     const provision_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/metadata/provision_contract.zig"),
         .target = target,
@@ -967,7 +959,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         .cache_budget = cache_budget_mod,
         .runtime_abi = runtime_abi_mod,
         .runtime_fs = runtime_fs_mod,
-        .replica_catalog = replica_catalog_mod,
         .provision_contract = provision_contract_mod,
         .read_state_observer = read_state_observer_mod,
         .private_error_diagnostics = private_error_diagnostics_mod,

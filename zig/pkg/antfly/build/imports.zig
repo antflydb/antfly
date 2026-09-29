@@ -23,7 +23,6 @@ pub const AntflyRootImports = struct {
     cache_budget: *std.Build.Module,
     runtime_abi: *std.Build.Module,
     runtime_fs: *std.Build.Module,
-    replica_catalog: *std.Build.Module,
     provision_contract: *std.Build.Module,
     read_state_observer: *std.Build.Module,
     private_error_diagnostics: *std.Build.Module,
@@ -376,7 +375,6 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_cache_budget", self.cache_budget);
         mod.addImport("antfly_runtime_abi", self.runtime_abi);
         mod.addImport("antfly_runtime_fs", self.runtime_fs);
-        mod.addImport("antfly_replica_catalog", self.replica_catalog);
         mod.addImport("antfly_provision_contract", self.provision_contract);
         mod.addImport("antfly_read_state_observer", self.read_state_observer);
         mod.addImport("antfly_inference_bridge", self.inference_bridge);

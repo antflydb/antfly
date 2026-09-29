@@ -202,6 +202,7 @@ zig/pkg/antfly/src/metadata/topology_protocol.zig
 zig/pkg/antfly/src/raft/feature_reads.zig
 zig/pkg/antfly/src/raft/read_gate.zig
 zig/pkg/antfly/src/raft/storage/backup_restore.zig
+zig/pkg/antfly/src/raft/storage/catalog.zig
 zig/pkg/antfly/src/runtime_bridge.zig
 zig/pkg/antfly/src/runtime_callback_abi.zig
 zig/pkg/antfly/src/runtime_dispatch.zig
