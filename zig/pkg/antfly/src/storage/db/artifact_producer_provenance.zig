@@ -18,7 +18,7 @@ pub const Effect = struct {
 };
 
 pub const Proof = struct {
-    version: u8 = 1,
+    version: u8 = 2,
     namespace: publication.Namespace,
     authority_epoch: u64,
     catalog_digest: publication.Digest,
@@ -31,6 +31,10 @@ pub const Proof = struct {
     input_digest: publication.Digest,
     sources: []const publication.Source,
     artifact_sources: []const publication.ArtifactSource,
+    /// Historical output compare-and-swap guards are not causal input guards.
+    /// They remain part of the authenticated donor publication even though
+    /// receiver adoption must compare the imported postimage instead.
+    mutation_preconditions: []const publication.ArtifactSource = &.{},
     effects: []const Effect,
 
     pub fn jsonStringify(self: Proof, stream: anytype) @TypeOf(stream.*).Error!void {
@@ -38,14 +42,15 @@ pub const Proof = struct {
     }
 
     pub fn inputCommand(self: Proof) publication.Command {
-        return .{ .namespace = self.namespace, .authority_epoch = self.authority_epoch, .catalog_digest = self.catalog_digest, .producer_kind = self.producer_kind, .producer_name = self.producer_name, .producer_generation = self.producer_generation, .producer_artifact_name = self.producer_artifact_name, .producer_scope_key = self.producer_scope_key, .sources = self.sources, .artifact_sources = self.artifact_sources, .mutations = &.{}, .publication_digest = self.publication_digest };
+        return .{ .namespace = self.namespace, .authority_epoch = self.authority_epoch, .catalog_digest = self.catalog_digest, .producer_kind = self.producer_kind, .producer_name = self.producer_name, .producer_generation = self.producer_generation, .producer_artifact_name = self.producer_artifact_name, .producer_scope_key = self.producer_scope_key, .sources = self.sources, .artifact_sources = self.artifact_sources, .mutation_preconditions = self.mutation_preconditions, .mutations = &.{}, .publication_digest = self.publication_digest };
     }
 
     pub fn validate(self: Proof) !void {
-        if (self.version != 1 or self.authority_epoch == 0 or (self.producer_generation == 0 and self.producer_kind != .resolver) or
+        if (self.version != 2 or self.authority_epoch == 0 or (self.producer_generation == 0 and self.producer_kind != .resolver) or
             self.producer_name.len == 0 or self.producer_artifact_name.len == 0 or
             self.sources.len == 0 or self.sources.len > publication.max_source_documents or
-            self.artifact_sources.len > publication.max_source_documents or self.effects.len == 0 or
+            self.artifact_sources.len > publication.max_source_documents or
+            self.mutation_preconditions.len > publication.max_source_documents - self.artifact_sources.len or self.effects.len == 0 or
             self.effects.len > publication.max_mutations or !std.mem.eql(u8, &self.input_digest, &self.inputCommand().inputDigest())) return error.ArtifactCatalogCorrupt;
         for (self.effects) |effect| if (effect.source_index >= self.sources.len or
             (effect.value_digest == null and effect.value_bytes != 0)) return error.ArtifactCatalogCorrupt;
@@ -70,17 +75,19 @@ pub const Proof = struct {
                 return error.ArtifactCatalogCorrupt;
             if (source.input_position) |position| position.requireNamespace(identity) catch return error.ArtifactCatalogCorrupt;
         }
-        for (self.artifact_sources, 0..) |source, index| {
-            if (source.source_index >= self.sources.len or !publication.guardedArtifactKey(source.key) or
-                (index != 0 and std.mem.order(u8, self.artifact_sources[index - 1].key, source.key) != .lt))
-                return error.ArtifactCatalogCorrupt;
-            if (source.input_position) |position| position.requireNamespace(identity) catch return error.ArtifactCatalogCorrupt;
-            const owner = @import("artifact_publication_owner.zig").documentAlloc(alloc, source.key) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return error.ArtifactCatalogCorrupt,
-            };
-            defer alloc.free(owner);
-            if (!std.mem.eql(u8, owner, self.sources[source.source_index].document_key)) return error.ArtifactCatalogCorrupt;
+        for ([_][]const publication.ArtifactSource{ self.artifact_sources, self.mutation_preconditions }) |guards| {
+            for (guards, 0..) |source, index| {
+                if (source.source_index >= self.sources.len or !publication.guardedArtifactKey(source.key) or
+                    (index != 0 and std.mem.order(u8, guards[index - 1].key, source.key) != .lt))
+                    return error.ArtifactCatalogCorrupt;
+                if (source.input_position) |position| position.requireNamespace(identity) catch return error.ArtifactCatalogCorrupt;
+                const owner = @import("artifact_publication_owner.zig").documentAlloc(alloc, source.key) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.ArtifactCatalogCorrupt,
+                };
+                defer alloc.free(owner);
+                if (!std.mem.eql(u8, owner, self.sources[source.source_index].document_key)) return error.ArtifactCatalogCorrupt;
+            }
         }
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         defer seen.deinit(alloc);
@@ -193,7 +200,7 @@ fn proofPositionSize(size: *usize, value: ?publication.Position) !void {
 }
 
 fn proofEncodedLength(proof: Proof) !usize {
-    var size: usize = 4 + 1 + 1 + 24 + 8 + 32 + 8 + 32 + 32 + 4 * 3 + 32;
+    var size: usize = 4 + 1 + 1 + 24 + 8 + 32 + 8 + 32 + 32 + 4 * 4 + 32;
     try proofBlobSize(&size, proof.producer_name);
     try proofBlobSize(&size, proof.producer_artifact_name);
     try proofBlobSize(&size, proof.producer_scope_key);
@@ -202,11 +209,11 @@ fn proofEncodedLength(proof: Proof) !usize {
         try proofAdd(&size, 1 + 32 + 8);
         try proofPositionSize(&size, source.input_position);
     }
-    for (proof.artifact_sources) |source| {
+    for ([_][]const publication.ArtifactSource{ proof.artifact_sources, proof.mutation_preconditions }) |guards| for (guards) |source| {
         try proofBlobSize(&size, source.key);
         try proofAdd(&size, 1 + @as(usize, if (source.content_digest == null) 0 else 32) + 4);
         try proofPositionSize(&size, source.input_position);
-    }
+    };
     for (proof.effects) |effect| {
         try proofBlobSize(&size, effect.key);
         try proofAdd(&size, 1 + 4 + 1 + @as(usize, if (effect.value_digest == null) 0 else 32) + 8);
@@ -262,6 +269,7 @@ pub fn encodeAlloc(alloc: std.mem.Allocator, proof: Proof) ![]u8 {
     writer.blob(proof.producer_scope_key);
     writer.writeU32(@intCast(proof.sources.len));
     writer.writeU32(@intCast(proof.artifact_sources.len));
+    writer.writeU32(@intCast(proof.mutation_preconditions.len));
     writer.writeU32(@intCast(proof.effects.len));
     for (proof.sources) |source| {
         writer.blob(source.document_key);
@@ -270,13 +278,13 @@ pub fn encodeAlloc(alloc: std.mem.Allocator, proof: Proof) ![]u8 {
         writer.writeU64(source.timestamp);
         try writer.position(source.input_position);
     }
-    for (proof.artifact_sources) |source| {
+    for ([_][]const publication.ArtifactSource{ proof.artifact_sources, proof.mutation_preconditions }) |guards| for (guards) |source| {
         writer.blob(source.key);
         writer.byte(@intFromBool(source.content_digest != null));
         if (source.content_digest) |digest| writer.write(&digest);
         try writer.position(source.input_position);
         writer.writeU32(source.source_index);
-    }
+    };
     for (proof.effects) |effect| {
         writer.byte(@intFromEnum(effect.family));
         writer.blob(effect.key);
@@ -336,7 +344,7 @@ pub fn decodeBorrowed(alloc: std.mem.Allocator, raw: []const u8) !Owned {
 }
 
 fn decode(alloc: std.mem.Allocator, raw: []const u8, copy_bytes: bool) !Owned {
-    if (raw.len < 4 + 1 + 1 + 24 + 8 + 32 + 8 + 32 + 32 + 4 * 6 + 32 or raw.len > max_encoded_bytes)
+    if (raw.len < 4 + 1 + 1 + 24 + 8 + 32 + 8 + 32 + 32 + 4 * 7 + 32 or raw.len > max_encoded_bytes)
         return error.ArtifactCatalogCorrupt;
     var digest: publication.Digest = undefined;
     std.crypto.hash.sha2.Sha256.hash(raw[0 .. raw.len - 32], &digest, .{});
@@ -359,20 +367,23 @@ fn decode(alloc: std.mem.Allocator, raw: []const u8, copy_bytes: bool) !Owned {
     const producer_scope_key = try cursor.blob();
     const source_count = try cursor.readU32();
     const artifact_count = try cursor.readU32();
+    const precondition_count = try cursor.readU32();
     const effect_count = try cursor.readU32();
-    if (source_count == 0 or source_count > publication.max_source_documents or artifact_count > publication.max_source_documents or effect_count == 0 or effect_count > publication.max_mutations)
+    if (source_count == 0 or source_count > publication.max_source_documents or artifact_count > publication.max_source_documents or
+        precondition_count > publication.max_source_documents - artifact_count or effect_count == 0 or effect_count > publication.max_mutations)
         return error.ArtifactCatalogCorrupt;
     const sources = try arena.allocator().alloc(publication.Source, source_count);
     const artifact_sources = try arena.allocator().alloc(publication.ArtifactSource, artifact_count);
+    const mutation_preconditions = try arena.allocator().alloc(publication.ArtifactSource, precondition_count);
     const effects = try arena.allocator().alloc(Effect, effect_count);
     for (sources) |*source| {
         source.* = .{ .document_key = try cursor.blob(), .exists = try cursor.flag(), .content_digest = (try cursor.take(32))[0..32].*, .timestamp = try cursor.readU64(), .input_position = try cursor.position() };
     }
-    for (artifact_sources) |*source| {
+    for ([_][]publication.ArtifactSource{ artifact_sources, mutation_preconditions }) |guards| for (guards) |*source| {
         const key_bytes = try cursor.blob();
         const content_digest: ?publication.Digest = if (try cursor.flag()) (try cursor.take(32))[0..32].* else null;
         source.* = .{ .key = key_bytes, .content_digest = content_digest, .input_position = try cursor.position(), .source_index = try cursor.readU32() };
-    }
+    };
     for (effects) |*effect| {
         const family = std.enums.fromInt(publication.Family, try cursor.byte()) orelse return error.ArtifactCatalogCorrupt;
         const key_bytes = try cursor.blob();
@@ -381,7 +392,7 @@ fn decode(alloc: std.mem.Allocator, raw: []const u8, copy_bytes: bool) !Owned {
         effect.* = .{ .family = family, .key = key_bytes, .source_index = source_index, .value_digest = value_digest, .value_bytes = try cursor.readU64() };
     }
     if (cursor.pos != cursor.bytes.len) return error.ArtifactCatalogCorrupt;
-    const proof: Proof = .{ .version = version, .namespace = namespace, .authority_epoch = epoch, .catalog_digest = catalog_digest, .producer_kind = producer_kind, .producer_name = producer_name, .producer_generation = generation, .producer_artifact_name = producer_artifact_name, .producer_scope_key = producer_scope_key, .publication_digest = publication_digest, .input_digest = input_digest, .sources = sources, .artifact_sources = artifact_sources, .effects = effects };
+    const proof: Proof = .{ .version = version, .namespace = namespace, .authority_epoch = epoch, .catalog_digest = catalog_digest, .producer_kind = producer_kind, .producer_name = producer_name, .producer_generation = generation, .producer_artifact_name = producer_artifact_name, .producer_scope_key = producer_scope_key, .publication_digest = publication_digest, .input_digest = input_digest, .sources = sources, .artifact_sources = artifact_sources, .mutation_preconditions = mutation_preconditions, .effects = effects };
     try proof.validate();
     return .{ .arena = arena, .proof = proof };
 }
@@ -396,6 +407,8 @@ pub fn fromCommand(alloc: std.mem.Allocator, command: publication.Command) !Owne
     for (sources) |*source| source.document_key = try owned.dupe(u8, source.document_key);
     const artifact_sources = try owned.dupe(publication.ArtifactSource, command.artifact_sources);
     for (artifact_sources) |*source| source.key = try owned.dupe(u8, source.key);
+    const mutation_preconditions = try owned.dupe(publication.ArtifactSource, command.mutation_preconditions);
+    for (mutation_preconditions) |*source| source.key = try owned.dupe(u8, source.key);
     const effects = try owned.alloc(Effect, command.mutations.len);
     for (command.mutations, effects) |mutation, *effect| {
         const digest: ?publication.Digest = if (mutation.value) |value| blk: {
@@ -418,6 +431,7 @@ pub fn fromCommand(alloc: std.mem.Allocator, command: publication.Command) !Owne
         .input_digest = command.inputDigest(),
         .sources = sources,
         .artifact_sources = artifact_sources,
+        .mutation_preconditions = mutation_preconditions,
         .effects = effects,
     };
     return .{ .arena = arena, .proof = proof };
@@ -1515,4 +1529,25 @@ test "ordered artifact inventory compact proof keeps binary keys bounded and rej
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{proof});
+}
+
+test "ordered artifact inventory compact proof preserves output CAS history" {
+    const alloc = std.testing.allocator;
+    const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(artifact);
+    const source = publication.Source{ .document_key = "doc", .content_digest = @splat(1), .timestamp = 7, .input_position = .{ .raft = .{ .term = 2, .index = 8 } } };
+    const before = publication.ArtifactSource{ .key = artifact, .content_digest = null, .input_position = .{ .raft = .{ .term = 2, .index = 9 } }, .source_index = 0 };
+    const after = publication.Mutation{ .family = .base_vector, .key = artifact, .value = null, .source_index = 0 };
+    var command: publication.Command = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "model", .producer_generation = 1, .producer_artifact_name = "model", .sources = (&source)[0..1], .mutation_preconditions = (&before)[0..1], .mutations = (&after)[0..1], .publication_digest = @splat(0) };
+    command.publication_digest = command.digest();
+    var prepared = try fromCommand(alloc, command);
+    defer prepared.deinit();
+    try std.testing.expectEqualDeep(before, prepared.proof.mutation_preconditions[0]);
+    const raw = try encodeAlloc(alloc, prepared.proof);
+    defer alloc.free(raw);
+    var recovered = try decodeAlloc(alloc, raw);
+    defer recovered.deinit();
+    try std.testing.expectEqualDeep(before, recovered.proof.mutation_preconditions[0]);
+    try recovered.proof.validatePortableShape(alloc);
+    try std.testing.expectEqualDeep(command.inputDigest(), recovered.proof.inputCommand().inputDigest());
 }

@@ -1771,8 +1771,11 @@ following mechanisms are installed behind that gate:
   passes, including allocation faults, LSM apply, 129-proof paged retirement,
   binary range/resume, corrupted-reference rejection, pinned-reader preservation,
   and current-epoch isolation.
-  Accepted proof bodies now use APF2, a compact checksummed binary record of
-  the same bounded logical read set and output digests. It removes JSON's
+  Accepted proof bodies now use APF2 v2, a compact checksummed binary record of
+  the same bounded logical read set, historical output compare-and-swap guards,
+  and output digests. Those output guards are kept distinct from causal inputs:
+  receiver adoption must compare the imported postimage, not replay the donor's
+  pre-publication guard. APF2 removes JSON's
   binary-key expansion so one legal proof fits within the AFB2 block ceiling;
   it does not itself add a portable proof block or confer receiver authority.
   The 206-case ordered-artifact target passes, including forged-field and
