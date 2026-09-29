@@ -877,6 +877,23 @@ test "relational index system source pin prepared crash blocks markers then reop
         const proof: portable.SourceCopyProof = .{ .scope = scope, .applied_index = 2, .retained_start = certificate.cut.retained_start };
         const artifact = try std.fmt.allocPrint(alloc, "{s}/source.afb2", .{root});
         defer alloc.free(artifact);
+        if (trial == 0) {
+            // The online reader must accept the same certified source-proof
+            // block as the one-pass and checkpointed restore paths.
+            const verifier = @import("../portable_source_verifier.zig");
+            const verified_file = try std.Io.Dir.cwd().openFile(std.testing.io, artifact, .{});
+            defer verified_file.close(std.testing.io);
+            for (0..256) |_| {
+                if ((try verifier.step(alloc, std.testing.io, verified_file, root, scope.pin(), certificate, .none, .{})).complete) break;
+            } else return error.TestExpectedSourceVerificationCompletion;
+            var objects = try verifier.ObjectReader.open(alloc, std.testing.io, verified_file, root, scope.pin(), certificate);
+            defer objects.deinit();
+            var proof_seen = false;
+            for (0..objects.objectCount()) |ordinal| {
+                if ((try objects.object(@intCast(ordinal))).kind == .source_proof_batch) proof_seen = true;
+            }
+            try std.testing.expect(proof_seen);
+        }
         const bytes = try backup.readFileAlloc(alloc, std.testing.io, artifact, 8 * 1024 * 1024);
         defer alloc.free(bytes);
         const decoder_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/decoder-{d}", .{ tmp.sub_path, trial });

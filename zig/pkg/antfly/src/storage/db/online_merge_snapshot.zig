@@ -33,6 +33,12 @@ const VectorStream = struct {
     digest: ?pages.Digest = null,
 };
 
+fn requireTransferableArtifactKind(kind: @import("../backup_codec.zig").BlockType) !void {
+    // Proof bodies are source evidence, not vector/graph afterimages. A merge
+    // must not declare its snapshot complete after skipping them.
+    if (kind == .source_proof_batch) return error.OnlineMergeProvenanceTransferRequired;
+}
+
 pub const Cache = struct {
     arena: ?std.heap.ArenaAllocator = null,
     sequence: ?u64 = null,
@@ -162,6 +168,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     while (receipt.phase == .artifacts and position.object < reader.objectCount() and integrity.items.len + vectors.items.len < pages.max_rows and work < pages.max_rows) : (work += 1) {
         try cancellation.check();
         const object = try reader.object(position.object);
+        try requireTransferableArtifactKind(object.kind);
         const raw_graph = object.kind == .source_artifact_batch;
         if (raw_graph and !graph_copy) return error.OnlineMergeArtifactTailsUnsupported;
         if (raw_graph or (vector_copy and object.kind == .artifact_batch)) {
@@ -336,6 +343,12 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     cache.arena = arena;
     arena_owned = false;
     return output(alloc, scope, cache, receipt);
+}
+
+test "ordered artifact inventory online merge refuses to drop certified source proofs" {
+    try std.testing.expectError(error.OnlineMergeProvenanceTransferRequired, requireTransferableArtifactKind(.source_proof_batch));
+    try requireTransferableArtifactKind(.source_artifact_batch);
+    try requireTransferableArtifactKind(.artifact_batch);
 }
 
 test "online direct vector receiver snapshot tail duplicate reply and restart preserve both projections" {
