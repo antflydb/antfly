@@ -1902,15 +1902,20 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         const CaptureDispatch = struct {
             calls: usize = 0,
             publish_calls: usize = 0,
+            encoded: ?[]u8 = null,
             fn enqueue(ptr: *anyopaque, _: publication.Namespace, bytes: []const u8) !void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 var decoded = try @import("artifact_publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, bytes);
                 defer decoded.deinit();
+                const copy = try std.testing.allocator.dupe(u8, bytes);
+                if (self.encoded) |prior_bytes| std.testing.allocator.free(prior_bytes);
+                self.encoded = copy;
                 self.calls += 1;
                 if (decoded.command.mode == .publish) self.publish_calls += 1;
             }
         };
         var dispatched = CaptureDispatch{};
+        defer if (dispatched.encoded) |bytes| alloc.free(bytes);
         db.artifact_publication_dispatcher = .{ .ptr = &dispatched, .enqueue = CaptureDispatch.enqueue };
         try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
         const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
@@ -2068,6 +2073,32 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             defer reader.abort();
             try std.testing.expect((try unit_jobs.prepareDocumentTurn(&reader, db.root_incarnation, "doc")).?.expected_revision > before_fresh);
             _ = try reader.get(&fresh_admission.jobs[0].key);
+        }
+        var accepted_child = try @import("artifact_publication_transport_codec.zig").decodeBorrowed(alloc, dispatched.encoded.?);
+        defer accepted_child.deinit();
+        try std.testing.expectEqual(.publish, accepted_child.command.mode);
+        try std.testing.expectEqualStrings("chunks", accepted_child.command.producer_name);
+        try std.testing.expectEqualStrings(unit_key, accepted_child.command.producer_scope_key);
+        try db.batchRaftReplicatedApply(.{ .artifact_publication = accepted_child.command }, .{ .term = 1, .index = 17 });
+        const before_accepted_retry = dispatched.calls;
+        for (0..3) |_| try std.testing.expectError(error.ArtifactPublicationPending, @import("enrichment/enrichment_runtime.zig").servicePendingArtifactUnitJobs(runtime, "doc", .{}));
+        try std.testing.expectEqual(before_accepted_retry, dispatched.calls);
+        {
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            _ = try reader.get(&fresh_admission.jobs[0].key);
+        }
+        for (0..4) |_| {
+            if (!try db.advanceArtifactUnitReceiptPage(alloc, "doc", retirement_plan.plan())) break;
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            if ((try unit_jobs.prepareDocumentTurn(&reader, db.root_incarnation, "doc")) == null) break;
+        }
+        {
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            try std.testing.expectError(error.NotFound, reader.get(&fresh_admission.jobs[0].key));
+            try std.testing.expectEqual(null, try unit_jobs.prepareDocumentTurn(&reader, db.root_incarnation, "doc"));
         }
     }
 }

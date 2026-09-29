@@ -2193,7 +2193,10 @@ following mechanisms are installed behind that gate:
   cursor advancement or job loss. After receipt retirement, the fixture
   accepts a fresh typed parent generation, admits its current unit job, and
   verifies that bounded worker turns submit an actual child publish command
-  while retaining the job pending receiver acceptance. This wires local
+  while retaining the job pending receiver acceptance. The receiver then
+  applies that command, retries the still-queued job without a duplicate
+  submission, and retires it and its document wake only through accepted
+  receipt maintenance. This wires local
   callbacks but does not complete remote child placement, large staged
   outputs, all-required stream closure, or the distributed activation fault
   matrix.
