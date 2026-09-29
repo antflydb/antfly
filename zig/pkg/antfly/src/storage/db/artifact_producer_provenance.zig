@@ -6,6 +6,7 @@
 const std = @import("std");
 const publication = @import("artifact_publication.zig");
 const binary = @import("relational_integrity_json.zig");
+const internal_keys = @import("../internal_keys.zig");
 pub const prefix = "\x00\x00__artifact_publication__:proof:";
 
 pub const Effect = struct {
@@ -205,6 +206,58 @@ pub fn key(namespace: publication.Namespace, digest: publication.Digest) [prefix
 const reference_prefix = "\x00\x00__artifact_publication__:proof_ref:";
 const count_prefix = "\x00\x00__artifact_publication__:proof_count:";
 const artifact_prefix = "\x00\x00__artifact_publication__:artifact_proof:";
+/// Range-seekable source-side evidence. The value is the accepted proof digest;
+/// the source reference and its count remain the authority. Cold retirement
+/// recovers the document from the bounded proof rather than duplicating it in
+/// another hot-path record.
+pub const document_reference_prefix = "\x00\x00__artifact_publication__:proof_doc:";
+
+const DocumentReference = struct {
+    source_index: usize,
+    key: []const u8,
+};
+
+pub const PreparedDocumentReferences = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: []const DocumentReference,
+
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+fn documentReferenceKeyAlloc(alloc: std.mem.Allocator, namespace: publication.Namespace, epoch: u64, document: []const u8, receipt_hash: []const u8) ![]u8 {
+    if (receipt_hash.len != 32) return error.ArtifactCatalogCorrupt;
+    const prefix_len = document_reference_prefix.len + 24 + 8;
+    const encoded_len = internal_keys.encodedComponentLen(document);
+    const result = try alloc.alloc(u8, prefix_len + encoded_len + 32);
+    @memcpy(result[0..document_reference_prefix.len], document_reference_prefix);
+    @memcpy(result[document_reference_prefix.len..][0..24], &namespace);
+    std.mem.writeInt(u64, result[document_reference_prefix.len + 24 ..][0..8], epoch, .big);
+    _ = internal_keys.encodeComponent(result[prefix_len..][0..encoded_len], document);
+    @memcpy(result[prefix_len + encoded_len ..], receipt_hash);
+    return result;
+}
+
+/// Prepare variable-length document keys before serialized apply. Every output
+/// source, including an absence publication, gets one range-seekable entry.
+pub fn prepareDocumentReferences(alloc: std.mem.Allocator, command: publication.Command) !PreparedDocumentReferences {
+    const owners = try command.outputSources();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    var entries: std.ArrayList(DocumentReference) = .empty;
+    for (command.sources, 0..) |source, source_index| {
+        if (!owners.isSet(source_index)) continue;
+        const reference = referenceKey(command, source);
+        try entries.append(owned, .{
+            .source_index = source_index,
+            .key = try documentReferenceKeyAlloc(owned, command.namespace, command.authority_epoch, source.document_key, reference[reference.len - 32 ..]),
+        });
+    }
+    return .{ .arena = arena, .entries = entries.items };
+}
 
 fn artifactReferenceKey(authority: publication.Authority, artifact: []const u8) [artifact_prefix.len + 24 + 8 + 32]u8 {
     var result: [artifact_prefix.len + 24 + 8 + 32]u8 = undefined;
@@ -485,7 +538,7 @@ pub fn referenceKey(command: publication.Command, source: publication.Source) [r
 /// One bounded maintenance page can release old-epoch references independently
 /// of proof size. The caller supplies a key obtained from the private prefix
 /// scan and must prove that epoch is no longer the active producer authority.
-pub fn retireReference(txn: anytype, reference: []const u8, current: publication.Authority) !void {
+pub fn retireReference(alloc: std.mem.Allocator, txn: anytype, reference: []const u8, current: publication.Authority) !void {
     const artifact = std.mem.startsWith(u8, reference, artifact_prefix);
     const prefix_len: usize = if (artifact) artifact_prefix.len else reference_prefix.len;
     if (reference.len != prefix_len + 24 + 8 + 32 or
@@ -496,8 +549,121 @@ pub fn retireReference(txn: anytype, reference: []const u8, current: publication
     const digest = try txn.get(reference);
     if (digest.len != 32 + @as(usize, if (artifact) publication.Position.encoded_len else 0)) return error.ArtifactCatalogCorrupt;
     const owned_digest: publication.Digest = digest[0..32].*;
+    if (!artifact) {
+        var owned = try decodeAlloc(alloc, try txn.get(&key(namespace, owned_digest)));
+        defer owned.deinit();
+        const source = for (owned.proof.sources) |candidate| {
+            if (std.mem.eql(u8, reference, &referenceKey(owned.proof.inputCommand(), candidate))) break candidate;
+        } else return error.ArtifactCatalogCorrupt;
+        const document_key = try documentReferenceKeyAlloc(alloc, namespace, epoch, source.document_key, reference[reference.len - 32 ..]);
+        defer alloc.free(document_key);
+        const indexed_digest = txn.get(document_key) catch |err| switch (err) {
+            error.NotFound => return error.ArtifactCatalogCorrupt,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, indexed_digest, &owned_digest)) return error.ArtifactCatalogCorrupt;
+        try txn.delete(document_key);
+    }
     try changeReferences(txn, namespace, owned_digest, false);
     try txn.delete(reference);
+}
+
+/// Retire at most one bounded page from each old-epoch reference family.
+/// Current references remain addressable to pinned readers, while each old
+/// document entry, reference count, and proof body retire atomically. There is
+/// no history-sized cursor: removing the first page exposes the next one.
+pub fn collectObsoletePage(alloc: std.mem.Allocator, store_handle: anytype) !bool {
+    const sources_done = try collectObsoleteReferencePage(alloc, store_handle, reference_prefix);
+    const artifacts_done = try collectObsoleteReferencePage(alloc, store_handle, artifact_prefix);
+    return sources_done and artifacts_done;
+}
+
+fn collectObsoleteReferencePage(alloc: std.mem.Allocator, store_handle: anytype, comptime family: []const u8) !bool {
+    const Retirement = struct { reference: []const u8, expected: []const u8, document_index: ?[]const u8, digest: publication.Digest };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var retired: std.ArrayList(Retirement) = .empty;
+    var at_end = false;
+    const authority = blk: {
+        var read = try store_handle.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer read.abort();
+        const current = (try publication.authority(&read)) orelse return true;
+        const scoped = try scratch.alloc(u8, family.len + current.namespace.len);
+        @memcpy(scoped[0..family.len], family);
+        @memcpy(scoped[family.len..], &current.namespace);
+        var cursor = try read.openPhysicalCursorAdapter();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(scoped);
+        var bytes: usize = 0;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        while (entry) |item| {
+            if (!std.mem.startsWith(u8, item.key, scoped)) {
+                entry = null;
+                break;
+            }
+            if (item.key.len != scoped.len + 8 + 32) return error.ArtifactCatalogCorrupt;
+            const epoch = std.mem.readInt(u64, item.key[scoped.len..][0..8], .big);
+            if (epoch == 0 or epoch > current.epoch) return error.ArtifactCatalogCorrupt;
+            if (epoch == current.epoch) {
+                entry = null;
+                break;
+            }
+            if (retired.items.len != 0 and (retired.items.len >= 128 or bytes >= 64 * 1024 or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
+            const expected_len = 32 + @as(usize, if (std.mem.eql(u8, family, artifact_prefix)) publication.Position.encoded_len else 0);
+            if (item.value.len != expected_len) return error.ArtifactCatalogCorrupt;
+            const owned_key = try scratch.dupe(u8, item.key);
+            const owned_value = try scratch.dupe(u8, item.value);
+            const digest: publication.Digest = owned_value[0..32].*;
+            var proof_bytes: usize = 0;
+            const document_index: ?[]const u8 = if (std.mem.eql(u8, family, reference_prefix)) source: {
+                const encoded = try read.get(&key(current.namespace, digest));
+                proof_bytes = encoded.len;
+                var proof = try decodeAlloc(scratch, encoded);
+                defer proof.deinit();
+                if (proof.proof.authority_epoch != epoch or !std.mem.eql(u8, &proof.proof.namespace, &current.namespace) or !std.mem.eql(u8, &proof.proof.publication_digest, &digest)) return error.ArtifactCatalogCorrupt;
+                const source = for (proof.proof.sources) |candidate| {
+                    if (std.mem.eql(u8, owned_key, &referenceKey(proof.proof.inputCommand(), candidate))) break candidate;
+                } else return error.ArtifactCatalogCorrupt;
+                const indexed = try documentReferenceKeyAlloc(scratch, current.namespace, epoch, source.document_key, owned_key[owned_key.len - 32 ..]);
+                const indexed_digest = read.get(indexed) catch |err| switch (err) {
+                    error.NotFound => return error.ArtifactCatalogCorrupt,
+                    else => return err,
+                };
+                if (!std.mem.eql(u8, indexed_digest, &digest)) return error.ArtifactCatalogCorrupt;
+                break :source indexed;
+            } else null;
+            try retired.append(scratch, .{ .reference = owned_key, .expected = owned_value, .document_index = document_index, .digest = digest });
+            bytes += owned_key.len + owned_value.len + proof_bytes + (if (document_index) |value| value.len else 0);
+            entry = try cursor.next();
+        }
+        at_end = entry == null;
+        break :blk current;
+    };
+    if (retired.items.len == 0) return at_end;
+    var writer = try store_handle.beginWriteTxn();
+    errdefer writer.abort();
+    const current = (try publication.authority(&writer)) orelse return error.ArtifactCatalogDrift;
+    if (!std.meta.eql(current, authority)) return error.ArtifactCatalogDrift;
+    for (retired.items) |item| {
+        const observed = writer.get(item.reference) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, observed, item.expected)) return error.ArtifactCatalogDrift;
+        if (item.document_index) |indexed| {
+            const value = writer.get(indexed) catch |err| switch (err) {
+                error.NotFound => return error.ArtifactCatalogDrift,
+                else => return err,
+            };
+            if (!std.mem.eql(u8, value, &item.digest)) return error.ArtifactCatalogDrift;
+            try writer.delete(indexed);
+        }
+        try changeReferences(&writer, current.namespace, item.digest, false);
+        try writer.delete(item.reference);
+    }
+    try writer.commit();
+    return at_end;
 }
 
 fn changeReferences(txn: anytype, namespace: publication.Namespace, digest: publication.Digest, increment: bool) !void {
@@ -526,6 +692,14 @@ fn changeReferences(txn: anytype, namespace: publication.Namespace, digest: publ
 /// Epoch retirement still needs a bounded reference walk; it cannot drop only
 /// the authority key and strand these references.
 pub fn stage(txn: anytype, command: publication.Command, encoded_proof: []const u8, position: publication.Position) !void {
+    return stageWithDocumentReferences(txn, command, encoded_proof, position, null);
+}
+
+pub fn stageIndexed(txn: anytype, command: publication.Command, encoded_proof: []const u8, position: publication.Position, prepared: *const PreparedDocumentReferences) !void {
+    return stageWithDocumentReferences(txn, command, encoded_proof, position, prepared);
+}
+
+fn stageWithDocumentReferences(txn: anytype, command: publication.Command, encoded_proof: []const u8, position: publication.Position, prepared: ?*const PreparedDocumentReferences) !void {
     const owners = try command.outputSources();
     const proof_key = key(command.namespace, command.publication_digest);
     const old = txn.get(&proof_key) catch |err| switch (err) {
@@ -535,6 +709,7 @@ pub fn stage(txn: anytype, command: publication.Command, encoded_proof: []const 
     if (old) |value| {
         if (!std.mem.eql(u8, value, encoded_proof)) return error.ArtifactCatalogCorrupt;
     } else try txn.put(&proof_key, encoded_proof);
+    var next_document: usize = 0;
     for (command.sources, 0..) |source, source_index| {
         if (!owners.isSet(source_index)) continue;
         const reference = referenceKey(command, source);
@@ -542,17 +717,30 @@ pub fn stage(txn: anytype, command: publication.Command, encoded_proof: []const 
             error.NotFound => null,
             else => return err,
         };
+        var unchanged = false;
         if (previous) |digest| {
             if (digest.len != 32) return error.ArtifactCatalogCorrupt;
-            if (std.mem.eql(u8, digest, &command.publication_digest)) continue;
+            unchanged = std.mem.eql(u8, digest, &command.publication_digest);
             // Copy before mutating the transaction: borrowed values may be
             // invalidated by the first subsequent write.
-            const old_digest: publication.Digest = digest[0..32].*;
-            try changeReferences(txn, command.namespace, old_digest, false);
+            if (!unchanged) {
+                const old_digest: publication.Digest = digest[0..32].*;
+                try changeReferences(txn, command.namespace, old_digest, false);
+            }
         }
-        try changeReferences(txn, command.namespace, command.publication_digest, true);
-        try txn.put(&reference, &command.publication_digest);
+        if (!unchanged) {
+            try changeReferences(txn, command.namespace, command.publication_digest, true);
+            try txn.put(&reference, &command.publication_digest);
+        }
+        if (prepared) |index| {
+            if (next_document == index.entries.len) return error.ArtifactCatalogCorrupt;
+            const entry = index.entries[next_document];
+            next_document += 1;
+            if (entry.source_index != source_index) return error.ArtifactCatalogCorrupt;
+            try txn.put(entry.key, &command.publication_digest);
+        }
     }
+    if (prepared) |index| if (next_document != index.entries.len) return error.ArtifactCatalogCorrupt;
     const authority: publication.Authority = .{ .namespace = command.namespace, .epoch = command.authority_epoch, .catalog_digest = command.catalog_digest };
     const encoded_position = try position.encode();
     var value: [32 + publication.Position.encoded_len]u8 = undefined;
@@ -573,6 +761,160 @@ pub fn stage(txn: anytype, command: publication.Command, encoded_proof: []const 
         try changeReferences(txn, command.namespace, command.publication_digest, true);
         try txn.put(&reference, &value);
     }
+}
+
+fn testEncodedProofAlloc(alloc: std.mem.Allocator, command: publication.Command) ![]u8 {
+    const effects = try alloc.alloc(Effect, command.mutations.len);
+    defer alloc.free(effects);
+    for (command.mutations, effects) |mutation, *effect| {
+        var digest: ?publication.Digest = null;
+        if (mutation.value) |value| {
+            var hashed: publication.Digest = undefined;
+            std.crypto.hash.sha2.Sha256.hash(value, &hashed, .{});
+            digest = hashed;
+        }
+        effect.* = .{ .family = mutation.family, .key = mutation.key, .source_index = mutation.source_index, .value_digest = digest, .value_bytes = if (mutation.value) |value| value.len else 0 };
+    }
+    return encodeAlloc(alloc, .{ .namespace = command.namespace, .authority_epoch = command.authority_epoch, .catalog_digest = command.catalog_digest, .producer_kind = command.producer_kind, .producer_name = command.producer_name, .producer_generation = command.producer_generation, .producer_artifact_name = command.producer_artifact_name, .producer_scope_key = command.producer_scope_key, .publication_digest = command.publication_digest, .input_digest = command.inputDigest(), .sources = command.sources, .artifact_sources = command.artifact_sources, .effects = effects });
+}
+
+test "ordered artifact inventory document proof index tracks absence replacement and retirement" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        values: std.StringHashMap([]u8),
+        fn get(self: *@This(), name: []const u8) anyerror![]const u8 {
+            return self.values.get(name) orelse error.NotFound;
+        }
+        fn put(self: *@This(), name: []const u8, value: []const u8) !void {
+            const owned_value = try std.testing.allocator.dupe(u8, value);
+            errdefer std.testing.allocator.free(owned_value);
+            const entry = try self.values.getOrPut(name);
+            if (entry.found_existing) std.testing.allocator.free(entry.value_ptr.*) else entry.key_ptr.* = try std.testing.allocator.dupe(u8, name);
+            entry.value_ptr.* = owned_value;
+        }
+        fn delete(self: *@This(), name: []const u8) !void {
+            const entry = self.values.fetchRemove(name) orelse return error.NotFound;
+            std.testing.allocator.free(entry.key);
+            std.testing.allocator.free(entry.value);
+        }
+        fn deinit(self: *@This()) void {
+            var it = self.values.iterator();
+            while (it.next()) |entry| {
+                std.testing.allocator.free(entry.key_ptr.*);
+                std.testing.allocator.free(entry.value_ptr.*);
+            }
+            self.values.deinit();
+        }
+    };
+    var txn: Fake = .{ .values = std.StringHashMap([]u8).init(alloc) };
+    defer txn.deinit();
+    const sources = [_]publication.Source{
+        .{ .document_key = "a\x00b", .content_digest = @splat(1), .timestamp = 1, .input_position = null },
+        .{ .document_key = "neighbor", .content_digest = @splat(2), .timestamp = 1, .input_position = null },
+    };
+    const effects = [_]publication.Mutation{.{ .family = .document_artifact, .key = "absent-output", .value = null, .source_index = 0 }};
+    var command: publication.Command = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "asset", .sources = &sources, .mutations = &effects, .publication_digest = @splat(3) };
+    const AllocationCheck = struct {
+        fn run(a: std.mem.Allocator, selected: publication.Command) !void {
+            var prepared = try prepareDocumentReferences(a, selected);
+            defer prepared.deinit();
+            try std.testing.expectEqual(@as(usize, 1), prepared.entries.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{command});
+    var index = try prepareDocumentReferences(alloc, command);
+    defer index.deinit();
+    try std.testing.expectEqual(@as(usize, 1), index.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), index.entries[0].source_index);
+    const reference = referenceKey(command, sources[0]);
+    const position: publication.Position = .{ .raft = .{ .term = 1, .index = 1 } };
+    const first_proof = try testEncodedProofAlloc(alloc, command);
+    defer alloc.free(first_proof);
+    try stageIndexed(&txn, command, first_proof, position, &index);
+    try stageIndexed(&txn, command, first_proof, position, &index);
+    try std.testing.expectEqualSlices(u8, &command.publication_digest, try txn.get(index.entries[0].key));
+    command.publication_digest = @splat(4);
+    const second_proof = try testEncodedProofAlloc(alloc, command);
+    defer alloc.free(second_proof);
+    try stageIndexed(&txn, command, second_proof, position, &index);
+    try std.testing.expectEqualSlices(u8, &command.publication_digest, try txn.get(index.entries[0].key));
+    const current: publication.Authority = .{ .namespace = command.namespace, .epoch = 2, .catalog_digest = command.catalog_digest };
+    try retireReference(alloc, &txn, &reference, current);
+    try std.testing.expectError(error.NotFound, txn.get(index.entries[0].key));
+}
+
+test "ordered artifact inventory obsolete proof GC bounds pages and preserves current and pinned evidence" {
+    const alloc = std.testing.allocator;
+    const db_mod = @import("db.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/proof-gc", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    var namespace: publication.Namespace = undefined;
+    @import("doc_identity.zig").encodeNamespace(&namespace, db.core.identity_namespace);
+    const active: publication.Authority = .{ .namespace = namespace, .epoch = 2, .catalog_digest = @splat(3) };
+    const position: publication.Position = .{ .raft = .{ .term = 1, .index = 1 } };
+    var first_reference: [reference_prefix.len + 24 + 8 + 32]u8 = undefined;
+    var first_proof: publication.Digest = undefined;
+    var first_document_index: ?[]u8 = null;
+    defer if (first_document_index) |value| alloc.free(value);
+    var current_reference: [reference_prefix.len + 24 + 8 + 32]u8 = undefined;
+    {
+        var writer = try db.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        try publication.stageAuthority(&writer, .{ .mode = .activate, .namespace = namespace, .authority_epoch = active.epoch, .catalog_digest = active.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        for (0..129) |ordinal| {
+            const document = try std.fmt.allocPrint(alloc, "doc{d:0>4}", .{ordinal});
+            defer alloc.free(document);
+            const output = try internal_keys.artifactNamedPrefixAlloc(alloc, document, "asset", "proof");
+            defer alloc.free(output);
+            const source = publication.Source{ .document_key = document, .content_digest = @splat(1), .timestamp = 1, .input_position = null };
+            const effect = publication.Mutation{ .family = .document_artifact, .key = output, .value = null, .source_index = 0 };
+            var digest: publication.Digest = undefined;
+            std.crypto.hash.sha2.Sha256.hash(document, &digest, .{});
+            const command: publication.Command = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = active.catalog_digest, .producer_name = "proof", .producer_generation = 1, .producer_artifact_name = "proof", .sources = (&source)[0..1], .mutations = (&effect)[0..1], .publication_digest = digest };
+            const encoded = try testEncodedProofAlloc(alloc, command);
+            defer alloc.free(encoded);
+            var indexed = try prepareDocumentReferences(alloc, command);
+            defer indexed.deinit();
+            try stageIndexed(&writer, command, encoded, position, &indexed);
+            if (ordinal == 0) {
+                first_reference = referenceKey(command, source);
+                first_proof = digest;
+                first_document_index = try alloc.dupe(u8, indexed.entries[0].key);
+            }
+        }
+        const source = publication.Source{ .document_key = "current", .content_digest = @splat(1), .timestamp = 1, .input_position = null };
+        const output = try internal_keys.artifactNamedPrefixAlloc(alloc, "current", "asset", "proof");
+        defer alloc.free(output);
+        const effect = publication.Mutation{ .family = .document_artifact, .key = output, .value = null, .source_index = 0 };
+        const command: publication.Command = .{ .namespace = namespace, .authority_epoch = 2, .catalog_digest = active.catalog_digest, .producer_name = "proof", .producer_generation = 2, .producer_artifact_name = "proof", .sources = (&source)[0..1], .mutations = (&effect)[0..1], .publication_digest = @splat(9) };
+        const encoded = try testEncodedProofAlloc(alloc, command);
+        defer alloc.free(encoded);
+        var indexed = try prepareDocumentReferences(alloc, command);
+        defer indexed.deinit();
+        try stageIndexed(&writer, command, encoded, position, &indexed);
+        current_reference = referenceKey(command, source);
+        try writer.commit();
+    }
+    var pinned = try db.core.store.beginReadTxn();
+    defer pinned.abort();
+    try std.testing.expect((try publication.authority(&pinned)) != null);
+    _ = try pinned.get(&first_reference);
+    var pages: usize = 0;
+    while (pages < 512) {
+        pages += 1;
+        if (try collectObsoletePage(alloc, db.core.store)) break;
+    }
+    try std.testing.expect(pages > 1 and pages < 512);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(&first_reference));
+    try std.testing.expectError(error.NotFound, read.get(first_document_index.?));
+    try std.testing.expectError(error.NotFound, read.get(&key(namespace, first_proof)));
+    _ = try read.get(&current_reference);
 }
 
 test "ordered artifact inventory provenance shares receipts and reclaims superseded proof" {
@@ -616,8 +958,12 @@ test "ordered artifact inventory provenance shares receipts and reclaims superse
     var command: publication.Command = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "model", .sources = &sources, .mutations = &mutations, .publication_digest = @splat(3) };
     const original_key = key(command.namespace, command.publication_digest);
     const position: publication.Position = .{ .raft = .{ .term = 1, .index = 1 } };
-    try stage(&txn, command, "first-proof", position);
-    try stage(&txn, command, "first-proof", position);
+    const first_proof = try testEncodedProofAlloc(std.testing.allocator, command);
+    defer std.testing.allocator.free(first_proof);
+    var first_index = try prepareDocumentReferences(std.testing.allocator, command);
+    defer first_index.deinit();
+    try stageIndexed(&txn, command, first_proof, position, &first_index);
+    try stageIndexed(&txn, command, first_proof, position, &first_index);
     // Preparation evidence survives unrelated writes, but not replacement or
     // retirement of the exact accepted artifact proof. Check the whole value:
     // an identical digest at a different publication position is not a match.
@@ -637,29 +983,25 @@ test "ordered artifact inventory provenance shares receipts and reclaims superse
     try certificate.requireCurrent(&txn);
     try std.testing.expectError(error.NotFound, txn.get(&referenceKey(command, sources[2])));
     try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, (try txn.get(&countKey(command.namespace, command.publication_digest)))[0..8], .little));
-    command.sources = sources[0..1];
-    command.mutations = mutations[0..1];
     command.publication_digest = @splat(4);
-    try stage(&txn, command, "second-proof", position);
+    const second_proof = try testEncodedProofAlloc(std.testing.allocator, command);
+    defer std.testing.allocator.free(second_proof);
+    var second_index = try prepareDocumentReferences(std.testing.allocator, command);
+    defer second_index.deinit();
+    try stageIndexed(&txn, command, second_proof, position, &second_index);
     try std.testing.expectError(error.EnrichmentSourceChanged, certificate.requireCurrent(&txn));
-    try std.testing.expectEqualStrings("first-proof", try txn.get(&original_key));
-    command.sources = sources[1..2];
-    var second = mutations[1];
-    second.source_index = 0;
-    command.mutations = (&second)[0..1];
-    try stage(&txn, command, "second-proof", position);
     try std.testing.expectError(error.NotFound, txn.get(&original_key));
     try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, (try txn.get(&countKey(command.namespace, command.publication_digest)))[0..8], .little));
     try std.testing.expectError(error.ArtifactCatalogCorrupt, stage(&txn, command, "different-proof", position));
     const reference_b = referenceKey(command, sources[1]);
     const authority: publication.Authority = .{ .namespace = command.namespace, .epoch = 1, .catalog_digest = command.catalog_digest };
-    try std.testing.expectError(error.ArtifactCatalogScopeChanged, retireReference(&txn, &reference_b, authority));
+    try std.testing.expectError(error.ArtifactCatalogScopeChanged, retireReference(std.testing.allocator, &txn, &reference_b, authority));
     var next_authority = authority;
     next_authority.epoch = 2;
-    try retireReference(&txn, &reference_b, next_authority);
-    try std.testing.expectEqualStrings("second-proof", try txn.get(&key(command.namespace, command.publication_digest)));
-    try retireReference(&txn, &referenceKey(command, sources[0]), next_authority);
-    for (mutations) |effect| try retireReference(&txn, &artifactReferenceKey(authority, effect.key), next_authority);
+    try retireReference(std.testing.allocator, &txn, &reference_b, next_authority);
+    try std.testing.expectEqualSlices(u8, second_proof, try txn.get(&key(command.namespace, command.publication_digest)));
+    try retireReference(std.testing.allocator, &txn, &referenceKey(command, sources[0]), next_authority);
+    for (mutations) |effect| try retireReference(std.testing.allocator, &txn, &artifactReferenceKey(authority, effect.key), next_authority);
     try std.testing.expectError(error.NotFound, txn.get(&key(command.namespace, command.publication_digest)));
 }
 

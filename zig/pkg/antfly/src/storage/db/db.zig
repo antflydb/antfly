@@ -30893,6 +30893,8 @@ pub const DB = struct {
         defer if (prepared_replay) |value| self.alloc.free(value);
         var prepared_proof: ?[]u8 = null;
         defer if (prepared_proof) |value| self.alloc.free(value);
+        var prepared_document_refs: ?@import("artifact_producer_provenance.zig").PreparedDocumentReferences = null;
+        defer if (prepared_document_refs) |*value| value.deinit();
         var coverage_layout: ?@import("artifact_coverage_layout.zig").Layout = null;
         defer if (coverage_layout) |*value| value.deinit();
         var reservation: ?resource_manager_mod.Reservation = null;
@@ -31033,6 +31035,7 @@ pub const DB = struct {
                         var proof = try @import("artifact_producer_provenance.zig").fromCommand(self.alloc, command);
                         defer proof.deinit();
                         prepared_proof = try @import("artifact_producer_provenance.zig").encodeAlloc(self.alloc, proof.proof);
+                        prepared_document_refs = try @import("artifact_producer_provenance.zig").prepareDocumentReferences(self.alloc, command);
                     }
                 }
             } else preparation_error = error.EnrichmentSourceChanged;
@@ -31266,6 +31269,7 @@ pub const DB = struct {
             asset_upstream_fences: []const @import("artifact_asset_publication.zig").UpstreamFence,
             position: publication.Position,
             proof: []const u8,
+            document_references: *const @import("artifact_producer_provenance.zig").PreparedDocumentReferences,
             upload: ?@import("artifact_publication_transport.zig").Finalization,
             fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
                 const guard: *@This() = @ptrCast(@alignCast(ptr));
@@ -31277,14 +31281,14 @@ pub const DB = struct {
                 for (guard.asset_upstream_fences) |fence| try fence.requireCurrent(txn);
                 try publication.stageCoverage(alloc, txn, guard.command, guard.coverage);
                 try publication.stageReceipts(txn, guard.command, guard.sequence);
-                try @import("artifact_producer_provenance.zig").stage(txn, guard.command, guard.proof, guard.position);
+                try @import("artifact_producer_provenance.zig").stageIndexed(txn, guard.command, guard.proof, guard.position, guard.document_references);
                 try publication.stageArtifactRevisions(txn, guard.command, guard.position);
                 if (guard.command.producer_kind == .resolver) try @import("artifact_publication_resolution.zig").stageHandoff(alloc, txn, guard.command);
                 try DB.completeArtifactUpload(txn, guard.upload, .{ .term = guard.position.raft.term, .index = guard.position.raft.index });
                 try guard.db.stageRestoreStagingHAOutbox(txn, guard.ha_payload);
             }
         };
-        var guard: Guard = .{ .db = self, .ha_payload = ha_payload, .command = command, .sequence = sequence, .coverage = prepared_value.coverage, .chunk_fence = prepared_value.chunk_fence, .chunk_vector_fence = prepared_value.chunk_vector_fence, .asset_upstream_fences = prepared_value.asset_upstream_fences, .position = .{ .raft = .{ .term = entry.term, .index = entry.index } }, .proof = prepared_proof orelse return error.ArtifactCatalogCorrupt, .upload = opts.artifact_upload_finalize };
+        var guard: Guard = .{ .db = self, .ha_payload = ha_payload, .command = command, .sequence = sequence, .coverage = prepared_value.coverage, .chunk_fence = prepared_value.chunk_fence, .chunk_vector_fence = prepared_value.chunk_vector_fence, .asset_upstream_fences = prepared_value.asset_upstream_fences, .position = .{ .raft = .{ .term = entry.term, .index = entry.index } }, .proof = prepared_proof orelse return error.ArtifactCatalogCorrupt, .document_references = if (prepared_document_refs) |*value| value else return error.ArtifactCatalogCorrupt, .upload = opts.artifact_upload_finalize };
         _ = self.core.store.putBatchWithPromotionsReplayAndBuiltWrite(batch_ctx.io, writes.items, deletes.items, &.{}, .{ .sequence = sequence, .payload = replay }, null, .{ .ptr = &guard, .validate = Guard.validate }) catch |err| switch (err) {
             error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .stale_source, &apply_held),
             error.ArtifactCoverageBaselinePending => return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .baseline_pending, &apply_held),
@@ -36081,6 +36085,7 @@ pub const DB = struct {
             break :blk owner.kind;
         };
         const retired_work = try @import("artifact_producer_obligations.zig").collectObsoleteWorkPage(scratch, self.core.store);
+        const retired_proofs = try @import("artifact_producer_provenance.zig").collectObsoletePage(scratch, self.core.store);
         const retired_checkpoints = try @import("artifact_stream_checkpoint.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
         const retired_streams = try @import("artifact_stream_progress.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
         const retired_completions = try @import("artifact_completion_progress.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
@@ -36090,7 +36095,7 @@ pub const DB = struct {
         const retired_unit_jobs = try @import("artifact_unit_jobs.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
         const retired_authored = try @import("artifact_authored_acceptance.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
         const swept_authored = try @import("artifact_authored_acceptance.zig").collectCurrentPage(scratch, self.core.store, self.root_incarnation);
-        const retired = retired_work and retired_checkpoints and retired_streams and retired_completions and retired_native and retired_inventories and retired_units and retired_unit_jobs and retired_authored and swept_authored;
+        const retired = retired_work and retired_proofs and retired_checkpoints and retired_streams and retired_completions and retired_native and retired_inventories and retired_units and retired_unit_jobs and retired_authored and swept_authored;
         if (owner_kind == .raft) {
             var prepared = (try @import("artifact_producer_baseline.zig").prepareRaft(scratch, self.core.store)) orelse {
                 var validation = (try @import("artifact_producer_validation.zig").prepareRaft(scratch, self.core.store)) orelse {
@@ -149343,6 +149348,10 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
         defer read.abort();
         try std.testing.expectEqualStrings("{}", try read.get(copy_key));
         try std.testing.expect((try publication.readReceipt(&read, copy_command, source)) != null);
+        var indexed = try provenance.prepareDocumentReferences(alloc, copy_command);
+        defer indexed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), indexed.entries.len);
+        try std.testing.expectEqualSlices(u8, &copy_command.publication_digest, try read.get(indexed.entries[0].key));
     }
     const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, "doc", "g");
     defer alloc.free(count_key);

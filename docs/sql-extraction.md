@@ -1754,6 +1754,18 @@ following mechanisms are installed behind that gate:
   revision witness without reading large artifact bodies. This is deliberately
   distinct from retry acknowledgement: shared graph outputs can be legitimately
   superseded and need projection reconciliation, not repeated inference.
+- Accepted producer proofs now also stage a document-ordered reference in the
+  same atomic apply, including publications whose output is absent. Variable
+  key construction occurs before the apply lock; cold epoch retirement recovers
+  the document from the bounded proof rather than duplicating long document
+  keys on the write path. A bounded, two-phase maintenance page verifies old
+  references and document entries outside its writer transaction, then retires
+  them with reference counts and proof bodies under an authority CAS. This is
+  the range-seekable source evidence index
+  needed for bounded snapshot export, not yet a portable proof stream or a
+  receiver-local adoption certificate. The 204-case ordered-artifact target
+  passes, including allocation faults, LSM apply, 129-proof paged retirement,
+  pinned-reader preservation, and current-epoch isolation.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups
