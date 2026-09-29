@@ -74,6 +74,10 @@ pub const Config = struct {
     /// Question-first positions (`packing.question_first`). Requires
     /// `packing`.
     question_first: bool = false,
+    /// Train (and export) this option scorer (`laya.decision_head`). Null
+    /// keeps the source checkpoint's; `.pointer` on a scorer checkpoint
+    /// starts a new, seeded pointer head.
+    decision_head: ?model.DecisionHead = null,
     /// Two-stage choice (roadmap 2b): only valid with `packing: .candidate`.
     /// Set to also train, alongside the ordinary candidate rows, one joint
     /// (question-style) row per eligible `choice` record over a sampled
@@ -375,6 +379,12 @@ fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.jso
     if (c.packing != null) {
         _ = decision.object.swapRemove("packing");
         if (layout.enabled()) try decision.object.put(a, "packing", try packingConfigJson(a, layout));
+        if (c.decision_head) |head| {
+            try decision.object.put(a, "decision_head", .{ .string = @tagName(head) });
+            if (head == .pointer) {
+                try decision.object.put(a, "pointer_dim", .{ .integer = @intCast((model.Config{}).pointer_dim) });
+            } else _ = decision.object.orderedRemove("pointer_dim");
+        }
     }
     // The old option buckets override per-type temperatures in inference.
     // They must never survive a change to the trained weights.
@@ -555,6 +565,12 @@ fn validateEncoderMetadata(value: std.json.Value) !void {
 /// Trainable values already have an owned copy and are filled at publication.
 fn exportInputs(a: std.mem.Allocator, reader: *const safetensors.MMapReader, selected: []const training.controller.Parameter) ![]checkpoint.NamedTensor {
     var result: std.ArrayListUnmanaged(checkpoint.NamedTensor) = .empty;
+    // Trained tensors the source lacks (a new pointer head) are exported too.
+    for (selected) |p| if (std.mem.startsWith(u8, p.name, "pointer.") and reader.header.tensors.get(p.name) == null) {
+        const shape = try a.alloc(usize, p.dimensions.len);
+        for (shape, p.dimensions) |*dst, dim| dst.* = @intCast(dim);
+        try result.append(a, .{ .name = try a.dupe(u8, p.name), .shape = shape, .data = &.{} });
+    };
     var tensors = reader.header.tensors.iterator();
     while (tensors.next()) |entry| {
         const shape = try a.alloc(usize, entry.value_ptr.shape.len);
@@ -590,6 +606,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
     var encoder = try modern.parseConfig(a, config_bytes);
     const source_laya = encoder.laya orelse return error.InvalidLayaConfig;
     encoder.laya.?.packing = try packing(c, source_laya);
+    if (c.decision_head) |head| encoder.laya.?.decision_head = head;
     const laya = encoder.laya.?;
     if (c.freeze_layers > encoder.num_hidden_layers) return error.InvalidLayaJob;
     for ([_][]const u8{ "attention_bias", "mlp_bias", "norm_bias" }) |key| if (config_json.value.object.get(key)) |v| {
@@ -642,7 +659,11 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         defer a.free(source_bytes);
         var source = try safetensors.MMapReader.fromBorrowedBytesLimited(a, source_bytes, 16 * 1024 * 1024);
         defer source.deinit();
-        try @import("../../models/laya.zig").validateReader(&source, laya, encoder);
+        // The source is checked against its own head; a pointer head it
+        // lacks is initialized by `training.parameters`.
+        var source_check = laya;
+        source_check.decision_head = source_laya.decision_head;
+        try @import("../../models/laya.zig").validateReader(&source, source_check, encoder);
         if (source.header.tensors.get("temperature")) |meta| if (!std.mem.eql(i64, meta.shape, &.{3})) return error.InvalidLayaWeights;
         const initial = try cache.get(train.examples[0..@min(train.examples.len, c.batch_size)]);
         const selected = try training.parameters(permanent, &initial.graph, &source, c.freeze_layers, lora, c.seed);

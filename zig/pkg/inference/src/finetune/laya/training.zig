@@ -140,7 +140,9 @@ fn loraInitA(a: std.mem.Allocator, dims: []const i32, seed: u64, name: []const u
 /// Trainable parameters, excluding those frozen by `freeze_layers` or `lora`.
 /// A LoRA `.lora_A`/`.lora_B` parameter has no source tensor: `A` gets a
 /// Kaiming-uniform draw and `B` is zero, so training starts identical to the
-/// unmodified base model (`graph.zig`'s `Lora` doc comment).
+/// unmodified base model (`graph.zig`'s `Lora` doc comment). A pointer head
+/// missing from the source (`laya.decision_head`) starts the same way, with
+/// zero biases.
 pub fn parameters(a: std.mem.Allocator, graph: *const ml.Graph, reader: *const tensors.MMapReader, freeze_layers: u32, lora: ?architecture.Lora, seed: u64) ![]controller.Parameter {
     var out: std.ArrayListUnmanaged(controller.Parameter) = .empty;
     for (graph.parameters.items) |id| {
@@ -153,6 +155,14 @@ pub fn parameters(a: std.mem.Allocator, graph: *const ml.Graph, reader: *const t
         const values = if (std.mem.endsWith(u8, name, ".lora_A"))
             try loraInitA(a, dims, seed, name)
         else if (std.mem.endsWith(u8, name, ".lora_B")) blk: {
+            const count = shape.numElements() orelse return error.InvalidLayaTrainingWeightShape;
+            const zeros = try a.alloc(f32, @intCast(count));
+            @memset(zeros, 0);
+            break :blk zeros;
+        } else if (std.mem.startsWith(u8, name, "pointer.") and reader.header.tensors.get(name) == null) blk: {
+            // A new pointer head on a scorer checkpoint: Kaiming-uniform
+            // weights and zero biases, seeded like the LoRA adapters.
+            if (std.mem.endsWith(u8, name, ".weight")) break :blk try loraInitA(a, dims, seed, name);
             const count = shape.numElements() orelse return error.InvalidLayaTrainingWeightShape;
             const zeros = try a.alloc(f32, @intCast(count));
             @memset(zeros, 0);
@@ -223,6 +233,7 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
     const kinds = try a.alloc(i32, ids.len);
     const type_mask = try a.alloc(f32, ids.len * cfg.hidden_size);
     const markers = try a.alloc(i32, l.questions * l.options);
+    const anchors = try a.alloc(i32, l.questions);
     const positions = try a.alloc(i64, ids.len);
     var question: usize = 0;
     for (examples, 0..) |e, row| {
@@ -239,12 +250,16 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
         }
         for (0..e.questions()) |qi| {
             const q = e.question(qi);
+            // The decision's [CLS]: its branch anchor, or the unpacked
+            // sequence's first token.
+            const anchor: usize = if (e.packed_row) |p| @intCast(p.row.anchors[qi]) else 0;
+            anchors[question] = @intCast(row * l.sequence + anchor);
             @memset(markers[question * l.options ..][0..l.options], @intCast(row * l.sequence));
             for (q.markers, 0..) |pos, i| markers[question * l.options + i] = @intCast(row * l.sequence + @as(usize, @intCast(pos)));
             question += 1;
         }
     }
-    for ([_]ml.NodeId{ built.inputs.ids, built.inputs.kinds, built.inputs.markers }, [_][]const i32{ ids, kinds, markers }) |id, data| {
+    for ([_]ml.NodeId{ built.inputs.ids, built.inputs.kinds, built.inputs.markers, built.inputs.anchors }, [_][]const i32{ ids, kinds, markers, anchors }) |id, data| {
         const value = (try cb.fromInt32Shape(data, &.{@intCast(data.len)})) orelse return error.UnsupportedLayaTrainingBackend;
         errdefer cb.free(value);
         try result.append(a, .{ .node_id = id, .value = value });

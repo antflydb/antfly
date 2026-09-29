@@ -74,6 +74,7 @@ pub const Inputs = struct {
     kinds: Id, // per token; trunk tokens use any valid index with type_mask 0
     type_mask: Id, // [N,H], 0 where a token receives no question-type embedding
     markers: Id, // flattened batch-offset token indices, [questions*options]
+    anchors: Id, // flattened batch-offset token index of each decision's [CLS], [questions]; read by the pointer head
     encoder_bias: Id, // [B*encoder_heads,S,S], padding and tree visibility
     local_bias: Id, // encoder_bias plus the logical sliding window
     head_bias: Id, // [B*head_heads,S,S], padding and tree visibility
@@ -279,6 +280,7 @@ pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f3
         .kinds = try b.parameter("__laya_kinds", Shape.init(.i32, &.{n})),
         .type_mask = try b.parameter("__laya_type_mask", Shape.init(.f32, &.{ n, h })),
         .markers = try b.parameter("__laya_markers", Shape.init(.i32, &.{l.questions * l.options})),
+        .anchors = try b.parameter("__laya_anchors", Shape.init(.i32, &.{l.questions})),
         .encoder_bias = try b.parameter("__laya_encoder_bias", Shape.init(.f32, &.{ l.batch * nh, l.sequence, l.sequence })),
         .local_bias = try b.parameter("__laya_local_bias", Shape.init(.f32, &.{ l.batch * nh, l.sequence, l.sequence })),
         .head_bias = try b.parameter("__laya_head_bias", Shape.init(.f32, &.{ l.batch * hh, l.sequence, l.sequence })),
@@ -357,6 +359,20 @@ pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f3
         try result.trace(b.graph.allocator, prefix, x);
     }
     const m = try b.gather(x, result.inputs.markers, Shape.init(.f32, &.{ l.questions * l.options, h }));
+    if (lc.decision_head == .pointer) {
+        // Pointer head: scaled dot product of the anchor's query projection
+        // with each option marker's key projection.
+        const p: u32 = @intCast(lc.pointer_dim);
+        const anchor = try b.gather(x, result.inputs.anchors, Shape.init(.f32, &.{ l.questions, h }));
+        const q = try linear(b, &result, anchor, "pointer.q", l.questions, h, p, true, null);
+        const k = try linear(b, &result, m, "pointer.k", l.questions * l.options, h, p, true, null);
+        const keys = try b.reshape(k, Shape.init(.f32, &.{ l.questions, l.options, p }));
+        const query = try b.reshape(q, Shape.init(.f32, &.{ l.questions, p, 1 }));
+        const scores = try b.matmul3D(keys, query);
+        const scaled = try b.mul(scores, try b.scalarConst(.f32, 1 / @sqrt(@as(f32, @floatFromInt(p)))));
+        result.logits = try b.reshape(scaled, Shape.init(.f32, &.{ l.questions, l.options }));
+        return result;
+    }
     const normalized = try norm(b, m, "scorer.0", h, 1e-5, true);
     const up = try linear(b, &result, normalized, "scorer.1", l.questions * l.options, h, h, true, null);
     const logits = try linear(b, &result, try b.geluExact(up), "scorer.3", l.questions * l.options, h, 1, true, null);

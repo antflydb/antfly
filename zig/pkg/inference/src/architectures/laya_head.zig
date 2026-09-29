@@ -57,7 +57,8 @@ pub fn forward(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, ma
     }
     const hidden = try transform(cb, a, cfg, encoder, mask, kinds, batch, seq, dim);
     defer cb.free(hidden);
-    if (cb.kind() == .cuda) return forwardCudaTail(cb, a, cfg, hidden, markers, batch, seq, count, dim);
+    // The CUDA tail is scorer-only; a pointer head scores on the host path.
+    if (cb.kind() == .cuda and cfg.decision_head == .scorer) return forwardCudaTail(cb, a, cfg, hidden, markers, batch, seq, count, dim);
     const host = try cb.toFloat32(hidden, a);
     defer a.free(host);
     if (host.len != batch * seq * dim) return error.UnexpectedOutputShape;
@@ -84,15 +85,19 @@ fn scoreHost(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32
     }
     const m = try cb.fromFloat32Shape(gathered, &.{ @intCast(batch * count), @intCast(dim) });
     defer cb.free(m);
-    const n = try norm(cb, m, "scorer.0", dim);
-    defer cb.free(n);
-    const s1 = try linear(cb, n, "scorer.1", batch * count, dim, dim);
-    defer cb.free(s1);
-    const sg = try exactGelu(cb, s1);
-    defer cb.free(sg);
-    const s2 = try linear(cb, sg, "scorer.3", batch * count, dim, 1);
-    defer cb.free(s2);
-    const logits = try cb.toFloat32(s2, a);
+    const logits = if (cfg.decision_head == .pointer)
+        try pointerLogits(cb, a, cfg, host, m, anchors, count, dim)
+    else blk: {
+        const n = try norm(cb, m, "scorer.0", dim);
+        defer cb.free(n);
+        const s1 = try linear(cb, n, "scorer.1", batch * count, dim, dim);
+        defer cb.free(s1);
+        const sg = try exactGelu(cb, s1);
+        defer cb.free(sg);
+        const s2 = try linear(cb, sg, "scorer.3", batch * count, dim, 1);
+        defer cb.free(s2);
+        break :blk try cb.toFloat32(s2, a);
+    };
     defer a.free(logits);
     if (logits.len != batch * count) return error.UnexpectedOutputShape;
     for (markers, logits) |pos, *logit| if (pos < 0) {
@@ -108,6 +113,36 @@ fn scoreHost(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32
     const f = try cb.fromFloat32Shape(features, &.{ @intCast(batch), @intCast(dim + 4) });
     defer cb.free(f);
     return actionHead(cb, a, cfg, f, logits, batch, count, dim);
+}
+
+/// Pointer head scores, `[decisions * count]`: the scaled dot product of a
+/// query projection of each decision's anchor row and a key projection of
+/// each of its option markers (`markers_ct`, `[decisions * count, dim]`).
+fn pointerLogits(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32, markers_ct: CT, anchors: []const usize, count: usize, dim: usize) ![]f32 {
+    const batch = anchors.len;
+    const p = cfg.pointer_dim;
+    const rows = try a.alloc(f32, batch * dim);
+    defer a.free(rows);
+    for (anchors, 0..) |anchor, i| @memcpy(rows[i * dim ..][0..dim], host[anchor * dim ..][0..dim]);
+    const anchor_ct = try cb.fromFloat32Shape(rows, &.{ @intCast(batch), @intCast(dim) });
+    defer cb.free(anchor_ct);
+    const q_ct = try linear(cb, anchor_ct, "pointer.q", batch, dim, p);
+    defer cb.free(q_ct);
+    const k_ct = try linear(cb, markers_ct, "pointer.k", batch * count, dim, p);
+    defer cb.free(k_ct);
+    const q = try cb.toFloat32(q_ct, a);
+    defer a.free(q);
+    const k = try cb.toFloat32(k_ct, a);
+    defer a.free(k);
+    if (q.len != batch * p or k.len != batch * count * p) return error.UnexpectedOutputShape;
+    const logits = try a.alloc(f32, batch * count);
+    const scale = 1 / @sqrt(@as(f32, @floatFromInt(p)));
+    for (0..batch) |row| for (0..count) |option| {
+        var sum: f32 = 0;
+        for (q[row * p ..][0..p], k[(row * count + option) * p ..][0..p]) |x, y| sum += x * y;
+        logits[row * count + option] = sum * scale;
+    };
+    return logits;
 }
 
 /// Top probability, margin, normalized entropy and option count of one

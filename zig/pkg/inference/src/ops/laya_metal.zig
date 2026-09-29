@@ -21,10 +21,11 @@ pub fn enabled() bool {
     return platform.env.getenvBool("ANTFLY_LAYA_METAL_RESIDENT") and !platform.env.getenvBool("TERMITE_METAL_DISABLE_LAYA_RESIDENT");
 }
 
-/// The fused path reads dense weights. A checkpoint served with quantized
-/// linears (`laya.weight_quantization`) runs the generic encoder instead.
+/// The fused path reads dense weights and scores with the upstream scorer. A
+/// checkpoint served with quantized linears (`laya.weight_quantization`) or
+/// a pointer head (`laya.decision_head`) runs the generic encoder instead.
 pub fn enabledFor(laya: @import("../models/laya.zig").Config) bool {
-    return enabled() and (laya.effectiveWeightQuantization() catch return false) == .none;
+    return enabled() and laya.decision_head == .scorer and (laya.effectiveWeightQuantization() catch return false) == .none;
 }
 
 /// Conservative two-layer frame bound, including dense-attention scratch.

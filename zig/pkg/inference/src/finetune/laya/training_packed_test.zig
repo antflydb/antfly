@@ -83,8 +83,11 @@ test "laya packed training graph matches packed serving logits, alone and in a p
     var words = synthetic.WordTokenizer{};
     const tok = words.tokenizer();
     // `fuse_layers` 3 fuses the head and the top encoder layer.
-    for ([_][]const u8{ "{\"mode\":\"question\"}", "{\"mode\":\"candidate\"}", "{\"mode\":\"question\",\"fuse_layers\":3}", "{\"mode\":\"question\",\"question_first\":true}", "{\"mode\":\"candidate\",\"question_first\":true}" }) |packing| for ([_]bool{ false, true }) |use_fused_attention| {
-        try synthetic.writeModel(a, std.testing.io, dir, packing, 128, 719);
+    const Case = struct { packing: []const u8, extra: []const u8 = "" };
+    const pointer = ",\"decision_head\":\"pointer\"";
+    for ([_]Case{ .{ .packing = "{\"mode\":\"question\"}" }, .{ .packing = "{\"mode\":\"candidate\"}" }, .{ .packing = "{\"mode\":\"question\",\"fuse_layers\":3}" }, .{ .packing = "{\"mode\":\"question\",\"question_first\":true}" }, .{ .packing = "{\"mode\":\"candidate\",\"question_first\":true}" }, .{ .packing = "{\"mode\":\"question\"}", .extra = pointer }, .{ .packing = "{\"mode\":\"question\",\"question_first\":true}", .extra = pointer } }) |case| for ([_]bool{ false, true }) |use_fused_attention| {
+        const packing = case.packing;
+        try synthetic.writeModelWith(a, std.testing.io, dir, packing, case.extra, 128, 719);
         const config = try modern.parseConfig(scratch, try files.readFileFromDir(scratch, dir, "config.json"));
         const laya = config.laya.?;
         var examples: [states.len]train.Example = undefined;
@@ -123,7 +126,7 @@ test "laya packed training graph matches packed serving logits, alone and in a p
             }
             try std.testing.expectEqual(@as(usize, l.questions), decision);
         }
-        std.debug.print("Laya packed {s} (fused attention {}): training-graph vs serving max logit error={d}\n", .{ packing, use_fused_attention, worst });
+        std.debug.print("Laya packed {s}{s} (fused attention {}): training-graph vs serving max logit error={d}\n", .{ packing, case.extra, use_fused_attention, worst });
         try std.testing.expect(worst < 1e-4);
         try tmp.dir.deleteFile(std.testing.io, "model.safetensors");
     };
@@ -149,6 +152,13 @@ test "laya training exports per-question upper layers that serve exactly" {
     try exerciseUnpackedToPackedParity(true, false, 3);
 }
 
+// Pointer head (`laya.decision_head`) on a scorer checkpoint: the head is
+// initialized, trained, exported with the model, and served exactly.
+test "laya training exports a new pointer head that serves exactly" {
+    try exerciseParity(false, false, 0, .pointer);
+    try exerciseParity(true, false, 0, .pointer);
+}
+
 // Regression coverage for the fused-attention eval dropout leak: a
 // `Program`'s graph (and the fused op's graph-time `dropout_probability`)
 // is built once and reused for both training steps and `predict` eval, so
@@ -163,6 +173,10 @@ test "laya training converts an unpacked checkpoint into a served packed model (
 }
 
 fn exerciseUnpackedToPackedParity(force_fused_attention: bool, trunk_sees_questions: bool, fuse_layers: u32) !void {
+    return exerciseParity(force_fused_attention, trunk_sees_questions, fuse_layers, null);
+}
+
+fn exerciseParity(force_fused_attention: bool, trunk_sees_questions: bool, fuse_layers: u32, decision_head: ?model.DecisionHead) !void {
     const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
     const job = @import("job.zig");
     const hf = @import("inference_hf_tokenizer");
@@ -187,6 +201,7 @@ fn exerciseUnpackedToPackedParity(force_fused_attention: bool, trunk_sees_questi
         .force_fused_attention = force_fused_attention,
         .trunk_sees_questions = trunk_sees_questions,
         .fuse_layers = fuse_layers,
+        .decision_head = decision_head,
     };
     var admission = @import("../../runtime/tier/memory.zig").AdmissionController{};
     try job.execute(a, io, c, &admission);
@@ -196,6 +211,7 @@ fn exerciseUnpackedToPackedParity(force_fused_attention: bool, trunk_sees_questi
     const cfg = factory.getLayaConfig(session) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(trunk_sees_questions, cfg.packing.trunk_sees_questions);
     try std.testing.expectEqual(fuse_layers, cfg.packing.fuse_layers);
+    try std.testing.expectEqual(decision_head orelse .scorer, cfg.decision_head);
     try std.testing.expectEqual(model.PackingMode.question, cfg.packing.mode);
     // Serving the exported packed model reproduces the job's final evaluation.
     const Prediction = struct { kind: model.QuestionType, logits: []const f32, target: []const f32 };

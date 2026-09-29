@@ -109,6 +109,8 @@ pub fn quantizedLinear(name: []const u8) bool {
     return false;
 }
 
+pub const DecisionHead = enum { scorer, pointer };
+
 pub const Config = struct {
     mask_token: [128]u8 = "[MASK]".* ++ ([_]u8{0} ** 122),
     mask_token_len: usize = 6,
@@ -120,6 +122,13 @@ pub const Config = struct {
     buckets: [3][4]?f32 = .{ .{ null, null, null, null }, .{ null, null, null, null }, .{ null, null, null, null } },
     packing: Packing = .{},
     weight_quantization: WeightQuantization = .none,
+    /// How options are scored from the head's output. `scorer` (upstream):
+    /// an MLP over each option marker. `pointer` (LAYA.md, "Lessons from
+    /// Jeeves"): a scaled dot product between a query projection of the
+    /// question's `[CLS]` anchor and a key projection of each option marker,
+    /// `pointer.q`/`pointer.k`, each `[pointer_dim, hidden]`.
+    decision_head: DecisionHead = .scorer,
+    pointer_dim: usize = 256,
 
     /// The configured precision, unless ANTFLY_LAYA_WEIGHT_QUANT names one.
     pub fn effectiveWeightQuantization(self: Config) !WeightQuantization {
@@ -172,6 +181,14 @@ pub const Config = struct {
         if (obj.get("weight_quantization")) |v| {
             if (v != .string) return error.InvalidLayaConfig;
             out.weight_quantization = std.meta.stringToEnum(WeightQuantization, v.string) orelse return error.InvalidLayaConfig;
+        }
+        if (obj.get("decision_head")) |v| {
+            if (v != .string) return error.InvalidLayaConfig;
+            out.decision_head = std.meta.stringToEnum(DecisionHead, v.string) orelse return error.InvalidLayaConfig;
+        }
+        if (obj.get("pointer_dim")) |v| {
+            if (v != .integer or v.integer < 8 or v.integer > 4096 or out.decision_head != .pointer) return error.InvalidLayaConfig;
+            out.pointer_dim = @intCast(v.integer);
         }
         return out;
     }
@@ -364,6 +381,10 @@ pub fn validateReader(reader: *const @import("safetensors.zig").MMapReader, cfg:
     try Check.norm(reader, "scorer.0", d, true);
     try Check.pair(reader, "scorer.1", d, d);
     try Check.pair(reader, "scorer.3", d, 1);
+    if (cfg.decision_head == .pointer) {
+        try Check.pair(reader, "pointer.q", d, @intCast(cfg.pointer_dim));
+        try Check.pair(reader, "pointer.k", d, @intCast(cfg.pointer_dim));
+    }
     try Check.pair(reader, "act_head.0", d + 4, 256);
     try Check.pair(reader, "act_head.2", 256, @intCast(cfg.n_act));
     for (0..cfg.head_layers) |layer| {
