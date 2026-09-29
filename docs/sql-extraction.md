@@ -1832,6 +1832,11 @@ following mechanisms are installed behind that gate:
   receiver-owned physical generations in O(1) per proof, and rejects donor
   generation drift. It does not yet rebind graph effect bytes or map the
   non-index producer families, so it is candidate identity, not acceptance.
+  A selected direct-index candidate can now build a receiver-owned APF3 body
+  off-lock from remapped local inputs and selected postimages. The body binds
+  donor lineage through its adoption digest, drops donor historical output
+  preconditions, and refuses graph/non-index adoption; it does not stage
+  receipts or grant authority until ordered receiver apply is wired.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups

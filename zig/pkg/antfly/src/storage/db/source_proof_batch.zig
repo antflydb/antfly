@@ -332,6 +332,66 @@ pub fn revalidateReceiverCandidate(
     return true;
 }
 
+/// Prepare the receiver-owned proof outside serialized apply. Its logical
+/// slices borrow the candidate, while `encoded` is separately owned by the
+/// caller. Writer apply must revalidate the candidate and stage this proof,
+/// its selected receipts and references in one transaction. This function
+/// grants no authority by itself.
+pub const AdoptedProof = struct {
+    proof: provenance.Proof,
+    encoded: []u8,
+    effects: []provenance.Effect,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.encoded);
+        alloc.free(self.effects);
+        self.* = undefined;
+    }
+};
+
+pub fn buildAdoptedProofAlloc(alloc: std.mem.Allocator, candidate: *const ReceiverCandidate) !AdoptedProof {
+    // Graph key/value generations must first be rebound and compared against
+    // their receiver postimages. Non-index producer generations need their
+    // own catalog identity mapping. Never inherit the donor's generation.
+    if (candidate.donor.producer_kind != .index) return error.ArtifactAdoptionUnsupported;
+    const generation = candidate.receiver_producer_generation orelse return error.ArtifactAdoptionUnsupported;
+    const effects = try alloc.alloc(provenance.Effect, candidate.effects.len);
+    errdefer alloc.free(effects);
+    for (candidate.effects, effects) |selected, *effect| {
+        if (selected.effect.family == .graph) return error.ArtifactAdoptionUnsupported;
+        effect.* = selected.effect;
+    }
+    var proof: provenance.Proof = .{
+        .namespace = candidate.receiver.namespace,
+        .authority_epoch = candidate.receiver.binding.epoch,
+        .catalog_digest = candidate.receiver.binding.digest,
+        .producer_kind = candidate.donor.producer_kind,
+        .producer_name = candidate.donor.producer_name,
+        .producer_generation = generation,
+        .producer_artifact_name = candidate.donor.producer_artifact_name,
+        .producer_scope_key = candidate.donor.producer_scope_key,
+        .publication_digest = @splat(0),
+        .input_digest = undefined,
+        .sources = candidate.sources,
+        .artifact_sources = candidate.artifact_sources,
+        .effects = effects,
+        .origin = .{
+            .source_pin = candidate.donor.source_pin,
+            .namespace = candidate.donor.namespace,
+            .binding = candidate.donor.binding,
+            .publication_digest = candidate.donor.publication_digest,
+            .input_digest = candidate.donor.input_digest,
+            .proof_checksum = candidate.donor.proof_checksum,
+            .selected_bitmap = candidate.donor.selected_bitmap,
+        },
+    };
+    proof.input_digest = proof.inputCommand().inputDigest();
+    proof.publication_digest = proof.adoptionDigest();
+    try proof.validatePortableShape(alloc);
+    const encoded = try provenance.encodeAlloc(alloc, proof);
+    return .{ .proof = proof, .encoded = encoded, .effects = effects };
+}
+
 test "ordered artifact inventory receiver producer mapping rejects donor identity drift" {
     const alloc = std.testing.allocator;
     const prefix = "AIDX\x02\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00g\x03\x02\x00\x00\x00{}";
@@ -638,6 +698,31 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     try std.testing.expect(mapped.effects[1].input_position == null);
     try std.testing.expectEqualSlices(u8, &row_digest, &mapped.sources[0].content_digest);
     try std.testing.expect(try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
+    var adopted = try buildAdoptedProofAlloc(alloc, &mapped);
+    defer adopted.deinit(alloc);
+    try std.testing.expectEqualDeep(receiver_namespace, adopted.proof.namespace);
+    try std.testing.expectEqualDeep(receiver_binding.digest, adopted.proof.catalog_digest);
+    try std.testing.expectEqual(@as(u64, 9), adopted.proof.producer_generation);
+    try std.testing.expectEqualDeep(row_position, adopted.proof.sources[0].input_position.?);
+    try std.testing.expectEqualDeep(guard_position, adopted.proof.artifact_sources[0].input_position.?);
+    try std.testing.expectEqual(@as(usize, 0), adopted.proof.mutation_preconditions.len);
+    try std.testing.expectEqualDeep(source_pin, adopted.proof.origin.?.source_pin);
+    try std.testing.expectEqualDeep(proof.publication_digest, adopted.proof.origin.?.publication_digest);
+    try std.testing.expect(!std.mem.eql(u8, &proof.publication_digest, &adopted.proof.publication_digest));
+    var roundtrip = try provenance.decodeAlloc(alloc, adopted.encoded);
+    defer roundtrip.deinit();
+    try std.testing.expectEqualDeep(adopted.proof.publication_digest, roundtrip.proof.publication_digest);
+    const ProofAllocationCheck = struct {
+        fn run(a: std.mem.Allocator, candidate: *const ReceiverCandidate) !void {
+            var built = try buildAdoptedProofAlloc(a, candidate);
+            defer built.deinit(a);
+            try std.testing.expectEqual(candidate.receiver.namespace, built.proof.namespace);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, ProofAllocationCheck.run, .{&mapped});
+    mapped.donor.producer_kind = .graph;
+    try std.testing.expectError(error.ArtifactAdoptionUnsupported, buildAdoptedProofAlloc(alloc, &mapped));
+    mapped.donor.producer_kind = .index;
     const changed_position: publication.Position = .{ .raft = .{ .term = 9, .index = 13 } };
     const changed_position_bytes = try changed_position.encode();
     try receiver.values.put(&output_revision_key, &changed_position_bytes);
