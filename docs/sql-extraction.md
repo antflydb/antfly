@@ -1854,7 +1854,10 @@ following mechanisms are installed behind that gate:
   Online artifact-page apply now writes receiver-local artifact revisions in
   the same batch as each transferred afterimage or deletion. Those revisions
   are the exact output witnesses later adoption needs, and replay-only pages
-  cannot advance them to a new Raft position.
+  cannot advance them to a new Raft position. Receiver candidate preparation
+  treats a present output without such a revision as stale before constructing
+  an adopted proof; absent outputs can still acquire a tombstone revision in
+  ordered apply.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups

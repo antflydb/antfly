@@ -294,11 +294,15 @@ pub fn prepareReceiverCandidate(
             std.crypto.hash.sha2.Sha256.hash(value, &actual, .{});
             if (!std.mem.eql(u8, &actual, &expected)) return null;
         } else if (effect.value_digest != null) return null;
+        const input_position = try publication.artifactRevision(txn, receiver_namespace, effect.key);
+        // A present imported postimage needs a receiver-owned physical
+        // revision. Only an absent output may acquire one at ordered adoption.
+        if (raw != null and input_position == null) return null;
         var local = effect;
         local.key = try owned.dupe(u8, effect.key);
         selected_effects[selected_count] = .{
             .effect = local,
-            .input_position = try publication.artifactRevision(txn, receiver_namespace, effect.key),
+            .input_position = input_position,
         };
         selected_count += 1;
     }
@@ -794,6 +798,9 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
     try receiver.values.put(&row_revision_key, &row_position_bytes);
     try std.testing.expect(try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
+    try std.testing.expect(receiver.values.remove(&output_revision_key));
+    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, &plan, decoded)) == null);
+    try receiver.values.put(&output_revision_key, &output_position_bytes);
     std.mem.writeInt(u64, authority_bytes[28..36], receiver_binding.epoch + 1, .little);
     std.crypto.hash.Blake3.hash(authority_bytes[0..68], authority_bytes[68..100], .{});
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
