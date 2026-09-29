@@ -364,6 +364,9 @@ fn injectPublishFault(point: PublishFaultPoint) !void {
 }
 
 fn loadDecodedPathWithIo(alloc: Allocator, io: std.Io, path: []const u8) !DecodedLoadResult {
+    // The freestanding path reads through RebuildState.storage above. There is
+    // no process cwd to consult when that storage is absent.
+    if (comptime builtin.os.tag == .freestanding) return .absent;
     const encoded = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(rebuild_state_max_read_bytes)) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return .absent,
         error.StreamTooLong => return .corrupt,
