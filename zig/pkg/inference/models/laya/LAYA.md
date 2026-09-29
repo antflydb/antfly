@@ -904,6 +904,72 @@ isolation, and tests the scale hypothesis directly. A MoJev-style pooled
 bilinear head is an optional ablation. Teacher throughput sets the cost of this
 experiment; see [Teacher throughput](#teacher-throughput).
 
+### Lessons from Jeeves (research, 2026-09-29)
+
+[PostHog/jeeves](https://github.com/PostHog/jeeves) is a Jev-like decision
+model: Qwen3.5-9B with LoRA (r = 16 on all projections) and a pointer head,
+trained with SFT and then reinforcement learning (CISPO) to reason before it
+decides. Figures below are the project's own; we have not reproduced them.
+
+| Setting | Accuracy |
+| --- | --- |
+| Their test split (2,962 items), with reasoning | 0.840 |
+| Same split, without reasoning | 0.804 |
+| Dev (325 questions), full reasoning (median 3.3 s, p90 17.1 s on one H100) | 0.825 |
+| Dev, reasoning only below 0.9 confidence, capped at 768 tokens (median 2.0 s) | 0.806 |
+| Dev, no reasoning (about 0.3 s) | 0.775 |
+| Test overall, item-weighted, with reasoning (Jev: 0.857) | 0.889 |
+
+What bears on Laya:
+
+- **Their layout is ours, on a causal decoder.** The prompt is `<state> …
+  <q> instructions <opt> option </opt> … <decide>`: the state comes first and
+  never sees the question.
+  - Serving prefills the prefix a state's questions share once and gives
+    every question its own copy of that cache (`inference/engine.py`,
+    `group`). That is our trunk cache.
+  - It works for them because a causal model's state tokens were never
+    trained to see what follows them.
+  - Our results point the same way. Every layout that keeps the ModernBERT
+    state question-blind trails unpacked by about 0.1 or more, even with all
+    30 layers fused per question ([Per-question upper layers](#scaling-packed-training-on-open-jev-2026-09-27)).
+  - Both open reproductions that keep the state question-blind (MoJev and
+    Jeeves) start from Qwen decoders.
+- **Base model over data volume.** SFT used 19,126 questions (12 public
+  datasets plus synthetic policy data), a tenth of MoJev's 205k rows. That
+  fits our Open-Jev result, where 33× more data did not move the packed
+  encoder.
+- **A pointer head.** Each option is scored by a scaled dot product between a
+  query projection (256 wide) of the hidden state at `<decide>` and a key
+  projection at that option's `</opt>`, then one temperature fitted on dev.
+  Laya instead runs a two-layer transformer head over option markers. A
+  pointer head is a cheap ablation on our encoder, and it is the natural
+  head for a decoder base.
+- **Rare tokens as anchors.** `<state>`, `<q>`, `<opt>`, `</opt>` and
+  `<decide>` map to unused Qwen tokens (`<|fim_prefix|>`, …). In their
+  ablation, plain text such as "State" did worse. Laya inherits upstream's
+  plain-text `"choice question: …"` prefix.
+- **Confidence-gated escalation.** `nothink_threshold` answers without
+  reasoning when the no-reasoning confidence is at least the threshold, and
+  reasons otherwise. For Antfly that suggests Laya as the fast path, with low-
+  confidence decisions sent to a reasoning model.
+- **Smaller points.** They repeat the question after the reasoning block
+  (dropping it hurt). They stopped RL at step 402 of 624, because later steps
+  over-sharpened the head on a saturated pool. Their shared-prefix prefill is
+  the same as our teacher's `--prefill shared`.
+
+**Inference (ours): what this means for Laya and Antenna.**
+- A question-blind, cacheable state on a decoder base is the
+  best-supported route to Jev-level accuracy with state reuse. For Laya that
+  means a small Qwen decision model (0.8B–2B, as MoJev uses) with a pointer
+  head, served with the runtime's prefix KV cache.
+- Antenna needs an encoder for embeddings, chunking and extraction
+  ([ANTENNA.md](../antenna/ANTENNA.md)), so this does not transfer directly.
+  On the encoder, the cheaper open levers are question-first positions
+  (running), a pointer head, and rare-token anchors.
+- Antenna's step 8 (a schema-blind trunk with task branches) should expect
+  the same accuracy loss unless one of those closes it.
+
 ### Scaling packed training on Open-Jev (2026-09-27)
 
 This is the test of the scale hypothesis above. It trains the default,
