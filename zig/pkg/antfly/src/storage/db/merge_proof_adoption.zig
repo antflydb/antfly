@@ -61,10 +61,20 @@ pub const Fence = struct {
     pub fn donorRange(self: *const Fence) !ByteRange {
         const merged = self.state.merged_range orelse return error.InvalidMergeState;
         const base = self.state.receiver_base_range;
+        if (base.start.len != 0 and base.end.len != 0 and std.mem.order(u8, base.start, base.end) != .lt)
+            return error.InvalidMergeState;
         const extends_left = !std.mem.eql(u8, merged.start, base.start);
         const extends_right = !std.mem.eql(u8, merged.end, base.end);
         if (extends_left == extends_right) return error.InvalidMergeState;
-        if (extends_left) return .{ .start = merged.start, .end = base.start };
+        if (extends_left) {
+            if (base.start.len == 0 or
+                (merged.start.len != 0 and std.mem.order(u8, merged.start, base.start) != .lt))
+                return error.InvalidMergeState;
+            return .{ .start = merged.start, .end = base.start };
+        }
+        if (base.end.len == 0 or
+            (merged.end.len != 0 and std.mem.order(u8, base.end, merged.end) != .lt))
+            return error.InvalidMergeState;
         return .{ .start = base.end, .end = merged.end };
     }
 };
@@ -157,6 +167,15 @@ test "ordered artifact inventory adoption fence compares both exact receiver con
     fence.state.merged_range = .{ .start = "a", .end = "zz" };
     try std.testing.expectError(error.InvalidMergeState, fence.donorRange());
     fence.state.merged_range = .{ .start = "m", .end = "z" };
+    try std.testing.expectError(error.InvalidMergeState, fence.donorRange());
+    fence.state.merged_range = .{ .start = "n", .end = "z" };
+    try std.testing.expectError(error.InvalidMergeState, fence.donorRange());
+    fence.state.merged_range = .{ .start = "m", .end = "y" };
+    try std.testing.expectError(error.InvalidMergeState, fence.donorRange());
+    fence.state.merged_range = .{ .start = "m", .end = "" };
+    try std.testing.expectEqualStrings("z", (try fence.donorRange()).start);
+    fence.state.receiver_base_range = .{ .start = "", .end = "z" };
+    fence.state.merged_range = .{ .start = "a", .end = "z" };
     try std.testing.expectError(error.InvalidMergeState, fence.donorRange());
     txn.progress = "later-page";
     try std.testing.expect(!try fence.matchesStored(&txn));
