@@ -5647,7 +5647,7 @@ fn stableProjectionStatus(value: []const u8) []const u8 {
 fn cloneEnrichmentStats(stats: db_mod.types.EnrichmentStats) db_mod.types.EnrichmentStats {
     var cloned = stats;
     cloned.projection_checkpoint_status = stableProjectionStatus(stats.projection_checkpoint_status);
-    cloned.active_phase = stableStatusLabel(@import("../inference/execution_context.zig").Phase, stats.active_phase, &.{"idle"});
+    cloned.active_phase = stableStatusLabel(@import("antfly_inference_execution_context").Phase, stats.active_phase, &.{"idle"});
     cloned.stall_reason = stableStatusLabel(enum {}, stats.stall_reason, &.{ "", "worker_missing", "model_loading", "publishing_overdue", "embedding_overdue" });
     return cloned;
 }

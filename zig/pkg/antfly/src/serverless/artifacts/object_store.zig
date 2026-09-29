@@ -18,7 +18,7 @@ const objectstore = @import("objectstore");
 const artifact_store = @import("store.zig");
 const remote_uri = @import("../remote_uri.zig");
 const object_store_support = @import("../object_store_support.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const ObjectStore = struct {
     const verified_object_cache_limit: usize = 4096;

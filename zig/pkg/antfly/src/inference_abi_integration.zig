@@ -19,7 +19,7 @@
 //! archive; it cannot inline or directly call inference_host.zig.
 
 const std = @import("std");
-const bridge = @import("standalone/inference_bridge.zig");
+const bridge = @import("antfly_inference_bridge");
 
 pub fn main() !void {
     const table = bridge.antfly_standalone_inference_get_function_table();

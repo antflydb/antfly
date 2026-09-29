@@ -3841,7 +3841,7 @@ fn consumerTests() type {
         test "transaction attempt budgets follow the borrowed transport clock" {
             var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
             defer vopr_io.deinit();
-            const borrow = @import("../runtime_io_abi.zig").Borrow.init(&vopr_io.io());
+            const borrow = @import("antfly_runtime_abi").io_abi.Borrow.init(&vopr_io.io());
             const worker = HostedParticipantWorker{
                 .catalog = undefined,
                 .router = undefined,

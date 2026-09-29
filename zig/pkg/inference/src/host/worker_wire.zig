@@ -14,8 +14,8 @@
 // limitations under the License.
 
 const std = @import("std");
-const bridge = @import("inference_bridge.zig");
-const http = @import("../runtime_http_abi.zig");
+const bridge = @import("antfly_inference_bridge");
+const http = @import("antfly_runtime_abi").http_abi;
 
 pub const version: u32 = 5;
 // Only options are JSON metadata. The application payload is carried raw.
@@ -276,7 +276,7 @@ pub const Reservation = struct { lease: usize = 0, amounts: bridge.AdmissionAmou
 pub const Observation = struct { key: usize, previous: u64, next: u64 };
 
 test "inference worker logical body limit matches the public HTTP contract" {
-    try std.testing.expectEqual(@import("../api/public_limits.zig").max_request_body_bytes, @import("antfly_inference_worker_rpc").max_body_bytes);
+    try std.testing.expectEqual(@import("antfly_public_limits").max_request_body_bytes, @import("antfly_inference_worker_rpc").max_body_bytes);
 }
 
 test "inference worker raster capability reserves envelope overhead before rendering" {

@@ -3675,7 +3675,7 @@ pub const MetadataHttpNodeVopr = struct {
     pub fn catalogRoutingSnapshotWithClock(
         self: MetadataHttpNodeVopr,
         deadline_ns: ?u64,
-        deadline_io: ?@import("../runtime_io_abi.zig").Borrow,
+        deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow,
     ) !metadata_api.CatalogRoutingSnapshot {
         self.cluster.scheduler_gate.lock();
         defer self.cluster.scheduler_gate.unlock();
@@ -7131,7 +7131,7 @@ const PublicApiCatalogSource = struct {
     fn iface(self: *@This()) api_table_catalog.CatalogSource {
         return .{
             .ptr = self,
-            .io = @import("../runtime_io_abi.zig").Borrow.init(&(self.node.cluster.backendRuntime(self.node.index).io() orelse std.Options.debug_io)),
+            .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&(self.node.cluster.backendRuntime(self.node.index).io() orelse std.Options.debug_io)),
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,

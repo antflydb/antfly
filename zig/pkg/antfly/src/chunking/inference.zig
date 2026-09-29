@@ -24,9 +24,9 @@ const std_http_listener = @import("../common/http/std_http_listener.zig");
 const inference_chunker = @import("inference_chunker");
 const chunk_provider = @import("provider.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
-const remote_capabilities = @import("../inference/remote_capabilities.zig");
+const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const inference_work = @import("antfly_inference_work");
-const execution_context = @import("../inference/execution_context.zig");
+const execution_context = @import("antfly_inference_execution_context");
 const platform_time = @import("antfly_platform").time;
 
 const Allocator = std.mem.Allocator;

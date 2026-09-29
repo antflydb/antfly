@@ -14,7 +14,7 @@
 // limitations.
 
 const std = @import("std");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const raft_mod = struct {
     pub const ReadConsistency = @import("../raft/read_gate.zig").ReadConsistency;
 };
@@ -329,7 +329,7 @@ test "distributed graph translates native worker and catalog deadline boundaries
     const catalog = table_catalog.CatalogSource{
         .ptr = undefined,
         .vtable = undefined,
-        .io = @import("../runtime_io_abi.zig").Borrow.init(&catalog_io.io()),
+        .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&catalog_io.io()),
     };
     const routed_deadline = worker.routingDeadline(catalog).?;
     try std.testing.expect(routed_deadline > 17 * std.time.ns_per_s);

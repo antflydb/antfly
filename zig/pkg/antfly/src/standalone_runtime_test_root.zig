@@ -21,9 +21,9 @@ pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 
 test {
     _ = @import("antfly_inference_worker_rpc");
-    _ = @import("standalone/inference_worker_wire.zig");
+    _ = @import("antfly_inference_worker_wire");
     _ = @import("standalone/inference_worker.zig");
-    _ = @import("standalone/provider_failure.zig");
+    _ = @import("antfly_inference_provider_failure");
     _ = runtime;
     _ = inference_host;
     _ = inference_client;

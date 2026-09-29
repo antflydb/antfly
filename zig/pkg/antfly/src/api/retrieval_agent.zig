@@ -11857,7 +11857,7 @@ test "retrieval graph navigation fills candidate slots and bounds lookahead" {
 test "retrieval graph navigation terminal answer preserves embedded JSON provider" {
     const httpx = @import("httpx");
     const Fake = struct {
-        fn generate(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: ?@import("../inference/execution_context.zig").RequestContext) ![]u8 {
+        fn generate(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: ?@import("antfly_inference_execution_context").RequestContext) ![]u8 {
             return alloc.dupe(u8, "{\"choices\":[{\"message\":{\"content\":\"grounded answer\"}}]}");
         }
     };

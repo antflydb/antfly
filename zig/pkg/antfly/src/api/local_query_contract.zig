@@ -691,7 +691,7 @@ pub const graph_paths = @import("../graph/paths.zig");
 
 pub const graph_query_mod = @import("../graph/query.zig");
 
-pub const public_limits = @import("public_limits.zig");
+pub const public_limits = @import("antfly_public_limits");
 
 pub const table_read_source = @import("../storage/db/dynamic_field_capability.zig");
 

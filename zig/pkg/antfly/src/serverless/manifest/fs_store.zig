@@ -20,7 +20,7 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const manifest_types = @import("types.zig");
 const manifest_codec = @import("codec.zig");
 const manifest_store = @import("store.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const FsStore = struct {
     alloc: Allocator,

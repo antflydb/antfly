@@ -20,7 +20,7 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const cancellation_mod = @import("../common/cancellation.zig");
+const cancellation_mod = @import("antfly_cancellation");
 const request_admission = @import("../common/request_admission.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");

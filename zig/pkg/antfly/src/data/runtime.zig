@@ -18,7 +18,7 @@ const store_report_update = @import("../metadata/store_report_update.zig");
 const store_report_baseline = @import("../metadata/store_report_baseline.zig");
 const report_collection = @import("../metadata/report_collection.zig");
 const system_catalog = @import("../system_catalog/domain.zig");
-const runtime_io_abi = @import("../runtime_io_abi.zig");
+const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
 const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
@@ -25015,7 +25015,7 @@ const RemoteMetadataSource = struct {
         }
         var bounded = request;
         bounded.deadline_ns = started +| remaining;
-        bounded.deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&self.io);
+        bounded.deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&self.io);
         const slot = &self.validation_slots[std.hash.Wyhash.hash(0, name) % self.validation_slots.len];
         while (!slot.mutex.tryLock()) {
             try bounded.ensureActive();
@@ -31685,7 +31685,7 @@ fn consumerTests() type {
                 defer source.deinit();
                 const context: antfly.public_api.operation.RequestContext = .{
                     .deadline_ns = source.awakeNs() + (if (mode == .short_deadline) @as(u64, 3 * std.time.ns_per_s) else remote_metadata_snapshot_timeout_ns),
-                    .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&io),
+                    .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io),
                     .cancellation = cancellation.token(),
                 };
                 const result = source.readSystemCatalog(alloc, context, .{ .write_validation = "docs" });
@@ -41096,7 +41096,7 @@ fn consumerTests() type {
             defer source.deinit();
             try std.testing.expectError(error.Cancelled, source.statusSource().acquireJoinPlanning(.{
                 .clock = .{ .deadline_ns = platform_time.monotonicNs() + 250 * std.time.ns_per_ms },
-                .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&fake.canceled),
+                .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&fake.canceled),
             }));
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
             try std.testing.expect(source.control_read_generation == null);
@@ -41127,7 +41127,7 @@ fn consumerTests() type {
             defer observed.release();
             try std.testing.expectError(error.Timeout, source.refreshControlReadGenerationAfterMiss(observed, .{ .clock = .{ .deadline_ns = 0 } }));
             var canceled: std.atomic.Value(bool) = .init(true);
-            try std.testing.expectError(error.Cancelled, source.refreshControlReadGenerationAfterMiss(observed, .{ .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&canceled) }));
+            try std.testing.expectError(error.Cancelled, source.refreshControlReadGenerationAfterMiss(observed, .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled) }));
             try std.testing.expect(source.control_read_generation == observed);
             source.test_faults.fetch_head_error = error.ConnectionRefused;
             // A missing route forces a fresh head even inside the cache TTL.
@@ -42598,7 +42598,7 @@ fn consumerTests() type {
             defer clock.deinit();
             const context: antfly.public_api.distributed_txn.PreDecisionContext = .{
                 .deadline_ns = 2 * std.time.ns_per_s,
-                .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&clock.io()),
+                .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&clock.io()),
             };
             try std.testing.expectEqual(@as(?u64, 2 * std.time.ns_per_s - response_reserve_ns), DataServer.preDecisionLeaderWaitNs(context));
             clock.monotonic_ns = 1_200 * std.time.ns_per_ms;

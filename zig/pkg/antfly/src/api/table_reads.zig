@@ -35,9 +35,9 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const remote_capabilities = @import("../inference/remote_capabilities.zig");
-const execution_context = @import("../inference/execution_context.zig");
-const inference_request_context = @import("../inference/execution_context.zig");
+const remote_capabilities = @import("antfly_inference_remote_capabilities");
+const execution_context = @import("antfly_inference_execution_context");
+const inference_request_context = @import("antfly_inference_execution_context");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = if (control_only_storage_sources)
@@ -82,7 +82,7 @@ const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
-const public_limits = @import("public_limits.zig");
+const public_limits = @import("antfly_public_limits");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const table_read_source = @import("table_read_source.zig");
@@ -17123,7 +17123,7 @@ fn consumerTests() type {
             const catalog = table_catalog.CatalogSource{
                 .ptr = undefined,
                 .vtable = undefined,
-                .io = @import("../runtime_io_abi.zig").Borrow.init(&routing_io.io()),
+                .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&routing_io.io()),
             };
             const native_deadline = platform_time.monotonicNs() + 5 * ns;
             const req = db_mod.types.SearchRequest{ .execution_deadline_ns = native_deadline };
@@ -17141,7 +17141,7 @@ fn consumerTests() type {
             defer request_io.deinit();
             const opts = db_mod.types.LookupOptions{
                 .execution_deadline_ns = 8 * ns,
-                .execution_io = @import("../runtime_io_abi.zig").Borrow.init(&request_io.io()),
+                .execution_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&request_io.io()),
             };
             try std.testing.expectEqual(routing_now + ns, lookupRoutingDeadline(catalog, opts).?);
             var fence = metadata_api.CatalogRouteFence{

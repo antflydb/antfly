@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const rowsource = @import("../../storage/rowsource/types.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const SidecarKind = enum(u8) {
     text = 1,

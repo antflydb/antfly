@@ -16,8 +16,8 @@
 //! Normalize private provider errors at their owner, before any ABI/RPC hop.
 //! Never transport arbitrary error names or log request bodies/media bytes.
 const std = @import("std");
-const bridge = @import("inference_bridge.zig");
-const diagnostics = @import("../runtime_private_error_diagnostics.zig");
+const bridge = @import("antfly_inference_bridge");
+const diagnostics = @import("antfly_private_error_diagnostics");
 
 const operation_slots = @intFromEnum(bridge.ProviderOperation.classify_texts) + 1;
 var overflow_counts = [_]@import("antfly_platform").atomic.Value(u64){.init(0)} ** operation_slots;

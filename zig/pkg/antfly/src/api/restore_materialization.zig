@@ -73,13 +73,13 @@ fn save(alloc: std.mem.Allocator, io: std.Io, root: []const u8, checkpoint: Chec
 
 /// Returns a parsed, authenticated manifest only once all decoder files are
 /// durable. Every unsuccessful slice retains its verified byte/hash prefix.
-pub fn step(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, root: []const u8, cancellation: @import("../common/cancellation.zig").CancellationToken) !?native.LoadedManifest {
+pub fn step(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) !?native.LoadedManifest {
     return stepWithBudget(alloc, io, location, source, scope, root, cancellation, chunk_bytes);
 }
 
 /// Portable uses the identical durable SHA prefix as native objects, followed
 /// by an atomic logical-object/row cursor inside a disposable LSM decoder.
-pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("../storage/docstore.zig").ByteRange, root: []const u8, cancellation: @import("../common/cancellation.zig").CancellationToken, byte_budget: usize) !bool {
+pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("../storage/docstore.zig").ByteRange, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, byte_budget: usize) !bool {
     if (byte_budget == 0 or byte_budget > chunk_bytes or source.format != .portable or !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;
     if ((source.cohort_seal == null) == (source.rewrite == null)) return error.RestoreSourceProofMissing;
     try cancellation.check();
@@ -133,7 +133,7 @@ pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *b
 
 /// Shared bounded logical import after either repository checksum verification
 /// or the peer transport's exact immutable certificate verification.
-pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.Io.File, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("../storage/docstore.zig").ByteRange, root: []const u8, cancellation: @import("../common/cancellation.zig").CancellationToken) !bool {
+pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.Io.File, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("../storage/docstore.zig").ByteRange, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
     try cancellation.check();
     if (source.format != .portable or (source.cohort_seal == null) == (source.rewrite == null) or
         !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;
@@ -196,7 +196,7 @@ pub fn bindPortableDecoderRange(alloc: std.mem.Allocator, store: *@import("../st
     try store.sync(true);
 }
 
-pub fn stepWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, root: []const u8, cancellation: @import("../common/cancellation.zig").CancellationToken, byte_budget: usize) !?native.LoadedManifest {
+pub fn stepWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, byte_budget: usize) !?native.LoadedManifest {
     if (byte_budget == 0 or byte_budget > chunk_bytes) return error.InvalidBackupRange;
     try cancellation.check();
     if (source.native_manifest_size_bytes == 0 or source.native_manifest_sha256.len != 64 or !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;

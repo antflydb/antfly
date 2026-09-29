@@ -19,15 +19,11 @@
 // provider-neutral Embedder, Generator, and Reranker interfaces.
 
 const std = @import("std");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
-const builtin = @import("builtin");
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
 const inference = @import("antfly_inference_types");
-const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
-    @import("../storage/db/template_stub.zig")
-else
-    @import("../template.zig");
+const template_mod = @import("antfly_template_content");
 
 const EmbedWireRequest = struct {
     model: []const u8,
@@ -1631,7 +1627,7 @@ fn testDenseEmbedRequest(comptime task_type: ?[]const u8, comptime instruction: 
     try std.testing.expectEqual(@as(f32, 2.5), vec[2]);
 }
 
-test "antfly embed fails on non-200 response" {
+test "antfly embed treats service unavailability as transient" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1671,5 +1667,5 @@ test "antfly embed fails on non-200 response" {
     try ts.handleOne();
     group.await(io) catch {};
 
-    try std.testing.expectEqual(error.EmbedRequestFailed, result_err);
+    try std.testing.expectEqual(error.EmbedTransientFailure, result_err);
 }

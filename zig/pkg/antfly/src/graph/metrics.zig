@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const metric_cost = @import("metric_cost.zig");
 pub const warm_start = @import("warm_start.zig");
 

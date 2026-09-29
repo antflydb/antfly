@@ -17,7 +17,7 @@
 //! Remote-store implementations and backup algorithms stay in backups.zig.
 
 const std = @import("std");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const platform_time = @import("antfly_platform").time;
 
 pub const format_version: u32 = 2;

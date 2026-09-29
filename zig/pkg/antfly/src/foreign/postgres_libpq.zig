@@ -14,7 +14,7 @@
 // limitations.
 
 const std = @import("std");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 const builtin = @import("builtin");

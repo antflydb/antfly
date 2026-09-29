@@ -26,7 +26,7 @@ const wal_mod = @import("../wal/mod.zig");
 const builder_mod = @import("builder.zig");
 const publication_plan = @import("publication_plan.zig");
 const api_codec = @import("../api/codec.zig");
-const Cancellation = @import("../../common/cancellation.zig").CancellationToken;
+const Cancellation = @import("antfly_cancellation").CancellationToken;
 const document_facts = @import("document_facts.zig");
 const page_tree = @import("../graph_segment/page_tree.zig");
 

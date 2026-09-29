@@ -31,7 +31,7 @@ const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const api_operation = @import("operation.zig");
 const backup_cohort_driver = @import("backup_cohort_driver.zig");
 const search_pattern_filter = @import("../search/pattern_filter.zig");
@@ -102,7 +102,7 @@ const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
-const public_limits = @import("public_limits.zig");
+const public_limits = @import("antfly_public_limits");
 const query_builder_agent = @import("query_builder_agent.zig");
 const request_admission_policy = @import("request_admission_policy.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
@@ -138,8 +138,8 @@ const metadata_table_topology_mutations = @import("../metadata/table_topology_mu
 const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 const metadata_server = @import("../metadata/server.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
-const cache_budget = @import("../common/cache_budget.zig");
+const query_embedding_cache = @import("antfly_inference_query_embedding_cache");
+const cache_budget = @import("antfly_cache_budget");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const connections_api = @import("connections.zig");
 const common_config = @import("../common/config.zig");
@@ -4444,7 +4444,7 @@ pub const ApiHttpServer = struct {
         return .{
             .ptr = self,
             .require_authoritative_routing = true,
-            .fanout_io = if (self.sharedApiIo()) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null,
+            .fanout_io = if (self.sharedApiIo()) |io| @import("antfly_runtime_abi").io_abi.Borrow.init(&io) else null,
             .vtable = &join_context_vtable,
             .lifecycle_hook = self.cfg.distributed_join_lifecycle_hook,
         };
@@ -12060,7 +12060,7 @@ pub const ApiHttpServer = struct {
     pub fn preparePublicCommitWithIntegrity(self: *ApiHttpServer, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, request: api_operation.RequestContext) !@import("relational_integrity_commit.zig").Prepared {
         const integrity = @import("relational_integrity_commit.zig");
         var preparation_request = request;
-        if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io);
+        if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
         var snapshot_opt = try self.source.cachedAdminSnapshot();
         if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
         if (snapshot_opt) |value| {
@@ -12159,7 +12159,7 @@ pub const ApiHttpServer = struct {
             return .{ .committed = .{ .participant_count = 0 } };
         }
         var preparation_request = request;
-        if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io);
+        if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
         retained_preparation.* = if (request.relational_recovery == .repair)
             integrity.prepareRepair(alloc, reader, snapshot.tables, snapshot.ranges, tables[0], preparation_request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err
         else
@@ -53396,7 +53396,7 @@ test "system catalog identity failures remain unavailable across status adapters
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source, null, null);
     defer server.deinit();
     for ([_]anyerror{ error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch }) |err| {
-        fixture.err = @import("../runtime_error_abi.zig").errorFromStatus(@import("../runtime_error_abi.zig").statusFromError(err));
+        fixture.err = @import("antfly_runtime_abi").error_abi.errorFromStatus(@import("antfly_runtime_abi").error_abi.statusFromError(err));
         try std.testing.expectEqual(err, fixture.err);
         try std.testing.expectError(error.CatalogRoutingUnavailable, source.systemCatalog(std.testing.allocator, .{}, .snapshot));
         try std.testing.expectEqual(@as(u16, 503), system_catalog.httpStatus(error.CatalogRoutingUnavailable));

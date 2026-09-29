@@ -21,9 +21,9 @@
 
 const std = @import("std");
 const httpx = @import("httpx");
-const bedrock = @import("bedrock.zig");
-const vertex = @import("vertex.zig");
-const provider_defaults = @import("../common/provider_defaults.zig");
+const bedrock = @import("antfly_inference_bedrock");
+const vertex = @import("antfly_inference_vertex");
+const provider_defaults = @import("antfly_inference_provider_defaults");
 
 /// Mirrors the inference registry's task taxonomy plus "other" for models
 /// whose task type the provider's listing API does not classify.

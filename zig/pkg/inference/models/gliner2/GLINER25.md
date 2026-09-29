@@ -775,7 +775,7 @@ ingest process stalled at 100% CPU with no further log output
 `GlinerBoundary*LimitExceeded` error (like the pre-existing
 `UnsupportedGlinerBoundaryRuntime`) collapses to the stable
 `error.InferenceProviderFailure` at the provider ABI boundary
-(`zig/pkg/antfly/src/standalone/provider_failure.zig`), which
+(`zig/pkg/inference/src/host/provider_failure.zig`), which
 `enrichment_runtime.zig`'s `enrichmentErrorDisposition` already classifies
 `.terminal_request` (not retried) -- confirmed by code reading and by
 reproducing the exact 2-item-batch rejection against a live `antfly

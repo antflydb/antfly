@@ -151,7 +151,7 @@ test "online merge private port preserves source recovery errors through foreign
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.failure;
         }
-        fn foreignDispatch(call: *const @import("../runtime_native_abi.zig").CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("../runtime_error_abi.zig").Status {
+        fn foreignDispatch(call: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
             return Port.BoundaryAbi.local_dispatch(call, callback, args, output);
         }
     };

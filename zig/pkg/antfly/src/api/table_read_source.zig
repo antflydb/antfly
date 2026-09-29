@@ -28,7 +28,7 @@ const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const metadata_api = @import("../metadata/api.zig");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const LookupResponse = struct {
     json: []u8,
@@ -1219,7 +1219,7 @@ fn consumerTests() type {
                 },
             };
             fence.admission_deadline_ns = 999;
-            fence.admission_deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io);
+            fence.admission_deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io);
             fence.admission_cancellation = CancellationToken.fromAtomic(&wire_cancellation);
             const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, fence, .{});
             defer std.testing.allocator.free(encoded);

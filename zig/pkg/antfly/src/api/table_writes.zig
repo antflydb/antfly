@@ -449,7 +449,7 @@ const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const remote_capabilities = @import("../inference/remote_capabilities.zig");
+const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const asset_producer_runtime = @import("../asset_producer_runtime.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
@@ -32765,7 +32765,7 @@ fn consumerTests() type {
             defer vopr_io.deinit();
             const context = distributed_txn.PreDecisionContext{
                 .deadline_ns = 100,
-                .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&vopr_io.io()),
+                .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&vopr_io.io()),
             };
             try ensurePreDecisionContextActive(context);
             vopr_io.monotonic_ns = 100;

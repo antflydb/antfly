@@ -22,7 +22,7 @@ const std = @import("std");
 const platform_time = @import("antfly_platform").time;
 const httpx = @import("httpx");
 const work = @import("antfly_inference_work");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 const capability_cache_ttl_ns: u64 = 30 * std.time.ns_per_s;
 const capability_cache_stale_ns: u64 = 5 * 60 * std.time.ns_per_s;

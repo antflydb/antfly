@@ -27,14 +27,14 @@ const remote_uri = @import("../serverless/remote_uri.zig");
 const tables_api = @import("tables.zig");
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
-const bedrock = @import("../inference/bedrock.zig");
+const bedrock = @import("antfly_inference_bedrock");
 const httpx = @import("httpx");
 const system_catalog = @import("../system_catalog/domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const google_auth = @import("antfly_google").auth;
 const backup_contract = @import("backup_contract.zig");
 const backup_repository = @import("../storage/backup_repository.zig");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 const objectCancellationToken = @import("local_backups.zig").objectCancellationToken;
 

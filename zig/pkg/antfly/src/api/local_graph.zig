@@ -14,7 +14,7 @@
 // limitations under the License.
 
 pub const std = @import("std");
-pub const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+pub const CancellationToken = @import("antfly_cancellation").CancellationToken;
 pub const db_mod = struct {
     pub const types = @import("../storage/db/types.zig");
     pub const doc_filter_wire = @import("../storage/db/doc_filter_wire.zig");

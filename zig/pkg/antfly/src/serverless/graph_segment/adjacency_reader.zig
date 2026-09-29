@@ -23,7 +23,7 @@ const types = @import("types.zig");
 const topology = @import("topology_reader.zig");
 const artifacts = @import("../artifacts/store.zig");
 const refs = @import("../manifest/artifact_ref.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const paged = @import("page_reader.zig");
 const page_graph = @import("page_graph.zig");
 

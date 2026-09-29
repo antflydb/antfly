@@ -18,9 +18,9 @@
 //! not a public or stable C API.
 
 const std = @import("std");
-const error_abi = @import("../runtime_error_abi.zig");
-const http_abi = @import("../runtime_http_abi.zig");
-const native_abi = @import("../runtime_native_abi.zig");
+const error_abi = @import("antfly_runtime_abi").error_abi;
+const http_abi = @import("antfly_runtime_abi").http_abi;
+const native_abi = @import("antfly_runtime_abi").native_abi;
 const antfly_image = @import("antfly_image");
 
 pub const abi_version: u32 = 27;

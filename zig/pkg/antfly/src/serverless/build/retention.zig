@@ -383,13 +383,13 @@ pub const Pruner = struct {
         };
     }
 
-    fn sweepScopedUploads(self: *Pruner, namespace: []const u8, retired_before: u64, retained: *const std.StringHashMapUnmanaged(void), cancellation: @import("../../common/cancellation.zig").CancellationToken) !usize {
+    fn sweepScopedUploads(self: *Pruner, namespace: []const u8, retired_before: u64, retained: *const std.StringHashMapUnmanaged(void), cancellation: @import("antfly_cancellation").CancellationToken) !usize {
         const Sweep = struct {
             artifacts: *artifacts_mod.ArtifactStore,
             retained: *const std.StringHashMapUnmanaged(void),
             retired_before: u64,
             deleted: usize = 0,
-            cancellation: @import("../../common/cancellation.zig").CancellationToken,
+            cancellation: @import("antfly_cancellation").CancellationToken,
 
             fn visit(ptr: *anyopaque, scope: scoped_artifacts.UploadScope, id: []const u8) !void {
                 const self_: *@This() = @ptrCast(@alignCast(ptr));

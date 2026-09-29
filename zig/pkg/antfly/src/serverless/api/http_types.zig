@@ -14,7 +14,7 @@
 // limitations.
 
 const std = @import("std");
-const cancellation_mod = @import("../../common/cancellation.zig");
+const cancellation_mod = @import("antfly_cancellation");
 const http_routes = @import("http_routes.zig");
 
 const Allocator = std.mem.Allocator;

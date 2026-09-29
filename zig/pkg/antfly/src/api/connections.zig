@@ -29,11 +29,11 @@ const platform_sync = @import("antfly_platform").sync;
 const common_config = @import("../common/config.zig");
 const common_secrets = @import("../common/secrets.zig");
 const metadata_api = @import("../metadata/api.zig");
-const bedrock = @import("../inference/bedrock.zig");
-const list_models = @import("../inference/list_models.zig");
+const bedrock = @import("antfly_inference_bedrock");
+const list_models = @import("antfly_inference_list_models");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
-const runtime_http_abi = @import("../runtime_http_abi.zig");
+const runtime_http_abi = @import("antfly_runtime_abi").http_abi;
 const runtime_memory_abi = @import("runtime_memory_abi");
 const backups_api = @import("backups.zig");
 

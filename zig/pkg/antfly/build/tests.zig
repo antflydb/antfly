@@ -4293,8 +4293,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone runtime local generator accepts media url data uris",
             "local generate message conversion preserves tool history and admission",
             "inference worker",
-            "provider failure logging",
-            "provider owner logs private cause",
             "standalone runtime local dense embed preserves borrowed binary media",
             "standalone numeric result ABI",
             "standalone raster embedding control",
@@ -4350,7 +4348,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone preload bridge preserves A4B residency controls",
             "standalone data directory does not change the default models directory",
             "standalone linked inference ABI validates the supported function-table prefix",
-            "linked inference ABI rejects mismatched context and function-table prefixes",
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",
             "standalone resolves the default secret store before full config parsing",
             "standalone runtime secret store follows projected symlink rotation",
@@ -4401,6 +4398,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
     lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
+    inline for (.{
+        test_imports.runtime.inference_bridge,
+        test_imports.runtime.inference_provider_failure,
+        test_imports.runtime.inference_worker_wire,
+    }) |module| {
+        lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+    }
     // Keep the complete API worker fixture out of the inference-heavy runtime
     // object. Compile this narrow integration slice independently so adding
     // restore coverage does not inflate every standalone runtime test build.

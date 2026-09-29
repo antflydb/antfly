@@ -49,7 +49,7 @@ pub const Catalog = struct {
     plan_id: [16]u8,
     plan_digest: [32]u8,
     authority: Authority,
-    io: ?@import("../runtime_io_abi.zig").Borrow = null,
+    io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
 
     /// All snapshot/owner slices are immutable and borrowed for this Catalog's
     /// lifetime. The driver owns their arena through completion of a page/2PC.

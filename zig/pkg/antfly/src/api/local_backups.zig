@@ -23,11 +23,11 @@ pub const remote_uri = @import("../serverless/remote_uri.zig");
 pub const tables_api = @import("local_tables.zig");
 pub const common_secrets = @import("../common/secrets.zig");
 pub const common_config = @import("../common/config.zig");
-pub const bedrock = @import("../inference/bedrock.zig");
+pub const bedrock = @import("antfly_inference_bedrock");
 pub const httpx = @import("httpx");
 pub const google_auth = @import("antfly_google").auth;
 pub const backup_contract = @import("backup_contract.zig");
-pub const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+pub const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub fn objectCancellationToken(cancellation: CancellationToken) ?object_storage.CancellationToken {
     return object_storage.CancellationToken.fromCallback(

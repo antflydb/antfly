@@ -30,16 +30,16 @@ const process_memory_budget = @import("../common/process_memory_budget.zig");
 const preload_model_spec = @import("../common/preload_model_spec.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
-const inference_bridge = @import("inference_bridge.zig");
+const inference_bridge = @import("antfly_inference_bridge");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
-const runtime_http_abi = @import("../runtime_http_abi.zig");
+const runtime_http_abi = @import("antfly_runtime_abi").http_abi;
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
 const LegacyLiteHandle = if (control_only_storage_sources) struct {} else antfly.lite.backend.Handle;
 const LegacyAuthBackend = if (control_only_storage_sources) struct {} else antfly.lsm_backend.BackendHandle;
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const inline_inference_codegen = builtin.is_test;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
 const inference_chunker = @import("inference_chunker");
@@ -5023,7 +5023,7 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .authorization = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Authorization")),
         .content_type = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
     };
-    var transport = @import("../runtime_http_bridge.zig").Outbound{ .context = context };
+    var transport = @import("antfly_runtime_abi").http_bridge.Outbound{ .context = context };
     const body_source = if (route.request_body == .buffered) transport.bodySource() else runtime_http_abi.RequestBodySource{};
     var response_handle: ?*anyopaque = null;
     var response_view: runtime_http_abi.HttpResponseView = undefined;
@@ -8050,7 +8050,7 @@ test "standalone encoded reader ABI round trips borrowed payloads" {
     var fake = FakeReader{ .first_ptr = png[0..].ptr, .second_ptr = jpeg[0..].ptr };
     var state = inference_host.LinkedInferenceState{
         .alloc = alloc,
-        .executor = try @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io).receive(),
+        .executor = try @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io).receive(),
         .io = std.testing.io,
         .node = undefined, // The model-free override must not enter Node.
         .warm_models = undefined,
@@ -8182,7 +8182,7 @@ test "standalone raster reader ABI preserves borrowed strided pages and identity
     var fake = FakeReader{ .expected = .{ first[0..].ptr, second[0..].ptr } };
     var state = inference_host.LinkedInferenceState{
         .alloc = alloc,
-        .executor = try @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io).receive(),
+        .executor = try @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io).receive(),
         .io = std.testing.io,
         .node = undefined, // The model-free override must not enter Node.
         .warm_models = undefined,

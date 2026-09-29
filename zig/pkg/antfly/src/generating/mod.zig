@@ -18,16 +18,16 @@ const httpx = @import("httpx");
 const lib = @import("antfly_generating");
 const inference = @import("../inference/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const RequestContext = @import("../inference/execution_context.zig").RequestContext;
+const RequestContext = @import("antfly_inference_execution_context").RequestContext;
 const openai_provider = @import("antfly_inference_openai");
-const antfly_provider = @import("../inference/local.zig");
-const vertex_provider = @import("../inference/vertex.zig");
+const antfly_provider = @import("antfly_inference_local");
+const vertex_provider = @import("antfly_inference_vertex");
 const common_secrets = @import("../common/secrets.zig");
-const execution_context = @import("../inference/execution_context.zig");
+const execution_context = @import("antfly_inference_execution_context");
 const platform_time = @import("antfly_platform").time;
 const provider_limits = @import("../common/provider_limits.zig");
 const credential_identity = @import("../common/credential_source_identity.zig");
-const provider_defaults = @import("../common/provider_defaults.zig");
+const provider_defaults = @import("antfly_inference_provider_defaults");
 
 const remote_generate_max_timeout_ms: u64 = 300_000;
 
@@ -1082,7 +1082,7 @@ test "generating backend batch preserves cancellation alongside quota policy" {
     }, &.{"hello"}));
     var cancelled = std.atomic.Value(bool).init(true);
     context.deadline_ns = null;
-    context.cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&cancelled);
+    context.cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled);
     try std.testing.expectError(error.Cancelled, generateAntflyTextBatchResponse(alloc, &client, cfg, .{
         .limits = &limits,
         .request_context = context,

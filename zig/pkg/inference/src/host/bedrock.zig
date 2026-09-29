@@ -14,17 +14,14 @@
 // limitations under the License.
 
 const std = @import("std");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference = @import("antfly_inference_types");
 const inference_work = @import("antfly_inference_work");
-const credential_source_identity = @import("../common/credential_source_identity.zig");
-const provider_defaults = @import("../common/provider_defaults.zig");
-const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
-    @import("../storage/db/template_stub.zig")
-else
-    @import("../template.zig");
+const credential_source_identity = @import("antfly_credentials");
+const provider_defaults = @import("antfly_inference_provider_defaults");
+const template_mod = @import("antfly_template_content");
 
 const HeaderPair = [2][]const u8;
 pub const cohere_max_batch_size = provider_defaults.cohere_max_embedding_batch_size;

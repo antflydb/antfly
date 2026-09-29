@@ -95,7 +95,7 @@ test "source owner deadlines normalize executor clock epochs without extending b
     var vtable = std.testing.io.vtable.*;
     vtable.now = FakeClock.now;
     const io: std.Io = .{ .userdata = &clock_now, .vtable = &vtable };
-    const context: request_operation.RequestContext = .{ .deadline_ns = 10 + std.time.ns_per_s, .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&io) };
+    const context: request_operation.RequestContext = .{ .deadline_ns = 10 + std.time.ns_per_s, .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) };
     const before = platform_time.monotonicNs();
     const normalized = try platformDeadlineContext(context);
     const after = platform_time.monotonicNs();
@@ -138,7 +138,7 @@ test "source owner routed admission preserves the fence clock" {
     var catalog: Fixture = .{ .now = 1000 * std.time.ns_per_s };
     catalog.io = .{ .userdata = &catalog, .vtable = &vtable };
     var source: ProvisionedKernelOwnerSource = undefined;
-    source.catalog = .{ .ptr = &catalog, .io = @import("../runtime_io_abi.zig").Borrow.init(&catalog.io), .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .validate_route = Fixture.resolve } };
+    source.catalog = .{ .ptr = &catalog, .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&catalog.io), .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .validate_route = Fixture.resolve } };
     const fence: metadata_api.CatalogRouteFence = .{
         .metadata_group_id = 1,
         .catalog_revision = 1,
@@ -146,7 +146,7 @@ test "source owner routed admission preserves the fence clock" {
         .topology_epoch = 1,
         .route = .{ .group_id = 2, .range_id = 2, .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 } },
         .admission_deadline_ns = request.now + std.time.ns_per_s,
-        .admission_deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&request.io),
+        .admission_deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&request.io),
     };
     try std.testing.expectError(error.TopologyChanged, source.validateRoutedRead(std.testing.allocator, fence, 2, "rows"));
     try std.testing.expectEqual(@as(usize, 1), catalog.calls);
@@ -2395,7 +2395,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     const ReadControls = struct {
         execution_deadline_ns: ?u64 = null,
-        execution_io: ?@import("../runtime_io_abi.zig").Borrow = null,
+        execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
         historical_raft_apply: bool = false,
 

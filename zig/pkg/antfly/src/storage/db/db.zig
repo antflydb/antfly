@@ -74,7 +74,7 @@ const index_repair_state = @import("derived/index_repair_state.zig");
 const index_repair_status = @import("../../common/index_repair_status.zig");
 const index_generation_manifest = @import("derived/index_generation_manifest.zig");
 const root_identity = @import("root_identity.zig");
-const runtime_error_abi = @import("../../runtime_error_abi.zig");
+const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
 const json_helpers = @import("../../api/json_helpers.zig");
 
 test {

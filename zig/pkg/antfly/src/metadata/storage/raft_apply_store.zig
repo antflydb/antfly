@@ -77,7 +77,7 @@ fn decodeMetadataCheckpoint(bytes: []const u8) !AppliedMetadataCheckpoint {
 pub const CatalogProjectionSnapshot = apply_contract.CatalogProjectionSnapshot;
 pub const CatalogCursor = apply_contract.CatalogCursor;
 
-fn catalogProjectionDeadline(deadline_ns: ?u64, deadline_io: ?@import("../../runtime_io_abi.zig").Borrow) !void {
+fn catalogProjectionDeadline(deadline_ns: ?u64, deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow) !void {
     if (deadline_ns) |deadline| {
         const now_ns: u64 = if (deadline_io) |borrow| blk: {
             var receiver = try borrow.receive();
@@ -5696,7 +5696,7 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         group_id: u64,
         deadline_ns: ?u64,
-        deadline_io: ?@import("../../runtime_io_abi.zig").Borrow,
+        deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow,
     ) ![]metadata.TableRecord {
         try catalogProjectionDeadline(deadline_ns, deadline_io);
         var prefix_buf: [128]u8 = undefined;
@@ -5737,7 +5737,7 @@ pub const RaftApplyStore = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         deadline_ns: ?u64,
-        deadline_io: ?@import("../../runtime_io_abi.zig").Borrow,
+        deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow,
     ) !CatalogProjectionSnapshot {
         try catalogProjectionDeadline(deadline_ns, deadline_io);
         var txn = try self.store.beginReadTxn();
@@ -6451,7 +6451,7 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         group_id: u64,
         deadline_ns: ?u64,
-        deadline_io: ?@import("../../runtime_io_abi.zig").Borrow,
+        deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow,
     ) ![]metadata.RangeRecord {
         try catalogProjectionDeadline(deadline_ns, deadline_io);
         var prefix_buf: [128]u8 = undefined;
@@ -18536,7 +18536,7 @@ test "metadata raft apply store catalog projection uses storage snapshot indepen
     // Projection scans must retain the caller's clock across every page.
     var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
     defer vopr_io.deinit();
-    const clock = @import("../../runtime_io_abi.zig").Borrow.init(&vopr_io.io());
+    const clock = @import("antfly_runtime_abi").io_abi.Borrow.init(&vopr_io.io());
     const deadline = 8 * std.time.ns_per_s;
     {
         const snapshot = try store.captureCatalogProjectionWithClock(std.testing.allocator, 41, deadline, clock);

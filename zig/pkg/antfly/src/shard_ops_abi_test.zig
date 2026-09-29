@@ -16,10 +16,10 @@
 const std = @import("std");
 pub const antfly_sources = @import("source_owner_physical.zig");
 const shard = @import("raft/shard_ops.zig");
-const errors = @import("runtime_error_abi.zig");
+const errors = @import("antfly_runtime_abi").error_abi;
 extern fn shard_adapter_test_provider(*shard.ShardOperationAdapter, *errors.Status) callconv(.c) void;
 extern fn shard_adapter_test_error_ordinal(errors.Status) callconv(.c) u16;
-extern fn shard_adapter_test_call_contract(*@import("runtime_native_abi.zig").CallContract) callconv(.c) void;
+extern fn shard_adapter_test_call_contract(*@import("antfly_runtime_abi").native_abi.CallContract) callconv(.c) void;
 extern fn shard_adapter_test_callback_name(*usize) callconv(.c) [*]const u8;
 extern fn restore_persistence_test_provider(*@import("api/restore_jobs.zig").ReplicatedPersistence) callconv(.c) void;
 extern fn routed_batch_test_provider(*@import("api/internal_group_operations.zig").RoutedRaftBatchWriter, *errors.Status) callconv(.c) void;
@@ -107,11 +107,11 @@ test "shard adapter archive boundary preserves busy retry and topology read erro
     const retained = owned.adapter();
     const Callback = @FieldType(shard.ShardOperationAdapter.VTable, "catch_up_merge_receiver");
     const Args = std.meta.ArgsTuple(@typeInfo(Callback).pointer.child);
-    const local_contract = @import("runtime_native_abi.zig").CallContract.of("catch_up_merge_receiver", Callback, Args, void);
+    const local_contract = @import("antfly_runtime_abi").native_abi.CallContract.of("catch_up_merge_receiver", Callback, Args, void);
     var provider_name_len: usize = 0;
     const provider_name = shard_adapter_test_callback_name(&provider_name_len);
     try std.testing.expectEqualStrings(@typeName(Callback), provider_name[0..provider_name_len]);
-    var provider_contract: @import("runtime_native_abi.zig").CallContract = undefined;
+    var provider_contract: @import("antfly_runtime_abi").native_abi.CallContract = undefined;
     shard_adapter_test_call_contract(&provider_contract);
     try std.testing.expectEqualDeep(local_contract, provider_contract);
     const request: shard.TopologyReadRequest = .{ .transition_id = 9, .attempt_epoch = 3, .mode = .merge_copy_receipt };

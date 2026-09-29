@@ -16,7 +16,7 @@
 pub const std = @import("std");
 pub const platform_clock = @import("antfly_platform").clock;
 pub const platform_time = @import("antfly_platform").time;
-pub const runtime_io_abi = @import("../runtime_io_abi.zig");
+pub const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
 
 /// One absolute monotonic budget shared by snapshot capture and all CPU-side
 /// routing work that follows it. The periodic checkpoint keeps large catalog

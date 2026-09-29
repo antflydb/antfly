@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
@@ -7776,7 +7776,7 @@ test "serverless external selector transitions preserve resolved sidecars withou
         fn delete(ptr: *anyopaque, _: []const u8) !void {
             return deny(ptr);
         }
-        fn scoped(ptr: *anyopaque, _: Allocator, _: artifacts_mod.store.UploadScope, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.ArtifactMetadata {
+        fn scoped(ptr: *anyopaque, _: Allocator, _: artifacts_mod.store.UploadScope, _: []const u8, _: @import("antfly_cancellation").CancellationToken) !artifacts_mod.ArtifactMetadata {
             return deny(ptr);
         }
         fn expectPlanRequired(self: *@This(), builder: *Builder, plan: publication_plan.TablePublicationPlan) !void {

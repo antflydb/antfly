@@ -23,7 +23,7 @@ const staging = @import("../storage/db/restore_staging_contract.zig");
 const transfer = @import("../storage/db/source_artifact_transfer.zig");
 const native = @import("../storage/db/native_backup.zig");
 const fs = @import("../common/fs_paths.zig");
-const Cancellation = @import("../common/cancellation.zig").CancellationToken;
+const Cancellation = @import("antfly_cancellation").CancellationToken;
 pub const Result = struct { complete: bool, next_offset: u64 };
 
 const Receipt = struct {

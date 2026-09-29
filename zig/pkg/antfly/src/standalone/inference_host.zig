@@ -20,11 +20,11 @@ const std = @import("std");
 const httpx = @import("httpx");
 const antfly = @import("inference_host_root.zig");
 const inference = @import("inference_server");
-const inference_bridge = @import("inference_bridge.zig");
-const http_abi = @import("../runtime_http_abi.zig");
+const inference_bridge = @import("antfly_inference_bridge");
+const http_abi = @import("antfly_runtime_abi").http_abi;
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
-const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
 const inference_api = @import("inference_api");
 const inference_chunker = @import("inference_chunker");
 const chunking_types = @import("../chunking/types.zig");
@@ -32,7 +32,7 @@ const worker_runtime = @import("inference_worker.zig");
 
 pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
-    executor: @import("../runtime_io_abi.zig").Receiver,
+    executor: @import("antfly_runtime_abi").io_abi.Receiver,
     /// Host-owned interface protected by standalone's inference-lane lease.
     io: std.Io,
     node: inference.server.Node,

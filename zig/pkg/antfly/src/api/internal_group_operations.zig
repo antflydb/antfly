@@ -16,7 +16,7 @@
 //! Transport-neutral operations for internal group coordination.
 
 const std = @import("std");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const batch_api = @import("batch.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const distributed_graph = @import("distributed_graph.zig");

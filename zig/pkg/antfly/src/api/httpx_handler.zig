@@ -25,7 +25,7 @@ const httpx = @import("httpx");
 const system_catalog = @import("../system_catalog/domain.zig");
 const system_catalog_routes = @import("../system_catalog/routes.zig");
 const system_catalog_http = @import("system_catalog_http.zig");
-const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
 const inference_connection_abi = @import("../inference_connection_abi.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -1840,7 +1840,7 @@ pub const AntflyApiHandler = struct {
                 }.call,
             } else .none,
             .deadline_ns = ctx.application_deadline_ns,
-            .deadline_io = if (ctx.application_deadline_io) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null,
+            .deadline_io = if (ctx.application_deadline_io) |io| @import("antfly_runtime_abi").io_abi.Borrow.init(&io) else null,
             .request_id = ctx.header("x-request-id") orelse "",
             .principal = if (identity) |authenticated| .{
                 .kind = .user,

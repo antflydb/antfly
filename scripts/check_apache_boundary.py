@@ -62,6 +62,15 @@ PACKAGE_ENTRYPOINTS = (
 # Generated data modules resolve to their producers. Only Zig's standard library
 # and build-generated configuration constants terminate traversal.
 SOURCE_MODULES = {
+    "antfly_cancellation": ("zig/lib/runtime/src/cancellation.zig",),
+    "antfly_cache_budget": ("zig/lib/runtime/src/cache_budget.zig",),
+    "antfly_runtime_abi": ("zig/lib/runtime/src/root.zig",),
+    "antfly_private_error_diagnostics": ("zig/lib/runtime/src/private_error_diagnostics.zig",),
+    "antfly_inference_bridge": ("zig/pkg/inference/src/host/bridge.zig",),
+    "antfly_inference_provider_failure": ("zig/pkg/inference/src/host/provider_failure.zig",),
+    "antfly_inference_worker_wire": ("zig/pkg/inference/src/host/worker_wire.zig",),
+    "antfly_public_limits": ("zig/pkg/antfly-embedded/src/api/public_limits.zig",),
+    "antfly_template_content": ("zig/lib/template/src/content_part.zig",),
     "antfly_data_uri": ("zig/lib/scraping/src/data_uri.zig",),
     "antfly_websearch_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_websearch_openapi/root.zig",
@@ -128,6 +137,14 @@ SOURCE_MODULES = {
     "antfly_inference_types": ("zig/pkg/inference/src/host/types.zig",),
     "antfly_inference_work": ("zig/pkg/inference/src/host/work.zig",),
     "antfly_inference_openai": ("zig/pkg/inference/src/host/openai.zig",),
+    "antfly_inference_provider_defaults": ("zig/pkg/inference/src/host/provider_defaults.zig",),
+    "antfly_inference_bedrock": ("zig/pkg/inference/src/host/bedrock.zig",),
+    "antfly_inference_local": ("zig/pkg/inference/src/host/local.zig",),
+    "antfly_inference_list_models": ("zig/pkg/inference/src/host/list_models.zig",),
+    "antfly_inference_vertex": ("zig/pkg/inference/src/host/vertex.zig",),
+    "antfly_inference_remote_capabilities": ("zig/pkg/inference/src/host/remote_capabilities.zig",),
+    "antfly_inference_execution_context": ("zig/pkg/inference/src/host/execution_context.zig",),
+    "antfly_inference_query_embedding_cache": ("zig/pkg/inference/src/host/query_embedding_cache.zig",),
     "antfly_jsonschema": ("zig/lib/jsonschema/src/mod.zig",),
     "antfly_logging_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_logging_openapi/root.zig",

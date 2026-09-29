@@ -16,7 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const objectstore = @import("objectstore");
-const bedrock = @import("../inference/bedrock.zig");
+const bedrock = @import("antfly_inference_bedrock");
 
 pub const AwsCredentialContext = struct {
     alloc: Allocator,

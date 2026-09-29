@@ -19,11 +19,28 @@ const addSnowballModule = @import("snowball.zig").addSnowballModule;
 
 pub const AntflyRootImports = struct {
     storage_boundary: @import("storage_boundary.zig").Modules,
+    cancellation: *std.Build.Module,
+    cache_budget: *std.Build.Module,
+    runtime_abi: *std.Build.Module,
+    private_error_diagnostics: *std.Build.Module,
+    inference_bridge: *std.Build.Module,
+    inference_provider_failure: *std.Build.Module,
+    public_limits: *std.Build.Module,
+    template_content: *std.Build.Module,
+    inference_worker_wire: *std.Build.Module,
     inference_worker_rpc: *std.Build.Module,
     inference_embedding_wire: *std.Build.Module,
     inference_types: *std.Build.Module,
     inference_work: *std.Build.Module,
     inference_openai: *std.Build.Module,
+    inference_provider_defaults: *std.Build.Module,
+    inference_bedrock: *std.Build.Module,
+    inference_local: *std.Build.Module,
+    inference_list_models: *std.Build.Module,
+    inference_vertex: *std.Build.Module,
+    inference_remote_capabilities: *std.Build.Module,
+    inference_execution_context: *std.Build.Module,
+    inference_query_embedding_cache: *std.Build.Module,
     boundary_profile: @import("storage_boundary.zig").Profile = .all,
     build_info: @import("../../../lib/build_info/build_support.zig").BuildInfo,
     build_options: *std.Build.Step.Options,
@@ -206,11 +223,28 @@ pub const AntflyRootImports = struct {
         options.addOption(bool, "bench_minimal_deps", false);
         mod.addOptions("build_options", options);
         mod.addImport("antfly_platform", self.platform);
+        mod.addImport("antfly_cancellation", self.cancellation);
+        mod.addImport("antfly_cache_budget", self.cache_budget);
+        mod.addImport("antfly_runtime_abi", self.runtime_abi);
+        mod.addImport("antfly_inference_bridge", self.inference_bridge);
+        mod.addImport("antfly_public_limits", self.public_limits);
+        mod.addImport("antfly_template_content", self.template_content);
+        mod.addImport("antfly_inference_worker_wire", self.inference_worker_wire);
+        mod.addImport("antfly_private_error_diagnostics", self.private_error_diagnostics);
+        mod.addImport("antfly_inference_provider_failure", self.inference_provider_failure);
         mod.addImport("antfly_inference_worker_rpc", self.inference_worker_rpc);
         mod.addImport("antfly_inference_embedding_wire", self.inference_embedding_wire);
         mod.addImport("antfly_inference_types", self.inference_types);
         mod.addImport("antfly_inference_work", self.inference_work);
         mod.addImport("antfly_inference_openai", self.inference_openai);
+        mod.addImport("antfly_inference_provider_defaults", self.inference_provider_defaults);
+        mod.addImport("antfly_inference_bedrock", self.inference_bedrock);
+        mod.addImport("antfly_inference_local", self.inference_local);
+        mod.addImport("antfly_inference_list_models", self.inference_list_models);
+        mod.addImport("antfly_inference_vertex", self.inference_vertex);
+        mod.addImport("antfly_inference_remote_capabilities", self.inference_remote_capabilities);
+        mod.addImport("antfly_inference_execution_context", self.inference_execution_context);
+        mod.addImport("antfly_inference_query_embedding_cache", self.inference_query_embedding_cache);
         inline for (.{
             "httpx",              "common_openapi",  "inference_config_openapi", "logging_openapi",
             "middleware_openapi", "scraping",        "scraping_openapi",         "s3_openapi",
@@ -290,6 +324,8 @@ pub const AntflyRootImports = struct {
         mod.addOptions("build_options", options);
         self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
         mod.addImport("antfly_platform", self.platform);
+        mod.addImport("antfly_cancellation", self.cancellation);
+        mod.addImport("antfly_template_content", self.template_content);
         mod.link_libc = link_libc;
         inline for (.{ "image", "font", "pdf", "json", "scraping", "scraping_openapi", "reader_config", "chunking", "hash", "httpx", "structlog" }) |field| self.addImport(mod, field);
     }
@@ -321,11 +357,28 @@ pub const AntflyRootImports = struct {
         self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
         mod.addOptions("build_options", self.build_options);
         mod.addImport("antfly_platform", self.platform);
+        mod.addImport("antfly_cancellation", self.cancellation);
+        mod.addImport("antfly_cache_budget", self.cache_budget);
+        mod.addImport("antfly_runtime_abi", self.runtime_abi);
+        mod.addImport("antfly_inference_bridge", self.inference_bridge);
+        mod.addImport("antfly_public_limits", self.public_limits);
+        mod.addImport("antfly_template_content", self.template_content);
+        mod.addImport("antfly_inference_worker_wire", self.inference_worker_wire);
+        mod.addImport("antfly_private_error_diagnostics", self.private_error_diagnostics);
+        mod.addImport("antfly_inference_provider_failure", self.inference_provider_failure);
         mod.addImport("antfly_inference_worker_rpc", self.inference_worker_rpc);
         mod.addImport("antfly_inference_embedding_wire", self.inference_embedding_wire);
         mod.addImport("antfly_inference_types", self.inference_types);
         mod.addImport("antfly_inference_work", self.inference_work);
         mod.addImport("antfly_inference_openai", self.inference_openai);
+        mod.addImport("antfly_inference_provider_defaults", self.inference_provider_defaults);
+        mod.addImport("antfly_inference_bedrock", self.inference_bedrock);
+        mod.addImport("antfly_inference_local", self.inference_local);
+        mod.addImport("antfly_inference_list_models", self.inference_list_models);
+        mod.addImport("antfly_inference_vertex", self.inference_vertex);
+        mod.addImport("antfly_inference_remote_capabilities", self.inference_remote_capabilities);
+        mod.addImport("antfly_inference_execution_context", self.inference_execution_context);
+        mod.addImport("antfly_inference_query_embedding_cache", self.inference_query_embedding_cache);
         if (link_libc and !self.platform_link_libc) {
             platform_build.addFilesystemCapacitySource(
                 mod,

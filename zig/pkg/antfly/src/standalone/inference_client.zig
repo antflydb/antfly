@@ -25,7 +25,7 @@ const readers = @import("antfly_readers");
 const transcribing = @import("antfly_transcribing");
 const extracting = @import("antfly_extracting");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const bridge = @import("inference_bridge.zig");
+const bridge = @import("antfly_inference_bridge");
 const failure_identity = @import("runtime_failure_identity");
 
 const DenseApi = struct {

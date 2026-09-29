@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const schema_mod = @import("../schema.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const platform_time = @import("antfly_platform").time;
 
 pub const CoverageReadMode = enum(u8) {

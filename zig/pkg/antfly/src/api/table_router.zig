@@ -28,7 +28,7 @@ const table_catalog = @import("table_catalog.zig");
 /// admission, refresh and endpoint selection within this same budget.
 pub const RouteBudget = struct {
     clock: table_catalog.RoutingBudget = .{},
-    cancellation: ?@import("../common/cancellation.zig").CancellationToken = null,
+    cancellation: ?@import("antfly_cancellation").CancellationToken = null,
 
     pub fn fromRequest(request: anytype) RouteBudget {
         return .{
@@ -688,7 +688,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 4), state.batch_calls);
             try std.testing.expectError(error.Timeout, resolveGroupRoutes(std.testing.allocator, unused_catalog, router.withBudget(.{ .clock = .{ .deadline_ns = 0 } }), &.{7}, .prefer_leader));
             var canceled = std.atomic.Value(bool).init(true);
-            try std.testing.expectError(error.Cancelled, resolveGroupRoute(std.testing.allocator, unused_catalog, router.withBudget(.{ .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&canceled) }), 7, .prefer_leader));
+            try std.testing.expectError(error.Cancelled, resolveGroupRoute(std.testing.allocator, unused_catalog, router.withBudget(.{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled) }), 7, .prefer_leader));
             try std.testing.expectEqual(@as(usize, 4), state.batch_calls);
         }
 

@@ -27,11 +27,11 @@ const backend_erased = @import("../storage/backend_erased.zig");
 const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
-const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
-const runtime_io_abi = @import("../runtime_io_abi.zig");
+const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
 
 pub const CreateContext = abi.CreateContext;
 pub const CallContext = abi.CallContext;

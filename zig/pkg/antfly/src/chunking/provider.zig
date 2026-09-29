@@ -20,7 +20,7 @@
 //! crossing the checked native boundary.
 
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
-const execution_context = @import("../inference/execution_context.zig");
+const execution_context = @import("antfly_inference_execution_context");
 const httpx = @import("httpx");
 const std = @import("std");
 

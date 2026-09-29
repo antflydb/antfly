@@ -18,7 +18,7 @@
 //! implementations retain copies, never pointers to this request.
 const abi = @import("kernel_owner_abi");
 pub const memory = @import("runtime_memory_abi");
-pub const executor = @import("../runtime_io_abi.zig");
+pub const executor = @import("antfly_runtime_abi").io_abi;
 
 pub const abi_version: u32 = 1;
 pub const Request = extern struct {

@@ -16,7 +16,7 @@
 const std = @import("std");
 const join_planning = @import("join_planning.zig");
 const RouteBudget = @import("table_router.zig").RouteBudget;
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const platform_sync = @import("antfly_platform").sync;
 const table_reads = @import("table_read_source.zig");
 const query_api = @import("query.zig");
@@ -133,7 +133,7 @@ pub const JoinContext = struct {
     planning_scope: ?*PlanningScope = null,
     routing_session: ?*table_catalog.RoutingSession = null,
     require_authoritative_routing: bool = true,
-    fanout_io: ?@import("../runtime_io_abi.zig").Borrow = null,
+    fanout_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
 
     response_label: ?[]const u8 = null,
 
@@ -9531,7 +9531,7 @@ test "distributed join fanout bounds concurrency drains errors and preserves gro
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(8) });
     defer threaded.deinit();
     const io = threaded.io();
-    var ctx = JoinContext{ .ptr = &fixture, .fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io), .vtable = undefined };
+    var ctx = JoinContext{ .ptr = &fixture, .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io), .vtable = undefined };
     const source = table_reads.TableReadSource{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .query_group_local = Fixture.query } };
     const alloc = std.testing.allocator;
     var hits = std.json.Array.init(alloc);

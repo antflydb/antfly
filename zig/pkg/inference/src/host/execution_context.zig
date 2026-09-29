@@ -22,8 +22,8 @@
 
 const std = @import("std");
 const httpx = @import("httpx");
-const remote_capabilities = @import("remote_capabilities.zig");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const remote_capabilities = @import("antfly_inference_remote_capabilities");
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const platform_time = @import("antfly_platform").time;
 
 pub const source_table_header = "X-Antfly-Source-Table";

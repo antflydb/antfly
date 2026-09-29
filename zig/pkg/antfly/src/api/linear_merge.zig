@@ -21,7 +21,7 @@ const raft_mod = @import("../raft/mod.zig");
 const table_reads = @import("table_read_source.zig");
 const table_writes = @import("table_write_source.zig");
 const query_api = @import("query.zig");
-const public_limits = @import("public_limits.zig");
+const public_limits = @import("antfly_public_limits");
 const platform_time = @import("antfly_platform").time;
 
 pub const OwnedLinearMergeRequest = struct {

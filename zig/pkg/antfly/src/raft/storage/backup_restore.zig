@@ -21,7 +21,7 @@ const backups_api = @import("../../api/local_backups.zig");
 const db_mod = @import("../../storage/db/selected_root.zig").db;
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const portable_backup = @import("../../storage/portable_backup.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const RestoreAuthority = union(enum) {
     /// A private artifact already admitted and staged by Antfly.

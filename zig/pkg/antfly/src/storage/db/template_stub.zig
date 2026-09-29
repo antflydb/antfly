@@ -20,16 +20,7 @@ const host_template = if (builtin.os.tag == .freestanding or build_options.bench
 
 const Allocator = std.mem.Allocator;
 
-pub const ContentPart = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps) union(enum) {
-    text: []const u8,
-    media_url: []const u8,
-    binary: BinaryContent,
-
-    pub const BinaryContent = struct {
-        mime_type: []const u8,
-        data: []const u8,
-    };
-} else host_template.ContentPart;
+pub const ContentPart = @import("antfly_template_content").ContentPart;
 
 pub fn renderDocument(
     alloc: Allocator,

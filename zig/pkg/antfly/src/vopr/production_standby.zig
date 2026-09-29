@@ -121,7 +121,7 @@ pub const Owners = struct {
     }
     fn freeRouting(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
     fn catalogSource(self: *Owners) catalog.CatalogSource {
-        return .{ .ptr = self, .io = @import("../runtime_io_abi.zig").Borrow.init(&self.io), .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .routing_snapshot = routing, .linearizable_routing_snapshot = routing, .free_routing_snapshot = freeRouting } };
+        return .{ .ptr = self, .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&self.io), .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .routing_snapshot = routing, .linearizable_routing_snapshot = routing, .free_routing_snapshot = freeRouting } };
     }
     fn statusSource(self: *Owners) api.StatusSource {
         return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .routing_snapshot = routing, .linearizable_routing_snapshot = routing, .free_routing_snapshot = freeRouting } };

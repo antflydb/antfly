@@ -1358,7 +1358,7 @@ test "serverless compactor no-ops when head is already compacted" {
     try std.testing.expect(first.published);
 
     const RejectUploads = struct {
-        fn put(_: *anyopaque, _: Allocator, _: @import("../artifacts/store.zig").UploadScope, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.ArtifactMetadata {
+        fn put(_: *anyopaque, _: Allocator, _: @import("../artifacts/store.zig").UploadScope, _: []const u8, _: @import("antfly_cancellation").CancellationToken) !artifacts_mod.ArtifactMetadata {
             return error.UnexpectedCompactionUpload;
         }
     };

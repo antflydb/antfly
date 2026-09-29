@@ -34,7 +34,7 @@ const rowsource = @import("../../storage/rowsource/types.zig");
 const indexed_reader = @import("indexed_reader.zig");
 const query_request = @import("request.zig");
 const lake_rows = @import("lake_rows.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const default_candidate_limit: usize = 100;
 

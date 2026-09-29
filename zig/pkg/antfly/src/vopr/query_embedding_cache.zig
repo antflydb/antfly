@@ -19,8 +19,8 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const cache_budget = @import("../common/cache_budget.zig");
-const query_cache = @import("../inference/query_embedding_cache.zig");
+const cache_budget = @import("antfly_cache_budget");
+const query_cache = @import("antfly_inference_query_embedding_cache");
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {

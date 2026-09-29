@@ -539,10 +539,10 @@ pub const Owner = struct {
         return try self.waitForSyncWithCancellation(table_name, sync_level, .none);
     }
 
-    pub fn waitForSyncWithCancellation(self: *Owner, table_name: []const u8, sync_level: abi.SyncLevel, cancellation: @import("../common/cancellation.zig").CancellationToken) !void {
+    pub fn waitForSyncWithCancellation(self: *Owner, table_name: []const u8, sync_level: abi.SyncLevel, cancellation: @import("antfly_cancellation").CancellationToken) !void {
         const Callback = struct {
             fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
-                const token: *const @import("../common/cancellation.zig").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
                 return @intFromBool(token.isCancelled());
             }
         };

@@ -17,7 +17,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../common/fs_paths.zig");
 const artifact_store = @import("store.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const FsStore = struct {
     const verified_file_cache_limit: usize = 4096;

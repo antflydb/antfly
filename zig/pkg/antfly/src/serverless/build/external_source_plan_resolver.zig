@@ -932,7 +932,7 @@ const MemoryArtifactStore = struct {
         .delete = deleteErased,
     };
 
-    fn putScoped(ptr: *anyopaque, alloc: Allocator, scope: artifacts_mod.store.UploadScope, bytes: []const u8, cancellation: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.ArtifactMetadata {
+    fn putScoped(ptr: *anyopaque, alloc: Allocator, scope: artifacts_mod.store.UploadScope, bytes: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) !artifacts_mod.ArtifactMetadata {
         try cancellation.check();
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.bytes) |old| self.alloc.free(old);

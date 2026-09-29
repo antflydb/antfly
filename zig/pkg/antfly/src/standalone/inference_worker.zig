@@ -17,9 +17,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const rpc = @import("antfly_inference_worker_rpc");
-pub const wire = @import("inference_worker_wire.zig");
-const bridge = @import("inference_bridge.zig");
-const http = @import("../runtime_http_abi.zig");
+pub const wire = @import("antfly_inference_worker_wire");
+const bridge = @import("antfly_inference_bridge");
+const http = @import("antfly_runtime_abi").http_abi;
 const host = @import("inference_host.zig");
 const platform = @import("antfly_platform");
 const httpx = @import("httpx");
@@ -578,7 +578,7 @@ const Child = struct {
             // Diagnose at the error owner, including envelope decoding and
             // response serialization, before the first lossy RPC status hop.
             const status = if (envelope.operation == .provider)
-                @import("provider_failure.zig").status(diagnostic.operation, diagnostic.request_json, diagnostic.has_deadline, err)
+                @import("antfly_inference_provider_failure").status(diagnostic.operation, diagnostic.request_json, diagnostic.has_deadline, err)
             else
                 bridge.statusFromError(err);
             return reply(&self.endpoint, status, "", "");

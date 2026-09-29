@@ -17,8 +17,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
-const inference_request_context = @import("../../../inference/execution_context.zig");
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
+const inference_request_context = @import("antfly_inference_execution_context");
 const RequestContext = inference_request_context.RequestContext;
 const utf8_text = @import("utf8_text.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)

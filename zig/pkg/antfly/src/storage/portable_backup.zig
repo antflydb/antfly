@@ -101,7 +101,7 @@ const PortableOutputMode = union(enum) {
 };
 
 const PortableOutput = struct {
-    cancellation: @import("../common/cancellation.zig").CancellationToken = .none,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
     alloc: Allocator,
     writer: ?*std.Io.Writer = null,
     mode: PortableOutputMode,
@@ -278,7 +278,7 @@ pub const ExportOptions = struct {
     /// The proof travels with logical rows; routed enforcement keys do not.
     cohort: ?CohortProof = null,
     source_copy: ?SourceCopyProof = null,
-    cancellation: @import("../common/cancellation.zig").CancellationToken = .none,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
     stats: ?*ExportStats = null,
     header_backup_id: [16]u8 = [_]u8{0} ** 16,
     backup_id: []const u8 = "",
@@ -1912,7 +1912,7 @@ pub const ImportOptions = struct {
     unpublished_staging: bool = false,
     progress_context: ?*anyopaque = null,
     progress_fn: ?*const fn (?*anyopaque, ImportProgress) void = null,
-    cancellation: @import("../common/cancellation.zig").CancellationToken = .none,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
     /// Decoded historical epochs, not total archive history. A single oversized
     /// epoch may exceed this budget while its row is being validated.
     schema_cache_bytes: usize = default_schema_cache_bytes,
@@ -2007,11 +2007,11 @@ fn loadCohortArchive(alloc: Allocator, store: *DocStore, proof: StagedImportProo
 /// The caller owns an unpublished LSM directory and has verified the full file
 /// digest. Each call commits at most one bounded row/metadata page together
 /// with its exact archive cursor. Source identities are rebuilt, not copied.
-pub fn importCohortFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: CohortProof, scope: [32]u8, max_rows: usize, cancellation: @import("../common/cancellation.zig").CancellationToken) !bool {
+pub fn importCohortFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: CohortProof, scope: [32]u8, max_rows: usize, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
     return importStagedFilePage(alloc, store, io, file, size, .{ .cohort = proof }, scope, max_rows, cancellation);
 }
 
-pub fn importSourceCopyFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: SourceCopyProof, scope: [32]u8, max_rows: usize, cancellation: @import("../common/cancellation.zig").CancellationToken) !bool {
+pub fn importSourceCopyFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: SourceCopyProof, scope: [32]u8, max_rows: usize, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
     return importStagedFilePage(alloc, store, io, file, size, .{ .source_copy = proof }, scope, max_rows, cancellation);
 }
 
@@ -2023,7 +2023,7 @@ fn syncImportCheckpoint(store: *DocStore) !void {
     try store.syncReplayState();
 }
 
-fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: StagedImportProof, scope: [32]u8, max_rows: usize, cancellation: @import("../common/cancellation.zig").CancellationToken) !bool {
+fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: StagedImportProof, scope: [32]u8, max_rows: usize, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
     if (max_rows == 0 or max_rows > 128) return error.InvalidBackupRequest;
     try cancellation.check();
     if (!try file.tryLock(io, .shared)) return error.WriterLocked;
@@ -2427,7 +2427,7 @@ pub fn verifySourceCertificateFile(
     file: std.Io.File,
     file_size: u64,
     expected: source_snapshot.Certificate,
-    cancellation: @import("../common/cancellation.zig").CancellationToken,
+    cancellation: @import("antfly_cancellation").CancellationToken,
 ) !void {
     try cancellation.check();
     _ = try expected.encode();

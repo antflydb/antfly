@@ -14,7 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const cache_budget = @import("../common/cache_budget.zig");
+const cache_budget = @import("antfly_cache_budget");
 const platform_time = @import("antfly_platform").time;
 
 pub const Key = [32]u8;

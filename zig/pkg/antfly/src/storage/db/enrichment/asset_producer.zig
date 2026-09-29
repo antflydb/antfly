@@ -16,8 +16,8 @@
 const std = @import("std");
 const antfly_image = @import("antfly_image");
 const inference_work = @import("antfly_inference_work");
-const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
-const request_context = @import("../../../inference/execution_context.zig");
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
+const request_context = @import("antfly_inference_execution_context");
 const RequestContext = request_context.RequestContext;
 
 const Allocator = std.mem.Allocator;
@@ -1404,7 +1404,7 @@ test "asset producer preserves legacy native batch under request context" {
         .{
             .io = std.testing.io,
             .deadline_ns = null,
-            .cancellation = @import("../../../common/cancellation.zig").CancellationToken.fromAtomic(&cancelled),
+            .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled),
         },
     ));
     try std.testing.expectEqual(@as(usize, 2), probe.batch_calls);
