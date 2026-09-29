@@ -1830,8 +1830,10 @@ following mechanisms are installed behind that gate:
   receiver producer plan now validates both exact and semantic catalog
   bindings once per source cut, maps index/graph producer names and kinds to
   receiver-owned physical generations in O(1) per proof, and rejects donor
-  generation drift. It does not yet rebind graph effect bytes or map the
-  non-index producer families, so it is candidate identity, not acceptance.
+  generation drift. It also maps enrichment authority epochs and resolver
+  definition generations, including default-zero resolver generations, from
+  the authenticated catalog pair. Graph effect rebinding and promotion
+  identity remain open; mapping is candidate identity, not acceptance.
   A selected direct-index candidate can now build a receiver-owned APF3 body
   off-lock from remapped local inputs and selected postimages. The body binds
   donor lineage through its adoption digest, drops donor historical output

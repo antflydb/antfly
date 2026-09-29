@@ -148,17 +148,67 @@ pub const ReceiverCandidate = struct {
 };
 
 /// Exact bindings certify each physical catalog; their semantic digests
-/// certify the cross-owner definition match. Match the producer by name and
-/// kind, then take only the receiver's physical generation. One plan serves
-/// all bounded proofs at a certified cut: catalog canonicalization and index
-/// parsing do not recur per row. Graph outputs additionally require value/key
+/// certify the cross-owner definition match. One plan serves all bounded
+/// proofs at a certified cut: index/graph physical generations, enrichment
+/// authority epochs, and resolver definition generations are mapped by name
+/// without re-parsing catalogs per proof. Graph outputs still require value/key
 /// rebinding before this identity is usable.
 pub const ReceiverProducerPlan = struct {
     const IndexBinding = struct { kind: u8, donor: u64, receiver: u64 };
+    const GenerationBinding = struct { donor: u64, receiver: u64 };
     arena: std.heap.ArenaAllocator,
     donor_binding: inventory.Binding,
     receiver_binding: inventory.Binding,
     indexes: std.StringHashMapUnmanaged(IndexBinding),
+    enrichments: std.StringHashMapUnmanaged(GenerationBinding),
+    resolvers: std.StringHashMapUnmanaged(GenerationBinding),
+
+    fn familyGenerations(scratch: std.mem.Allocator, owned: std.mem.Allocator, raw: []const u8, default_generation: ?u64) !std.StringHashMapUnmanaged(u64) {
+        var result: std.StringHashMapUnmanaged(u64) = .empty;
+        if (raw.len == 0) return result;
+        var parsed = std.json.parseFromSlice(std.json.Value, scratch, raw, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.SourceSnapshotCorrupt,
+        };
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.SourceSnapshotCorrupt;
+        for (parsed.value.array.items) |item| {
+            if (item != .object) return error.SourceSnapshotCorrupt;
+            const name = item.object.get("name") orelse return error.SourceSnapshotCorrupt;
+            if (name != .string or name.string.len == 0) return error.SourceSnapshotCorrupt;
+            const producer_generation = default_generation orelse blk: {
+                const value = item.object.get("config_generation") orelse break :blk 0;
+                if (value != .integer or value.integer < 0) return error.SourceSnapshotCorrupt;
+                break :blk std.math.cast(u64, value.integer) orelse return error.SourceSnapshotCorrupt;
+            };
+            if (result.contains(name.string)) return error.SourceSnapshotCorrupt;
+            const inserted = try result.getOrPut(owned, try owned.dupe(u8, name.string));
+            if (inserted.found_existing) return error.SourceSnapshotCorrupt;
+            inserted.value_ptr.* = producer_generation;
+        }
+        return result;
+    }
+
+    fn mapFamily(
+        scratch: std.mem.Allocator,
+        owned: std.mem.Allocator,
+        donor_raw: []const u8,
+        receiver_raw: []const u8,
+        donor_epoch: ?u64,
+        receiver_epoch: ?u64,
+    ) !std.StringHashMapUnmanaged(GenerationBinding) {
+        const donor = try familyGenerations(scratch, owned, donor_raw, donor_epoch);
+        const receiver = try familyGenerations(scratch, owned, receiver_raw, receiver_epoch);
+        if (donor.count() != receiver.count()) return error.SourceSnapshotCorrupt;
+        var mapped: std.StringHashMapUnmanaged(GenerationBinding) = .empty;
+        var iterator = donor.iterator();
+        while (iterator.next()) |entry| {
+            const target = receiver.get(entry.key_ptr.*) orelse return error.SourceSnapshotCorrupt;
+            if (donor_epoch == null and entry.value_ptr.* != target) return error.SourceSnapshotCorrupt;
+            try mapped.put(owned, entry.key_ptr.*, .{ .donor = entry.value_ptr.*, .receiver = target });
+        }
+        return mapped;
+    }
 
     pub fn init(alloc: std.mem.Allocator, donor_catalog: inventory.Catalogs, donor_binding: inventory.Binding, receiver_catalog: inventory.Catalogs, receiver_binding: inventory.Binding) !ReceiverProducerPlan {
         if (!std.mem.eql(u8, &donor_catalog.digest(), &donor_binding.digest) or
@@ -190,7 +240,9 @@ pub const ReceiverProducerPlan = struct {
             }
         }
         if (indexes.count() != receiver_indexes.count()) return error.SourceSnapshotCorrupt;
-        return .{ .arena = arena, .donor_binding = donor_binding, .receiver_binding = receiver_binding, .indexes = indexes };
+        const enrichments = try mapFamily(alloc, owned, donor_catalog.enrichments, receiver_catalog.enrichments, donor_binding.epoch, receiver_binding.epoch);
+        const resolvers = try mapFamily(alloc, owned, donor_catalog.resolvers, receiver_catalog.resolvers, null, null);
+        return .{ .arena = arena, .donor_binding = donor_binding, .receiver_binding = receiver_binding, .indexes = indexes, .enrichments = enrichments, .resolvers = resolvers };
     }
 
     pub fn deinit(self: *ReceiverProducerPlan) void {
@@ -199,6 +251,12 @@ pub const ReceiverProducerPlan = struct {
     }
 
     pub fn generation(self: *const ReceiverProducerPlan, proof: provenance.Proof) !?u64 {
+        if (proof.producer_kind == .enrichment or proof.producer_kind == .resolver) {
+            const mapping = if (proof.producer_kind == .enrichment) self.enrichments.get(proof.producer_name) else self.resolvers.get(proof.producer_name);
+            const entry = mapping orelse return error.SourceSnapshotCorrupt;
+            if (entry.donor != proof.producer_generation) return error.SourceSnapshotCorrupt;
+            return entry.receiver;
+        }
         if (proof.producer_kind != .index and proof.producer_kind != .graph) return null;
         const entry = self.indexes.get(proof.producer_name) orelse return error.SourceSnapshotCorrupt;
         if ((entry.kind == 3) != (proof.producer_kind == .graph) or entry.donor != proof.producer_generation)
@@ -477,6 +535,64 @@ test "ordered artifact inventory receiver producer mapping rejects donor identit
             var mapped = try ReceiverProducerPlan.init(a, source_catalog, source_binding, target_catalog, target_binding);
             defer mapped.deinit();
             try std.testing.expectEqual(@as(usize, 1), mapped.indexes.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ donor, donor_binding, receiver, receiver_binding });
+}
+
+test "ordered artifact inventory receiver maps enrichment epochs and resolver definitions" {
+    const alloc = std.testing.allocator;
+    const donor: inventory.Catalogs = .{
+        .enrichments = "[{\"name\":\"asset\",\"source_field\":\"body\"}]",
+        .resolvers = "[{\"name\":\"resolve\",\"config_generation\":7},{\"name\":\"default\"}]",
+    };
+    const receiver: inventory.Catalogs = .{
+        .enrichments = "[{\"source_field\":\"body\",\"name\":\"asset\"}]",
+        .resolvers = "[{\"name\":\"default\"},{\"config_generation\":7,\"name\":\"resolve\"}]",
+    };
+    const donor_binding: inventory.Binding = .{ .epoch = 3, .digest = donor.digest(), .semantic_digest = try donor.semanticDigest(alloc), .effect_protocol = 15 };
+    const receiver_binding: inventory.Binding = .{ .epoch = 4, .digest = receiver.digest(), .semantic_digest = try receiver.semanticDigest(alloc), .effect_protocol = 15 };
+    var plan = try ReceiverProducerPlan.init(alloc, donor, donor_binding, receiver, receiver_binding);
+    defer plan.deinit();
+    var proof: provenance.Proof = .{
+        .namespace = @splat(1),
+        .authority_epoch = donor_binding.epoch,
+        .catalog_digest = donor_binding.digest,
+        .producer_kind = .enrichment,
+        .producer_name = "asset",
+        .producer_generation = donor_binding.epoch,
+        .producer_artifact_name = "asset",
+        .publication_digest = @splat(2),
+        .input_digest = @splat(3),
+        .sources = &.{},
+        .artifact_sources = &.{},
+        .effects = &.{},
+    };
+    try std.testing.expectEqual(@as(?u64, receiver_binding.epoch), try plan.generation(proof));
+    proof.producer_generation = receiver_binding.epoch;
+    try std.testing.expectError(error.SourceSnapshotCorrupt, plan.generation(proof));
+    proof.producer_kind = .resolver;
+    proof.producer_name = "resolve";
+    proof.producer_generation = 7;
+    try std.testing.expectEqual(@as(?u64, 7), try plan.generation(proof));
+    proof.producer_generation = 8;
+    try std.testing.expectError(error.SourceSnapshotCorrupt, plan.generation(proof));
+    proof.producer_name = "default";
+    proof.producer_generation = 0;
+    try std.testing.expectEqual(@as(?u64, 0), try plan.generation(proof));
+    proof.producer_name = "missing";
+    try std.testing.expectError(error.SourceSnapshotCorrupt, plan.generation(proof));
+    proof.producer_kind = .promotion;
+    try std.testing.expect((try plan.generation(proof)) == null);
+    const drifted: inventory.Catalogs = .{ .enrichments = donor.enrichments, .resolvers = "[{\"name\":\"resolve\",\"config_generation\":8}]" };
+    const drifted_binding: inventory.Binding = .{ .epoch = 4, .digest = drifted.digest(), .semantic_digest = try drifted.semanticDigest(alloc), .effect_protocol = 15 };
+    try std.testing.expectError(error.SourceSnapshotCorrupt, ReceiverProducerPlan.init(alloc, donor, donor_binding, drifted, drifted_binding));
+    const AllocationCheck = struct {
+        fn run(a: std.mem.Allocator, source: inventory.Catalogs, source_binding: inventory.Binding, target: inventory.Catalogs, target_binding: inventory.Binding) !void {
+            var mapped = try ReceiverProducerPlan.init(a, source, source_binding, target, target_binding);
+            defer mapped.deinit();
+            try std.testing.expectEqual(@as(usize, 1), mapped.enrichments.count());
+            try std.testing.expectEqual(@as(usize, 2), mapped.resolvers.count());
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ donor, donor_binding, receiver, receiver_binding });
