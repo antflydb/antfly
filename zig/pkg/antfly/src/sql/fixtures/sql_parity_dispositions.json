@@ -153,11 +153,12 @@
     {
       "id": "sql-0005",
       "status": "unresolved",
-      "reason": "The exact statement body has typed runtime coverage: its CTE reads two source rows, releases the source cursor, generates distinct target identities, and submits one atomic INSERT batch; a source failure closes without generating IDs or submitting a mutation. A pgwire protocol fixture runs the original PREPARE/EXECUTE sequence and verifies deferral. Authenticated mounted HTTP prepared execution binds source and target, captures one read-committed source snapshot, and admits one target native batch. The exact prepared pgwire sequence is not yet mounted on that native source/target path, so the case remains unresolved.",
+      "reason": "The exact statement body has typed runtime coverage: its CTE reads two source rows, releases the source cursor, generates distinct target identities, and submits one atomic INSERT batch; a source failure closes without generating IDs or submitting a mutation. A pgwire protocol fixture runs the original PREPARE/EXECUTE sequence and verifies deferral. Authenticated mounted HTTP prepared execution binds source and target, captures one read-committed source snapshot, and admits one target native batch. A linked hosted test runs the exact pgwire PREPARE/EXECUTE sequence against real Raft-backed source and target tables, verifies INSERT completion and typed target read-back, and retries only proven precommit read unavailability. Multi-owner and distributed fault evidence remain missing, so the case remains unresolved.",
       "evidence": [
         {"path": "zig/pkg/antfly/src/sql/insert_test.zig", "test": "SQL original prepared CTE INSERT captures source before one target mutation", "gate": "sql-original-prepared-cte-runtime"},
         {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE INSERT defers mutation until execute", "gate": "pgwire-original-prepared-cte"},
-        {"path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL API cross-table MERGE retains both source and target range proofs", "gate": "sql-mounted-merge"}
+        {"path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL API cross-table MERGE retains both source and target range proofs", "gate": "sql-mounted-merge"},
+        {"path": "zig/pkg/antfly/src/api/hosted_self_fk_e2e.zig", "test": "mounted hosted CTE MERGE retains owner statement fences", "gate": "antfly-api-hosted-cte-merge-test"}
       ]
     },
     {

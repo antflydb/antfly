@@ -149,7 +149,7 @@ test "hosted CTE MERGE retries only proven precommit read unavailability" {
     try std.testing.expect(!pgwirePrecommitReadUnavailable(pgwire_safe, 1, 0, 1));
     try std.testing.expect(!pgwirePrecommitReadUnavailable("SERROR\x00C40003\x00Mwrite outcome unknown\x00", 1, 0, 0));
 }
-fn runHostedPgwireMergeOnce(alloc: std.mem.Allocator, io: std.Io, api: *http_server.ApiHttpServer, original: []const u8) !enum { committed, retry_read } {
+fn runHostedPgwirePreparedOnce(alloc: std.mem.Allocator, io: std.Io, api: *http_server.ApiHttpServer, original: []const u8, execute: []const u8, select: []const u8, completion_tag: []const u8, expected_row: []const []const u8) !enum { committed, retry_read } {
     var pg_adapter: @import("sql_pgwire.zig").Adapter = .{ .server = api };
     const Wire = struct {
         fn frame(out: *std.Io.Writer, tag: u8, payload: []const u8) !void {
@@ -168,8 +168,12 @@ fn runHostedPgwireMergeOnce(alloc: std.mem.Allocator, io: std.Io, api: *http_ser
     const prepare_command = try std.fmt.allocPrint(alloc, "{s}\x00", .{original});
     defer alloc.free(prepare_command);
     try Wire.frame(&input.writer, 'Q', prepare_command);
-    try Wire.frame(&input.writer, 'Q', "EXECUTE cte_merge_plan\x00");
-    try Wire.frame(&input.writer, 'Q', "SELECT id,status FROM usage_records WHERE id = 'prepared_id'\x00");
+    const execute_command = try std.fmt.allocPrint(alloc, "{s}\x00", .{execute});
+    defer alloc.free(execute_command);
+    try Wire.frame(&input.writer, 'Q', execute_command);
+    const select_command = try std.fmt.allocPrint(alloc, "{s}\x00", .{select});
+    defer alloc.free(select_command);
+    try Wire.frame(&input.writer, 'Q', select_command);
     try Wire.frame(&input.writer, 'X', "");
     var reader = std.Io.Reader.fixed(input.written());
     var output = std.Io.Writer.Allocating.init(alloc);
@@ -179,23 +183,23 @@ fn runHostedPgwireMergeOnce(alloc: std.mem.Allocator, io: std.Io, api: *http_ser
     try session.run();
     var frames: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = output.written() };
     var prepared_count: usize = 0;
-    var merge_count: usize = 0;
+    var mutation_count: usize = 0;
     var read_count: usize = 0;
     while (frames.offset < frames.bytes.len) {
         const tag = try frames.int(u8);
         const size = try frames.int(u32);
         const payload = try frames.take(size - 4);
         if (tag == 'E') {
-            if (pgwirePrecommitReadUnavailable(payload, prepared_count, merge_count, read_count)) return .retry_read;
-            std.debug.print("hosted pgwire CTE MERGE error after prepared={} merged={} reads={}: {s}\n", .{ prepared_count, merge_count, read_count, payload });
-            return error.TestUnexpectedPgwireMergeError;
+            if (pgwirePrecommitReadUnavailable(payload, prepared_count, mutation_count, read_count)) return .retry_read;
+            std.debug.print("hosted pgwire CTE mutation error after prepared={} mutated={} reads={}: {s}\n", .{ prepared_count, mutation_count, read_count, payload });
+            return error.TestUnexpectedPgwireMutationError;
         }
         if (tag == 'C' and std.mem.eql(u8, payload, "PREPARE\x00")) prepared_count += 1;
-        if (tag == 'C' and std.mem.eql(u8, payload, "MERGE 1\x00")) merge_count += 1;
+        if (tag == 'C' and std.mem.eql(u8, payload, completion_tag)) mutation_count += 1;
         if (tag != 'D') continue;
         var row: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = payload };
-        try std.testing.expectEqual(@as(u16, 2), try row.int(u16));
-        for ([_][]const u8{ "prepared_id", "open" }) |expected| {
+        try std.testing.expectEqual(@as(u16, @intCast(expected_row.len)), try row.int(u16));
+        for (expected_row) |expected| {
             const length = try row.int(i32);
             try std.testing.expect(length >= 0);
             try std.testing.expectEqualStrings(expected, try row.take(@intCast(length)));
@@ -203,7 +207,7 @@ fn runHostedPgwireMergeOnce(alloc: std.mem.Allocator, io: std.Io, api: *http_ser
         read_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), prepared_count);
-    try std.testing.expectEqual(@as(usize, 1), merge_count);
+    try std.testing.expectEqual(@as(usize, 1), mutation_count);
     try std.testing.expectEqual(@as(usize, 1), read_count);
     return .committed;
 }
@@ -1103,7 +1107,11 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
         defer read_grant.deinit(alloc);
         var write_grant = try usermgr.Permission.initOwned(alloc, .table, "usage_records", .write);
         defer write_grant.deinit(alloc);
-        var user = try user_manager.createUser("prepared_writer", "secret", &.{ read_grant, write_grant });
+        var archive_read = try usermgr.Permission.initOwned(alloc, .table, "archived_records", .read);
+        defer archive_read.deinit(alloc);
+        var archive_write = try usermgr.Permission.initOwned(alloc, .table, "archived_records", .write);
+        defer archive_write.deinit(alloc);
+        var user = try user_manager.createUser("prepared_writer", "secret", &.{ read_grant, write_grant, archive_read, archive_write });
         user.deinit(alloc);
     }
     var data = try data_runtime.DataServer.initFromMetadataApiUrl(process_alloc, .{
@@ -1218,8 +1226,24 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
         const api = if (data.http_server) |*server| server else return error.OwnerReadNotReady;
         const pgwire_deadline = platform.time.monotonicNs() +| 60 * std.time.ns_per_s;
         while (true) {
-            if (try runHostedPgwireMergeOnce(alloc, io, api, original) == .committed) break;
+            if (try runHostedPgwirePreparedOnce(alloc, io, api, original, "EXECUTE cte_merge_plan", "SELECT id,status FROM usage_records WHERE id = 'prepared_id'", "MERGE 1\x00", &.{ "prepared_id", "open" }) == .committed) break;
             if (platform.time.monotonicNs() >= pgwire_deadline) return error.PgwireReadNotReady;
+            try io.sleep(.fromMilliseconds(50), .awake);
+        }
+
+        // The exact sql-0005 cross-table CTE INSERT must use the same mounted
+        // owner path, not only the protocol mock or the one-table MERGE path.
+        var create_archive = try sql(alloc, transport, &headers, base, "CREATE TABLE archived_records (id TEXT PRIMARY KEY)");
+        defer create_archive.deinit(alloc);
+        try std.testing.expect(create_archive.status == 200 or create_archive.status == 202);
+        _ = try awaitTableNamed(alloc, io, transport, &headers, base, "archived_records");
+        const original_insert = for (corpus.value.object.get("entries").?.array.items) |entry| {
+            if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0005")) break entry.object.get("sql").?.string;
+        } else return error.TestMissingCorpusCase;
+        const insert_deadline = platform.time.monotonicNs() +| 60 * std.time.ns_per_s;
+        while (true) {
+            if (try runHostedPgwirePreparedOnce(alloc, io, api, original_insert, "EXECUTE cte_insert_plan", "SELECT id FROM archived_records WHERE id = 'prepared_id'", "INSERT 0 1\x00", &.{"prepared_id"}) == .committed) break;
+            if (platform.time.monotonicNs() >= insert_deadline) return error.PgwireReadNotReady;
             try io.sleep(.fromMilliseconds(50), .awake);
         }
         return;

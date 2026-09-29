@@ -109,9 +109,11 @@ source rows are captured and the cursor is closed before one target mutation,
 while a source failure performs no write. A pgwire fixture covers the exact
 PREPARE/EXECUTE sequence and defers execution. An authenticated mounted HTTP
 prepared execution binds the source and target, captures the read-committed
-source snapshot, and admits one target native batch. The exact prepared pgwire
-sequence is not yet mounted on the native source/target path, so the case
-remains unresolved.
+source snapshot, and admits one target native batch. A linked hosted test now
+runs the exact pgwire PREPARE/EXECUTE sequence against real Raft-backed source
+and target tables, checks `INSERT 0 1` and the typed target read-back, and
+retries only a proven precommit read-unavailable error. Multi-owner and
+distributed fault evidence remain missing, so the case remains unresolved.
 For `sql-0006` and `sql-0007`, the exact prepared CTE UPDATE and DELETE now
 execute through authenticated mounted pgwire and a native relational owner.
 Command counts and typed reads prove the update and subsequent deletion;
