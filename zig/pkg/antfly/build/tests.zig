@@ -474,7 +474,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
     const retained_transfer_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
-        .filters = &.{ "relational index system rewrite", "relational index system retained", "relational index system merge tail", "storage.source_snapshot." },
+        .filters = &.{ "relational index system rewrite", "relational index system retained", "relational index system merge tail", "relational index system source pin prepared crash", "storage.source_snapshot." },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-retained-transfer-test", "Run bounded retained-frame transfer, cold resume and corruption regressions").dependOn(&addFilteredTestRunArtifact(b, retained_transfer_tests).step);

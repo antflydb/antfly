@@ -794,12 +794,17 @@ test "relational index system source pin prepared crash blocks markers then reop
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source-{d}", .{ tmp.sub_path, trial });
         defer alloc.free(path);
         const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+        const graph_key = try @import("../internal_keys.zig").graphEdgeArtifactKeyAlloc(alloc, "a", "g", "links", "neighbor");
+        defer alloc.free(graph_key);
+        const graph_value = try @import("enrichment/artifact_codec.zig").encodeGraphEdgeAlloc(alloc, null, 1, 1, 0, 0, "");
+        defer alloc.free(graph_value);
         var scope: ledger.Scope = undefined;
         {
             var db = try db_mod.DB.open(alloc, path, options);
             defer db.close();
             try db.setSchemaJson(alloc, schema);
             try db.batchRaftReplicatedApply(.{ .timestamp_ns = 111, .writes = &.{.{ .key = "a", .value = "{\"id\":1}" }} }, .{ .term = 1, .index = 1 });
+            if (trial == 0) try db.core.store.putBatch(&.{.{ .key = graph_key, .value = graph_value }}, &.{});
             const owner = try db.relationalTopologyIdentity();
             scope = .{ .fence = .{ .role = .merge_source, .transition_id = 77, .attempt = 1, .admission_epoch = owner.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
             test_failure = point;
@@ -859,6 +864,11 @@ test "relational index system source pin prepared crash blocks markers then reop
         try std.testing.expectError(error.SourceCopyRestoreUnsupported, portable.importPortableWithOptions(alloc, decoder.core.store, bytes, .{}));
         try portable.importPortableWithOptions(alloc, decoder.core.store, bytes, .{ .source_copy = proof, .unpublished_staging = true });
         try portable.validateCompleteSourceCopyImage(alloc, decoder.core.store, proof);
+        if (trial == 0) {
+            const restored_graph = try decoder.core.store.get(alloc, graph_key);
+            defer alloc.free(restored_graph);
+            try std.testing.expectEqualSlices(u8, graph_value, restored_graph);
+        }
         try std.testing.expectError(error.SourceCopyRestoreUnsupported, portable.validateCompleteDatabaseImageAlloc(alloc, decoder.core.store));
         const primary_key = try @import("../internal_keys.zig").relationalRowKeyAlloc(alloc, "a");
         defer alloc.free(primary_key);
