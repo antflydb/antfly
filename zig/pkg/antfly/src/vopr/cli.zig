@@ -88,8 +88,6 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         12
     else if (std.mem.eql(u8, scenario, "raft"))
         33
-    else if (std.mem.eql(u8, scenario, "lmdb"))
-        13
     else if (std.mem.eql(u8, scenario, "lsm"))
         49
     else if (std.mem.eql(u8, scenario, "standby-scaling"))
@@ -135,9 +133,6 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
     } else if (std.mem.eql(u8, scenario, "raft")) blk: {
         if (transition_budget != 33) return error.RaftScenarioRequiresThirtyThreeTransitions;
         break :blk try antfly.raft_vopr.record(alloc, seed);
-    } else if (std.mem.eql(u8, scenario, "lmdb")) blk: {
-        if (transition_budget != 13) return error.LmdbScenarioRequiresThirteenTransitions;
-        break :blk try antfly.lmdb_vopr.record(alloc, seed);
     } else if (std.mem.eql(u8, scenario, "lsm")) blk: {
         if (transition_budget != 49) return error.LsmScenarioRequiresFortyNineTransitions;
         break :blk try antfly.lsm_vopr.record(alloc, seed);
@@ -736,8 +731,6 @@ fn replayKnownScenario(alloc: std.mem.Allocator, recorded: *const vopr.trace.Tra
         return antfly.db_split_vopr.replay(alloc, recorded);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.raft_vopr.CliScenario.name))
         return antfly.raft_vopr.replay(alloc, recorded);
-    if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name))
-        return antfly.lmdb_vopr.replay(alloc, recorded);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lsm_vopr.CliScenario.name))
         return antfly.lsm_vopr.replay(alloc, recorded);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.standby_vopr.CliScenario.name))
@@ -815,8 +808,6 @@ fn runKnownScenarioWithChoicesAndRecorder(
         return runContextFreeWithChoicesAndRecorder(antfly.db_split_vopr.CliScenario, alloc, recorded, source, recorder);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.raft_vopr.CliScenario.name))
         return runContextFreeWithChoicesAndRecorder(antfly.raft_vopr.CliScenario, alloc, recorded, source, recorder);
-    if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name))
-        return runContextFreeWithChoicesAndRecorder(antfly.lmdb_vopr.CliScenario, alloc, recorded, source, recorder);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lsm_vopr.CliScenario.name))
         return runContextFreeWithChoicesAndRecorder(antfly.lsm_vopr.CliScenario, alloc, recorded, source, recorder);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.standby_vopr.CliScenario.name))
@@ -932,8 +923,6 @@ fn declarationsKnown(recorded: *const vopr.trace.Trace) []const vopr.property.De
         return antfly.db_split_vopr.CliScenario.properties;
     if (std.mem.eql(u8, recorded.header.scenario, antfly.raft_vopr.CliScenario.name))
         return antfly.raft_vopr.CliScenario.properties;
-    if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name))
-        return antfly.lmdb_vopr.CliScenario.properties;
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lsm_vopr.CliScenario.name))
         return antfly.lsm_vopr.CliScenario.properties;
     if (std.mem.eql(u8, recorded.header.scenario, antfly.standby_vopr.CliScenario.name))
@@ -957,7 +946,6 @@ fn defaultCampaignTransitions(scenario: []const u8) !usize {
     if (std.mem.eql(u8, scenario, "index-manager")) return 11;
     if (std.mem.eql(u8, scenario, "db-split")) return 12;
     if (std.mem.eql(u8, scenario, "raft")) return 33;
-    if (std.mem.eql(u8, scenario, "lmdb")) return 13;
     if (std.mem.eql(u8, scenario, "lsm")) return 49;
     if (std.mem.eql(u8, scenario, "standby")) return 33;
     if (std.mem.eql(u8, scenario, "standby-scaling")) return 600_000;
@@ -997,7 +985,6 @@ fn recordCampaignScenario(
     if (std.mem.eql(u8, scenario, "index-manager")) return antfly.index_manager_vopr.record(alloc, seed);
     if (std.mem.eql(u8, scenario, "db-split")) return antfly.db_split_vopr.record(alloc, seed);
     if (std.mem.eql(u8, scenario, "raft")) return antfly.raft_vopr.record(alloc, seed);
-    if (std.mem.eql(u8, scenario, "lmdb")) return antfly.lmdb_vopr.record(alloc, seed);
     if (std.mem.eql(u8, scenario, "lsm")) return antfly.lsm_vopr.record(alloc, seed);
     if (std.mem.eql(u8, scenario, "standby")) return antfly.standby_vopr.record(alloc, seed);
     if (std.mem.eql(u8, scenario, "standby-scaling")) return antfly.full_cluster_vopr.recordStandbyScaling(alloc, seed, transitions);
@@ -1014,7 +1001,6 @@ fn artifactMatchesScenario(artifact: *const vopr.trace.Trace, scenario: []const 
     if (std.mem.eql(u8, scenario, "index-manager")) return std.mem.eql(u8, artifact.header.scenario, antfly.index_manager_vopr.CliScenario.name);
     if (std.mem.eql(u8, scenario, "db-split")) return std.mem.eql(u8, artifact.header.scenario, antfly.db_split_vopr.CliScenario.name);
     if (std.mem.eql(u8, scenario, "raft")) return std.mem.eql(u8, artifact.header.scenario, antfly.raft_vopr.CliScenario.name);
-    if (std.mem.eql(u8, scenario, "lmdb")) return std.mem.eql(u8, artifact.header.scenario, antfly.lmdb_vopr.CliScenario.name);
     if (std.mem.eql(u8, scenario, "lsm")) return std.mem.eql(u8, artifact.header.scenario, antfly.lsm_vopr.CliScenario.name);
     if (std.mem.eql(u8, scenario, "standby")) return std.mem.eql(u8, artifact.header.scenario, antfly.standby_vopr.CliScenario.name);
     if (std.mem.eql(u8, scenario, "standby-scaling")) return std.mem.eql(u8, artifact.header.scenario, StandbyScaling.name);
@@ -1546,30 +1532,6 @@ fn reduceCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
         return reduceContextFree(antfly.index_manager_vopr.CliScenario, alloc, io, output, &recorded, attempts);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.db_split_vopr.CliScenario.name))
         return reduceContextFree(antfly.db_split_vopr.CliScenario, alloc, io, output, &recorded, attempts);
-    if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name)) {
-        const target = if (recorded.failures.items.len > 0)
-            recorded.failures.items[0].fingerprint
-        else
-            return error.FailingTraceRequired;
-        var reduced = try vopr.reducer.reduce(
-            antfly.lmdb_vopr.CliScenario,
-            alloc,
-            &recorded,
-            target,
-            .{ .max_attempts = attempts },
-        );
-        defer reduced.deinit();
-        return writeReducedArtifact(
-            alloc,
-            io,
-            output,
-            &reduced.artifact,
-            reduced.report.original_transitions,
-            reduced.report.reduced_transitions,
-            reduced.report.attempts,
-            reduced.report.target_fingerprint,
-        );
-    }
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lsm_vopr.CliScenario.name)) {
         const target = if (recorded.failures.items.len > 0)
             recorded.failures.items[0].fingerprint
@@ -1754,8 +1716,6 @@ fn fixtureDirForScenario(recorded: *const vopr.trace.Trace) ![]const u8 {
         return "pkg/antfly/src/vopr/fixtures/db-split";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.raft_vopr.CliScenario.name))
         return "pkg/antfly/src/vopr/fixtures/raft";
-    if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name))
-        return "pkg/antfly/src/vopr/fixtures/lmdb";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lsm_vopr.CliScenario.name))
         return "pkg/antfly/src/vopr/fixtures/lsm";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.standby_vopr.CliScenario.name))
@@ -2653,9 +2613,9 @@ fn report(action: []const u8, path: []const u8, artifact: *const vopr.trace.Trac
 fn usage() error{InvalidUsage} {
     std.debug.print(
         \\usage:
-        \\  vopr run --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|standby|standby-scaling --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
+        \\  vopr run --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lsm|standby|standby-scaling --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
         \\  vopr replay --trace <path>
-        \\  vopr campaign --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|standby|standby-scaling --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path> [--fail-on-findings] [--defer-diagnostics] [--exploration-policy cooperative|bounded-fair|adversarial]
+        \\  vopr campaign --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lsm|standby|standby-scaling --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path> [--fail-on-findings] [--defer-diagnostics] [--exploration-policy cooperative|bounded-fair|adversarial]
         \\  vopr reduce --trace <path> --out <path> [--attempts <n>]
         \\  vopr promote --trace <path> --name <fixture-name> [--force]
         \\  vopr tla --trace <path> --domain raft|transaction --out <path.ndjson>
@@ -3021,7 +2981,6 @@ test "VOPR scenario registry records and exactly replays every context-free doma
         "index-manager",
         "db-split",
         "raft",
-        "lmdb",
         "lsm",
         "standby",
         "distributed-transaction",

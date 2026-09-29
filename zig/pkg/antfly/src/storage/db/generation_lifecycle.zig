@@ -109,9 +109,13 @@ fn closePublicationLockWithIo(io: std.Io, file: std.Io.File) void {
 }
 
 fn closePublicationLock(file: std.Io.File) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    file.close(io_impl.io());
+    if (comptime builtin.os.tag == .freestanding) {
+        unreachable;
+    } else {
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        file.close(io_impl.io());
+    }
 }
 
 const LeaseKind = enum { preparation, exclusive, reconciliation, read };

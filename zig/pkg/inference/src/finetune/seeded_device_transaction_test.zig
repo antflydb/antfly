@@ -48,6 +48,8 @@ const Fake = struct {
         // This fake intentionally exercises the legacy norm fallback. Optional
         // capabilities consulted by that path must be null, not undefined.
         result.vtable.residentTrainingValidate = null;
+        result.vtable.residentTrainingBeginBatch = null;
+        result.vtable.residentTrainingEndBatch = null;
         result.vtable.trainingAdamWManyF32 = adam;
         result.vtable.trainingSynchronize = synchronize;
         return result;

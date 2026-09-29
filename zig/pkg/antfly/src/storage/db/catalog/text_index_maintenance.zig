@@ -86,21 +86,23 @@ pub fn applyPlannedMerge(
         old_ids[i] = snap.segments[seg_idx].id;
     }
 
-    if (index.prepareMergedSegmentToFile(snap, planned)) |prepared| {
-        return index.replaceSegmentsIfActiveManyPrepared(old_ids, prepared) catch |err| switch (err) {
-            error.EmptySegment => try index.removeSegmentsIfActive(old_ids),
+    if (comptime @import("builtin").os.tag != .freestanding) {
+        if (index.prepareMergedSegmentToFile(snap, planned)) |prepared| {
+            return index.replaceSegmentsIfActiveManyPrepared(old_ids, prepared) catch |err| switch (err) {
+                error.EmptySegment => try index.removeSegmentsIfActive(old_ids),
+                else => {
+                    logErr(apply_error_prefix, err);
+                    return err;
+                },
+            };
+        } else |err| switch (err) {
+            error.Unsupported => {},
+            error.EmptySegment => return try index.removeSegmentsIfActive(old_ids),
             else => {
-                logErr(apply_error_prefix, err);
+                logErr(merge_error_prefix, err);
                 return err;
             },
-        };
-    } else |err| switch (err) {
-        error.Unsupported => {},
-        error.EmptySegment => return try index.removeSegmentsIfActive(old_ids),
-        else => {
-            logErr(merge_error_prefix, err);
-            return err;
-        },
+        }
     }
 
     var merged = merger_mod.mergeSegmentsBounded(alloc, snap, planned, .{

@@ -167,7 +167,11 @@ pub const DB = struct {
         }
         self.inner.closeOwned();
         if (self.owned_lite_backend) |*lite_backend| {
-            lite_backend.deinit();
+            if (comptime @import("builtin").os.tag == .freestanding) {
+                unreachable;
+            } else {
+                lite_backend.deinit();
+            }
         }
         self.* = undefined;
     }

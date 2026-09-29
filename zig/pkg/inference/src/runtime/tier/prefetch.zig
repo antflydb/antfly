@@ -36,7 +36,7 @@ pub fn Queue(comptime Item: type) type {
 
         allocator: std.mem.Allocator,
         items: std.ArrayListUnmanaged(Item) = .empty,
-        io_impl: std.Io.Threaded,
+        io_impl: if (builtin.os.tag == .freestanding) void else std.Io.Threaded,
         mutex: std.Io.Mutex = .init,
         lifecycle_mutex: std.Io.Mutex = .init,
         wake: std.Io.Event = .unset,
@@ -57,15 +57,24 @@ pub fn Queue(comptime Item: type) type {
             process_ctx: *anyopaque,
             process_fn: *const fn (ctx: *anyopaque, item: Item) void,
         ) Self {
-            return .{
-                .allocator = allocator,
-                .io_impl = std.Io.Threaded.init(allocator, .{
-                    .async_limit = .nothing,
-                    .concurrent_limit = .limited(1),
-                }),
-                .process_ctx = process_ctx,
-                .process_fn = process_fn,
-            };
+            if (comptime builtin.os.tag == .freestanding) {
+                return .{
+                    .allocator = allocator,
+                    .io_impl = {},
+                    .process_ctx = process_ctx,
+                    .process_fn = process_fn,
+                };
+            } else {
+                return .{
+                    .allocator = allocator,
+                    .io_impl = std.Io.Threaded.init(allocator, .{
+                        .async_limit = .nothing,
+                        .concurrent_limit = .limited(1),
+                    }),
+                    .process_ctx = process_ctx,
+                    .process_fn = process_fn,
+                };
+            }
         }
 
         pub fn initWithPriority(
@@ -91,14 +100,18 @@ pub fn Queue(comptime Item: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.stop();
-            self.lock();
-            self.closing = true;
-            self.signal();
-            self.unlock();
-            if (self.worker) |*worker| worker.await(self.io_impl.io());
-            self.items.deinit(self.allocator);
-            self.io_impl.deinit();
+            if (comptime builtin.os.tag == .freestanding) {
+                self.items.deinit(self.allocator);
+            } else {
+                self.stop();
+                self.lock();
+                self.closing = true;
+                self.signal();
+                self.unlock();
+                if (self.worker) |*worker| worker.await(self.io_impl.io());
+                self.items.deinit(self.allocator);
+                self.io_impl.deinit();
+            }
         }
 
         pub fn lockHandle(self: *Self) LockHandle {
@@ -122,8 +135,12 @@ pub fn Queue(comptime Item: type) type {
         }
 
         pub fn start(self: *Self) !void {
-            if (builtin.is_test) return;
-            try self.startWorker();
+            if (comptime builtin.os.tag == .freestanding) {
+                return;
+            } else {
+                if (builtin.is_test) return;
+                try self.startWorker();
+            }
         }
 
         fn startWorker(self: *Self) !void {
@@ -139,15 +156,17 @@ pub fn Queue(comptime Item: type) type {
         }
 
         pub fn stop(self: *Self) void {
-            const io = self.io_impl.io();
-            self.lifecycle_mutex.lockUncancelable(io);
-            defer self.lifecycle_mutex.unlock(io);
-            self.lock();
-            defer self.unlock();
-            self.worker_enabled = false;
-            // An unlocked processor may still own the weights. Wait for that
-            // callback, while keeping the dormant task and its capacity owned.
-            while (self.worker_processing) self.idle.waitUncancelable(io, &self.mutex);
+            if (comptime builtin.os.tag != .freestanding) {
+                const io = self.io_impl.io();
+                self.lifecycle_mutex.lockUncancelable(io);
+                defer self.lifecycle_mutex.unlock(io);
+                self.lock();
+                defer self.unlock();
+                self.worker_enabled = false;
+                // An unlocked processor may still own the weights. Wait for that
+                // callback, while keeping the dormant task and its capacity owned.
+                while (self.worker_processing) self.idle.waitUncancelable(io, &self.mutex);
+            }
         }
 
         pub fn drainBudget(self: *Self, max_items: usize) void {

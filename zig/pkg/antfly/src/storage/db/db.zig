@@ -6077,12 +6077,16 @@ pub const DB = struct {
                 try generation_lifecycle.acquirePublishedGenerationReadWithRuntime(alloc, path, backend_runtime);
             errdefer if (generation_read_lease) |*lease| lease.deinit();
             if (opts.physical_root_mode == .filesystem_managed and opts.exclusive_generation == null) {
-                const fence = try std.fs.path.join(alloc, &.{ path, vector_migration.contract.offline_fence_file });
-                defer alloc.free(fence);
-                const io = backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
-                if (std.Io.Dir.cwd().access(io, fence, .{})) |_| {
-                    return error.VectorMigrationOfflineAdmission;
-                } else |err| if (err != error.FileNotFound) return err;
+                if (comptime builtin.os.tag == .freestanding) {
+                    return error.UnsupportedPlatform;
+                } else {
+                    const fence = try std.fs.path.join(alloc, &.{ path, vector_migration.contract.offline_fence_file });
+                    defer alloc.free(fence);
+                    const io = backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+                    if (std.Io.Dir.cwd().access(io, fence, .{})) |_| {
+                        return error.VectorMigrationOfflineAdmission;
+                    } else |err| if (err != error.FileNotFound) return err;
+                }
             }
 
             const open_started_ns = monotonicTimeNs();
@@ -6334,8 +6338,10 @@ pub const DB = struct {
                 }
             }
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
-                try db.resumePreparedSourcePin();
-                try @import("source_pin.zig").reconcileReleased(&db);
+                if (comptime builtin.os.tag != .freestanding) {
+                    try db.resumePreparedSourcePin();
+                    try @import("source_pin.zig").reconcileReleased(&db);
+                }
             } else {
                 db.source_pin_gc_epoch.store(0, .release);
             }
@@ -7296,7 +7302,9 @@ pub const DB = struct {
         }
         self.async_context.query_visibility_hook_mutex.unlock();
         if (pending_hook) |attached| {
-            self.replayPendingIndexRepairVisibility(attached);
+            if (comptime builtin.os.tag != .freestanding) {
+                self.replayPendingIndexRepairVisibility(attached);
+            }
             _ = self.async_context.query_visibility_hook_in_flight.fetchSub(1, .release);
         }
         if (hook == null) {
@@ -9500,12 +9508,16 @@ pub const DB = struct {
             // pin. A crash in that window must repair the exact pending cut
             // before this outer replay fast path acknowledges the entry.
             if (req.online_source) |command| if (command == .admit) {
-                try self.applyOnlineSourceBatch(req, .{
-                    .validate_range_ownership = false,
-                    .wait_for_sync_level = false,
-                    .bypass_ha_write_gate = !mirror_scoped_restore,
-                    .raft_applied_entry_marker = identity,
-                });
+                if (comptime builtin.os.tag == .freestanding) {
+                    return error.UnsupportedPlatform;
+                } else {
+                    try self.applyOnlineSourceBatch(req, .{
+                        .validate_range_ownership = false,
+                        .wait_for_sync_level = false,
+                        .bypass_ha_write_gate = !mirror_scoped_restore,
+                        .raft_applied_entry_marker = identity,
+                    });
+                }
             };
             if (req.restore_staging) |command| if (command == .finish and
                 (command.finish.phase == .validated or command.finish.phase == .published))
@@ -10109,7 +10121,13 @@ pub const DB = struct {
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         try @import("merge_page_contract.zig").validateRequest(req);
         try @import("online_source_contract.zig").validateRequest(req);
-        if (req.online_source != null) return self.applyOnlineSourceBatch(req, opts);
+        if (req.online_source != null) {
+            if (comptime builtin.os.tag == .freestanding) {
+                return error.UnsupportedPlatform;
+            } else {
+                return self.applyOnlineSourceBatch(req, opts);
+            }
+        }
         if (self.core.store.retained_effects_cache.load(.acquire) != 1) {
             var source_read = try self.core.store.beginReadTxn();
             defer source_read.abort();
@@ -10124,12 +10142,20 @@ pub const DB = struct {
                 .begin => |scope| {
                     if (req.writes.len != 0) return error.InvalidRestoreStagingCommand;
                     _ = scope;
-                    return self.applyRestoreStagingControl(req, opts);
+                    if (comptime builtin.os.tag == .freestanding) {
+                        return error.UnsupportedPlatform;
+                    } else {
+                        return self.applyRestoreStagingControl(req, opts);
+                    }
                 },
                 .finish => |finish| {
                     if (req.writes.len != 0) return error.InvalidRestoreStagingCommand;
                     _ = finish;
-                    return self.applyRestoreStagingControl(req, opts);
+                    if (comptime builtin.os.tag == .freestanding) {
+                        return error.UnsupportedPlatform;
+                    } else {
+                        return self.applyRestoreStagingControl(req, opts);
+                    }
                 },
                 .import_page, .rewrite_page => |page| {
                     if (req.writes.len +| req.deletes.len > 128 or page.timestamps.len != req.writes.len or page.next.len > 8 * 1024 * 1024) return error.InvalidRestoreStagingCommand;
@@ -16347,6 +16373,7 @@ pub const DB = struct {
     }
 
     pub fn hasPendingIndexRepairIntents(self: *const DB, alloc: Allocator) !bool {
+        if (builtin.os.tag == .freestanding) return self.hasManagedIndexAdmissionMarker(alloc);
         const location = try self.indexRepairStateLocation();
         var state = index_repair_state.loadAt(alloc, location) catch |err| switch (err) {
             error.FileNotFound => return self.hasManagedIndexAdmissionMarker(alloc),
@@ -17988,6 +18015,8 @@ pub const DB = struct {
         blocking_trigger: index_repair_state.Trigger,
         reason: []const u8,
     ) !bool {
+        // Browser databases have no durable repair sidecar to publish.
+        if (builtin.os.tag == .freestanding) return false;
         const cfg = self.core.index_manager.get(index_name) orelse return error.NotFound;
         if (cfg.kind != .dense_vector) return error.InvalidArgument;
         if (try self.indexRepairIdForIndex(alloc, index_name)) |repair_id| {
@@ -35263,15 +35292,19 @@ pub const DB = struct {
         preloaded_repair_state: ?*const index_repair_state.State,
     ) ResidentIndexAdmission {
         if (self.core.index_manager.repairUnavailable(index_name)) {
-            if (preloaded_repair_state) |state| {
-                self.refreshIndexRepairAvailabilityForIndexFromState(
-                    alloc,
-                    index_name,
-                    state,
-                    openModeRequiresReadOnlyBackends(self.open_mode),
-                ) catch return .rebuilding;
+            if (comptime builtin.os.tag == .freestanding) {
+                return .rebuilding;
             } else {
-                self.refreshIndexRepairAvailabilityForIndex(alloc, index_name) catch return .rebuilding;
+                if (preloaded_repair_state) |state| {
+                    self.refreshIndexRepairAvailabilityForIndexFromState(
+                        alloc,
+                        index_name,
+                        state,
+                        openModeRequiresReadOnlyBackends(self.open_mode),
+                    ) catch return .rebuilding;
+                } else {
+                    self.refreshIndexRepairAvailabilityForIndex(alloc, index_name) catch return .rebuilding;
+                }
             }
             if (self.core.index_manager.repairUnavailable(index_name)) return .rebuilding;
         }
@@ -35501,10 +35534,14 @@ pub const DB = struct {
     }
 
     fn loadIndexRepairStateForStats(self: *const DB, alloc: Allocator) !?index_repair_state.State {
-        return self.loadIndexRepairState(alloc) catch |err| switch (err) {
-            error.FileNotFound, error.DurableIndexRepairStateUnavailable, error.InvalidIndexRepairState => null,
-            else => return err,
-        };
+        if (comptime builtin.os.tag == .freestanding) {
+            return null;
+        } else {
+            return self.loadIndexRepairState(alloc) catch |err| switch (err) {
+                error.FileNotFound, error.DurableIndexRepairStateUnavailable, error.InvalidIndexRepairState => null,
+                else => return err,
+            };
+        }
     }
 
     fn freeDBIndexStatsItem(alloc: Allocator, item: types.DBIndexStats) void {
@@ -36614,6 +36651,7 @@ pub const DB = struct {
         // See STATUS.md for the status-plane contract.
         if (!self.core.tryLockApplyShared()) {
             return .{
+                .indexes_available = false,
                 .async_indexing = self.snapshotAsyncIndexingStats(),
                 .doc_set_planning = self.snapshotDocSetPlanningStats(),
                 .visibility = self.snapshotVisibilityStats(),
@@ -38730,7 +38768,9 @@ pub const DB = struct {
             if (cfg.kind == .dense_vector) {
                 item.dense_native_storage_phase = self.core.index_manager.denseNativeStoragePhase(cfg.name);
             }
-            try self.applyStatusOnlyRebuildStateStats(alloc, cfg, &item);
+            if (comptime builtin.os.tag != .freestanding) {
+                try self.applyStatusOnlyRebuildStateStats(alloc, cfg, &item);
+            }
             applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
             try self.applyDurableIndexRepairStats(
                 alloc,
@@ -41511,21 +41551,23 @@ pub const DB = struct {
         entry: *index_manager_mod.IndexManager.DenseIndex,
     ) !bool {
         if (!entry.index.generationRepairPending()) return false;
-        _ = self.ensureAutomaticDenseGenerationRepairIntent(
-            self.alloc,
-            entry.config,
-            .projection_generation_invalid,
-            "dense_hbc_published_snapshot_incomplete",
-        ) catch |err| switch (err) {
-            error.DurableIndexRepairStateUnavailable => {
-                // Embedded/Lite runtimes intentionally have no durable repair
-                // owner. The query gate is already closed; their maintenance
-                // pass performs the same synchronous shadow replacement used
-                // for other automatic generation repairs.
-                std.log.warn("incomplete dense index quarantined without durable repair owner name={s}", .{entry.config.name});
-            },
-            else => return err,
-        };
+        if (comptime builtin.os.tag != .freestanding) {
+            _ = self.ensureAutomaticDenseGenerationRepairIntent(
+                self.alloc,
+                entry.config,
+                .projection_generation_invalid,
+                "dense_hbc_published_snapshot_incomplete",
+            ) catch |err| switch (err) {
+                error.DurableIndexRepairStateUnavailable => {
+                    // Embedded/Lite runtimes intentionally have no durable repair
+                    // owner. The query gate is already closed; their maintenance
+                    // pass performs the same synchronous shadow replacement used
+                    // for other automatic generation repairs.
+                    std.log.warn("incomplete dense index quarantined without durable repair owner name={s}", .{entry.config.name});
+                },
+                else => return err,
+            };
+        }
         return true;
     }
 
@@ -66869,18 +66911,22 @@ fn clampReplayTruncationForRepairPins(
     checkpoint: ?index_repair_state.Location,
     effective: u64,
 ) !u64 {
-    const location = checkpoint orelse return effective;
-    var state = index_repair_state.loadAt(alloc, location) catch |err| switch (err) {
-        error.FileNotFound => return effective,
-        // A malformed local repair checkpoint may have contained a zero or
-        // finalized replay pin. Retain everything until an operator repairs
-        // the checkpoint; never convert corruption into replay loss.
-        error.InvalidIndexRepairState => return 0,
-        else => return err,
-    };
-    defer state.deinit(alloc);
-    const pin = state.minimumRetainAfterSequence() orelse return effective;
-    return @min(effective, pin);
+    if (comptime builtin.os.tag == .freestanding) {
+        return effective;
+    } else {
+        const location = checkpoint orelse return effective;
+        var state = index_repair_state.loadAt(alloc, location) catch |err| switch (err) {
+            error.FileNotFound => return effective,
+            // A malformed local repair checkpoint may have contained a zero or
+            // finalized replay pin. Retain everything until an operator repairs
+            // the checkpoint; never convert corruption into replay loss.
+            error.InvalidIndexRepairState => return 0,
+            else => return err,
+        };
+        defer state.deinit(alloc);
+        const pin = state.minimumRetainAfterSequence() orelse return effective;
+        return @min(effective, pin);
+    }
 }
 
 fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {

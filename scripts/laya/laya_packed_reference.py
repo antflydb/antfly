@@ -110,8 +110,7 @@ def pack(tok, decision, mode, state, questions):
     options in the question branch (question mode, closed by [SEP]) or one
     [MASK] option branch per label (candidate mode)."""
     row = {
-        k: []
-        for k in ("ids", "positions", "segments", "parents", "kinds", "anchors")
+        k: [] for k in ("ids", "positions", "segments", "parents", "kinds", "anchors")
     }
     markers = []
 
@@ -195,9 +194,7 @@ def packed_forward(model, cfg, row):
     n, hidden = ids.shape[1], cfg.hidden_size
     heads = cfg.num_attention_heads
     head_dim = hidden // heads
-    window = (
-        positions[:, None] - positions[None, :]
-    ).abs() <= cfg.local_attention // 2
+    window = (positions[:, None] - positions[None, :]).abs() <= cfg.local_attention // 2
     h = enc.embeddings(input_ids=ids)[0]
     for i, layer in enumerate(enc.layers):
         is_global = i % cfg.global_attn_every_n_layers == 0
@@ -227,7 +224,9 @@ def packed_forward(model, cfg, row):
     count = valid.sum(-1).clamp(min=2).float()
     entropy = -(p * p.clamp_min(1e-9).log()).sum(-1) / count.log()
     top2 = p.topk(2, -1).values
-    features = torch.stack([top2[:, 0], top2[:, 0] - top2[:, 1], entropy, count / 255.0], -1)
+    features = torch.stack(
+        [top2[:, 0], top2[:, 0] - top2[:, 1], entropy, count / 255.0], -1
+    )
     pooled = h[torch.tensor(row["anchors"])].float()
     actions = model.act_head(torch.cat([pooled, features], -1))
     return logits, actions

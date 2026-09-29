@@ -79,6 +79,11 @@ pub const RaftLog = struct {
         return self.snapshot_index;
     }
 
+    pub fn lastTerm(self: *const RaftLog) types.Term {
+        if (self.entries.items.len > 0) return self.entries.items[self.entries.items.len - 1].term;
+        return self.snapshot_term;
+    }
+
     pub fn term(self: *const RaftLog, index: types.Index) ?types.Term {
         if (index == self.snapshot_index) return self.snapshot_term;
         for (self.entries.items) |entry| {

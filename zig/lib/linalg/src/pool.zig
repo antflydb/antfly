@@ -28,38 +28,47 @@ pub const Job = struct {
 };
 
 const SyncPool = struct {
-    io_impl: std.Io.Threaded,
+    io_impl: if (supports_sync_parallelism) std.Io.Threaded else void,
     submit_mutex: std.Io.Mutex = .init,
     capacity: usize,
 
     fn init(capacity: usize) SyncPool {
-        const bounded = @min(capacity, max_workers - 1);
-        return .{
-            .capacity = bounded,
-            .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{
-                .async_limit = .limited(bounded),
-                .concurrent_limit = .limited(bounded),
-            }),
-        };
+        if (comptime supports_sync_parallelism) {
+            const bounded = @min(capacity, max_workers - 1);
+            return .{
+                .capacity = bounded,
+                .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{
+                    .async_limit = .limited(bounded),
+                    .concurrent_limit = .limited(bounded),
+                }),
+            };
+        } else {
+            return .{ .capacity = 0, .io_impl = {} };
+        }
     }
 
     fn deinit(self: *SyncPool) void {
-        self.io_impl.deinit();
+        if (comptime supports_sync_parallelism) self.io_impl.deinit();
     }
 
     fn dispatch(self: *SyncPool, jobs: []const Job) void {
-        if (jobs.len <= 1 or jobs.len - 1 > self.capacity) {
+        if (comptime !supports_sync_parallelism) {
+            for (jobs) |job| job.fn_ptr(job.ctx);
+            return;
+        } else if (jobs.len <= 1 or jobs.len - 1 > self.capacity) {
             for (jobs) |job| job.fn_ptr(job.ctx);
             return;
         }
-        const io = self.io_impl.io();
-        // Sync kernels promise completed output and have no cancellation
-        // result. Keep all jobs and caller-owned buffers alive through drain.
-        const protection = io.swapCancelProtection(.blocked);
-        defer _ = io.swapCancelProtection(protection);
-        self.submit_mutex.lockUncancelable(io);
-        defer self.submit_mutex.unlock(io);
-        dispatchJobsIo(io, jobs) catch unreachable;
+        if (comptime supports_sync_parallelism) {
+            const io = self.io_impl.io();
+            // Sync kernels promise completed output and have no cancellation
+            // result. Keep all jobs and caller-owned buffers alive through drain.
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            self.submit_mutex.lockUncancelable(io);
+            defer self.submit_mutex.unlock(io);
+            dispatchJobsIo(io, jobs) catch unreachable;
+        }
     }
 };
 
@@ -84,7 +93,8 @@ pub inline fn cachedCpuCount() usize {
 /// Return the bounded background capacity for the Sync compatibility path.
 /// Individual async launches may still fall back inline on resource pressure.
 pub fn ensurePool(worker_count: usize) usize {
-    if (!supports_sync_parallelism or worker_count == 0) return 0;
+    if (comptime !supports_sync_parallelism) return 0;
+    if (worker_count == 0) return 0;
     if (!pool_initialized.load(.acquire)) {
         const io = std.Io.Threaded.global_single_threaded.io();
         pool_init_mutex.lockUncancelable(io);

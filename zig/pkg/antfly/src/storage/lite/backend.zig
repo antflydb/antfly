@@ -214,10 +214,14 @@ pub const Handle = struct {
     pub fn deinit(self: *Handle) void {
         switch (self.engine) {
             .bridge_lsm_container => {
-                if (self.bridge_storage) |storage| {
-                    storage.deinit();
-                    self.allocator.destroy(storage);
-                    self.bridge_storage = null;
+                if (comptime builtin.os.tag == .freestanding) {
+                    unreachable;
+                } else {
+                    if (self.bridge_storage) |storage| {
+                        storage.deinit();
+                        self.allocator.destroy(storage);
+                        self.bridge_storage = null;
+                    }
                 }
             },
             .native_single_file => {

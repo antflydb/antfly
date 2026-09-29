@@ -228,11 +228,19 @@ pub const TypedDocValuesFieldCoverage = struct {
         // The winner can spend meaningful time validating and decompressing a
         // large column. Park concurrent request workers instead of repeatedly
         // yielding them for the duration of that scan.
-        std.Io.Threaded.mutexLock(&self.initialization_mutex);
+        if (comptime builtin.os.tag == .freestanding) {
+            self.initialization_mutex.lockUncancelable(.failing);
+        } else {
+            std.Io.Threaded.mutexLock(&self.initialization_mutex);
+        }
     }
 
     fn unlockInitialization(self: *TypedDocValuesFieldCoverage) void {
-        std.Io.Threaded.mutexUnlock(&self.initialization_mutex);
+        if (comptime builtin.os.tag == .freestanding) {
+            self.initialization_mutex.unlock(.failing);
+        } else {
+            std.Io.Threaded.mutexUnlock(&self.initialization_mutex);
+        }
     }
 
     fn status(self: *const TypedDocValuesFieldCoverage) TypedDocValuesCoverageStatus {

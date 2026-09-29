@@ -7260,7 +7260,7 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
     const io = io_impl.io();
 
     const Local = struct {
-        transcribe_calls: usize = 0,
+        transcribe_calls: std.atomic.Value(usize) = .init(0),
 
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
@@ -7282,7 +7282,7 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
 
         fn transcribeAudio(ptr: *anyopaque, a: Allocator, model: []const u8, request: transcribing.Request) !transcribing.Response {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.transcribe_calls += 1;
+            _ = self.transcribe_calls.fetchAdd(1, .monotonic);
             try std.testing.expectEqualStrings("local-transcriber", model);
             try std.testing.expectEqualStrings("en-US", request.language.?);
             const text = if (std.mem.endsWith(u8, request.url, "a.wav")) "first transcript" else "second transcript";
@@ -7344,7 +7344,7 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
     try std.testing.expectEqual(@as(usize, 2), results.len);
     try std.testing.expectEqualStrings("first transcript", results[0]);
     try std.testing.expectEqualStrings("second transcript", results[1]);
-    try std.testing.expectEqual(@as(usize, 2), local.transcribe_calls);
+    try std.testing.expectEqual(@as(usize, 2), local.transcribe_calls.load(.monotonic));
 }
 
 test "asset producer runtime routes antfly transcriber without url to local provider" {

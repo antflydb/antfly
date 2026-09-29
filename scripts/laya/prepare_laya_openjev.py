@@ -65,10 +65,19 @@ import os
 import tempfile
 from pathlib import Path
 
-from prepare_laya_longcontext_teacher import laya_decision_config, load_module, upstream_question
+from prepare_laya_longcontext_teacher import (
+    laya_decision_config,
+    load_module,
+    upstream_question,
+)
 
 DEFAULT_EXCLUDED = ("customer-control-v1",)
-BOOLEAN_OPTIONS = {("no", "yes"): False, ("false", "true"): False, ("yes", "no"): True, ("true", "false"): True}
+BOOLEAN_OPTIONS = {
+    ("no", "yes"): False,
+    ("false", "true"): False,
+    ("yes", "no"): True,
+    ("true", "false"): True,
+}
 
 
 def open_text(path: Path):
@@ -81,12 +90,18 @@ def state_text(state) -> str:
 
 def convert(row: dict, max_labels: int = 20) -> dict:
     """One Open-Jev row as a native record. Raises ValueError when it cannot map."""
-    kind, options, target = row["kind"], list(row["options"]), [float(p) for p in row["target"]]
+    kind, options, target = (
+        row["kind"],
+        list(row["options"]),
+        [float(p) for p in row["target"]],
+    )
     if len(options) != len(target):
         raise ValueError("options and target differ in length")
     if kind == "choice":
         parts = [option.split(": ", 1) for option in options]
-        if all(len(p) == 2 and p[0] for p in parts) and len({p[0] for p in parts}) == len(parts):
+        if all(len(p) == 2 and p[0] for p in parts) and len(
+            {p[0] for p in parts}
+        ) == len(parts):
             labels, descriptions = [p[0] for p in parts], [p[1] for p in parts]
         else:
             labels, descriptions = options, [""] * len(options)
@@ -101,7 +116,11 @@ def convert(row: dict, max_labels: int = 20) -> dict:
         labels, descriptions = ["false", "true"], ["", ""]
     else:
         raise ValueError(f"unknown kind {kind}")
-    if not 2 <= len(labels) <= max_labels or len(set(labels)) != len(labels) or not all(labels):
+    if (
+        not 2 <= len(labels) <= max_labels
+        or len(set(labels)) != len(labels)
+        or not all(labels)
+    ):
         raise ValueError(f"expected 2-{max_labels} unique nonempty labels")
     total = sum(target)
     if any(not math.isfinite(p) or p < 0 for p in target) or abs(total - 1) > 1e-4:
@@ -123,19 +142,49 @@ def convert(row: dict, max_labels: int = 20) -> dict:
 
 def fits(tok, record: dict, decision: dict, build_sequence, margin: int) -> bool:
     """True when Laya keeps the whole state with `margin` tokens to spare."""
-    ids, _ = build_sequence(tok, record["text"], upstream_question(record), decision["max_len"] * 4, decision["head_max_len"])
+    ids, _ = build_sequence(
+        tok,
+        record["text"],
+        upstream_question(record),
+        decision["max_len"] * 4,
+        decision["head_max_len"],
+    )
     return len(ids) + margin <= decision["max_len"]
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("source", type=Path, help="Open-Jev raw JSONL (optionally .gz)")
-    parser.add_argument("--laya-model", type=Path, required=True, help="Prepared unpacked Laya directory")
-    parser.add_argument("--common", type=Path, required=True, help="Upstream laya/common.py")
+    parser.add_argument(
+        "--laya-model",
+        type=Path,
+        required=True,
+        help="Prepared unpacked Laya directory",
+    )
+    parser.add_argument(
+        "--common", type=Path, required=True, help="Upstream laya/common.py"
+    )
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--exclude-source", action="append", help=f"Drop a source (default: {', '.join(DEFAULT_EXCLUDED)})")
-    parser.add_argument("--disjoint-from", type=Path, action="append", default=[], help="Native split to stay disjoint from")
-    parser.add_argument("--margin", type=int, default=4, help="Spare tokens required after the whole state")
+    parser.add_argument(
+        "--exclude-source",
+        action="append",
+        help=f"Drop a source (default: {', '.join(DEFAULT_EXCLUDED)})",
+    )
+    parser.add_argument(
+        "--disjoint-from",
+        type=Path,
+        action="append",
+        default=[],
+        help="Native split to stay disjoint from",
+    )
+    parser.add_argument(
+        "--margin",
+        type=int,
+        default=4,
+        help="Spare tokens required after the whole state",
+    )
     args = parser.parse_args()
     if args.output.exists():
         parser.error(f"Output already exists: {args.output}")
@@ -152,7 +201,9 @@ def main():
         for line in path.read_text().splitlines():
             if line.strip():
                 r = json.loads(line)
-                avoid_groups.add(r["group_id"]); avoid_ids.add(r["id"]); avoid_texts.add(r["text"])
+                avoid_groups.add(r["group_id"])
+                avoid_ids.add(r["id"])
+                avoid_texts.add(r["text"])
 
     dropped = collections.Counter()
     kept_by_source = collections.Counter()
@@ -160,7 +211,12 @@ def main():
     count, ids = 0, set()
     temporary = None
     try:
-        with open_text(args.source) as source, tempfile.NamedTemporaryFile(mode="w", dir=args.output.parent, delete=False) as out:
+        with (
+            open_text(args.source) as source,
+            tempfile.NamedTemporaryFile(
+                mode="w", dir=args.output.parent, delete=False
+            ) as out,
+        ):
             temporary = Path(out.name)
             for line in source:
                 if not line.strip():
@@ -174,21 +230,35 @@ def main():
                 except (ValueError, KeyError, TypeError):
                     dropped["unmappable"] += 1
                     continue
-                if record["group_id"] in avoid_groups or record["id"] in avoid_ids or record["text"] in avoid_texts:
+                if (
+                    record["group_id"] in avoid_groups
+                    or record["id"] in avoid_ids
+                    or record["text"] in avoid_texts
+                ):
                     dropped["overlaps a disjoint split"] += 1
                     continue
                 if record["id"] in ids:
                     dropped["duplicate id"] += 1
                     continue
-                key = (record["text"], record["kind"], record["instruction"], tuple(record["labels"]), tuple(record["descriptions"]))
+                key = (
+                    record["text"],
+                    record["kind"],
+                    record["instruction"],
+                    tuple(record["labels"]),
+                    tuple(record["descriptions"]),
+                )
                 if key not in fit_cache:
-                    fit_cache[key] = fits(tok, record, decision, common.build_sequence, args.margin)
+                    fit_cache[key] = fits(
+                        tok, record, decision, common.build_sequence, args.margin
+                    )
                 if not fit_cache[key]:
                     dropped["state does not fit"] += 1
                     continue
                 ids.add(record["id"])
                 kept_by_source[row["source"]] += 1
-                out.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+                out.write(
+                    json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
+                )
                 count += 1
             if not count:
                 raise ValueError("Empty dataset")
@@ -198,7 +268,17 @@ def main():
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-    print(json.dumps({"records": count, "output": str(args.output), "dropped": dict(dropped), "kept_by_source": dict(kept_by_source)}, indent=2))
+    print(
+        json.dumps(
+            {
+                "records": count,
+                "output": str(args.output),
+                "dropped": dict(dropped),
+                "kept_by_source": dict(kept_by_source),
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

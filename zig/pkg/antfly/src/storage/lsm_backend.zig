@@ -1974,20 +1974,22 @@ pub const Backend = struct {
     }
 
     pub fn prepareWalOperationLockFile(self: *Backend) !void {
-        if (!self.options.wal_enabled or self.root_dir == null or !self.storage.?.supportsNativePathLocks()) return;
-        if (self.wal_operation_lock_file != null) return;
+        if (comptime builtin.os.tag != .freestanding) {
+            if (!self.options.wal_enabled or self.root_dir == null or !self.storage.?.supportsNativePathLocks()) return;
+            if (self.wal_operation_lock_file != null) return;
 
-        const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
-        defer self.allocator.free(lock_path);
-        self.wal_operation_lock_file = storage_io.openNativePathLockFileWithPool(
-            self.allocator,
-            lock_path,
-            .{ .create_if_missing = true },
-            self.options.native_storage_pool,
-        ) catch |err| switch (err) {
-            error.FileNotFound => if (self.options.backend.read_only) return else return err,
-            else => return err,
-        };
+            const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
+            defer self.allocator.free(lock_path);
+            self.wal_operation_lock_file = storage_io.openNativePathLockFileWithPool(
+                self.allocator,
+                lock_path,
+                .{ .create_if_missing = true },
+                self.options.native_storage_pool,
+            ) catch |err| switch (err) {
+                error.FileNotFound => if (self.options.backend.read_only) return else return err,
+                else => return err,
+            };
+        }
     }
 
     pub fn closeWalOperationLockFile(self: *Backend) void {

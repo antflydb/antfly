@@ -752,6 +752,7 @@ pub const Raft = struct {
             .hard = self.hard_state,
             .conf_state = self.conf_state,
             .last_index = self.log.lastIndex(),
+            .last_term = self.log.lastTerm(),
             .applied_index = self.log.applied,
             .election_elapsed = self.election_elapsed,
             .randomized_election_timeout = self.randomized_election_timeout,

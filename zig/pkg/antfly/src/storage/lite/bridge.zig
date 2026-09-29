@@ -73,7 +73,7 @@ pub const ContainerStorage = struct {
     };
 
     allocator: Allocator,
-    io_impl: std.Io.Threaded,
+    io_impl: if (builtin.os.tag == .freestanding) void else std.Io.Threaded,
     path: []u8,
     lock_file: ?std.Io.File = null,
     read_only: bool = false,

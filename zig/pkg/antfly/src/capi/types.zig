@@ -401,7 +401,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         => .unsupported,
         error.InferenceProviderCallCapacityExhausted => .busy,
         error.DurabilityOutcomeUnknown => .outcome_unknown,
-        error.RunUntilIdleNoProgress => .stalled,
+        error.RunUntilIdleNoProgress, error.EnrichmentWaitTimeout => .stalled,
         // A dimension probe against a live embedder hit an operational
         // (network/transport) failure rather than a malformed request --
         // matches `managed_embedder.isOperationalEmbeddingProbeError`'s
@@ -420,6 +420,7 @@ test "run until idle no-progress error maps to a dedicated stalled ABI code, not
     // Regression guard for the dogfood ingest livelock follow-up: a bounded
     // stall must be distinguishable at the C ABI from an opaque server fault.
     try std.testing.expectEqual(ErrorCode.stalled, mapError(error.RunUntilIdleNoProgress));
+    try std.testing.expectEqual(ErrorCode.stalled, mapError(error.EnrichmentWaitTimeout));
     try std.testing.expect(ErrorCode.stalled != ErrorCode.internal);
     try std.testing.expectEqualStrings("ANTFLY_STALLED", std.mem.span(errorCodeName(@intFromEnum(ErrorCode.stalled))));
     try std.testing.expectEqualStrings(

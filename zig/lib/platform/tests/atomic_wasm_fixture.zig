@@ -14,10 +14,13 @@
 // limitations under the License.
 
 const atomic = @import("platform_atomic");
+const std = @import("std");
+
+pub const std_options_debug_io: std.Io = .failing;
 
 export fn checkAwakeClock() u32 {
     const time = @import("platform_time");
-    const io = @import("std").Options.debug_io;
+    const io = std.Options.debug_io;
     const before = time.awakeNs(io);
     const after = time.awakeNs(io);
     return if (after > before) 0 else 1;

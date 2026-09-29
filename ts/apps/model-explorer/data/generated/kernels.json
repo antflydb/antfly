@@ -2274,6 +2274,30 @@
    }
   },
   {
+   "name": "termite_modernbert_training_attention_dkdv",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_modernbert_training_attention_dq",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_modernbert_training_attention_forward",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_moe_merged_gate_up_activation",
    "family": "moe",
    "generated": false,
@@ -3899,6 +3923,14 @@
   },
   {
    "name": "termite_sdpa_f32_nomic_q8",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32_segments",
    "family": "attention",
    "generated": false,
    "source": {
