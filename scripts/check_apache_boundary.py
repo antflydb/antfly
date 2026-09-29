@@ -71,6 +71,7 @@ SOURCE_MODULES = {
     "antfly_inference_worker_wire": ("zig/pkg/inference/src/host/worker_wire.zig",),
     "antfly_public_limits": ("zig/pkg/antfly-embedded/src/api/public_limits.zig",),
     "antfly_template_content": ("zig/lib/template/src/content_part.zig",),
+    "antfly_sparse_embedding": ("zig/pkg/antfly-embedded/src/engine/sparse_embedding.zig",),
     "antfly_data_uri": ("zig/lib/scraping/src/data_uri.zig",),
     "antfly_websearch_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_websearch_openapi/root.zig",
@@ -144,6 +145,9 @@ SOURCE_MODULES = {
     "antfly_inference_vertex": ("zig/pkg/inference/src/host/vertex.zig",),
     "antfly_inference_remote_capabilities": ("zig/pkg/inference/src/host/remote_capabilities.zig",),
     "antfly_inference_execution_context": ("zig/pkg/inference/src/host/execution_context.zig",),
+    "antfly_inference_request_types": ("zig/pkg/inference/src/host/request_types.zig",),
+    "antfly_inference_runtime_paths": ("zig/pkg/inference/src/host/runtime_paths.zig",),
+    "antfly_inference_host": ("zig/pkg/inference/src/host/host.zig",),
     "antfly_inference_query_embedding_cache": ("zig/pkg/inference/src/host/query_embedding_cache.zig",),
     "antfly_jsonschema": ("zig/lib/jsonschema/src/mod.zig",),
     "antfly_logging_openapi": (

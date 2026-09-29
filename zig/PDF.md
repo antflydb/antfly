@@ -4548,7 +4548,7 @@ report model qualification after running only the fake providers.
   generated production inference archive, resolves only
   `antfly_standalone_inference_get_function_table`, and verifies function-table
   prefix validation, wrapper-owned version rejection, stable `Status` mapping,
-  and borrowed binary MIME rejection without importing `inference_host.zig`.
+  and borrowed binary MIME rejection without importing `pkg/inference/src/host/host.zig`.
   The focused standalone runtime test depends on this executable.
 
 ## Performance architecture after review

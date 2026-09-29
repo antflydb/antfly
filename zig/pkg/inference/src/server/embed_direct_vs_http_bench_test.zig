@@ -16,7 +16,7 @@
 //! Diagnostic and regression coverage for the in-process "managed_direct"
 //! dense-embedding entry point (used by the Lite/dogfood in-process worker
 //! bridge, `host.linkedInferenceInvokeProvider` -> `Node.embedDenseTextsDirect*`
-//! in antfly/src/standalone/inference_host.zig) versus the HTTP embeddings
+//! in inference/src/host/host.zig) versus the HTTP embeddings
 //! handler, for the SAME warm session and batch.
 //!
 //! Context: the enrichment concurrency handoff

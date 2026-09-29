@@ -83,16 +83,7 @@ pub const SparseEmbedWithContextFn = *const fn (ptr: *anyopaque, alloc: Allocato
 pub const SparseEmbedBatchWithContextFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8, context: RequestContext) anyerror![]SparseEmbedding;
 pub const SparseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) void;
 
-pub const SparseEmbedding = struct {
-    indices: []u32,
-    values: []f32,
-
-    pub fn deinit(self: *SparseEmbedding, alloc: Allocator) void {
-        alloc.free(self.indices);
-        alloc.free(self.values);
-        self.* = undefined;
-    }
-};
+pub const SparseEmbedding = @import("antfly_sparse_embedding").SparseEmbedding;
 
 pub const DenseEmbedder = struct {
     ptr: *anyopaque,

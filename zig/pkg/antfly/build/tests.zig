@@ -4291,17 +4291,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone.runtime.test.system catalog",
             "catalog.domain.",
             "standalone runtime local generator accepts media url data uris",
-            "local generate message conversion preserves tool history and admission",
-            "inference worker",
             "standalone runtime local dense embed preserves borrowed binary media",
-            "standalone numeric result ABI",
-            "standalone raster embedding control",
             "standalone encoded reader ABI round trips borrowed payloads",
             "standalone raster reader ABI preserves borrowed strided pages and identity",
-            "encoded reader ABI enforces resolved model capabilities",
             "standalone runtime local generator preflights mixed resident media exactly",
             "standalone runtime local generator refuses decode allocation beyond preflight",
-            "linked generator validates concrete MIME and decoded pixels",
             "standalone inference middleware reuses public API authentication",
             "standalone CORS middleware",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",
@@ -4341,13 +4335,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone preserves effective process envelope provenance for inference",
             "standalone kernel JIT mode precedence is CLI then environment then config",
             "inference config falls back to common config",
-            "standalone prompt cache detaches resource observer before owner teardown",
             "inference admission bridge charges combined native residency to resource manager",
             "standalone tokenizer bridge enforces growth and permits exact teardown",
-            "standalone inference keep alive parses compound durations and zero",
-            "standalone preload bridge preserves A4B residency controls",
-            "standalone data directory does not change the default models directory",
-            "standalone linked inference ABI validates the supported function-table prefix",
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",
             "standalone resolves the default secret store before full config parsing",
             "standalone runtime secret store follows projected symlink rotation",
@@ -4382,7 +4371,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "Lease executor accepts optional CertificateRequest with projected CA and verified hostname",
             "Lease executor accepts TLS 1.2 optional CertificateRequest",
             "Lease executor rejects optional CertificateRequest hostname mismatch",
-            "linked rerank documents become server content parts with attachment references",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4405,6 +4393,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     }) |module| {
         lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
     }
+    const inference_host_tests = b.addTest(.{
+        .root_module = test_imports.runtime.inference_host,
+        .filters = &.{
+            "local generate message conversion preserves tool history and admission",
+            "inference worker",
+            "standalone numeric result ABI",
+            "standalone raster embedding control",
+            "encoded reader ABI enforces resolved model capabilities",
+            "linked generator validates concrete MIME and decoded pixels",
+            "standalone prompt cache detaches resource observer before owner teardown",
+            "standalone inference keep alive parses compound durations and zero",
+            "standalone preload bridge preserves A4B residency controls",
+            "standalone data directory does not change the default models directory",
+            "standalone linked inference ABI validates the supported function-table prefix",
+            "linked rerank documents become server content parts with attachment references",
+        },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+    });
+    lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(inference_host_tests).step);
     // Keep the complete API worker fixture out of the inference-heavy runtime
     // object. Compile this narrow integration slice independently so adding
     // restore coverage does not inflate every standalone runtime test build.

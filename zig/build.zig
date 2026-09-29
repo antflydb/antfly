@@ -752,6 +752,11 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     });
+    const sparse_embedding_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/sparse_embedding.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const inference_worker_rpc_mod = b.createModule(.{
         .root_source_file = b.path("pkg/inference/src/host/worker_rpc.zig"),
         .target = target,
@@ -861,6 +866,19 @@ pub fn create(b: *std.Build) ?Artifacts {
     inference_execution_context_mod.addImport("httpx", httpx_mod);
     inference_execution_context_mod.addImport("antfly_inference_remote_capabilities", inference_remote_capabilities_mod);
     inference_execution_context_mod.addImport("antfly_cancellation", cancellation_mod);
+    const inference_request_types_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/request_types.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_request_types_mod.addImport("antfly_inference_execution_context", inference_execution_context_mod);
+    const inference_runtime_paths_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/runtime_paths.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_runtime_paths_mod.addImport("antfly_platform", platform_mod);
+    inference_runtime_paths_mod.addImport("inference_server", inference_server_mod);
     const inference_query_embedding_cache_mod = b.createModule(.{
         .root_source_file = b.path("pkg/inference/src/host/query_embedding_cache.zig"),
         .target = target,
@@ -868,6 +886,33 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     inference_query_embedding_cache_mod.addImport("antfly_cache_budget", cache_budget_mod);
     inference_query_embedding_cache_mod.addImport("antfly_platform", platform_mod);
+    const inference_host_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/host.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_host_mod.addImport("httpx", httpx_mod);
+    inference_host_mod.addImport("antfly_readers", readers_mod);
+    inference_host_mod.addImport("antfly_transcribing", transcribing_mod);
+    inference_host_mod.addImport("antfly_extracting", extracting_mod);
+    inference_host_mod.addImport("antfly_scraping", scraping_mod);
+    inference_host_mod.addImport("antfly_template_content", template_content_mod);
+    inference_host_mod.addImport("antfly_sparse_embedding", sparse_embedding_mod);
+    inference_host_mod.addImport("antfly_inference_types", inference_types_mod);
+    inference_host_mod.addImport("antfly_inference_work", inference_work_mod);
+    inference_host_mod.addImport("antfly_inference_request_types", inference_request_types_mod);
+    inference_host_mod.addImport("antfly_inference_execution_context", inference_execution_context_mod);
+    inference_host_mod.addImport("antfly_inference_runtime_paths", inference_runtime_paths_mod);
+    inference_host_mod.addImport("inference_server", inference_server_mod);
+    inference_host_mod.addImport("antfly_inference_bridge", inference_bridge_mod);
+    inference_host_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
+    inference_host_mod.addImport("antfly_platform", platform_mod);
+    inference_host_mod.addImport("inference_api", inference_api_mod);
+    inference_host_mod.addImport("inference_chunker", inference_chunker_mod);
+    inference_host_mod.addImport("antfly_chunking", chunking_mod);
+    inference_host_mod.addImport("antfly_inference_worker_rpc", inference_worker_rpc_mod);
+    inference_host_mod.addImport("antfly_inference_worker_wire", inference_worker_wire_mod);
+    inference_host_mod.addImport("antfly_inference_provider_failure", inference_provider_failure_mod);
     const inference_openai_tests = b.addTest(.{ .root_module = inference_openai_mod });
     b.step("antfly-inference-host-openai-test", "Run embedded inference OpenAI provider tests")
         .dependOn(&b.addRunArtifact(inference_openai_tests).step);
@@ -893,6 +938,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .inference_provider_failure = inference_provider_failure_mod,
         .public_limits = public_limits_mod,
         .template_content = template_content_mod,
+        .sparse_embedding = sparse_embedding_mod,
         .inference_worker_wire = inference_worker_wire_mod,
         .inference_worker_rpc = inference_worker_rpc_mod,
         .inference_embedding_wire = inference_embedding_wire_mod,
@@ -906,7 +952,10 @@ pub fn create(b: *std.Build) ?Artifacts {
         .inference_vertex = inference_vertex_mod,
         .inference_remote_capabilities = inference_remote_capabilities_mod,
         .inference_execution_context = inference_execution_context_mod,
+        .inference_request_types = inference_request_types_mod,
+        .inference_runtime_paths = inference_runtime_paths_mod,
         .inference_query_embedding_cache = inference_query_embedding_cache_mod,
+        .inference_host = inference_host_mod,
         .build_info = build_info,
         .build_options = build_options,
         .lite_options = antfly_storage_build.createLiteOptions(b, lite_local_inference_runtime),

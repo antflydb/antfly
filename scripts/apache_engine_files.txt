@@ -252,10 +252,7 @@ zig/pkg/antfly/src/source_owner_common.zig
 zig/pkg/antfly/src/source_owner_lite.zig
 zig/pkg/antfly/src/source_owner_storage.zig
 zig/pkg/antfly/src/sparse/sparse.zig
-zig/pkg/antfly/src/standalone/inference_host.zig
-zig/pkg/antfly/src/standalone/inference_host_root.zig
 zig/pkg/antfly/src/standalone/inference_provider.zig
-zig/pkg/antfly/src/standalone/inference_worker.zig
 zig/pkg/antfly/src/storage/admission_waiter.zig
 zig/pkg/antfly/src/storage/artifact_payload.zig
 zig/pkg/antfly/src/storage/backend_adapter.zig

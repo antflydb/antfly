@@ -1084,8 +1084,12 @@ def check_runtime_boundary(graph: ImportGraph) -> bool:
 def check_codegen_boundary(graph: ImportGraph) -> bool:
     clean = True
     for source_name, target_name in CODEGEN_BOUNDARIES:
+        if not (graph.source_root / source_name).is_file() or not (graph.source_root / target_name).is_file():
+            continue
         source = graph.resolve_source(source_name)
         target = graph.resolve_source(target_name)
+        # Relocated inference host files are checked as Apache package sources
+        # by check_apache_boundary.py instead of this server-only import graph.
         path = graph.shortest_path(source, target)
         if not path:
             continue
@@ -1094,7 +1098,12 @@ def check_codegen_boundary(graph: ImportGraph) -> bool:
         print(f"codegen boundary violation: {rendered}", file=sys.stderr)
 
     for source_name, token in INFERENCE_ABI_FORBIDDEN_TOKENS:
-        source = graph.resolve_source(source_name)
+        if source_name == "standalone/inference_bridge.zig" and not (graph.source_root / source_name).is_file():
+            source = REPO_ROOT / "zig/pkg/inference/src/host/bridge.zig"
+        elif not (graph.source_root / source_name).is_file():
+            continue
+        else:
+            source = graph.resolve_source(source_name)
         if token not in source.read_text(encoding="utf-8"):
             continue
         clean = False

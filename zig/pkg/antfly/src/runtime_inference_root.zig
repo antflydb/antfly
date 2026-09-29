@@ -31,7 +31,7 @@ const runtimeAllocator = process.runtimeAllocator;
 
 const inference_runtime = @import("inference_runtime/runtime.zig");
 
-const standalone_inference_host = @import("standalone/inference_host.zig");
+const standalone_inference_host = @import("antfly_inference_host");
 
 const standalone_inference_bridge = @import("antfly_inference_bridge");
 

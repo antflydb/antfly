@@ -191,6 +191,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     embedded_support_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
     embedded_support_mod.addImport("antfly_public_limits", antfly_imports.public_limits);
     embedded_support_mod.addImport("antfly_template_content", antfly_imports.template_content);
+    embedded_support_mod.addImport("antfly_sparse_embedding", antfly_imports.sparse_embedding);
     embedded_support_mod.addImport("antfly_scraping", scraping_mod);
     embedded_support_mod.addImport("antfly_resolver", resolver_mod);
     embedded_support_mod.addImport("antfly_matcher", matcher_mod);

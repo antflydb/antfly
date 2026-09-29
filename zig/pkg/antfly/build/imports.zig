@@ -27,6 +27,7 @@ pub const AntflyRootImports = struct {
     inference_provider_failure: *std.Build.Module,
     public_limits: *std.Build.Module,
     template_content: *std.Build.Module,
+    sparse_embedding: *std.Build.Module,
     inference_worker_wire: *std.Build.Module,
     inference_worker_rpc: *std.Build.Module,
     inference_embedding_wire: *std.Build.Module,
@@ -40,7 +41,10 @@ pub const AntflyRootImports = struct {
     inference_vertex: *std.Build.Module,
     inference_remote_capabilities: *std.Build.Module,
     inference_execution_context: *std.Build.Module,
+    inference_request_types: *std.Build.Module,
+    inference_runtime_paths: *std.Build.Module,
     inference_query_embedding_cache: *std.Build.Module,
+    inference_host: *std.Build.Module,
     boundary_profile: @import("storage_boundary.zig").Profile = .all,
     build_info: @import("../../../lib/build_info/build_support.zig").BuildInfo,
     build_options: *std.Build.Step.Options,
@@ -229,6 +233,7 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_inference_bridge", self.inference_bridge);
         mod.addImport("antfly_public_limits", self.public_limits);
         mod.addImport("antfly_template_content", self.template_content);
+        mod.addImport("antfly_sparse_embedding", self.sparse_embedding);
         mod.addImport("antfly_inference_worker_wire", self.inference_worker_wire);
         mod.addImport("antfly_private_error_diagnostics", self.private_error_diagnostics);
         mod.addImport("antfly_inference_provider_failure", self.inference_provider_failure);
@@ -244,7 +249,10 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_inference_vertex", self.inference_vertex);
         mod.addImport("antfly_inference_remote_capabilities", self.inference_remote_capabilities);
         mod.addImport("antfly_inference_execution_context", self.inference_execution_context);
+        mod.addImport("antfly_inference_request_types", self.inference_request_types);
+        mod.addImport("antfly_inference_runtime_paths", self.inference_runtime_paths);
         mod.addImport("antfly_inference_query_embedding_cache", self.inference_query_embedding_cache);
+        mod.addImport("antfly_inference_host", self.inference_host);
         inline for (.{
             "httpx",              "common_openapi",  "inference_config_openapi", "logging_openapi",
             "middleware_openapi", "scraping",        "scraping_openapi",         "s3_openapi",
@@ -363,6 +371,7 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_inference_bridge", self.inference_bridge);
         mod.addImport("antfly_public_limits", self.public_limits);
         mod.addImport("antfly_template_content", self.template_content);
+        mod.addImport("antfly_sparse_embedding", self.sparse_embedding);
         mod.addImport("antfly_inference_worker_wire", self.inference_worker_wire);
         mod.addImport("antfly_private_error_diagnostics", self.private_error_diagnostics);
         mod.addImport("antfly_inference_provider_failure", self.inference_provider_failure);
@@ -378,7 +387,10 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_inference_vertex", self.inference_vertex);
         mod.addImport("antfly_inference_remote_capabilities", self.inference_remote_capabilities);
         mod.addImport("antfly_inference_execution_context", self.inference_execution_context);
+        mod.addImport("antfly_inference_request_types", self.inference_request_types);
+        mod.addImport("antfly_inference_runtime_paths", self.inference_runtime_paths);
         mod.addImport("antfly_inference_query_embedding_cache", self.inference_query_embedding_cache);
+        mod.addImport("antfly_inference_host", self.inference_host);
         if (link_libc and !self.platform_link_libc) {
             platform_build.addFilesystemCapacitySource(
                 mod,

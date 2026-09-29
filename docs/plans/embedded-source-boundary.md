@@ -23,26 +23,22 @@ formats, and WASM behavior remain the same.
 1. Move shared generated OpenAPI types and code generation into
    `antfly-embedded`; move source-text tests with those files. Done on the
    licensing branch.
-2. Move provider and transport code without embedded DB dependencies into
-   `inference`. This includes worker RPC and wire formats, inference types,
-   work admission, OpenAI, Bedrock, Vertex, local inference, model listing,
-   remote capabilities, execution context, query cache, bridge, and failure
-   classification. Shared cancellation, cache budget, runtime ABI, diagnostics,
-   template content, and public request limits get independent Apache owners.
+2. Move the inference host, worker execution, providers, and transport into
+   `inference`. Extract their shared request types and path helpers so the
+   host imports only named Apache modules; remove the server-side host facade.
+   Shared cancellation, cache budget, runtime ABI, diagnostics, template
+   content, sparse embeddings, and public request limits get independent
+   Apache owners. Done on the licensing branch.
 3. Extract storage and local API owners into `antfly-embedded`, replacing
    relative server-to-engine imports with explicit module imports. Move the
    DB-backed managed embedder and shared configuration/template contracts with
    their embedded owners. Keep backup/restore and the C ABI there.
-4. Move the inference host and worker execution into `inference` after their
-   embedded dependencies have named module boundaries. The server keeps its
-   provider adapter and worker supervision policy; the inference CLI runtime
-   must not call back through server-owned worker source.
-5. Extract the Apache raft and metadata contracts needed by the local engine.
+4. Extract the Apache raft and metadata contracts needed by the local engine.
    Server raft, placement, and metadata control stay in `antfly`.
-6. Give `antfly-embedded` an independent build graph for Lite, C ABI, and
+5. Give `antfly-embedded` an independent build graph for Lite, C ABI, and
    WASM. Remove the Apache per-file exceptions for `zig/pkg/antfly` once no
    Apache owner remains there.
-7. Change the staged-source CI check to remove `zig/pkg/antfly` entirely.
+6. Change the staged-source CI check to remove `zig/pkg/antfly` entirely.
    Build Lite, the C ABI, WASM, and inference from that source tree; also
    build the server from the full tree and run focused backup/restore tests.
 

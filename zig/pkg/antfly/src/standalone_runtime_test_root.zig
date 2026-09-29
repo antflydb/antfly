@@ -14,7 +14,7 @@
 // limitations.
 
 pub const runtime = @import("standalone/runtime.zig");
-pub const inference_host = @import("standalone/inference_host.zig");
+pub const inference_host = @import("antfly_inference_host");
 pub const inference_client = @import("standalone/inference_client.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
@@ -22,7 +22,7 @@ pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 test {
     _ = @import("antfly_inference_worker_rpc");
     _ = @import("antfly_inference_worker_wire");
-    _ = @import("standalone/inference_worker.zig");
+    _ = @import("antfly_inference_host").worker_module;
     _ = @import("antfly_inference_provider_failure");
     _ = runtime;
     _ = inference_host;

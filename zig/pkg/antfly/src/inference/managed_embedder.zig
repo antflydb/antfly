@@ -84,34 +84,8 @@ pub const ProviderKind = enum {
 /// Antfly assigns retrieval roles from the operation: artifact/index writes
 /// are documents and semantic-search inputs are queries. Provider adapters
 /// translate these canonical roles to their wire-specific spelling.
-pub const EmbeddingTaskType = enum {
-    retrieval_query,
-    retrieval_document,
-
-    pub fn canonical(self: EmbeddingTaskType) []const u8 {
-        return switch (self) {
-            .retrieval_query => "RETRIEVAL_QUERY",
-            .retrieval_document => "RETRIEVAL_DOCUMENT",
-        };
-    }
-
-    pub fn cohereInputType(self: EmbeddingTaskType) []const u8 {
-        return switch (self) {
-            .retrieval_query => "search_query",
-            .retrieval_document => "search_document",
-        };
-    }
-};
-
-pub const EmbeddingRequestContext = struct {
-    request: RequestContext,
-    task_type: EmbeddingTaskType = .retrieval_document,
-    instruction: ?[]const u8 = null,
-
-    pub fn check(self: EmbeddingRequestContext) !void {
-        return self.request.check();
-    }
-};
+pub const EmbeddingTaskType = @import("antfly_inference_request_types").EmbeddingTaskType;
+pub const EmbeddingRequestContext = @import("antfly_inference_request_types").EmbeddingRequestContext;
 
 pub const AntflyProvider = struct {
     ptr: *anyopaque,
@@ -393,17 +367,8 @@ pub const AntflyProvider = struct {
     }
 };
 
-pub const ClassificationRequest = struct {
-    texts: []const []const u8,
-    labels: []const []const u8,
-    hypothesis_template: ?[]const u8 = null,
-    multi_label: bool = false,
-};
-
-pub const ClassificationScore = struct {
-    label: []const u8,
-    score: f32,
-};
+pub const ClassificationRequest = @import("antfly_inference_request_types").ClassificationRequest;
+pub const ClassificationScore = @import("antfly_inference_request_types").ClassificationScore;
 
 pub fn deinitRewrittenTexts(alloc: std.mem.Allocator, texts: []const []const u8) void {
     for (texts) |text| alloc.free(text);

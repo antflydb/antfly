@@ -448,7 +448,7 @@ test "gliner boundary v2 upgrades a plain extraction request without schema_vers
 }
 
 // The in-process worker's provider "extract" operation
-// (host.linkedInferenceInvokeProvider in antfly/src/standalone/inference_host.zig)
+// (host.linkedInferenceInvokeProvider in inference/src/host/host.zig)
 // calls Node.extractDirectWithControl directly, never through extractJSON.
 // It sends a typed extracting_api.Request built from the enrichment runtime's
 // producer_json config (examples/dogfood/index_config.go's

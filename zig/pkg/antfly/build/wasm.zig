@@ -192,6 +192,11 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     }));
+    embedded_support_wasm_mod.addImport("antfly_sparse_embedding", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/sparse_embedding.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    }));
     const wasm_matcher_mod = b.createModule(.{
         .root_source_file = b.path("lib/matcher/src/mod.zig"),
         .target = wasm_target,

@@ -279,7 +279,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
 
     // Exercise the real production archive boundary for encoded-image reads.
     // The probe resolves only the exported C function table, so it cannot
-    // accidentally pass by importing inference_host.zig into the test root.
+    // accidentally pass by importing pkg/inference/src/host/host.zig into the test root.
     const linked_inference_abi_integration_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/inference_abi_integration.zig"),
         .target = target,
