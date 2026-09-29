@@ -68,6 +68,8 @@ pub const WorkspaceStats = struct {
 };
 
 pub fn estimate(backbone: model.Backbone) !Estimate {
+    // Resident serving holds the published DeBERTa geometry only.
+    if (backbone == .modern_bert) return error.UnsupportedGlinerBoundaryEncoder;
     return estimateFor(Owner, MetalDevice.metadata_bytes, artifact.specs(backbone), Geometry.published(backbone));
 }
 
@@ -155,6 +157,7 @@ fn OwnerWithDevice(comptime Device: type) type {
         counters: Stats,
 
         pub fn create(allocator: std.mem.Allocator, identity: bundle.Identity) !*Self {
+            if (identity.backbone == .modern_bert) return error.UnsupportedGlinerBoundaryEncoder;
             return createWithSpecs(allocator, identity, artifact.specs(identity.backbone), Geometry.published(identity.backbone));
         }
 
