@@ -14,9 +14,9 @@
 // limitations under the License.
 
 const std = @import("std");
-const public_openapi_types_source = @embedFile("generated/antfly_public_openapi/types.zig");
-const metadata_openapi_types_source = @embedFile("generated/antfly_metadata_openapi/types.zig");
-const client_openapi_types_source = @embedFile("generated/antfly_client_openapi/types.zig");
+const public_openapi_types_source = @embedFile("public_types.zig");
+const metadata_openapi_types_source = @embedFile("metadata_types.zig");
+const client_openapi_types_source = @embedFile("client_types.zig");
 
 fn expectOpenApiDocumentsToken(token: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, public_openapi_types_source, token) != null);

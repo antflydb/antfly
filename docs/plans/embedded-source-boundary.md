@@ -12,8 +12,9 @@ through declared Zig modules.
   Antfly inference provider adapters, C ABI, Lite CLI, shared local contracts,
   and their build owner.
 - `zig/pkg/inference`: native inference engine, host, worker, and CLI.
-- `zig/pkg/antfly-server-api`: Apache generated schemas and route interfaces
-  consumed only by the server; it does not become an embedded dependency.
+- `zig/pkg/antfly-server-api`: Apache generated admin and internal schemas and
+  route interfaces consumed only by the server; it is not an embedded dependency.
+- `zig/pkg/antfly-client`: generated public HTTP client code and client SDK.
 - `zig/pkg/antfly`: ELv2 server orchestration, distributed coordination,
   network APIs, and its build owner. It may import the embedded engine.
 - `zig/lib`: independently reusable Apache libraries.
@@ -23,9 +24,11 @@ formats, and WASM behavior remain the same.
 
 ## Migration
 
-1. Move shared generated OpenAPI types and code generation into
-   `antfly-embedded`; move source-text tests with those files. Done on the
-   licensing branch.
+1. Keep shared generated OpenAPI types in `antfly-embedded`, server-only
+   admin/internal output in `antfly-server-api`, the public HTTP client in
+   `antfly-client`, and inference output in `inference`. Keep the orchestrating
+   code generation in neutral `zig/build_support`; move source-text tests with
+   their source owners. Done on the licensing branch for those module families.
 2. Move the inference host, worker execution, and transport into `inference`.
    Place Antfly provider adapters, remote capability discovery, and endpoint
    context in `antfly-embedded/src/inference`. Keep provider-neutral execution
@@ -59,18 +62,16 @@ boundary.
 Classify these files by responsibility, not by their current `raft/` or
 `metadata/` directory names:
 
-- The generic Raft implementation stays in `zig/lib/raft`. The local replica
-  catalog and backup/restore storage, read-safety interfaces, and typed feature
-  reads belong with the embedded storage owner. This includes the current
-  `raft/storage/{catalog,backup_restore}.zig`, `raft/{read_gate,feature_reads}.zig`,
-  and `raft/state_machine/read_state_observer.zig`. Replace the thin
-  `raft/catalog.zig` re-export with direct named-module imports.
-- Local catalog cloning, index reconciliation, provisioning results, and
-  restore projections belong with embedded metadata and backup code. The
-  current `metadata/{local_catalog,local_index_reconcile,provision_contract,
-  restore_provisioning_contract}.zig` are the starting set. Move their storage,
-  API, and managed-embedder dependencies first so the new owners do not import
-  back into `pkg/antfly`.
+- The generic Raft implementation stays in `zig/lib/raft`. Replica catalog and
+  backup/restore bootstrap remain server-owned: they serve distributed replica
+  coordination, not Lite. Read-safety interfaces and typed feature reads used
+  by the local engine may move with the embedded storage owner. The generic
+  read-state observer lives in `lib/raft`; the thin `raft/catalog.zig` re-export
+  is gone.
+- Move local catalog cloning, index reconciliation, and restore projections
+  with embedded metadata and backup code only when an embedded entry point
+  actually consumes them. `metadata/provision_contract.zig` remains with server
+  provisioning because its current consumers are server-only.
 - Topology wire versions, reallocation requests, incarnation IDs, and mutation
   stamps are currently consumed by server coordination, not the Lite or
   inference import graph. Keep them in `pkg/antfly` unless an actual embedded
@@ -90,7 +91,7 @@ of `pkg/antfly` and a duplicate copy of any moved source file.
 
 The replica catalog remains in `pkg/antfly/src/raft/storage`: it serves
 distributed replica bootstrap and restore, not Lite's C ABI. The provisioning
-result contract lives in `pkg/antfly-embedded/src/metadata`, the read-state
+result contract remains in `pkg/antfly/src/metadata`, the read-state
 observer in `lib/raft`, and portable filesystem helpers in `lib/runtime`. The
 remaining local metadata and backup implementations still depend on Apache
 storage/API files under `pkg/antfly`; those dependencies must move before their
@@ -104,15 +105,15 @@ and extensions. The `/admin/v1` and `/internal/v1` specifications remain
 separate because they have different audiences and security contracts; they
 should not be folded into the public SDK/documentation spec.
 
-Generated Zig modules should follow their consumers rather than the location
-of the authored YAML. Put embedded database and provider contracts under
-`pkg/antfly-embedded`, inference API contracts under `pkg/inference`, and
-server-only admin, internal, and authority/route modules under an Apache
-`pkg/antfly-server-api` owner imported by the ELv2 server.
-Move any types genuinely shared between embedded and server into a small
-Apache schema owner instead of copying or generating the same type twice.
-The code-generation build support currently in
-`pkg/antfly-embedded/build/codegen.zig` orchestrates all three products, so
-move that build support to a neutral build directory when splitting generated
-destinations. Keep one deterministic generation/check step across all outputs
-and assert that Lite/C API/inference never imports server-only modules.
+Generated Zig modules follow their consumers rather than the location of the
+authored YAML. Embedded database and provider contracts live under
+`pkg/antfly-embedded`, the public HTTP client under `pkg/antfly-client`,
+inference API contracts under `pkg/inference`, and server-only admin/internal
+modules under Apache `pkg/antfly-server-api`, imported by the ELv2 server.
+Metadata and auth modules remain shared because embedded local API code uses
+their types; generating them twice would create distinct Zig types. Their
+server router output currently shares a generated module with those types;
+splitting that router requires generator support for an external types import.
+The neutral `zig/build_support/openapi.zig` orchestrates one deterministic
+generation/check step across all outputs. The boundary check must keep Lite,
+C API, and inference free of server-only imports.

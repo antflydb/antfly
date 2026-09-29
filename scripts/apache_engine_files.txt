@@ -196,6 +196,7 @@ zig/pkg/antfly/src/metadata/catalog_mutation_stamp.zig
 zig/pkg/antfly/src/metadata/incarnation.zig
 zig/pkg/antfly/src/metadata/local_catalog.zig
 zig/pkg/antfly/src/metadata/local_index_reconcile.zig
+zig/pkg/antfly/src/metadata/provision_contract.zig
 zig/pkg/antfly/src/metadata/reallocation_request.zig
 zig/pkg/antfly/src/metadata/restore_provisioning_contract.zig
 zig/pkg/antfly/src/metadata/topology_protocol.zig

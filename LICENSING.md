@@ -15,7 +15,8 @@ Shared engine sources currently remain under `zig/pkg/antfly` to preserve
 imports and avoid duplicating implementations. Their exact license scope is
 recorded in [`scripts/apache_engine_files.txt`](scripts/apache_engine_files.txt).
 The header tool and Apache dependency checker use that same list. Shared
-generated OpenAPI contracts have their own Apache LICENSE; their schema inputs
+generated OpenAPI contracts are owned by the embedded, client, inference, and
+server-API Apache packages according to their consumers; their schema inputs
 are covered by `specs/LICENSE`.
 
 The inference package, shared `zig/lib` implementations, client SDKs, Lite

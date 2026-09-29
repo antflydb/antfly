@@ -42,8 +42,10 @@ ELV2_ROOTS = (
 APACHE_ROOTS = (
     "zig/build.zig",
     "zig/build.zig.zon",
+    "zig/build_support",
     "zig/pkg/antfly-embedded",
     "zig/pkg/antfly-client",
+    "zig/pkg/antfly-server-api",
     "zig/pkg/inference",
     "zig/pkg/inference-client",
     "zig/lib",

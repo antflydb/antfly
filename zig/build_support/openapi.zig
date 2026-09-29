@@ -155,6 +155,8 @@ pub fn addOpenApiSourceSteps(
 
     const antfly_generated_root = "pkg/antfly-embedded/src/openapi/generated";
     const inference_generated_root = "pkg/inference/src/api/generated";
+    const client_generated_root = "pkg/antfly-client/src/openapi/generated";
+    const server_generated_root = "pkg/antfly-server-api/src/openapi/generated";
     const public_spec = addPrefixedPublicOpenApiSpec(b);
     const modules = [_]GeneratedModule{
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/shared/provider.yaml"), "antfly_provider_openapi", antfly_generated_root ++ "/antfly_provider_openapi", "types", &.{}),
@@ -169,7 +171,7 @@ pub fn addOpenApiSourceSteps(
             .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
             .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         }),
-        addGeneratedModule(b, openapi_build, openapi_codegen, public_spec, "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", "types,client", &.{
+        addGeneratedModule(b, openapi_build, openapi_codegen, public_spec, "antfly_client_openapi", client_generated_root ++ "/antfly_client_openapi", "types,client", &.{
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
             .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
@@ -199,8 +201,8 @@ pub fn addOpenApiSourceSteps(
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
         }),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/query.yaml"), "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi", "types", &.{}),
-        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/admin.yaml"), "antfly_admin_openapi", antfly_generated_root ++ "/antfly_admin_openapi", "types,server", &.{}),
-        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/internal.yaml"), "antfly_internal_openapi", antfly_generated_root ++ "/antfly_internal_openapi", "types,server", &.{}),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/admin.yaml"), "antfly_admin_openapi", server_generated_root ++ "/antfly_admin_openapi", "types,server", &.{}),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/internal.yaml"), "antfly_internal_openapi", server_generated_root ++ "/antfly_internal_openapi", "types,server", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/auth/api.yaml"), "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", "types,server", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", "types,server", &.{
             .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
@@ -294,7 +296,7 @@ pub fn addOpenApiSourceSteps(
 
     // Assemble complete owner trees so removing a module from this inventory
     // also removes its obsolete checked-in directory during synchronization.
-    for ([_][]const u8{ antfly_generated_root, inference_generated_root }) |destination| {
+    for ([_][]const u8{ antfly_generated_root, inference_generated_root, client_generated_root, server_generated_root }) |destination| {
         const tree = b.addWriteFiles();
         const prefix = b.fmt("{s}/", .{destination});
         for (modules) |module| {
@@ -313,6 +315,8 @@ pub fn addOpenApiSourceSteps(
 /// Configure each runtime's schema modules while sharing the committed source tree.
 pub const CommittedOptions = struct {
     root: std.Build.LazyPath,
+    client_root: std.Build.LazyPath,
+    server_root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     httpx: *std.Build.Module,
@@ -355,8 +359,14 @@ pub const CommittedModules = struct {
 };
 
 fn committedModule(b: *std.Build, options: CommittedOptions, name: []const u8, httpx: bool) *std.Build.Module {
+    const root = if (std.mem.eql(u8, name, "antfly_client_openapi"))
+        options.client_root
+    else if (std.mem.eql(u8, name, "antfly_admin_openapi") or std.mem.eql(u8, name, "antfly_internal_openapi"))
+        options.server_root
+    else
+        options.root;
     const settings: std.Build.Module.CreateOptions = .{
-        .root_source_file = options.root.path(b, b.fmt("{s}/root.zig", .{name})),
+        .root_source_file = root.path(b, b.fmt("{s}/root.zig", .{name})),
         .target = options.target,
         .optimize = options.optimize,
     };

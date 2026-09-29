@@ -62,6 +62,12 @@ PACKAGE_ENTRYPOINTS = (
 # Generated data modules resolve to their producers. Only Zig's standard library
 # and build-generated configuration constants terminate traversal.
 SOURCE_MODULES = {
+    "antfly_admin_openapi": (
+        "zig/pkg/antfly-server-api/src/openapi/generated/antfly_admin_openapi/root.zig",
+    ),
+    "antfly_internal_openapi": (
+        "zig/pkg/antfly-server-api/src/openapi/generated/antfly_internal_openapi/root.zig",
+    ),
     "antfly_cancellation": ("zig/lib/runtime/src/cancellation.zig",),
     "antfly_cache_budget": ("zig/lib/runtime/src/cache_budget.zig",),
     "antfly_runtime_abi": ("zig/lib/runtime/src/root.zig",),
@@ -69,7 +75,7 @@ SOURCE_MODULES = {
     "antfly_inference_bridge": ("zig/pkg/inference/src/host/bridge.zig",),
     "antfly_inference_provider_failure": ("zig/pkg/inference/src/host/provider_failure.zig",),
     "antfly_runtime_fs": ("zig/lib/runtime/src/fs.zig",),
-    "antfly_provision_contract": ("zig/pkg/antfly-embedded/src/metadata/provision_contract.zig",),
+    "antfly_provision_contract": ("zig/pkg/antfly/src/metadata/provision_contract.zig",),
     "antfly_read_state_observer": ("zig/lib/raft/src/read_state_observer.zig",),
     "antfly_inference_worker_wire": ("zig/pkg/inference/src/host/worker_wire.zig",),
     "antfly_public_limits": ("zig/pkg/antfly-embedded/src/api/public_limits.zig",),
@@ -105,7 +111,7 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_chunking_openapi/root.zig",
     ),
     "antfly_client_openapi": (
-        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_client_openapi/root.zig",
+        "zig/pkg/antfly-client/src/openapi/generated/antfly_client_openapi/root.zig",
     ),
     "antfly_common_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_common_openapi/root.zig",
@@ -420,6 +426,9 @@ def check_sources(root: Path = ROOT) -> tuple[set[str], list[str]]:
             continue
         if not path.is_file():
             errors.append(f"missing source: {name} (imported by {parent})")
+            continue
+        if name.startswith("zig/pkg/antfly-server-api/"):
+            errors.append(f"embedded product imports server-only API: {name} (imported by {parent})")
             continue
         third_party = name.startswith(SOURCE_ROOT + "search/snowball/generated/")
         if not third_party and group_for(name, "all") != "apache":

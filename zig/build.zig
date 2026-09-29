@@ -24,7 +24,7 @@ const lib_sql_build_support = @import("lib/sql/build_support.zig");
 const yacc_build = @import("lib/yacc/build_support.zig");
 const tools_build = @import("tools/build_support.zig");
 
-const pkg_antfly_build_codegen = @import("pkg/antfly-embedded/build/codegen.zig");
+const pkg_antfly_build_codegen = @import("build_support/openapi.zig");
 const addOpenApiRootCheckStep = pkg_antfly_build_codegen.addOpenApiRootCheckStep;
 const addOpenApiSourceSteps = pkg_antfly_build_codegen.addOpenApiSourceSteps;
 
@@ -238,11 +238,15 @@ pub fn create(b: *std.Build) ?Artifacts {
     openapi_regen_step.dependOn(&update_public_openapi.step);
     const openapi_check_step = b.step("check-openapi", "Compare checked-in OpenAPI sources without modifying them");
     openapi_check_step.dependOn(&openapi_sources.check.step);
-    const openapi_docs_test = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/openapi/exact_sort_docs_test.zig"),
+    const openapi_docs_test_mod = b.createModule(.{
+        .root_source_file = b.path("build_support/openapi_exact_sort_test.zig"),
         .target = b.graph.host,
         .optimize = optimize,
-    }) });
+    });
+    openapi_docs_test_mod.addAnonymousImport("public_types.zig", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/antfly_public_openapi/types.zig") });
+    openapi_docs_test_mod.addAnonymousImport("metadata_types.zig", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/antfly_metadata_openapi/types.zig") });
+    openapi_docs_test_mod.addAnonymousImport("client_types.zig", .{ .root_source_file = b.path("pkg/antfly-client/src/openapi/generated/antfly_client_openapi/types.zig") });
+    const openapi_docs_test = b.addTest(.{ .root_module = openapi_docs_test_mod });
     openapi_check_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     const yacc_codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), target, optimize);
     b.step("yacc-zig", "Build and install the standalone Zig yacc generator").dependOn(&b.addInstallArtifact(yacc_codegen, .{}).step);
@@ -271,6 +275,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     openapi_check_step.dependOn(&openapi_root_check.step);
     const openapi_modules = pkg_antfly_build_codegen.createCommittedModules(b, .{
         .root = b.path("pkg/antfly-embedded/src/openapi/generated"),
+        .client_root = b.path("pkg/antfly-client/src/openapi/generated"),
+        .server_root = b.path("pkg/antfly-server-api/src/openapi/generated"),
         .target = target,
         .optimize = optimize,
         .httpx = httpx_mod,
@@ -728,7 +734,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     runtime_fs_mod.addImport("antfly_platform", platform_mod);
     const provision_contract_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/metadata/provision_contract.zig"),
+        .root_source_file = b.path("pkg/antfly/src/metadata/provision_contract.zig"),
         .target = target,
         .optimize = optimize,
     });

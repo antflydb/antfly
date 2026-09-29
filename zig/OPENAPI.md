@@ -63,16 +63,21 @@ assistant `tool_calls`, and tool-message `tool_call_id`.
 When adding a new shared generating primitive, update `specs/openapi/shared/generating.yaml`,
 then reference it from the owning service spec with an external `$ref`. If the
 reference is used by checked-in Zig generated code, add the matching
-`--import-mapping` in `zig/build.zig` and import the generated shared module
+`--import-mapping` in `zig/build_support/openapi.zig` and import the generated shared module
 into the dependent generated module.
 
 ## Generated Modules
 
-Generated Antfly and shared API modules live under:
+Generated embedded/shared Antfly API modules live under:
 
 ```text
 pkg/antfly-embedded/src/openapi/generated/
 ```
+
+Server-only admin and internal route modules live under
+`pkg/antfly-server-api/src/openapi/generated/`. The public HTTP client module
+lives under `pkg/antfly-client/src/openapi/generated/`. Metadata and auth types
+remain shared with embedded local APIs and are generated only once.
 
 The generated inference API module lives under:
 

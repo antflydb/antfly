@@ -20,7 +20,7 @@ const platform_build = @import("../../../lib/platform/build_support.zig");
 const image_build = @import("../../../lib/image/build_support.zig");
 const pdf_build = @import("../../../lib/pdf/build_support.zig");
 const tokenizer_build = @import("../../../lib/tokenizer/build_support.zig");
-const codegen = @import("../../antfly-embedded/build/codegen.zig");
+const codegen = @import("../../../build_support/openapi.zig");
 const configureEmbeddedModule = @import("embedded.zig").configureModule;
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 
@@ -46,6 +46,8 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     httpx_mod.addImport("antfly-json", json_mod);
     const api = codegen.createCommittedModules(b, .{
         .root = b.path("pkg/antfly-embedded/src/openapi/generated"),
+        .client_root = b.path("pkg/antfly-client/src/openapi/generated"),
+        .server_root = b.path("pkg/antfly-server-api/src/openapi/generated"),
         .target = wasm_target,
         .optimize = optimize,
         .json = json_mod,
