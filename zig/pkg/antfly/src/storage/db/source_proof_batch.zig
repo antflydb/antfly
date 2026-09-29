@@ -68,6 +68,70 @@ pub fn decodeValue(alloc: std.mem.Allocator, namespace: publication.Namespace, d
 }
 
 pub const Entry = struct { digest: publication.Digest, value: []const u8 };
+pub const Position = struct { object: u32, offset: u64 = 0, remaining: u32 = 0 };
+pub const Descriptor = struct {
+    digest: publication.Digest,
+    object: u32,
+    value_offset: u64,
+    value_len: u32,
+    next_position: Position,
+
+    pub fn read(self: Descriptor, reader: anytype, offset: u64, out: []u8) !void {
+        if (offset > self.value_len or out.len > self.value_len - offset) return error.SourceSnapshotCorrupt;
+        try exact(reader, self.object, self.value_offset + offset, out);
+    }
+};
+
+fn exact(reader: anytype, object: u32, offset: u64, out: []u8) !void {
+    var done: usize = 0;
+    while (done < out.len) {
+        const count = try reader.readAt(object, offset + done, out[done..]);
+        if (count == 0 or count > out.len - done) return error.SourceSnapshotCorrupt;
+        done += count;
+    }
+}
+
+fn readWord(reader: anytype, object: u32, offset: u64) !u32 {
+    var bytes: [4]u8 = undefined;
+    try exact(reader, object, offset, &bytes);
+    return std.mem.readInt(u32, &bytes, .little);
+}
+
+/// Locate one record without copying its potentially large APF2 body. A
+/// source-certificate verifier authenticates the complete object before the
+/// merge driver uses these offsets; the receiver validates the record again
+/// before granting any local adoption evidence.
+pub fn descriptor(reader: anytype, object_size: u64, position: Position) !?Descriptor {
+    if (object_size < 4 or object_size > max_bytes) return error.SourceSnapshotCorrupt;
+    var next = position;
+    if (next.offset == 0) {
+        if (next.remaining != 0) return error.SourceSnapshotCorrupt;
+        next.remaining = try readWord(reader, next.object, 0);
+        if (next.remaining == 0 or next.remaining > max_entries or next.remaining > (object_size - 4) / 86)
+            return error.SourceSnapshotCorrupt;
+        next.offset = 4;
+    }
+    if (next.offset < 4 or next.offset > object_size or next.remaining > max_entries) return error.SourceSnapshotCorrupt;
+    if (next.remaining == 0) {
+        if (next.offset != object_size) return error.SourceSnapshotCorrupt;
+        return null;
+    }
+    if (object_size - next.offset < 40) return error.SourceSnapshotCorrupt;
+    if (try readWord(reader, next.object, next.offset) != 32) return error.SourceSnapshotCorrupt;
+    var digest: publication.Digest = undefined;
+    try exact(reader, next.object, next.offset + 4, &digest);
+    const value_len = try readWord(reader, next.object, next.offset + 36);
+    if (value_len < 46 or value_len > max_bytes - 44 or value_len > object_size - next.offset - 40)
+        return error.SourceSnapshotCorrupt;
+    const value_offset = next.offset + 40;
+    const end = value_offset + value_len;
+    next.offset = end;
+    next.remaining -= 1;
+    if ((next.remaining == 0 and end != object_size) or next.remaining > (object_size - end) / 86)
+        return error.SourceSnapshotCorrupt;
+    return .{ .digest = digest, .object = position.object, .value_offset = value_offset, .value_len = value_len, .next_position = next };
+}
+
 pub const Reader = struct {
     bytes: []const u8,
     offset: usize = 4,
@@ -121,4 +185,43 @@ test "ordered artifact inventory source proof batch rejects forged bitmap and co
     forged[6] = 2;
     try std.testing.expectError(error.SourceSnapshotCorrupt, decodeValue(alloc, proof.namespace, proof.publication_digest, forged));
     try std.testing.expectError(error.SourceSnapshotCorrupt, Reader.init("\xff\xff\xff\x7f"));
+}
+
+test "ordered artifact inventory source proof descriptor resumes a certified large body" {
+    const alloc = std.testing.allocator;
+    const document = try alloc.alloc(u8, 2 * 1024 * 1024);
+    defer alloc.free(document);
+    @memset(document, 'd');
+    const source = publication.Source{ .document_key = document, .content_digest = @splat(3), .timestamp = 1, .input_position = null };
+    const effect = provenance.Effect{ .family = .document_artifact, .key = "effect", .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    var proof: provenance.Proof = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "asset", .publication_digest = @splat(4), .input_digest = undefined, .sources = (&source)[0..1], .artifact_sources = &.{}, .effects = (&effect)[0..1] };
+    proof.input_digest = proof.inputCommand().inputDigest();
+    const raw = try provenance.encodeAlloc(alloc, proof);
+    defer alloc.free(raw);
+    const value = try encodeValueAlloc(alloc, &.{1}, raw);
+    defer alloc.free(value);
+    const batch = try @import("../backup_codec.zig").encodeKeyValueBatch(alloc, &.{.{ .key = &proof.publication_digest, .value = value }});
+    defer alloc.free(batch);
+    const Mock = struct {
+        bytes: []const u8,
+        fn readAt(self: *@This(), object: u32, offset: u64, out: []u8) !usize {
+            if (object != 7 or offset > self.bytes.len) return 0;
+            const count = @min(out.len, self.bytes.len - @as(usize, @intCast(offset)));
+            if (count == 0) return 0;
+            @memcpy(out[0..count], self.bytes[@intCast(offset)..][0..count]);
+            return count;
+        }
+    };
+    var reader: Mock = .{ .bytes = batch };
+    const first = (try descriptor(&reader, batch.len, .{ .object = 7 })).?;
+    try std.testing.expectEqualSlices(u8, &proof.publication_digest, &first.digest);
+    try std.testing.expectEqual(@as(u32, @intCast(value.len)), first.value_len);
+    var sample: [17]u8 = undefined;
+    const crossing_offset: usize = 1024 * 1024 - 8;
+    try first.read(&reader, crossing_offset, &sample);
+    try std.testing.expectEqualSlices(u8, value[crossing_offset..][0..sample.len], &sample);
+    try std.testing.expect((try descriptor(&reader, batch.len, first.next_position)) == null);
+    try std.testing.expectError(error.SourceSnapshotCorrupt, first.read(&reader, value.len - 1, sample[0..2]));
+    try std.testing.expectError(error.SourceSnapshotCorrupt, descriptor(&reader, batch.len - 1, .{ .object = 7 }));
+    try std.testing.expectError(error.SourceSnapshotCorrupt, descriptor(&reader, batch.len, .{ .object = 7, .offset = 0, .remaining = 1 }));
 }

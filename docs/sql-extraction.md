@@ -1790,6 +1790,12 @@ following mechanisms are installed behind that gate:
   including binary document keys, full source-pin reopen, source certificate
   verification and checkpointed staging import. Receiver-local adoption and
   retained-effect/tail provenance transfer remain open.
+  A validated positional descriptor can resume a proof value from its
+  certified object without copying the full body, including reads across the
+  1 MiB merge-chunk boundary. The replicated merge-page contract still has no
+  separate provenance payload/capability, so the descriptor does not claim
+  that online merge carries or adopts these records yet. The focused ordered
+  artifact suite now passes 209 cases.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups
