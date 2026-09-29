@@ -12,6 +12,9 @@ const compiler = @import("../sql/compiler.zig");
 const reads = @import("table_read_source.zig");
 const operation = @import("operation.zig");
 const alloc = std.testing.allocator;
+const sql_schema_json =
+    \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+;
 
 const Fixture = struct {
     logical_name: []const u8 = "rows",
@@ -72,7 +75,7 @@ const Fixture = struct {
                 for (query.targets, found, names) |target, *resolved, *name| {
                     const archive = self.second_logical_name != null and std.mem.eql(u8, target.table, self.second_logical_name.?);
                     if (!archive and !std.mem.eql(u8, target.table, self.logical_name)) return error.UnexpectedCall;
-                    resolved.* = .{ .table_id = if (archive) 101 else 100, .name = if (archive) "physical_archive" else "physical" };
+                    resolved.* = .{ .table_id = if (archive) 101 else 100, .name = if (archive) "physical_archive" else "physical", .query_definition = if (query.include_query_definitions) .{ .table_id = if (archive) 101 else 100, .schema_json = sql_schema_json, .read_schema_json = "", .indexes_json = "{}" } else null };
                     name.* = target.table;
                 }
                 break :blk std.json.Stringify.valueAlloc(a, domain.ResolvedMany{ .revision = 7, .tables = found, .logical_names = names }, .{});
@@ -213,8 +216,12 @@ const Fixture = struct {
         if (self.unknown) return error.MetadataMutationOutcomeUnknown;
         return a.dupe(u8, value);
     }
-    fn put(_: *anyopaque, _: []const u8, _: []const u8, _: u64) !void {
-        return error.UnexpectedCall;
+    fn put(ptr: *anyopaque, key: []const u8, value: []const u8, _: u64) !void {
+        const self = cast(ptr);
+        if (self.job_key == null or !std.mem.eql(u8, self.job_key.?, key)) return error.UnexpectedCall;
+        const owned = try alloc.dupe(u8, value);
+        alloc.free(self.job_value.?);
+        self.job_value = owned;
     }
     fn delete(_: *anyopaque, _: []const u8, _: u64) !void {
         return error.UnexpectedCall;
@@ -226,7 +233,10 @@ const Fixture = struct {
         return jobs.ReplicatedPersistence.fromLocal(self, .{ .load = load, .get = get, .create_with_staging = create, .put = put, .delete = delete, .delete_many = deleteMany });
     }
     fn server(self: *@This()) !http.ApiHttpServer {
-        var result = http.ApiHttpServer.init(alloc, .{}, .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = catalog, .linearizable_snapshot = snapshot, .free_admin_snapshot = freeSnapshot } }, .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = undefined, .query = undefined } }, null);
+        return self.serverWith(null, null);
+    }
+    fn serverWith(self: *@This(), manager: ?*@import("../usermgr/mod.zig").UserManager, runtime: ?*@import("../storage/background_runtime.zig").BackendRuntime) !http.ApiHttpServer {
+        var result = http.ApiHttpServer.init(alloc, .{ .user_manager = manager, .backend_runtime = runtime }, .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = catalog, .linearizable_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .supports_query_definitions = true } }, .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = undefined, .query = undefined } }, null);
         errdefer result.deinit();
         result.restore_job_store.io = std.testing.io;
         try result.restore_job_store.attachReplicated(self.persistence());
@@ -237,6 +247,79 @@ const Fixture = struct {
 };
 
 const ddl: @import("../sql/ast.zig").CatalogDdl = .{ .kind = .table, .action = .truncate, .name = .{ .table = "rows" }, .truncate_tables = &.{.{ .table = "rows" }} };
+
+test "SQL TRUNCATE prepared statement uses mounted durable generation admission" {
+    // sql-0003: PREPARE is connection-owned and side-effect free; EXECUTE
+    // must return the durable pending job, never a false synchronous success.
+    var fixture: Fixture = .{ .logical_name = "usage_records" };
+    defer fixture.deinit();
+    const usermgr = @import("../usermgr/mod.zig");
+    const casbin = @import("antfly_casbin");
+    var user_store = usermgr.MemoryStore.init(alloc);
+    defer user_store.deinit();
+    var policies = casbin.MemoryAdapter.init(alloc);
+    defer policies.deinit();
+    var manager = try usermgr.UserManager.init(alloc, user_store.iface(), try usermgr.initDefaultEnforcer(alloc, policies.iface()));
+    defer manager.deinit();
+    var permission = try usermgr.Permission.initOwned(alloc, .table, "usage_records", .admin);
+    defer permission.deinit(alloc);
+    var user = try manager.createUser("truncate_admin", "secret", &.{permission});
+    defer user.deinit(alloc);
+    var runtime = try @import("../storage/background_runtime.zig").BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    {
+        var server = try fixture.serverWith(&manager, runtime.ptr());
+        defer server.deinit();
+        var adapter: @import("sql_pgwire.zig").Adapter = .{ .server = &server };
+        const Wire = struct {
+            fn frame(out: *std.Io.Writer, tag: u8, payload: []const u8) !void {
+                try out.writeByte(tag);
+                try out.writeInt(u32, @intCast(payload.len + 4), .big);
+                try out.writeAll(payload);
+            }
+        };
+        var input = std.Io.Writer.Allocating.init(alloc);
+        defer input.deinit();
+        const startup_body = "user\x00truncate_admin\x00database\x00default\x00\x00";
+        try input.writer.writeInt(u32, @intCast(startup_body.len + 8), .big);
+        try input.writer.writeInt(u32, 196608, .big);
+        try input.writer.writeAll(startup_body);
+        try Wire.frame(&input.writer, 'p', "secret\x00");
+        try Wire.frame(&input.writer, 'Q', "PREPARE truncate_usage_plan AS TRUNCATE usage_records\x00");
+        try Wire.frame(&input.writer, 'Q', "EXECUTE truncate_usage_plan\x00");
+        try Wire.frame(&input.writer, 'X', "");
+        var reader = std.Io.Reader.fixed(input.written());
+        var output = std.Io.Writer.Allocating.init(alloc);
+        defer output.deinit();
+        var session: @import("../pgwire/protocol.zig").Session = .{ .alloc = alloc, .io = std.testing.io, .source = adapter.backend(), .reader = &reader, .writer = &output.writer };
+        defer session.deinit();
+        try session.run();
+        var frames: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = output.written() };
+        var prepared: usize = 0;
+        var pending: usize = 0;
+        while (frames.offset < frames.bytes.len) {
+            const tag = try frames.int(u8);
+            const size = try frames.int(u32);
+            const payload = try frames.take(size - 4);
+            if (tag == 'C') {
+                try std.testing.expectEqualStrings("PREPARE\x00", payload);
+                prepared += 1;
+            }
+            if (tag == 'E') {
+                try std.testing.expect(std.mem.indexOf(u8, payload, "55000") != null);
+                try std.testing.expect(std.mem.indexOf(u8, payload, "restore_job_id") != null);
+                pending += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), prepared);
+        try std.testing.expectEqual(@as(usize, 1), pending);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.admissions);
+    var plan = try std.json.parseFromSlice(stages.Plan, alloc, fixture.plan.?, .{});
+    defer plan.deinit();
+    try std.testing.expect(plan.value.targets[0].empty_generation);
+    try std.testing.expectEqualStrings("usage_records", plan.value.targets[0].catalog_binding.?.name);
+}
 
 test "SQL TRUNCATE original single-table source cases use durable generation admission" {
     // sql-0160, sql-0161, sql-0162, sql-0163, sql-1101. The original

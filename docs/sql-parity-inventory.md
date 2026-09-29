@@ -91,11 +91,13 @@ exact typed-text INSERT plan runs through an authenticated pgwire session and
 the native relational writer. The INSERT command count and a subsequent typed
 read verify one committed row; write admission still resolves the current
 catalog identity and row-policy state.
-For `sql-0003`/`sql-0004`, a pgwire regression checks that their exact PREPARE
-statements defer backend execution and that EXECUTE retains a pending-DDL
-receipt without a false successful command completion. Those cases remain
-unresolved until the prepared forms have mounted catalog/owner admission and
-recovery evidence; protocol-only coverage is not DDL publication parity.
+`sql-0003` is also a tested supersession: the exact PREPARE runs through an
+authenticated mounted pgwire adapter; EXECUTE admits one durable TRUNCATE
+generation job and returns its pending receipt, not a false synchronous
+completion. The staged restore gate separately covers owner publication.
+For `sql-0004`, a pgwire regression proves PREPARE defers execution and EXECUTE
+retains a pending-DDL receipt without a false success, but the case remains
+unresolved until its CREATE TABLE form has mounted catalog/owner evidence.
 `sql-0037`, `sql-0039`, `sql-0041`, `sql-0043`, and `sql-0046` are tested
 supersessions of catalog/admin session mutations. Their exact public-namespace
 and one-millisecond timeout commands run through the pgwire session state
