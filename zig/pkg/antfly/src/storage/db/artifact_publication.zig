@@ -790,9 +790,16 @@ fn readReceiptWithDigest(txn: anytype, command: Command, source: Source, input_d
 }
 
 pub fn stageReceipts(txn: anytype, command: Command, sequence: u64) !void {
-    if (sequence == 0) return error.InvalidBatchRequest;
     const owners = try command.outputSources();
-    const input_digest = command.inputDigest();
+    return stageSelectedReceipts(txn, command, command.inputDigest(), owners, sequence);
+}
+
+/// Adopted APF3 proofs have authenticated effects but no replayable mutation
+/// bodies. Their selected output-source set is supplied by the validated
+/// proof, not synthesized from placeholder Mutation values. The caller must
+/// revalidate inputs and postimages in this same writer transaction.
+pub fn stageSelectedReceipts(txn: anytype, command: Command, input_digest: Digest, owners: std.StaticBitSet(max_source_documents), sequence: u64) !void {
+    if (sequence == 0 or command.sources.len > max_source_documents) return error.InvalidBatchRequest;
     for (command.sources, 0..) |source, source_index| {
         if (!owners.isSet(source_index)) continue;
         const key = receiptKey(command, source);

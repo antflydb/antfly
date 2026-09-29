@@ -1836,7 +1836,13 @@ following mechanisms are installed behind that gate:
   off-lock from remapped local inputs and selected postimages. The body binds
   donor lineage through its adoption digest, drops donor historical output
   preconditions, and refuses graph/non-index adoption; it does not stage
-  receipts or grant authority until ordered receiver apply is wired.
+  receipts or grant authority until ordered receiver apply is wired. The
+  adopted-proof staging participant now takes selected source ownership from
+  APF3 effects rather than fabricated mutation bodies, stages only those
+  receipts and document/artifact references, and fences each artifact against
+  its actual receiver-local revision. It still requires a certified-evidence
+  fence and causal/postimage revalidation in the same ordered transaction;
+  absent outputs without a receiver revision and graph rebindings remain gated.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups

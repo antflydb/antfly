@@ -613,6 +613,25 @@ fn documentReferenceKeyAlloc(alloc: std.mem.Allocator, namespace: publication.Na
 /// source, including an absence publication, gets one range-seekable entry.
 pub fn prepareDocumentReferences(alloc: std.mem.Allocator, command: publication.Command) !PreparedDocumentReferences {
     const owners = try command.outputSources();
+    return prepareSelectedDocumentReferences(alloc, command, owners);
+}
+
+fn selectedOwners(proof: Proof) !std.StaticBitSet(publication.max_source_documents) {
+    if (proof.origin == null) return error.ArtifactCatalogCorrupt;
+    var owners = std.StaticBitSet(publication.max_source_documents).initEmpty();
+    for (proof.effects) |effect| {
+        if (effect.source_index >= proof.sources.len) return error.ArtifactCatalogCorrupt;
+        owners.set(effect.source_index);
+    }
+    return owners;
+}
+
+pub fn prepareAdoptedDocumentReferences(alloc: std.mem.Allocator, proof: Proof) !PreparedDocumentReferences {
+    try proof.validate();
+    return prepareSelectedDocumentReferences(alloc, proof.inputCommand(), try selectedOwners(proof));
+}
+
+fn prepareSelectedDocumentReferences(alloc: std.mem.Allocator, command: publication.Command, owners: std.StaticBitSet(publication.max_source_documents)) !PreparedDocumentReferences {
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const owned = arena.allocator();
@@ -1214,15 +1233,35 @@ fn changeReferences(txn: anytype, namespace: publication.Namespace, digest: publ
 /// Epoch retirement still needs a bounded reference walk; it cannot drop only
 /// the authority key and strand these references.
 pub fn stage(txn: anytype, command: publication.Command, encoded_proof: []const u8, position: publication.Position) !void {
-    return stageWithDocumentReferences(txn, command, encoded_proof, position, null);
+    return stageWithDocumentReferences(txn, command, encoded_proof, position, null, null);
 }
 
 pub fn stageIndexed(txn: anytype, command: publication.Command, encoded_proof: []const u8, position: publication.Position, prepared: *const PreparedDocumentReferences) !void {
-    return stageWithDocumentReferences(txn, command, encoded_proof, position, prepared);
+    return stageWithDocumentReferences(txn, command, encoded_proof, position, prepared, null);
 }
 
-fn stageWithDocumentReferences(txn: anytype, command: publication.Command, encoded_proof: []const u8, position: publication.Position, prepared: ?*const PreparedDocumentReferences) !void {
-    const owners = try command.outputSources();
+/// Stage adopted proof references and selected receipts together. This is a
+/// transaction participant, not a certificate: the caller must verify source
+/// evidence, receiver inputs and postimages before invoking it and abort the
+/// writer transaction on any error.
+pub fn stageAdoptedIndexed(txn: anytype, proof: Proof, encoded_proof: []const u8, positions: []const publication.Position, prepared: *const PreparedDocumentReferences, sequence: u64) !void {
+    try proof.validate();
+    if (positions.len != proof.effects.len) return error.ArtifactCatalogCorrupt;
+    for (proof.effects, positions) |effect, position| {
+        try position.requireNamespace(publication.namespaceFromBytes(proof.namespace));
+        if (!std.meta.eql(try publication.artifactRevision(txn, proof.namespace, effect.key), @as(?publication.Position, position)))
+            return error.EnrichmentSourceChanged;
+    }
+    const owners = try selectedOwners(proof);
+    const command = proof.inputCommand();
+    try publication.stageSelectedReceipts(txn, command, proof.input_digest, owners, sequence);
+    try stageWithDocumentReferences(txn, command, encoded_proof, positions[0], prepared, .{ .proof = proof, .positions = positions });
+}
+
+const AdoptedEffects = struct { proof: Proof, positions: []const publication.Position };
+
+fn stageWithDocumentReferences(txn: anytype, command: publication.Command, encoded_proof: []const u8, position: publication.Position, prepared: ?*const PreparedDocumentReferences, adopted: ?AdoptedEffects) !void {
+    const owners = if (adopted) |selected| try selectedOwners(selected.proof) else try command.outputSources();
     const proof_key = key(command.namespace, command.publication_digest);
     const old = txn.get(&proof_key) catch |err| switch (err) {
         error.NotFound => null,
@@ -1267,9 +1306,12 @@ fn stageWithDocumentReferences(txn: anytype, command: publication.Command, encod
     const encoded_position = try position.encode();
     var value: [32 + publication.Position.encoded_len]u8 = undefined;
     @memcpy(value[0..32], &command.publication_digest);
-    @memcpy(value[32..], &encoded_position);
-    for (command.mutations) |effect| {
-        const reference = artifactReferenceKey(authority, effect.key);
+    const effect_count = if (adopted) |selected| selected.proof.effects.len else command.mutations.len;
+    for (0..effect_count) |effect_index| {
+        const effect_key = if (adopted) |selected| selected.proof.effects[effect_index].key else command.mutations[effect_index].key;
+        const effect_position = if (adopted) |selected| try selected.positions[effect_index].encode() else encoded_position;
+        @memcpy(value[32..], &effect_position);
+        const reference = artifactReferenceKey(authority, effect_key);
         const previous = txn.get(&reference) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -1298,6 +1340,87 @@ fn testEncodedProofAlloc(alloc: std.mem.Allocator, command: publication.Command)
         effect.* = .{ .family = mutation.family, .key = mutation.key, .source_index = mutation.source_index, .value_digest = digest, .value_bytes = if (mutation.value) |value| value.len else 0 };
     }
     return encodeAlloc(alloc, .{ .namespace = command.namespace, .authority_epoch = command.authority_epoch, .catalog_digest = command.catalog_digest, .producer_kind = command.producer_kind, .producer_name = command.producer_name, .producer_generation = command.producer_generation, .producer_artifact_name = command.producer_artifact_name, .producer_scope_key = command.producer_scope_key, .publication_digest = command.publication_digest, .input_digest = command.inputDigest(), .sources = command.sources, .artifact_sources = command.artifact_sources, .mutation_preconditions = command.mutation_preconditions, .effects = effects });
+}
+
+test "ordered artifact inventory adopted proof stages only selected receipts and references" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        values: std.StringHashMap([]u8),
+        pub fn get(self: *@This(), name: []const u8) anyerror![]const u8 {
+            return self.values.get(name) orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), name: []const u8, value: []const u8) !void {
+            const copied = try std.testing.allocator.dupe(u8, value);
+            errdefer std.testing.allocator.free(copied);
+            const entry = try self.values.getOrPut(name);
+            if (entry.found_existing) std.testing.allocator.free(entry.value_ptr.*) else entry.key_ptr.* = try std.testing.allocator.dupe(u8, name);
+            entry.value_ptr.* = copied;
+        }
+        pub fn delete(self: *@This(), name: []const u8) !void {
+            const entry = self.values.fetchRemove(name) orelse return error.NotFound;
+            std.testing.allocator.free(entry.key);
+            std.testing.allocator.free(entry.value);
+        }
+        fn deinit(self: *@This()) void {
+            var iter = self.values.iterator();
+            while (iter.next()) |entry| {
+                std.testing.allocator.free(entry.key_ptr.*);
+                std.testing.allocator.free(entry.value_ptr.*);
+            }
+            self.values.deinit();
+        }
+    };
+    var txn: Fake = .{ .values = std.StringHashMap([]u8).init(alloc) };
+    defer txn.deinit();
+    const sources = [_]publication.Source{
+        .{ .document_key = "a", .content_digest = @splat(1), .timestamp = 1, .input_position = null },
+        .{ .document_key = "b", .content_digest = @splat(2), .timestamp = 1, .input_position = null },
+    };
+    const output = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "a", "index");
+    defer alloc.free(output);
+    const effects = [_]Effect{.{ .family = .base_vector, .key = output, .source_index = 0, .value_digest = null, .value_bytes = 0 }};
+    var proof: Proof = .{
+        .namespace = @splat(1),
+        .authority_epoch = 4,
+        .catalog_digest = @splat(2),
+        .producer_kind = .index,
+        .producer_name = "index",
+        .producer_generation = 9,
+        .producer_artifact_name = "index",
+        .publication_digest = @splat(0),
+        .input_digest = undefined,
+        .sources = &sources,
+        .artifact_sources = &.{},
+        .effects = &effects,
+        .origin = .{ .source_pin = @splat(3), .namespace = @splat(4), .binding = .{ .epoch = 2, .digest = @splat(5), .semantic_digest = @splat(6), .effect_protocol = 15 }, .publication_digest = @splat(7), .input_digest = @splat(8), .proof_checksum = @splat(9), .selected_bitmap = &.{1} },
+    };
+    proof.input_digest = proof.inputCommand().inputDigest();
+    proof.publication_digest = proof.adoptionDigest();
+    try proof.validatePortableShape(alloc);
+    const encoded = try encodeAlloc(alloc, proof);
+    defer alloc.free(encoded);
+    var prepared = try prepareAdoptedDocumentReferences(alloc, proof);
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 1), prepared.entries.len);
+    // The imported output was written before the later adoption command.
+    const position: publication.Position = .{ .raft = .{ .term = 1, .index = 9 } };
+    const output_revision = try position.encode();
+    try std.testing.expectError(error.EnrichmentSourceChanged, stageAdoptedIndexed(&txn, proof, encoded, &.{position}, &prepared, 11));
+    try txn.put(&publication.artifactRevisionKey(proof.namespace, output), &output_revision);
+    try stageAdoptedIndexed(&txn, proof, encoded, &.{position}, &prepared, 11);
+    try stageAdoptedIndexed(&txn, proof, encoded, &.{position}, &prepared, 11);
+    try std.testing.expectEqualDeep(proof.publication_digest, (try publication.readReceipt(&txn, proof.inputCommand(), sources[0])).?.publication_digest);
+    try std.testing.expect((try publication.readReceipt(&txn, proof.inputCommand(), sources[1])) == null);
+    try std.testing.expectEqualSlices(u8, encoded, try txn.get(&key(proof.namespace, proof.publication_digest)));
+    try std.testing.expectEqualSlices(u8, &proof.publication_digest, try txn.get(prepared.entries[0].key));
+    try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, (try txn.get(&countKey(proof.namespace, proof.publication_digest)))[0..8], .little));
+    const artifact_reference = artifactReferenceKey(.{ .namespace = proof.namespace, .epoch = proof.authority_epoch, .catalog_digest = proof.catalog_digest }, output);
+    const stored_reference = try txn.get(&artifact_reference);
+    try std.testing.expectEqualSlices(u8, &output_revision, stored_reference[32..]);
+    try std.testing.expectError(error.NotFound, txn.get(output));
+    const later: publication.Position = .{ .raft = .{ .term = 1, .index = 12 } };
+    try txn.put(&publication.artifactRevisionKey(proof.namespace, output), &try later.encode());
+    try std.testing.expectError(error.EnrichmentSourceChanged, stageAdoptedIndexed(&txn, proof, encoded, &.{position}, &prepared, 11));
 }
 
 test "ordered artifact inventory document proof index tracks absence replacement and retirement" {
