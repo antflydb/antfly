@@ -22,7 +22,10 @@ pub const Field = struct { name: []const u8, values: []const Value };
 pub const Record = struct { type: []const u8, id: []const u8, fields: []const Field };
 pub const Endpoint = struct { entity: ?[]const u8 = null, span: ?target.Source = null };
 pub const Relation = struct { type: []const u8, head: Endpoint, tail: Endpoint };
-pub const Classification = struct { task: []const u8, labels: []const []const u8 };
+/// `probabilities`, when present, are soft targets (for example a teacher's
+/// calibrated scores) in the task's declared label order; `labels` still
+/// carries the hard decision that the task's cardinality validates.
+pub const Classification = struct { task: []const u8, labels: []const []const u8, probabilities: ?[]const f32 = null };
 pub const Row = struct {
     version: u32,
     id: []const u8,
@@ -426,7 +429,14 @@ fn parse(backing: Allocator, bytes: []const u8, options: Options, control: ?Cont
             if (std.mem.eql(u8, task.task.name, classification.task)) break i;
         } else return error.UnknownBoundaryTrainingLabel;
         try charge(&count, classification.labels.len, options.limits);
-        out.* = .{ .task = task, .labels = try labels(a, classification.labels, schema.schema.classifications[task].task.labels) };
+        const declared = schema.schema.classifications[task].task.labels;
+        const probabilities = if (classification.probabilities) |values| soft: {
+            if (values.len != declared.len) return error.InvalidBoundaryTrainingLabel;
+            for (values) |value| if (!std.math.isFinite(value) or value < 0 or value > 1) return error.InvalidBoundaryTrainingLabel;
+            try charge(&count, values.len, options.limits);
+            break :soft try a.dupe(f32, values);
+        } else null;
+        out.* = .{ .task = task, .labels = try labels(a, classification.labels, declared), .probabilities = probabilities };
     }
     try check(control);
     validators.options.compile_options.control = null;
@@ -604,4 +614,29 @@ test "boundary training dataset terminal operation rejects current cancellation 
     var sample = try dataset.sample(0, null, null);
     defer sample.deinit();
     try std.testing.expectEqualStrings("document-2", sample.row.id);
+}
+
+test "boundary dataset carries soft classification probabilities in declared label order" {
+    const a = std.testing.allocator;
+    const soft_row =
+        \\{"version":1,"id":"soft-1","text":"Ada paid","schema":{"entities":["person"],"classifications":[{"name":"topic","labels":["meeting","billing"]}]},"classifications":[{"task":"topic","labels":["billing"],"probabilities":[0.25,0.75]}]}
+    ;
+    var dataset = try Dataset.fromBytes(a, soft_row, .{}, null, null);
+    defer dataset.deinit();
+    var sample_ = try dataset.sample(0, null, null);
+    defer sample_.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, sample_.annotations.classifications[0].probabilities.?);
+    try std.testing.expectEqual(@as(usize, 1), sample_.annotations.classifications[0].labels[0]);
+    for ([_][]const u8{ "[0.25,0.75,0.0]", "[0.25,1.5]", "[-0.1,0.75]" }) |bad| {
+        const row = try std.mem.replaceOwned(u8, a, soft_row, "[0.25,0.75]", bad);
+        defer a.free(row);
+        // Rows are validated when loaded or, at the latest, when sampled.
+        var rejected = Dataset.fromBytes(a, row, .{}, null, null) catch continue;
+        defer rejected.deinit();
+        if (rejected.sample(0, null, null)) |value| {
+            var owned = value;
+            owned.deinit();
+            return error.TestExpectedError;
+        } else |_| {}
+    }
 }

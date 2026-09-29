@@ -8,8 +8,10 @@ const data = @import("boundary_dataset.zig");
 const run = @import("boundary_run.zig");
 const step = @import("boundary_train_step.zig");
 const helper = @import("boundary_train_step_test.zig");
+const objectives_mod = @import("boundary_train_objectives.zig");
 const processor = @import("../../pipelines/gliner_boundary_processor.zig");
 const native = @import("../../ops/native_compute.zig");
+const ml = @import("ml").graph;
 const bundle = @import("../../models/gliner_boundary_bundle.zig");
 const Tensor = @import("../../backends/tensor.zig").Tensor;
 const metal_runtime = @import("../../backends/metal_runtime.zig");
@@ -100,9 +102,6 @@ fn exerciseWithActivation(a: std.mem.Allocator, execution: controller.Execution,
 }
 
 fn exerciseWithBoundaryAttention(a: std.mem.Allocator, execution: controller.Execution, attention_profile: step.AttentionProfile, activation_profile: step.ActivationProfile, fused_boundary: bool) !void {
-    var samples = try dataset(a);
-    defer samples.deinit();
-    var tokenizer = helper.TestTokenizer{};
     var config = helper.config();
     if (fused_boundary) {
         config.head.boundary_dim = 32;
@@ -110,6 +109,23 @@ fn exerciseWithBoundaryAttention(a: std.mem.Allocator, execution: controller.Exe
         config.head.dropout = 0;
     }
     if (activation_profile == .layer_recompute_v1) config.encoder.num_hidden_layers = 2;
+    return exerciseConfig(a, execution, attention_profile, activation_profile, fused_boundary, config);
+}
+
+/// A two-layer ModernBERT trunk (one global, one local layer) under the same
+/// full and heads-only jobs, cancellation, limits, and durable resume.
+/// `replay_tiled_v1` selects the fused trunk attention.
+fn exerciseModernBert(a: std.mem.Allocator, execution: controller.Execution, attention_profile: step.AttentionProfile) !void {
+    var config = helper.config();
+    config.backbone = .modern_bert;
+    config.encoder = .{ .hidden_size = 4, .intermediate_size = 8, .num_hidden_layers = 2, .num_attention_heads = 2, .vocab_size = 512, .max_position_embeddings = 256, .position_buckets = 0, .layer_norm_eps = 1e-5, .hidden_dropout_prob = 0, .attention_probs_dropout_prob = 0, .pad_token_id = 0, .family = .modern_bert, .global_rope_theta = 160000, .local_rope_theta = 10000, .local_attention_window = 8, .global_attn_every_n_layers = 2 };
+    return exerciseConfig(a, execution, attention_profile, .retained_v1, false, config);
+}
+
+fn exerciseConfig(a: std.mem.Allocator, execution: controller.Execution, attention_profile: step.AttentionProfile, activation_profile: step.ActivationProfile, fused_boundary: bool, config: @import("../../models/gliner_boundary.zig").Config) !void {
+    var samples = try dataset(a);
+    defer samples.deinit();
+    var tokenizer = helper.TestTokenizer{};
     var first = try samples.sample(0, null, null);
     defer first.deinit();
     var prepared = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = first.row.text, .schema = &first.schema }}, .{});
@@ -140,7 +156,9 @@ fn exerciseWithBoundaryAttention(a: std.mem.Allocator, execution: controller.Exe
         for (dims, shape.dims[0..shape.rank_]) |*dim, size| dim.* = @intCast(size);
         // The zero-dropout classifier removes Sequential index two. Preserve
         // the released canonical name, as the real source/benchmark loader does.
-        const canonical = if (std.mem.eql(u8, name, "classifier.2.weight")) "classifier.3.weight" else if (std.mem.eql(u8, name, "classifier.2.bias")) "classifier.3.bias" else if (std.mem.startsWith(u8, name, "embeddings.") or std.mem.startsWith(u8, name, "encoder.")) try std.fmt.allocPrint(scratch, "encoder.{s}", .{name}) else name;
+        const encoder_name = std.mem.startsWith(u8, name, "embeddings.") or std.mem.startsWith(u8, name, "encoder.") or
+            (config.encoder.family == .modern_bert and (std.mem.startsWith(u8, name, "layers.") or std.mem.startsWith(u8, name, "final_norm.")));
+        const canonical = if (std.mem.eql(u8, name, "classifier.2.weight")) "classifier.3.weight" else if (std.mem.eql(u8, name, "classifier.2.bias")) "classifier.3.bias" else if (encoder_name) try std.fmt.allocPrint(scratch, "encoder.{s}", .{name}) else name;
         try parameters.append(scratch, .{ .name = name, .canonical_name = canonical, .dimensions = dims, .values = tensor.asFloat32(), .kind = .original });
     }
     const source = bundle.Identity{ .backbone = config.backbone, .precision = .fp32, .weight = bundle.Digest.of("immutable tiny test weights"), .sidecars = .{ bundle.Digest.of("model"), bundle.Digest.of("encoder"), bundle.Digest.of("tokenizer"), bundle.Digest.of("tokenizer config") } };
@@ -324,6 +342,26 @@ fn exerciseWithBoundaryAttention(a: std.mem.Allocator, execution: controller.Exe
             }
         }
     }
+}
+
+test "boundary native trainer composes ModernBERT full and heads jobs with cancellation and durable partial resume" {
+    try exerciseModernBert(std.testing.allocator, .native, .materialized_v1);
+}
+
+test "boundary native trainer resident Metal composes ModernBERT full and heads jobs with exact durable resume" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    try exerciseModernBert(std.testing.allocator, .resident_metal, .materialized_v1);
+}
+
+test "boundary native trainer composes ModernBERT fused-attention full and heads jobs with durable partial resume" {
+    try exerciseModernBert(std.testing.allocator, .native, .replay_tiled_v1);
+}
+
+test "boundary native trainer resident Metal composes ModernBERT fused-attention full and heads jobs with exact durable resume" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    try exerciseModernBert(std.testing.allocator, .resident_metal, .replay_tiled_v1);
 }
 
 test "boundary native trainer composes immutable batches full and heads training cancellation and durable partial resume" {
@@ -552,4 +590,440 @@ test "boundary native trainer CUDA fused boundary attention preserves durable re
     try @import("../../graph/resident_training_fixture.zig").CudaDevice.requireAvailable();
     try exerciseWithBoundaryAttention(std.testing.allocator, .resident_cuda, .materialized_v1, .retained_v1, true);
     try exerciseWithBoundaryAttention(std.testing.allocator, .resident_cuda, .replay_tiled_v1, .layer_recompute_v1, true);
+}
+
+/// Deterministic teacher states sized to each microbatch's student routes.
+const SyntheticTeacher = struct {
+    hidden: usize,
+    calls: usize = 0,
+
+    fn teacher(self: *SyntheticTeacher, salt: u8) trainer.Teacher {
+        var identity: [32]u8 = @splat(0);
+        identity[0] = salt;
+        return .{ .ptr = self, .identity = identity, .encode = encode };
+    }
+
+    const Owned = struct {
+        allocator: std.mem.Allocator,
+        values: [4][]f32,
+        fn release(raw: ?*anyopaque) void {
+            const self: *Owned = @ptrCast(@alignCast(raw.?));
+            for (self.values) |values| self.allocator.free(values);
+            self.allocator.destroy(self);
+        }
+    };
+
+    fn encode(raw: *anyopaque, a: std.mem.Allocator, items: []const processor.Item, student: *const processor.PreparedBatch, _: ?@import("../../execution_control.zig").InferenceExecutionControl) !trainer.TeacherStates {
+        const self: *SyntheticTeacher = @ptrCast(@alignCast(raw));
+        if (items.len != student.samples.len) return error.TestUnexpectedResult;
+        self.calls += 1;
+        const owned = try a.create(Owned);
+        owned.allocator = a;
+        const rows = [_]usize{ student.text_word_mask.len, student.query_marker_mask.len, student.cls_marker_mask.len, student.parent_marker_mask.len };
+        for (&owned.values, rows, 0..) |*values, count, route| {
+            values.* = try a.alloc(f32, count * self.hidden);
+            for (values.*, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i * 5 + route * 17 + 1)) * 0.41) + 0.25 * @as(f32, @floatFromInt(i % self.hidden));
+        }
+        return .{ .text = owned.values[0], .queries = owned.values[1], .classifications = owned.values[2], .parents = owned.values[3], .context = owned, .release = Owned.release };
+    }
+};
+
+const NeckedFixture = struct {
+    config: @import("../../models/gliner_boundary.zig").Config,
+    samples: data.Dataset,
+    tokenizer: helper.TestTokenizer = .{},
+    arena: std.heap.ArenaAllocator,
+    store: native.WeightStore,
+    parameters: std.ArrayListUnmanaged(run.Parameter) = .empty,
+    source: bundle.Identity,
+
+    fn init(self: *NeckedFixture, a: std.mem.Allocator, identity_neck: bool) !void {
+        var config = modernConfig();
+        config.neck = .linear;
+        return self.initConfig(a, config, identity_neck);
+    }
+
+    fn modernConfig() @import("../../models/gliner_boundary.zig").Config {
+        var config = helper.config();
+        config.backbone = .modern_bert;
+        config.encoder = .{ .hidden_size = 4, .intermediate_size = 8, .num_hidden_layers = 2, .num_attention_heads = 2, .vocab_size = 512, .max_position_embeddings = 256, .position_buckets = 0, .layer_norm_eps = 1e-5, .hidden_dropout_prob = 0, .attention_probs_dropout_prob = 0, .pad_token_id = 0, .family = .modern_bert, .global_rope_theta = 160000, .local_rope_theta = 10000, .local_attention_window = 8, .global_attn_every_n_layers = 2 };
+        return config;
+    }
+
+    fn initConfig(self: *NeckedFixture, a: std.mem.Allocator, config: @import("../../models/gliner_boundary.zig").Config, identity_neck: bool) !void {
+        self.* = .{ .config = config, .samples = try dataset(a), .arena = std.heap.ArenaAllocator.init(a), .store = .{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty }, .source = .{ .backbone = config.backbone, .precision = .fp32, .weight = bundle.Digest.of("immutable tiny test weights"), .sidecars = .{ bundle.Digest.of("model"), bundle.Digest.of("encoder"), bundle.Digest.of("tokenizer"), bundle.Digest.of("tokenizer config") } } };
+        errdefer self.deinit();
+        var first = try self.samples.sample(0, null, null);
+        defer first.deinit();
+        var prepared = try processor.prepare(a, self.tokenizer.tokenizer(), &.{.{ .text = first.row.text, .schema = &first.schema }}, .{});
+        defer prepared.deinit();
+        // Enroll every source tensor, heads included, as a full job's source has them.
+        var graph = try step.buildWithAttentionProfile(a, config, &prepared, &.{&first.schema}, .{}, .training, .materialized_v1, .{});
+        defer graph.deinit();
+        const scratch = self.arena.allocator();
+        const h = config.encoder.hidden_size;
+        for (graph.graph.parameters.items) |id| {
+            const node = graph.graph.node(id);
+            const borrowed_name = graph.graph.parameterName(node);
+            if (std.mem.startsWith(u8, borrowed_name, "__")) continue;
+            const name = try a.dupe(u8, borrowed_name);
+            var enrolled = false;
+            errdefer if (!enrolled) a.free(name);
+            const shape = node.output_shape;
+            const values = try scratch.alloc(f32, @intCast(shape.numElements().?));
+            for (values, 0..) |*v, index| v.* = if (std.mem.endsWith(u8, name, ".bias")) 0 else if (std.mem.indexOf(u8, name, "norm") != null) 1 else 0.05 * @sin(@as(f32, @floatFromInt(index + @as(usize, id) * 11 + 1)));
+            if (identity_neck and std.mem.eql(u8, name, "gliner_neck.weight")) for (values, 0..) |*v, index| {
+                v.* = if (index / h == index % h) 1 else 0;
+            };
+            var tensor = try Tensor.initFloat32(a, name, shape.dims[0..shape.rank_], values);
+            errdefer if (!enrolled) tensor.deinit();
+            try self.store.resident_weights.put(a, name, .{ .tensor = tensor });
+            enrolled = true;
+            const dims = try scratch.alloc(i32, shape.rank_);
+            for (dims, shape.dims[0..shape.rank_]) |*dim, size| dim.* = @intCast(size);
+            const encoder_name = std.mem.startsWith(u8, name, "embeddings.") or std.mem.startsWith(u8, name, "layers.") or std.mem.startsWith(u8, name, "final_norm.") or std.mem.startsWith(u8, name, "encoder.");
+            const canonical = if (std.mem.eql(u8, name, "classifier.2.weight")) "classifier.3.weight" else if (std.mem.eql(u8, name, "classifier.2.bias")) "classifier.3.bias" else if (encoder_name) try std.fmt.allocPrint(scratch, "encoder.{s}", .{name}) else name;
+            try self.parameters.append(scratch, .{ .name = name, .canonical_name = canonical, .dimensions = dims, .values = tensor.asFloat32(), .kind = .original });
+        }
+    }
+
+    fn deinit(self: *NeckedFixture) void {
+        self.store.deinitOwned();
+        self.arena.deinit();
+        self.samples.deinit();
+    }
+
+    fn options(teacher: trainer.Teacher) trainer.Options {
+        return .{ .run = .{ .mode = .full, .epochs = 1, .batch_size = 2, .accumulation = 1, .seed = 918, .encoder_lr = 0.001, .task_lr = 0.002 }, .source_reserved_bytes = 16 * 1024 * 1024, .distillation = .{ .teacher = teacher }, .limits = .{ .max_host_bytes = 256 * 1024 * 1024, .max_backend_bytes = 256 * 1024 * 1024, .max_combined_bytes = 1024 * 1024 * 1024 } };
+    }
+};
+
+test "boundary native trainer distills a necked ModernBERT from a teacher and leaves every head weight frozen" {
+    const a = std.testing.allocator;
+    var fixture: NeckedFixture = undefined;
+    try fixture.init(a, false);
+    defer fixture.deinit();
+    const config = fixture.config;
+    const parameters = fixture.parameters;
+    const source = fixture.source;
+    var teacher = SyntheticTeacher{ .hidden = config.encoder.hidden_size };
+    var options = NeckedFixture.options(teacher.teacher(1));
+    var distilled = try trainer.Trainer.init(a, &fixture.store, fixture.tokenizer.tokenizer(), source, config, &fixture.samples, parameters.items, options, null);
+    defer distilled.deinit();
+    var steps: usize = 0;
+    while (try distilled.next(null)) |report| {
+        const terms = report.terms orelse continue;
+        try std.testing.expect(terms.distillation > 0);
+        try std.testing.expectEqual(terms.distillation, terms.total);
+        steps += 1;
+    }
+    try std.testing.expect(steps > 0);
+    try std.testing.expectEqual(steps, teacher.calls);
+    var moved_trunk = false;
+    var moved_neck = false;
+    for (distilled.optimizer.owner.regular_params.items) |slot| {
+        const initial = for (parameters.items) |parameter| {
+            if (std.mem.eql(u8, parameter.name, slot.name)) break parameter.values;
+        } else return error.TestUnexpectedResult;
+        const changed = !std.mem.eql(f32, initial, slot.weights);
+        const trunk = std.mem.startsWith(u8, slot.name, "embeddings.") or std.mem.startsWith(u8, slot.name, "layers.") or std.mem.startsWith(u8, slot.name, "final_norm.");
+        if (std.mem.startsWith(u8, slot.name, "gliner_neck.")) {
+            moved_neck = moved_neck or changed;
+        } else if (trunk) {
+            moved_trunk = moved_trunk or changed;
+        } else if (changed) {
+            std.debug.print("head weight moved under pure distillation: {s}\n", .{slot.name});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(moved_trunk and moved_neck);
+    // The teacher identity and the objective bind into the run fingerprint.
+    options.distillation.?.teacher = teacher.teacher(2);
+    var other_teacher = try trainer.Trainer.init(a, &fixture.store, fixture.tokenizer.tokenizer(), source, config, &fixture.samples, parameters.items, options, null);
+    defer other_teacher.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &distilled.fingerprint, &other_teacher.fingerprint));
+    options.distillation = null;
+    var plain = try trainer.Trainer.init(a, &fixture.store, fixture.tokenizer.tokenizer(), source, config, &fixture.samples, parameters.items, options, null);
+    defer plain.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &distilled.fingerprint, &plain.fingerprint));
+}
+
+test "boundary native trainer fits an identity neck to the teacher before the first update" {
+    const a = std.testing.allocator;
+    var fixture: NeckedFixture = undefined;
+    try fixture.init(a, true);
+    defer fixture.deinit();
+    const h = fixture.config.encoder.hidden_size;
+    var teacher = SyntheticTeacher{ .hidden = h };
+    var options = NeckedFixture.options(teacher.teacher(1));
+    options.distillation.?.fit = .{ .rows = 5 };
+    var fitted = try trainer.Trainer.init(a, &fixture.store, fixture.tokenizer.tokenizer(), fixture.source, fixture.config, &fixture.samples, fixture.parameters.items, options, null);
+    defer fitted.deinit();
+    // The fit runs before training: the teacher saw the fit rows, and the
+    // optimizer's neck is no longer the identity.
+    try std.testing.expect(teacher.calls > 0);
+    var found = false;
+    for (fitted.optimizer.owner.regular_params.items) |slot| {
+        if (!std.mem.eql(u8, slot.name, "gliner_neck.weight")) continue;
+        found = true;
+        var identity = true;
+        for (slot.weights, 0..) |value, index| {
+            try std.testing.expect(std.math.isFinite(value));
+            identity = identity and value == @as(f32, if (index / h == index % h) 1 else 0);
+        }
+        try std.testing.expect(!identity);
+    }
+    try std.testing.expect(found);
+    // The fit settings are part of the run identity.
+    options.distillation.?.fit = .{};
+    var unfitted = try trainer.Trainer.init(a, &fixture.store, fixture.tokenizer.tokenizer(), fixture.source, fixture.config, &fixture.samples, fixture.parameters.items, options, null);
+    defer unfitted.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &fitted.fingerprint, &unfitted.fingerprint));
+    // A neck that is not the identity cannot be fitted this way.
+    var other: NeckedFixture = undefined;
+    try other.init(a, false);
+    defer other.deinit();
+    options.distillation.?.fit = .{ .rows = 5 };
+    try std.testing.expectError(error.BoundaryNeckFitNeedsIdentity, trainer.Trainer.init(a, &other.store, other.tokenizer.tokenizer(), other.source, other.config, &other.samples, other.parameters.items, options, null));
+}
+
+/// Records the first step's routed student states, concatenated.
+const StateRecorder = struct {
+    allocator: std.mem.Allocator,
+    states: ?[]f32 = null,
+    fn observer(self: *StateRecorder) @import("boundary_distillation.zig").Observer {
+        return .{ .ptr = self, .observe = observe };
+    }
+    fn observe(raw: *anyopaque, _: usize, groups: []const @import("boundary_distillation.zig").Group) !void {
+        const self: *StateRecorder = @ptrCast(@alignCast(raw));
+        if (self.states != null) return;
+        var total: usize = 0;
+        for (groups) |group| total += group.student.len;
+        const out = try self.allocator.alloc(f32, total);
+        var at: usize = 0;
+        for (groups) |group| {
+            @memcpy(out[at..][0..group.student.len], group.student);
+            at += group.student.len;
+        }
+        self.states = out;
+    }
+};
+
+fn firstStates(a: std.mem.Allocator, fixture: *NeckedFixture, execution: controller.Execution) ![]f32 {
+    const gib: usize = 1024 * 1024 * 1024;
+    var teacher = SyntheticTeacher{ .hidden = fixture.config.encoder.hidden_size };
+    var recorder = StateRecorder{ .allocator = a };
+    errdefer if (recorder.states) |states| a.free(states);
+    const options = trainer.Options{ .execution = execution, .run = .{ .mode = .full, .epochs = 1, .batch_size = 2, .accumulation = 1, .seed = 918, .encoder_lr = 0.001, .task_lr = 0.002 }, .source_reserved_bytes = 16 * 1024 * 1024, .distillation = .{ .teacher = teacher.teacher(3), .observer = recorder.observer() }, .limits = .{ .max_host_bytes = 4 * gib, .max_backend_bytes = 4 * gib, .max_combined_bytes = 12 * gib } };
+    var owner = try trainer.Trainer.init(a, &fixture.store, fixture.tokenizer.tokenizer(), fixture.source, fixture.config, &fixture.samples, fixture.parameters.items, options, null);
+    defer owner.deinit();
+    while (recorder.states == null) _ = (try owner.next(null)) orelse return error.TestUnexpectedResult;
+    return recorder.states.?;
+}
+
+test "boundary native trainer resident Metal first step computes the native objective" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // The published base head (two boundary-attention layers, window 128,
+    // pool 384) on the tiny ModernBERT trunk.
+    const boundary = @import("../../models/gliner_boundary.zig");
+    var published = NeckedFixture.modernConfig();
+    {
+        const bytes = try @import("../../util/c_file.zig").readFile(a, "testdata/gliner25/models/base/config.json");
+        defer a.free(bytes);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer parsed.deinit();
+        published.head = try boundary.parseHeadConfig(parsed.value.object.get("boundary_head").?.object);
+    }
+    // Real ModernBERT-base widths with two layers, and a width sweep.
+    const Width = struct { hidden: u32, heads: u32, intermediate: u32, layers: u32 = 2, vocab: u32 = 512, global_every: u32 = 3 };
+    const widths = [_]Width{.{ .hidden = 64, .heads = 4, .intermediate = 96, .layers = 2, .global_every = 2 }};
+    var configs: [3 + widths.len]struct { []const u8, boundary.Config } = undefined;
+    var deberta_wide = helper.config();
+    deberta_wide.encoder.hidden_size = 64;
+    deberta_wide.encoder.num_attention_heads = 4;
+    deberta_wide.encoder.intermediate_size = 256;
+    configs[0] = .{ "deberta-wide", deberta_wide };
+    configs[1] = .{ "modernbert", NeckedFixture.modernConfig() };
+    configs[2] = .{ "modernbert-published-head", published };
+    for (widths, configs[3..]) |width, *out| {
+        var wide = published;
+        wide.encoder.hidden_size = width.hidden;
+        wide.encoder.num_attention_heads = width.heads;
+        wide.encoder.intermediate_size = width.intermediate;
+        wide.encoder.num_hidden_layers = width.layers;
+        wide.encoder.vocab_size = width.vocab;
+        wide.encoder.global_attn_every_n_layers = width.global_every;
+        out.* = .{ "width", wide };
+    }
+    var mismatched = false;
+    for (configs) |entry| {
+        var fixture: NeckedFixture = undefined;
+        try fixture.initConfig(a, entry[1], false);
+        defer fixture.deinit();
+        const cpu = try firstStates(a, &fixture, .native);
+        defer a.free(cpu);
+        const metal = try firstStates(a, &fixture, .resident_metal);
+        defer a.free(metal);
+        var scale: f32 = 0;
+        var worst: f32 = 0;
+        for (cpu, metal) |want, got| {
+            scale = @max(scale, @abs(want));
+            worst = @max(worst, @abs(want - got));
+        }
+        const e = entry[1].encoder;
+        std.debug.print("{s} hidden={d} heads={d} layers={d} global_every={d}: routed states max |native - metal|={d} (scale {d})\n", .{ entry[0], e.hidden_size, e.num_attention_heads, e.num_hidden_layers, e.global_attn_every_n_layers, worst, scale });
+        if (worst > 1e-4 * @max(1, scale)) mismatched = true;
+    }
+    try std.testing.expect(!mismatched);
+}
+
+test "resident Metal ModernBERT encoder nodes match the interpreter" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const encoder_graph = @import("boundary_encoder_graph.zig");
+    const seeded = @import("../../graph/seeded_training.zig");
+    const interpreter = @import("../../graph/interpreter.zig");
+    const device_fixture = @import("../../graph/resident_training_fixture.zig");
+    var config = NeckedFixture.modernConfig();
+    config.encoder.hidden_size = 64;
+    config.encoder.num_attention_heads = 4;
+    config.encoder.intermediate_size = 96;
+    config.encoder.num_hidden_layers = 2;
+    config.encoder.global_attn_every_n_layers = 2;
+    var samples = try dataset(a);
+    defer samples.deinit();
+    var tokenizer = helper.TestTokenizer{};
+    var first = try samples.sample(0, null, null);
+    defer first.deinit();
+    var second = try samples.sample(1, null, null);
+    defer second.deinit();
+    var prepared = try processor.prepare(a, tokenizer.tokenizer(), &.{ .{ .text = first.row.text, .schema = &first.schema }, .{ .text = second.row.text, .schema = &second.schema } }, .{});
+    defer prepared.deinit();
+    const layout = try encoder_graph.layoutFromPrepared(&config, &prepared, .{});
+    var graph = ml.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.Builder.init(&graph);
+    var built = try encoder_graph.buildWithProfile(&builder, &config, layout, .train, .materialized_v1, .{});
+    defer built.deinit();
+    var names_list = std.ArrayListUnmanaged([]const u8).empty;
+    defer names_list.deinit(a);
+    var nodes_list = std.ArrayListUnmanaged(ml.NodeId).empty;
+    defer nodes_list.deinit(a);
+    for ([_][]const u8{ "embedding", "layer0", "encoder", "text", "queries", "classifications", "parents", "relations" }, [_]ml.NodeId{ built.regions.embedding_output, built.regions.layers[0].output, built.nodes.encoder, built.nodes.text, built.nodes.queries, built.nodes.classifications, built.nodes.parents, built.nodes.relation_queries }) |name, node| {
+        if (node == ml.null_node) continue;
+        try names_list.append(a, name);
+        try nodes_list.append(a, node);
+    }
+    const names = names_list.items;
+    const nodes = nodes_list.items;
+    const seeds = try a.alloc(ml.autodiff.Seed, nodes.len);
+    defer a.free(seeds);
+    for (nodes, seeds, 0..) |node, *seed, i| {
+        var name: [64]u8 = undefined;
+        seed.* = .{ .output = node, .cotangent = try builder.parameter(try std.fmt.bufPrint(&name, "__probe_cotangent_{d}", .{i}), graph.node(node).output_shape) };
+        try graph.markOutput(node);
+    }
+    var wrt = std.ArrayListUnmanaged(ml.NodeId).empty;
+    defer wrt.deinit(a);
+    // Deterministic weights and step bindings, as host values.
+    var host = std.ArrayListUnmanaged(struct { node: ml.NodeId, dims: []i32, f32s: ?[]f32 = null, i32s: ?[]const i32 = null }).empty;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    for (graph.parameters.items) |id| {
+        const node = graph.node(id);
+        const name = graph.parameterName(node);
+        if (std.mem.startsWith(u8, name, "__")) continue;
+        try wrt.append(a, id);
+        const shape = node.output_shape;
+        const values = try scratch.alloc(f32, @intCast(shape.numElements().?));
+        for (values, 0..) |*v, index| v.* = if (std.mem.indexOf(u8, name, "norm") != null) 1 else 0.05 * @sin(@as(f32, @floatFromInt(index + @as(usize, id) * 11 + 1)));
+        const dims = try scratch.alloc(i32, shape.rank_);
+        for (dims, shape.dims[0..shape.rank_]) |*d, size| d.* = @intCast(size);
+        try host.append(scratch, .{ .node = id, .dims = dims, .f32s = values });
+    }
+    var bound = try encoder_graph.bindPrepared(a, &built, &config, &prepared, .{ .seed = 1, .micro_batch = 0 });
+    defer bound.deinit();
+    for (bound.bindings) |binding| {
+        const dims = try scratch.alloc(i32, binding.shape.rank_);
+        for (dims, binding.shape.dims[0..binding.shape.rank_]) |*d, size| d.* = @intCast(size);
+        switch (binding.values) {
+            .f32 => |values| try host.append(scratch, .{ .node = binding.node, .dims = dims, .f32s = @constCast(values) }),
+            .i32 => |values| try host.append(scratch, .{ .node = binding.node, .dims = dims, .i32s = values }),
+        }
+    }
+    // Interpreter on the CPU.
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cpu = compute.computeBackend();
+    var cpu_inputs = std.ArrayListUnmanaged(interpreter.RuntimeInput).empty;
+    defer {
+        for (cpu_inputs.items) |input| cpu.free(input.value);
+        cpu_inputs.deinit(a);
+    }
+    for (host.items) |item| try cpu_inputs.append(a, .{ .node_id = item.node, .value = if (item.f32s) |v| try cpu.fromFloat32Shape(v, item.dims) else (try cpu.fromInt32Shape(item.i32s.?, item.dims)).? });
+    var reference = try interpreter.execute(a, &graph, &cpu, .{ .runtime_inputs = cpu_inputs.items, .strict_integer_constants = true });
+    defer reference.deinit(&cpu);
+    // The resident Metal training session.
+    var device = try device_fixture.Device.init(a);
+    defer device.deinit();
+    const metal = device.backend.computeBackend();
+    var metal_inputs = std.ArrayListUnmanaged(interpreter.RuntimeInput).empty;
+    defer {
+        for (metal_inputs.items) |input| metal.free(input.value);
+        metal_inputs.deinit(a);
+    }
+    for (host.items) |item| try metal_inputs.append(a, .{ .node_id = item.node, .value = if (item.f32s) |v| try metal.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = v, .shape = item.dims } }, .{}) else try metal.residentTrainingPrimitive(&.{ .upload_i32 = .{ .values = item.i32s.?, .shape = item.dims } }, .{}) });
+    var session = try seeded.Session.init(a, &graph, seeds, wrt.items, .{ .execution = .resident_metal, .allow_no_gradients = true });
+    defer session.deinit();
+    var tape = try session.forward(&metal, metal_inputs.items, .{ .binding = @splat(3), .optimizer_step = 0, .microbatch = 0 }, null);
+    defer tape.deinit();
+    var failed = false;
+    for (names, 0..) |name, i| {
+        const want = try cpu.toFloat32(reference.outputs[i], a);
+        defer a.free(want);
+        const got = try metal.toFloat32(try tape.logits(i), a);
+        defer a.free(got);
+        var worst: f32 = 0;
+        var scale: f32 = 0;
+        for (want, got) |w, g| {
+            worst = @max(worst, @abs(w - g));
+            scale = @max(scale, @abs(w));
+        }
+        std.debug.print("resident Metal {s}: max |interpreter - resident|={d} (scale {d})\n", .{ name, worst, scale });
+        failed = failed or worst > 1e-4 * @max(1, scale);
+    }
+    try std.testing.expect(!failed);
+}
+
+test "boundary native trainer fits the same neck on Metal as on the CPU" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fixture: NeckedFixture = undefined;
+    try fixture.init(a, true);
+    defer fixture.deinit();
+    var teacher = SyntheticTeacher{ .hidden = fixture.config.encoder.hidden_size };
+    var necks: [2][]f32 = undefined;
+    for ([_]controller.Execution{ .native, .resident_metal }, &necks) |execution, *out| {
+        var options = NeckedFixture.options(teacher.teacher(1));
+        options.execution = execution;
+        options.distillation.?.fit = .{ .rows = 5 };
+        var owner = try trainer.Trainer.init(a, &fixture.store, fixture.tokenizer.tokenizer(), fixture.source, fixture.config, &fixture.samples, fixture.parameters.items, options, null);
+        defer owner.deinit();
+        try owner.optimizer.ensureHostState(null);
+        out.* = for (owner.optimizer.owner.regular_params.items) |slot| {
+            if (std.mem.eql(u8, slot.name, "gliner_neck.weight")) break try a.dupe(f32, slot.weights);
+        } else return error.TestUnexpectedResult;
+    }
+    defer for (necks) |values| a.free(values);
+    var worst: f32 = 0;
+    for (necks[0], necks[1]) |cpu, metal| worst = @max(worst, @abs(cpu - metal));
+    std.debug.print("neck fit CPU vs Metal: max difference {d}\n", .{worst});
+    try std.testing.expect(worst < 1e-3);
 }

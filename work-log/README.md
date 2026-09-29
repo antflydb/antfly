@@ -59,6 +59,7 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../zig/ROADMAP.md).
 | Inference | [inference/ml-graph-ir-proposal.md](completed/inference/ml-graph-ir-proposal.md) | [GRAPH.md](../zig/pkg/inference/GRAPH.md) | Former ML.md: the superseded computation-graph IR proposal |
 | Inference | [inference/pjrt-status-history.md](completed/inference/pjrt-status-history.md) | [PJRT.md](../zig/pkg/inference/PJRT.md) | PJRT whole-model artifact status bullets |
 | Inference | [inference/gliner2/cuda-qualification-2026-07.md](completed/inference/gliner2/cuda-qualification-2026-07.md) | [gliner2/CUDA.md](../zig/pkg/inference/models/gliner2/CUDA.md) | July 2026 GLiNER2 CUDA environment, results, and route evidence |
+| Inference | [inference/laya/2026-09-26-longcontext-teacher.md](completed/inference/laya/2026-09-26-longcontext-teacher.md) | [laya/LAYA.md](../zig/pkg/inference/models/laya/LAYA.md#long-context-teacher-step-2a) | Long-context teacher (step 2a): Qwen3-14B via MLX label scoring, eligibility/timing/memory evidence, and full metrics |
 | Audio | [audio/benchmark-baseline-2026-04.md](completed/audio/benchmark-baseline-2026-04.md) | [AUDIO.md](../zig/lib/audio/AUDIO.md) | 2026-04-14 single-run codec benchmark baseline |
 
 ## Planned Features

@@ -29,6 +29,7 @@ const eval_gliner2_autodiff_adapter_dataset = @import("../tools/eval_gliner2_aut
 const eval_gliner2_boundary_head = @import("../eval/eval_gliner2_top_layer_boundary_head.zig");
 const eval_gliner2_boundary_task_head = @import("../eval/eval_gliner2_top_layer_boundary_task_head.zig");
 const eval_reranker_checkpoint = @import("../eval/eval_reranker_checkpoint.zig");
+const eval_laya = @import("../eval/eval_laya.zig");
 const generate_gemma4_multimodal_pilot_dataset = @import("../tools/generate_gemma4_multimodal_pilot_dataset.zig");
 const generate_gemma4_pilot_dataset = @import("../tools/generate_gemma4_pilot_dataset.zig");
 const inspect_colqwen2_checkpoint = @import("../tools/inspect_colqwen2_checkpoint.zig").Command(@import("inference_internal"));
@@ -159,6 +160,7 @@ const commands = [_]Command{
     .{ .domain = "train", .action = "run", .subject = "layoutlmv3-lora-token", .adapter_argv0 = "train-eval-layoutlmv3-lora-token", .main_fn = train_eval_layoutlmv3_lora_token.main },
 
     .{ .domain = "eval", .action = "run", .subject = "reranker-checkpoint", .adapter_argv0 = "eval-reranker-checkpoint", .main_fn = eval_reranker_checkpoint.main },
+    .{ .domain = "eval", .action = "run", .subject = "laya", .adapter_argv0 = "eval-laya", .main_fn = eval_laya.main },
     .{ .domain = "eval", .action = "run", .subject = "fused-chunker", .adapter_argv0 = "eval-fused-chunker", .main_fn = eval_fused_chunker.main },
     .{ .domain = "eval", .action = "run", .subject = "gliner2-adapter", .adapter_argv0 = "eval-gliner2-autodiff-adapter", .main_fn = eval_gliner2_autodiff_adapter.main },
     .{ .domain = "eval", .action = "run", .subject = "gliner2-adapter-dataset", .adapter_argv0 = "eval-gliner2-autodiff-adapter-dataset", .main_fn = eval_gliner2_autodiff_adapter_dataset.main },

@@ -201,6 +201,20 @@ pub const Instruction = struct {
                 geometry.work_items = attention.work_items;
                 geometry.control_readback_upper_bound_bytes = attention.scalar_readback_bytes;
             },
+            .fused_modernbert_training_attention_v1, .fused_modernbert_training_attention_backward_v1 => |attrs| {
+                const backward = self.op == .fused_modernbert_training_attention_backward_v1;
+                const layout = try attrs.layout();
+                if (n != (if (backward) @as(u8, 3) else 2) or
+                    !self.inputs[0].eq(layout.qkvShape()) or !self.inputs[1].eq(layout.controlShape()) or
+                    (backward and !self.inputs[2].eq(layout.outputShape())) or
+                    !self.output.eq(if (backward) layout.qkvShape() else layout.outputShape()))
+                    return error.InvalidResidentProgramShape;
+                const attention = @import("modernbert_training_attention.zig");
+                geometry.scratch_bytes = try attention.scratchBytes(attrs, backward);
+                // The control's retained host copy is validated per call.
+                geometry.host_metadata_bytes = geometry.input_elements[1] * 4;
+                geometry.work_items = try attention.workItems(attrs, backward);
+            },
             .reshape => |attrs| {
                 if (n != 1 or attrs.runtime_shape or !attrs.new_shape.eq(self.output) or
                     self.inputs[0].dtype != self.output.dtype or geometry.input_elements[0] != out_count)
