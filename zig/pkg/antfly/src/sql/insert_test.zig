@@ -225,3 +225,88 @@ test "SQL INSERT SELECT source failures and row quotas occur before mutation" {
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try std.testing.expect(fixture.source_closed);
 }
+
+test "SQL original prepared CTE INSERT captures source before one target mutation" {
+    // sql-0005: execute the body of the exact original PREPARE statement.
+    const alloc = std.testing.allocator;
+    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    defer corpus.deinit();
+    const original = for (corpus.value.object.get("entries").?.array.items) |entry| {
+        if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0005")) break entry.object.get("sql").?.string;
+    } else return error.TestMissingCorpusCase;
+    const separator = std.mem.indexOf(u8, original, " AS ") orelse return error.TestInvalidCorpusCase;
+    try std.testing.expectEqualStrings("PREPARE cte_insert_plan", original[0..separator]);
+    const PreparedCteFixture = struct {
+        pages: usize = 0,
+        closes: usize = 0,
+        generated: usize = 0,
+        commits: usize = 0,
+        fail_source: bool = false,
+
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .generate_row_id = generate, .mutate = mutate, .checkpoint = checkpoint } };
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+            const source = std.mem.eql(u8, name.table, "usage_records");
+            try std.testing.expectEqual(if (source) catalog.Action.read else catalog.Action.write, action);
+            try std.testing.expect(source or std.mem.eql(u8, name.table, "archived_records"));
+            return .{ .id = if (source) 1 else 2, .physical_name = name.table, .schema_version = 1, .columns = &.{.{ .name = "id", .path = "id", .type = .string }} };
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedScan;
+        }
+        fn open(ptr: *anyopaque, _: std.mem.Allocator, table: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            try std.testing.expectEqual(@as(u64, 1), table.id);
+            return .{ .ptr = ptr, .next = next, .close = close };
+        }
+        fn next(ptr: *anyopaque, allocator: std.mem.Allocator, _: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.pages += 1;
+            if (self.fail_source) return error.SourceReadFailed;
+            if (self.pages > 1) return .{ .rows = &.{} };
+            const rows = try allocator.alloc(catalog.Row, 2);
+            for (rows, 0..) |*row, i| {
+                var object: std.json.ObjectMap = .empty;
+                try object.put(allocator, "id", .{ .string = if (i == 0) "u1" else "u2" });
+                row.* = .{ .id = if (i == 0) "source-1" else "source-2", .version = 1, .value = .{ .object = object } };
+            }
+            return .{ .rows = rows };
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.closes += 1;
+        }
+        fn generate(ptr: *anyopaque, allocator: std.mem.Allocator) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.generated += 1;
+            return std.fmt.allocPrint(allocator, "archive-{d}", .{self.generated});
+        }
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 2), table.id);
+            try std.testing.expectEqual(@as(usize, 1), self.closes);
+            try std.testing.expectEqual(@as(usize, 2), mutations.len);
+            for (mutations, 0..) |mutation, i| {
+                try std.testing.expectEqualStrings(if (i == 0) "archive-1" else "archive-2", mutation.key);
+                try std.testing.expectEqualStrings(if (i == 0) "u1" else "u2", mutation.row.?.object.get("id").?.string);
+            }
+            self.commits += 1;
+            return .committed;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var fixture: PreparedCteFixture = .{};
+    var compiled = try compiler.compile(alloc, original[separator + " AS ".len ..], .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(alloc, fixture.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("INSERT", result.output.command_tag);
+    try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+    try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+    try std.testing.expectEqual(@as(usize, 2), fixture.generated);
+    fixture = .{ .fail_source = true };
+    try std.testing.expectError(error.SourceReadFailed, runtime.execute(alloc, fixture.backend(), &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 1), fixture.closes);
+    try std.testing.expectEqual(@as(usize, 0), fixture.generated);
+    try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+}

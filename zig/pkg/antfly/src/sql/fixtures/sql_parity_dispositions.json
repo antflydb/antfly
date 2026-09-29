@@ -138,7 +138,7 @@
     {
       "id": "sql-0005",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "The exact statement body now has a typed runtime regression: its CTE reads two source rows, releases the source cursor, generates distinct target identities, and submits one atomic INSERT batch; a source failure closes the cursor without generating IDs or submitting a mutation. This does not yet exercise the original PREPARE and EXECUTE sequence through mounted pgwire or prove a cross-owner native source/target commit, so protocol and distributed parity remain unresolved."
     },
     {
       "id": "sql-0006",
