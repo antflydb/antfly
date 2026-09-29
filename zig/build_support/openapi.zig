@@ -51,6 +51,7 @@ fn addGeneratedDirectory(
     source_path: std.Build.LazyPath,
     package_name: []const u8,
     generate_what: []const u8,
+    external_types_module: ?[]const u8,
     import_mappings: []const [2][]const u8,
 ) std.Build.LazyPath {
     return openapi_build.addGeneratedDirectory(b, .{
@@ -59,6 +60,7 @@ fn addGeneratedDirectory(
         .spec = source_path,
         .package_name = package_name,
         .generate = generate_what,
+        .external_types_module = external_types_module,
         .import_mappings = import_mappings,
         .zig_type_mappings = &.{
             .{ "raw_json", "@import(\"antfly-json\").RawValue" },
@@ -125,6 +127,20 @@ fn addGeneratedModule(
     generate_what: []const u8,
     import_mappings: []const [2][]const u8,
 ) GeneratedModule {
+    return addGeneratedModuleWithTypes(b, openapi_build, openapi_codegen, source_path, package_name, generated_dir, generate_what, null, import_mappings);
+}
+
+fn addGeneratedModuleWithTypes(
+    b: *std.Build,
+    comptime openapi_build: type,
+    openapi_codegen: *std.Build.Step.Compile,
+    source_path: std.Build.LazyPath,
+    package_name: []const u8,
+    generated_dir: []const u8,
+    generate_what: []const u8,
+    external_types_module: ?[]const u8,
+    import_mappings: []const [2][]const u8,
+) GeneratedModule {
     const provider_mappings = [_][2][]const u8{
         .{ "../shared/provider.yaml", "antfly_provider_openapi" },
         .{ "./provider.yaml", "antfly_provider_openapi" },
@@ -132,7 +148,7 @@ fn addGeneratedModule(
     };
     const mappings = std.mem.concat(b.allocator, [2][]const u8, &.{ &provider_mappings, import_mappings }) catch @panic("OOM");
     return .{
-        .directory = addGeneratedDirectory(b, openapi_build, openapi_codegen, source_path, package_name, generate_what, mappings),
+        .directory = addGeneratedDirectory(b, openapi_build, openapi_codegen, source_path, package_name, generate_what, external_types_module, mappings),
         .destination = generated_dir,
     };
 }
@@ -157,6 +173,18 @@ pub fn addOpenApiSourceSteps(
     const inference_generated_root = "pkg/inference/src/api/generated";
     const client_generated_root = "pkg/antfly-client/src/openapi/generated";
     const server_generated_root = "pkg/antfly-server-api/src/openapi/generated";
+    const metadata_mappings = &[_][2][]const u8{
+        .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
+        .{ "indexes.yaml", "antfly_indexes_openapi" },
+        .{ "sort.yaml", "antfly_sort_openapi" },
+        .{ "embeddings.yaml", "antfly_embeddings_openapi" },
+        .{ "schema.yaml", "antfly_schema_openapi" },
+        .{ "generating.yaml", "antfly_generating_api_openapi" },
+        .{ "eval.yaml", "antfly_eval_openapi" },
+        .{ "../shared/generating.yaml", "antfly_generating_openapi" },
+        .{ "reranking.yaml", "antfly_reranking_openapi" },
+        .{ "query.yaml", "antfly_query_openapi" },
+    };
     const public_spec = addPrefixedPublicOpenApiSpec(b);
     const modules = [_]GeneratedModule{
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/shared/provider.yaml"), "antfly_provider_openapi", antfly_generated_root ++ "/antfly_provider_openapi", "types", &.{}),
@@ -203,19 +231,10 @@ pub fn addOpenApiSourceSteps(
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/query.yaml"), "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi", "types", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/admin.yaml"), "antfly_admin_openapi", server_generated_root ++ "/antfly_admin_openapi", "types,server", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/internal.yaml"), "antfly_internal_openapi", server_generated_root ++ "/antfly_internal_openapi", "types,server", &.{}),
-        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/auth/api.yaml"), "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", "types,server", &.{}),
-        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", "types,server", &.{
-            .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
-            .{ "indexes.yaml", "antfly_indexes_openapi" },
-            .{ "sort.yaml", "antfly_sort_openapi" },
-            .{ "embeddings.yaml", "antfly_embeddings_openapi" },
-            .{ "schema.yaml", "antfly_schema_openapi" },
-            .{ "generating.yaml", "antfly_generating_api_openapi" },
-            .{ "eval.yaml", "antfly_eval_openapi" },
-            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "reranking.yaml", "antfly_reranking_openapi" },
-            .{ "query.yaml", "antfly_query_openapi" },
-        }),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/auth/api.yaml"), "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", "types", &.{}),
+        addGeneratedModuleWithTypes(b, openapi_build, openapi_codegen, b.path("../specs/openapi/auth/api.yaml"), "antfly_usermgr_server_openapi", server_generated_root ++ "/antfly_usermgr_server_openapi", "server", "antfly_usermgr_openapi", &.{}),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", "types", metadata_mappings),
+        addGeneratedModuleWithTypes(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_server_openapi", server_generated_root ++ "/antfly_metadata_server_openapi", "server", "antfly_metadata_openapi", metadata_mappings),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/shared/logging.yaml"), "antfly_logging_openapi", antfly_generated_root ++ "/antfly_logging_openapi", "types", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/audio.yaml"), "antfly_audio_openapi", antfly_generated_root ++ "/antfly_audio_openapi", "types", &.{
             .{ "../shared/s3.yaml", "antfly_s3_openapi" },
@@ -337,7 +356,9 @@ pub const CommittedModules = struct {
     admin: *std.Build.Module,
     internal: *std.Build.Module,
     usermgr: *std.Build.Module,
+    usermgr_server: *std.Build.Module,
     metadata: *std.Build.Module,
+    metadata_server: *std.Build.Module,
     logging: *std.Build.Module,
     audio: *std.Build.Module,
     middleware: *std.Build.Module,
@@ -361,7 +382,10 @@ pub const CommittedModules = struct {
 fn committedModule(b: *std.Build, options: CommittedOptions, name: []const u8, httpx: bool) *std.Build.Module {
     const root = if (std.mem.eql(u8, name, "antfly_client_openapi"))
         options.client_root
-    else if (std.mem.eql(u8, name, "antfly_admin_openapi") or std.mem.eql(u8, name, "antfly_internal_openapi"))
+    else if (std.mem.eql(u8, name, "antfly_admin_openapi") or
+        std.mem.eql(u8, name, "antfly_internal_openapi") or
+        std.mem.eql(u8, name, "antfly_metadata_server_openapi") or
+        std.mem.eql(u8, name, "antfly_usermgr_server_openapi"))
         options.server_root
     else
         options.root;
@@ -387,8 +411,10 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     const query_openapi_mod = committedModule(b, options, "antfly_query_openapi", false);
     const admin_openapi_mod = committedModule(b, options, "antfly_admin_openapi", true);
     const internal_openapi_mod = committedModule(b, options, "antfly_internal_openapi", true);
-    const usermgr_openapi_mod = committedModule(b, options, "antfly_usermgr_openapi", true);
-    const metadata_openapi_mod = committedModule(b, options, "antfly_metadata_openapi", true);
+    const usermgr_openapi_mod = committedModule(b, options, "antfly_usermgr_openapi", false);
+    const usermgr_server_openapi_mod = committedModule(b, options, "antfly_usermgr_server_openapi", true);
+    const metadata_openapi_mod = committedModule(b, options, "antfly_metadata_openapi", false);
+    const metadata_server_openapi_mod = committedModule(b, options, "antfly_metadata_server_openapi", true);
     const logging_openapi_mod = committedModule(b, options, "antfly_logging_openapi", false);
     const audio_openapi_mod = committedModule(b, options, "antfly_audio_openapi", false);
     const middleware_openapi_mod = committedModule(b, options, "antfly_middleware_openapi", false);
@@ -440,6 +466,11 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     client_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
     client_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
     metadata_openapi_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
+    usermgr_server_openapi_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
+    metadata_server_openapi_mod.addImport("antfly_metadata_openapi", metadata_openapi_mod);
+    metadata_server_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
+    metadata_server_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    metadata_server_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     metadata_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     metadata_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     metadata_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
@@ -487,7 +518,9 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
         .admin = admin_openapi_mod,
         .internal = internal_openapi_mod,
         .usermgr = usermgr_openapi_mod,
+        .usermgr_server = usermgr_server_openapi_mod,
         .metadata = metadata_openapi_mod,
+        .metadata_server = metadata_server_openapi_mod,
         .logging = logging_openapi_mod,
         .audio = audio_openapi_mod,
         .middleware = middleware_openapi_mod,

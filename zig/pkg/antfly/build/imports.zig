@@ -67,7 +67,9 @@ pub const AntflyRootImports = struct {
     admin_openapi: *std.Build.Module,
     internal_openapi: *std.Build.Module,
     metadata_openapi: *std.Build.Module,
+    metadata_server_openapi: *std.Build.Module,
     usermgr_openapi: *std.Build.Module,
+    usermgr_server_openapi: *std.Build.Module,
     logging_openapi: *std.Build.Module,
     audio_openapi: *std.Build.Module,
     middleware_openapi: *std.Build.Module,
@@ -142,7 +144,9 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_admin_openapi", .field = "admin_openapi" },
         .{ .name = "antfly_internal_openapi", .field = "internal_openapi" },
         .{ .name = "antfly_metadata_openapi", .field = "metadata_openapi" },
+        .{ .name = "antfly_metadata_server_openapi", .field = "metadata_server_openapi" },
         .{ .name = "antfly_usermgr_openapi", .field = "usermgr_openapi" },
+        .{ .name = "antfly_usermgr_server_openapi", .field = "usermgr_server_openapi" },
         .{ .name = "antfly_logging_openapi", .field = "logging_openapi" },
         .{ .name = "antfly_audio_openapi", .field = "audio_openapi" },
         .{ .name = "antfly_middleware_openapi", .field = "middleware_openapi" },
@@ -318,6 +322,8 @@ pub const AntflyRootImports = struct {
         "raft_engine",
         "toon",
         "usermgr_openapi",
+        "metadata_server_openapi",
+        "usermgr_server_openapi",
     };
 
     pub fn configureStorage(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {

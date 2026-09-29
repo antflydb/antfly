@@ -27,6 +27,7 @@ const docstore_mod = @import("../storage/docstore.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const metadata_server_openapi = @import("antfly_metadata_server_openapi");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const tables_api = @import("tables.zig");
@@ -542,7 +543,7 @@ pub fn parseBoundJoinRequestWithSecrets(alloc: std.mem.Allocator, body: []const 
     const wire = parsed.value.join orelse return null;
     var bound = try supportedBoundJoinFromWire(alloc, wire);
     errdefer bound.deinit(alloc);
-    var envelope = try metadata_openapi.server.parseQueryTableBody(alloc, body);
+    var envelope = try metadata_server_openapi.server.parseQueryTableBody(alloc, body);
     defer envelope.deinit();
     return .{ .join = bound, .foreign_sources = try foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolvedWithSecrets(alloc, envelope.value.foreign_sources, secrets) };
 }
@@ -1743,7 +1744,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     job_store.setContext(ctx);
     try ctx.ensureExecutionDeadline();
     const uses_foreign = joinUsesForeignSource(join, foreign_sources);
-    var contract_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
+    var contract_request = metadata_server_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
     defer contract_request.deinit();
     try ctx.ensureExecutionDeadline();
     const requested_left_field_strings = contract_request.value.fields orelse &.{};
@@ -4646,7 +4647,7 @@ pub fn parseSupportedJoinRequestWithSecrets(
     body: []const u8,
     secret_store: ?*@import("../common/secrets.zig").FileStore,
 ) !?ParsedSupportedJoinRequest {
-    var parsed_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
+    var parsed_request = metadata_server_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
     defer parsed_request.deinit();
     const join = parsed_request.value.join orelse return null;
     var owned_join = try supportedJoinRequestFromOpenApi(alloc, join);

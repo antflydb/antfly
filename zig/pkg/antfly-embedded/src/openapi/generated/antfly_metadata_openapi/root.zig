@@ -2,8 +2,6 @@
 // Package: antfly_metadata_openapi
 
 pub const types = @import("types.zig");
-pub const server = @import("server.zig");
-pub const ServerRouter = server.ServerRouter;
 
 pub const AgentDecision = types.AgentDecision;
 pub const AgentQuestion = types.AgentQuestion;

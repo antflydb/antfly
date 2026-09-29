@@ -151,6 +151,7 @@ pub const ModuleImport = struct {
 pub const OpenApiModuleOptions = struct {
     spec: std.Build.LazyPath,
     package_name: []const u8 = "api",
+    external_types_module: ?[]const u8 = null,
     generate: struct {
         types: bool = true,
         client: bool = false,
@@ -174,6 +175,8 @@ pub fn addOpenApiModule(dep: *std.Build.Dependency, b: *std.Build, opts: OpenApi
     codegen.addArgs(&.{"--spec"});
     codegen.addFileArg(opts.spec);
     codegen.addArgs(&.{ "--package", opts.package_name });
+    if (opts.external_types_module) |module_name|
+        codegen.addArgs(&.{ "--external-types-module", module_name });
 
     // Build --generate flag
     var gen_parts = std.ArrayListUnmanaged(u8).empty;

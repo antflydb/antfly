@@ -12,8 +12,9 @@ through declared Zig modules.
   Antfly inference provider adapters, C ABI, Lite CLI, shared local contracts,
   and their build owner.
 - `zig/pkg/inference`: native inference engine, host, worker, and CLI.
-- `zig/pkg/antfly-server-api`: Apache generated admin and internal schemas and
-  route interfaces consumed only by the server; it is not an embedded dependency.
+- `zig/pkg/antfly-server-api`: Apache generated admin/internal schemas and
+  metadata/auth route interfaces consumed only by the server; it is not an
+  embedded dependency.
 - `zig/pkg/antfly-client`: generated public HTTP client code and client SDK.
 - `zig/pkg/antfly`: ELv2 server orchestration, distributed coordination,
   network APIs, and its build owner. It may import the embedded engine.
@@ -25,7 +26,7 @@ formats, and WASM behavior remain the same.
 ## Migration
 
 1. Keep shared generated OpenAPI types in `antfly-embedded`, server-only
-   admin/internal output in `antfly-server-api`, the public HTTP client in
+   admin/internal output and metadata/auth routers in `antfly-server-api`, the public HTTP client in
    `antfly-client`, and inference output in `inference`. Keep the orchestrating
    code generation in neutral `zig/build_support`; move source-text tests with
    their source owners. Done on the licensing branch for those module families.
@@ -109,11 +110,12 @@ Generated Zig modules follow their consumers rather than the location of the
 authored YAML. Embedded database and provider contracts live under
 `pkg/antfly-embedded`, the public HTTP client under `pkg/antfly-client`,
 inference API contracts under `pkg/inference`, and server-only admin/internal
-modules under Apache `pkg/antfly-server-api`, imported by the ELv2 server.
-Metadata and auth modules remain shared because embedded local API code uses
-their types; generating them twice would create distinct Zig types. Their
-server router output currently shares a generated module with those types;
-splitting that router requires generator support for an external types import.
+modules and metadata/auth routers under Apache `pkg/antfly-server-api`,
+imported by the ELv2 server.
+Metadata and auth types remain shared because embedded local API code uses
+them; generating them twice would create distinct Zig types. Their server
+routers are generated into `antfly-server-api` with an external types-module
+import, so the server and embedded code use the same schema declarations.
 The neutral `zig/build_support/openapi.zig` orchestrates one deterministic
 generation/check step across all outputs. The boundary check must keep Lite,
 C API, and inference free of server-only imports.

@@ -293,7 +293,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     const admin_openapi_mod = openapi_modules.admin;
     const internal_openapi_mod = openapi_modules.internal;
     const usermgr_openapi_mod = openapi_modules.usermgr;
+    const usermgr_server_openapi_mod = openapi_modules.usermgr_server;
     const metadata_openapi_mod = openapi_modules.metadata;
+    const metadata_server_openapi_mod = openapi_modules.metadata_server;
     const logging_openapi_mod = openapi_modules.logging;
     const audio_openapi_mod = openapi_modules.audio;
     const middleware_openapi_mod = openapi_modules.middleware;
@@ -311,6 +313,17 @@ pub fn create(b: *std.Build) ?Artifacts {
     const openai_api_mod = openapi_modules.openai_api;
     const exa_api_mod = openapi_modules.exa_api;
     const tavily_api_mod = openapi_modules.tavily_api;
+
+    const openapi_split_test_mod = b.createModule(.{
+        .root_source_file = b.path("build_support/openapi_split_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    openapi_split_test_mod.addImport("antfly_metadata_openapi", metadata_openapi_mod);
+    openapi_split_test_mod.addImport("antfly_metadata_server_openapi", metadata_server_openapi_mod);
+    openapi_split_test_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
+    openapi_split_test_mod.addImport("antfly_usermgr_server_openapi", usermgr_server_openapi_mod);
+    openapi_check_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = openapi_split_test_mod })).step);
 
     // Handlebars template engine
     const handlebars_dep = b.dependency("handlebars", .{ .target = target, .optimize = optimize });
@@ -1011,7 +1024,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         .admin_openapi = admin_openapi_mod,
         .internal_openapi = internal_openapi_mod,
         .metadata_openapi = metadata_openapi_mod,
+        .metadata_server_openapi = metadata_server_openapi_mod,
         .usermgr_openapi = usermgr_openapi_mod,
+        .usermgr_server_openapi = usermgr_server_openapi_mod,
         .logging_openapi = logging_openapi_mod,
         .audio_openapi = audio_openapi_mod,
         .middleware_openapi = middleware_openapi_mod,

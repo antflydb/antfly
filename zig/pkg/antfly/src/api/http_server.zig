@@ -147,6 +147,8 @@ const generating_runtime = @import("../generating/mod.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
+const metadata_server_openapi = @import("antfly_metadata_server_openapi");
+const usermgr_server_openapi = @import("antfly_usermgr_server_openapi");
 const casbin = @import("antfly_casbin");
 const httpx = @import("httpx");
 const mcp = @import("antfly_mcp");
@@ -208,12 +210,12 @@ test "OCC version zero matches only an absent document" {
 
 fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.GlobalStatefulQueryRequest) {
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
-    return metadata_openapi.server.parseGlobalQueryBody(alloc, body);
+    return metadata_server_openapi.server.parseGlobalQueryBody(alloc, body);
 }
 
 fn parsePublicTableQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.StatefulQueryRequest) {
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
-    return metadata_openapi.server.parseQueryTableBody(alloc, body);
+    return metadata_server_openapi.server.parseQueryTableBody(alloc, body);
 }
 
 fn isNdjsonContentType(content_type: ?[]const u8) bool {
@@ -7271,7 +7273,7 @@ pub const ApiHttpServer = struct {
         request_context: managed_embedder.RequestContext,
     ) !contextual_operations.OwnedResponse {
         try request_context.check();
-        var parsed = metadata_openapi.server.parseQueryBuilderAgentBody(self.alloc, body) catch
+        var parsed = metadata_server_openapi.server.parseQueryBuilderAgentBody(self.alloc, body) catch
             return try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request");
         defer parsed.deinit();
         if (parsed.value.intent.len == 0)
@@ -25102,7 +25104,7 @@ pub const OwnedCreateApiKeyRequest = struct {
 };
 
 pub fn parseCreateUserRequest(alloc: std.mem.Allocator, body: []const u8, path_username: []const u8) !OwnedCreateUserRequest {
-    var parsed = try usermgr_openapi.server.parseCreateUserBody(alloc, body);
+    var parsed = try usermgr_server_openapi.server.parseCreateUserBody(alloc, body);
     defer parsed.deinit();
     if (parsed.value.password.len == 0) return error.InvalidCreateUserRequest;
 
@@ -25130,14 +25132,14 @@ pub fn parseCreateUserRequest(alloc: std.mem.Allocator, body: []const u8, path_u
 }
 
 pub fn parsePasswordUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
-    var parsed = try usermgr_openapi.server.parseUpdateUserPasswordBody(alloc, body);
+    var parsed = try usermgr_server_openapi.server.parseUpdateUserPasswordBody(alloc, body);
     defer parsed.deinit();
     if (parsed.value.new_password.len == 0) return error.InvalidPasswordUpdateRequest;
     return try alloc.dupe(u8, parsed.value.new_password);
 }
 
 pub fn parseCreateApiKeyRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedCreateApiKeyRequest {
-    var parsed = try usermgr_openapi.server.parseCreateApiKeyBody(alloc, body);
+    var parsed = try usermgr_server_openapi.server.parseCreateApiKeyBody(alloc, body);
     defer parsed.deinit();
     if (parsed.value.name.len == 0) return error.InvalidApiKeyRequest;
     const name = try alloc.dupe(u8, parsed.value.name);
@@ -25163,13 +25165,13 @@ pub fn parseCreateApiKeyRequest(alloc: std.mem.Allocator, body: []const u8) !Own
 }
 
 pub fn parsePermissionBody(alloc: std.mem.Allocator, body: []const u8) !usermgr.Permission {
-    var parsed = try usermgr_openapi.server.parseAddPermissionToUserBody(alloc, body);
+    var parsed = try usermgr_server_openapi.server.parseAddPermissionToUserBody(alloc, body);
     defer parsed.deinit();
     return try permissionFromOpenApi(alloc, parsed.value);
 }
 
 pub fn parseRoleAssignmentBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
-    var parsed = try usermgr_openapi.server.parseAddRoleToUserBody(alloc, body);
+    var parsed = try usermgr_server_openapi.server.parseAddRoleToUserBody(alloc, body);
     defer parsed.deinit();
     if (parsed.value.role.len == 0) return error.InvalidRole;
     return try alloc.dupe(u8, parsed.value.role);
@@ -25267,7 +25269,7 @@ fn cloneRowFiltersFromOpenApi(
     return out;
 }
 
-fn parseRemovePermissionFromUserParams(alloc: std.mem.Allocator, query: []const u8) !usermgr_openapi.server.RemovePermissionFromUserParams {
+fn parseRemovePermissionFromUserParams(alloc: std.mem.Allocator, query: []const u8) !usermgr_server_openapi.server.RemovePermissionFromUserParams {
     const resource = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "resource")) orelse return error.MissingResource;
     const resource_type = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "resourceType")) orelse return error.MissingResourceType;
     _ = usermgr.ResourceType.fromSlice(resource_type) catch return error.InvalidResourceType;
@@ -25277,7 +25279,7 @@ fn parseRemovePermissionFromUserParams(alloc: std.mem.Allocator, query: []const 
     };
 }
 
-fn parseRemoveRoleFromUserParams(alloc: std.mem.Allocator, query: []const u8) !usermgr_openapi.server.RemoveRoleFromUserParams {
+fn parseRemoveRoleFromUserParams(alloc: std.mem.Allocator, query: []const u8) !usermgr_server_openapi.server.RemoveRoleFromUserParams {
     const role = (try parseSimpleQueryParamDecodedAlloc(alloc, query, "role")) orelse return error.MissingRole;
     if (role.len == 0) return error.MissingRole;
     return .{ .role = role };
@@ -25321,7 +25323,7 @@ fn parseRestoreJobListOptions(alloc: std.mem.Allocator, query: []const u8) !ApiH
     return .{ .limit = limit, .cursor = cursor, .phase = phase, .scope = scope };
 }
 
-fn parseListTablesParams(alloc: std.mem.Allocator, query: []const u8) !metadata_openapi.server.ListTablesParams {
+fn parseListTablesParams(alloc: std.mem.Allocator, query: []const u8) !metadata_server_openapi.server.ListTablesParams {
     return .{
         .prefix = try parseSimpleQueryParamDecodedAlloc(alloc, query, "prefix"),
         .pattern = try parseSimpleQueryParamDecodedAlloc(alloc, query, "pattern"),
@@ -52978,7 +52980,7 @@ test "system catalog binds primary and nested joins once without conflating lite
 
 test "system catalog row filter path decoding preserves exact star and escaped percent" {
     const alloc = std.testing.allocator;
-    const params = usermgr_openapi.server.SetRowFilterParams{ .database = "default", .namespace = "public" };
+    const params = usermgr_server_openapi.server.SetRowFilterParams{ .database = "default", .namespace = "public" };
     const star = try scopedRowFilterKeyAlloc(alloc, "%2A", params);
     defer alloc.free(star);
     const escaped = try scopedRowFilterKeyAlloc(alloc, "%252A", params);

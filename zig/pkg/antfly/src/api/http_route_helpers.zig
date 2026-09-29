@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const metadata_server_openapi = @import("antfly_metadata_server_openapi");
 const query_contract = @import("query_contract.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 
@@ -470,7 +471,7 @@ fn parseScanKeysRequestImpl(alloc: std.mem.Allocator, body: []const u8, allow_in
         } else false;
     } else false;
 
-    var parsed = metadata_openapi.server.parseScanKeysBody(alloc, body) catch |err| switch (err) {
+    var parsed = metadata_server_openapi.server.parseScanKeysBody(alloc, body) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidQueryRequest,
     };

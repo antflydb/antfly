@@ -21,6 +21,7 @@ pub const GenerateOptions = struct {
     spec: std.Build.LazyPath,
     package_name: []const u8,
     generate: []const u8,
+    external_types_module: ?[]const u8 = null,
     import_mappings: []const [2][]const u8 = &.{},
     zig_type_mappings: []const [2][]const u8 = &.{},
     /// Named component -> JSON pointer into the original document. Keeps
@@ -47,6 +48,8 @@ pub fn addGeneratedDirectory(b: *std.Build, options: GenerateOptions) std.Build.
     codegen.addArg("--spec");
     codegen.addFileArg(json_spec);
     codegen.addArgs(&.{ "--package", options.package_name, "--generate", options.generate });
+    if (options.external_types_module) |module_name|
+        codegen.addArgs(&.{ "--external-types-module", module_name });
     for (options.import_mappings) |mapping| {
         codegen.addArgs(&.{ "--import-mapping", b.fmt("{s}={s}", .{ mapping[0], mapping[1] }) });
     }

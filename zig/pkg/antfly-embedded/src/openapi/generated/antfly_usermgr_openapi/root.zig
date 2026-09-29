@@ -2,8 +2,6 @@
 // Package: antfly_usermgr_openapi
 
 pub const types = @import("types.zig");
-pub const server = @import("server.zig");
-pub const ServerRouter = server.ServerRouter;
 
 pub const ApiKey = types.ApiKey;
 pub const ApiKeyWithSecret = types.ApiKeyWithSecret;

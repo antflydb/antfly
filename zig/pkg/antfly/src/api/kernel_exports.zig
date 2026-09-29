@@ -31,6 +31,8 @@ const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
+const metadata_server_openapi = @import("antfly_metadata_server_openapi");
+const usermgr_server_openapi = @import("antfly_usermgr_server_openapi");
 const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
 
 pub const CreateContext = abi.CreateContext;
@@ -650,7 +652,7 @@ fn routeMetadata(method: abi.HttpMethod, path: []const u8) RouteMetadata {
         .delete => "DELETE",
         .patch => "PATCH",
     };
-    inline for (.{ metadata_openapi.server.routes, usermgr_openapi.server.routes }) |routes| {
+    inline for (.{ metadata_server_openapi.server.routes, usermgr_server_openapi.server.routes }) |routes| {
         for (routes) |route| {
             if (std.mem.eql(u8, route.method, method_name) and metadataPathMatches(route.path, path)) {
                 return .{

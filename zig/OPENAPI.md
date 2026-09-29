@@ -74,10 +74,11 @@ Generated embedded/shared Antfly API modules live under:
 pkg/antfly-embedded/src/openapi/generated/
 ```
 
-Server-only admin and internal route modules live under
+Server-only admin/internal modules and metadata/auth routers live under
 `pkg/antfly-server-api/src/openapi/generated/`. The public HTTP client module
 lives under `pkg/antfly-client/src/openapi/generated/`. Metadata and auth types
-remain shared with embedded local APIs and are generated only once.
+remain shared with embedded local APIs and are generated only once; the server
+routers use `--external-types-module` to import them.
 
 The generated inference API module lives under:
 

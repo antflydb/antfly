@@ -199,13 +199,17 @@ class ApacheBoundaryTests(unittest.TestCase):
         self.assertTrue(any("unreviewed module" in error for error in errors))
 
     def test_rejects_server_only_generated_api(self):
-        _, errors = self.check_fixture(
-            'const admin = @import("antfly_admin_openapi");',
-            {
-                "zig/pkg/antfly-server-api/src/openapi/generated/antfly_admin_openapi/root.zig": "",
-            },
-        )
-        self.assertTrue(any("embedded product imports server-only API" in error for error in errors))
+        for module in ("antfly_admin_openapi", "antfly_metadata_server_openapi"):
+            with self.subTest(module=module):
+                _, errors = self.check_fixture(
+                    f'const server = @import("{module}");',
+                    {
+                        f"zig/pkg/antfly-server-api/src/openapi/generated/{module}/root.zig": "",
+                    },
+                )
+                self.assertTrue(
+                    any("embedded product imports server-only API" in error for error in errors)
+                )
 
     def test_rejects_server_import_inside_shared_module(self):
         seen, errors = self.check_fixture(
