@@ -118,9 +118,13 @@ Command counts and typed reads prove the update and subsequent deletion;
 component fixtures also cover source-failure-before-write and versioned
 mutation after the captured self-read closes. These supersede the original
 catalog/admin PREPARE interpretation, not distributed failover coverage.
-`sql-0008` has exact protocol and typed MERGE component evidence, but its
-atomic read-set mock is not an owner-issued range-proof commit. Mounted native
-and distributed fault evidence remain missing, so it stays unresolved.
+`sql-0008` has exact protocol and typed MERGE component evidence. Authenticated
+mounted HTTP preparation defers work, then execution carries a captured self-
+read range proof into one guarded native commit; source conflicts, unknown
+outcomes, and failed proof acquisition have distinct no-replay behavior. This
+fixture mocks proof issuance and commit, so real owner-validated range-proof
+commit, mounted pgwire/native execution, and distributed fault evidence remain
+missing. It stays unresolved.
 `sql-0037`, `sql-0039`, `sql-0041`, `sql-0043`, and `sql-0046` are tested
 supersessions of catalog/admin session mutations. Their exact public-namespace
 and one-millisecond timeout commands run through the pgwire session state

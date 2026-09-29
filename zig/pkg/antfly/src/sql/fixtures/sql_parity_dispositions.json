@@ -178,10 +178,11 @@
     {
       "id": "sql-0008",
       "status": "unresolved",
-      "reason": "The exact original prepared CTE MERGE body executes in a typed component fixture with an atomic statement-read-set capability, one captured self-read, two versioned writes after capture closes, and source failure before mutation. The exact pgwire PREPARE/EXECUTE sequence is covered separately. Mounted owner range-proof commit and distributed fault evidence remain missing.",
+      "reason": "The exact prepared CTE MERGE body executes in a typed component fixture with atomic statement-read-set capability, captured self-read, versioned writes after capture closes, and source failure before mutation. The exact pgwire PREPARE/EXECUTE sequence is covered separately. Authenticated mounted HTTP preparation defers execution, then carries a captured self-read range proof into one guarded native commit; source conflict and unknown-outcome receipts stay distinct, and proof acquisition failure prevents commit. The mounted proof source and commit are test fakes, not a real owner-validated range-proof transaction or mounted pgwire/native execution, so the case remains unresolved.",
       "evidence": [
         {"path": "zig/pkg/antfly/src/sql/joined_mutation_test.zig", "test": "SQL original prepared CTE UPDATE DELETE and MERGE capture before one mutation", "gate": "sql-original-prepared-cte-runtime"},
-        {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE", "gate": "pgwire-original-prepared-cte"}
+        {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE", "gate": "pgwire-original-prepared-cte"},
+        {"path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL API cross-table MERGE retains both source and target range proofs", "gate": "sql-mounted-merge"}
       ]
     },
     {

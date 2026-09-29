@@ -1623,6 +1623,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
         source_conflict: bool = false,
         unknown_commit: bool = false,
         fail_source_proof: bool = false,
+        fail_merge_proof: bool = false,
         expression_case: bool = false,
         conditional_case: bool = false,
         skip_case: bool = false,
@@ -1633,6 +1634,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
         grouped_predicate_case: bool = false,
         cte_case: bool = false,
         prepared_cte_insert_case: bool = false,
+        prepared_cte_merge_case: bool = false,
         prepared_cte_batches: usize = 0,
         archive_id: u64 = 5,
         target_guard: bool = false,
@@ -1685,7 +1687,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
         fn proofs(ptr: *anyopaque, alloc: std.mem.Allocator, index: usize) ![]reads.RelationalStatementRead.OwnerRangeProof {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const table_id = self.states[index].table_id;
-            if (table_id != 3 and self.fail_source_proof) return error.TestProofUnavailable;
+            if ((table_id != 3 and self.fail_source_proof) or (table_id == 3 and self.prepared_cte_merge_case and self.fail_merge_proof)) return error.TestProofUnavailable;
             const group_id: u64 = if (table_id == 3) 5 else if (table_id == 4) 7 else 9;
             const range_id: u64 = if (table_id == 3) 6 else if (table_id == 4) 8 else 10;
             const observations = try alloc.dupe(@import("range_read_guards.zig").Proof, &.{.{ .bucket = @intCast(table_id), .generation = 1 }});
@@ -1714,7 +1716,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
         }
         fn normalize(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const db_types.BatchWrite) ![]db_types.BatchWrite {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(@as(usize, if (self.skip_case or self.delete_case) 0 else if (self.returning_case or self.insert_returning_case or self.cte_case or self.prepared_cte_insert_case) 1 else 2), writes.len);
+            try std.testing.expectEqual(@as(usize, if (self.skip_case or self.delete_case) 0 else if (self.returning_case or self.insert_returning_case or self.cte_case or self.prepared_cte_insert_case or self.prepared_cte_merge_case) 1 else 2), writes.len);
             return alloc.dupe(db_types.BatchWrite, writes);
         }
         fn close(_: *anyopaque) void {}
@@ -1735,6 +1737,29 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
         }
         fn commit(ptr: *anyopaque, alloc: std.mem.Allocator, _: db_types.TxnId, _: u64, tables: []const contract.TableCommitRequest, _: db_types.SyncLevel) !?contract.CommitOutcome {
             const self: *Self = @ptrCast(@alignCast(ptr));
+            if (self.prepared_cte_merge_case) {
+                try std.testing.expectEqual(@as(usize, 1), tables.len);
+                const table = tables[0];
+                try std.testing.expectEqualStrings("physical_usage", table.table_name);
+                try std.testing.expect(table.range_guards.len != 0);
+                for (table.range_guards) |guard| {
+                    try std.testing.expectEqual(@as(u64, 3), guard.fence.table_id);
+                    try std.testing.expectEqual(@as(u64, 3), guard.fence.route.identity_namespace.table_id);
+                    try std.testing.expectEqual(@as(?u64, 1), guard.proofs[0].generation);
+                }
+                try std.testing.expectEqual(@as(usize, 1), table.writes.len);
+                try std.testing.expectEqual(@as(usize, 1), table.predicates.len);
+                try std.testing.expectEqualStrings("row-a", table.writes[0].key);
+                try std.testing.expectEqual(@as(u64, 42), table.predicates[0].expected_version);
+                const row = try std.json.parseFromSlice(std.json.Value, alloc, table.writes[0].value, .{});
+                defer row.deinit();
+                try std.testing.expectEqualStrings("old", row.value.object.get("status").?.string);
+                self.commit_attempts += 1;
+                if (self.source_conflict) return .{ .conflict = .{ .table_name = "physical_usage", .key = "row-a", .message = "self-read range changed", .retryable = true } };
+                if (self.unknown_commit) return error.TestTransportFailure;
+                self.commits += 1;
+                return .{ .committed = .{ .participant_count = 1 } };
+            }
             try std.testing.expectEqual(@as(usize, 2), tables.len);
             for (tables) |table| {
                 if (std.mem.eql(u8, table.table_name, "physical_usage")) {
@@ -2359,6 +2384,81 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
     try std.testing.expectEqual(@as(i64, 1), insert_result.value.rows_affected);
     try std.testing.expectEqual(captures_before_insert + 1, fake.captures);
     try std.testing.expectEqual(batches_before_insert + 1, fake.prepared_cte_batches);
+    // sql-0008: the original CTE-backed self-MERGE must carry the source and
+    // target range decision into one guarded native commit. This mounted API
+    // fixture uses an owner-proof fake; the actual owner validation remains a
+    // separate release gate.
+    fake.prepared_cte_insert_case = false;
+    fake.prepared_cte_merge_case = true;
+    const original_cte_merge = for (parsed.value.object.get("entries").?.array.items) |entry| {
+        if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0008")) break entry.object.get("sql").?.string;
+    } else return error.TestMissingCorpusCase;
+    const merge_separator = std.mem.indexOf(u8, original_cte_merge, " AS ") orelse return error.TestInvalidCorpusCase;
+    const merge_body = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .statement = original_cte_merge[merge_separator + " AS ".len ..] }, .{});
+    defer std.testing.allocator.free(merge_body);
+    const captures_before_merge = fake.captures;
+    const attempts_before_merge = fake.commit_attempts;
+    var merge_prepare_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/db/v1/sql/prepared");
+    defer merge_prepare_request.deinit();
+    merge_prepare_request.body = merge_body;
+    var merge_prepare_context = httpx.Context.init(std.testing.allocator, std.testing.io, &merge_prepare_request);
+    defer merge_prepare_context.deinit();
+    var merge_prepare_response = try handler.prepareSQL(&merge_prepare_context);
+    defer merge_prepare_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), merge_prepare_response.status.code);
+    try std.testing.expectEqual(captures_before_merge, fake.captures);
+    try std.testing.expectEqual(attempts_before_merge, fake.commit_attempts);
+    const merge_prepared = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, merge_prepare_response.body.?, .{});
+    defer merge_prepared.deinit();
+    const merge_prepared_id = merge_prepared.value.object.get("prepared_id").?.string;
+    var merge_execute_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/db/v1/sql/prepared/execute");
+    defer merge_execute_request.deinit();
+    merge_execute_request.body = "{}";
+    var merge_execute_context = httpx.Context.init(std.testing.allocator, std.testing.io, &merge_execute_request);
+    defer merge_execute_context.deinit();
+    var merge_execute_response = try handler.executePreparedSQL(&merge_execute_context, merge_prepared_id);
+    defer merge_execute_response.deinit();
+    if (merge_execute_response.status.code != 200) std.debug.print("sql-0008: {s}\n", .{merge_execute_response.body orelse ""});
+    try std.testing.expectEqual(@as(u16, 200), merge_execute_response.status.code);
+    const merge_result = try std.json.parseFromSlice(wire.SQLResponse, std.testing.allocator, merge_execute_response.body.?, .{});
+    defer merge_result.deinit();
+    try std.testing.expectEqualStrings("MERGE", merge_result.value.command_tag);
+    try std.testing.expectEqual(@as(i64, 1), merge_result.value.rows_affected);
+    try std.testing.expectEqual(captures_before_merge + 1, fake.captures);
+    try std.testing.expectEqual(attempts_before_merge + 1, fake.commit_attempts);
+    for ([_]struct { conflict: bool, code: []const u8, retryable: bool }{
+        .{ .conflict = true, .code = "40001", .retryable = true },
+        .{ .conflict = false, .code = "40003", .retryable = false },
+    }) |fault| {
+        fake.source_conflict = fault.conflict;
+        fake.unknown_commit = !fault.conflict;
+        const captures_before_fault = fake.captures;
+        const attempts_before_fault = fake.commit_attempts;
+        const commits_before_fault = fake.commits;
+        var fault_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/db/v1/sql/prepared/execute");
+        defer fault_request.deinit();
+        fault_request.body = "{}";
+        var fault_context = httpx.Context.init(std.testing.allocator, std.testing.io, &fault_request);
+        defer fault_context.deinit();
+        var fault_response = try handler.executePreparedSQL(&fault_context, merge_prepared_id);
+        defer fault_response.deinit();
+        try std.testing.expectEqual(@as(u16, 409), fault_response.status.code);
+        const fault_diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, std.testing.allocator, fault_response.body.?, .{});
+        defer fault_diagnostic.deinit();
+        try std.testing.expectEqualStrings(fault.code, fault_diagnostic.value.code);
+        try std.testing.expectEqual(@as(?bool, fault.retryable), fault_diagnostic.value.retryable);
+        try std.testing.expectEqual(captures_before_fault + 1, fake.captures);
+        try std.testing.expectEqual(attempts_before_fault + 1, fake.commit_attempts);
+        try std.testing.expectEqual(commits_before_fault, fake.commits);
+    }
+    fake.source_conflict = false;
+    fake.unknown_commit = false;
+    fake.fail_merge_proof = true;
+    const attempts_before_proof_failure = fake.commit_attempts;
+    var failed_proof = try compiler.compile(std.testing.allocator, original_cte_merge[merge_separator + " AS ".len ..], .{});
+    defer failed_proof.deinit();
+    try std.testing.expectError(error.TestProofUnavailable, adapter.execute(std.testing.allocator, &failed_proof, &.{}, .{}, null));
+    try std.testing.expectEqual(attempts_before_proof_failure, fake.commit_attempts);
 }
 
 test "SQL document reads reject the relational stateless fallback before transport" {
