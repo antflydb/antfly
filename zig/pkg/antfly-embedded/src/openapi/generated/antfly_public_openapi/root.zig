@@ -2,7 +2,6 @@
 // Package: antfly_public_openapi
 
 pub const types = @import("types.zig");
-pub const server = @import("server.zig");
 
 pub const AgentDecision = types.AgentDecision;
 pub const AgentQuestion = types.AgentQuestion;

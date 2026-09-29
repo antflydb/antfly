@@ -185,20 +185,23 @@ pub fn addOpenApiSourceSteps(
         .{ "reranking.yaml", "antfly_reranking_openapi" },
         .{ "query.yaml", "antfly_query_openapi" },
     };
+    const public_mappings = &[_][2][]const u8{
+        .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
+        .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
+        .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
+        .{ "specs/openapi/antfly/embeddings.yaml", "antfly_embeddings_openapi" },
+        .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
+        .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
+        .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
+        .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
+        .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
+    };
+    const joined_public_spec = addJoinedPublicOpenApiSpec(b);
     const public_spec = addPrefixedPublicOpenApiSpec(b);
     const modules = [_]GeneratedModule{
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/shared/provider.yaml"), "antfly_provider_openapi", antfly_generated_root ++ "/antfly_provider_openapi", "types", &.{}),
-        addGeneratedModule(b, openapi_build, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi", "types,extractors", &.{
-            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
-            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
-            .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
-            .{ "specs/openapi/antfly/embeddings.yaml", "antfly_embeddings_openapi" },
-            .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
-            .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
-            .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
-            .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
-        }),
+        addGeneratedModule(b, openapi_build, openapi_codegen, joined_public_spec, "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi", "types", public_mappings),
+        addGeneratedModuleWithTypes(b, openapi_build, openapi_codegen, joined_public_spec, "antfly_public_server_openapi", server_generated_root ++ "/antfly_public_server_openapi", "extractors", "antfly_public_openapi", public_mappings),
         addGeneratedModule(b, openapi_build, openapi_codegen, public_spec, "antfly_client_openapi", client_generated_root ++ "/antfly_client_openapi", "types,client", &.{
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
@@ -345,6 +348,7 @@ pub const CommittedOptions = struct {
 
 pub const CommittedModules = struct {
     public: *std.Build.Module,
+    public_server: *std.Build.Module,
     client: *std.Build.Module,
     schema: *std.Build.Module,
     graph_identifier: *std.Build.Module,
@@ -382,7 +386,8 @@ pub const CommittedModules = struct {
 fn committedModule(b: *std.Build, options: CommittedOptions, name: []const u8, httpx: bool) *std.Build.Module {
     const root = if (std.mem.eql(u8, name, "antfly_client_openapi"))
         options.client_root
-    else if (std.mem.eql(u8, name, "antfly_admin_openapi") or
+    else if (std.mem.eql(u8, name, "antfly_public_server_openapi") or
+        std.mem.eql(u8, name, "antfly_admin_openapi") or
         std.mem.eql(u8, name, "antfly_internal_openapi") or
         std.mem.eql(u8, name, "antfly_metadata_server_openapi") or
         std.mem.eql(u8, name, "antfly_usermgr_server_openapi"))
@@ -401,6 +406,7 @@ fn committedModule(b: *std.Build, options: CommittedOptions, name: []const u8, h
 
 pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) CommittedModules {
     const public_openapi_mod = committedModule(b, options, "antfly_public_openapi", false);
+    const public_server_openapi_mod = committedModule(b, options, "antfly_public_server_openapi", false);
     const client_openapi_mod = committedModule(b, options, "antfly_client_openapi", true);
     const schema_openapi_mod = committedModule(b, options, "antfly_schema_openapi", false);
     const graph_identifier_openapi_mod = committedModule(b, options, "antfly_graph_identifier_openapi", false);
@@ -433,6 +439,10 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     reranking_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
     public_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
     client_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    public_server_openapi_mod.addImport("antfly_public_openapi", public_openapi_mod);
+    public_server_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
+    public_server_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    public_server_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     const generating_api_openapi_mod = committedModule(b, options, "antfly_generating_api_openapi", false);
     const extraction_openapi_mod = committedModule(b, options, "antfly_extraction_openapi", false);
     extraction_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -507,6 +517,7 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     metadata_openapi_mod.addImport("antfly-json", options.json);
     return .{
         .public = public_openapi_mod,
+        .public_server = public_server_openapi_mod,
         .client = client_openapi_mod,
         .schema = schema_openapi_mod,
         .graph_identifier = graph_identifier_openapi_mod,

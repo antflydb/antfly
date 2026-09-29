@@ -56,6 +56,7 @@ pub const AntflyRootImports = struct {
     embedded_openapi: *std.Build.Module,
     raft_engine: *std.Build.Module,
     public_openapi: *std.Build.Module,
+    public_server_openapi: *std.Build.Module,
     client_openapi: *std.Build.Module,
     schema_openapi: *std.Build.Module,
     indexes_openapi: *std.Build.Module,
@@ -133,6 +134,7 @@ pub const AntflyRootImports = struct {
     const import_table = [_]struct { name: []const u8, field: []const u8 }{
         .{ .name = "raft_engine", .field = "raft_engine" },
         .{ .name = "antfly_public_openapi", .field = "public_openapi" },
+        .{ .name = "antfly_public_server_openapi", .field = "public_server_openapi" },
         .{ .name = "antfly_client_openapi", .field = "client_openapi" },
         .{ .name = "antfly_schema_openapi", .field = "schema_openapi" },
         .{ .name = "antfly_indexes_openapi", .field = "indexes_openapi" },
@@ -322,6 +324,7 @@ pub const AntflyRootImports = struct {
         "raft_engine",
         "toon",
         "usermgr_openapi",
+        "public_server_openapi",
         "metadata_server_openapi",
         "usermgr_server_openapi",
     };

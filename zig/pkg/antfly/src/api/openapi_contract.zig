@@ -17,6 +17,9 @@ const std = @import("std");
 const request_admission_policy = @import("request_admission_policy.zig");
 
 pub const generated = @import("antfly_public_openapi");
+pub const public_server_generated = @import("antfly_public_server_openapi");
+pub const metadata_server_generated = @import("antfly_metadata_server_openapi");
+pub const usermgr_server_generated = @import("antfly_usermgr_server_openapi");
 pub const client_generated = @import("antfly_client_openapi");
 pub const schema_generated = @import("antfly_schema_openapi");
 pub const indexes_generated = @import("antfly_indexes_openapi");
@@ -455,7 +458,7 @@ test "indexes openapi rejects stats without discriminator" {
 }
 
 test "generated extractors: path param structs exist" {
-    const server = generated.server;
+    const server = public_server_generated.server;
     try std.testing.expect(@hasField(server.GetTablePathParams, "table_name"));
     try std.testing.expect(@hasField(server.CreateTablePathParams, "table_name"));
     try std.testing.expect(@hasField(server.LookupKeyPathParams, "table_name"));
@@ -465,7 +468,7 @@ test "generated extractors: path param structs exist" {
 }
 
 test "generated extractors: route table covers public API" {
-    const server = generated.server;
+    const server = public_server_generated.server;
     try std.testing.expect(server.routes.len >= 33);
     var found_get_status = false;
     var found_create_table = false;
@@ -502,7 +505,7 @@ test "generated extractors: route table covers public API" {
 }
 
 test "generated route policy inventory is unique and describes wire modes" {
-    const server = generated.server;
+    const server = public_server_generated.server;
     var found_buffered_query = false;
     var found_streaming_retrieval = false;
     var found_streaming_research = false;
@@ -617,8 +620,8 @@ test "usermgr openapi module is generated and wired" {
 }
 
 test "usermgr openapi module generates extractor surface for routed endpoints" {
-    const server = usermgr_generated.server;
-    try std.testing.expect(@hasDecl(usermgr_generated, "server"));
+    const server = usermgr_server_generated.server;
+    try std.testing.expect(@hasDecl(usermgr_server_generated, "server"));
     try std.testing.expect(@hasDecl(server, "parseCreateUserBody"));
     try std.testing.expect(@hasDecl(server, "parseUpdateUserPasswordBody"));
     try std.testing.expect(@hasDecl(server, "parseAddPermissionToUserBody"));
@@ -796,8 +799,8 @@ test "metadata openapi module resolves shared refs through owner modules" {
 }
 
 test "metadata openapi module generates extractor surface for routed endpoints" {
-    const server = metadata_generated.server;
-    try std.testing.expect(@hasDecl(metadata_generated, "server"));
+    const server = metadata_server_generated.server;
+    try std.testing.expect(@hasDecl(metadata_server_generated, "server"));
     try std.testing.expect(@hasDecl(server, "parseRetrievalAgentBody"));
     try std.testing.expect(@hasDecl(server, "parseEvaluateBody"));
     try std.testing.expect(@hasDecl(server, "parseQueryBuilderAgentBody"));

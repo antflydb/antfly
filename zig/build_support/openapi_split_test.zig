@@ -14,12 +14,19 @@
 // limitations under the License.
 
 const std = @import("std");
+const public = @import("antfly_public_openapi");
+const public_server = @import("antfly_public_server_openapi");
 const metadata = @import("antfly_metadata_openapi");
 const metadata_server = @import("antfly_metadata_server_openapi");
 const usermgr = @import("antfly_usermgr_openapi");
 const usermgr_server = @import("antfly_usermgr_server_openapi");
 
 test "server parsers use the same schema types as embedded code" {
+    const public_result = @TypeOf(public_server.server.parseQueryBuilderAgentBody(undefined, undefined));
+    try std.testing.expect(@typeInfo(public_result).error_union.payload == std.json.Parsed(public.QueryBuilderRequest));
+    try std.testing.expect(!@hasDecl(public, "server"));
+    try std.testing.expect(!@hasDecl(metadata, "server"));
+    try std.testing.expect(!@hasDecl(usermgr, "server"));
     const metadata_result = @TypeOf(metadata_server.server.parseQueryTableBody(undefined, undefined));
     const usermgr_result = @TypeOf(usermgr_server.server.parseCreateUserBody(undefined, undefined));
     try std.testing.expect(@typeInfo(metadata_result).error_union.payload == std.json.Parsed(metadata.StatefulQueryRequest));

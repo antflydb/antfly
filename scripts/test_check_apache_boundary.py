@@ -199,7 +199,7 @@ class ApacheBoundaryTests(unittest.TestCase):
         self.assertTrue(any("unreviewed module" in error for error in errors))
 
     def test_rejects_server_only_generated_api(self):
-        for module in ("antfly_admin_openapi", "antfly_metadata_server_openapi"):
+        for module in ("antfly_admin_openapi", "antfly_metadata_server_openapi", "antfly_usermgr_server_openapi", "antfly_public_server_openapi"):
             with self.subTest(module=module):
                 _, errors = self.check_fixture(
                     f'const server = @import("{module}");',

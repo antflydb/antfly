@@ -13,7 +13,7 @@ through declared Zig modules.
   and their build owner.
 - `zig/pkg/inference`: native inference engine, host, worker, and CLI.
 - `zig/pkg/antfly-server-api`: Apache generated admin/internal schemas and
-  metadata/auth route interfaces consumed only by the server; it is not an
+  public/metadata/auth route interfaces consumed only by the server; it is not an
   embedded dependency.
 - `zig/pkg/antfly-client`: generated public HTTP client code and client SDK.
 - `zig/pkg/antfly`: ELv2 server orchestration, distributed coordination,
@@ -26,8 +26,9 @@ formats, and WASM behavior remain the same.
 ## Migration
 
 1. Keep shared generated OpenAPI types in `antfly-embedded`, server-only
-   admin/internal output and metadata/auth routers in `antfly-server-api`, the public HTTP client in
-   `antfly-client`, and inference output in `inference`. Keep the orchestrating
+   admin/internal output and public, metadata, and auth extractors and routers
+   in `antfly-server-api`, the public HTTP client in `antfly-client`, and
+   inference output in `inference`. Keep the orchestrating
    code generation in neutral `zig/build_support`; move source-text tests with
    their source owners. Done on the licensing branch for those module families.
 2. Move the inference host, worker execution, and transport into `inference`.
@@ -110,11 +111,11 @@ Generated Zig modules follow their consumers rather than the location of the
 authored YAML. Embedded database and provider contracts live under
 `pkg/antfly-embedded`, the public HTTP client under `pkg/antfly-client`,
 inference API contracts under `pkg/inference`, and server-only admin/internal
-modules and metadata/auth routers under Apache `pkg/antfly-server-api`,
-imported by the ELv2 server.
-Metadata and auth types remain shared because embedded local API code uses
-them; generating them twice would create distinct Zig types. Their server
-routers are generated into `antfly-server-api` with an external types-module
+modules and public, metadata, and auth extractors and routers under Apache
+`pkg/antfly-server-api`, imported by the ELv2 server.
+Public, metadata, and auth types remain shared because embedded local API
+code uses them; generating them twice would create distinct Zig types. Their
+server extractors and routers are generated into `antfly-server-api` with an external types-module
 import, so the server and embedded code use the same schema declarations.
 The neutral `zig/build_support/openapi.zig` orchestrates one deterministic
 generation/check step across all outputs. The boundary check must keep Lite,

@@ -1540,6 +1540,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "usermgr openapi module generates extractor surface for routed endpoints",
+        "generated extractors: path param structs exist",
+        "generated extractors: route table covers public API",
         "artifact enrichment accepts typed chunker and rejects ambiguous legacy config",
         "artifact enrichment list does not expose internal JSON or producer credentials",
         "typed enrichment producer and graph scorer normalize to legacy storage fields",

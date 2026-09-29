@@ -284,6 +284,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .export_modules = true,
     });
     const public_openapi_mod = openapi_modules.public;
+    const public_server_openapi_mod = openapi_modules.public_server;
     const client_openapi_mod = openapi_modules.client;
     const schema_openapi_mod = openapi_modules.schema;
     const indexes_openapi_mod = openapi_modules.indexes;
@@ -314,15 +315,38 @@ pub fn create(b: *std.Build) ?Artifacts {
     const exa_api_mod = openapi_modules.exa_api;
     const tavily_api_mod = openapi_modules.tavily_api;
 
-    const openapi_split_test_mod = b.createModule(.{
-        .root_source_file = b.path("build_support/openapi_split_test.zig"),
-        .target = target,
+    // Schema checks execute on the build host even during cross compilation.
+    const openapi_check_json = b.createModule(.{
+        .root_source_file = b.path("lib/json/src/mod.zig"),
+        .target = b.graph.host,
         .optimize = optimize,
     });
-    openapi_split_test_mod.addImport("antfly_metadata_openapi", metadata_openapi_mod);
-    openapi_split_test_mod.addImport("antfly_metadata_server_openapi", metadata_server_openapi_mod);
-    openapi_split_test_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
-    openapi_split_test_mod.addImport("antfly_usermgr_server_openapi", usermgr_server_openapi_mod);
+    const openapi_check_httpx = b.createModule(.{
+        .root_source_file = b.path("lib/httpx/src/httpx.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    openapi_check_httpx.addImport("antfly-json", openapi_check_json);
+    const openapi_check_modules = pkg_antfly_build_codegen.createCommittedModules(b, .{
+        .root = b.path("pkg/antfly-embedded/src/openapi/generated"),
+        .client_root = b.path("pkg/antfly-client/src/openapi/generated"),
+        .server_root = b.path("pkg/antfly-server-api/src/openapi/generated"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .httpx = openapi_check_httpx,
+        .json = openapi_check_json,
+    });
+    const openapi_split_test_mod = b.createModule(.{
+        .root_source_file = b.path("build_support/openapi_split_test.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    openapi_split_test_mod.addImport("antfly_public_openapi", openapi_check_modules.public);
+    openapi_split_test_mod.addImport("antfly_public_server_openapi", openapi_check_modules.public_server);
+    openapi_split_test_mod.addImport("antfly_metadata_openapi", openapi_check_modules.metadata);
+    openapi_split_test_mod.addImport("antfly_metadata_server_openapi", openapi_check_modules.metadata_server);
+    openapi_split_test_mod.addImport("antfly_usermgr_openapi", openapi_check_modules.usermgr);
+    openapi_split_test_mod.addImport("antfly_usermgr_server_openapi", openapi_check_modules.usermgr_server);
     openapi_check_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = openapi_split_test_mod })).step);
 
     // Handlebars template engine
@@ -1013,6 +1037,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         }),
         .raft_engine = raft_engine_mod,
         .public_openapi = public_openapi_mod,
+        .public_server_openapi = public_server_openapi_mod,
         .client_openapi = client_openapi_mod,
         .schema_openapi = schema_openapi_mod,
         .indexes_openapi = indexes_openapi_mod,
