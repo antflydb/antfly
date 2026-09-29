@@ -239,7 +239,7 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
     const kinds = try a.alloc(i32, ids.len);
     const type_mask = try a.alloc(f32, ids.len * cfg.hidden_size);
     const markers = try a.alloc(i32, l.questions * l.options);
-    const anchors = try a.alloc(i32, l.questions);
+    const anchors = try a.alloc(i32, l.questions * l.options);
     const positions = try a.alloc(i64, ids.len);
     var question: usize = 0;
     for (examples, 0..) |e, row| {
@@ -259,7 +259,7 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
             // The decision's [CLS]: its branch anchor, or the unpacked
             // sequence's first token.
             const anchor: usize = if (e.packed_row) |p| @intCast(p.row.anchors[qi]) else 0;
-            anchors[question] = @intCast(row * l.sequence + anchor);
+            @memset(anchors[question * l.options ..][0..l.options], @intCast(row * l.sequence + anchor));
             @memset(markers[question * l.options ..][0..l.options], @intCast(row * l.sequence));
             for (q.markers, 0..) |pos, i| markers[question * l.options + i] = @intCast(row * l.sequence + @as(usize, @intCast(pos)));
             question += 1;

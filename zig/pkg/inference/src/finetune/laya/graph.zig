@@ -74,7 +74,7 @@ pub const Inputs = struct {
     kinds: Id, // per token; trunk tokens use any valid index with type_mask 0
     type_mask: Id, // [N,H], 0 where a token receives no question-type embedding
     markers: Id, // flattened batch-offset token indices, [questions*options]
-    anchors: Id, // flattened batch-offset token index of each decision's [CLS], [questions]; read by the pointer head
+    anchors: Id, // flattened batch-offset token index of each option's decision [CLS], [questions*options]; read by the pointer head
     encoder_bias: Id, // [B*encoder_heads,S,S], padding and tree visibility
     local_bias: Id, // encoder_bias plus the logical sliding window
     head_bias: Id, // [B*head_heads,S,S], padding and tree visibility
@@ -280,7 +280,7 @@ pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f3
         .kinds = try b.parameter("__laya_kinds", Shape.init(.i32, &.{n})),
         .type_mask = try b.parameter("__laya_type_mask", Shape.init(.f32, &.{ n, h })),
         .markers = try b.parameter("__laya_markers", Shape.init(.i32, &.{l.questions * l.options})),
-        .anchors = try b.parameter("__laya_anchors", Shape.init(.i32, &.{l.questions})),
+        .anchors = try b.parameter("__laya_anchors", Shape.init(.i32, &.{l.questions * l.options})),
         .encoder_bias = try b.parameter("__laya_encoder_bias", Shape.init(.f32, &.{ l.batch * nh, l.sequence, l.sequence })),
         .local_bias = try b.parameter("__laya_local_bias", Shape.init(.f32, &.{ l.batch * nh, l.sequence, l.sequence })),
         .head_bias = try b.parameter("__laya_head_bias", Shape.init(.f32, &.{ l.batch * hh, l.sequence, l.sequence })),
@@ -363,16 +363,20 @@ pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f3
         // Pointer head: scaled dot product of the anchor's query projection
         // with each option marker's key projection.
         const p: u32 = @intCast(lc.pointer_dim);
-        // LayerNorm is per row, so normalizing every row once and gathering
-        // equals normalizing the gathered rows (and declares it once).
-        const xn = try norm(b, x, "pointer.norm", h, 1e-5, true);
-        const anchor = try b.gather(xn, result.inputs.anchors, Shape.init(.f32, &.{ l.questions, h }));
-        const options = try b.gather(xn, result.inputs.markers, Shape.init(.f32, &.{ l.questions * l.options, h }));
-        const q = try linear(b, &result, anchor, "pointer.q", l.questions, h, p, true, null);
+        // Gather from the head output (as the scorer does), then normalize
+        // both row sets with one shared `pointer.norm`. Gathering from a
+        // LayerNorm output returns row 0 for every index on resident Metal
+        // training (LAYA.md, "Pointer head").
+        const norm_w = try param(b, "pointer.norm", "weight", &.{h});
+        const norm_b = try param(b, "pointer.norm", "bias", &.{h});
+        const anchor_rows = try b.gather(x, result.inputs.anchors, Shape.init(.f32, &.{ l.questions * l.options, h }));
+        const anchor = b.graph.node(try b.layerNorm(anchor_rows, norm_w, norm_b, h, 1e-5)).vjp_alternate;
+        const options = b.graph.node(try b.layerNorm(m, norm_w, norm_b, h, 1e-5)).vjp_alternate;
+        const q = try linear(b, &result, anchor, "pointer.q", l.questions * l.options, h, p, true, null);
         const k = try linear(b, &result, options, "pointer.k", l.questions * l.options, h, p, true, null);
-        const keys = try b.reshape(k, Shape.init(.f32, &.{ l.questions, l.options, p }));
-        const query = try b.reshape(q, Shape.init(.f32, &.{ l.questions, p, 1 }));
-        const scores = try b.matmul3D(keys, query);
+        const product = try b.mul(q, k);
+        const scores = try b.reduceSum(product, &.{1});
+        inline for (.{ .{ "pointer.anchor", anchor }, .{ "pointer.options", options }, .{ "pointer.q", q }, .{ "pointer.k", k }, .{ "pointer.product", product }, .{ "pointer.scores", scores } }) |t| try result.trace(b.graph.allocator, t[0], t[1]);
         const scaled = try b.mul(scores, try b.scalarConst(.f32, 1 / @sqrt(@as(f32, @floatFromInt(p)))));
         result.logits = try b.reshape(scaled, Shape.init(.f32, &.{ l.questions, l.options }));
         return result;

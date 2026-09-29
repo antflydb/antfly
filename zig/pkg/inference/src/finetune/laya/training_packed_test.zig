@@ -132,6 +132,83 @@ test "laya packed training graph matches packed serving logits, alone and in a p
     };
 }
 
+// Every parameter gradient of a packed pointer-head model agrees between the
+// native and the resident Metal training backends. Guards the resident Metal
+// gather-from-LayerNorm fault that made every pointer score identical.
+test "laya pointer head gradients agree between native and resident Metal" {
+    if (!@import("build_options").enable_metal or !@import("../../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const interpreter = @import("../../graph/interpreter.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", scratch);
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    try synthetic.writeModelWith(a, std.testing.io, dir, "{\"mode\":\"question\"}", ",\"decision_head\":\"pointer\"", 128, 719);
+    const config = try modern.parseConfig(scratch, try files.readFileFromDir(scratch, dir, "config.json"));
+    var examples: [states.len]train.Example = undefined;
+    for (&examples, states) |*e, state| e.* = try packedExample(scratch, (try tree.build(scratch, tok, config.laya.?, state, &questions, null))[0]);
+    const l = try train.bucketedLayout(&examples, config);
+    var results: [2][][]f32 = undefined;
+    var names: [][]const u8 = undefined;
+    for ([_]train.controller.Execution{ .native, .resident_metal }, &results) |execution, *out| {
+        var program = try train.Program.init(a, config, l, 0);
+        defer program.deinit();
+        var weights = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ dir, "model.safetensors" }));
+        defer weights.deinit();
+        const parameters = try train.parameters(scratch, &program.graph, &weights, 0, null, 0);
+        const originals = try scratch.alloc(run.Parameter, parameters.len);
+        for (parameters, originals) |p, *o| o.* = .{ .name = p.name, .canonical_name = p.name, .dimensions = p.dimensions, .values = p.values, .kind = .original };
+        var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        const owner = try backend.Owner.init(a, &store, originals, parameters, execution, .{}, null);
+        defer owner.deinit();
+        var cpu_vtable: @import("../../ops/ops.zig").ComputeBackend.VTable = undefined;
+        @import("cpu.zig").install(&owner.cb, &cpu_vtable);
+        const cb = &owner.cb;
+        var trainer = try train.controller.Trainer.init(a, cb, parameters, .{ .execution = execution, .limits = .{ .max_state_bytes = 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } } } });
+        defer trainer.deinit();
+        var prng = std.Random.DefaultPrng.init(715);
+        const runtime = try train.inputs(scratch, cb, &program.graph, program.built, config, &examples, prng.random(), false, false);
+        defer for (runtime) |input| cb.free(input.value);
+        var binding = try trainer.bind(&program.graph, null);
+        defer binding.deinit();
+        const combined = try std.mem.concat(scratch, interpreter.RuntimeInput, &.{ binding.inputs, runtime });
+        const backward_inputs = try scratch.alloc(interpreter.RuntimeInput, combined.len + 1);
+        for (combined, backward_inputs[0..combined.len]) |input, *dst| dst.* = .{ .node_id = program.gradients.id_map[input.node_id], .value = input.value };
+        const cotangent = try scratch.alloc(f32, l.questions * l.options);
+        for (cotangent, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.25;
+        const seed = try cb.fromFloat32Shape(cotangent, &.{ @intCast(l.questions), @intCast(l.options) });
+        defer cb.free(seed);
+        backward_inputs[combined.len] = .{ .node_id = program.gradients.id_map[program.seed], .value = seed };
+        var backward = try train.executeFramed(a, &program.gradients.graph, cb, backward_inputs);
+        defer backward.deinit(cb);
+        out.* = try scratch.alloc([]f32, program.wrt.len);
+        names = try scratch.alloc([]const u8, program.wrt.len);
+        for (program.wrt, backward.outputs[0..program.wrt.len], out.*, names) |id, output, *dst, *name| {
+            dst.* = try cb.toFloat32(output, scratch);
+            name.* = try scratch.dupe(u8, program.graph.parameterName(program.graph.node(id)));
+        }
+    }
+    var mismatches: usize = 0;
+    for (names, results[0], results[1]) |name, want, got| {
+        var error_sq: f64 = 0;
+        var want_sq: f64 = 0;
+        for (want, got) |x, y| {
+            error_sq += @as(f64, x - y) * (x - y);
+            want_sq += @as(f64, x) * x;
+        }
+        const relative = @sqrt(error_sq / @max(want_sq, 1e-30));
+        if (relative > 1e-3) {
+            std.debug.print("Laya pointer gradient mismatch {s}: relative L2 {d} (|native|={d})\n", .{ name, relative, @sqrt(want_sq) });
+            mismatches += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatches);
+}
+
 test "laya training converts an unpacked checkpoint into a served packed model" {
     try exerciseUnpackedToPackedParity(false, false, 0);
 }
@@ -219,6 +296,16 @@ fn exerciseParity(force_fused_attention: bool, trunk_sees_questions: bool, fuse_
         const report = try std.json.parseFromSlice(Report, scratch, try files.readFile(scratch, try std.fs.path.join(scratch, &.{ c.output_dir, "report.json" })), .{ .ignore_unknown_fields = true });
         std.debug.print("Laya new pointer head initial soft CE={d}\n", .{report.value.initial_eval.soft_ce});
         try std.testing.expect(report.value.initial_eval.soft_ce < 5);
+        // Training moved the zero-initialized query projection.
+        var weights = try safetensors.MMapReader.openFileAbsolute(a, try std.fs.path.join(scratch, &.{ model_path, "model.safetensors" }));
+        defer weights.deinit();
+        var q = try weights.readTensor("pointer.q.weight");
+        defer q.deinit();
+        const values = try train.floatValues(scratch, q);
+        var largest: f32 = 0;
+        for (values) |v| largest = @max(largest, @abs(v));
+        std.debug.print("Laya new pointer head trained |pointer.q| max={d}\n", .{largest});
+        try std.testing.expect(largest > 0);
     }
     try std.testing.expectEqual(model.PackingMode.question, cfg.packing.mode);
     // Serving the exported packed model reproduces the job's final evaluation.
