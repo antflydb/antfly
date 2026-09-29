@@ -1808,7 +1808,8 @@ following mechanisms are installed behind that gate:
   late activation cannot turn a previously empty proof stream into an
   apparently complete receiver cut. Import now also checks APF2 source order,
   physical position namespace, artifact guard ownership, output key family,
-  duplicate outputs and document ownership before storing candidate bytes;
+  duplicate outputs, document ownership and the live scoped-producer guard
+  rule before storing candidate bytes;
   a valid checksum alone is not an adoption certificate. Bounded off-lock
   receiver preparation can now recapture every causal primary/artifact input,
   compare its current value and timestamp, and own the receiver's physical

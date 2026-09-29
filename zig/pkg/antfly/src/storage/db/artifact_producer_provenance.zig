@@ -64,6 +64,10 @@ pub const Proof = struct {
         try self.validate();
         if (std.mem.allEqual(u8, &self.namespace, 0) or std.mem.allEqual(u8, &self.catalog_digest, 0))
             return error.ArtifactCatalogCorrupt;
+        publication.validateScopeGuard(alloc, self.producer_scope_key, self.artifact_sources) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.ArtifactCatalogCorrupt,
+        };
         const identity = publication.namespaceFromBytes(self.namespace);
         for (self.sources, 0..) |source, index| {
             if (source.document_key.len == 0 or (index != 0 and
@@ -1170,7 +1174,7 @@ fn testEncodedProofAlloc(alloc: std.mem.Allocator, command: publication.Command)
         }
         effect.* = .{ .family = mutation.family, .key = mutation.key, .source_index = mutation.source_index, .value_digest = digest, .value_bytes = if (mutation.value) |value| value.len else 0 };
     }
-    return encodeAlloc(alloc, .{ .namespace = command.namespace, .authority_epoch = command.authority_epoch, .catalog_digest = command.catalog_digest, .producer_kind = command.producer_kind, .producer_name = command.producer_name, .producer_generation = command.producer_generation, .producer_artifact_name = command.producer_artifact_name, .producer_scope_key = command.producer_scope_key, .publication_digest = command.publication_digest, .input_digest = command.inputDigest(), .sources = command.sources, .artifact_sources = command.artifact_sources, .effects = effects });
+    return encodeAlloc(alloc, .{ .namespace = command.namespace, .authority_epoch = command.authority_epoch, .catalog_digest = command.catalog_digest, .producer_kind = command.producer_kind, .producer_name = command.producer_name, .producer_generation = command.producer_generation, .producer_artifact_name = command.producer_artifact_name, .producer_scope_key = command.producer_scope_key, .publication_digest = command.publication_digest, .input_digest = command.inputDigest(), .sources = command.sources, .artifact_sources = command.artifact_sources, .mutation_preconditions = command.mutation_preconditions, .effects = effects });
 }
 
 test "ordered artifact inventory document proof index tracks absence replacement and retirement" {
@@ -1550,4 +1554,21 @@ test "ordered artifact inventory compact proof preserves output CAS history" {
     try std.testing.expectEqualDeep(before, recovered.proof.mutation_preconditions[0]);
     try recovered.proof.validatePortableShape(alloc);
     try std.testing.expectEqualDeep(command.inputDigest(), recovered.proof.inputCommand().inputDigest());
+}
+
+test "ordered artifact inventory portable scoped proof requires its causal unit guard" {
+    const alloc = std.testing.allocator;
+    const scope = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "chunks", 0);
+    defer alloc.free(scope);
+    const output = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(output);
+    const source = publication.Source{ .document_key = "doc", .content_digest = @splat(1), .timestamp = 1, .input_position = null };
+    const guard = publication.ArtifactSource{ .key = scope, .content_digest = @splat(2), .input_position = null, .source_index = 0 };
+    const effect = Effect{ .family = .base_vector, .key = output, .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    var proof: Proof = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "model", .producer_generation = 1, .producer_artifact_name = "model", .producer_scope_key = scope, .publication_digest = @splat(3), .input_digest = undefined, .sources = (&source)[0..1], .artifact_sources = &.{}, .effects = (&effect)[0..1] };
+    proof.input_digest = proof.inputCommand().inputDigest();
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, proof.validatePortableShape(alloc));
+    proof.artifact_sources = (&guard)[0..1];
+    proof.input_digest = proof.inputCommand().inputDigest();
+    try proof.validatePortableShape(alloc);
 }

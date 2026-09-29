@@ -374,24 +374,7 @@ pub const Command = struct {
         try consume(&remaining, self.producer_name.len);
         try consume(&remaining, self.producer_artifact_name.len);
         try consume(&remaining, self.producer_scope_key.len);
-        if (self.producer_scope_key.len != 0) {
-            var scoped = (try @import("artifact_ids.zig").decodeArtifactRefAlloc(alloc, self.producer_scope_key)) orelse return error.InvalidBatchRequest;
-            defer scoped.deinit(alloc);
-            if (scoped.kind != .chunk and !(scoped.kind == .asset and scoped.unit_id != null)) return error.InvalidBatchRequest;
-            const head = if (scoped.kind == .chunk)
-                try @import("artifact_chunk_manifest.zig").keyForMemberAlloc(alloc, self.producer_scope_key)
-            else
-                try @import("artifact_extraction_generation.zig").headKeyAlloc(alloc, scoped.document_id, scoped.name);
-            defer if (head) |key| alloc.free(key);
-            if (scoped.kind == .chunk) if (head) |key| {
-                key[keys.findComponentTerminator(key, 1).? + 2] = keys.producer_generation_head_kind;
-            };
-            const guarded = for (self.artifact_sources) |source| {
-                if (std.mem.eql(u8, source.key, self.producer_scope_key)) break true;
-                if (head) |key| if (source.content_digest != null and std.mem.eql(u8, source.key, key)) break true;
-            } else false;
-            if (!guarded) return error.InvalidBatchRequest;
-        }
+        try validateScopeGuard(alloc, self.producer_scope_key, self.artifact_sources);
         var documents: std.StringHashMapUnmanaged(void) = .empty;
         defer documents.deinit(alloc);
         for (self.sources, 0..) |source, source_order| {
@@ -577,6 +560,28 @@ pub fn guardedArtifactKey(key_bytes: []const u8) bool {
     if (@import("artifact_generation_scope.zig").isHead(key_bytes)) return true;
     inline for (std.meta.tags(Family)) |family| if (validFamilyKey(family, key_bytes)) return true;
     return false;
+}
+
+/// Scoped work must carry the exact inventory/head witness that authorized
+/// its unit. Portable proof admission shares this rule with live publication.
+pub fn validateScopeGuard(alloc: std.mem.Allocator, scope_key: []const u8, artifact_sources: []const ArtifactSource) !void {
+    if (scope_key.len == 0) return;
+    var scoped = (try @import("artifact_ids.zig").decodeArtifactRefAlloc(alloc, scope_key)) orelse return error.InvalidBatchRequest;
+    defer scoped.deinit(alloc);
+    if (scoped.kind != .chunk and !(scoped.kind == .asset and scoped.unit_id != null)) return error.InvalidBatchRequest;
+    const head = if (scoped.kind == .chunk)
+        try @import("artifact_chunk_manifest.zig").keyForMemberAlloc(alloc, scope_key)
+    else
+        try @import("artifact_extraction_generation.zig").headKeyAlloc(alloc, scoped.document_id, scoped.name);
+    defer if (head) |key| alloc.free(key);
+    if (scoped.kind == .chunk) if (head) |key| {
+        key[keys.findComponentTerminator(key, 1).? + 2] = keys.producer_generation_head_kind;
+    };
+    for (artifact_sources) |source| {
+        if (std.mem.eql(u8, source.key, scope_key)) return;
+        if (head) |key| if (source.content_digest != null and std.mem.eql(u8, source.key, key)) return;
+    }
+    return error.InvalidBatchRequest;
 }
 
 test "ordered artifact inventory generation heads are read guards not generic mutation authority" {
