@@ -205,7 +205,8 @@ pub const StreamVerifier = struct {
         var request = self.plan.generated_templates[ordinal];
         request.doc_key = document;
         switch (node.scope) {
-            .document, .producer_defined => {
+            .producer_defined => return null,
+            .document => {
                 const closure = (if (request.kind == .asset or request.kind == .chunk_text)
                     streams.prepareEnrichmentClosure(alloc, txn, root, request, self.plan)
                 else
@@ -804,6 +805,29 @@ test "ordered artifact inventory completion control verifies independent roots b
     var read = try source.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expectEqual(@as(u64, 0), (try obligations.load(&read)).?.pending_documents);
+}
+
+test "ordered artifact inventory completion leaves extraction-owned scope pending until certified" {
+    const alloc = std.testing.allocator;
+    const db_mod = @import("db.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-pending-extraction", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 4 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .producer_json = "{\"type\":\"document_extraction\"}" });
+    var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    const plan = if (pin.plan().completion_plan) |*value| value else return error.TestUnexpectedResult;
+    const node = for (plan.nodes) |*candidate| {
+        if (candidate.kind == .generated and candidate.scope == .producer_defined) break candidate;
+    } else return error.TestUnexpectedResult;
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    var verifier: StreamVerifier = .{ .plan = pin.plan() };
+    try std.testing.expectEqual(null, try verifier.verify(alloc, &read, db.root_incarnation, "doc", node));
 }
 
 test "ordered artifact inventory completion never skips an unverified index requirement" {

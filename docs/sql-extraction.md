@@ -2471,6 +2471,9 @@ following mechanisms are installed behind that gate:
   per document. Missing requirement verifiers still stop progress; all-member
   evidence agreement, repair/retry coordination and drain/seal remain separate
   activation gates. A sender's completed page is not remote acceptance.
+  Extraction-owned producer scopes now remain explicitly pending until their
+  own closure verifier exists; they cannot enter the document-only verifier and
+  turn an uncertified scope into a catalog-drift failure.
   LSM regressions exercise native-only completion on two independent roots with
   different work revisions, receiver evidence missing/present after restart,
   rollback, duplicate delivery, stale inputs, forged claims, allocation failures,
