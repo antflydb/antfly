@@ -1882,9 +1882,11 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         // Replace the accepted parent once more so every remaining queued
         // generation is obsolete. The final retirement must remove the child
         // directory atomically, not leave a permanently runnable empty scope.
+        var replacement_id: publication.Digest = undefined;
         {
             var replacement = try extraction.Plan.init(alloc, scope, try generations.Spec.init(authority, scope, parent.inputDigest(), chunks.Builder.init().finish(), 3));
             defer replacement.deinit();
+            replacement_id = replacement.core.spec.id();
             var writer = try db.core.store.beginWriteTxn();
             errdefer writer.abort();
             _ = try replacement.begin(&writer);
@@ -1897,15 +1899,19 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         // A lost retirement reply remains idempotent after a newer accepted
         // parent generation has invalidated the old receipt's proof.
         try std.testing.expect(!try db.retireArtifactUnitJob(&obsolete_job));
-        const NoopDispatch = struct {
+        const CaptureDispatch = struct {
             calls: usize = 0,
-            fn enqueue(ptr: *anyopaque, _: publication.Namespace, _: []const u8) !void {
+            publish_calls: usize = 0,
+            fn enqueue(ptr: *anyopaque, _: publication.Namespace, bytes: []const u8) !void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
+                var decoded = try @import("artifact_publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, bytes);
+                defer decoded.deinit();
                 self.calls += 1;
+                if (decoded.command.mode == .publish) self.publish_calls += 1;
             }
         };
-        var dispatched = NoopDispatch{};
-        db.artifact_publication_dispatcher = .{ .ptr = &dispatched, .enqueue = NoopDispatch.enqueue };
+        var dispatched = CaptureDispatch{};
+        db.artifact_publication_dispatcher = .{ .ptr = &dispatched, .enqueue = CaptureDispatch.enqueue };
         try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
         const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
         const before_worker = blk: {
@@ -1994,6 +2000,74 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             try std.testing.expectEqual(null, try unit_jobs.prepareDocumentTurn(&reader, db.root_incarnation, "doc"));
             // The old snapshot still retains its pre-wrap continuation.
             try std.testing.expectEqual(null, (try unit_jobs.prepareDocumentTurn(&snapshot, db.root_incarnation, "doc")).?.selected);
+        }
+        // A newly accepted generation after full retirement gives the replay
+        // wake one current typed unit, rather than only obsolete jobs. The
+        // old fair cursor may sort after the new key, so bounded wrap turns
+        // must reach its callback without losing the job or crediting replay.
+        const extracted: @import("enrichment/document_extraction.zig").Unit = .{
+            .unit_id = @constCast("page-1"),
+            .unit_type = @constCast("page"),
+            .text = @constCast("hello world"),
+            .method = @constCast("text"),
+        };
+        const fingerprint = try @import("enrichment/document_unit_fingerprint.zig").fingerprintAlloc(alloc, extracted);
+        defer alloc.free(fingerprint);
+        const typed = try @import("enrichment/document_unit_payload.zig").encodeAlloc(alloc, "doc", "units", extracted, fingerprint, "input", "text/plain", .{ .range_id = "unit-range-0" });
+        defer alloc.free(typed);
+        var fresh_output = chunks.Builder.init();
+        const encoded_entry = try extraction.encodeEntry(alloc, .{ .name = unit_name, .value = typed });
+        defer alloc.free(encoded_entry);
+        try fresh_output.append(0, encoded_entry);
+        {
+            var fresh = try extraction.Plan.init(alloc, scope, try generations.Spec.init(authority, scope, parent.inputDigest(), fresh_output.finish(), 4));
+            defer fresh.deinit();
+            var writer = try db.core.store.beginWriteTxn();
+            errdefer writer.abort();
+            _ = try fresh.begin(&writer);
+            const fresh_entries = [_]extraction.Entry{.{ .name = unit_name, .value = typed }};
+            var fresh_append = try extraction.PreparedAppend.init(alloc, &fresh, try fresh.core.load(&writer), &fresh_entries);
+            defer fresh_append.deinit();
+            _ = try fresh_append.stage(&fresh, &writer);
+            _ = try fresh.publish(&writer, replacement_id, Guard{});
+            try AcceptedFixture.stage(alloc, &writer, parent, parent_proof.proof, &fresh, .{ .raft = .{ .term = 1, .index = 16 } });
+            std.mem.writeInt(u64, marker[8..16], 16, .little);
+            try writer.put(&keys.raft_document_applied_entry_key, &marker);
+            try writer.commit();
+        }
+        var fresh_page = blk: {
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            var current_plan = try db.core.index_manager.acquireWritePlanSnapshot();
+            defer current_plan.release();
+            break :blk try unit_jobs.discover(alloc, &reader, db.root_incarnation, "doc", "chunks", current_plan.plan(), .{});
+        };
+        defer fresh_page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fresh_page.missing.len);
+        var fresh_admission = blk: {
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            break :blk try unit_jobs.prepare(alloc, &reader, db.root_incarnation, &fresh_page, .{});
+        };
+        defer fresh_admission.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fresh_admission.jobs.len);
+        _ = try db.admitArtifactUnitJobs(&fresh_admission);
+        const before_fresh = blk: {
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            break :blk (try unit_jobs.prepareDocumentTurn(&reader, db.root_incarnation, "doc")).?.expected_revision;
+        };
+        try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+        for (0..4) |_| {
+            try std.testing.expectError(error.ArtifactPublicationPending, @import("enrichment/enrichment_runtime.zig").servicePendingArtifactUnitJobs(runtime, "doc", .{}));
+            if (dispatched.calls != 0) break;
+        }
+        try std.testing.expect(dispatched.publish_calls != 0);
+        {
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            try std.testing.expect((try unit_jobs.prepareDocumentTurn(&reader, db.root_incarnation, "doc")).?.expected_revision > before_fresh);
+            _ = try reader.get(&fresh_admission.jobs[0].key);
         }
     }
 }

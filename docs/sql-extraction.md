@@ -2190,8 +2190,11 @@ following mechanisms are installed behind that gate:
   retires them. Missing dispatch or durable-turn infrastructure also fails
   closed while an outbox exists. A restart fixture checks the document-only
   wake, unavailable hooks, and refusal of the durable turn commit without
-  cursor advancement or job loss. This wires
-  local callbacks but does not complete remote child placement, large staged
+  cursor advancement or job loss. After receipt retirement, the fixture
+  accepts a fresh typed parent generation, admits its current unit job, and
+  verifies that bounded worker turns submit an actual child publish command
+  while retaining the job pending receiver acceptance. This wires local
+  callbacks but does not complete remote child placement, large staged
   outputs, all-required stream closure, or the distributed activation fault
   matrix.
 - Persisted unit encoding now lives in a shared typed payload contract rather
