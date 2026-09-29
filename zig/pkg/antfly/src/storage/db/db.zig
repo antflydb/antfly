@@ -9772,7 +9772,7 @@ pub const DB = struct {
         return req.artifact_catalog != null or req.online_source != null or req.restore_staging != null or req.restore_staging_scope != null or
             req.relational_topology != null or req.relational_generation_gc != null or req.split_transition != null or
             req.split_checkpoint != null or req.split_replication != null or
-            req.merge_checkpoint != null or req.merge_replication != null;
+            req.merge_checkpoint != null or req.merge_replication != null or req.merge_proof_adoption != null;
     }
 
     pub fn batchRaftReplicatedApply(
@@ -10771,7 +10771,7 @@ pub const DB = struct {
                         .native_topology_position = stamp,
                         .ha_applied_lsn_marker = record.lsn,
                     });
-                } else if (decoded.value.ordinary_raft_entry orelse decoded.value.artifact_publication_raft_entry orelse decoded.value.artifact_publication_transport_raft_entry orelse decoded.value.artifact_catalog_raft_entry orelse decoded.value.initial_child_raft_entry orelse decoded.value.graph_retirement_raft_entry orelse decoded.value.restore_generation_admission_raft_entry) |entry| {
+                } else if (decoded.value.ordinary_raft_entry orelse decoded.value.artifact_publication_raft_entry orelse decoded.value.artifact_publication_transport_raft_entry orelse decoded.value.merge_proof_adoption_raft_entry orelse decoded.value.artifact_catalog_raft_entry orelse decoded.value.initial_child_raft_entry orelse decoded.value.graph_retirement_raft_entry orelse decoded.value.restore_generation_admission_raft_entry) |entry| {
                     if (decoded.value.request.artifact_catalog) |command| if (decoded.value.request.online_source != null or decoded.value.request.merge_checkpoint != null) {
                         const context = try self.preflightArtifactAdmission(decoded.value.request, entry);
                         if (!try self.reconcileOrderedArtifactCatalogWithContext(command, entry.index, context)) return error.ArtifactCatalogDrift;
@@ -11090,9 +11090,11 @@ pub const DB = struct {
                 req.merge_artifacts.len != 0)) return error.RowPolicyTopologyUnsupported;
         try @import("../range_protection.zig").validateRequest(req);
         try @import("merge_page_contract.zig").validateRequest(req);
+        try @import("merge_proof_adoption.zig").validateRequest(req);
         try @import("online_source_contract.zig").validateRequest(req);
         try @import("artifact_inventory.zig").validateRequest(req);
         try @import("artifact_publication_transport.zig").validateBatchRequest(req);
+        if (req.merge_proof_adoption != null) return self.applyMergeProofAdoptionBatch(req, opts);
         if (req.artifact_catalog != null and req.online_source == null and req.merge_checkpoint == null) return self.applyArtifactCatalogBatch(req, opts);
         if (req.artifact_publication != null) return self.applyArtifactPublicationBatch(req, opts);
         if (req.artifact_publication_transport != null) return self.applyArtifactPublicationTransportBatch(req, opts);
@@ -30787,6 +30789,110 @@ pub const DB = struct {
             if (upload.action != .finalize) return error.InvalidBatchRequest;
             try @import("artifact_publication_transport.zig").stageCompletion(txn, upload.namespace, upload.publication_digest, upload.manifest_root, prepared.created_index, entry.index);
         }
+    }
+
+    fn applyMergeProofAdoptionBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
+        const adoption = @import("merge_proof_adoption.zig");
+        const proof_batch = @import("source_proof_batch.zig");
+        const provenance = @import("artifact_producer_provenance.zig");
+        try adoption.validateRequest(req);
+        const command = req.merge_proof_adoption orelse return error.InvalidBatchRequest;
+        const entry = opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest;
+        if (entry.term == 0 or entry.index == 0 or opts.artifact_upload_finalize != null or
+            opts.extra_store_writes.len != 0 or opts.extra_store_deletes.len != 0) return error.InvalidBatchRequest;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+
+        var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        if (!opts.bypass_ha_write_gate) {
+            try self.enforceHAWriteGate();
+            try self.ensureDurableHAStartupBarrier();
+            try self.flushDurableHAOutboxes();
+            try self.preflightHABatchSyncCommit();
+        }
+        const ha_payload = if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
+            try ha_effects_mod.encodeMergeProofAdoptionMutationRequestAlloc(self.alloc, req, entry)
+        else
+            null;
+        defer if (ha_payload) |value| self.alloc.free(value);
+
+        var preparation_budget = if (self.core.index_manager.resource_manager) |manager|
+            resource_manager_mod.BudgetedAllocator.init(manager, .shard_transition_working_set, self.alloc, 1)
+        else
+            null;
+        defer if (preparation_budget) |*budget| budget.deinit();
+        const preparation_alloc = if (preparation_budget) |*budget| budget.allocator() else self.alloc;
+        var fence: ?adoption.Fence = null;
+        defer if (fence) |*value| value.deinit(preparation_alloc);
+        var prepared: ?proof_batch.PreparedAdoption = null;
+        defer if (prepared) |*value| value.deinit(preparation_alloc);
+        {
+            var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+            defer read.abort();
+            fence = adoption.loadFence(preparation_alloc, &read, self.core.identity_namespace, command) catch |err| {
+                if (err == error.OutOfMemory) if (preparation_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+            if (fence) |*current| {
+                var plan = proof_batch.ReceiverProducerPlan.initForMerge(preparation_alloc, &read, current.progress.value) catch |err| switch (err) {
+                    error.ArtifactCatalogDrift => null,
+                    error.OutOfMemory => {
+                        if (preparation_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
+                        return err;
+                    },
+                    else => return err,
+                };
+                defer if (plan) |*value| value.deinit();
+                if (plan) |*mapping| {
+                    var receiver_namespace: [24]u8 = undefined;
+                    var donor_namespace: [24]u8 = undefined;
+                    doc_identity.encodeNamespace(&receiver_namespace, current.progress.value.receiver_namespace);
+                    doc_identity.encodeNamespace(&donor_namespace, current.progress.value.source.namespace);
+                    prepared = proof_batch.prepareAdoption(preparation_alloc, &read, receiver_namespace, try current.donorRange(), command.source_pin, donor_namespace, command.proof_digest, mapping) catch |err| switch (err) {
+                        error.ArtifactAdoptionUnsupported, error.ArtifactCatalogDrift => null,
+                        error.OutOfMemory => {
+                            if (preparation_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
+                            return err;
+                        },
+                        else => return err,
+                    };
+                }
+            }
+        }
+
+        var mutation = self.core.snapshot_admission.acquireMutation();
+        defer mutation.release();
+        try self.lockApplyForPortableRuntime();
+        var apply_held = true;
+        defer if (apply_held) self.core.unlockApply();
+        if (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry) == .already_applied) return;
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        if (fence) |*current| if (prepared) |*candidate| {
+            if (std.mem.eql(u8, &candidate.candidate.donor.record_digest, &command.record_digest) and
+                try current.matchesStored(&txn) and
+                try proof_batch.revalidateReceiverCandidate(preparation_alloc, &txn, candidate.candidate.receiver.namespace, candidate.candidate))
+            {
+                // No donor receipt, sequence or physical position is trusted.
+                // The ordered Raft index is this metadata-only receipt's
+                // monotonic publication sequence; copied values were already
+                // installed and journaled by merge pages.
+                try provenance.stageAdoptedIndexed(&txn, candidate.adopted.proof, candidate.adopted.encoded, candidate.positions, .{ .raft = .{ .term = entry.term, .index = entry.index } }, &candidate.references, entry.index);
+            }
+        };
+        var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+        const marker = raftAppliedEntryWrite(entry, &marker_buf);
+        try txn.put(marker.key, marker.value);
+        var standby_buf: [ha_applied_lsn_value_len]u8 = undefined;
+        if (opts.ha_applied_lsn_marker) |lsn| {
+            const standby = haAppliedReplicationLsnWrite(lsn, &standby_buf);
+            try txn.put(standby.key, standby.value);
+        }
+        try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
+        try txn.commit();
+        self.core.unlockApply();
+        apply_held = false;
+        if (ha_payload != null) try self.flushDurableHAOutboxes();
     }
 
     fn applyArtifactPublicationTransportBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
@@ -138235,6 +138341,139 @@ test "db replicated transaction commits each raft receipt atomically" {
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("{\"title\":\"newer\"}", raw);
     try std.testing.expectEqual(@as(u64, 16_000), try db.getTimestamp(alloc, "doc:receipt"));
+}
+
+test "storage.hot_standby merge proof adoption certifies receiver-local absent output" {
+    const alloc = std.testing.allocator;
+    const publication = @import("artifact_publication.zig");
+    const provenance = @import("artifact_producer_provenance.zig");
+    const proof_batch = @import("source_proof_batch.zig");
+    const inventory = @import("artifact_inventory.zig");
+    const pages = @import("merge_page_contract.zig");
+    const source_catalog = @import("merge_artifact_catalog.zig");
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const receiver_namespace: @import("doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 };
+    const donor_namespace: @import("doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 };
+    var db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = receiver_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    const keys = @import("../internal_keys.zig");
+    const row_key = try keys.documentKeyAlloc(alloc, "doc");
+    defer alloc.free(row_key);
+    const ttl_key = try keys.ttlKeyAlloc(alloc, "doc");
+    defer alloc.free(ttl_key);
+    const output_key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "output");
+    defer alloc.free(output_key);
+    const index_prefix = "AIDX\x02\x00\x00\x00\x01\x00\x00\x00\x05\x00\x00\x00index\x00\x02\x00\x00\x00{}";
+    const donor_catalog: inventory.Catalogs = .{ .indexes = index_prefix ++ "\x01\x00\x00\x00\x00\x00\x00\x00" };
+    const receiver_catalog: inventory.Catalogs = .{ .indexes = index_prefix ++ "\x09\x00\x00\x00\x00\x00\x00\x00" };
+    const donor_binding: inventory.Binding = .{ .epoch = 1, .digest = donor_catalog.digest(), .semantic_digest = try donor_catalog.semanticDigest(alloc), .effect_protocol = 15 };
+    const receiver_binding: inventory.Binding = .{ .epoch = 2, .digest = receiver_catalog.digest(), .semantic_digest = try receiver_catalog.semanticDigest(alloc), .effect_protocol = 15 };
+    var receiver_bytes: publication.Namespace = undefined;
+    var donor_bytes: publication.Namespace = undefined;
+    doc_identity.encodeNamespace(&receiver_bytes, receiver_namespace);
+    doc_identity.encodeNamespace(&donor_bytes, donor_namespace);
+    const progress: pages.Progress = .{
+        .version = 2,
+        .transition_id = 42,
+        .donor_group_id = 2,
+        .receiver_group_id = 3,
+        .receiver_namespace = receiver_namespace,
+        .attempt = .{ .donor_term = 3, .sequence = 1 },
+        .source = .{ .namespace = donor_namespace, .pin_digest = @splat(9), .applied_index = 5, .retention = .{ .epoch = 1, .after_sequence = 0 }, .artifact_catalog = donor_binding, .provenance_required = true },
+        .provenance_pending = true,
+    };
+    const progress_raw = try pages.encode(alloc, progress);
+    defer alloc.free(progress_raw);
+    const source_raw = (try source_catalog.encode(alloc, .{ .kind = @as(enum { begin_copy, accept }, .begin_copy), .page_source = @as(?pages.Source, progress.source), .page_receiver_namespace = @as(?@TypeOf(receiver_namespace), receiver_namespace), .page_source_catalogs = @as(?inventory.Catalogs, donor_catalog) }, progress)).?;
+    defer alloc.free(source_raw);
+    var state_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer state_bytes.deinit(alloc);
+    try merge_state_mod.encode(&state_bytes, alloc, .{ .transition_id = progress.transition_id, .donor_group_id = progress.donor_group_id, .receiver_group_id = progress.receiver_group_id, .phase = .accepting, .receiver_base_range = .{ .start = "dop", .end = "" }, .merged_range = .{ .start = "doc", .end = "" }, .copy_attempt = progress.attempt });
+    const ordered_raw = try std.json.Stringify.valueAlloc(alloc, inventory.Ordered{ .command = .{ .namespace = receiver_bytes, .previous = donor_binding, .binding = receiver_binding, .catalogs = receiver_catalog }, .applied_index = 4 }, .{ .emit_strings_as_arrays = true });
+    defer alloc.free(ordered_raw);
+    const row = "{}";
+    var row_digest: publication.Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(row, &row_digest, .{});
+    const source = publication.Source{ .document_key = "doc", .content_digest = row_digest, .timestamp = 7, .input_position = null };
+    const effect = provenance.Effect{ .family = .base_vector, .key = output_key, .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    var donor_proof: provenance.Proof = .{ .namespace = donor_bytes, .authority_epoch = donor_binding.epoch, .catalog_digest = donor_binding.digest, .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "output", .publication_digest = @splat(4), .input_digest = undefined, .sources = (&source)[0..1], .artifact_sources = &.{}, .effects = (&effect)[0..1] };
+    donor_proof.input_digest = donor_proof.inputCommand().inputDigest();
+    const proof_raw = try provenance.encodeAlloc(alloc, donor_proof);
+    defer alloc.free(proof_raw);
+    const imported = try proof_batch.encodeValueAlloc(alloc, &.{1}, proof_raw);
+    defer alloc.free(imported);
+    const record_digest = proof_batch.recordDigest(proof_raw[proof_raw.len - 32 ..][0..32].*, &.{1});
+    const imported_key = proof_batch.mergeKey(donor_bytes, progress.source.pin_digest, donor_proof.publication_digest);
+    const witness_key = proof_batch.witnessKey(donor_bytes, progress.source.pin_digest, donor_proof.publication_digest);
+    var ttl: [8]u8 = undefined;
+    std.mem.writeInt(u64, &ttl, 7, .little);
+    var authority_raw: [100]u8 = undefined;
+    @memcpy(authority_raw[0..4], "APA1");
+    @memcpy(authority_raw[4..28], &receiver_bytes);
+    std.mem.writeInt(u64, authority_raw[28..36], receiver_binding.epoch, .little);
+    @memcpy(authority_raw[36..68], &receiver_binding.digest);
+    std.crypto.hash.Blake3.hash(authority_raw[0..68], authority_raw[68..100], .{});
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(row_key, row);
+        try txn.put(ttl_key, &ttl);
+        try txn.put(inventory.index_key, receiver_catalog.indexes);
+        try inventory.refresh(&txn);
+        try txn.put(inventory.ordered_key, ordered_raw);
+        try txn.put(publication.authority_key, &authority_raw);
+        try txn.put(merge_state_mod.key, state_bytes.items);
+        try txn.put(pages.key, progress_raw);
+        try txn.put(source_catalog.key, source_raw);
+        try txn.put(&imported_key, imported);
+        try txn.put(&witness_key, &record_digest);
+        try txn.commit();
+    }
+    const command: @import("merge_proof_adoption.zig").Command = .{ .transition_id = progress.transition_id, .attempt = progress.attempt, .source_pin = progress.source.pin_digest, .proof_digest = donor_proof.publication_digest, .record_digest = record_digest };
+    try db.batchRaftReplicatedApply(.{ .merge_proof_adoption = command }, .{ .term = 4, .index = 7 });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualDeep(publication.Position{ .raft = .{ .term = 4, .index = 7 } }, (try publication.artifactRevision(&read, receiver_bytes, output_key)).?);
+    }
+    try std.testing.expectEqual(@as(u64, 7), (try db.raftAppliedEntry()).?.index);
+    var wrong = command;
+    wrong.record_digest = @splat(8);
+    try db.batchRaftReplicatedApply(.{ .merge_proof_adoption = wrong }, .{ .term = 4, .index = 8 });
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualDeep(publication.Position{ .raft = .{ .term = 4, .index = 7 } }, (try publication.artifactRevision(&read, receiver_bytes, output_key)).?);
+    try std.testing.expectEqual(@as(u64, 8), (try db.raftAppliedEntry()).?.index);
+}
+
+test "storage.hot_standby stale merge proof adoption advances only its ordered watermark" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const command: @import("merge_proof_adoption.zig").Command = .{
+        .transition_id = 42,
+        .attempt = .{ .donor_term = 3, .sequence = 1 },
+        .source_pin = @splat(1),
+        .proof_digest = @splat(2),
+        .record_digest = @splat(3),
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        const before = db.core.nextDerivedSequence();
+        try db.batchRaftReplicatedApply(.{ .merge_proof_adoption = command }, .{ .term = 2, .index = 7 });
+        try std.testing.expectEqual(@as(u64, 7), (try db.raftAppliedEntry()).?.index);
+        try std.testing.expectEqual(before, db.core.nextDerivedSequence());
+    }
+    var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer reopened.close();
+    try reopened.batchRaftReplicatedApply(.{ .merge_proof_adoption = command }, .{ .term = 2, .index = 7 });
+    try std.testing.expectEqual(@as(u64, 7), (try reopened.raftAppliedEntry()).?.index);
 }
 
 test "db raced replicated transaction completion persists receipt and participant acknowledgement" {

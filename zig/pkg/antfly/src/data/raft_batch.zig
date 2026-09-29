@@ -33,6 +33,7 @@ pub const source_pin_protocol_version = internal_batch_forwarding.raft_batch_sou
 pub const relational_transfer_protocol_version = internal_batch_forwarding.raft_batch_relational_transfer_protocol_version;
 pub const source_scope_protocol_version = internal_batch_forwarding.raft_batch_source_scope_protocol_version;
 pub const merge_chunk_protocol_version = internal_batch_forwarding.raft_batch_merge_chunk_protocol_version;
+pub const merge_proof_adoption_protocol_version = internal_batch_forwarding.raft_batch_merge_proof_adoption_protocol_version;
 
 pub const OwnedStorageOwnerDescriptor = struct {
     descriptor: descriptor_contract.Descriptor,
@@ -200,6 +201,29 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "ordered artifact merge adoption uses private raft batch encoding" {
+            const alloc = std.testing.allocator;
+            const request: db_mod.types.BatchRequest = .{ .merge_proof_adoption = .{
+                .transition_id = 7,
+                .attempt = .{ .donor_term = 3, .sequence = 4 },
+                .source_pin = @splat(1),
+                .proof_digest = @splat(2),
+                .record_digest = @splat(3),
+            } };
+            const batch_json = try batch_api.encodeBatchRequest(alloc, request);
+            defer alloc.free(batch_json);
+            try std.testing.expectError(error.InvalidBatchRequest, batch_api.parseBatchRequest(alloc, batch_json));
+            const encoded = try encode(alloc, "docs", request);
+            defer alloc.free(encoded);
+            var decoded = try decode(alloc, encoded);
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqualDeep(request.merge_proof_adoption.?, decoded.batch.req.merge_proof_adoption.?);
+            try std.testing.expectError(error.InvalidBatchRequest, encode(alloc, "docs", .{
+                .merge_proof_adoption = request.merge_proof_adoption,
+                .deletes = &.{"doc"},
+            }));
+        }
+
         test "raft protocol barrier is fail closed for legacy batch parsers" {
             try std.testing.expect(activation_barrier_protocol_version > timestamp_protocol_version);
             try std.testing.expect(merge_transition_protocol_version > activation_barrier_protocol_version);

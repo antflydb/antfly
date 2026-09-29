@@ -13836,6 +13836,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
             const Cursor = struct {
                 const Entry = struct { key: []const u8, value: []const u8 };
                 pub fn close(_: *@This()) void {}
+                pub fn setUpperBound(_: *@This(), _: ?[]const u8) void {}
                 pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
                     return null;
                 }

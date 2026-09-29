@@ -22,9 +22,9 @@ pub fn load(alloc: std.mem.Allocator, txn: anytype) !?std.json.Parsed(Intent) {
     return value;
 }
 pub fn requireAbsent(txn: anytype) !void {
-    _ = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return,
-        else => return err,
+    _ = txn.get(key) catch |err| {
+        if (err == error.NotFound) return;
+        return err;
     };
     return error.IntegrityTopologyBusy;
 }

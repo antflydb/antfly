@@ -726,6 +726,7 @@ test "relational index system integrity compare claim fences absence and exact o
         const Cursor = struct {
             const Entry = struct { key: []const u8, value: []const u8 };
             pub fn close(_: *@This()) void {}
+            pub fn setUpperBound(_: *@This(), _: ?[]const u8) void {}
             pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
                 return null;
             }

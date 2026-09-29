@@ -410,6 +410,9 @@ pub const BatchRequest = struct {
     merge_replication: ?MergeReplicationContext = null,
     /// Separate effect-bearing command; never combined with a checkpoint.
     merge_page: ?@import("merge_page_contract.zig").Command = null,
+    /// Private ordered receiver-local certification of one imported proof.
+    /// Public batch JSON never accepts this control.
+    merge_proof_adoption: ?@import("merge_proof_adoption.zig").Command = null,
     /// Authoritative document-scoped store rows, not original write inputs.
     /// Ordered after primary copy and before the receiver completion checkpoint.
     merge_artifacts: []const BatchWrite = &.{},

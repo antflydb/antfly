@@ -46,6 +46,10 @@ pub const batch_artifact_publication_protocol_version: u16 = 15;
 /// ordered finalize control. Version 15 peers cannot ignore stage entries or
 /// reinterpret a missing final payload as an ordinary empty batch.
 pub const batch_artifact_publication_transport_protocol_version: u16 = 16;
+/// Receiver-local imported-proof adoption is a distinct ordered decision.
+/// It cannot be replayed as an empty legacy batch or admitted before every
+/// applying member understands its evidence fence and standby envelope.
+pub const batch_merge_proof_adoption_protocol_version: u16 = 17;
 pub const batch_timestamp_protocol_version: u16 = 1;
 pub const batch_activation_barrier_protocol_version: u16 = 2;
 pub const batch_merge_transition_protocol_version: u16 = 3;

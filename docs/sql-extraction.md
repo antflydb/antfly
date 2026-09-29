@@ -1867,6 +1867,16 @@ following mechanisms are installed behind that gate:
   candidate, encoded adopted APF3, exact output positions and document
   reference keys as one bundle before apply; releasing the imported proof
   buffer cannot invalidate the prepared transaction inputs.
+  Direct-index proof adoption now has a private isolated data-Raft command and
+  a distinct standby payload version. Preparation owns the exact receiver
+  merge-state/progress bytes; ordered apply compares both again and validates
+  local inputs, postimages, catalog and import witness before atomically
+  committing adopted receipts, proof references, the Raft marker and HA
+  outbox. A stale copy attempt consumes only its ordered marker. Data-Raft
+  admission requires protocol 17, which remains above the current activated
+  version; no merge coordinator submits this command yet. Bounded proof
+  enumeration, retained-tail adoption, graph/scoped-producer rebinding,
+  completion discharge and all-member activation still remain open.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups
@@ -2975,6 +2985,9 @@ Before advertising the expanded protocol, finish and validate:
    output still requires receiver-local adoption evidence.
 3. Historic provenance carried with retained effects and snapshots, atomic
    receiver-local adoption certificates, and contender/promotion recovery.
+   The direct-index ordered adoption participant is wired and tested locally,
+   but its bounded coordinator, distributed retry outcomes, other producer
+   families and admission/activation barrier are not complete.
 4. Complete scoped regeneration through the required-stream driver and all-member capability/catalog
    barriers, followed by the distributed crash, lost-reply, leadership-change,
    and standby-promotion fault matrix.

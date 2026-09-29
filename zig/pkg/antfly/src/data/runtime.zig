@@ -12092,6 +12092,7 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.merge_proof_adoption != null) return data_raft_batch.merge_proof_adoption_protocol_version;
         if (req.artifact_publication_transport != null) return @import("../common/data_raft_protocol.zig").batch_artifact_publication_transport_protocol_version;
         const extended = @import("../common/data_raft_protocol.zig").batch_artifact_publication_protocol_version;
         if (req.artifact_publication != null) return extended;
@@ -23962,6 +23963,15 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
         const invalid_publication: antfly.db.types.BatchRequest = .{ .artifact_publication = .{ .mode = .activate, .namespace = @splat(0), .authority_epoch = 0, .catalog_digest = @splat(0), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) } };
         try std.testing.expectEqual(@as(u16, 15), DataServer.requiredRaftBatchProtocolVersion(invalid_publication));
         try std.testing.expectError(error.InvalidBatchRequest, @import("../storage/db/artifact_publication.zig").validateRequest(alloc, invalid_publication));
+        const adoption: antfly.db.types.BatchRequest = .{ .merge_proof_adoption = .{
+            .transition_id = 1,
+            .attempt = .{ .donor_term = 2, .sequence = 3 },
+            .source_pin = @splat(1),
+            .proof_digest = @splat(2),
+            .record_digest = @splat(3),
+        } };
+        try std.testing.expectEqual(data_raft_batch.merge_proof_adoption_protocol_version, DataServer.requiredRaftBatchProtocolVersion(adoption));
+        try std.testing.expect(data_raft_batch.protocol_version < data_raft_batch.merge_proof_adoption_protocol_version);
         const unbound_vector_page: antfly.db.types.BatchRequest = .{ .merge_page = .{
             .source = online_checkpoint.merge_checkpoint.?.page_source.?,
             .sequence = 1,
