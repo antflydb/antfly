@@ -41,6 +41,7 @@ const Mock = struct {
     stream_rows: usize = 0,
     expected_stream_statement: ?[]const u8 = null,
     expected_execute_statement: ?[]const u8 = null,
+    expected_result_tag: ?[]const u8 = null,
     setting_stream_opens: usize = 0,
     stream_offset: usize = 0,
     stream_closes: usize = 0,
@@ -148,6 +149,7 @@ const Mock = struct {
         try request.check();
         if (self.cursor_revoked) return error.Forbidden;
         if (self.ddl_pending or self.ddl_unknown) return .{ .columns = &.{} };
+        if (self.expected_result_tag != null) return .{ .columns = &.{}, .binding_guard = "immutable-catalog-binding" };
         if (self.json_null_results) return .{ .columns = &.{.{ .name = "j", .type = .json }} };
         return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = "immutable-catalog-binding", .setting_epoch = self.describe_setting_epoch };
     }
@@ -210,6 +212,7 @@ const Mock = struct {
                 self.saw_text_parameter = true;
             } else self.seen_parameter = request.parameters[0].integer;
         }
+        if (self.expected_result_tag) |tag| return .{ .command_tag = tag, .mutation_outcome = .committed };
         const rows = try alloc.alloc([]const std.json.Value, 2);
         rows[0] = try alloc.dupe(std.json.Value, &.{.{ .integer = self.seen_parameter orelse 9007199254740993 }});
         rows[1] = try alloc.dupe(std.json.Value, &.{.{ .integer = 2 }});
@@ -1452,6 +1455,37 @@ test "pgwire original prepared read executes text and deallocates connection sta
     try std.testing.expectEqual(@as(usize, 1), mock.executions);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output.written(), "26000"));
     try std.testing.expectEqual(@as(usize, 1), mock.disconnects);
+}
+
+test "pgwire original prepared CTE INSERT defers mutation until execute" {
+    // sql-0005: protocol session owns PREPARE; the typed runtime body is tested separately.
+    const alloc = std.testing.allocator;
+    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+    defer corpus.deinit();
+    const original = for (corpus.value.object.get("entries").?.array.items) |entry| {
+        if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0005")) break entry.object.get("sql").?.string;
+    } else return error.TestMissingCorpusCase;
+    const separator = std.mem.indexOf(u8, original, " AS ") orelse return error.TestInvalidCorpusCase;
+    var input = std.Io.Writer.Allocating.init(alloc);
+    defer input.deinit();
+    try startup(&input.writer);
+    const prepare_command = try std.fmt.allocPrint(alloc, "{s}\x00", .{original});
+    defer alloc.free(prepare_command);
+    try frame(&input.writer, 'Q', prepare_command);
+    try frame(&input.writer, 'Q', "EXECUTE cte_insert_plan\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .expected_execute_statement = original[separator + " AS ".len ..], .expected_result_tag = "INSERT 0 2" };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.describes);
+    try std.testing.expectEqual(@as(usize, 1), mock.executions);
+    try std.testing.expect(mock.saw_binding_guard);
+    const observed = try tags(alloc, output.written());
+    defer alloc.free(observed);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, observed, "C"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "PREPARE\x00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "INSERT 0 2\x00") != null);
 }
 
 test "pgwire extended typed bind describes without execution and resumes once" {

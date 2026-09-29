@@ -138,7 +138,7 @@
     {
       "id": "sql-0005",
       "status": "unresolved",
-      "reason": "The exact statement body now has a typed runtime regression: its CTE reads two source rows, releases the source cursor, generates distinct target identities, and submits one atomic INSERT batch; a source failure closes the cursor without generating IDs or submitting a mutation. This does not yet exercise the original PREPARE and EXECUTE sequence through mounted pgwire or prove a cross-owner native source/target commit, so protocol and distributed parity remain unresolved."
+      "reason": "The exact statement body has typed runtime coverage: its CTE reads two source rows, releases the source cursor, generates distinct target identities, and submits one atomic INSERT batch; a source failure closes without generating IDs or submitting a mutation. A pgwire protocol fixture runs the original PREPARE/EXECUTE sequence and verifies deferral. Authenticated mounted HTTP prepared execution binds source and target, captures one read-committed source snapshot, and admits one target native batch. The exact prepared pgwire sequence is not yet mounted on that native source/target path, so the case remains unresolved."
     },
     {
       "id": "sql-0006",

@@ -106,8 +106,12 @@ The fixture applies the admitted metadata transition in process, so this case
 does not stand in for multi-node consensus and placement fault coverage.
 For `sql-0005`, the exact CTE-backed INSERT body has typed component coverage:
 source rows are captured and the cursor is closed before one target mutation,
-while a source failure performs no write. The original prepared pgwire sequence
-and cross-owner native commit are not yet covered, so it remains unresolved.
+while a source failure performs no write. A pgwire fixture covers the exact
+PREPARE/EXECUTE sequence and defers execution. An authenticated mounted HTTP
+prepared execution binds the source and target, captures the read-committed
+source snapshot, and admits one target native batch. The exact prepared pgwire
+sequence is not yet mounted on the native source/target path, so the case
+remains unresolved.
 `sql-0037`, `sql-0039`, `sql-0041`, `sql-0043`, and `sql-0046` are tested
 supersessions of catalog/admin session mutations. Their exact public-namespace
 and one-millisecond timeout commands run through the pgwire session state

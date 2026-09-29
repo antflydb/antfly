@@ -1632,6 +1632,8 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
         expression_predicate_case: bool = false,
         grouped_predicate_case: bool = false,
         cte_case: bool = false,
+        prepared_cte_insert_case: bool = false,
+        prepared_cte_batches: usize = 0,
         archive_id: u64 = 5,
         target_guard: bool = false,
         source_guard: bool = false,
@@ -1670,15 +1672,15 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
         fn freeSnapshot(_: *anyopaque, _: *metadata.AdminSnapshot) void {}
         fn open(ptr: *anyopaque, _: std.mem.Allocator, scans: []const reads.RelationalStatementScan, _: @import("../raft/read_gate.zig").ReadConsistency) !reads.RelationalStatementRead {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(@as(usize, 2), scans.len);
+            try std.testing.expectEqual(@as(usize, if (self.prepared_cte_insert_case) 1 else 2), scans.len);
             self.captures += 1;
-            for (scans, &self.states, &self.views) |scan_request, *state, *view| {
-                try std.testing.expect(scan_request.opts.include_range_proofs);
+            for (scans, self.states[0..scans.len], self.views[0..scans.len]) |scan_request, *state, *view| {
+                try std.testing.expectEqual(!self.prepared_cte_insert_case, scan_request.opts.include_range_proofs);
                 const table_id: u64 = if (std.mem.eql(u8, scan_request.table, "physical_usage")) 3 else if (std.mem.eql(u8, scan_request.table, "physical_source")) 4 else if (std.mem.eql(u8, scan_request.table, "physical_archive")) 5 else return error.TestUnexpectedTable;
                 state.* = .{ .table_id = table_id, .expression_case = self.expression_case, .conditional_case = self.conditional_case, .skip_case = self.skip_case, .delete_case = self.delete_case, .insert_returning_case = self.insert_returning_case, .expression_predicate_case = self.expression_predicate_case, .grouped_predicate_case = self.grouped_predicate_case, .cte_case = self.cte_case };
                 view.* = .{ .ptr = state, .vtable = &.{ .next = next, .close = close } };
             }
-            return .{ .ptr = self, .views = &self.views, .vtable = &.{ .close = close, .range_proofs = proofs } };
+            return .{ .ptr = self, .views = self.views[0..scans.len], .vtable = &.{ .close = close, .range_proofs = proofs } };
         }
         fn proofs(ptr: *anyopaque, alloc: std.mem.Allocator, index: usize) ![]reads.RelationalStatementRead.OwnerRangeProof {
             const self: *Self = @ptrCast(@alignCast(ptr));
@@ -1706,15 +1708,31 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
             return .{ .arena = arena, .rows = rows, .after = null };
         }
         fn openNormalize(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, _: []const u8, _: []const u8, _: db_types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?View {
-            try std.testing.expectEqualStrings("physical_usage", table);
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings(if (self.prepared_cte_insert_case) "physical_archive" else "physical_usage", table);
             return .{ .ptr = ptr, .vtable = &.{ .next = undefined, .normalize = normalize, .close = close } };
         }
         fn normalize(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const db_types.BatchWrite) ![]db_types.BatchWrite {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(@as(usize, if (self.skip_case or self.delete_case) 0 else if (self.returning_case or self.insert_returning_case or self.cte_case) 1 else 2), writes.len);
+            try std.testing.expectEqual(@as(usize, if (self.skip_case or self.delete_case) 0 else if (self.returning_case or self.insert_returning_case or self.cte_case or self.prepared_cte_insert_case) 1 else 2), writes.len);
             return alloc.dupe(db_types.BatchWrite, writes);
         }
         fn close(_: *anyopaque) void {}
+        fn commitBatch(ptr: *anyopaque, alloc: std.mem.Allocator, tables: []const contract.TableCommitRequest, _: db_types.SyncLevel) !?contract.CommitOutcome {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.prepared_cte_insert_case);
+            try std.testing.expectEqual(@as(usize, 1), tables.len);
+            const table = tables[0];
+            try std.testing.expectEqualStrings("physical_archive", table.table_name);
+            try std.testing.expectEqual(@as(usize, 1), table.writes.len);
+            try std.testing.expectEqual(@as(usize, 0), table.deletes.len);
+            try std.testing.expect(self.states[0].done);
+            const row = try std.json.parseFromSlice(std.json.Value, alloc, table.writes[0].value, .{});
+            defer row.deinit();
+            try std.testing.expectEqualStrings("a", row.value.object.get("id").?.string);
+            self.prepared_cte_batches += 1;
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
         fn commit(ptr: *anyopaque, alloc: std.mem.Allocator, _: db_types.TxnId, _: u64, tables: []const contract.TableCommitRequest, _: db_types.SyncLevel) !?contract.CommitOutcome {
             const self: *Self = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(usize, 2), tables.len);
@@ -1807,7 +1825,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
     var prepared_store = try prepared_backend.runtimeStore(std.testing.allocator, .{ .name = "merge-prepared-test" });
     defer prepared_store.deinit();
     var prepared_durable = @import("transactions.zig").DurableSessionStore.initRuntime(std.testing.allocator, &prepared_store);
-    var server = http_server.ApiHttpServer.init(std.testing.allocator, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.open, .open_relational_read = Fake.openNormalize } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .commit_transaction_with_id = Fake.commit } });
+    var server = http_server.ApiHttpServer.init(std.testing.allocator, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.open, .open_relational_read = Fake.openNormalize } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .commit_batch = Fake.commitBatch, .commit_transaction_with_id = Fake.commit } });
     defer server.deinit();
     var permissions = [_]@import("../usermgr/mod.zig").Permission{
         .{ .resource = @constCast("*"), .resource_type = .table, .type = .read },
@@ -2297,6 +2315,50 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
     fake.expression_predicate_case = false;
     fake.grouped_predicate_case = false;
     fake.cte_case = false;
+    // sql-0005: the exact prepared CTE INSERT body reads usage_records while
+    // writing archived_records through one target batch after the captured
+    // read-committed source snapshot. PREPARE must not read or mutate.
+    if (identity) |*owned| owned.deinit(std.testing.allocator);
+    identity = null;
+    identity = try http_server.cloneCatalogIdentity(std.testing.allocator, .{ .username = @constCast("merge_writer"), .permissions = &permissions });
+    fake.prepared_cte_insert_case = true;
+    const original_cte_insert = for (parsed.value.object.get("entries").?.array.items) |entry| {
+        if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0005")) break entry.object.get("sql").?.string;
+    } else return error.TestMissingCorpusCase;
+    const separator = std.mem.indexOf(u8, original_cte_insert, " AS ") orelse return error.TestInvalidCorpusCase;
+    const insert_statement = original_cte_insert[separator + " AS ".len ..];
+    const insert_body = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .statement = insert_statement }, .{});
+    defer std.testing.allocator.free(insert_body);
+    const captures_before_insert = fake.captures;
+    const batches_before_insert = fake.prepared_cte_batches;
+    var insert_prepare_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/db/v1/sql/prepared");
+    defer insert_prepare_request.deinit();
+    insert_prepare_request.body = insert_body;
+    var insert_prepare_context = httpx.Context.init(std.testing.allocator, std.testing.io, &insert_prepare_request);
+    defer insert_prepare_context.deinit();
+    var insert_prepare_response = try handler.prepareSQL(&insert_prepare_context);
+    defer insert_prepare_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), insert_prepare_response.status.code);
+    try std.testing.expectEqual(captures_before_insert, fake.captures);
+    try std.testing.expectEqual(batches_before_insert, fake.prepared_cte_batches);
+    const insert_prepared = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, insert_prepare_response.body.?, .{});
+    defer insert_prepared.deinit();
+    const insert_prepared_id = insert_prepared.value.object.get("prepared_id").?.string;
+    var insert_execute_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/db/v1/sql/prepared/execute");
+    defer insert_execute_request.deinit();
+    insert_execute_request.body = "{}";
+    var insert_execute_context = httpx.Context.init(std.testing.allocator, std.testing.io, &insert_execute_request);
+    defer insert_execute_context.deinit();
+    var insert_execute_response = try handler.executePreparedSQL(&insert_execute_context, insert_prepared_id);
+    defer insert_execute_response.deinit();
+    if (insert_execute_response.status.code != 200) std.debug.print("sql-0005: {s}\n", .{insert_execute_response.body orelse ""});
+    try std.testing.expectEqual(@as(u16, 200), insert_execute_response.status.code);
+    const insert_result = try std.json.parseFromSlice(wire.SQLResponse, std.testing.allocator, insert_execute_response.body.?, .{});
+    defer insert_result.deinit();
+    try std.testing.expectEqualStrings("INSERT", insert_result.value.command_tag);
+    try std.testing.expectEqual(@as(i64, 1), insert_result.value.rows_affected);
+    try std.testing.expectEqual(captures_before_insert + 1, fake.captures);
+    try std.testing.expectEqual(batches_before_insert + 1, fake.prepared_cte_batches);
 }
 
 test "SQL document reads reject the relational stateless fallback before transport" {
