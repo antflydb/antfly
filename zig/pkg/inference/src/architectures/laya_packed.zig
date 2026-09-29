@@ -107,11 +107,15 @@ pub fn forwardRow(cb: *const ops.ComputeBackend, a: std.mem.Allocator, cfg: mode
     if (row.trunk_sees_tree or row.fused) return forwardFull(cb, a, cfg, laya, row);
     // A multi-row batch (pipelines/laya.zig, laya_tree.coalesce) packs
     // several states' trees into one row. A cold batch runs as one call:
-    // segment attention keeps its cost proportional to visible keys. Once
-    // any of its trunks is cached, each tree runs on its own so hot trunks
-    // are reused rather than re-encoded (and cold ones fill the cache).
+    // segment attention keeps its cost proportional to visible keys. On the
+    // CPU, once any of its trunks is cached, each tree runs on its own so hot
+    // trunks are reused rather than re-encoded (and cold ones fill the
+    // cache). On Metal the batch stays one call: per-call overhead outweighs
+    // the saved trunk work (a fully hot four-state batch on the synthetic
+    // model: 6.6 ms batched against 25.5 ms per tree; the CPU goes 34.6 ms
+    // to 28.7 ms the other way).
     if (tree.treeCount(row) != 1) {
-        return if (anyTrunkCached(a, cfg, laya, row, store)) forwardTrees(cb, a, cfg, laya, row, store) else forwardFull(cb, a, cfg, laya, row);
+        return if (!deviceCache(cb) and anyTrunkCached(a, cfg, laya, row, store)) forwardTrees(cb, a, cfg, laya, row, store) else forwardFull(cb, a, cfg, laya, row);
     }
     const layout = trunkRows(row) orelse return forwardFull(cb, a, cfg, laya, row);
     const trunk = layout.tokens;
