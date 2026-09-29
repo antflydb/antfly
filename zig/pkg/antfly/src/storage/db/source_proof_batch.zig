@@ -160,6 +160,42 @@ pub fn prepareReceiverCandidate(
     return .{ .arena = arena, .sources = sources, .artifact_sources = artifact_sources, .effects = selected_effects[0..selected_count] };
 }
 
+/// The writer transaction must repeat this check before installing any local
+/// receipt. A successful off-lock preparation is only a snapshot observation:
+/// equal bytes at a newer physical revision are still a stale candidate.
+/// Returning false lets the caller regenerate instead of accepting donor
+/// authority or overwriting a concurrent receiver publication.
+pub fn revalidateReceiverCandidate(
+    alloc: std.mem.Allocator,
+    txn: anytype,
+    receiver_namespace: publication.Namespace,
+    candidate: ReceiverCandidate,
+) !bool {
+    publication.validateSources(alloc, txn, receiver_namespace, candidate.sources) catch |err| switch (err) {
+        error.EnrichmentSourceChanged => return false,
+        else => return err,
+    };
+    publication.validateArtifactSources(alloc, txn, receiver_namespace, candidate.sources, candidate.artifact_sources) catch |err| switch (err) {
+        error.EnrichmentSourceChanged => return false,
+        else => return err,
+    };
+    for (candidate.effects) |selected| {
+        if (!std.meta.eql(try publication.artifactRevision(txn, receiver_namespace, selected.effect.key), selected.input_position)) return false;
+        const raw = txn.get(selected.effect.key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (raw) |value| {
+            const expected = selected.effect.value_digest orelse return false;
+            if (value.len != selected.effect.value_bytes) return false;
+            var actual: publication.Digest = undefined;
+            std.crypto.hash.sha2.Sha256.hash(value, &actual, .{});
+            if (!std.mem.eql(u8, &actual, &expected)) return false;
+        } else if (selected.effect.value_digest != null) return false;
+    }
+    return true;
+}
+
 pub fn decodeValue(alloc: std.mem.Allocator, namespace: publication.Namespace, digest: publication.Digest, raw: []const u8) !Decoded {
     if (raw.len < 6 + 40 or raw.len > max_bytes - 44 or !std.mem.eql(u8, raw[0..4], record_magic)) return error.SourceSnapshotCorrupt;
     const bitmap_len = std.mem.readInt(u16, raw[4..6], .little);
@@ -395,6 +431,19 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     try std.testing.expectEqualDeep(output_position, mapped.effects[0].input_position.?);
     try std.testing.expect(mapped.effects[1].input_position == null);
     try std.testing.expectEqualSlices(u8, &row_digest, &mapped.sources[0].content_digest);
+    try std.testing.expect(try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
+    const changed_position: publication.Position = .{ .raft = .{ .term = 9, .index = 13 } };
+    const changed_position_bytes = try changed_position.encode();
+    try receiver.values.put(&output_revision_key, &changed_position_bytes);
+    try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
+    try receiver.values.put(&output_revision_key, &output_position_bytes);
+    try receiver.values.put(&guard_revision_key, &changed_position_bytes);
+    try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
+    try receiver.values.put(&guard_revision_key, &guard_position_bytes);
+    try receiver.values.put(&row_revision_key, &changed_position_bytes);
+    try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
+    try receiver.values.put(&row_revision_key, &row_position_bytes);
+    try std.testing.expect(try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
     try std.testing.expectError(error.SourceSnapshotCorrupt, prepareReceiverCandidate(alloc, &receiver, receiver_namespace, .{ .start = "e", .end = "f" }, decoded));
     const AllocationCheck = struct {
         fn run(a: std.mem.Allocator, txn: *Fake, donor_namespace: publication.Namespace, receiver_ns: publication.Namespace, range: @import("../byte_range.zig").ByteRange, digest: publication.Digest, encoded_value: []const u8, expected_position: publication.Position) !void {
@@ -407,15 +456,19 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     };
     try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &receiver, proof.namespace, receiver_namespace, donor_range, proof.publication_digest, value, row_position });
     try receiver.values.put(output_key, "changed output");
+    try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
     try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, decoded)) == null);
     try receiver.values.put(output_key, output_value);
     try receiver.values.put(tombstone_key, "resurrected");
+    try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
     try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, decoded)) == null);
     try std.testing.expect(receiver.values.remove(tombstone_key));
     try receiver.values.put(guard_key, "changed");
+    try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
     try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, decoded)) == null);
     try receiver.values.put(guard_key, guard_value);
     try receiver.values.put(row_key, "{\"v\":2}");
+    try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
     try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, decoded)) == null);
 }
 

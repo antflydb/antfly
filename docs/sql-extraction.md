@@ -1816,6 +1816,9 @@ following mechanisms are installed behind that gate:
   ownership; changed inputs or outputs yield a stale candidate rather than
   inheriting donor positions. This remains candidate work until an ordered,
   replayable receiver transaction revalidates and installs local receipts.
+  A receiver-side writer-transaction verifier now repeats the exact primary,
+  artifact-input, and selected-output checks against local physical revisions,
+  including same-byte ABA changes. No caller installs receipts from it yet.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups
