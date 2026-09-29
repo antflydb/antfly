@@ -2214,7 +2214,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_diagnostic_tests).step);
     const hosted_cte_merge_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
-        .filters = &.{"mounted hosted CTE MERGE retains owner statement fences"},
+        .filters = &.{ "mounted hosted CTE MERGE retains owner statement fences", "hosted CTE MERGE retries only proven precommit read unavailability", "SQL pgwire MERGE completion reports committed affected rows" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-cte-merge-test", "Run linked hosted CTE MERGE owner-snapshot regression")

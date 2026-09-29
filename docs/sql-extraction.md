@@ -1294,8 +1294,11 @@ compaction/selective-query performance comparison remains unmeasured.
   arms and a read-only CTE-backed MERGE have exact mounted coverage. A linked
   hosted CTE self-MERGE now prepares and executes the exact `sql-0008` body
   through authenticated HTTP, proving real Raft-owner statement-fence capture,
-  guarded prepare/commit and row read-back. The complete mounted pgwire path
-  and distributed fault evidence remain open; 1,381 cases remain unresolved.
+  guarded prepare/commit and row read-back. The linked hosted test also runs
+  exact pgwire PREPARE/EXECUTE against that owner, verifies the `MERGE 1`
+  completion and typed row, and distinguishes precommit read unavailability
+  from an ambiguous write outcome. Distributed fault evidence remains open;
+  1,381 cases remain unresolved.
 
 - Follow-up ReleaseSafe SQL suite: 168 tests. Membership benchmark (opt-in
   `ANTFLY_SQL_MEMBERSHIP_BENCHMARK=1`): 10,000 outer and 10,000 inner rows,

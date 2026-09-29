@@ -895,10 +895,16 @@ fn commandTag(alloc: std.mem.Allocator, command: []const u8, rows: usize, affect
     if (std.mem.eql(u8, command, "DDL PENDING")) return alloc.dupe(u8, command);
     if (std.mem.eql(u8, command, "SELECT")) return std.fmt.allocPrint(alloc, "SELECT {d}", .{rows});
     if (std.mem.eql(u8, command, "INSERT")) return std.fmt.allocPrint(alloc, "INSERT 0 {d}", .{affected});
-    if (std.mem.eql(u8, command, "UPDATE") or std.mem.eql(u8, command, "DELETE")) return std.fmt.allocPrint(alloc, "{s} {d}", .{ command, affected });
+    if (std.mem.eql(u8, command, "UPDATE") or std.mem.eql(u8, command, "DELETE") or std.mem.eql(u8, command, "MERGE")) return std.fmt.allocPrint(alloc, "{s} {d}", .{ command, affected });
     if (std.mem.startsWith(u8, command, "CREATE ") or std.mem.startsWith(u8, command, "DROP ") or std.mem.startsWith(u8, command, "ALTER ")) return alloc.dupe(u8, command);
     inline for (.{ "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "SET CONSTRAINTS", "TRUNCATE TABLE" }) |tag| if (std.mem.eql(u8, command, tag)) return alloc.dupe(u8, command);
     return error.UnsupportedSqlExecution;
+}
+
+test "SQL pgwire MERGE completion reports committed affected rows" {
+    const tag = try commandTag(std.testing.allocator, "MERGE", 0, 3);
+    defer std.testing.allocator.free(tag);
+    try std.testing.expectEqualStrings("MERGE 3", tag);
 }
 
 fn releaseResult(raw: *anyopaque) void {

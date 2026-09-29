@@ -14,6 +14,8 @@ const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
 const publication = @import("../metadata/fk_generation_publication.zig");
 const test_helpers = @import("../public_test_helpers.zig");
+const usermgr = @import("../usermgr/mod.zig");
+const casbin = @import("antfly_casbin");
 
 fn deinitDriverIfLive(driver: *raft.ManagedProgressDriver, live: *bool) void {
     if (!live.*) return;
@@ -102,6 +104,108 @@ fn sql(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []con
     const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement }, .{});
     defer alloc.free(body);
     return request(alloc, transport, headers, base, "/db/v1/sql", .POST, body);
+}
+fn retryablePrecommitSqlRead(alloc: std.mem.Allocator, response: http.HttpResponse) bool {
+    if (response.status != 503 or response.body.len > 4096) return false;
+    const Diagnostic = struct {
+        code: []const u8,
+        message: []const u8,
+        retryable: bool,
+        transaction_status: ?[]const u8 = null,
+        transaction_id: ?[]const u8 = null,
+    };
+    var parsed = std.json.parseFromSlice(Diagnostic, alloc, response.body, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    return std.mem.eql(u8, parsed.value.code, "53300") and
+        std.mem.eql(u8, parsed.value.message, "A consistent SQL statement read is temporarily unavailable.") and parsed.value.retryable and
+        parsed.value.transaction_status != null and std.mem.eql(u8, parsed.value.transaction_status.?, "idle") and
+        parsed.value.transaction_id == null;
+}
+fn executePreparedAfterReadReady(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, suffix: []const u8) !http.HttpResponse {
+    const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+    while (true) {
+        var response = try request(alloc, transport, headers, base, suffix, .POST, "{}");
+        if (!retryablePrecommitSqlRead(alloc, response) or platform.time.monotonicNs() >= deadline) return response;
+        response.deinit(alloc);
+        try io.sleep(.fromMilliseconds(50), .awake);
+    }
+}
+fn pgwirePrecommitReadUnavailable(payload: []const u8, prepared_count: usize, merge_count: usize, read_count: usize) bool {
+    return prepared_count == 1 and merge_count == 0 and read_count == 0 and
+        std.mem.indexOf(u8, payload, "C53300\x00MA consistent SQL statement read is temporarily unavailable. Retry the complete statement after a bounded delay.\x00") != null and
+        std.mem.indexOf(u8, payload, "D{\"retryable\":true}") != null and
+        std.mem.indexOf(u8, payload, "transaction_id") == null;
+}
+test "hosted CTE MERGE retries only proven precommit read unavailability" {
+    const safe = http.HttpResponse{ .status = 503, .body = @constCast("{\"code\":\"53300\",\"message\":\"A consistent SQL statement read is temporarily unavailable.\",\"retryable\":true,\"transaction_status\":\"idle\"}") };
+    try std.testing.expect(retryablePrecommitSqlRead(std.testing.allocator, safe));
+    const unknown = http.HttpResponse{ .status = 409, .body = @constCast("{\"code\":\"40003\",\"message\":\"outcome unknown\",\"retryable\":false,\"transaction_status\":\"failed\"}") };
+    try std.testing.expect(!retryablePrecommitSqlRead(std.testing.allocator, unknown));
+    const receipt = http.HttpResponse{ .status = 503, .body = @constCast("{\"code\":\"53300\",\"message\":\"A consistent SQL statement read is temporarily unavailable.\",\"retryable\":true,\"transaction_status\":\"idle\",\"transaction_id\":\"00000000000000000000000000000001\"}") };
+    try std.testing.expect(!retryablePrecommitSqlRead(std.testing.allocator, receipt));
+    const pgwire_safe = "SERROR\x00C53300\x00MA consistent SQL statement read is temporarily unavailable. Retry the complete statement after a bounded delay.\x00D{\"retryable\":true}\x00\x00";
+    try std.testing.expect(pgwirePrecommitReadUnavailable(pgwire_safe, 1, 0, 0));
+    try std.testing.expect(!pgwirePrecommitReadUnavailable(pgwire_safe, 1, 1, 0));
+    try std.testing.expect(!pgwirePrecommitReadUnavailable(pgwire_safe, 1, 0, 1));
+    try std.testing.expect(!pgwirePrecommitReadUnavailable("SERROR\x00C40003\x00Mwrite outcome unknown\x00", 1, 0, 0));
+}
+fn runHostedPgwireMergeOnce(alloc: std.mem.Allocator, io: std.Io, api: *http_server.ApiHttpServer, original: []const u8) !enum { committed, retry_read } {
+    var pg_adapter: @import("sql_pgwire.zig").Adapter = .{ .server = api };
+    const Wire = struct {
+        fn frame(out: *std.Io.Writer, tag: u8, payload: []const u8) !void {
+            try out.writeByte(tag);
+            try out.writeInt(u32, @intCast(payload.len + 4), .big);
+            try out.writeAll(payload);
+        }
+    };
+    var input = std.Io.Writer.Allocating.init(alloc);
+    defer input.deinit();
+    const startup = "user\x00prepared_writer\x00database\x00default\x00\x00";
+    try input.writer.writeInt(u32, @intCast(startup.len + 8), .big);
+    try input.writer.writeInt(u32, 196608, .big);
+    try input.writer.writeAll(startup);
+    try Wire.frame(&input.writer, 'p', "secret\x00");
+    const prepare_command = try std.fmt.allocPrint(alloc, "{s}\x00", .{original});
+    defer alloc.free(prepare_command);
+    try Wire.frame(&input.writer, 'Q', prepare_command);
+    try Wire.frame(&input.writer, 'Q', "EXECUTE cte_merge_plan\x00");
+    try Wire.frame(&input.writer, 'Q', "SELECT id,status FROM usage_records WHERE id = 'prepared_id'\x00");
+    try Wire.frame(&input.writer, 'X', "");
+    var reader = std.Io.Reader.fixed(input.written());
+    var output = std.Io.Writer.Allocating.init(alloc);
+    defer output.deinit();
+    var session: @import("../pgwire/protocol.zig").Session = .{ .alloc = alloc, .io = io, .source = pg_adapter.backend(), .reader = &reader, .writer = &output.writer };
+    defer session.deinit();
+    try session.run();
+    var frames: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = output.written() };
+    var prepared_count: usize = 0;
+    var merge_count: usize = 0;
+    var read_count: usize = 0;
+    while (frames.offset < frames.bytes.len) {
+        const tag = try frames.int(u8);
+        const size = try frames.int(u32);
+        const payload = try frames.take(size - 4);
+        if (tag == 'E') {
+            if (pgwirePrecommitReadUnavailable(payload, prepared_count, merge_count, read_count)) return .retry_read;
+            std.debug.print("hosted pgwire CTE MERGE error after prepared={} merged={} reads={}: {s}\n", .{ prepared_count, merge_count, read_count, payload });
+            return error.TestUnexpectedPgwireMergeError;
+        }
+        if (tag == 'C' and std.mem.eql(u8, payload, "PREPARE\x00")) prepared_count += 1;
+        if (tag == 'C' and std.mem.eql(u8, payload, "MERGE 1\x00")) merge_count += 1;
+        if (tag != 'D') continue;
+        var row: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = payload };
+        try std.testing.expectEqual(@as(u16, 2), try row.int(u16));
+        for ([_][]const u8{ "prepared_id", "open" }) |expected| {
+            const length = try row.int(i32);
+            try std.testing.expect(length >= 0);
+            try std.testing.expectEqualStrings(expected, try row.take(@intCast(length)));
+        }
+        read_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), prepared_count);
+    try std.testing.expectEqual(@as(usize, 1), merge_count);
+    try std.testing.expectEqual(@as(usize, 1), read_count);
+    return .committed;
 }
 fn table(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8) !http.HttpResponse {
     return tableNamed(alloc, transport, headers, base, "nodes");
@@ -988,11 +1092,25 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     } else return error.MetadataIncarnationUnavailable;
     var metadata_uri = try metadata.adminBaseUri(alloc);
     defer alloc.free(metadata_uri);
+    var user_store = usermgr.MemoryStore.init(alloc);
+    defer user_store.deinit();
+    var policies = casbin.MemoryAdapter.init(alloc);
+    defer policies.deinit();
+    var user_manager = try usermgr.UserManager.init(alloc, user_store.iface(), try usermgr.initDefaultEnforcer(alloc, policies.iface()));
+    defer user_manager.deinit();
+    if (snapshot_probe) {
+        var read_grant = try usermgr.Permission.initOwned(alloc, .table, "usage_records", .read);
+        defer read_grant.deinit(alloc);
+        var write_grant = try usermgr.Permission.initOwned(alloc, .table, "usage_records", .write);
+        defer write_grant.deinit(alloc);
+        var user = try user_manager.createUser("prepared_writer", "secret", &.{ read_grant, write_grant });
+        user.deinit(alloc);
+    }
     var data = try data_runtime.DataServer.initFromMetadataApiUrl(process_alloc, .{
         .replica_root_dir = data_root,
         .replica_catalog_path = data_catalog,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store_path = if (snapshot_probe) session_path else null, .session_owner_lease_ttl_ns = if (snapshot_probe) 30 * std.time.ns_per_s else null },
+        .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store_path = if (snapshot_probe) session_path else null, .session_owner_lease_ttl_ns = if (snapshot_probe) 30 * std.time.ns_per_s else null, .user_manager = if (snapshot_probe) &user_manager else null },
     }, metadata_uri);
     var data_live = true;
     defer if (data_live) {
@@ -1077,7 +1195,7 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
         const prepared_id = prepared_json.value.object.get("prepared_id").?.string;
         const execute_suffix = try std.fmt.allocPrint(alloc, "/db/v1/sql/prepared/{s}/execute", .{prepared_id});
         defer alloc.free(execute_suffix);
-        var merged = try request(alloc, transport, &headers, base, execute_suffix, .POST, "{}");
+        var merged = try executePreparedAfterReadReady(alloc, io, transport, &headers, base, execute_suffix);
         defer merged.deinit(alloc);
         if (merged.status != 200) std.debug.print("hosted CTE MERGE status={d} body={s}\n", .{ merged.status, merged.body });
         try std.testing.expectEqual(@as(u16, 200), merged.status);
@@ -1094,6 +1212,16 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
         try std.testing.expectEqual(@as(usize, 1), rows.len);
         try std.testing.expectEqualStrings("prepared_id", rows[0].array.items[0].string);
         try std.testing.expectEqualStrings("open", rows[0].array.items[1].string);
+
+        // Run the full original PREPARE/EXECUTE text through pgwire's
+        // authenticated protocol session, borrowing this same hosted owner.
+        const api = if (data.http_server) |*server| server else return error.OwnerReadNotReady;
+        const pgwire_deadline = platform.time.monotonicNs() +| 60 * std.time.ns_per_s;
+        while (true) {
+            if (try runHostedPgwireMergeOnce(alloc, io, api, original) == .committed) break;
+            if (platform.time.monotonicNs() >= pgwire_deadline) return error.PgwireReadNotReady;
+            try io.sleep(.fromMilliseconds(50), .awake);
+        }
         return;
     }
     if (leader_transfer) {

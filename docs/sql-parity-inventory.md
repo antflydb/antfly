@@ -125,8 +125,10 @@ outcomes, and failed proof acquisition have distinct no-replay behavior. This
 fixture mocks proof issuance and commit, so real owner-validated range-proof
 commit was still missing there. A linked hosted test now prepares and executes
 the exact corpus MERGE body through authenticated HTTP against a real Raft-backed
-owner, verifies guarded prepare/commit, and reads back the row. The complete
-mounted pgwire/native sequence and distributed fault evidence remain missing;
+owner, verifies guarded prepare/commit, and reads back the row. The same linked
+hosted test now runs the exact pgwire PREPARE/EXECUTE sequence against that owner,
+asserts the `MERGE 1` completion and typed read-back, and retries only a proven
+precommit read-unavailable error. Distributed fault evidence remains missing;
 the case stays unresolved.
 `sql-0037`, `sql-0039`, `sql-0041`, `sql-0043`, and `sql-0046` are tested
 supersessions of catalog/admin session mutations. Their exact public-namespace
