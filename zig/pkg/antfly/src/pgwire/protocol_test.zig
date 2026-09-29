@@ -155,7 +155,6 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.observed_setting = if (request.setting_overlay.len == 0) null else request.setting_overlay[0].value.integer;
         self.observed_setting_epoch = request.setting_epoch;
-        if (self.expected_execute_statement) |expected| if (std.mem.startsWith(u8, request.statement, "SELECT")) try std.testing.expectEqualStrings(expected, request.statement);
         self.executions += 1;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "begin")) return .{ .command_tag = "BEGIN", .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "commit")) {
@@ -172,6 +171,7 @@ const Mock = struct {
             .rollback_to => "ROLLBACK",
             .release => "RELEASE",
         }, .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
+        if (self.expected_execute_statement) |expected| try std.testing.expectEqualStrings(expected, request.statement);
         self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, "immutable-catalog-binding") else false;
         if (self.entered) |event| event.set(request.io);
         while (self.blocked) {
@@ -1172,6 +1172,33 @@ test "pgwire pending DDL returns error receipt without successful command comple
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "55000") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"schema_version\":8") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "do not replay") != null);
+}
+
+test "pgwire original prepared DDL defers execution and preserves pending receipt" {
+    const cases = [_]struct { prepare: []const u8, execute_command: []const u8, statement: []const u8 }{
+        .{ .prepare = "PREPARE truncate_usage_plan AS TRUNCATE usage_records\x00", .execute_command = "EXECUTE truncate_usage_plan\x00", .statement = "TRUNCATE usage_records" }, // sql-0003
+        .{ .prepare = "PREPARE create_usage_plan AS CREATE TABLE prepared_usage_records (id uuid)\x00", .execute_command = "EXECUTE create_usage_plan\x00", .statement = "CREATE TABLE prepared_usage_records (id uuid)" }, // sql-0004
+    };
+    for (cases) |case| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', case.prepare);
+        try frame(&input.writer, 'Q', case.execute_command);
+        try frame(&input.writer, 'X', "");
+        var mock = Mock{ .ddl_pending = true, .expected_execute_statement = case.statement };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.describes);
+        try std.testing.expectEqual(@as(usize, 1), mock.executions);
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observed, "C"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observed, "E"));
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "PREPARE\x00") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "55000") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"schema_version\":8") != null);
+    }
 }
 
 test "pgwire unknown DDL admission never claims a committed declaration" {

@@ -288,9 +288,13 @@ pub fn create(b: *std.Build) ?Artifacts {
         .link_libc = link_libc,
     });
     pgwire_test_mod.addImport("sql_parser", sql_parser_mod);
+    // This intentionally remains a storage-independent test root. Every
+    // pgwire-owned test has the pgwire prefix; without a compile filter Zig
+    // also discovers transitive storage tests through the SQL binder and
+    // requires unrelated native imports this module does not provide.
     const pgwire_tests = b.addTest(.{
         .root_module = pgwire_test_mod,
-        .filters = b.args orelse &.{},
+        .filters = b.args orelse &.{"pgwire"},
     });
     const run_pgwire_tests = b.addRunArtifact(pgwire_tests);
     pgwire_tests.step.max_rss = 1024 * 1024 * 1024;
