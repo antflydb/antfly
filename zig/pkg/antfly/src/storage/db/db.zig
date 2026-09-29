@@ -149215,6 +149215,133 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
     try std.testing.expectError(error.EnrichmentSourceChanged, planning.Context.create(alloc, &current.read.?, "doc", "relations", asset_key, "{}"));
 }
 
+test "db ordered artifact inventory graph planning inherits selected extraction head instead of stale root" {
+    const alloc = std.testing.allocator;
+    const publication = @import("artifact_publication.zig");
+    const provenance = @import("artifact_producer_provenance.zig");
+    const extraction = @import("artifact_extraction_generation.zig");
+    const generations = @import("artifact_chunk_generation.zig");
+    const chunks = @import("artifact_chunk_manifest.zig");
+    const planning = @import("artifact_graph_planning.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-extraction-head", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .content_type = "application/json" });
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"relations\"}]}" });
+    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"seed\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    var catalog = try db.artifactInventoryCommand(alloc);
+    defer catalog.catalogs.deinit(alloc);
+    catalog.binding.effect_protocol = 15;
+    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    const authority: publication.Authority = .{ .namespace = catalog.namespace, .epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest };
+    const scope = try @import("artifact_generation_scope.zig").extractionKeyAlloc(alloc, "doc", "relations");
+    defer alloc.free(scope);
+    const root_entry: extraction.Entry = .{ .name = "root", .value = "{}" };
+    const encoded_entry = try extraction.encodeEntry(alloc, root_entry);
+    defer alloc.free(encoded_entry);
+    var output = chunks.Builder.init();
+    try output.append(0, encoded_entry);
+    var source: publication.Source = undefined;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        source = try publication.capturePrimarySource(alloc, &read, catalog.namespace, "doc");
+    }
+    defer alloc.free(source.document_key);
+    var header: publication.Command = .{ .producer_kind = .enrichment, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "relations", .producer_generation = catalog.binding.epoch, .producer_artifact_name = "relations", .sources = (&source)[0..1], .mutations = &.{}, .publication_digest = @splat(0) };
+    var plan = try extraction.Plan.init(alloc, scope, try generations.Spec.init(authority, scope, header.inputDigest(), output.finish(), 1));
+    defer plan.deinit();
+    const head_raw = plan.core.spec.encode();
+    const effects = [_]publication.Mutation{.{ .family = .document_artifact, .key = plan.core.head_key, .value = &head_raw, .source_index = 0 }};
+    header.mutations = &effects;
+    header.publication_digest = header.digest();
+    var head_digest: publication.Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&head_raw, &head_digest, .{});
+    const proof_effects = [_]provenance.Effect{.{ .family = .document_artifact, .key = plan.core.head_key, .value_digest = head_digest, .value_bytes = head_raw.len, .source_index = 0 }};
+    const proof: provenance.Proof = .{ .namespace = header.namespace, .authority_epoch = header.authority_epoch, .catalog_digest = header.catalog_digest, .producer_kind = header.producer_kind, .producer_name = header.producer_name, .producer_generation = header.producer_generation, .producer_artifact_name = header.producer_artifact_name, .publication_digest = header.publication_digest, .input_digest = header.inputDigest(), .sources = header.sources, .artifact_sources = &.{}, .effects = &proof_effects };
+    const encoded_proof = try provenance.encodeAlloc(alloc, proof);
+    defer alloc.free(encoded_proof);
+    const stale_root = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "relations");
+    defer alloc.free(stale_root);
+    {
+        // Receiver-side accepted-generation fixture. Production head writes
+        // remain gated on ordered producer admission and finalization.
+        const Guard = struct {
+            pub fn validate(_: @This(), _: anytype) !void {}
+        };
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(stale_root, "{\"stale\":true}");
+        _ = try plan.begin(&txn);
+        var append = try extraction.PreparedAppend.init(alloc, &plan, try plan.core.load(&txn), &.{root_entry});
+        defer append.deinit();
+        _ = try append.stage(&plan, &txn);
+        _ = try plan.publish(&txn, null, Guard{});
+        const position: publication.Position = .{ .raft = .{ .term = 1, .index = 4 } };
+        try publication.stageArtifactRevisions(&txn, header, position);
+        try provenance.stage(&txn, header, encoded_proof, position);
+        var marker_bytes: [raft_applied_entry_value_len]u8 = undefined;
+        const marker = raftAppliedEntryWrite(.{ .term = 1, .index = 4 }, &marker_bytes);
+        try txn.put(marker.key, marker.value);
+        try txn.commit();
+    }
+    var pinned = try db.core.store.beginReadTxn();
+    defer pinned.abort();
+    var view = (try extraction.View(@import("../docstore.zig").DocStore.Txn).open(alloc, &pinned, scope)).?;
+    defer view.deinit();
+    try std.testing.expectEqualStrings("{}", (try view.get(alloc, "root")).?);
+    try std.testing.expectEqualStrings("{\"stale\":true}", try pinned.get(stale_root));
+    const AllocationCheck = struct {
+        fn run(a: Allocator, read: *@import("../backend_erased.zig").ReadTxn, head: []const u8, value: []const u8) !void {
+            const selected_context = try planning.Context.createWithProof(a, read, "doc", "relations", head, value);
+            defer selected_context.destroy();
+            try std.testing.expectEqualStrings(head, selected_context.base.artifact_sources[0].key);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &pinned.read.?, plan.core.head_key, @as([]const u8, &head_raw) });
+    const context = try planning.Context.createWithProof(alloc, &pinned.read.?, "doc", "relations", plan.core.head_key, &head_raw);
+    defer context.destroy();
+    try std.testing.expectEqual(@as(usize, 1), context.base.artifact_sources.len);
+    try std.testing.expectEqualStrings(plan.core.head_key, context.base.artifact_sources[0].key);
+    const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, "doc", "g");
+    defer alloc.free(count_key);
+    const count = try @import("graph_edge_contender.zig").encodeVisibleCount(db.core.index_manager.coverageGenerationForIndex("g").?, 0);
+    try context.publishGraphEffects(&[_]docstore_mod.KVPair{.{ .key = count_key, .value = &count }}, &.{});
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = context.commands.items[0] }, .{ .term = 1, .index = 5 });
+    var current = try db.core.store.beginReadTxn();
+    defer current.abort();
+    try std.testing.expect((try publication.readReceipt(&current, context.commands.items[0], context.commands.items[0].sources[0])) != null);
+    var empty = try extraction.Plan.init(alloc, scope, try generations.Spec.init(authority, scope, header.inputDigest(), chunks.Builder.init().finish(), 2));
+    defer empty.deinit();
+    {
+        const Guard = struct {
+            pub fn validate(_: @This(), _: anytype) !void {}
+        };
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try empty.begin(&txn);
+        _ = try empty.publish(&txn, plan.core.spec.id(), Guard{});
+        var marker_bytes: [raft_applied_entry_value_len]u8 = undefined;
+        const marker = raftAppliedEntryWrite(.{ .term = 1, .index = 6 }, &marker_bytes);
+        try txn.put(marker.key, marker.value);
+        try txn.commit();
+    }
+    var replaced = try db.core.store.beginReadTxn();
+    defer replaced.abort();
+    try std.testing.expectError(error.EnrichmentSourceChanged, planning.Context.createWithProof(alloc, &replaced.read.?, "doc", "relations", plan.core.head_key, &head_raw));
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = context.commands.items[0] }, .{ .term = 1, .index = 7 });
+    var post = try db.core.store.beginReadTxn();
+    defer post.abort();
+    try std.testing.expectEqual(publication.Rejection.stale_source, (try publication.rejected(&post, context.commands.items[0])).?.reason);
+}
+
 test "db ordered artifact inventory accepted upload commits graph coverage provenance and terminal receipt" {
     try testAcceptedArtifactUpload(false);
 }

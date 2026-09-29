@@ -1918,6 +1918,11 @@ following mechanisms are installed behind that gate:
   their legacy tails. Navigation-key recovery shares that read and avoids
   loading block values. This closes a recovery-reader visibility gap, not the
   ordered producer-publication or provenance-adoption gate.
+  Ordered graph planning also reads a selected extraction root through that
+  generation and inherits its accepted head proof, not a stale physical root.
+  A head replacement invalidates prepared graph commands at Raft apply; the
+  graph callback still needs producer-side extraction activation and the
+  remaining cross-owner adoption barriers.
   These are storage/read foundations, not production activation: ordered command
   admission, receipts, quotas, producer regeneration, remaining index/graph
   readers, and transfer/adoption must be integrated before publishing heads in

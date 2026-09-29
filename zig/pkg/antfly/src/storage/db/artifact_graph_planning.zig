@@ -56,6 +56,12 @@ pub const Context = struct {
     /// Its accepted proof must still have current original inputs: a receipt
     /// from before a primary update cannot authorize a new graph projection.
     pub fn create(owner: std.mem.Allocator, read: *erased.ReadTxn, document: []const u8, artifact_name: []const u8, artifact_key: []const u8, expected_asset: ?[]const u8) !*Context {
+        return createWithProof(owner, read, document, artifact_name, artifact_key, expected_asset);
+    }
+
+    /// A selected extraction generation owns the logical root. Its head, not
+    /// an obsolete physical root row, is the accepted proof and CAS guard.
+    pub fn createWithProof(owner: std.mem.Allocator, read: *erased.ReadTxn, document: []const u8, artifact_name: []const u8, proof_key: []const u8, expected_proof: ?[]const u8) !*Context {
         const self = try owner.create(Context);
         errdefer owner.destroy(self);
         self.arena = std.heap.ArenaAllocator.init(owner);
@@ -66,7 +72,7 @@ pub const Context = struct {
         self.read = read;
         self.store = snapshot_store.borrow(self.alloc, read);
         self.commands = .empty;
-        self.proof = (try provenance.readCurrentForArtifact(self.owned, read, artifact_key, expected_asset)) orelse return error.ArtifactPublicationPending;
+        self.proof = (try provenance.readCurrentForArtifact(self.owned, read, proof_key, expected_proof)) orelse return error.ArtifactPublicationPending;
         errdefer self.proof.deinit();
         const proof = self.proof.proof;
         self.source_index = for (proof.sources, 0..) |source, index| {
@@ -87,8 +93,8 @@ pub const Context = struct {
         self.catalog = .{ .entries = entries.items, .resolvers = .{ .items = if (catalogs.resolvers.len == 0) &.{} else try resolvers.deserializeCatalog(self.owned, catalogs.resolvers) } };
         self.index_manager = &self.catalog;
         var guards: std.ArrayList(publication.ArtifactSource) = .empty;
-        for (proof.artifact_sources) |input| if (!std.mem.eql(u8, input.key, artifact_key)) try guards.append(self.owned, input);
-        try guards.append(self.owned, try self.guard(artifact_key));
+        for (proof.artifact_sources) |input| if (!std.mem.eql(u8, input.key, proof_key)) try guards.append(self.owned, input);
+        try guards.append(self.owned, try self.guard(proof_key));
         std.mem.sort(publication.ArtifactSource, guards.items, {}, guardLess);
         self.base = .{ .producer_kind = .graph, .namespace = proof.namespace, .authority_epoch = proof.authority_epoch, .catalog_digest = proof.catalog_digest, .producer_name = "", .producer_generation = 0, .producer_artifact_name = try self.owned.dupe(u8, artifact_name), .sources = proof.sources, .artifact_sources = guards.items, .mutations = &.{}, .publication_digest = @splat(0) };
         return self;

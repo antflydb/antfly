@@ -21014,16 +21014,28 @@ fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocato
     const artifact_name = requestArtifactName(request);
     const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", artifact_name);
     defer alloc.free(artifact_key);
-    const stored = read.get(artifact_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const extraction = @import("../artifact_extraction_generation.zig");
+    const scope = try @import("../artifact_generation_scope.zig").extractionKeyAlloc(alloc, request.doc_key, artifact_name);
+    defer alloc.free(scope);
+    var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
+    var selected = try extraction.View(@TypeOf(borrowed)).open(alloc, &borrowed, scope);
+    defer if (selected) |*view| view.deinit();
+    const stored = if (selected) |*view|
+        try view.get(alloc, "root")
+    else
+        read.get(artifact_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    const proof_key = if (selected) |*view| view.plan.core.head_key else artifact_key;
+    const selected_head = if (selected) |*view| view.plan.core.spec.encode() else undefined;
+    const proof_value: ?[]const u8 = if (selected != null) &selected_head else stored;
     if (expected_asset == .observed) {
         const observed = expected_asset.observed;
         if ((stored == null) != (observed == null)) return error.EnrichmentSourceChanged;
         if (stored) |value| if (!std.mem.eql(u8, value, observed.?)) return error.EnrichmentSourceChanged;
     }
-    const context = try @import("../artifact_graph_planning.zig").Context.create(alloc, &read, request.doc_key, artifact_name, artifact_key, stored);
+    const context = try @import("../artifact_graph_planning.zig").Context.createWithProof(alloc, &read, request.doc_key, artifact_name, proof_key, proof_value);
     defer context.destroy();
     var window: GeneratedReplayWindow = .{ .alloc = alloc };
     defer window.deinit();
