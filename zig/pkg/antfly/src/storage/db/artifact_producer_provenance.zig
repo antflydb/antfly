@@ -124,36 +124,206 @@ pub const Owned = struct {
     }
 };
 
-// Binary JSON expands each key byte to at most four decimal characters plus
-// a delimiter. Artifact bodies are replaced by fixed-size digests. Preparation
-// must charge this actual allocation before entering the apply transaction.
-pub const max_encoded_bytes = publication.max_payload_bytes * 6 + publication.max_mutations * 256;
+// Publication validation caps all variable key bytes at 64 MiB. A compact
+// proof adds fixed per-source/effect fields, so one legal proof fits inside an
+// AFB2 block without expanding binary keys into decimal JSON arrays. This is
+// a PR-only storage format; there is no deployed APF1 compatibility contract.
+pub const max_encoded_bytes = @import("artifact_publication_transport_codec.zig").max_encoded_bytes;
+const proof_magic = "APF2";
+
+fn proofAdd(size: *usize, amount: usize) !void {
+    size.* = std.math.add(usize, size.*, amount) catch return error.TransactionTooLarge;
+    if (size.* > max_encoded_bytes) return error.TransactionTooLarge;
+}
+
+fn proofBlobSize(size: *usize, value: []const u8) !void {
+    if (value.len > std.math.maxInt(u32)) return error.TransactionTooLarge;
+    try proofAdd(size, 4 + value.len);
+}
+
+fn proofPositionSize(size: *usize, value: ?publication.Position) !void {
+    try proofAdd(size, 1 + @as(usize, if (value == null) 0 else publication.Position.encoded_len));
+}
+
+fn proofEncodedLength(proof: Proof) !usize {
+    var size: usize = 4 + 1 + 1 + 24 + 8 + 32 + 8 + 32 + 32 + 4 * 3 + 32;
+    try proofBlobSize(&size, proof.producer_name);
+    try proofBlobSize(&size, proof.producer_artifact_name);
+    try proofBlobSize(&size, proof.producer_scope_key);
+    for (proof.sources) |source| {
+        try proofBlobSize(&size, source.document_key);
+        try proofAdd(&size, 1 + 32 + 8);
+        try proofPositionSize(&size, source.input_position);
+    }
+    for (proof.artifact_sources) |source| {
+        try proofBlobSize(&size, source.key);
+        try proofAdd(&size, 1 + @as(usize, if (source.content_digest == null) 0 else 32) + 4);
+        try proofPositionSize(&size, source.input_position);
+    }
+    for (proof.effects) |effect| {
+        try proofBlobSize(&size, effect.key);
+        try proofAdd(&size, 1 + 4 + 1 + @as(usize, if (effect.value_digest == null) 0 else 32) + 8);
+    }
+    return size;
+}
+
+const ProofWriter = struct {
+    bytes: []u8,
+    pos: usize = 0,
+    fn write(self: *@This(), value: []const u8) void {
+        @memcpy(self.bytes[self.pos..][0..value.len], value);
+        self.pos += value.len;
+    }
+    fn byte(self: *@This(), value: u8) void {
+        self.bytes[self.pos] = value;
+        self.pos += 1;
+    }
+    fn writeU32(self: *@This(), value: u32) void {
+        std.mem.writeInt(u32, self.bytes[self.pos..][0..4], value, .little);
+        self.pos += 4;
+    }
+    fn writeU64(self: *@This(), value: u64) void {
+        std.mem.writeInt(u64, self.bytes[self.pos..][0..8], value, .little);
+        self.pos += 8;
+    }
+    fn blob(self: *@This(), value: []const u8) void {
+        self.writeU32(@intCast(value.len));
+        self.write(value);
+    }
+    fn position(self: *@This(), value: ?publication.Position) !void {
+        self.byte(@intFromBool(value != null));
+        if (value) |position_value| self.write(&try position_value.encode());
+    }
+};
 
 pub fn encodeAlloc(alloc: std.mem.Allocator, proof: Proof) ![]u8 {
     try proof.validate();
-    const json = try std.json.Stringify.valueAlloc(alloc, proof, .{});
-    defer alloc.free(json);
-    if (json.len > max_encoded_bytes - 40) return error.TransactionTooLarge;
-    const result = try alloc.alloc(u8, 40 + json.len);
-    @memcpy(result[0..4], "APF1");
-    std.mem.writeInt(u32, result[4..8], @intCast(json.len), .little);
-    @memcpy(result[8 .. result.len - 32], json);
-    std.crypto.hash.sha2.Sha256.hash(result[0 .. result.len - 32], result[result.len - 32 ..][0..32], .{});
+    const result = try alloc.alloc(u8, try proofEncodedLength(proof));
+    errdefer alloc.free(result);
+    var writer: ProofWriter = .{ .bytes = result };
+    writer.write(proof_magic);
+    writer.byte(proof.version);
+    writer.byte(@intFromEnum(proof.producer_kind));
+    writer.write(&proof.namespace);
+    writer.writeU64(proof.authority_epoch);
+    writer.write(&proof.catalog_digest);
+    writer.writeU64(proof.producer_generation);
+    writer.write(&proof.publication_digest);
+    writer.write(&proof.input_digest);
+    writer.blob(proof.producer_name);
+    writer.blob(proof.producer_artifact_name);
+    writer.blob(proof.producer_scope_key);
+    writer.writeU32(@intCast(proof.sources.len));
+    writer.writeU32(@intCast(proof.artifact_sources.len));
+    writer.writeU32(@intCast(proof.effects.len));
+    for (proof.sources) |source| {
+        writer.blob(source.document_key);
+        writer.byte(@intFromBool(source.exists));
+        writer.write(&source.content_digest);
+        writer.writeU64(source.timestamp);
+        try writer.position(source.input_position);
+    }
+    for (proof.artifact_sources) |source| {
+        writer.blob(source.key);
+        writer.byte(@intFromBool(source.content_digest != null));
+        if (source.content_digest) |digest| writer.write(&digest);
+        try writer.position(source.input_position);
+        writer.writeU32(source.source_index);
+    }
+    for (proof.effects) |effect| {
+        writer.byte(@intFromEnum(effect.family));
+        writer.blob(effect.key);
+        writer.writeU32(effect.source_index);
+        writer.byte(@intFromBool(effect.value_digest != null));
+        if (effect.value_digest) |digest| writer.write(&digest);
+        writer.writeU64(effect.value_bytes);
+    }
+    if (writer.pos != result.len - 32) return error.ArtifactCatalogCorrupt;
+    std.crypto.hash.sha2.Sha256.hash(result[0..writer.pos], result[writer.pos..][0..32], .{});
     return result;
 }
 
+const ProofCursor = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+    fn take(self: *@This(), length: usize) ![]const u8 {
+        if (length > self.bytes.len -| self.pos) return error.ArtifactCatalogCorrupt;
+        const result = self.bytes[self.pos..][0..length];
+        self.pos += length;
+        return result;
+    }
+    fn byte(self: *@This()) !u8 {
+        return (try self.take(1))[0];
+    }
+    fn readU32(self: *@This()) !u32 {
+        return std.mem.readInt(u32, (try self.take(4))[0..4], .little);
+    }
+    fn readU64(self: *@This()) !u64 {
+        return std.mem.readInt(u64, (try self.take(8))[0..8], .little);
+    }
+    fn blob(self: *@This()) ![]const u8 {
+        return self.take(try self.readU32());
+    }
+    fn flag(self: *@This()) !bool {
+        return switch (try self.byte()) {
+            0 => false,
+            1 => true,
+            else => error.ArtifactCatalogCorrupt,
+        };
+    }
+    fn position(self: *@This()) !?publication.Position {
+        if (!try self.flag()) return null;
+        return publication.Position.decode(try self.take(publication.Position.encoded_len)) catch return error.ArtifactCatalogCorrupt;
+    }
+};
+
 pub fn decodeAlloc(alloc: std.mem.Allocator, raw: []const u8) !Owned {
-    if (raw.len < 40 or raw.len > max_encoded_bytes or !std.mem.eql(u8, raw[0..4], "APF1") or
-        std.mem.readInt(u32, raw[4..8], .little) != raw.len - 40) return error.ArtifactCatalogCorrupt;
+    if (raw.len < 4 + 1 + 1 + 24 + 8 + 32 + 8 + 32 + 32 + 4 * 6 + 32 or raw.len > max_encoded_bytes)
+        return error.ArtifactCatalogCorrupt;
     var digest: publication.Digest = undefined;
     std.crypto.hash.sha2.Sha256.hash(raw[0 .. raw.len - 32], &digest, .{});
     if (!std.mem.eql(u8, &digest, raw[raw.len - 32 ..])) return error.ArtifactCatalogCorrupt;
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    const proof = std.json.parseFromSliceLeaky(Proof, arena.allocator(), raw[8 .. raw.len - 32], .{ .allocate = .alloc_always }) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return error.ArtifactCatalogCorrupt,
-    };
+    const owned_raw = try arena.allocator().dupe(u8, raw);
+    var cursor: ProofCursor = .{ .bytes = owned_raw[0 .. owned_raw.len - 32] };
+    if (!std.mem.eql(u8, try cursor.take(4), proof_magic)) return error.ArtifactCatalogCorrupt;
+    const version = try cursor.byte();
+    const producer_kind = std.enums.fromInt(@FieldType(publication.Command, "producer_kind"), try cursor.byte()) orelse return error.ArtifactCatalogCorrupt;
+    const namespace: publication.Namespace = (try cursor.take(24))[0..24].*;
+    const epoch = try cursor.readU64();
+    const catalog_digest: publication.Digest = (try cursor.take(32))[0..32].*;
+    const generation = try cursor.readU64();
+    const publication_digest: publication.Digest = (try cursor.take(32))[0..32].*;
+    const input_digest: publication.Digest = (try cursor.take(32))[0..32].*;
+    const producer_name = try cursor.blob();
+    const producer_artifact_name = try cursor.blob();
+    const producer_scope_key = try cursor.blob();
+    const source_count = try cursor.readU32();
+    const artifact_count = try cursor.readU32();
+    const effect_count = try cursor.readU32();
+    if (source_count == 0 or source_count > publication.max_source_documents or artifact_count > publication.max_source_documents or effect_count == 0 or effect_count > publication.max_mutations)
+        return error.ArtifactCatalogCorrupt;
+    const sources = try arena.allocator().alloc(publication.Source, source_count);
+    const artifact_sources = try arena.allocator().alloc(publication.ArtifactSource, artifact_count);
+    const effects = try arena.allocator().alloc(Effect, effect_count);
+    for (sources) |*source| {
+        source.* = .{ .document_key = try cursor.blob(), .exists = try cursor.flag(), .content_digest = (try cursor.take(32))[0..32].*, .timestamp = try cursor.readU64(), .input_position = try cursor.position() };
+    }
+    for (artifact_sources) |*source| {
+        const key_bytes = try cursor.blob();
+        const content_digest: ?publication.Digest = if (try cursor.flag()) (try cursor.take(32))[0..32].* else null;
+        source.* = .{ .key = key_bytes, .content_digest = content_digest, .input_position = try cursor.position(), .source_index = try cursor.readU32() };
+    }
+    for (effects) |*effect| {
+        const family = std.enums.fromInt(publication.Family, try cursor.byte()) orelse return error.ArtifactCatalogCorrupt;
+        const key_bytes = try cursor.blob();
+        const source_index = try cursor.readU32();
+        const value_digest: ?publication.Digest = if (try cursor.flag()) (try cursor.take(32))[0..32].* else null;
+        effect.* = .{ .family = family, .key = key_bytes, .source_index = source_index, .value_digest = value_digest, .value_bytes = try cursor.readU64() };
+    }
+    if (cursor.pos != cursor.bytes.len) return error.ArtifactCatalogCorrupt;
+    const proof: Proof = .{ .version = version, .namespace = namespace, .authority_epoch = epoch, .catalog_digest = catalog_digest, .producer_kind = producer_kind, .producer_name = producer_name, .producer_generation = generation, .producer_artifact_name = producer_artifact_name, .producer_scope_key = producer_scope_key, .publication_digest = publication_digest, .input_digest = input_digest, .sources = sources, .artifact_sources = artifact_sources, .effects = effects };
     try proof.validate();
     return .{ .arena = arena, .proof = proof };
 }
@@ -1215,4 +1385,35 @@ test "ordered artifact inventory provenance preserves complete binary read set w
     try std.testing.expect(decoded.proof.artifact_sources[0].content_digest == null);
     encoded[encoded.len - 1] ^= 1;
     try std.testing.expectError(error.ArtifactCatalogCorrupt, decodeAlloc(alloc, encoded));
+}
+
+test "ordered artifact inventory compact proof keeps binary keys bounded and rejects forged fields" {
+    const alloc = std.testing.allocator;
+    const document = [_]u8{0} ** (32 * 1024);
+    const source = publication.Source{ .document_key = &document, .content_digest = @splat(1), .timestamp = 1, .input_position = null };
+    const effect = Effect{ .family = .document_artifact, .key = "effect", .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    var proof: Proof = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "asset", .publication_digest = @splat(3), .input_digest = undefined, .sources = (&source)[0..1], .artifact_sources = &.{}, .effects = (&effect)[0..1] };
+    proof.input_digest = proof.inputCommand().inputDigest();
+    const encoded = try encodeAlloc(alloc, proof);
+    defer alloc.free(encoded);
+    try std.testing.expect(encoded.len < document.len + 512);
+    try std.testing.expect(encoded.len < @import("../backup_codec.zig").max_block_payload_bytes);
+    var decoded = try decodeAlloc(alloc, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(proof, decoded.proof);
+    const forged = try alloc.dupe(u8, encoded);
+    defer alloc.free(forged);
+    forged[5] = 255; // unknown producer kind, with a valid physical checksum
+    std.crypto.hash.sha2.Sha256.hash(forged[0 .. forged.len - 32], forged[forged.len - 32 ..][0..32], .{});
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, decodeAlloc(alloc, forged));
+    const AllocationCheck = struct {
+        fn run(a: std.mem.Allocator, logical: Proof) !void {
+            const raw = try encodeAlloc(a, logical);
+            defer a.free(raw);
+            var value = try decodeAlloc(a, raw);
+            defer value.deinit();
+            try std.testing.expectEqualDeep(logical, value.proof);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{proof});
 }

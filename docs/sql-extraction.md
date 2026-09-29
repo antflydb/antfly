@@ -1767,10 +1767,16 @@ following mechanisms are installed behind that gate:
   reader now seeks directly to encoded binary lower bounds, pages by entry and
   byte limits, and checks each index against its live source reference and
   proof-body presence. It is candidate enumeration, not portable validation of
-  the proof's causal input/output scope. The 205-case ordered-artifact target
+  the proof's causal input/output scope. The ordered-artifact target
   passes, including allocation faults, LSM apply, 129-proof paged retirement,
   binary range/resume, corrupted-reference rejection, pinned-reader preservation,
   and current-epoch isolation.
+  Accepted proof bodies now use APF2, a compact checksummed binary record of
+  the same bounded logical read set and output digests. It removes JSON's
+  binary-key expansion so one legal proof fits within the AFB2 block ceiling;
+  it does not itself add a portable proof block or confer receiver authority.
+  The 206-case ordered-artifact target passes, including forged-field and
+  allocation-failure codec tests.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups
