@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const http_common = @import("../../common/http/http_common.zig");
 const std_http_executor = @import("../../common/http/std_http_executor.zig");
 

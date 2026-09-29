@@ -14,7 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const fs = @import("fs_paths.zig");
+const fs = @import("antfly_runtime_fs").fs_paths;
 
 pub fn writeAtomic(alloc: std.mem.Allocator, io: std.Io, path: []const u8, bytes: []const u8) !void {
     const temp = try std.fmt.allocPrint(alloc, "{s}.migration-tmp", .{path});

@@ -115,7 +115,6 @@ zig/pkg/antfly/src/common/config.zig
 zig/pkg/antfly/src/common/credential_safety.zig
 zig/pkg/antfly/src/common/credential_source_identity.zig
 zig/pkg/antfly/src/common/dense_native_storage_phase.zig
-zig/pkg/antfly/src/common/fs_paths.zig
 zig/pkg/antfly/src/common/full_text_index_defaults.zig
 zig/pkg/antfly/src/common/group_ids.zig
 zig/pkg/antfly/src/common/http/http_common.zig
@@ -140,7 +139,6 @@ zig/pkg/antfly/src/common/secrets.zig
 zig/pkg/antfly/src/common/table_storage.zig
 zig/pkg/antfly/src/common/test_directory.zig
 zig/pkg/antfly/src/common/threaded_connect_io.zig
-zig/pkg/antfly/src/common/threaded_io_limits.zig
 zig/pkg/antfly/src/common/topology_records.zig
 zig/pkg/antfly/src/common/vector_migration.zig
 zig/pkg/antfly/src/embedded_root.zig
@@ -198,16 +196,12 @@ zig/pkg/antfly/src/metadata/catalog_mutation_stamp.zig
 zig/pkg/antfly/src/metadata/incarnation.zig
 zig/pkg/antfly/src/metadata/local_catalog.zig
 zig/pkg/antfly/src/metadata/local_index_reconcile.zig
-zig/pkg/antfly/src/metadata/provision_contract.zig
 zig/pkg/antfly/src/metadata/reallocation_request.zig
 zig/pkg/antfly/src/metadata/restore_provisioning_contract.zig
 zig/pkg/antfly/src/metadata/topology_protocol.zig
-zig/pkg/antfly/src/raft/catalog.zig
 zig/pkg/antfly/src/raft/feature_reads.zig
 zig/pkg/antfly/src/raft/read_gate.zig
-zig/pkg/antfly/src/raft/state_machine/read_state_observer.zig
 zig/pkg/antfly/src/raft/storage/backup_restore.zig
-zig/pkg/antfly/src/raft/storage/catalog.zig
 zig/pkg/antfly/src/runtime_bridge.zig
 zig/pkg/antfly/src/runtime_callback_abi.zig
 zig/pkg/antfly/src/runtime_dispatch.zig

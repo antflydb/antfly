@@ -14,9 +14,9 @@
 // limitations under the License.
 
 pub const std = @import("std");
-pub const fs_paths = @import("../common/fs_paths.zig");
+pub const fs_paths = @import("antfly_runtime_fs").fs_paths;
 pub const group_ids = @import("../common/group_ids.zig");
-pub const threaded_io_limits = @import("../common/threaded_io_limits.zig");
+pub const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 pub const metadata_table_manager = @import("../metadata/local_catalog.zig");
 pub const object_storage = @import("../storage/object_storage.zig");
 pub const remote_uri = @import("../serverless/remote_uri.zig");

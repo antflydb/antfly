@@ -3424,7 +3424,7 @@ test "relational index system source snapshot certificate survives transfer rest
             const verifier = @import("portable_source_verifier.zig");
             const verify_root = try std.fmt.allocPrint(alloc, "{s}.verify", .{path});
             defer alloc.free(verify_root);
-            try @import("../common/fs_paths.zig").createDirPathPortable(io, verify_root);
+            try @import("antfly_runtime_fs").fs_paths.createDirPathPortable(io, verify_root);
             var done = false;
             var total_read: u64 = 0;
             var initialize_count: usize = 0;

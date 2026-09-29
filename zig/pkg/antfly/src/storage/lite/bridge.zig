@@ -24,8 +24,8 @@ const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const byte_copy = @import("../../common/byte_copy.zig");
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const platform_sync = @import("antfly_platform").sync;
 const storage_io = @import("../lsm_backend/storage_io.zig");
 

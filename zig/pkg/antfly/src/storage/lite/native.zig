@@ -23,8 +23,8 @@ const builtin = @import("builtin");
 const Crc32 = @import("antfly_hash").Crc32;
 const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const resource_manager_mod = @import("../resource_manager.zig");
 const maintenance = @import("../maintenance.zig");
 

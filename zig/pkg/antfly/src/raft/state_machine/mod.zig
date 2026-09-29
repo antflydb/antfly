@@ -16,7 +16,7 @@
 const std = @import("std");
 const raft_engine = @import("raft_engine");
 pub const applied_sink = @import("applied_sink.zig");
-pub const read_state_observer = @import("read_state_observer.zig");
+pub const read_state_observer = @import("antfly_read_state_observer");
 pub const metadata = @import("metadata.zig");
 pub const data = @import("data.zig");
 pub const metadata_store = @import("metadata_store.zig");

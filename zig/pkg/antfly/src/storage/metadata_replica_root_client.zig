@@ -18,7 +18,7 @@
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
-const provision_contract = @import("../metadata/provision_contract.zig");
+const provision_contract = @import("antfly_provision_contract");
 const table_manager = @import("../metadata/table_manager.zig");
 
 pub const ProvisionSummary = provision_contract.ProvisionSummary;

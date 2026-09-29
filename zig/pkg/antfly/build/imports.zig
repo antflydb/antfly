@@ -22,6 +22,10 @@ pub const AntflyRootImports = struct {
     cancellation: *std.Build.Module,
     cache_budget: *std.Build.Module,
     runtime_abi: *std.Build.Module,
+    runtime_fs: *std.Build.Module,
+    replica_catalog: *std.Build.Module,
+    provision_contract: *std.Build.Module,
+    read_state_observer: *std.Build.Module,
     private_error_diagnostics: *std.Build.Module,
     inference_bridge: *std.Build.Module,
     inference_provider_failure: *std.Build.Module,
@@ -211,6 +215,7 @@ pub const AntflyRootImports = struct {
     /// they do not depend on local tokenization, inference, or storage engines.
     pub fn configureCli(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
         mod.addImport("antfly_platform", self.platform);
+        mod.addImport("antfly_runtime_fs", self.runtime_fs);
         mod.addImport("httpx", self.httpx);
         mod.addImport("antfly-json", self.json);
         mod.addImport("antfly_metadata_openapi", self.metadata_openapi);
@@ -230,6 +235,7 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_cache_budget", self.cache_budget);
         mod.addImport("antfly_runtime_abi", self.runtime_abi);
+        mod.addImport("antfly_runtime_fs", self.runtime_fs);
         mod.addImport("antfly_inference_bridge", self.inference_bridge);
         mod.addImport("antfly_public_limits", self.public_limits);
         mod.addImport("antfly_template_content", self.template_content);
@@ -334,6 +340,7 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_template_content", self.template_content);
+        mod.addImport("antfly_runtime_fs", self.runtime_fs);
         mod.link_libc = link_libc;
         inline for (.{ "image", "font", "pdf", "json", "scraping", "scraping_openapi", "reader_config", "chunking", "hash", "httpx", "structlog" }) |field| self.addImport(mod, field);
     }
@@ -368,6 +375,10 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_cache_budget", self.cache_budget);
         mod.addImport("antfly_runtime_abi", self.runtime_abi);
+        mod.addImport("antfly_runtime_fs", self.runtime_fs);
+        mod.addImport("antfly_replica_catalog", self.replica_catalog);
+        mod.addImport("antfly_provision_contract", self.provision_contract);
+        mod.addImport("antfly_read_state_observer", self.read_state_observer);
         mod.addImport("antfly_inference_bridge", self.inference_bridge);
         mod.addImport("antfly_public_limits", self.public_limits);
         mod.addImport("antfly_template_content", self.template_content);

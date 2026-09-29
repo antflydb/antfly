@@ -16,7 +16,7 @@
 const std = @import("std");
 const raft_engine = @import("raft_engine");
 const db_types = @import("../storage/db/types.zig");
-const read_state_observer_mod = @import("state_machine/read_state_observer.zig");
+const read_state_observer_mod = @import("antfly_read_state_observer");
 
 /// Tracks quorum ReadIndex requests until the matching ReadState has crossed
 /// this replica's state-machine apply boundary. Registration is request

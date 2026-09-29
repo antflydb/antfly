@@ -15,8 +15,8 @@
 
 const std = @import("std");
 const system_catalog = @import("../../system_catalog/domain.zig");
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const backups_api = @import("../../api/local_backups.zig");
 const db_mod = @import("../../storage/db/selected_root.zig").db;
 const doc_identity = @import("../../storage/db/doc_identity.zig");
@@ -520,7 +520,7 @@ pub fn applyBackupRestoreFromRecord(
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
     group_id: u64,
-    restore: @import("../catalog.zig").BackupRestoreBootstrapRecord,
+    restore: @import("antfly_replica_catalog").BackupRestoreBootstrapRecord,
 ) !void {
     return try applyBackupRestoreFromRecordWithOptions(alloc, replica_root_dir, group_id, restore, .{});
 }
@@ -529,7 +529,7 @@ pub fn applyBackupRestoreFromRecordWithOptions(
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
     group_id: u64,
-    restore: @import("../catalog.zig").BackupRestoreBootstrapRecord,
+    restore: @import("antfly_replica_catalog").BackupRestoreBootstrapRecord,
     open_options: backups_api.OpenOptions,
 ) !void {
     try restore.validate();
@@ -1381,7 +1381,7 @@ test "backup restore bootstrap adopts an exact imported generation while repair 
         return error.TestUnexpectedResult;
     defer resident_read.deinit();
 
-    const exact: @import("../catalog.zig").BackupRestoreBootstrapRecord = .{
+    const exact: @import("antfly_replica_catalog").BackupRestoreBootstrapRecord = .{
         .backup_id = "backup-1701",
         .artifact_backup_id = "artifact-1701",
         .location = "s3://backup/antfly",

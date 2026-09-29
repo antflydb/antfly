@@ -19,10 +19,10 @@ const control_only_storage_sources = storage_source_options.control_only;
 const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
 const backups_api = @import("../api/backups.zig");
 const common_config = @import("../common/config.zig");
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const metadata_api = @import("api.zig");
 const table_manager = @import("table_manager.zig");
-const raft_catalog = @import("../raft/catalog.zig");
+const raft_catalog = @import("antfly_replica_catalog");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/selected_root.zig").db;
@@ -42,7 +42,7 @@ const shard_db_adapter_mod = @import("shard_db_adapter.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
 const restore_state_contract = @import("../storage/restore_state_contract.zig");
 
-pub const ProvisionSummary = @import("provision_contract.zig").ProvisionSummary;
+pub const ProvisionSummary = @import("antfly_provision_contract").ProvisionSummary;
 
 pub const ReconcileReplicaRootOptions = struct {
     drain_resolver_backfill: bool = true,

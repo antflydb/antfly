@@ -16,7 +16,7 @@
 //! File-oriented Lite commands share the engine, not the server facade.
 pub const build_options = @import("build_options");
 pub const common = struct {
-    pub const fs_paths = @import("common/fs_paths.zig");
+    pub const fs_paths = @import("antfly_runtime_fs").fs_paths;
     pub const secret_record = @import("common/secret_record.zig");
 };
 pub const db = @import("storage/db/selected_root.zig").db;

@@ -14,7 +14,7 @@
 // limitations.
 
 const std = @import("std");
-const fs_paths = @import("fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 
 pub const marker_file_name = "ANTFLY_FORMAT";
 pub const current_storage_format: u32 = 1;

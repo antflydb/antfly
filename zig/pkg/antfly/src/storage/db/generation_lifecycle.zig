@@ -16,7 +16,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const background_runtime = @import("../background_runtime.zig");
 
 const Allocator = std.mem.Allocator;

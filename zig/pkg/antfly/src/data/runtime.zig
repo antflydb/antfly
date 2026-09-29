@@ -29,7 +29,7 @@ const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const process_memory_budget = @import("../common/process_memory_budget.zig");
 const runtime_status = @import("../api/runtime_status.zig");
 const metadata_runtime_status_protocol = @import("../metadata/runtime_status_protocol.zig");
@@ -31953,7 +31953,7 @@ fn consumerTests() type {
                     event.waitUncancelable(io);
                 }
             };
-            var tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_control]std.Io.Future(void) = undefined;
+            var tasks: [@import("antfly_runtime_fs").threaded_io_limits.backend_runtime_control]std.Io.Future(void) = undefined;
             var started: usize = 0;
             defer {
                 release.set(control_io);
@@ -31967,7 +31967,7 @@ fn consumerTests() type {
 
             const raft_io = backend_runtime.ptr().raftOutboundIo().?;
             var raft_release: std.Io.Event = .unset;
-            var raft_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_raft_outbound]std.Io.Future(void) = undefined;
+            var raft_tasks: [@import("antfly_runtime_fs").threaded_io_limits.backend_runtime_raft_outbound]std.Io.Future(void) = undefined;
             var raft_started: usize = 0;
             defer {
                 raft_release.set(raft_io);
@@ -32012,7 +32012,7 @@ fn consumerTests() type {
             // task graph uses the separately admitted forwarding lane.
             const api_io = backend_runtime.ptr().apiIo().?;
             var api_release: std.Io.Event = .unset;
-            var api_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_api]std.Io.Future(void) = undefined;
+            var api_tasks: [@import("antfly_runtime_fs").threaded_io_limits.backend_runtime_api]std.Io.Future(void) = undefined;
             var api_started: usize = 0;
             defer {
                 api_release.set(api_io);
@@ -32060,7 +32060,7 @@ fn consumerTests() type {
             // cannot consume the capacity needed to replicate and confirm their work.
             const forward_io = forward_lane.io();
             var forward_release: std.Io.Event = .unset;
-            var forward_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_request_forward]std.Io.Future(void) = undefined;
+            var forward_tasks: [@import("antfly_runtime_fs").threaded_io_limits.backend_runtime_request_forward]std.Io.Future(void) = undefined;
             var forward_started: usize = 0;
             defer {
                 forward_release.set(forward_io);
@@ -51235,7 +51235,7 @@ fn implementationTests() type {
                 const io = virtual_io.io();
                 var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
                     .backend = .manual,
-                    .lane_limits = .{ .request_forward = @import("../common/threaded_io_limits.zig").request_forward_workers_per_request },
+                    .lane_limits = .{ .request_forward = @import("antfly_runtime_fs").threaded_io_limits.request_forward_workers_per_request },
                     .borrowed_io = .{ .general = io, .control = io, .request_forward = io },
                 });
                 defer runtime.deinit();

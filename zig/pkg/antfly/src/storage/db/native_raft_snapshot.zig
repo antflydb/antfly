@@ -18,7 +18,7 @@
 //! Local sidecar pins and derived projections are deliberately not included.
 const std = @import("std");
 const core = @import("core.zig");
-const fs = @import("../../common/fs_paths.zig");
+const fs = @import("antfly_runtime_fs").fs_paths;
 const Cancellation = @import("types.zig").CancellationToken;
 const Sha = std.crypto.hash.sha2.Sha256;
 pub const max_files = 1_000_000;

@@ -18,7 +18,7 @@
 //! retention estimates or a truncated WAL. Epoch changes require the caller's
 //! authenticated HA timeline transition; numeric timeline IDs are not ordered.
 const std = @import("std");
-const fs = @import("../../common/fs_paths.zig");
+const fs = @import("antfly_runtime_fs").fs_paths;
 pub const size = 68;
 pub const anchor_name = ".antfly-ha-replay-floor";
 

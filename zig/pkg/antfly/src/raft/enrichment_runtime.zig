@@ -16,8 +16,8 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const leader_runtime = @import("leader_runtime.zig");
-const read_state_observer_mod = @import("state_machine/read_state_observer.zig");
-const threaded_io_limits = @import("../common/threaded_io_limits.zig");
+const read_state_observer_mod = @import("antfly_read_state_observer");
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 
 pub const ExecutorBackend = enum {
     simulated,

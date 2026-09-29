@@ -32,7 +32,7 @@ const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
 const rowsource_external = @import("../../storage/rowsource/external.zig");
 const resource_manager_mod = @import("../../storage/resource_manager.zig");
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const snappy = @import("../../encoding/snappy.zig");
 pub const ObjectRangeCacheDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 

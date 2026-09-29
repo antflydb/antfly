@@ -22,7 +22,7 @@ pub const coverage_policy = @import("../api/coverage_policy.zig");
 pub const table_index_config = @import("../api/table_index_config.zig");
 pub const indexes_api = @import("../api/local_indexes.zig");
 pub const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
-pub const ProvisionSummary = @import("provision_contract.zig").ProvisionSummary;
+pub const ProvisionSummary = @import("antfly_provision_contract").ProvisionSummary;
 
 pub const ReconcileDbIndexOptions = struct {
     /// Hidden restore owners admit physical projections while empty. External

@@ -182,6 +182,13 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     });
     wasm_runtime_abi_mod.addImport("httpx", httpx_mod);
     embedded_support_wasm_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
+    const wasm_runtime_fs_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/fs.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_runtime_fs_mod.addImport("antfly_platform", wasm_platform_mod);
+    embedded_support_wasm_mod.addImport("antfly_runtime_fs", wasm_runtime_fs_mod);
     embedded_support_wasm_mod.addImport("antfly_public_limits", b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/api/public_limits.zig"),
         .target = wasm_target,

@@ -31,7 +31,7 @@ const portable_backup = @import("../portable_backup.zig");
 const query_api = @import("../../api/query.zig");
 const tables_api = @import("../../api/local_tables.zig");
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const full_text_index_defaults = @import("../../common/full_text_index_defaults.zig");
 
 pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
@@ -1247,7 +1247,7 @@ test "lite restore staging expands a self-contained native AFB2 bundle" {
     defer allocator.free(snapshot_path);
     const source_shard = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source_root, snapshot_path });
     defer allocator.free(source_shard);
-    try @import("../../common/fs_paths.zig").createDirPathPortable(io, source_shard);
+    try @import("antfly_runtime_fs").fs_paths.createDirPathPortable(io, source_shard);
     const payload_path = try std.fmt.allocPrint(allocator, "{s}/primary.bin", .{source_shard});
     defer allocator.free(payload_path);
     {

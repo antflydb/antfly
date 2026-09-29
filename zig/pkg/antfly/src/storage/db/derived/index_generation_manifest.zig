@@ -20,7 +20,7 @@
 
 const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
-const fs_paths = @import("../../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 
 const Allocator = std.mem.Allocator;
 const file_name = ".antfly-index-generation";

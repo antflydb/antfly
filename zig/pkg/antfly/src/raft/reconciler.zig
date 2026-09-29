@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const raft_engine = @import("raft_engine");
-const catalog = @import("catalog.zig");
+const catalog = @import("antfly_replica_catalog");
 const host_mod = @import("host.zig");
 const peer_resolver = @import("peer_resolver.zig");
 

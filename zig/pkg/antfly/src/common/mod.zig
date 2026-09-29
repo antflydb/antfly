@@ -31,10 +31,10 @@ pub const prometheus = @import("prometheus.zig");
 pub const request_admission = @import("request_admission.zig");
 pub const group_ids = @import("group_ids.zig");
 pub const data_format = @import("data_format.zig");
-pub const fs_paths = @import("fs_paths.zig");
+pub const fs_paths = @import("antfly_runtime_fs").fs_paths;
 pub const byte_copy = @import("byte_copy.zig");
 pub const cache_budget = @import("antfly_cache_budget");
-pub const threaded_io_limits = @import("threaded_io_limits.zig");
+pub const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 pub const threaded_connect_io = @import("threaded_connect_io.zig");
 
 test {

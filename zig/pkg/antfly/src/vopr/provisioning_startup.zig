@@ -18,7 +18,7 @@
 const std = @import("std");
 const vopr = @import("vopr");
 const data_format = @import("../common/data_format.zig");
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const provisioner = @import("../metadata/table_provisioner.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 

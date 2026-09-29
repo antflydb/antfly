@@ -20,8 +20,8 @@ const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const byte_copy = @import("../../common/byte_copy.zig");
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 
 const Allocator = std.mem.Allocator;
 const CounterU64 = platform.atomic.Value(u64);

@@ -22,7 +22,7 @@ const backend_erased = @import("../../backend_erased.zig");
 const docstore_mod = @import("../../docstore.zig");
 const lsm_backend = @import("../../lsm_backend.zig");
 const mem_backend = @import("../../mem_backend.zig");
-const fs_paths = @import("../../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const platform_time = @import("antfly_platform").time;
 
 const metadata_prefix = "\x00\x00__metadata__:derived_apply:";

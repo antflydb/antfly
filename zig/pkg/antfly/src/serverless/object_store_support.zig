@@ -358,7 +358,7 @@ pub const OpenedObjectStore = struct {
         };
         if (dynamic) {
             const io = try alloc.create(std.Io.Threaded);
-            io.* = @import("../common/threaded_io_limits.zig").initServerlessObjectStore(alloc);
+            io.* = @import("antfly_runtime_fs").threaded_io_limits.initServerlessObjectStore(alloc);
             credential_io = io;
             const context = try alloc.create(AwsCredentialContext);
             errdefer alloc.destroy(context);

@@ -69,10 +69,12 @@ Classify these files by responsibility, not by their current `raft/` or
   restore_provisioning_contract}.zig` are the starting set. Move their storage,
   API, and managed-embedder dependencies first so the new owners do not import
   back into `pkg/antfly`.
-- Incarnation IDs, mutation stamps, topology wire versions, and reallocation
-  requests are shared durable/protocol contracts. Give them an Apache protocol
-  owner with narrow named modules; server coordination imports those types.
-  Split `backup_cohort.zig` at its pure plan/checkpoint transition and driver
+- Topology wire versions, reallocation requests, incarnation IDs, and mutation
+  stamps are currently consumed by server coordination, not the Lite or
+  inference import graph. Keep them in `pkg/antfly` unless an actual embedded
+  consumer appears. `topology_records.zig` is distinct: its durable table and
+  range records are read by local restore code.
+- Split `backup_cohort.zig` at its pure plan/checkpoint transition and driver
   interface: the reusable state machine remains Apache, while admission,
   metadata locks, Raft persistence, and scheduling are server-owned.
 - Raft hosts, transport, placement planning, metadata authority, control loops,
@@ -83,3 +85,10 @@ Move one dependency layer at a time, then build Lite, the C ABI, and WASM from
 the Apache-only staged tree and run the server read-gate, metadata, restore,
 and standalone suites. The boundary check should reject an embedded import
 of `pkg/antfly` and a duplicate copy of any moved source file.
+
+The first layer now has named owners: the replica catalog lives in
+`pkg/antfly-embedded/src/replica`, the provisioning result contract in
+`pkg/antfly-embedded/src/metadata`, the read-state observer in `lib/raft`, and
+portable filesystem helpers in `lib/runtime`. The remaining local metadata and
+backup implementations still depend on Apache storage/API files under
+`pkg/antfly`; those dependencies must move before their consumers can.

@@ -40,7 +40,7 @@ const bedrock = @import("antfly_inference_bedrock");
 const foreign_mod = @import("../../foreign/mod.zig");
 const scraping = @import("antfly_scraping");
 const object_store_support = @import("../object_store_support.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const common_config = @import("../../common/config.zig");
 
 pub const BootstrapConfig = struct {

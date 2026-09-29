@@ -16,7 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const validation = @import("validation.zig");
 
 pub const marker_name = ".antfly-ha-local-gc-eligible.json";

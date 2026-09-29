@@ -714,7 +714,7 @@ test "raft runtime cadence validates independent intervals" {
 
 test "managed host runtime deterministically drains metadata updates" {
     const raft_engine = @import("raft_engine");
-    const catalog = @import("catalog.zig");
+    const catalog = @import("antfly_replica_catalog");
     const host_mod = @import("host.zig");
 
     const Factory = struct {

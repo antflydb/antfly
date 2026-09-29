@@ -19,7 +19,7 @@ const http_common = @import("http_common.zig");
 const http_driver = @import("http_driver.zig");
 const http_server = @import("http_server.zig");
 const http_snapshot = @import("http_snapshot.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 
 pub const HttpTransportStackConfig = struct {
     driver: http_driver.HttpDriverConfig = .{},
