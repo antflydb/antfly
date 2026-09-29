@@ -25,6 +25,8 @@ const schema = @import("../../pipelines/extraction_schema.zig");
 const targets = @import("boundary_targets.zig");
 const seeded = @import("../../graph/seeded_training.zig");
 const objectives = @import("boundary_train_objectives.zig");
+const distillation = @import("boundary_distillation.zig");
+const neck_fit = @import("boundary_distillation_fit.zig");
 const regex = @import("../../pipelines/extraction_regex.zig");
 const export_mod = @import("boundary_training_export.zig");
 const source_mod = @import("boundary_training_source.zig");
@@ -51,6 +53,19 @@ pub const Limits = struct {
     differentiation: seeded.Options = .{},
 };
 pub const DecisionEvents = @import("boundary_training_decisions.zig");
+pub const TeacherStates = distillation.TeacherStates;
+pub const Teacher = distillation.Teacher;
+pub const Distillation = struct {
+    teacher: Teacher,
+    weight: f32 = 1,
+    /// Also train the task heads on the rows' labels. Pure distillation
+    /// builds no head, so every head weight stays exactly as loaded.
+    heads: bool = false,
+    /// Fit the (identity) neck in closed form before the first update.
+    fit: neck_fit.Options = .{},
+    /// Borrowed diagnostics: sees each step's aligned student and teacher rows.
+    observer: ?distillation.Observer = null,
+};
 pub const Options = struct {
     /// Borrowed diagnostics over decisions already produced by the step.
     decision_observer: ?DecisionEvents.Observer = null,
@@ -72,7 +87,14 @@ pub const Options = struct {
     gold_hold_fraction: f32 = 0.15,
     require_gold_relation_coverage: bool = false,
     regex: regex.ContextOptions = .{},
+    /// Antenna feature distillation (boundary_distillation.zig).
+    distillation: ?Distillation = null,
     limits: Limits = .{},
+
+    pub fn stepObjectives(self: Options) step.Objectives {
+        const value = self.distillation orelse return .{};
+        return .{ .heads = value.heads, .distillation = true };
+    }
 };
 pub const Report = struct {
     epoch: u64,
@@ -270,6 +292,10 @@ pub const Trainer = struct {
             const weight = @field(options.weights, field.name);
             if (!std.math.isFinite(weight) or weight < 0) return error.InvalidBoundaryTrainingRun;
         }
+        if (options.distillation) |value| {
+            // Recomputation regions end at the trunk, before the neck.
+            if (!std.math.isFinite(value.weight) or value.weight <= 0 or options.activation_profile != .retained_v1) return error.InvalidBoundaryTrainingRun;
+        }
         var arena = std.heap.ArenaAllocator.init(host);
         defer arena.deinit();
         const scratch = arena.allocator();
@@ -288,6 +314,9 @@ pub const Trainer = struct {
             try parameters.append(scratch, .{ .name = descriptor.a_name, .canonical_name = descriptor.a_name, .dimensions = a_dims, .values = initialized.a, .kind = .adapter });
             try parameters.append(scratch, .{ .name = descriptor.b_name, .canonical_name = descriptor.b_name, .dimensions = b_dims, .values = initialized.b, .kind = .adapter });
             if (initialized.magnitude) |values| try parameters.append(scratch, .{ .name = descriptor.magnitude_name.?, .canonical_name = descriptor.magnitude_name.?, .dimensions = try scratch.dupe(i32, &.{@intCast(descriptor.target.out_dim)}), .values = values, .kind = .adapter });
+        };
+        if (options.distillation) |value| if (value.fit.rows != 0) {
+            try self.fitNeck(store, parameters.items, value, scratch, control);
         };
         const selected = try self.run_plan.selectParameters(scratch, parameters.items);
         const backend_limits = backend_mod.Limits{
@@ -361,15 +390,57 @@ pub const Trainer = struct {
             hash.update(@tagName(options.activation_profile));
             hash.update("\x00");
         }
-        const settings = try std.json.Stringify.valueAlloc(scratch, .{ .model = config, .capacities = options.capacities, .weights = options.weights, .gold_start = options.gold_start, .gold_end = options.gold_end, .gold_hold_fraction = options.gold_hold_fraction, .require_gold_relation_coverage = options.require_gold_relation_coverage, .word_splitter = options.processor.word_splitter, .validators = "native_python312_unicode15_v1" }, .{});
+        // The model serializes its pre-neck fields exactly as before the neck
+        // existed, so existing run fingerprints (and durable resumes) hold.
+        const model_settings = .{ .version = config.version, .architecture_version = config.architecture_version, .max_len = config.max_len, .backbone = config.backbone, .head = config.head, .encoder = config.encoder };
+        const settings = try std.json.Stringify.valueAlloc(scratch, .{ .model = model_settings, .capacities = options.capacities, .weights = options.weights, .gold_start = options.gold_start, .gold_end = options.gold_end, .gold_hold_fraction = options.gold_hold_fraction, .require_gold_relation_coverage = options.require_gold_relation_coverage, .word_splitter = options.processor.word_splitter, .validators = "native_python312_unicode15_v1" }, .{});
         hash.update(settings);
+        if (config.neck != .none) {
+            hash.update("\x00neck\x00");
+            hash.update(@tagName(config.neck));
+            hash.update("\x00");
+        }
+        if (options.distillation) |value| {
+            hash.update("\x00distillation.zspace_mse.v1\x00");
+            hash.update(&value.teacher.identity);
+            hash.update(std.mem.asBytes(&value.weight));
+            hash.update(&.{@intFromBool(value.heads)});
+            if (value.fit.rows != 0) {
+                hash.update("\x00neck_fit.ridge_normal_equations.v1\x00");
+                hash.update(std.mem.asBytes(&value.fit.rows));
+                hash.update(std.mem.asBytes(&value.fit.ridge));
+            }
+        }
         self.fingerprint = hash.finalResult();
         var processor_options = options.processor;
         processor_options.control = control;
         var target_options = options.limits.step.targets;
         target_options.gold_capacity = options.capacities.gold_per_query orelse config.head.max_gold_per_query;
+        target_options.allow_unsupervised = options.distillation != null;
         try dataset.preflight(tokenizer, processor_options, target_options, control, null);
         try check(control);
+    }
+
+    /// Replaces the identity neck in `parameters` (borrowed source values) with
+    /// its closed-form fit; the optimizer copies the fitted values.
+    fn fitNeck(self: *Trainer, store: *native.WeightStore, parameters: []run.Parameter, value: Distillation, scratch: Allocator, control: ?Control) !void {
+        const config = self.model_config;
+        if (config.neck != .linear or self.options.peft != null) return error.InvalidBoundaryNeckFit;
+        const h = config.encoder.hidden_size;
+        var weight_index: ?usize = null;
+        var bias_index: ?usize = null;
+        for (parameters, 0..) |parameter, index| {
+            if (std.mem.eql(u8, parameter.name, model.neck_prefix ++ ".weight")) weight_index = index;
+            if (std.mem.eql(u8, parameter.name, model.neck_prefix ++ ".bias")) bias_index = index;
+        }
+        const w = weight_index orelse return error.InvalidBoundaryNeckFit;
+        const b = bias_index orelse return error.InvalidBoundaryNeckFit;
+        try neck_fit.requireIdentity(parameters[w].values, parameters[b].values, h);
+        var fitted = try neck_fit.fit(self.host_budget.allocator(), .{ .store = store, .config = config, .dataset = self.dataset, .tokenizer = self.tokenizer, .processor = self.options.processor, .batch_size = self.options.run.batch_size, .execution = self.options.execution, .encoder_limits = self.options.limits.step.encoder }, value.teacher, value.fit, control);
+        defer fitted.deinit();
+        std.log.info("Antenna neck fit: rows={d} explained_variance={d:.4}", .{ fitted.rows, fitted.r2 });
+        parameters[w].values = try scratch.dupe(f32, fitted.weight);
+        parameters[b].values = try scratch.dupe(f32, fitted.bias);
     }
 
     fn initializeAdapterLayout(self: *const Trainer, a: Allocator, source: bundle.Identity, config: peft.Config, original: []const run.Parameter) !adapters.Layout {
@@ -562,6 +633,10 @@ pub const Trainer = struct {
         processor_options.control = control;
         var prepared = try processor.prepare(a, self.tokenizer, inputs, processor_options);
         defer prepared.deinit();
+        // The teacher encodes the same items; its states stay live through
+        // the step, which borrows them.
+        var teacher_states: ?TeacherStates = if (self.options.distillation) |value| try value.teacher.encode(value.teacher.ptr, a, inputs, &prepared, control) else null;
+        defer if (teacher_states) |*states| states.deinit();
         self.memory_failures.begin(.graph_preparation);
         try self.ensurePlan(&prepared, schemas, control);
         self.memory_failures.begin(.batch_preparation);
@@ -574,7 +649,7 @@ pub const Trainer = struct {
         const negative_draws = try scratch.alloc(f32, @as(usize, plan.encoder.layout.batch) * plan.encoder.layout.queries);
         var negative_rng = run.Random.init(self.run_plan.config.seed, identity.microbatch_step, "negative_queries");
         for (negative_draws) |*value| value.* = negative_rng.uniform();
-        const context = step.StepContext{ .decision_observer = self.options.decision_observer, .identity = .{ .binding = self.fingerprint, .optimizer_step = identity.optimizer_step, .microbatch = identity.microbatch_step }, .replay = .{ .seed = self.run_plan.config.seed, .micro_batch = identity.microbatch_step }, .progress = .{ .optimizer_step = identity.optimizer_step, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = self.options.gold_start, .gold_end = self.options.gold_end, .gold_hold_fraction = self.options.gold_hold_fraction }, .weights = self.options.weights, .injection_draws = draws, .negative_query_draws = negative_draws, .require_gold_relation_coverage = self.options.require_gold_relation_coverage };
+        const context = step.StepContext{ .decision_observer = self.options.decision_observer, .identity = .{ .binding = self.fingerprint, .optimizer_step = identity.optimizer_step, .microbatch = identity.microbatch_step }, .replay = .{ .seed = self.run_plan.config.seed, .micro_batch = identity.microbatch_step }, .progress = .{ .optimizer_step = identity.optimizer_step, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = self.options.gold_start, .gold_end = self.options.gold_end, .gold_hold_fraction = self.options.gold_hold_fraction }, .weights = self.options.weights, .injection_draws = draws, .negative_query_draws = negative_draws, .require_gold_relation_coverage = self.options.require_gold_relation_coverage, .distillation = if (teacher_states) |states| .{ .text = states.text, .queries = states.queries, .classifications = states.classifications, .parents = states.parents, .weight = self.options.distillation.?.weight, .observer = self.options.distillation.?.observer } else null };
         var result = blk: {
             self.memory_failures.begin(.forward_backward);
             var bindings = try self.optimizer.bind(plan.graph, control);
@@ -701,10 +776,11 @@ pub const Trainer = struct {
         var step_limits = self.options.limits.step;
         step_limits.targets.regex_context = &self.validators;
         step_limits.targets.validate_value_fn = regex.Context.validateValue;
+        step_limits.targets.allow_unsupervised = self.options.distillation != null;
         step_limits.recomputation.max_backend_bytes = @min(step_limits.recomputation.max_backend_bytes, self.options.limits.max_backend_bytes);
         step_limits.recomputation.max_host_bytes = @min(step_limits.recomputation.max_host_bytes, try std.math.add(usize, self.options.source_reserved_bytes, self.options.limits.max_host_bytes));
         const arithmetic: step.AttentionArithmetic = if (self.options.execution == .resident_cuda and self.options.attention_profile == .materialized_v1) .pytorch_fp32 else .scale_after_sum;
-        var plan = try step.buildWithTrainingArithmetic(a, self.model_config, prepared, schemas, self.options.capacities, .training, self.options.attention_profile, self.options.activation_profile, .{ .encoder = arithmetic, .boundary = if (self.options.execution == .resident_cuda and self.backend.cuda_backend.?.boundary_attention != null) .cuda_fused_d32_v1 else .materialized_v1, .prefix = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .tree_v1, .score = if (self.options.execution == .resident_cuda) .pytorch_sequential_v1 else .grouped_v1, .candidate_features = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .host_v1, .input_gradients = if (self.options.execution == .resident_cuda) .pytorch_v2 else .grouped_v1, .gather = if (self.options.execution == .resident_cuda) .pytorch_gather_v1 else .serial_v1, .sigmoid = if (self.options.execution == .resident_cuda) .pytorch_saved_v1 else .decomposed_v1, .record = if (self.options.execution == .resident_cuda) .pytorch_batch_v1 else .per_group_v1 }, step_limits);
+        var plan = try step.buildWithObjectives(a, self.model_config, prepared, schemas, self.options.capacities, .training, self.options.attention_profile, self.options.activation_profile, .{ .encoder = arithmetic, .boundary = if (self.options.execution == .resident_cuda and self.backend.cuda_backend.?.boundary_attention != null) .cuda_fused_d32_v1 else .materialized_v1, .prefix = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .tree_v1, .score = if (self.options.execution == .resident_cuda) .pytorch_sequential_v1 else .grouped_v1, .candidate_features = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .host_v1, .input_gradients = if (self.options.execution == .resident_cuda) .pytorch_v2 else .grouped_v1, .gather = if (self.options.execution == .resident_cuda) .pytorch_gather_v1 else .serial_v1, .sigmoid = if (self.options.execution == .resident_cuda) .pytorch_saved_v1 else .decomposed_v1, .record = if (self.options.execution == .resident_cuda) .pytorch_batch_v1 else .per_group_v1 }, self.options.stepObjectives(), step_limits);
         errdefer plan.deinit();
         if (self.options.execution == .resident_cuda) try plan.enableCudaTrainingFusion();
         if (self.adapter_layout) |adapter_layout| {
@@ -845,6 +921,9 @@ fn gradientRoute(plan: *const step.Plan, result: *const step.StepResult, name: [
         route = .{ .kind = presence.kind, .gradient_index = std.mem.indexOfScalar(ml.NodeId, result.backward.parameter_ids, presence.parameter) };
         if (route.kind == .computed and route.gradient_index == null) return error.MissingBoundaryTrainingGradient;
     }
-    if (route.kind == .absent and step.isTouchParameter(name, plan.config.head)) route.kind = .computed_zero;
+    // Upstream touches the optional record and relation heads with a zero
+    // loss. A plan without heads touches nothing, so they stay absent (and
+    // untouched by weight decay).
+    if (route.kind == .absent and plan.objectives.heads and step.isTouchParameter(name, plan.config.head)) route.kind = .computed_zero;
     return route;
 }
