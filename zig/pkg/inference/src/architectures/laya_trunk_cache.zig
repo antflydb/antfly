@@ -59,6 +59,9 @@ pub const Entry = struct {
     lease: ?memory.AdmissionLease = null,
     pins: usize = 0,
     last_used: u64 = 0,
+    /// A `fill` entry whose publication failed: still in use by its filler,
+    /// so it stays reserved and leased until its last `release`.
+    orphaned: bool = false,
 
     fn span(self: *const Entry, slot: usize) [2]usize {
         const n = self.tokens * self.hidden;
@@ -140,6 +143,14 @@ pub const Cache = struct {
         self.pending.deinit(self.allocator);
     }
 
+    /// Precision of entries created from now on; entries already cached or
+    /// being filled keep theirs.
+    pub fn setPrecision(self: *Cache, precision: Precision) void {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.precision = precision;
+    }
+
     /// Charge future entries to the session's admission controller.
     pub fn configureAdmission(self: *Cache, admission: Admission) void {
         platform.sync.lockYielding(&self.mutex);
@@ -156,10 +167,17 @@ pub const Cache = struct {
     }
 
     pub fn key(ids: []const i64, layers: usize, hidden: usize) [32]u8 {
+        return keyAt(ids, layers, hidden, 0);
+    }
+
+    /// The key of a trunk encoded at logical positions `first_position..`
+    /// (`packing.question_first` moves it); its keys carry those RoPE angles.
+    pub fn keyAt(ids: []const i64, layers: usize, hidden: usize, first_position: usize) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("antfly-laya-trunk/v1");
+        hash.update("antfly-laya-trunk/v2");
         hash.update(std.mem.asBytes(&layers));
         hash.update(std.mem.asBytes(&hidden));
+        hash.update(std.mem.asBytes(&first_position));
         hash.update(std.mem.sliceAsBytes(ids));
         return hash.finalResult();
     }
@@ -171,6 +189,15 @@ pub const Cache = struct {
         if (self.hitLocked(k)) |entry| return entry;
         self.stats.misses += 1;
         return null;
+    }
+
+    /// Whether `k` is cached, without pinning it or counting a hit. The
+    /// answer can go stale at once; it only guides scheduling.
+    pub fn contains(self: *Cache, k: [32]u8) bool {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries.items) |entry| if (std.mem.eql(u8, &entry.key, &k)) return true;
+        return false;
     }
 
     fn hitLocked(self: *Cache, k: [32]u8) ?*Entry {
@@ -185,7 +212,8 @@ pub const Cache = struct {
     }
 
     fn pendingLocked(self: *Cache, k: [32]u8) bool {
-        for (self.pending.items) |entry| if (std.mem.eql(u8, &entry.key, &k)) return true;
+        // An orphaned entry will never be published, so nobody waits on it.
+        for (self.pending.items) |entry| if (!entry.orphaned and std.mem.eql(u8, &entry.key, &k)) return true;
         return false;
     }
 
@@ -195,9 +223,15 @@ pub const Cache = struct {
     /// on a key another caller is filling waits for that fill.
     pub fn lookup(self: *Cache, k: [32]u8, tokens: usize, layers: usize, hidden: usize, host: bool) !Lookup {
         const count = try std.math.mul(usize, try std.math.mul(usize, 2 * layers, tokens), hidden);
-        const size = try std.math.mul(usize, count, if (self.precision == .f16) @as(usize, 2) else 4);
         while (true) {
             platform.sync.lockYielding(&self.mutex);
+            // Read the precision once, under the lock: the reservation, the
+            // entry, and its host slice must all agree on it.
+            const precision = self.precision;
+            const size = std.math.mul(usize, count, if (precision == .f16) @as(usize, 2) else 4) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
             if (self.hitLocked(k)) |entry| {
                 self.mutex.unlock();
                 return .{ .hit = entry };
@@ -223,7 +257,7 @@ pub const Cache = struct {
                 self.mutex.unlock();
                 return err;
             };
-            entry.* = .{ .key = k, .tokens = tokens, .hidden = hidden, .layers = layers, .precision = self.precision, .pins = 1, .lease = lease.lease };
+            entry.* = .{ .key = k, .tokens = tokens, .hidden = hidden, .layers = layers, .precision = precision, .pins = 1, .lease = lease.lease };
             self.pending.append(self.allocator, entry) catch |err| {
                 self.allocator.destroy(entry);
                 dropReservation(lease);
@@ -235,7 +269,7 @@ pub const Cache = struct {
             // Host storage is allocated outside the lock; its bytes are
             // already reserved.
             const host_count = if (host) count else 0;
-            const allocated = switch (self.precision) {
+            const allocated = switch (precision) {
                 .f16 => if (self.allocator.alloc(f16, host_count)) |v| blk: {
                     entry.host16 = v;
                     break :blk true;
@@ -294,7 +328,12 @@ pub const Cache = struct {
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         entry.pins -= 1;
-        if (entry.pins == 0 and std.mem.indexOfScalar(*Entry, self.entries.items, entry) == null and
+        if (entry.pins != 0) return;
+        if (entry.orphaned) {
+            // Its reservation and lease end with its last use.
+            self.removePendingLocked(entry);
+            self.destroy(entry);
+        } else if (std.mem.indexOfScalar(*Entry, self.entries.items, entry) == null and
             std.mem.indexOfScalar(*Entry, self.pending.items, entry) == null) self.destroy(entry);
     }
 
@@ -326,16 +365,16 @@ pub const Cache = struct {
     }
 
     /// Publish a filled `fill` entry. Its bytes and lease were reserved by
-    /// `lookup`, so it always fits. The caller keeps its pin and must
-    /// `release` it.
+    /// `lookup`, so it always fits; if the list cannot grow, the entry is
+    /// used once and freed on release instead. The caller keeps its pin and
+    /// must `release` it.
     pub fn publish(self: *Cache, entry: *Entry) void {
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         self.entries.ensureUnusedCapacity(self.allocator, 1) catch {
-            // Keep the entry usable for this caller; it is freed on release.
-            self.removePendingLocked(entry);
-            if (entry.lease) |*lease| lease.release();
-            entry.lease = null;
+            // The caller still reads the entry, so it stays charged (reserved
+            // bytes and lease) until its last `release` frees it.
+            entry.orphaned = true;
             return;
         };
         self.removePendingLocked(entry);
@@ -406,7 +445,7 @@ test "laya trunk cache stores f16 and f32 slots and charges admission before fil
     for ([_]Precision{ .f16, .f32 }) |precision| {
         var cache = Cache.init(a, 1 << 20);
         defer cache.deinit();
-        cache.precision = precision;
+        cache.setPrecision(precision);
         const entry = switch (try cache.lookup(Cache.key(&.{1}, 1, 4), 2, 1, 4, true)) {
             .fill => |e| e,
             else => return error.TestUnexpectedResult,
@@ -441,6 +480,34 @@ test "laya trunk cache stores f16 and f32 slots and charges admission before fil
     try std.testing.expectEqual(kept.bytes(), controller.snapshot().host_kv_bytes);
     cache.deinit();
     cache = Cache.init(a, 1 << 20);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_kv_bytes);
+}
+
+test "laya trunk cache keeps an entry it could not publish charged until its last release" {
+    var controller: memory.AdmissionController = .{};
+    // lookup allocates the entry, grows `pending`, then the host slice;
+    // publish's growth of `entries` is the fourth allocation.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
+    var cache = Cache.init(failing.allocator(), 1 << 20);
+    defer cache.deinit();
+    cache.configureAdmission(.{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1 << 20 }, .device = false });
+    const k = Cache.key(&.{8}, 1, 4);
+    const entry = switch (try cache.lookup(k, 2, 1, 4, true)) {
+        .fill => |e| e,
+        else => return error.TestUnexpectedResult,
+    };
+    cache.publish(entry);
+    try std.testing.expect(entry.orphaned);
+    try std.testing.expectEqual(@as(usize, 0), cache.snapshot().entries);
+    // Still in use by its filler: its bytes and lease stay charged.
+    try std.testing.expectEqual(entry.bytes(), cache.reserved_bytes);
+    try std.testing.expectEqual(entry.bytes(), controller.snapshot().host_kv_bytes);
+    // Nobody waits on an entry that will never be published.
+    platform.sync.lockYielding(&cache.mutex);
+    try std.testing.expect(!cache.pendingLocked(k));
+    cache.mutex.unlock();
+    cache.release(entry);
+    try std.testing.expectEqual(@as(usize, 0), cache.reserved_bytes);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_kv_bytes);
 }
 
