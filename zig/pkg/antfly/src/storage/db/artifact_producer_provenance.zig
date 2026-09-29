@@ -242,14 +242,22 @@ pub const ArtifactCertificate = struct {
     }
 };
 
+/// Capture the fixed receiver-local reference after the caller has validated
+/// the current artifact proof and its inputs in the same pinned snapshot.
+/// Final apply checks this CAS value without decoding the proof again.
+pub fn captureCurrentArtifactCertificate(txn: anytype, authority: publication.Authority, artifact: []const u8, expected_digest: publication.Digest) !ArtifactCertificate {
+    const reference = artifactReferenceKey(authority, artifact);
+    const raw = txn.get(&reference) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
+    if (raw.len != 32 + publication.Position.encoded_len) return error.ArtifactCatalogCorrupt;
+    if (!std.mem.eql(u8, raw[0..32], &expected_digest)) return error.EnrichmentSourceChanged;
+    return .{ .reference = reference, .value = raw[0 .. 32 + publication.Position.encoded_len].* };
+}
+
 pub fn certifyInheritedArtifact(alloc: std.mem.Allocator, txn: anytype, artifact: []const u8, expected_value: ?[]const u8, consumer: publication.Command) !ArtifactCertificate {
     var accepted = (try readCurrentForArtifact(alloc, txn, artifact, expected_value)) orelse return error.ArtifactCoverageBaselinePending;
     defer accepted.deinit();
     try accepted.proof.requireInheritedBy(consumer);
-    const reference = artifactReferenceKey(.{ .namespace = consumer.namespace, .epoch = consumer.authority_epoch, .catalog_digest = consumer.catalog_digest }, artifact);
-    const raw = try txn.get(&reference);
-    if (raw.len != 32 + publication.Position.encoded_len) return error.ArtifactCatalogCorrupt;
-    return .{ .reference = reference, .value = raw[0 .. 32 + publication.Position.encoded_len].* };
+    return captureCurrentArtifactCertificate(txn, .{ .namespace = consumer.namespace, .epoch = consumer.authority_epoch, .catalog_digest = consumer.catalog_digest }, artifact, accepted.proof.publication_digest);
 }
 
 /// Availability for authoritative projection accounting. Exact revision

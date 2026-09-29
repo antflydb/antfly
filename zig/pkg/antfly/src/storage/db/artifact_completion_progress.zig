@@ -147,7 +147,7 @@ pub const StreamVerifier = struct {
         root: u128,
         requirement: publication.Digest,
         observation: Observation,
-        value: union(enum) { native: @import("artifact_native_stream.zig").Closure, document: streams.DocumentClosure, chunks: streams.Closure, units: @import("artifact_unit_progress.zig").Closure, projection: @import("artifact_projection_certificate.zig").Closure },
+        value: union(enum) { native: @import("artifact_native_stream.zig").Closure, document: streams.DocumentClosure, extraction: streams.ExtractionClosure, chunks: streams.Closure, units: @import("artifact_unit_progress.zig").Closure, projection: @import("artifact_projection_certificate.zig").Closure },
         pub fn deinit(self: *@This()) void {
             switch (self.value) {
                 inline else => |*value| value.deinit(),
@@ -205,7 +205,13 @@ pub const StreamVerifier = struct {
         var request = self.plan.generated_templates[ordinal];
         request.doc_key = document;
         switch (node.scope) {
-            .producer_defined => return null,
+            .producer_defined => {
+                const closure = streams.prepareExtractionClosure(alloc, txn, root, request, self.plan) catch |err| switch (err) {
+                    error.ArtifactPublicationPending, error.ArtifactCoverageBaselinePending, error.EnrichmentSourceChanged => return null,
+                    else => return err,
+                };
+                return .{ .root = root, .requirement = closure.requirement, .observation = closure.observation, .value = .{ .extraction = closure } };
+            },
             .document => {
                 const closure = (if (request.kind == .asset or request.kind == .chunk_text)
                     streams.prepareEnrichmentClosure(alloc, txn, root, request, self.plan)
@@ -818,6 +824,13 @@ test "ordered artifact inventory completion leaves extraction-owned scope pendin
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
     try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .producer_json = "{\"type\":\"document_extraction\"}" });
+    var catalog = try db.artifactInventoryCommand(alloc);
+    defer catalog.catalogs.deinit(alloc);
+    catalog.binding.effect_protocol = 15;
+    try db.batchRaftReplicatedApply(.{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
+    var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
     var pin = try db.core.index_manager.acquireWritePlanSnapshot();
     defer pin.release();
     const plan = if (pin.plan().completion_plan) |*value| value else return error.TestUnexpectedResult;

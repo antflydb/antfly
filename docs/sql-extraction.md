@@ -2471,9 +2471,15 @@ following mechanisms are installed behind that gate:
   per document. Missing requirement verifiers still stop progress; all-member
   evidence agreement, repair/retry coordination and drain/seal remain separate
   activation gates. A sender's completed page is not remote acceptance.
-  Extraction-owned producer scopes now remain explicitly pending until their
-  own closure verifier exists; they cannot enter the document-only verifier and
-  turn an uncertified scope into a catalog-drift failure.
+  Extraction-owned producer scopes now use a separate receiver-local closure:
+  it authorizes the immutable template, verifies the fully published named
+  generation and accepted head proof/inputs, then carries exact head bytes,
+  the proof reference, and bounded private generation-state CAS witnesses into
+  the final writer. Child streams remain separate requirements. Missing heads
+  stay pending, and head-byte or private-state mutation invalidates a prepared
+  parent witness without rescanning units under apply. Allocation-failure
+  coverage exercises witness preparation and release. This does not activate
+  the still-gated extraction writer, portable adoption or all-member drain/seal.
   LSM regressions exercise native-only completion on two independent roots with
   different work revisions, receiver evidence missing/present after restart,
   rollback, duplicate delivery, stale inputs, forged claims, allocation failures,

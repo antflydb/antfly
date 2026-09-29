@@ -1628,7 +1628,21 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         // A child's closure never substitutes for the extraction parent's
         // separate requirement or turns the entire document into completion.
         const parent_requirement = try plan.plan().completion_plan.?.provider(child_requirement.parent_template.?);
-        try std.testing.expect((try verifier.verify(alloc, &reopened, db.root_incarnation, "doc", parent_requirement)) == null);
+        var parent_witness = (try verifier.verify(alloc, &reopened, db.root_incarnation, "doc", parent_requirement)).?;
+        defer parent_witness.deinit();
+        try std.testing.expect(parent_witness.value == .extraction);
+        try std.testing.expectEqualDeep(parent_requirement.id, parent_witness.requirement);
+        try parent_witness.requireCurrent(&reopened, db.root_incarnation);
+        const ExtractionAllocationCheck = struct {
+            fn run(a: std.mem.Allocator, reader: @TypeOf(&reopened), root: u128, parent_request: @import("enrichment/enrichment_types.zig").GeneratedEnrichmentRequest, snapshot: @TypeOf(plan.plan())) !void {
+                var prepared_parent = try @import("artifact_stream_progress.zig").prepareExtractionClosure(a, reader, root, parent_request, snapshot);
+                defer prepared_parent.deinit();
+                try prepared_parent.requireCurrent(reader, root);
+            }
+        };
+        var parent_request = plan.plan().generated_templates[child_requirement.parent_template.?];
+        parent_request.doc_key = "doc";
+        try std.testing.checkAllAllocationFailures(alloc, ExtractionAllocationCheck.run, .{ &reopened, db.root_incarnation, parent_request, plan.plan() });
     }
     // A new child scope behind the terminal cursor invalidates the old closure
     // through the same physical mutation hook as normal generated writes.
@@ -2099,6 +2113,58 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             defer reader.abort();
             try std.testing.expectError(error.NotFound, reader.get(&fresh_admission.jobs[0].key));
             try std.testing.expectEqual(null, try unit_jobs.prepareDocumentTurn(&reader, db.root_incarnation, "doc"));
+        }
+        var extraction_witness = blk: {
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            const child_requirement = try retirement_plan.plan().completion_plan.?.unitChild("chunks");
+            const parent_requirement = try retirement_plan.plan().completion_plan.?.provider(child_requirement.parent_template.?);
+            var verifier: @import("artifact_completion_progress.zig").StreamVerifier = .{ .plan = retirement_plan.plan() };
+            break :blk (try verifier.verify(alloc, &reader, db.root_incarnation, "doc", parent_requirement)).?;
+        };
+        defer extraction_witness.deinit();
+        try std.testing.expect(extraction_witness.value == .extraction);
+        {
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            try extraction_witness.requireCurrent(&reader, db.root_incarnation);
+        }
+        {
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            const head_key = extraction_witness.value.extraction.head_key;
+            const changed_head = try alloc.dupe(u8, try reader.get(head_key));
+            defer alloc.free(changed_head);
+            changed_head[changed_head.len - 1] ^= 1;
+            const HeadFault = struct {
+                reader: @TypeOf(&reader),
+                key: []const u8,
+                bytes: []const u8,
+                pub fn get(self: *@This(), selected: []const u8) ![]const u8 {
+                    if (std.mem.eql(u8, selected, self.key)) return self.bytes;
+                    return self.reader.get(selected);
+                }
+            };
+            var fault: HeadFault = .{ .reader = &reader, .key = head_key, .bytes = changed_head };
+            try std.testing.expectError(error.EnrichmentSourceChanged, extraction_witness.requireCurrent(&fault, db.root_incarnation));
+            try extraction_witness.requireCurrent(&reader, db.root_incarnation);
+        }
+        // Private generation state is not a visible document mutation. It
+        // still invalidates a prepared parent closure before final discharge.
+        {
+            var writer = try db.core.store.beginWriteTxn();
+            errdefer writer.abort();
+            const state_key = extraction_witness.value.extraction.state_key;
+            const changed_state = try alloc.dupe(u8, try writer.get(state_key));
+            defer alloc.free(changed_state);
+            changed_state[changed_state.len - 1] ^= 1;
+            try writer.put(state_key, changed_state);
+            try writer.commit();
+        }
+        {
+            var reader = try db.core.store.beginReadTxn();
+            defer reader.abort();
+            try std.testing.expectError(error.EnrichmentSourceChanged, extraction_witness.requireCurrent(&reader, db.root_incarnation));
         }
     }
 }

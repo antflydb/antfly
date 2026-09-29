@@ -173,6 +173,102 @@ pub const DocumentClosure = struct {
     }
 };
 
+/// An accepted extraction head commits an immutable unit directory, not the
+/// completion of its downstream child producers. The completion plan keeps
+/// those child streams as separate requirements. Retain the exact accepted
+/// head reference and both small generation-state records so private staging
+/// changes cannot invalidate a prepared witness without a visible row change.
+pub const ExtractionClosure = struct {
+    arena: std.heap.ArenaAllocator,
+    root: u128,
+    requirement: publication.Digest,
+    observation: Observation,
+    document: []const u8,
+    certificate: @import("artifact_producer_provenance.zig").ArtifactCertificate,
+    head_key: []const u8,
+    head_value: []const u8,
+    state_key: []const u8,
+    state_value: []const u8,
+    directory_key: []const u8,
+    directory_value: []const u8,
+
+    pub fn deinit(self: *ExtractionClosure) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn requireCurrent(self: ExtractionClosure, txn: anytype, actual_root: u128) !void {
+        if (actual_root == 0 or actual_root != self.root) return error.DurableRootIncarnationUnavailable;
+        try self.observation.requireCurrent(txn, self.document);
+        try self.certificate.requireCurrent(txn);
+        const head = txn.get(self.head_key) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
+        if (!std.mem.eql(u8, head, self.head_value)) return error.EnrichmentSourceChanged;
+        const state = txn.get(self.state_key) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
+        if (!std.mem.eql(u8, state, self.state_value)) return error.EnrichmentSourceChanged;
+        const directory = txn.get(self.directory_key) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
+        if (!std.mem.eql(u8, directory, self.directory_value)) return error.EnrichmentSourceChanged;
+    }
+};
+
+pub fn prepareExtractionClosure(alloc: std.mem.Allocator, txn: anytype, root: u128, request: Request, plan: *const Plan) !ExtractionClosure {
+    if (root == 0) return error.DurableRootIncarnationUnavailable;
+    if (request.doc_key.len == 0 or request.doc_key.len > checkpoints.max_cursor_bytes or request.artifact_name.len == 0 or request.kind != .asset) return error.InvalidBatchRequest;
+    const authorized = (try @import("artifact_producer_input.zig").authorizeTemplate(alloc, txn, request, plan)) orelse return error.ArtifactCatalogDrift;
+    if (authorized.requirement.scope != .producer_defined) return error.ArtifactCatalogDrift;
+    const extraction = @import("artifact_extraction_generation.zig");
+    const selected_scope = try @import("artifact_generation_scope.zig").extractionKeyAlloc(alloc, request.doc_key, request.artifact_name);
+    defer alloc.free(selected_scope);
+    var view = (try extraction.View(@typeInfo(@TypeOf(txn)).pointer.child).open(alloc, txn, selected_scope)) orelse return error.ArtifactPublicationPending;
+    defer view.deinit();
+    if (!std.meta.eql(view.plan.core.spec.authority, authorized.authority)) return error.ArtifactCatalogDrift;
+    const encoded_head = view.plan.core.spec.encode();
+    const provenance = @import("artifact_producer_provenance.zig");
+    var accepted = (try provenance.readCurrentForArtifact(alloc, txn, view.plan.core.head_key, &encoded_head)) orelse return error.ArtifactPublicationPending;
+    defer accepted.deinit();
+    const proof = accepted.proof;
+    if (proof.producer_kind != .enrichment or proof.producer_scope_key.len != 0 or
+        proof.producer_generation != authorized.authority.epoch or
+        !std.mem.eql(u8, proof.producer_name, request.artifact_name) or
+        !std.mem.eql(u8, proof.producer_artifact_name, request.artifact_name) or
+        !std.mem.eql(u8, &proof.input_digest, &view.plan.core.spec.input_digest)) return error.ArtifactCatalogCorrupt;
+    const head_effect = for (proof.effects) |effect| {
+        if (std.mem.eql(u8, effect.key, view.plan.core.head_key)) break effect;
+    } else return error.ArtifactCatalogCorrupt;
+    if (head_effect.source_index >= proof.sources.len or
+        !std.mem.eql(u8, proof.sources[head_effect.source_index].document_key, request.doc_key)) return error.ArtifactCatalogCorrupt;
+    const certificate = try provenance.captureCurrentArtifactCertificate(txn, authorized.authority, view.plan.core.head_key, proof.publication_digest);
+    const state_value = try txn.get(view.plan.core.state_key);
+    const directory_value = try txn.get(view.plan.progress);
+    if (state_value.len > 512 or directory_value.len > 512) return error.ArtifactCatalogCorrupt;
+    var observation = try Observation.capture(txn, request.doc_key);
+    try observation.observeProof(request.doc_key, proof);
+    try observation.requireCurrent(txn, request.doc_key);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    const document = try owned.dupe(u8, request.doc_key);
+    const head_key = try owned.dupe(u8, view.plan.core.head_key);
+    const head_value = try owned.dupe(u8, &encoded_head);
+    const state_key = try owned.dupe(u8, view.plan.core.state_key);
+    const owned_state = try owned.dupe(u8, state_value);
+    const directory_key = try owned.dupe(u8, view.plan.progress);
+    const owned_directory = try owned.dupe(u8, directory_value);
+    return .{
+        .arena = arena,
+        .root = root,
+        .requirement = authorized.requirement.id,
+        .observation = observation,
+        .document = document,
+        .certificate = certificate,
+        .head_key = head_key,
+        .head_value = head_value,
+        .state_key = state_key,
+        .state_value = owned_state,
+        .directory_key = directory_key,
+        .directory_value = owned_directory,
+    };
+}
+
 /// Root chunk replacements and singleton asset outputs have a closed scope
 /// set established by their catalog contract. A manifest with no accepted
 /// provenance is only an inventory; extraction/unit producers need their own
