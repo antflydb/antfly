@@ -26893,20 +26893,11 @@ fn scanRuntimeDocumentExtractionPreviousStateFromStore(
     var out = RuntimeDocumentExtractionPreviousState{};
     errdefer out.deinit(runtime.alloc);
 
-    var unit_keys = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer {
-        for (unit_keys.items) |key| runtime.alloc.free(@constCast(key));
-        unit_keys.deinit(runtime.alloc);
-    }
-    const unit_prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "asset", artifact_name);
-    defer runtime.alloc.free(unit_prefix);
-    const unit_rows = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, unit_prefix);
-    defer backend_scan.freeResults(runtime.alloc, unit_rows);
-    for (unit_rows) |entry| {
-        if (std.mem.eql(u8, entry.key, unit_prefix)) continue;
-        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) continue;
-        try unit_keys.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
-    }
+    var read = try runtime.store.beginRead();
+    defer read.abort();
+    const logical_chunks = @import("../artifact_chunk_cursor.zig");
+    var borrowed: logical_chunks.BorrowedRead = .{ .read = &read };
+    out.unit_keys = try @import("../artifact_extraction_generation.zig").unitKeysAlloc(runtime.alloc, &borrowed, doc_key, artifact_name);
 
     var chunk_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
@@ -26916,19 +26907,19 @@ fn scanRuntimeDocumentExtractionPreviousStateFromStore(
     for (runtime.index_manager.enrichments.items) |entry| {
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
-        const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "chunk", entry.name);
-        defer runtime.alloc.free(chunk_prefix);
-        const chunk_rows = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, chunk_prefix);
-        defer backend_scan.freeResults(runtime.alloc, chunk_rows);
-        for (chunk_rows) |row| {
-            if (!internal_keys.isChunkArtifactRecordKey(row.key)) continue;
-            try chunk_keys.append(runtime.alloc, try runtime.alloc.dupe(u8, row.key));
+        var cursor = try logical_chunks.Cursor(logical_chunks.BorrowedRead).openNamed(runtime.alloc, &borrowed, doc_key, entry.name);
+        defer cursor.close();
+        while (try cursor.next()) |row| {
+            const key = try runtime.alloc.dupe(u8, row.key);
+            chunk_keys.append(runtime.alloc, key) catch |err| {
+                runtime.alloc.free(key);
+                return err;
+            };
         }
     }
 
-    out.unit_keys = try unit_keys.toOwnedSlice(runtime.alloc);
     out.chunk_keys = try chunk_keys.toOwnedSlice(runtime.alloc);
-    out.navigation_block_keys = try scanRuntimeDocumentExtractionNavigationBlockKeys(runtime, doc_key, artifact_name);
+    out.navigation_block_keys = try scanRuntimeDocumentExtractionNavigationBlockKeysFromRead(runtime.alloc, &borrowed, doc_key, artifact_name);
     out.navigation_block_count = std.math.cast(u32, out.navigation_block_keys.len) orelse
         return error.InvalidDocumentExtractionState;
     out.unit_descriptors = try runtime.alloc.alloc(DocumentExtractionUnitDescriptor, out.unit_keys.len);
@@ -26949,26 +26940,44 @@ fn scanRuntimeDocumentExtractionNavigationBlockKeys(
     doc_key: []const u8,
     artifact_name: []const u8,
 ) ![]const []const u8 {
+    var read = try runtime.store.beginRead();
+    defer read.abort();
+    var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
+    return scanRuntimeDocumentExtractionNavigationBlockKeysFromRead(runtime.alloc, &borrowed, doc_key, artifact_name);
+}
+
+fn scanRuntimeDocumentExtractionNavigationBlockKeysFromRead(
+    alloc: Allocator,
+    txn: anytype,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]const []const u8 {
     const prefix = try internal_keys.documentUnitNavigationBlockPrefixAlloc(
-        runtime.alloc,
+        alloc,
         doc_key,
         artifact_name,
     );
-    defer runtime.alloc.free(prefix);
-    const rows = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
-    defer backend_scan.freeResults(runtime.alloc, rows);
+    defer alloc.free(prefix);
+    var cursor = try txn.openPhysicalCursorAdapter();
+    defer cursor.close();
     var keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
-        for (keys.items) |key| runtime.alloc.free(@constCast(key));
-        keys.deinit(runtime.alloc);
+        for (keys.items) |key| alloc.free(@constCast(key));
+        keys.deinit(alloc);
     }
-    for (rows) |row| {
+    var row = try cursor.seekAtOrAfter(prefix);
+    while (row) |entry| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, entry.key, prefix)) break;
         // The prefix ends immediately before the fixed-width block number.
         // Ignore malformed suffixes rather than broadening a repair deletion.
-        if (row.key.len != prefix.len + @sizeOf(u32)) continue;
-        try keys.append(runtime.alloc, try runtime.alloc.dupe(u8, row.key));
+        if (entry.key.len != prefix.len + @sizeOf(u32)) continue;
+        const key = try alloc.dupe(u8, entry.key);
+        keys.append(alloc, key) catch |err| {
+            alloc.free(key);
+            return err;
+        };
     }
-    return try keys.toOwnedSlice(runtime.alloc);
+    return try keys.toOwnedSlice(alloc);
 }
 
 fn cleanupRuntimeObsoleteNavigationBlocks(

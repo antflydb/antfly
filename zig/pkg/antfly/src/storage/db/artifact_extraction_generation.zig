@@ -339,6 +339,51 @@ pub fn View(comptime Txn: type) type {
     };
 }
 
+/// Reconstruct the logical unit inventory from one pinned read. Once a head
+/// selects a generation, its directory is authoritative even when it contains
+/// no units; obsolete physical rows must not be resurrected by recovery.
+/// Only keys are retained, so generation payloads are never loaded here.
+pub fn unitKeysAlloc(alloc: std.mem.Allocator, txn: anytype, document: []const u8, producer: []const u8) ![]const []const u8 {
+    const scope = try scopes.extractionKeyAlloc(alloc, document, producer);
+    defer alloc.free(scope);
+    var result: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (result.items) |key| alloc.free(key);
+        result.deinit(alloc);
+    }
+    if (try View(@TypeOf(txn.*)).open(alloc, txn, scope)) |selected| {
+        var view = selected;
+        defer view.deinit();
+        var cursor = try view.openCursor(alloc, 0);
+        defer cursor.deinit();
+        while (try cursor.next()) |descriptor| {
+            if (descriptor.name[0] != 1) continue;
+            if (descriptor.name.len == 1) return error.ArtifactCatalogCorrupt;
+            const key = try keys.documentUnitArtifactKeyAlloc(alloc, document, producer, descriptor.name[1..]);
+            result.append(alloc, key) catch |err| {
+                alloc.free(key);
+                return err;
+            };
+        }
+    } else {
+        const prefix = try keys.artifactNamedPrefixAlloc(alloc, document, "asset", producer);
+        defer alloc.free(prefix);
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(prefix);
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (!keys.isDocumentUnitArtifactRecordKey(entry.key)) continue;
+            const key = try alloc.dupe(u8, entry.key);
+            result.append(alloc, key) catch |err| {
+                alloc.free(key);
+                return err;
+            };
+        }
+    }
+    return result.toOwnedSlice(alloc);
+}
+
 pub const PreparedRetirement = struct {
     core: generations.PreparedRetirement,
     arena: std.heap.ArenaAllocator,
@@ -410,6 +455,8 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
     defer alloc.free(unit_name);
     const unit_key = try keys.documentUnitArtifactKeyAlloc(alloc, "doc", "extract", "unit\x00\xff");
     defer alloc.free(unit_key);
+    const stale_key = try keys.documentUnitArtifactKeyAlloc(alloc, "doc", "extract", "stale");
+    defer alloc.free(stale_key);
     const other_key = try keys.documentUnitArtifactKeyAlloc(alloc, "doc", "other", "unit\x00\xff");
     defer alloc.free(other_key);
     const entries = [_]Entry{ .{ .name = unit_name, .value = "first payload" }, .{ .name = "root", .value = "manifest" }, .{ .name = "unit\x00\xfe", .value = "third payload" } };
@@ -429,7 +476,16 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
         try @import("../source_authority.zig").bind(&txn, .native, authority.namespace);
         try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
         try txn.put(unit_key, "obsolete physical row");
+        try txn.put(stale_key, "obsolete extra unit");
         try txn.put(other_key, "unselected producer row");
+        {
+            const legacy_keys = try unitKeysAlloc(alloc, &txn, "doc", "extract");
+            defer {
+                for (legacy_keys) |key| alloc.free(key);
+                alloc.free(legacy_keys);
+            }
+            try std.testing.expectEqual(@as(usize, 2), legacy_keys.len);
+        }
         var physical = try captureInput(alloc, &txn, unit_key);
         defer physical.deinit();
         try std.testing.expect(physical.head_value == null);
@@ -479,6 +535,26 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
     const Selected = View(@import("../docstore.zig").DocStore.Txn);
     var view = (try Selected.open(alloc, &pinned, scope)).?;
     defer view.deinit();
+    {
+        const selected_keys = try unitKeysAlloc(alloc, &pinned, "doc", "extract");
+        defer {
+            for (selected_keys) |key| alloc.free(key);
+            alloc.free(selected_keys);
+        }
+        try std.testing.expectEqual(@as(usize, 1), selected_keys.len);
+        try std.testing.expectEqualStrings(unit_key, selected_keys[0]);
+    }
+    const InventoryAllocationCheck = struct {
+        fn run(a: std.mem.Allocator, txn: *@import("../docstore.zig").DocStore.Txn) !void {
+            const selected_keys = try unitKeysAlloc(a, txn, "doc", "extract");
+            defer {
+                for (selected_keys) |key| a.free(key);
+                a.free(selected_keys);
+            }
+            try std.testing.expectEqual(@as(usize, 1), selected_keys.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, InventoryAllocationCheck.run, .{&pinned});
     const CaptureCheck = struct {
         fn run(a: std.mem.Allocator, txn: *@import("../docstore.zig").DocStore.Txn, key: []const u8) !void {
             var input = try captureInput(a, txn, key);
@@ -547,6 +623,19 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
         _ = try empty.publish(&txn, plan.core.spec.id(), Guard{});
         _ = try plan.core.retire(&txn, authority, Guard{});
         try txn.commit();
+    }
+    {
+        var current = try db.core.store.beginReadTxn();
+        defer current.abort();
+        const empty_keys = try unitKeysAlloc(alloc, &current, "doc", "extract");
+        defer alloc.free(empty_keys);
+        try std.testing.expectEqual(@as(usize, 0), empty_keys.len);
+        const pinned_keys = try unitKeysAlloc(alloc, &pinned, "doc", "extract");
+        defer {
+            for (pinned_keys) |key| alloc.free(key);
+            alloc.free(pinned_keys);
+        }
+        try std.testing.expectEqual(@as(usize, 1), pinned_keys.len);
     }
     const MetadataOnly = struct {
         txn: *@import("../docstore.zig").DocStore.Txn,

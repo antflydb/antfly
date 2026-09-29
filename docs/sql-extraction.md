@@ -1912,6 +1912,12 @@ following mechanisms are installed behind that gate:
   decoded identity ownership on absence. LSM tests cover restart, aborted head
   publication, stale head/input rejection, duplicate append, allocation failures,
   divergent legacy tails, and old-reader visibility after member deletion.
+  Document-extraction state recovery now enumerates logical unit and child
+  chunk keys from one pinned read; a selected (including empty) extraction
+  head suppresses obsolete physical units, and selected chunk heads suppress
+  their legacy tails. Navigation-key recovery shares that read and avoids
+  loading block values. This closes a recovery-reader visibility gap, not the
+  ordered producer-publication or provenance-adoption gate.
   These are storage/read foundations, not production activation: ordered command
   admission, receipts, quotas, producer regeneration, remaining index/graph
   readers, and transfer/adoption must be integrated before publishing heads in
