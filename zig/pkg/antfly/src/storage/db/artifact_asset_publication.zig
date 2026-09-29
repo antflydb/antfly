@@ -75,6 +75,31 @@ fn optional(txn: anytype, key: []const u8) !?[]const u8 {
     };
 }
 
+pub const UpstreamFence = struct {
+    key: []const u8,
+    requires_value: bool,
+    certificate: ?@import("artifact_producer_provenance.zig").ArtifactCertificate = null,
+    prepared: bool = false,
+
+    /// The selected head authenticates an immutable directory, but its mere
+    /// presence does not prove that the logical root exists. Resolve that
+    /// membership and inherited causal proof before entering ordered apply.
+    pub fn bind(self: *UpstreamFence, alloc: std.mem.Allocator, txn: anytype, command: publication.Command) !void {
+        self.prepared = false;
+        self.certificate = null;
+        var input = try @import("artifact_extraction_generation.zig").captureInput(alloc, txn, self.key);
+        defer input.deinit();
+        if (self.requires_value and input.value == null) return error.EnrichmentSourceChanged;
+        if (input.proofValue() != null) self.certificate = try @import("artifact_producer_provenance.zig").certifyInheritedArtifact(alloc, txn, input.proofKey(self.key), input.proofValue(), command);
+        self.prepared = true;
+    }
+
+    pub fn requireCurrent(self: UpstreamFence, txn: anytype) !void {
+        if (!self.prepared) return error.InvalidBatchRequest;
+        if (self.certificate) |certificate| try certificate.requireCurrent(txn);
+    }
+};
+
 /// The value consumed by a provider and its accepted causal proof are sampled
 /// together. A durable but stale upstream result cannot authorize new output.
 pub fn readUpstream(alloc: std.mem.Allocator, token: *context.Token, txn: anytype, key: []const u8) !?[]u8 {
@@ -109,20 +134,44 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
     if (config.kind != .asset or command.producer_scope_key.len != 0) return error.InvalidBatchRequest;
     const producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(owned, config.producer_json);
     if (producer.type == .document_extraction or config.neighbor_context_json.len != 0) return error.OnlineMergeArtifactTailsUnsupported;
+    const extraction_source = try sourceIsExtraction(owned, configs, config.source_artifact_name);
+    var fences: std.ArrayList(UpstreamFence) = .empty;
     for (command.mutations) |effect| {
         const source = command.sources[effect.source_index];
         const expected = try keys.artifactNamedPrefixAlloc(owned, source.document_key, "asset", config.name);
         if (effect.family != .document_artifact or !std.mem.eql(u8, expected, effect.key)) return error.InvalidBatchRequest;
-        try requireUpstream(owned, command, config, effect);
+        try requireUpstream(owned, command, config, effect, extraction_source);
+        if (extraction_source and source.exists) try fences.append(owned, .{ .key = try keys.artifactNamedPrefixAlloc(owned, source.document_key, "asset", config.source_artifact_name), .requires_value = effect.value != null });
     }
-    return prepareTextEffects(&arena, command, catalogs, config, configs, command.mutations, null, true);
+    var prepared = try prepareTextEffects(&arena, command, catalogs, config, configs, command.mutations, null, true);
+    prepared.asset_upstream_fences = fences.items;
+    return prepared;
 }
 
-pub fn requireUpstream(alloc: std.mem.Allocator, command: publication.Command, config: @import("catalog/enrichment_catalog.zig").EnrichmentConfig, effect: publication.Mutation) !void {
+fn sourceIsExtraction(alloc: std.mem.Allocator, configs: []const @import("catalog/enrichment_catalog.zig").EnrichmentConfig, name: []const u8) !bool {
+    if (name.len == 0) return false;
+    for (configs) |candidate| {
+        if (!std.mem.eql(u8, candidate.name, name) or candidate.kind != .asset) continue;
+        var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, candidate.producer_json);
+        defer producer.deinit(alloc);
+        return producer.type == .document_extraction;
+    }
+    return false;
+}
+
+pub fn requireUpstream(alloc: std.mem.Allocator, command: publication.Command, config: @import("catalog/enrichment_catalog.zig").EnrichmentConfig, effect: publication.Mutation, extraction_source: bool) !void {
     const source = command.sources[effect.source_index];
     if (config.source_artifact_name.len == 0 or !source.exists) return;
     const upstream = try keys.artifactNamedPrefixAlloc(alloc, source.document_key, "asset", config.source_artifact_name);
     defer alloc.free(upstream);
+    if (extraction_source) {
+        const head = try @import("artifact_extraction_generation.zig").headKeyAlloc(alloc, source.document_key, config.source_artifact_name);
+        defer alloc.free(head);
+        const selected = for (command.artifact_sources) |guard| {
+            if (guard.source_index == effect.source_index and std.mem.eql(u8, guard.key, head)) break guard;
+        } else return error.InvalidBatchRequest;
+        if (selected.content_digest != null) return;
+    }
     for (command.artifact_sources) |guard| {
         if (guard.source_index == effect.source_index and std.mem.eql(u8, guard.key, upstream)) {
             if (effect.value != null and guard.content_digest == null) return error.InvalidBatchRequest;

@@ -905,6 +905,7 @@ pub const PreparedEffects = struct {
     coverage: []const Coverage = &.{},
     chunk_fence: ?@import("artifact_chunk_publication.zig").Fence = null,
     chunk_vector_fence: ?@import("artifact_chunk_vector_publication.zig").Fence = null,
+    asset_upstream_fences: []@import("artifact_asset_publication.zig").UpstreamFence = &.{},
     target_hints: ?[]const @import("derived/change_journal.zig").TargetHint = null,
     pub fn deinit(self: *@This()) void {
         self.arena.deinit();

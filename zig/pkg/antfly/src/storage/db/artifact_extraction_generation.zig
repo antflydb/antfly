@@ -31,14 +31,14 @@ pub fn headKeyAlloc(alloc: std.mem.Allocator, document: []const u8, producer: []
     return head;
 }
 
-/// Resolve units through the selected generation, including authoritative
-/// absence. Only a missing head permits physical-row fallback. Returned bytes
-/// borrow the pinned transaction; the input owns its head guard key.
+/// Resolve a root or unit through the selected generation, including
+/// authoritative absence. Only a missing head permits physical-row fallback.
+/// Returned bytes borrow the pinned transaction; the input owns its head guard.
 pub fn captureInput(alloc: std.mem.Allocator, txn: anytype, logical: []const u8) !generations.Input {
     const ids = @import("artifact_ids.zig");
     var ref = (try ids.decodeArtifactRefAlloc(alloc, logical)) orelse return generations.captureInput(alloc, txn, logical);
     defer ref.deinit(alloc);
-    if (ref.kind != .asset or ref.unit_id == null or ref.chunk_id != null) return generations.captureInput(alloc, txn, logical);
+    if (ref.kind != .asset or ref.chunk_id != null) return generations.captureInput(alloc, txn, logical);
     var input: generations.Input = .{ .alloc = alloc, .require_absence_proof = true };
     errdefer input.deinit();
     input.head_key = try headKeyAlloc(alloc, ref.document_id, ref.name);
@@ -48,9 +48,11 @@ pub fn captureInput(alloc: std.mem.Allocator, txn: anytype, logical: []const u8)
         defer alloc.free(scope);
         var view = try View(@TypeOf(txn.*)).fromHead(alloc, txn, scope, raw);
         defer view.deinit();
-        const name = try unitNameAlloc(alloc, ref.unit_id.?);
-        defer alloc.free(name);
-        input.value = try view.get(alloc, name);
+        if (ref.unit_id) |unit| {
+            const name = try unitNameAlloc(alloc, unit);
+            defer alloc.free(name);
+            input.value = try view.get(alloc, name);
+        } else input.value = try view.get(alloc, "root");
     } else input.value = txn.get(logical) catch |err| if (err == error.NotFound) null else return err;
     return input;
 }
@@ -455,6 +457,8 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
     defer alloc.free(unit_name);
     const unit_key = try keys.documentUnitArtifactKeyAlloc(alloc, "doc", "extract", "unit\x00\xff");
     defer alloc.free(unit_key);
+    const root_key = try keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "extract");
+    defer alloc.free(root_key);
     const stale_key = try keys.documentUnitArtifactKeyAlloc(alloc, "doc", "extract", "stale");
     defer alloc.free(stale_key);
     const other_key = try keys.documentUnitArtifactKeyAlloc(alloc, "doc", "other", "unit\x00\xff");
@@ -476,6 +480,7 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
         try @import("../source_authority.zig").bind(&txn, .native, authority.namespace);
         try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
         try txn.put(unit_key, "obsolete physical row");
+        try txn.put(root_key, "obsolete physical root");
         try txn.put(stale_key, "obsolete extra unit");
         try txn.put(other_key, "unselected producer row");
         {
@@ -490,6 +495,10 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
         defer physical.deinit();
         try std.testing.expect(physical.head_value == null);
         try std.testing.expectEqualStrings("obsolete physical row", physical.value.?);
+        var physical_root = try captureInput(alloc, &txn, root_key);
+        defer physical_root.deinit();
+        try std.testing.expect(physical_root.head_value == null);
+        try std.testing.expectEqualStrings("obsolete physical root", physical_root.value.?);
         _ = try plan.begin(&txn);
         var first = try PreparedAppend.init(alloc, &plan, try plan.core.load(&txn), entries[0..1]);
         defer first.deinit();
@@ -565,6 +574,21 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, CaptureCheck.run, .{ &pinned, unit_key });
+    {
+        var selected_root = try captureInput(alloc, &pinned, root_key);
+        defer selected_root.deinit();
+        try std.testing.expectEqualStrings("manifest", selected_root.value.?);
+        try std.testing.expectEqualStrings(plan.core.head_key, selected_root.proofKey(root_key));
+    }
+    const RootCaptureCheck = struct {
+        fn run(a: std.mem.Allocator, txn: *@import("../docstore.zig").DocStore.Txn, key: []const u8) !void {
+            var input = try captureInput(a, txn, key);
+            defer input.deinit();
+            try std.testing.expectEqualStrings("manifest", input.value.?);
+            try std.testing.expectEqualStrings(input.head_key.?, input.proofKey(key));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, RootCaptureCheck.run, .{ &pinned, root_key });
     const ids = @import("artifact_ids.zig");
     var identity = (try ids.decodeArtifactRefAlloc(alloc, unit_key)).?;
     defer identity.deinit(alloc);
@@ -630,6 +654,10 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
         const empty_keys = try unitKeysAlloc(alloc, &current, "doc", "extract");
         defer alloc.free(empty_keys);
         try std.testing.expectEqual(@as(usize, 0), empty_keys.len);
+        var empty_root = try captureInput(alloc, &current, root_key);
+        defer empty_root.deinit();
+        try std.testing.expect(empty_root.head_value != null);
+        try std.testing.expect(empty_root.value == null);
         const pinned_keys = try unitKeysAlloc(alloc, &pinned, "doc", "extract");
         defer {
             for (pinned_keys) |key| alloc.free(key);

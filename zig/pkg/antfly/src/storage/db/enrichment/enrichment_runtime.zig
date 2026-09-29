@@ -32565,8 +32565,14 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
         try std.testing.expectEqual((pass + 1) * calls_per_pass, harness.calls);
         var child = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
         defer child.deinit();
-        try std.testing.expectEqual(@as(usize, if (deleted) 0 else 1), child.command.artifact_sources.len);
-        if (!deleted) try std.testing.expectEqualStrings(key, child.command.artifact_sources[0].key);
+        try std.testing.expectEqual(@as(usize, if (deleted) 0 else 2), child.command.artifact_sources.len);
+        if (!deleted) {
+            const head = try @import("../artifact_extraction_generation.zig").headKeyAlloc(alloc, "doc", "copy");
+            defer alloc.free(head);
+            try std.testing.expectEqualStrings(key, child.command.artifact_sources[0].key);
+            try std.testing.expectEqualStrings(head, child.command.artifact_sources[1].key);
+            try std.testing.expect(child.command.artifact_sources[1].content_digest == null);
+        }
         try db.batchRaftReplicatedApply(.{ .artifact_publication = child.command }, .{ .term = 1, .index = pass * entries_per_pass + entries_per_pass + 2 });
         try processAsset(runtime, downstream, &batch, &prepared_sources, &window, &scope);
         try std.testing.expectEqual((pass + 1) * calls_per_pass, harness.calls);

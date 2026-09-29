@@ -691,7 +691,7 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
             } else false;
             if (!guarded_unit) return error.InvalidBatchRequest;
         }
-    } else try text.requireUpstream(owned, command, config, upstream_effect);
+    } else try text.requireUpstream(owned, command, config, upstream_effect, false);
     const guarded = for (command.mutation_preconditions) |condition| {
         if (condition.source_index == manifest.source_index and std.mem.eql(u8, condition.key, key) and condition.content_digest != null) break true;
     } else false;

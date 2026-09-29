@@ -31009,6 +31009,24 @@ pub const DB = struct {
                             input_preparation_error = true;
                         };
                     }
+                    if (value.asset_upstream_fences.len != 0 and preparation_error == null) {
+                        var read = try self.core.store.beginReadTxn();
+                        defer read.abort();
+                        var input_budget = if (self.core.index_manager.resource_manager) |manager|
+                            resource_manager_mod.BudgetedAllocator.init(manager, .shard_transition_working_set, self.alloc, 1)
+                        else
+                            null;
+                        defer if (input_budget) |*budget| budget.deinit();
+                        const input_alloc = if (input_budget) |*budget| budget.allocator() else self.alloc;
+                        for (value.asset_upstream_fences) |*fence| {
+                            fence.bind(input_alloc, &read, command) catch |err| {
+                                if (err == error.OutOfMemory) if (input_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
+                                preparation_error = err;
+                                input_preparation_error = true;
+                                break;
+                            };
+                        }
+                    }
                     if (preparation_error == null) {
                         var preparation_ctx = self.batchContext();
                         prepared_replay = try encodeChangeRecordPayloadWithTargetHints(&preparation_ctx, value.batch, 0, value.target_hints);
@@ -31245,6 +31263,7 @@ pub const DB = struct {
             coverage: []const publication.Coverage,
             chunk_fence: ?@import("artifact_chunk_publication.zig").Fence,
             chunk_vector_fence: ?@import("artifact_chunk_vector_publication.zig").Fence,
+            asset_upstream_fences: []const @import("artifact_asset_publication.zig").UpstreamFence,
             position: publication.Position,
             proof: []const u8,
             upload: ?@import("artifact_publication_transport.zig").Finalization,
@@ -31255,6 +31274,7 @@ pub const DB = struct {
                 try publication.validateArtifactSources(alloc, txn, guard.command.namespace, guard.command.sources, guard.command.mutation_preconditions);
                 if (guard.chunk_fence) |fence| try fence.requireCurrent(txn);
                 if (guard.chunk_vector_fence) |fence| try fence.requireCurrent(txn);
+                for (guard.asset_upstream_fences) |fence| try fence.requireCurrent(txn);
                 try publication.stageCoverage(alloc, txn, guard.command, guard.coverage);
                 try publication.stageReceipts(txn, guard.command, guard.sequence);
                 try @import("artifact_producer_provenance.zig").stage(txn, guard.command, guard.proof, guard.position);
@@ -31264,7 +31284,7 @@ pub const DB = struct {
                 try guard.db.stageRestoreStagingHAOutbox(txn, guard.ha_payload);
             }
         };
-        var guard: Guard = .{ .db = self, .ha_payload = ha_payload, .command = command, .sequence = sequence, .coverage = prepared_value.coverage, .chunk_fence = prepared_value.chunk_fence, .chunk_vector_fence = prepared_value.chunk_vector_fence, .position = .{ .raft = .{ .term = entry.term, .index = entry.index } }, .proof = prepared_proof orelse return error.ArtifactCatalogCorrupt, .upload = opts.artifact_upload_finalize };
+        var guard: Guard = .{ .db = self, .ha_payload = ha_payload, .command = command, .sequence = sequence, .coverage = prepared_value.coverage, .chunk_fence = prepared_value.chunk_fence, .chunk_vector_fence = prepared_value.chunk_vector_fence, .asset_upstream_fences = prepared_value.asset_upstream_fences, .position = .{ .raft = .{ .term = entry.term, .index = entry.index } }, .proof = prepared_proof orelse return error.ArtifactCatalogCorrupt, .upload = opts.artifact_upload_finalize };
         _ = self.core.store.putBatchWithPromotionsReplayAndBuiltWrite(batch_ctx.io, writes.items, deletes.items, &.{}, .{ .sequence = sequence, .payload = replay }, null, .{ .ptr = &guard, .validate = Guard.validate }) catch |err| switch (err) {
             error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .stale_source, &apply_held),
             error.ArtifactCoverageBaselinePending => return self.rejectArtifactPublicationAssumeApply(command, opts, ha_payload, .baseline_pending, &apply_held),
