@@ -80,7 +80,10 @@ pub fn load(alloc: std.mem.Allocator, txn: anytype, progress: pages.Progress) !s
         else => return err,
     };
     if (raw.len > 5 * 1024 * 1024) return error.ArtifactCatalogCorrupt;
-    var parsed = std.json.parseFromSlice(Record, alloc, raw, .{ .allocate = .alloc_always }) catch return error.ArtifactCatalogCorrupt;
+    var parsed = std.json.parseFromSlice(Record, alloc, raw, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.ArtifactCatalogCorrupt,
+    };
     errdefer parsed.deinit();
     const binding = progress.source.artifact_catalog orelse return error.ArtifactCatalogDrift;
     if (!parsed.value.matches(progress) or !std.mem.eql(u8, &parsed.value.catalogs.digest(), &binding.digest)) return error.ArtifactCatalogDrift;

@@ -245,6 +245,28 @@ pub const ReceiverProducerPlan = struct {
         return .{ .arena = arena, .donor_binding = donor_binding, .receiver_binding = receiver_binding, .indexes = indexes, .enrichments = enrichments, .resolvers = resolvers };
     }
 
+    /// The merge checkpoint committed the donor layout under the exact copy
+    /// attempt before importing any proof. Build this once per receiver pass
+    /// from that durable record and the current ordered receiver catalog;
+    /// neither a live donor lookup nor per-proof catalog parsing is needed.
+    pub fn initForMerge(alloc: std.mem.Allocator, txn: anytype, progress: @import("merge_page_contract.zig").Progress) !ReceiverProducerPlan {
+        try progress.validate();
+        const donor_binding = progress.source.artifact_catalog orelse return error.ArtifactCatalogDrift;
+        if (!progress.source.provenance_required or donor_binding.effect_protocol != 15) return error.ArtifactCatalogDrift;
+        var source = try @import("merge_artifact_catalog.zig").load(alloc, txn, progress);
+        defer source.deinit();
+        var receiver = (try inventory.load(alloc, txn)) orelse return error.ArtifactCatalogDrift;
+        defer receiver.deinit();
+        var receiver_namespace: publication.Namespace = undefined;
+        @import("doc_identity.zig").encodeNamespace(&receiver_namespace, progress.receiver_namespace);
+        if (!std.mem.eql(u8, &receiver.value.command.namespace, &receiver_namespace)) return error.ArtifactCatalogDrift;
+        const receiver_catalog = try inventory.catalogs(txn);
+        const local = try inventory.local(txn);
+        if (!std.mem.eql(u8, &receiver_catalog.digest(), &receiver.value.command.binding.digest) or
+            !std.mem.eql(u8, &local.digest, &receiver.value.command.binding.digest)) return error.ArtifactCatalogDrift;
+        return init(alloc, source.value.catalogs, donor_binding, receiver_catalog, receiver.value.command.binding);
+    }
+
     pub fn deinit(self: *ReceiverProducerPlan) void {
         self.arena.deinit();
         self.* = undefined;
@@ -596,6 +618,56 @@ test "ordered artifact inventory receiver maps enrichment epochs and resolver de
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ donor, donor_binding, receiver, receiver_binding });
+}
+
+test "ordered artifact inventory receiver plan pins durable merge source catalog" {
+    const alloc = std.testing.allocator;
+    const pages = @import("merge_page_contract.zig");
+    const source_catalog = @import("merge_artifact_catalog.zig");
+    const donor: inventory.Catalogs = .{ .indexes = "AIDX\x02\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00g\x03\x02\x00\x00\x00{}\x05\x00\x00\x00\x00\x00\x00\x00" };
+    const receiver: inventory.Catalogs = .{ .indexes = "AIDX\x02\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00g\x03\x02\x00\x00\x00{}\x09\x00\x00\x00\x00\x00\x00\x00" };
+    const donor_binding: inventory.Binding = .{ .epoch = 1, .digest = donor.digest(), .semantic_digest = try donor.semanticDigest(alloc), .effect_protocol = 15 };
+    const receiver_binding: inventory.Binding = .{ .epoch = 1, .digest = receiver.digest(), .semantic_digest = try receiver.semanticDigest(alloc), .effect_protocol = 15 };
+    const donor_namespace: @import("doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 };
+    const receiver_namespace: @import("doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 };
+    const progress: pages.Progress = .{
+        .version = 2,
+        .transition_id = 17,
+        .donor_group_id = 2,
+        .receiver_group_id = 3,
+        .receiver_namespace = receiver_namespace,
+        .attempt = .{ .donor_term = 1, .sequence = 1 },
+        .source = .{ .namespace = donor_namespace, .pin_digest = @splat(7), .applied_index = 5, .retention = .{ .epoch = 1, .after_sequence = 0 }, .artifact_catalog = donor_binding, .provenance_required = true },
+        .provenance_pending = true,
+    };
+    const source_raw = (try source_catalog.encode(alloc, .{ .kind = @as(enum { begin_copy, accept }, .begin_copy), .page_source = @as(?pages.Source, progress.source), .page_receiver_namespace = @as(?@TypeOf(receiver_namespace), receiver_namespace), .page_source_catalogs = @as(?inventory.Catalogs, donor) }, progress)).?;
+    defer alloc.free(source_raw);
+    var receiver_namespace_bytes: publication.Namespace = undefined;
+    @import("doc_identity.zig").encodeNamespace(&receiver_namespace_bytes, receiver_namespace);
+    const ordered: inventory.Ordered = .{ .command = .{ .namespace = receiver_namespace_bytes, .binding = receiver_binding, .catalogs = receiver }, .applied_index = 4 };
+    const ordered_raw = try std.json.Stringify.valueAlloc(alloc, ordered, .{ .emit_strings_as_arrays = true });
+    defer alloc.free(ordered_raw);
+    const Fake = struct {
+        source_raw: []const u8,
+        ordered_raw: []const u8,
+        indexes: []const u8,
+        pub fn get(self: *@This(), key_bytes: []const u8) anyerror![]const u8 {
+            if (std.mem.eql(u8, key_bytes, source_catalog.key)) return self.source_raw;
+            if (std.mem.eql(u8, key_bytes, inventory.ordered_key)) return self.ordered_raw;
+            if (std.mem.eql(u8, key_bytes, inventory.index_key)) return self.indexes;
+            return error.NotFound;
+        }
+    };
+    var txn: Fake = .{ .source_raw = source_raw, .ordered_raw = ordered_raw, .indexes = receiver.indexes };
+    var plan = try ReceiverProducerPlan.initForMerge(alloc, &txn, progress);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 1), plan.indexes.count());
+    try std.testing.expectEqual(@as(u64, 9), plan.indexes.get("g").?.receiver);
+    var changed_attempt = progress;
+    changed_attempt.attempt.sequence += 1;
+    try std.testing.expectError(error.ArtifactCatalogDrift, ReceiverProducerPlan.initForMerge(alloc, &txn, changed_attempt));
+    txn.indexes = donor.indexes;
+    try std.testing.expectError(error.ArtifactCatalogDrift, ReceiverProducerPlan.initForMerge(alloc, &txn, progress));
 }
 
 pub fn decodeValue(alloc: std.mem.Allocator, namespace: publication.Namespace, digest: publication.Digest, raw: []const u8) !Decoded {

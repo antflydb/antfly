@@ -1834,6 +1834,10 @@ following mechanisms are installed behind that gate:
   definition generations, including default-zero resolver generations, from
   the authenticated catalog pair. Graph effect rebinding and promotion
   identity remain open; mapping is candidate identity, not acceptance.
+  The receiver can now construct that plan from the donor catalog durably
+  bound to the exact merge attempt at its checkpoint and the current ordered
+  receiver catalog. It rejects an attempt change or local catalog drift without
+  a donor round trip or per-proof catalog transfer.
   A selected direct-index candidate can now build a receiver-owned APF3 body
   off-lock from remapped local inputs and selected postimages. The body binds
   donor lineage through its adoption digest, drops donor historical output
