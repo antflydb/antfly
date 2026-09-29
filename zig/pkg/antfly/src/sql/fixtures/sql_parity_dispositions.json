@@ -52,6 +52,16 @@
       "cwd": "zig",
       "timeout_seconds": 600
     },
+    "sql-original-prepared-cte-runtime": {
+      "command": ["zig", "build", "sql-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "SQL original prepared CTE"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
+    "pgwire-original-prepared-cte": {
+      "command": ["zig", "build", "pgwire-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "pgwire original prepared CTE"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "sql-mounted-read-shapes": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "httpx SQL executes one relational page with exact integer parameters"],
       "cwd": "zig",
@@ -138,22 +148,39 @@
     {
       "id": "sql-0005",
       "status": "unresolved",
-      "reason": "The exact statement body has typed runtime coverage: its CTE reads two source rows, releases the source cursor, generates distinct target identities, and submits one atomic INSERT batch; a source failure closes without generating IDs or submitting a mutation. A pgwire protocol fixture runs the original PREPARE/EXECUTE sequence and verifies deferral. Authenticated mounted HTTP prepared execution binds source and target, captures one read-committed source snapshot, and admits one target native batch. The exact prepared pgwire sequence is not yet mounted on that native source/target path, so the case remains unresolved."
+      "reason": "The exact statement body has typed runtime coverage: its CTE reads two source rows, releases the source cursor, generates distinct target identities, and submits one atomic INSERT batch; a source failure closes without generating IDs or submitting a mutation. A pgwire protocol fixture runs the original PREPARE/EXECUTE sequence and verifies deferral. Authenticated mounted HTTP prepared execution binds source and target, captures one read-committed source snapshot, and admits one target native batch. The exact prepared pgwire sequence is not yet mounted on that native source/target path, so the case remains unresolved.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/sql/insert_test.zig", "test": "SQL original prepared CTE INSERT captures source before one target mutation", "gate": "sql-original-prepared-cte-runtime"},
+        {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE INSERT defers mutation until execute", "gate": "pgwire-original-prepared-cte"},
+        {"path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL API cross-table MERGE retains both source and target range proofs", "gate": "sql-mounted-merge"}
+      ]
     },
     {
       "id": "sql-0006",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "The exact original prepared CTE UPDATE body has typed runtime coverage for one captured self-read, two versioned writes after capture closes, and source failure before mutation. The exact pgwire PREPARE/EXECUTE sequence is covered by a separate protocol fixture. Authenticated mounted pgwire/native execution and distributed fault evidence are still missing.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/sql/joined_mutation_test.zig", "test": "SQL original prepared CTE UPDATE DELETE and MERGE capture before one mutation", "gate": "sql-original-prepared-cte-runtime"},
+        {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE", "gate": "pgwire-original-prepared-cte"}
+      ]
     },
     {
       "id": "sql-0007",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "The exact original prepared CTE DELETE body has typed runtime coverage for one captured self-read, two versioned deletes after capture closes, and source failure before mutation. The exact pgwire PREPARE/EXECUTE sequence is covered by a separate protocol fixture. Authenticated mounted pgwire/native execution and distributed fault evidence are still missing.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/sql/joined_mutation_test.zig", "test": "SQL original prepared CTE UPDATE DELETE and MERGE capture before one mutation", "gate": "sql-original-prepared-cte-runtime"},
+        {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE", "gate": "pgwire-original-prepared-cte"}
+      ]
     },
     {
       "id": "sql-0008",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "The exact original prepared CTE MERGE body executes in a typed component fixture with an atomic statement-read-set capability, one captured self-read, two versioned writes after capture closes, and source failure before mutation. The exact pgwire PREPARE/EXECUTE sequence is covered separately. Mounted owner range-proof commit and distributed fault evidence remain missing.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/sql/joined_mutation_test.zig", "test": "SQL original prepared CTE UPDATE DELETE and MERGE capture before one mutation", "gate": "sql-original-prepared-cte-runtime"},
+        {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE", "gate": "pgwire-original-prepared-cte"}
+      ]
     },
     {
       "id": "sql-0009",

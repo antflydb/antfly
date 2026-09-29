@@ -1488,6 +1488,44 @@ test "pgwire original prepared CTE INSERT defers mutation until execute" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "INSERT 0 2\x00") != null);
 }
 
+test "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE" {
+    const alloc = std.testing.allocator;
+    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+    defer corpus.deinit();
+    for ([_]struct { id: []const u8, execute: []const u8, tag: []const u8 }{
+        .{ .id = "sql-0006", .execute = "EXECUTE cte_write_plan\x00", .tag = "UPDATE 2" },
+        .{ .id = "sql-0007", .execute = "EXECUTE cte_delete_plan\x00", .tag = "DELETE 2" },
+        .{ .id = "sql-0008", .execute = "EXECUTE cte_merge_plan\x00", .tag = "MERGE 2" },
+    }) |case| {
+        const original = for (corpus.value.object.get("entries").?.array.items) |entry| {
+            if (std.mem.eql(u8, entry.object.get("id").?.string, case.id)) break entry.object.get("sql").?.string;
+        } else return error.TestMissingCorpusCase;
+        const separator = std.mem.indexOf(u8, original, " AS ") orelse return error.TestInvalidCorpusCase;
+        var input = std.Io.Writer.Allocating.init(alloc);
+        defer input.deinit();
+        try startup(&input.writer);
+        const prepare_command = try std.fmt.allocPrint(alloc, "{s}\x00", .{original});
+        defer alloc.free(prepare_command);
+        try frame(&input.writer, 'Q', prepare_command);
+        try frame(&input.writer, 'Q', case.execute);
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .expected_execute_statement = original[separator + " AS ".len ..], .expected_result_tag = case.tag };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.describes);
+        try std.testing.expectEqual(@as(usize, 1), mock.executions);
+        try std.testing.expect(mock.saw_binding_guard);
+        const observed = try tags(alloc, output.written());
+        defer alloc.free(observed);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, observed, "C"));
+        try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') == null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "PREPARE\x00") != null);
+        const completion = try std.fmt.allocPrint(alloc, "{s}\x00", .{case.tag});
+        defer alloc.free(completion);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), completion) != null);
+    }
+}
+
 test "pgwire extended typed bind describes without execution and resumes once" {
     var input = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer input.deinit();

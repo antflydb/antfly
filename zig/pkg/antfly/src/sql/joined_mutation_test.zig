@@ -329,6 +329,114 @@ test "SQL joined FROM mutations choose hash keys and preserve CTE target identit
     }
 }
 
+test "SQL original prepared CTE UPDATE DELETE and MERGE capture before one mutation" {
+    const alloc = std.testing.allocator;
+    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    defer corpus.deinit();
+    const Fixture = struct {
+        const Self = @This();
+        const Cursor = struct {
+            owner: *Self,
+            request: catalog.StatementScan,
+            done: bool = false,
+            fn next(ptr: *anyopaque, allocator: std.mem.Allocator, _: u32) !catalog.Page {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.done) return .{ .rows = &.{} };
+                self.done = true;
+                if (self.owner.fail_read) return error.SourceReadFailed;
+                const rows = try allocator.alloc(catalog.Row, 2);
+                for (rows, 0..) |*row, i| {
+                    var values: std.json.ObjectMap = .empty;
+                    for (self.request.request.fields) |field| {
+                        const value: std.json.Value = if (std.mem.eql(u8, field, "id")) .{ .string = if (i == 0) "u1" else "u2" } else if (std.mem.eql(u8, field, "status")) .{ .string = "open" } else .null;
+                        try values.put(allocator, field, value);
+                    }
+                    row.* = .{ .id = if (i == 0) "row-u1" else "row-u2", .version = 1, .expected_content_digest = if (self.request.request.include_primary_digest) @splat(9) else null, .value = .{ .object = values } };
+                    if (self.request.request.include_document) row.document = try std.json.parseFromSliceLeaky(std.json.Value, allocator, if (i == 0) "{\"id\":\"u1\",\"status\":\"open\"}" else "{\"id\":\"u2\",\"status\":\"open\"}", .{});
+                }
+                return .{ .rows = rows };
+            }
+        };
+        states: [4]Cursor = undefined,
+        cursors: [4]catalog.Cursor = undefined,
+        captures: usize = 0,
+        closes: usize = 0,
+        commits: usize = 0,
+        fail_read: bool = false,
+        deleting: bool = false,
+        expected_status: []const u8 = "done",
+        atomic_read_set: bool = true,
+        fn backend(self: *Self) catalog.Backend {
+            return .{ .ptr = self, .atomic_statement_read_set = self.atomic_read_set, .vtable = &.{ .resolve = resolve, .scan = scan, .open_statement = open, .mutate = mutate, .checkpoint = checkpoint } };
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, name: ast.Name, _: catalog.Action) !catalog.Table {
+            try std.testing.expectEqualStrings("usage_records", name.table);
+            return .{ .id = 1, .physical_name = "usage_records", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = .string }, .{ .name = "status", .path = "status", .type = .string } } };
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedIndependentScan;
+        }
+        fn open(ptr: *anyopaque, _: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(scans.len > 0 and scans.len <= self.states.len);
+            self.captures += 1;
+            for (scans, self.states[0..scans.len], self.cursors[0..scans.len]) |request, *state, *cursor| {
+                state.* = .{ .owner = self, .request = request };
+                cursor.* = .{ .ptr = state, .next = Cursor.next, .close = undefined };
+            }
+            return .{ .ptr = self, .cursors = self.cursors[0..scans.len], .close = close };
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.closes += 1;
+        }
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), self.closes);
+            try std.testing.expectEqual(@as(usize, 2), mutations.len);
+            for (mutations, 0..) |mutation, i| {
+                try std.testing.expectEqualStrings(if (i == 0) "row-u1" else "row-u2", mutation.key);
+                try std.testing.expectEqual(@as(u64, 1), mutation.expected_version);
+                if (self.deleting) {
+                    try std.testing.expect(mutation.row == null);
+                } else try std.testing.expectEqualStrings(self.expected_status, mutation.row.?.object.get("status").?.string);
+            }
+            self.commits += 1;
+            return .committed;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    for ([_]struct { id: []const u8, tag: []const u8, deleting: bool, expected_status: []const u8 }{
+        .{ .id = "sql-0006", .tag = "UPDATE", .deleting = false, .expected_status = "done" },
+        .{ .id = "sql-0007", .tag = "DELETE", .deleting = true, .expected_status = "" },
+        .{ .id = "sql-0008", .tag = "MERGE", .deleting = false, .expected_status = "open" },
+    }) |case| {
+        const original = for (corpus.value.object.get("entries").?.array.items) |entry| {
+            if (std.mem.eql(u8, entry.object.get("id").?.string, case.id)) break entry.object.get("sql").?.string;
+        } else return error.TestMissingCorpusCase;
+        const separator = std.mem.indexOf(u8, original, " AS ") orelse return error.TestInvalidCorpusCase;
+        var compiled = try compiler.compile(alloc, original[separator + " AS ".len ..], .{});
+        defer compiled.deinit();
+        var fixture: Fixture = .{ .deleting = case.deleting, .expected_status = case.expected_status };
+        var result = try runtime.execute(alloc, fixture.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings(case.tag, result.output.command_tag);
+        try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+        try std.testing.expectEqual(@as(usize, 1), fixture.captures);
+        try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+        fixture = .{ .deleting = case.deleting, .expected_status = case.expected_status, .fail_read = true };
+        try std.testing.expectError(error.SourceReadFailed, runtime.execute(alloc, fixture.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 1), fixture.closes);
+        try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+        if (std.mem.eql(u8, case.id, "sql-0008")) {
+            fixture = .{ .atomic_read_set = false };
+            try std.testing.expectError(error.SqlRangeTrackingRequired, runtime.execute(alloc, fixture.backend(), &compiled, &.{}, .{}));
+            try std.testing.expectEqual(@as(usize, 0), fixture.captures);
+            try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+        }
+    }
+}
+
 test "SQL joined mutations empty matches and limits never partially commit" {
     var backend: Backend = .{};
     var empty = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=s.delta,cold='new' FROM source s WHERE t._id=s.id AND FALSE", .{});

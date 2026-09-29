@@ -110,13 +110,12 @@ def validate(inventory_bytes, ledger, root=ROOT, source_bytes=None):
             isinstance(entry.get("reason"), str) and bool(entry["reason"].strip()),
             f"{case_id}: missing rationale",
         )
-        if status not in RESOLVED:
-            continue
         evidence = entry.get("evidence", [])
-        require(
-            bool(evidence),
-            f"{case_id}: completed disposition requires executable evidence",
-        )
+        if status in RESOLVED:
+            require(
+                bool(evidence),
+                f"{case_id}: completed disposition requires executable evidence",
+            )
         if status == "rejected":
             require(
                 original_by_id[case_id]["source_expectation"] == "rejection",
@@ -142,10 +141,11 @@ def validate(inventory_bytes, ledger, root=ROOT, source_bytes=None):
             gate_id = proof["gate"]
             require(gate_id in gates, f"{case_id}: evidence gate missing")
             used_gates.add(gate_id)
-        require(
-            anchored,
-            f"{case_id}: at least one cited evidence test must identify the original case",
-        )
+        if evidence:
+            require(
+                anchored,
+                f"{case_id}: at least one cited evidence test must identify the original case",
+            )
     for gate_id in used_gates:
         gate = gates[gate_id]
         command = gate["command"]
@@ -237,7 +237,7 @@ def main(argv=None):
         if args.evidence:
             run_evidence(gates, ledger["gates"])
             print(
-                f"Resolved-case evidence passed; {len(blockers)} unresolved/deferred cases still block release."
+                f"Referenced evidence passed; {len(blockers)} unresolved/deferred cases still block release."
             )
             return 0
         if args.release:

@@ -1232,7 +1232,9 @@ compaction/selective-query performance comparison remains unmeasured.
   so an unrelated graph table neither blocks admission nor incurs index-JSON
   parsing; a graph-indexed CASCADE participant remains guarded. Unknown target
   names fail before the dependency walk parses unrelated table schemas.
-- All 19 currently referenced `make sql-parity-evidence-check` gates pass.
+- All 21 currently referenced `make sql-parity-evidence-check` gates pass,
+  including partial evidence on unresolved original prepared CTE mutations;
+  partial evidence does not grant release credit.
   The current SQL suite passes 227 tests, including the VALUES-subquery and
   observed-group Top-K admission cases.
   The dry-run EXPLAIN and mutation-subquery follow-up passes exact mounted

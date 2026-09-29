@@ -42,7 +42,9 @@ class ParityInventoryTest(unittest.TestCase):
         for status in ("implemented", "rejected", "superseded"):
             ledger = copy.deepcopy(self.ledger)
             unresolved = next(
-                entry for entry in ledger["entries"] if entry["status"] == "unresolved"
+                entry
+                for entry in ledger["entries"]
+                if entry["status"] == "unresolved" and not entry.get("evidence")
             )
             unresolved["status"] = status
             with self.assertRaisesRegex(ValueError, "executable evidence"):
@@ -78,6 +80,27 @@ class ParityInventoryTest(unittest.TestCase):
 
     def test_deferral_does_not_count_as_completion(self):
         self.assertEqual(1, len(release_blockers([{"status": "deferred"}])))
+
+    def test_unresolved_partial_evidence_is_checked_and_runs_without_release_credit(
+        self,
+    ):
+        _, entries, gate_ids = validate(self.inventory, self.ledger)
+        partial = next(entry for entry in entries if entry["id"] == "sql-0006")
+        self.assertEqual("unresolved", partial["status"])
+        self.assertIn("sql-original-prepared-cte-runtime", gate_ids)
+        self.assertIn("pgwire-original-prepared-cte", gate_ids)
+        ledger = copy.deepcopy(self.ledger)
+        partial = next(
+            entry for entry in ledger["entries"] if entry["id"] == "sql-0006"
+        )
+        partial["evidence"][0]["test"] = (
+            "SQL joined mutation equality work scales with inputs not Cartesian candidates"
+        )
+        partial["evidence"][1]["test"] = (
+            "pgwire original prepared CTE INSERT defers mutation until execute"
+        )
+        with self.assertRaisesRegex(ValueError, "at least one cited evidence test"):
+            validate(self.inventory, ledger)
 
     def test_changed_original_source_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "source checksum"):
