@@ -791,6 +791,7 @@ fn exportSourceProofs(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutpu
     var batch: std.ArrayListUnmanaged(backup_codec.KeyValueEntry) = .empty;
     defer deinitKeyValueBatch(alloc, &batch);
     var batch_bytes: usize = 4;
+    var emitted = false;
     var entry = try cursor.seekAtOrAfter(scoped);
     while (entry) |item| : (entry = try cursor.next()) {
         if (!std.mem.startsWith(u8, item.key, scoped)) break;
@@ -810,6 +811,7 @@ fn exportSourceProofs(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutpu
         errdefer if (value_owned) alloc.free(value);
         if (batch.items.len != 0 and (batch_bytes +| 40 +| value.len > batch_target_bytes or batch_bytes +| 40 +| value.len > source_proof_batch.max_bytes or batch.items.len == source_proof_batch.max_entries)) {
             try flushKeyValueBlock(alloc, out, &batch, .source_proof_batch);
+            emitted = true;
             batch_bytes = 4;
         }
         const owned_digest = try alloc.dupe(u8, &digest);
@@ -820,7 +822,17 @@ fn exportSourceProofs(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutpu
         digest_owned = false;
         batch_bytes += 40 + value.len;
     }
-    if (batch.items.len != 0) try flushKeyValueBlock(alloc, out, &batch, .source_proof_batch);
+    if (batch.items.len != 0) {
+        try flushKeyValueBlock(alloc, out, &batch, .source_proof_batch);
+        emitted = true;
+    }
+    if (!emitted) {
+        // The empty certified block binds producer-authority capability even
+        // when no output proof is selected at this immutable cut. Tail work
+        // must not be mistaken for a proof-free source.
+        const empty = [_]u8{ 0, 0, 0, 0 };
+        try out.writeBlock(.source_proof_batch, &empty);
+    }
 }
 
 fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutput, cohort: ?CohortProof, source_copy: ?SourceCopyProof) !void {
@@ -3774,6 +3786,17 @@ test "ordered artifact inventory source proof export restores inert selected evi
     try std.testing.expectError(error.NotFound, destination.get(alloc, publication.authority_key));
     try std.testing.expectError(error.NotFound, destination.get(alloc, &producer_provenance.key(namespace, entry.digest)));
     try std.testing.expectError(error.NotFound, destination.get(alloc, &producer_provenance.referenceKey(command, sources[0])));
+    var empty_writer = std.Io.Writer.Allocating.init(alloc);
+    defer empty_writer.deinit();
+    var empty_objects: std.ArrayListUnmanaged(PortableObject) = .empty;
+    defer empty_objects.deinit(alloc);
+    var empty_output: PortableOutput = .{ .alloc = alloc, .writer = &empty_writer.writer, .mode = .{ .inventory = &empty_objects } };
+    try exportSourceProofs(alloc, &pinned, &empty_output, .{ .start = "z", .end = "zz" }, namespace);
+    try std.testing.expectEqual(@as(usize, 1), empty_objects.items.len);
+    const empty_block = empty_writer.written();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, empty_block[6 .. empty_block.len - 4]);
+    var empty_reader = try source_proof_batch.Reader.init(empty_block[6 .. empty_block.len - 4]);
+    try std.testing.expect((try empty_reader.next()) == null);
 }
 
 test "ordinary portable restore rejects private source graph artifacts" {

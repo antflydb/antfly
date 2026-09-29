@@ -9652,6 +9652,11 @@ pub const DB = struct {
             if (effect.value) |value| payload_bytes +|= value.len;
             operations +|= 1;
         };
+        if (req.merge_page) |page| for (page.provenance_effects) |effect| {
+            payload_bytes +|= effect.key.len;
+            if (effect.value) |value| payload_bytes +|= value.len;
+            operations +|= 1;
+        };
         for (req.writes) |write| {
             payload_bytes +|= @intCast(write.key.len);
             payload_bytes +|= @intCast(write.value.len);
@@ -11229,6 +11234,16 @@ pub const DB = struct {
             // Standby receives the same bounded command, never the assembled
             // row re-escaped into an oversized replication JSON envelope.
             apply_opts.restore_ha_request = req;
+        };
+        if (apply_req.merge_page) |page| if (page.provenance_effects.len != 0) {
+            try @import("merge_page_contract.zig").validateRequest(apply_req);
+            var namespace: @import("artifact_publication.zig").Namespace = undefined;
+            doc_identity.encodeNamespace(&namespace, page.source.namespace);
+            for (page.provenance_effects) |effect| {
+                const digest = try @import("source_proof_batch.zig").transferDigest(namespace, page.source.pin_digest, effect.key);
+                var decoded = try @import("source_proof_batch.zig").decodeValue(preparation.guard.allocator(), namespace, digest, effect.value orelse return error.InvalidMergePage);
+                decoded.deinit();
+            }
         };
         if (apply_req.merge_page) |page| if (page.phase == .rows or page.phase == .tail) {
             if (page.chunk) |chunk| {
@@ -13230,6 +13245,12 @@ pub const DB = struct {
                 if (page.phase != .cleanup_integrity and compiled.findGeneration(address.generation) == null) return error.IntegrityCatalogChanged;
                 if (effect.value) |value| try store_writes.append(self.alloc, .{ .key = effect.key, .value = value }) else try delete_keys.append(self.alloc, effect.key);
             }
+        };
+        if (req.merge_page) |page| for (page.provenance_effects) |effect| {
+            // Inert source evidence commits with the page cursor, never with
+            // donor receipt or authority records. Adoption is a separate
+            // receiver-local validation and transaction.
+            try store_writes.append(self.alloc, .{ .key = effect.key, .value = effect.value orelse return error.InvalidMergePage });
         };
         try delete_keys.appendSlice(self.alloc, opts.extra_store_deletes);
         if (index_stage) |*stage| {

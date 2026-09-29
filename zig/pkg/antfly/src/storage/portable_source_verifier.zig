@@ -444,6 +444,7 @@ fn objectsStep(alloc: Allocator, io: std.Io, file: std.Io.File, index: std.Io.Fi
             if (state.kind == 0x18) {
                 if (state.metadata.phase != .done) return error.InvalidSourceSnapshot;
             } else {
+                if (state.kind == 0x1d) state.content.provenance_required = true;
                 state.content.ordered_content_digest = try state.object_hash.finish();
                 state.content.objects = std.math.add(u64, state.content.objects, 1) catch return error.SourceSnapshotTooLarge;
                 state.content.content_bytes = std.math.add(u64, state.content.content_bytes, if (state.kind == 0xff) 16 else state.blob_size) catch return error.SourceSnapshotTooLarge;

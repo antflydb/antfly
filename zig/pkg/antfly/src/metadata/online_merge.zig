@@ -77,7 +77,7 @@ pub const State = struct {
     }
     pub fn sourceIdentity(self: State) !page.Source {
         const certificate = self.certificate orelse return error.InvalidOnlineMergeState;
-        return .{ .namespace = certificate.cut.namespace, .pin_digest = try certificate.digest(), .applied_index = certificate.cut.applied_index, .retention = .{ .epoch = self.scope.consumer_epoch, .after_sequence = certificate.cut.retained_start }, .integrity = certificate.integrity, .artifact_catalog = self.artifact_catalog };
+        return .{ .namespace = certificate.cut.namespace, .pin_digest = try certificate.digest(), .applied_index = certificate.cut.applied_index, .retention = .{ .epoch = self.scope.consumer_epoch, .after_sequence = certificate.cut.retained_start }, .integrity = certificate.integrity, .artifact_catalog = self.artifact_catalog, .provenance_required = certificate.provenance_required };
     }
 };
 

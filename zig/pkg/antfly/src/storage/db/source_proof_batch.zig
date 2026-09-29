@@ -6,6 +6,7 @@ const provenance = @import("artifact_producer_provenance.zig");
 const publication = @import("artifact_publication.zig");
 
 pub const import_prefix = "\x00\x00__metadata__:source_proof:";
+pub const merge_prefix = "\x00\x00__metadata__:merge_source_proof:";
 pub const max_entries: usize = 65536;
 pub const max_bytes: usize = @import("../backup_codec.zig").max_block_payload_bytes;
 const record_magic = "SPR1";
@@ -16,6 +17,26 @@ pub fn importKey(namespace: publication.Namespace, digest: publication.Digest) [
     @memcpy(result[import_prefix.len..][0..24], &namespace);
     @memcpy(result[import_prefix.len + 24 ..], &digest);
     return result;
+}
+
+/// Merge evidence is cut-scoped so a later attempt cannot overwrite the
+/// selected-output bitmap from a different certified source pin.
+pub fn mergeKey(namespace: publication.Namespace, pin: [32]u8, digest: publication.Digest) [merge_prefix.len + 24 + 32 + 32]u8 {
+    var result: [merge_prefix.len + 24 + 32 + 32]u8 = undefined;
+    @memcpy(result[0..merge_prefix.len], merge_prefix);
+    @memcpy(result[merge_prefix.len..][0..24], &namespace);
+    @memcpy(result[merge_prefix.len + 24 ..][0..32], &pin);
+    @memcpy(result[merge_prefix.len + 56 ..], &digest);
+    return result;
+}
+
+/// Only inert evidence keys use this namespace. Donor receipt/authority keys
+/// are never legal merge-page effects.
+pub fn transferDigest(namespace: publication.Namespace, pin: [32]u8, key: []const u8) !publication.Digest {
+    if (key.len != merge_prefix.len + 24 + 32 + 32 or !std.mem.startsWith(u8, key, merge_prefix) or
+        !std.mem.eql(u8, key[merge_prefix.len..][0..24], &namespace) or
+        !std.mem.eql(u8, key[merge_prefix.len + 24 ..][0..32], &pin)) return error.InvalidMergePage;
+    return key[merge_prefix.len + 56 ..][0..32].*;
 }
 
 pub fn encodeValueAlloc(alloc: std.mem.Allocator, bitmap: []const u8, proof: []const u8) ![]u8 {
@@ -107,7 +128,7 @@ pub fn descriptor(reader: anytype, object_size: u64, position: Position) !?Descr
     if (next.offset == 0) {
         if (next.remaining != 0) return error.SourceSnapshotCorrupt;
         next.remaining = try readWord(reader, next.object, 0);
-        if (next.remaining == 0 or next.remaining > max_entries or next.remaining > (object_size - 4) / 86)
+        if ((next.remaining == 0 and object_size != 4) or next.remaining > max_entries or next.remaining > (object_size - 4) / 86)
             return error.SourceSnapshotCorrupt;
         next.offset = 4;
     }
@@ -140,7 +161,7 @@ pub const Reader = struct {
     pub fn init(bytes: []const u8) !Reader {
         if (bytes.len < 4 or bytes.len > max_bytes) return error.SourceSnapshotCorrupt;
         const count = std.mem.readInt(u32, bytes[0..4], .little);
-        if (count == 0 or count > max_entries or count > (bytes.len - 4) / 8) return error.SourceSnapshotCorrupt;
+        if ((count == 0 and bytes.len != 4) or count > max_entries or count > (bytes.len - 4) / 8) return error.SourceSnapshotCorrupt;
         return .{ .bytes = bytes, .remaining = count };
     }
 
@@ -224,4 +245,50 @@ test "ordered artifact inventory source proof descriptor resumes a certified lar
     try std.testing.expectError(error.SourceSnapshotCorrupt, first.read(&reader, value.len - 1, sample[0..2]));
     try std.testing.expectError(error.SourceSnapshotCorrupt, descriptor(&reader, batch.len - 1, .{ .object = 7 }));
     try std.testing.expectError(error.SourceSnapshotCorrupt, descriptor(&reader, batch.len, .{ .object = 7, .offset = 0, .remaining = 1 }));
+}
+
+test "ordered artifact inventory merge proof payload is isolated and chunk-resumable" {
+    const alloc = std.testing.allocator;
+    const pages = @import("merge_page_contract.zig");
+    const types = @import("types.zig");
+    const identity: @import("doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 };
+    var namespace: publication.Namespace = undefined;
+    @import("doc_identity.zig").encodeNamespace(&namespace, identity);
+    const document = try alloc.alloc(u8, 2 * pages.chunk_bytes);
+    defer alloc.free(document);
+    @memset(document, 'd');
+    const source = publication.Source{ .document_key = document, .content_digest = @splat(3), .timestamp = 1, .input_position = null };
+    const effect = provenance.Effect{ .family = .document_artifact, .key = "effect", .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    var proof: provenance.Proof = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "asset", .publication_digest = @splat(4), .input_digest = undefined, .sources = (&source)[0..1], .artifact_sources = &.{}, .effects = (&effect)[0..1] };
+    proof.input_digest = proof.inputCommand().inputDigest();
+    const raw = try provenance.encodeAlloc(alloc, proof);
+    defer alloc.free(raw);
+    const value = try encodeValueAlloc(alloc, &.{1}, raw);
+    defer alloc.free(value);
+    const import_key = mergeKey(namespace, @splat(1), proof.publication_digest);
+    var request: types.BatchRequest = .{
+        .merge_replication = .{ .transition_id = 7, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } },
+        .merge_page = .{ .source = .{ .namespace = identity, .pin_digest = @splat(1), .applied_index = 1, .retention = .{ .epoch = 1, .after_sequence = 0 }, .provenance_required = true }, .sequence = 1, .phase = .artifacts, .next = &import_key, .exhausted = false, .digest = @splat(0), .next_snapshot_position = .{ .object = 7, .offset = 64, .remaining = 0 }, .provenance_effects = &.{.{ .key = &import_key, .value = value }} },
+    };
+    request.merge_page.?.digest = pages.commandDigest(request);
+    try pages.validateRequest(request);
+    const chunks = try pages.RowChunks(types.BatchRequest).init(request);
+    const first = try chunks.requestAt(0);
+    const second = try chunks.requestAt(pages.chunk_bytes);
+    const final = try chunks.requestAt(2 * pages.chunk_bytes);
+    try std.testing.expectEqual(pages.ChunkPayload.provenance, first.merge_page.?.chunk.?.payload);
+    try std.testing.expect(!first.merge_page.?.chunk.?.complete());
+    try std.testing.expect(!second.merge_page.?.chunk.?.complete());
+    try std.testing.expect(final.merge_page.?.chunk.?.complete());
+    const encoded = try std.json.Stringify.valueAlloc(alloc, first.merge_page.?, .{});
+    defer alloc.free(encoded);
+    var decoded = try std.json.parseFromSlice(pages.Command, alloc, encoded, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(pages.ChunkPayload.provenance, decoded.value.chunk.?.payload);
+    try std.testing.expectEqualSlices(u8, first.merge_page.?.chunk.?.data, decoded.value.chunk.?.data);
+    const wrong_key = mergeKey(@splat(9), @splat(1), proof.publication_digest);
+    request.merge_page.?.provenance_effects = &.{.{ .key = &wrong_key, .value = value }};
+    request.merge_page.?.next = &wrong_key;
+    request.merge_page.?.digest = pages.commandDigest(request);
+    try std.testing.expectError(error.InvalidMergePage, pages.validateRequest(request));
 }

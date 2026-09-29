@@ -276,6 +276,11 @@ pub fn status(txn: anytype, scope: Scope) !Progress {
 /// must describe this admission's exact source cut; retries are exact CAS.
 pub fn stageCertificate(txn: anytype, scope: Scope, certificate: @import("../source_snapshot.zig").Certificate) !void {
     if (certificate.integrity) |binding| if (!std.mem.eql(u8, &binding.catalog_digest, &scope.fence.catalog_digest)) return error.SourceSnapshotCutMismatch;
+    // An authority activated after the immutable pin cannot be represented by
+    // a provenance-free certificate. Reject it in the replicated publication
+    // transaction, not only in the donor's off-lock preparation path.
+    if (try @import("artifact_publication.zig").authority(txn) != null and !certificate.provenance_required)
+        return error.OnlineMergeProvenanceTransferRequired;
     const certificate_digest = try certificate.digest();
     const found = try find(txn, scope) orelse return error.OnlineSourceScopeChanged;
     var progress = found.progress;
@@ -385,6 +390,12 @@ pub fn stage(txn: anytype, command: Command, applied_index: u64) !void {
             if (try @import("../source_pin_state.zig").load(txn)) |pending| if (std.mem.eql(u8, &pending.namespace, &progress.namespace) and std.mem.eql(u8, &pending.pin, &progress.pin)) try txn.delete(@import("../source_pin_state.zig").key);
         },
         .final_fence => |value| {
+            // Publication can race the snapshot even after its certificate
+            // was accepted. The final source cut is the last replicated point
+            // at which that race can be fenced before a receiver finishes.
+            if (try @import("artifact_publication.zig").authority(txn) != null and
+                (progress.published_certificate == null or !progress.published_certificate.?.provenance_required))
+                return error.OnlineMergeProvenanceTransferRequired;
             const active = try topology.current(txn) orelse return error.IntegrityTopologyChanged;
             if (!active.eql(scope.fence)) return error.IntegrityTopologyChanged;
             const state = try retained.load(txn) orelse return error.OnlineSourceScopeChanged;

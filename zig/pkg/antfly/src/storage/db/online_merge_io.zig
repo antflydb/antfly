@@ -888,7 +888,7 @@ pub fn requireRowDerivedIndexes(db: *DB, alloc: Allocator) !void {
 /// Coordinated transfer is authorized by the immutable published certificate,
 /// never by relaxing automatic admission or trusting a caller's live catalog.
 pub fn requireSnapshotIndexes(db: *DB, alloc: Allocator, identity: pages.Source, certificate: @import("../source_snapshot.zig").Certificate) !void {
-    if (!std.meta.eql(identity.integrity, certificate.integrity) or !std.mem.eql(u8, &identity.pin_digest, &try certificate.digest())) return error.SourceSnapshotCutMismatch;
+    if (!std.meta.eql(identity.integrity, certificate.integrity) or identity.provenance_required != certificate.provenance_required or !std.mem.eql(u8, &identity.pin_digest, &try certificate.digest())) return error.SourceSnapshotCutMismatch;
     db.core.lockApplyShared();
     defer db.core.unlockApplyShared();
     if (!try rowDerivedTransferIndexesAssumeApply(db, alloc, certificate.integrity != null or identity.artifact_catalog != null)) return error.TableTopologyProtocolUpgradeRequired;
@@ -940,7 +940,8 @@ fn validatePublished(scope: source.Scope, progress: source.Progress, identity: p
     if (progress.phase == .released or progress.snapshot_phase != .published or identity.retention == null or
         !identity.namespace.eql(scope.fence.namespace) or identity.retention.?.epoch != scope.consumer_epoch or identity.retention.?.after_sequence != progress.start or
         identity.applied_index != progress.admitted_applied_index or !std.mem.eql(u8, &identity.pin_digest, &progress.snapshot_certificate)) return error.SourceSnapshotCutMismatch;
-    if (!std.meta.eql(identity.integrity, if (progress.published_certificate) |certificate| certificate.integrity else null)) return error.SourceSnapshotCutMismatch;
+    if (!std.meta.eql(identity.integrity, if (progress.published_certificate) |certificate| certificate.integrity else null) or
+        identity.provenance_required != (if (progress.published_certificate) |certificate| certificate.provenance_required else false)) return error.SourceSnapshotCutMismatch;
 }
 
 fn encodePrepared(alloc: Allocator, scope: source.Scope, request: ?types.BatchRequest) ![]u8 {

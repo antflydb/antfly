@@ -48,6 +48,7 @@ const WireCommand = struct {
     chunk: ?WireChunk = null,
     integrity: []const pages.IntegrityEffect = &.{},
     artifact_effects: []const WireVector = &.{},
+    provenance_effects: []const WireVector = &.{},
 };
 
 comptime {
@@ -60,11 +61,12 @@ comptime {
 pub fn write(command: pages.Command, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
     inline for (@typeInfo(pages.Command).@"struct".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "artifact_effects")) {
-            if (command.artifact_effects.len != 0) {
+        if (comptime std.mem.eql(u8, field.name, "artifact_effects") or std.mem.eql(u8, field.name, "provenance_effects")) {
+            const effects = @field(command, field.name);
+            if (effects.len != 0) {
                 try stream.objectField(field.name);
                 try stream.beginArray();
-                for (command.artifact_effects) |effect| {
+                for (effects) |effect| {
                     try stream.beginObject();
                     try stream.objectField("key");
                     try binary.write(effect.key, stream);
@@ -159,10 +161,10 @@ pub fn parseValueLeaky(alloc: Allocator, value: std.json.Value, options: std.jso
 fn fromWire(alloc: Allocator, wire: WireCommand) std.json.ParseFromValueError!pages.Command {
     // Only native finalization may attach a fully assembled effect to a
     // chunk. A sender cannot smuggle an independent effect beside its spool.
-    if (wire.chunk != null and wire.artifact_effects.len != 0) return error.UnexpectedToken;
+    if (wire.chunk != null and (wire.artifact_effects.len != 0 or wire.provenance_effects.len != 0)) return error.UnexpectedToken;
     var command: pages.Command = undefined;
     inline for (@typeInfo(pages.Command).@"struct".fields) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "chunk") and !std.mem.eql(u8, field.name, "artifact_effects")) @field(command, field.name) = @field(wire, field.name);
+        if (comptime !std.mem.eql(u8, field.name, "chunk") and !std.mem.eql(u8, field.name, "artifact_effects") and !std.mem.eql(u8, field.name, "provenance_effects")) @field(command, field.name) = @field(wire, field.name);
     }
     if (wire.artifact_effects.len > @import("../retained_effects.zig").max_keys) return error.LengthMismatch;
     const vectors = try alloc.alloc(pages.IntegrityEffect, wire.artifact_effects.len);
@@ -183,6 +185,22 @@ fn fromWire(alloc: Allocator, wire: WireCommand) std.json.ParseFromValueError!pa
         }
     }
     command.artifact_effects = vectors;
+    if (wire.provenance_effects.len > pages.max_rows) return error.LengthMismatch;
+    const proofs = try alloc.alloc(pages.IntegrityEffect, wire.provenance_effects.len);
+    total = 0;
+    for (wire.provenance_effects, proofs) |effect, *out| {
+        total = std.math.add(usize, total, effect.key.len) catch return error.LengthMismatch;
+        if (total > pages.max_bytes) return error.LengthMismatch;
+        const encoded = effect.value_base64 orelse return error.UnexpectedToken;
+        if (encoded.len > std.base64.standard.Encoder.calcSize(pages.max_bytes - total)) return error.LengthMismatch;
+        const len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.UnexpectedToken;
+        if (len < 46 or len > pages.max_bytes - total) return error.LengthMismatch;
+        const bytes = try alloc.alloc(u8, len);
+        std.base64.standard.Decoder.decode(bytes, encoded) catch return error.UnexpectedToken;
+        out.* = .{ .key = effect.key, .value = bytes };
+        total += len;
+    }
+    command.provenance_effects = proofs;
     command.chunk = null;
     if (wire.chunk) |chunk| {
         if (chunk.data_base64.len > std.base64.standard.Encoder.calcSize(pages.max_chunk_bytes)) return error.LengthMismatch;

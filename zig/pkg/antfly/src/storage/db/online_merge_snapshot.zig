@@ -25,6 +25,7 @@ const verifier = @import("../portable_source_verifier.zig");
 const Certificate = @import("../source_snapshot.zig").Certificate;
 const Allocator = std.mem.Allocator;
 const VectorDescriptor = @import("online_vector_snapshot.zig").RawDescriptor;
+const ProofDescriptor = @import("source_proof_batch.zig").Descriptor;
 const VectorStream = struct {
     descriptor: VectorDescriptor,
     base: types.BatchRequest,
@@ -32,12 +33,13 @@ const VectorStream = struct {
     hashed: u64 = 0,
     digest: ?pages.Digest = null,
 };
-
-fn requireTransferableArtifactKind(kind: @import("../backup_codec.zig").BlockType) !void {
-    // Proof bodies are source evidence, not vector/graph afterimages. A merge
-    // must not declare its snapshot complete after skipping them.
-    if (kind == .source_proof_batch) return error.OnlineMergeProvenanceTransferRequired;
-}
+const ProofStream = struct {
+    descriptor: ProofDescriptor,
+    base: types.BatchRequest,
+    hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
+    hashed: u64 = 0,
+    digest: ?pages.Digest = null,
+};
 
 pub const Cache = struct {
     arena: ?std.heap.ArenaAllocator = null,
@@ -46,6 +48,7 @@ pub const Cache = struct {
     request: ?types.BatchRequest = null,
     chunks: ?pages.RowChunks(types.BatchRequest) = null,
     vector: ?VectorStream = null,
+    proof: ?ProofStream = null,
     pub fn clear(self: *Cache) void {
         if (self.arena) |*arena| arena.deinit();
         self.* = .{};
@@ -78,6 +81,35 @@ fn outputVector(alloc: Allocator, scope: source.Scope, cache: *Cache, receipt: p
     try vector.descriptor.read(reader, offset, data);
     var request = vector.base;
     request.merge_page.?.chunk = .{ .payload = .artifact, .row_key = vector.descriptor.key.?, .timestamp = 0, .total_bytes = vector.descriptor.value_len, .row_digest = vector.digest.?, .offset = offset, .data = data, .chunk_digest = @import("merge_page_chunks.zig").checksum(data) };
+    request.merge_page.?.digest = pages.commandDigest(request);
+    try pages.validateRequest(request);
+    return std.json.Stringify.valueAlloc(alloc, @import("online_merge_io_contract.zig").Prepared{ .scope = scope, .request = request }, .{});
+}
+
+fn outputProof(alloc: Allocator, scope: source.Scope, cache: *Cache, receipt: pages.Progress, reader: *verifier.ObjectReader, cancellation: types.CancellationToken) ![]u8 {
+    const proof = &cache.proof.?;
+    if (proof.digest == null) {
+        const end = @min(proof.descriptor.value_len, proof.hashed + 4 * pages.chunk_bytes);
+        var scratch: [64 * 1024]u8 = undefined;
+        while (proof.hashed < end) {
+            try cancellation.check();
+            const count: usize = @intCast(@min(scratch.len, end - proof.hashed));
+            try proof.descriptor.read(reader, proof.hashed, scratch[0..count]);
+            proof.hash.update(scratch[0..count]);
+            proof.hashed += count;
+        }
+        if (proof.hashed != proof.descriptor.value_len) return output(alloc, scope, cache, receipt);
+        proof.digest = proof.hash.finalResult();
+    }
+    const offset = if (receipt.assembly) |assembly| assembly.next_offset else 0;
+    if (offset >= proof.descriptor.value_len or offset % pages.chunk_bytes != 0) return error.InvalidMergePage;
+    const count: usize = @intCast(@min(pages.chunk_bytes, proof.descriptor.value_len - offset));
+    const data = try alloc.alloc(u8, count);
+    defer alloc.free(data);
+    try cancellation.check();
+    try proof.descriptor.read(reader, offset, data);
+    var request = proof.base;
+    request.merge_page.?.chunk = .{ .payload = .provenance, .row_key = request.merge_page.?.next, .timestamp = 0, .total_bytes = proof.descriptor.value_len, .row_digest = proof.digest.?, .offset = offset, .data = data, .chunk_digest = @import("merge_page_chunks.zig").checksum(data) };
     request.merge_page.?.digest = pages.commandDigest(request);
     try pages.validateRequest(request);
     return std.json.Stringify.valueAlloc(alloc, @import("online_merge_io_contract.zig").Prepared{ .scope = scope, .request = request }, .{});
@@ -140,6 +172,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     var reader = try verifier.ObjectReader.open(alloc, io, file, root, scope.pin(), certificate);
     defer reader.deinit();
     if (cache.vector != null) return outputVector(alloc, scope, cache, receipt, &reader, cancellation);
+    if (cache.proof != null) return outputProof(alloc, scope, cache, receipt, &reader, cancellation);
     var arena = std.heap.ArenaAllocator.init(db.alloc);
     var arena_owned = true;
     errdefer if (arena_owned) arena.deinit();
@@ -148,6 +181,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     var timestamps: std.ArrayList(u64) = .empty;
     var integrity: std.ArrayList(pages.IntegrityEffect) = .empty;
     var vectors: std.ArrayList(pages.IntegrityEffect) = .empty;
+    var proofs: std.ArrayList(pages.IntegrityEffect) = .empty;
     var position = cache.position;
     var last_row_position: ?pages.SnapshotPosition = null;
     var bytes: usize = 0;
@@ -165,14 +199,48 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     const graph_copy = vector_copy and effect_protocol == 15;
     // Even a row-only receiver must inspect the certified object kinds: a
     // protocol-14 source cannot silently discard private graph ownership.
-    while (receipt.phase == .artifacts and position.object < reader.objectCount() and integrity.items.len + vectors.items.len < pages.max_rows and work < pages.max_rows) : (work += 1) {
+    while (receipt.phase == .artifacts and position.object < reader.objectCount() and integrity.items.len + vectors.items.len + proofs.items.len < pages.max_rows and work < pages.max_rows) : (work += 1) {
         try cancellation.check();
         const object = try reader.object(position.object);
-        try requireTransferableArtifactKind(object.kind);
+        if (object.kind == .source_proof_batch) {
+            if (integrity.items.len != 0 or vectors.items.len != 0) break;
+            const proof_batch = @import("source_proof_batch.zig");
+            const descriptor = (try proof_batch.descriptor(&reader, object.size, .{ .object = position.object, .offset = position.offset, .remaining = position.remaining })) orelse {
+                position = .{ .object = position.object + 1, .offset = 0, .remaining = 0 };
+                if (proofs.items.len != 0) break;
+                continue;
+            };
+            var namespace: @import("artifact_publication.zig").Namespace = undefined;
+            @import("doc_identity.zig").encodeNamespace(&namespace, receipt.source.namespace);
+            const key_array = proof_batch.mergeKey(namespace, receipt.source.pin_digest, descriptor.digest);
+            const key = try owned.dupe(u8, &key_array);
+            if (proofs.items.len != 0 and key.len +| descriptor.value_len > pages.max_bytes -| bytes) break;
+            if (key.len +| descriptor.value_len > pages.max_bytes) {
+                const base: types.BatchRequest = .{
+                    .merge_replication = .{ .transition_id = scope.fence.transition_id, .donor_group_id = scope.fence.owner_group_id, .receiver_group_id = scope.fence.peer_group_id, .identity_namespace = scope.receiver_namespace, .copy_attempt = scope.copy_attempt },
+                    .merge_page = .{ .source = receipt.source, .sequence = try std.math.add(u64, receipt.sequence, 1), .phase = .artifacts, .after = try owned.dupe(u8, receipt.cursor), .next = key, .exhausted = false, .digest = @splat(0), .next_snapshot_position = .{ .object = descriptor.next_position.object, .offset = descriptor.next_position.offset, .remaining = descriptor.next_position.remaining } },
+                };
+                cache.proof = .{ .descriptor = descriptor, .base = base };
+                cache.arena = arena;
+                arena_owned = false;
+                return outputProof(alloc, scope, cache, receipt, &reader, cancellation);
+            }
+            const value = try owned.alloc(u8, descriptor.value_len);
+            try descriptor.read(&reader, 0, value);
+            var decoded = try proof_batch.decodeValue(owned, namespace, descriptor.digest, value);
+            decoded.deinit();
+            if (proofs.items.len != 0 and std.mem.order(u8, proofs.items[proofs.items.len - 1].key, key) != .lt) return error.SourceSnapshotCorrupt;
+            try proofs.append(owned, .{ .key = key, .value = value });
+            bytes +|= key.len +| value.len;
+            position = .{ .object = descriptor.next_position.object, .offset = descriptor.next_position.offset, .remaining = descriptor.next_position.remaining };
+            last_row_position = position;
+            if (bytes >= pages.max_bytes) break;
+            continue;
+        }
         const raw_graph = object.kind == .source_artifact_batch;
         if (raw_graph and !graph_copy) return error.OnlineMergeArtifactTailsUnsupported;
         if (raw_graph or (vector_copy and object.kind == .artifact_batch)) {
-            if (integrity.items.len != 0) break;
+            if (integrity.items.len != 0 or proofs.items.len != 0) break;
             const descriptor = (if (raw_graph)
                 try @import("online_vector_snapshot.zig").graphDescriptor(owned, &reader, object.size, position, effect_protocol)
             else
@@ -210,7 +278,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
             continue;
         }
         if (vector_copy and (object.kind == .embedding_batch or object.kind == .sparse_batch)) {
-            if (integrity.items.len != 0) break;
+            if (integrity.items.len != 0 or proofs.items.len != 0) break;
             var candidate = position;
             const effect = (try @import("online_vector_snapshot.zig").next(owned, &reader, object.kind == .sparse_batch, object.size, &candidate)) orelse {
                 position = .{ .object = position.object + 1, .offset = 0, .remaining = 0 };
@@ -234,7 +302,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
             position = .{ .object = position.object + 1, .offset = 0, .remaining = 0 };
             continue;
         }
-        if (vectors.items.len != 0) break;
+        if (vectors.items.len != 0 or proofs.items.len != 0) break;
         if (position.offset == 0) {
             position.remaining = try number(u32, &reader, position.object, 0);
             position.offset = 4;
@@ -322,48 +390,68 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
         last_row_position = position;
         if (bytes >= pages.max_bytes) break;
     }
-    if ((receipt.phase == .rows or receipt.phase == .artifacts) and writes.items.len == 0 and integrity.items.len == 0 and vectors.items.len == 0 and position.object < reader.objectCount()) {
+    if ((receipt.phase == .rows or receipt.phase == .artifacts) and writes.items.len == 0 and integrity.items.len == 0 and vectors.items.len == 0 and proofs.items.len == 0 and position.object < reader.objectCount()) {
         cache.position = position;
         arena.deinit();
         arena_owned = false;
         return output(alloc, scope, cache, receipt);
     }
-    const last = if (writes.items.len != 0) writes.items[writes.items.len - 1].key else if (integrity.items.len != 0) integrity.items[integrity.items.len - 1].key else if (vectors.items.len != 0) vectors.items[vectors.items.len - 1].key else "";
+    const last = if (writes.items.len != 0) writes.items[writes.items.len - 1].key else if (integrity.items.len != 0) integrity.items[integrity.items.len - 1].key else if (vectors.items.len != 0) vectors.items[vectors.items.len - 1].key else if (proofs.items.len != 0) proofs.items[proofs.items.len - 1].key else "";
     var request: types.BatchRequest = .{
         .merge_replication = .{ .transition_id = scope.fence.transition_id, .donor_group_id = scope.fence.owner_group_id, .receiver_group_id = scope.fence.peer_group_id, .identity_namespace = scope.receiver_namespace, .copy_attempt = scope.copy_attempt },
         .writes = writes.items,
-        .merge_page = .{ .source = receipt.source, .sequence = try std.math.add(u64, receipt.sequence, 1), .phase = receipt.phase, .after = try owned.dupe(u8, receipt.cursor), .next = last, .exhausted = writes.items.len == 0 and integrity.items.len == 0 and vectors.items.len == 0, .digest = @splat(0), .timestamps = timestamps.items, .next_snapshot_position = last_row_position, .integrity = integrity.items, .artifact_effects = vectors.items },
+        .merge_page = .{ .source = receipt.source, .sequence = try std.math.add(u64, receipt.sequence, 1), .phase = receipt.phase, .after = try owned.dupe(u8, receipt.cursor), .next = last, .exhausted = writes.items.len == 0 and integrity.items.len == 0 and vectors.items.len == 0 and proofs.items.len == 0, .digest = @splat(0), .timestamps = timestamps.items, .next_snapshot_position = last_row_position, .integrity = integrity.items, .artifact_effects = vectors.items, .provenance_effects = proofs.items },
     };
     // Artifact phase is permitted only by the row-derived schema capability
     // admission guard; authoritative graph/vector artifacts are not discarded.
     request.merge_page.?.digest = pages.commandDigest(request);
     try pages.validateRequest(request);
-    if (writes.items.len == 1 and bytes > pages.max_bytes) cache.chunks = try pages.RowChunks(types.BatchRequest).init(request);
+    if ((writes.items.len == 1 or proofs.items.len == 1) and bytes > pages.max_bytes) cache.chunks = try pages.RowChunks(types.BatchRequest).init(request);
     cache.request = request;
     cache.arena = arena;
     arena_owned = false;
     return output(alloc, scope, cache, receipt);
 }
 
-test "ordered artifact inventory online merge refuses to drop certified source proofs" {
-    try std.testing.expectError(error.OnlineMergeProvenanceTransferRequired, requireTransferableArtifactKind(.source_proof_batch));
-    try requireTransferableArtifactKind(.source_artifact_batch);
-    try requireTransferableArtifactKind(.artifact_batch);
+test "online direct vector receiver snapshot tail duplicate reply and restart preserve both projections" {
+    try testVectorReceiver(true, true, false, false, .none);
 }
 
-test "online direct vector receiver snapshot tail duplicate reply and restart preserve both projections" {
-    try testVectorReceiver(true, true);
+test "online direct vector certified source proof transfers inertly but requires local adoption" {
+    try testVectorReceiver(true, true, true, true, .none);
+}
+
+test "online direct vector empty certified source proof capability still requires adoption" {
+    try testVectorReceiver(true, true, true, false, .none);
+}
+
+test "online direct vector authority activated after snapshot cannot cross final fence" {
+    try testVectorReceiver(true, true, false, false, .before_fence);
+}
+
+test "online direct vector authority activated after pin cannot publish stale certificate" {
+    try testVectorReceiver(true, true, false, false, .before_publication);
 }
 
 test "online direct vector receiver default sync journals artifacts before asynchronous projection" {
-    try testVectorReceiver(true, false);
+    try testVectorReceiver(true, false, false, false, .none);
 }
 
 test "online direct vector fulltext-only receiver preserves latent artifacts through snapshot tail and restart" {
-    try testVectorReceiver(false, false);
+    try testVectorReceiver(false, false, false, false, .none);
 }
 
-fn testVectorReceiver(active_vectors: bool, full_sync: bool) !void {
+const LateAuthority = enum { none, before_publication, before_fence };
+
+fn activateTestAuthority(db: *DB, namespace: @import("artifact_publication.zig").Namespace, catalog_digest: [32]u8) !void {
+    const publication = @import("artifact_publication.zig");
+    var writer = try db.core.store.beginWriteTxn();
+    errdefer writer.abort();
+    try publication.stageAuthority(&writer, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+    try writer.commit();
+}
+
+fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: bool, selected_proof: bool, late_authority: LateAuthority) !void {
     const alloc = std.testing.allocator;
     const io_contract = @import("online_merge_io_contract.zig");
     const online_io = @import("online_merge_io.zig");
@@ -428,10 +516,53 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool) !void {
     var receiver_catalog = try receiver.artifactInventoryCommand(alloc);
     defer receiver_catalog.catalogs.deinit(alloc);
     try std.testing.expect(donor_catalog.binding.compatible(receiver_catalog.binding));
+    if (transfer_proof and selected_proof) {
+        const publication = @import("artifact_publication.zig");
+        const provenance = @import("artifact_producer_provenance.zig");
+        var namespace: publication.Namespace = undefined;
+        @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
+        var read = try donor.core.store.beginReadTxn();
+        const captured = try publication.capturePrimarySource(alloc, &read, namespace, "a");
+        read.abort();
+        defer alloc.free(captured.document_key);
+        const value = try donor.core.store.get(alloc, large_key);
+        defer alloc.free(value);
+        const mutation = publication.Mutation{ .family = .base_vector, .key = large_key, .value = value, .source_index = 0 };
+        const command: publication.Command = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = donor_catalog.binding.digest, .producer_kind = .index, .producer_name = "large_sparse", .producer_generation = 1, .producer_artifact_name = "large_sparse", .sources = (&captured)[0..1], .mutations = (&mutation)[0..1], .publication_digest = @splat(5) };
+        const effect = provenance.Effect{ .family = .base_vector, .key = large_key, .source_index = 0, .value_digest = large_digest, .value_bytes = value.len };
+        const logical: provenance.Proof = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = donor_catalog.binding.digest, .producer_kind = .index, .producer_name = "large_sparse", .producer_generation = 1, .producer_artifact_name = "large_sparse", .publication_digest = command.publication_digest, .input_digest = command.inputDigest(), .sources = (&captured)[0..1], .artifact_sources = &.{}, .effects = (&effect)[0..1] };
+        const encoded = try provenance.encodeAlloc(alloc, logical);
+        defer alloc.free(encoded);
+        var indexed = try provenance.prepareDocumentReferences(alloc, command);
+        defer indexed.deinit();
+        var writer = try donor.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        try @import("../source_authority.zig").bind(&writer, .raft, namespace);
+        try publication.stageAuthority(&writer, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = donor_catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        try provenance.stageIndexed(&writer, command, encoded, .{ .raft = .{ .term = 1, .index = 1 } }, &indexed);
+        try writer.commit();
+    } else if (transfer_proof) {
+        const publication = @import("artifact_publication.zig");
+        var namespace: publication.Namespace = undefined;
+        @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
+        var writer = try donor.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        try @import("../source_authority.zig").bind(&writer, .raft, namespace);
+        try publication.stageAuthority(&writer, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = donor_catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        try writer.commit();
+    }
     const identity = try donor.relationalTopologyIdentity();
     const scope: source.Scope = .{ .fence = .{ .role = .merge_source, .transition_id = 77, .attempt = 1, .admission_epoch = identity.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest }, .receiver_namespace = receiver_options.identity_namespace.?, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
     try donor.batchRaftReplicatedApply(.{ .artifact_catalog = donor_catalog, .online_source = .{ .admit = .{ .scope = scope, .artifact_catalog = donor_catalog.binding } } }, .{ .term = 1, .index = 2 });
     const certificate = try donor.prepareOnlineSourcePublication(scope, .none);
+    if (late_authority == .before_publication) {
+        var namespace: @import("artifact_publication.zig").Namespace = undefined;
+        @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
+        try activateTestAuthority(&donor, namespace, donor_catalog.binding.digest);
+        try std.testing.expectError(error.OnlineMergeProvenanceTransferRequired, donor.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 }));
+        try std.testing.expectEqual(source.SnapshotPhase.pinned, (try donor.onlineSourceStatus(scope)).snapshot_phase);
+        return;
+    }
     try donor.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
     try donor.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "a", .value = "{\"v\":[3,4],\"s\":{\"indices\":[1],\"values\":[9]},\"_embeddings\":{\"retired\":[9,10]}}" }}, .sync_level = .full_index }, .{ .term = 1, .index = 4 });
     try donor.batchRaftReplicatedApply(.{ .deletes = &.{"b"}, .sync_level = .full_index }, .{ .term = 1, .index = 5 });
@@ -444,8 +575,16 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool) !void {
         break :head status.value.retained_head;
     };
     try donor.batchRaftReplicatedApply(.{ .relational_topology = .{ .fence = scope.fence, .action = .begin } }, .{ .term = 1, .index = 6 });
+    if (late_authority == .before_fence) {
+        var namespace: @import("artifact_publication.zig").Namespace = undefined;
+        @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
+        try activateTestAuthority(&donor, namespace, donor_catalog.binding.digest);
+        try std.testing.expectError(error.OnlineMergeProvenanceTransferRequired, donor.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = retained_head } } }, .{ .term = 1, .index = 7 }));
+        try std.testing.expectEqual(source.Phase.retaining, (try donor.onlineSourceStatus(scope)).phase);
+        return;
+    }
     try donor.batchRaftReplicatedApply(.{ .online_source = .{ .final_fence = .{ .scope = scope, .expected_sequence = retained_head } } }, .{ .term = 1, .index = 7 });
-    const source_identity: pages.Source = .{ .namespace = identity.namespace, .pin_digest = try certificate.digest(), .applied_index = certificate.cut.applied_index, .retention = .{ .epoch = 1, .after_sequence = certificate.cut.retained_start }, .artifact_catalog = donor_catalog.binding };
+    const source_identity: pages.Source = .{ .namespace = identity.namespace, .pin_digest = try certificate.digest(), .applied_index = certificate.cut.applied_index, .retention = .{ .epoch = 1, .after_sequence = certificate.cut.retained_start }, .artifact_catalog = donor_catalog.binding, .provenance_required = certificate.provenance_required };
     var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 77, .donor_group_id = 2, .receiver_group_id = 3, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z", .page_receiver_namespace = scope.receiver_namespace, .page_source = source_identity };
     const context: types.MergeReplicationContext = .{ .transition_id = 77, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = scope.receiver_namespace, .copy_attempt = scope.copy_attempt };
     var accept_context = context;
@@ -465,6 +604,7 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool) !void {
     var checked_replay_without_catalog = false;
     var complete = false;
     var final_applied_index: u64 = 0;
+    var proof_pages: usize = 0;
     for (0..200) |_| {
         const status_raw = try online_io.executeJson(&receiver, alloc, .{ .scope = scope, .operation = .{ .status = .receiver } }, .none);
         defer alloc.free(status_raw);
@@ -488,8 +628,25 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool) !void {
         defer prepared.deinit();
         var request = prepared.value.request orelse continue;
         request.sync_level = if (full_sync) .full_index else .write;
+        if (transfer_proof and request.merge_page.?.tail != null and request.merge_page.?.tail.? == .finish) {
+            try std.testing.expect((proof_pages != 0) == selected_proof);
+            try std.testing.expectError(error.OnlineMergeProvenanceAdoptionRequired, receiver.batchRaftReplicatedApply(request, .{ .term = 1, .index = index }));
+            var namespace: @import("artifact_publication.zig").Namespace = undefined;
+            @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
+            const proof_key = @import("source_proof_batch.zig").mergeKey(namespace, source_identity.pin_digest, @splat(5));
+            if (selected_proof) {
+                const imported = try receiver.core.store.get(alloc, &proof_key);
+                defer alloc.free(imported);
+                var decoded = try @import("source_proof_batch.zig").decodeValue(alloc, namespace, @splat(5), imported);
+                defer decoded.deinit();
+                try std.testing.expectEqualSlices(u8, &.{1}, decoded.bitmap);
+            } else try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, &proof_key));
+            try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, @import("artifact_publication.zig").authority_key));
+            return;
+        }
         try receiver.batchRaftReplicatedApply(request, .{ .term = 1, .index = index });
         const page = request.merge_page.?;
+        if (page.provenance_effects.len != 0 or (if (page.chunk) |chunk| chunk.payload == .provenance and chunk.complete() else false)) proof_pages += 1;
         if (page.artifact_effects.len != 0 or (if (page.chunk) |chunk| chunk.payload == .artifact and chunk.complete() else false)) {
             const entries = try @import("derived/replay_stream.zig").iterateFrom(alloc, receiver.core.store, receiver.core.store.lastReplaySequence(0));
             defer {

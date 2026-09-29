@@ -1790,15 +1790,20 @@ following mechanisms are installed behind that gate:
   including binary document keys, full source-pin reopen, source certificate
   verification and checkpointed staging import. Receiver-local adoption and
   retained-effect/tail provenance transfer remain open.
-  A validated positional descriptor can resume a proof value from its
-  certified object without copying the full body, including reads across the
-  1 MiB merge-chunk boundary. The replicated merge-page contract still has no
-  separate provenance payload/capability, so the descriptor does not claim
-  that online merge carries or adopts these records yet. The portable online
-  source verifier recognizes the new certified block kind, but snapshot
-  transfer fails closed on it rather than silently completing without source
-  history. The focused ordered artifact suite now passes 210 cases, with 28
-  retained-transfer cases including the verifier's proof-block coverage.
+  Online merge now reads source proofs from certified AFB2 objects through the
+  bounded positional descriptor and carries them in a distinct provenance
+  page/chunk payload, not vector/graph effects. The receiver validates APF2
+  before apply and commits only inert, source-pin-scoped evidence keys with
+  the page receipt. A durable pending bit refuses the final tail certificate
+  until receiver-local adoption is implemented; transferred donor bytes do
+  not grant acceptance. Tests cover a donor/receiver snapshot, lost page
+  replies, a restart between three 1 MiB chunks, wrong-source keys, and the
+  finalization barrier. Receiver-local adoption, retained-tail provenance,
+  and bounded reclamation of abandoned merge evidence remain open. Replicated
+  snapshot publication and final-fence apply now reject a provenance-free
+  certificate if producer authority activated after its immutable pin, so a
+  late activation cannot turn a previously empty proof stream into an
+  apparently complete receiver cut.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups
