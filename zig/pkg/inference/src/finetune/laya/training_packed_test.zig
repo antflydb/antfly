@@ -212,6 +212,14 @@ fn exerciseParity(force_fused_attention: bool, trunk_sees_questions: bool, fuse_
     try std.testing.expectEqual(trunk_sees_questions, cfg.packing.trunk_sees_questions);
     try std.testing.expectEqual(fuse_layers, cfg.packing.fuse_layers);
     try std.testing.expectEqual(decision_head orelse .scorer, cfg.decision_head);
+    if (decision_head == .pointer) {
+        // A new pointer head starts as a uniform decision (zero query
+        // projection over normalized rows), not a saturated softmax.
+        const Report = struct { initial_eval: struct { soft_ce: f64 } };
+        const report = try std.json.parseFromSlice(Report, scratch, try files.readFile(scratch, try std.fs.path.join(scratch, &.{ c.output_dir, "report.json" })), .{ .ignore_unknown_fields = true });
+        std.debug.print("Laya new pointer head initial soft CE={d}\n", .{report.value.initial_eval.soft_ce});
+        try std.testing.expect(report.value.initial_eval.soft_ce < 5);
+    }
     try std.testing.expectEqual(model.PackingMode.question, cfg.packing.mode);
     // Serving the exported packed model reproduces the job's final evaluation.
     const Prediction = struct { kind: model.QuestionType, logits: []const f32, target: []const f32 };

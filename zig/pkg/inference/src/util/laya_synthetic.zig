@@ -153,6 +153,8 @@ pub fn writeModelWith(a: std.mem.Allocator, io: std.Io, dir: []const u8, packing
     try Add.tensor(&tensors, s, random, "act_head.0.bias", &.{256}, 0, 0.05);
     try Add.tensor(&tensors, s, random, "act_head.2.weight", &.{ n_act, 256 }, 0, 0.1);
     try Add.tensor(&tensors, s, random, "act_head.2.bias", &.{n_act}, 0, 0.05);
+    try Add.tensor(&tensors, s, random, "pointer.norm.weight", &.{d_}, 1, 0.05);
+    try Add.tensor(&tensors, s, random, "pointer.norm.bias", &.{d_}, 0, 0.05);
     for ([_][]const u8{ "pointer.q", "pointer.k" }) |prefix| {
         var name: [64]u8 = undefined;
         try Add.tensor(&tensors, s, random, try std.fmt.bufPrint(&name, "{s}.weight", .{prefix}), &.{ 256, d_ }, 0, 0.2);

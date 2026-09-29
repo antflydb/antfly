@@ -126,9 +126,15 @@ fn pointerLogits(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const
     for (anchors, 0..) |anchor, i| @memcpy(rows[i * dim ..][0..dim], host[anchor * dim ..][0..dim]);
     const anchor_ct = try cb.fromFloat32Shape(rows, &.{ @intCast(batch), @intCast(dim) });
     defer cb.free(anchor_ct);
-    const q_ct = try linear(cb, anchor_ct, "pointer.q", batch, dim, p);
+    // The head's output is the unnormalized residual stream; normalize it
+    // first, as the upstream scorer does (`scorer.0`).
+    const anchor_n = try norm(cb, anchor_ct, "pointer.norm", dim);
+    defer cb.free(anchor_n);
+    const markers_n = try norm(cb, markers_ct, "pointer.norm", dim);
+    defer cb.free(markers_n);
+    const q_ct = try linear(cb, anchor_n, "pointer.q", batch, dim, p);
     defer cb.free(q_ct);
-    const k_ct = try linear(cb, markers_ct, "pointer.k", batch * count, dim, p);
+    const k_ct = try linear(cb, markers_n, "pointer.k", batch * count, dim, p);
     defer cb.free(k_ct);
     const q = try cb.toFloat32(q_ct, a);
     defer a.free(q);

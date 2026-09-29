@@ -363,9 +363,13 @@ pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f3
         // Pointer head: scaled dot product of the anchor's query projection
         // with each option marker's key projection.
         const p: u32 = @intCast(lc.pointer_dim);
-        const anchor = try b.gather(x, result.inputs.anchors, Shape.init(.f32, &.{ l.questions, h }));
+        // LayerNorm is per row, so normalizing every row once and gathering
+        // equals normalizing the gathered rows (and declares it once).
+        const xn = try norm(b, x, "pointer.norm", h, 1e-5, true);
+        const anchor = try b.gather(xn, result.inputs.anchors, Shape.init(.f32, &.{ l.questions, h }));
+        const options = try b.gather(xn, result.inputs.markers, Shape.init(.f32, &.{ l.questions * l.options, h }));
         const q = try linear(b, &result, anchor, "pointer.q", l.questions, h, p, true, null);
-        const k = try linear(b, &result, m, "pointer.k", l.questions * l.options, h, p, true, null);
+        const k = try linear(b, &result, options, "pointer.k", l.questions * l.options, h, p, true, null);
         const keys = try b.reshape(k, Shape.init(.f32, &.{ l.questions, l.options, p }));
         const query = try b.reshape(q, Shape.init(.f32, &.{ l.questions, p, 1 }));
         const scores = try b.matmul3D(keys, query);

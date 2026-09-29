@@ -126,7 +126,8 @@ pub const Config = struct {
     /// an MLP over each option marker. `pointer` (LAYA.md, "Lessons from
     /// Jeeves"): a scaled dot product between a query projection of the
     /// question's `[CLS]` anchor and a key projection of each option marker,
-    /// `pointer.q`/`pointer.k`, each `[pointer_dim, hidden]`.
+    /// `pointer.q`/`pointer.k`, each `[pointer_dim, hidden]`, both reading
+    /// the head's output through the LayerNorm `pointer.norm`.
     decision_head: DecisionHead = .scorer,
     pointer_dim: usize = 256,
 
@@ -382,6 +383,7 @@ pub fn validateReader(reader: *const @import("safetensors.zig").MMapReader, cfg:
     try Check.pair(reader, "scorer.1", d, d);
     try Check.pair(reader, "scorer.3", d, 1);
     if (cfg.decision_head == .pointer) {
+        try Check.norm(reader, "pointer.norm", d, true);
         try Check.pair(reader, "pointer.q", d, @intCast(cfg.pointer_dim));
         try Check.pair(reader, "pointer.k", d, @intCast(cfg.pointer_dim));
     }
