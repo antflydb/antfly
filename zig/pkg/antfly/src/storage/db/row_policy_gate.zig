@@ -12,6 +12,7 @@ const scalar = @import("../../sql/scalar.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const role_authority = @import("../../usermgr/row_policy_authority.zig");
 const platform_time = @import("antfly_platform").time;
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 
 /// Evaluate only referenced typed ordinals before projection/pagination. A
 /// JSON-null cell remains a non-SQL-null datum, while absent and SQL-NULL
@@ -62,8 +63,8 @@ pub const EvaluationScratch = struct {
 
 pub const Gate = struct {
     phase: std.atomic.Value(u8) = .init(@intFromEnum(catalog.RowPolicyPhase.disabled)),
-    generation: std.atomic.Value(u64) = .init(0),
-    catalog_epoch: std.atomic.Value(u64) = .init(0),
+    generation: AtomicU64 = .init(0),
+    catalog_epoch: AtomicU64 = .init(0),
     schema_version: std.atomic.Value(u32) = .init(0),
     readers: std.atomic.Value(usize) = .init(0),
 

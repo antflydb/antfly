@@ -14,6 +14,7 @@
 
 import gzip
 import json
+from typing import Any
 from unittest.mock import patch
 
 import httpx
@@ -26,6 +27,7 @@ from antfly import (
     SQLPreparedExecutionRequest,
     SQLPrepareRequest,
     SQLRequest,
+    SQLResponse,
 )
 
 
@@ -100,7 +102,7 @@ def test_generated_prepared_operations_preserve_transport_policy(operation):
         )
 
     generated = AuthenticatedClient(base_url="http://sql.test", token="token")
-    kwargs = {"client": generated}
+    kwargs: dict[str, Any] = {"client": generated}
     if operation == "prepare_sql":
         kwargs["body"] = SQLPrepareRequest(statement="SELECT 1")
     else:
@@ -218,6 +220,7 @@ def test_generated_sql_parses_compressed_response_once():
     with httpx.Client(base_url="http://sql.test", transport=transport) as http:
         generated.set_httpx_client(http)
         response = execute_sql.sync_detailed(client=generated, body=SQLRequest(statement="SELECT * FROM docs"))
+    assert isinstance(response.parsed, SQLResponse)
     assert response.parsed.command_tag == "SELECT 0"
 
 

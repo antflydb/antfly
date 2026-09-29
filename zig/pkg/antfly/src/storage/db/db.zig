@@ -6445,7 +6445,9 @@ pub const DB = struct {
                 }
             }
             core_owner.identity_visibility.summary = try doc_identity.visibilitySummaryFromStore(core_owner.store);
-            const policy_secret = if (opts.secret_store) |store|
+            // Freestanding builds have no file-backed secret store. Keep the
+            // native FileStore implementation out of the WASM module graph.
+            const policy_secret: ?[]u8 = if (comptime builtin.os.tag == .freestanding) null else if (opts.secret_store) |store|
                 try store.getOwned(alloc, "antfly.trusted_principal.secret")
             else
                 null;
@@ -6454,7 +6456,7 @@ pub const DB = struct {
                 @memset(value, 0);
                 alloc.free(value);
             };
-            const policy_issuer = if (opts.secret_store) |store|
+            const policy_issuer: ?[]u8 = if (comptime builtin.os.tag == .freestanding) null else if (opts.secret_store) |store|
                 try store.getOwned(alloc, "antfly.trusted_principal.issuer")
             else
                 null;

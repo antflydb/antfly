@@ -651,7 +651,7 @@ const Evaluator = struct {
         // this scalar's independent output bound.
         var counter: std.Io.Writer.Discarding = .init(&.{});
         try std.json.Stringify.value(value, .{}, &counter.writer);
-        try self.charge(counter.count);
+        try self.charge(std.math.cast(usize, counter.count) orelse return error.SqlProgramLimitExceeded);
         std.json.Stringify.value(value, .{}, &writer.writer) catch return error.OutOfMemory;
         return writer.toOwnedSlice();
     }
