@@ -1821,7 +1821,10 @@ following mechanisms are installed behind that gate:
   artifact-input, and selected-output checks against local physical revisions,
   including same-byte ABA changes. Candidate preparation also owns the source
   pin, APF2 checksum, donor producer identity and selected-source bitmap after
-  release of the transfer buffer. No caller installs receipts from it yet.
+  release of the transfer buffer. Preparation also requires the certified
+  donor binding to match the APF2 epoch/digest and the receiver's ordered
+  semantic catalog; writer revalidation repeats the receiver catalog and
+  active authority fence. No caller installs receipts from it yet.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups
