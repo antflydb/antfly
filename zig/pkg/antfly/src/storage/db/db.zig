@@ -149250,7 +149250,8 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
     var db = try DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .content_type = "application/json" });
+    try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
+    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .source_artifact_name = "relations", .content_type = "application/json" });
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"relations\"}]}" });
     try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"seed\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
     var catalog = try db.artifactInventoryCommand(alloc);
@@ -149330,11 +149331,24 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
     defer context.destroy();
     try std.testing.expectEqual(@as(usize, 1), context.base.artifact_sources.len);
     try std.testing.expectEqualStrings(plan.core.head_key, context.base.artifact_sources[0].key);
+    const copy_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "copy");
+    defer alloc.free(copy_key);
+    const copy_guard = [_]publication.ArtifactSource{.{ .key = plan.core.head_key, .content_digest = head_digest, .input_position = try publication.artifactRevision(&pinned, catalog.namespace, plan.core.head_key), .source_index = 0 }};
+    const copy_effects = [_]publication.Mutation{.{ .family = .document_artifact, .key = copy_key, .value = "{}", .source_index = 0 }};
+    var copy_command: publication.Command = .{ .producer_kind = .enrichment, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "copy", .producer_generation = catalog.binding.epoch, .producer_artifact_name = "copy", .sources = (&source)[0..1], .artifact_sources = &copy_guard, .mutations = &copy_effects, .publication_digest = @splat(0) };
+    copy_command.publication_digest = copy_command.digest();
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = copy_command }, .{ .term = 1, .index = 5 });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualStrings("{}", try read.get(copy_key));
+        try std.testing.expect((try publication.readReceipt(&read, copy_command, source)) != null);
+    }
     const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, "doc", "g");
     defer alloc.free(count_key);
     const count = try @import("graph_edge_contender.zig").encodeVisibleCount(db.core.index_manager.coverageGenerationForIndex("g").?, 0);
     try context.publishGraphEffects(&[_]docstore_mod.KVPair{.{ .key = count_key, .value = &count }}, &.{});
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = context.commands.items[0] }, .{ .term = 1, .index = 5 });
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = context.commands.items[0] }, .{ .term = 1, .index = 6 });
     var current = try db.core.store.beginReadTxn();
     defer current.abort();
     try std.testing.expect((try publication.readReceipt(&current, context.commands.items[0], context.commands.items[0].sources[0])) != null);
@@ -149349,14 +149363,24 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
         _ = try empty.begin(&txn);
         _ = try empty.publish(&txn, plan.core.spec.id(), Guard{});
         var marker_bytes: [raft_applied_entry_value_len]u8 = undefined;
-        const marker = raftAppliedEntryWrite(.{ .term = 1, .index = 6 }, &marker_bytes);
+        const marker = raftAppliedEntryWrite(.{ .term = 1, .index = 7 }, &marker_bytes);
         try txn.put(marker.key, marker.value);
         try txn.commit();
     }
     var replaced = try db.core.store.beginReadTxn();
     defer replaced.abort();
     try std.testing.expectError(error.EnrichmentSourceChanged, planning.Context.createWithProof(alloc, &replaced.read.?, "doc", "relations", plan.core.head_key, &head_raw));
-    try db.batchRaftReplicatedApply(.{ .artifact_publication = context.commands.items[0] }, .{ .term = 1, .index = 7 });
+    const empty_head_raw = empty.core.spec.encode();
+    var empty_digest: publication.Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&empty_head_raw, &empty_digest, .{});
+    const empty_guard = [_]publication.ArtifactSource{.{ .key = empty.core.head_key, .content_digest = empty_digest, .input_position = try publication.artifactRevision(&replaced, catalog.namespace, empty.core.head_key), .source_index = 0 }};
+    var empty_copy_command = copy_command;
+    empty_copy_command.artifact_sources = &empty_guard;
+    empty_copy_command.publication_digest = empty_copy_command.digest();
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateArtifactSources(alloc, &replaced, copy_command.namespace, copy_command.sources, copy_command.artifact_sources));
+    var empty_fence: @import("artifact_asset_publication.zig").UpstreamFence = .{ .key = stale_root, .requires_value = true };
+    try std.testing.expectError(error.EnrichmentSourceChanged, empty_fence.bind(alloc, &replaced, empty_copy_command));
+    try db.batchRaftReplicatedApply(.{ .artifact_publication = context.commands.items[0] }, .{ .term = 1, .index = 8 });
     var post = try db.core.store.beginReadTxn();
     defer post.abort();
     try std.testing.expectEqual(publication.Rejection.stale_source, (try publication.rejected(&post, context.commands.items[0])).?.reason);

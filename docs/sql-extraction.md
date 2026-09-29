@@ -2231,8 +2231,13 @@ following mechanisms are installed behind that gate:
   set's provenance witness afterward. Asset callbacks and resolver reads select
   those inputs in one snapshot and inherit the head's accepted causal proof,
   including for empty output sets. Missing producer certification remains pending
-  rather than adopting a legacy member receipt. LSM tests cover private append,
-  rollback, head replacement, stale/absent guards, and pinned old observations.
+  rather than adopting a legacy member receipt. Root asset reads, like unit
+  reads, resolve through the selected extraction head; a selected empty set
+  cannot fall back to stale physical root bytes. Downstream asset publication
+  validates that root membership and the accepted producer proof off-lock,
+  then fences the receiver-local proof reference at atomic apply. LSM tests
+  cover private append, rollback, head replacement, stale/absent guards,
+  downstream acceptance, stale/empty guard rejection, and pinned old observations.
   Ordered staged-generation finalization must still publish that proof together
   with the head, receipts, coverage, and consumer work before these paths activate.
 - Accepted asset retries now drive ordered graph consumers before completing,
