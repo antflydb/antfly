@@ -123,11 +123,11 @@ mounted HTTP preparation defers work, then execution carries a captured self-
 read range proof into one guarded native commit; source conflicts, unknown
 outcomes, and failed proof acquisition have distinct no-replay behavior. This
 fixture mocks proof issuance and commit, so real owner-validated range-proof
-commit for the exact prepared corpus statement, mounted pgwire/native execution,
-and distributed fault evidence remain missing. A separate linked hosted test now
-executes a CTE self-MERGE through authenticated HTTP against a real Raft-backed
-owner and guarded transaction prepare/commit, proving the owner route fence is
-carried end to end for that shape. It stays unresolved.
+commit was still missing there. A linked hosted test now prepares and executes
+the exact corpus MERGE body through authenticated HTTP against a real Raft-backed
+owner, verifies guarded prepare/commit, and reads back the row. The complete
+mounted pgwire/native sequence and distributed fault evidence remain missing;
+the case stays unresolved.
 `sql-0037`, `sql-0039`, `sql-0041`, `sql-0043`, and `sql-0046` are tested
 supersessions of catalog/admin session mutations. Their exact public-namespace
 and one-millisecond timeout commands run through the pgwire session state

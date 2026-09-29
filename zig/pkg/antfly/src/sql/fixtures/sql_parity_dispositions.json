@@ -102,6 +102,11 @@
       "cwd": "zig",
       "timeout_seconds": 600
     },
+    "antfly-api-hosted-cte-merge-test": {
+      "command": ["zig", "build", "antfly-api-hosted-cte-merge-test", "--cache-dir", ".zig-cache/sql-parity-evidence"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "sql-mounted-conflict-apply": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "SQL direct conflict scalar uses one guarded native cut through owner and commit"],
       "cwd": "zig",
@@ -178,11 +183,12 @@
     {
       "id": "sql-0008",
       "status": "unresolved",
-      "reason": "The exact prepared CTE MERGE body executes in a typed component fixture with atomic statement-read-set capability, captured self-read, versioned writes after capture closes, and source failure before mutation. The exact pgwire PREPARE/EXECUTE sequence is covered separately. Authenticated mounted HTTP preparation defers execution, then carries a captured self-read range proof into one guarded native commit; source conflict and unknown-outcome receipts stay distinct, and proof acquisition failure prevents commit. The mounted proof source and commit are test fakes, not a real owner-validated range-proof transaction or mounted pgwire/native execution, so the case remains unresolved.",
+      "reason": "The exact prepared CTE MERGE body executes in a typed component fixture with atomic statement-read-set capability, captured self-read, versioned writes after capture closes, and source failure before mutation. The exact pgwire PREPARE/EXECUTE sequence is covered separately. Authenticated mounted HTTP preparation defers execution, then carries a captured self-read range proof into one guarded native commit; source conflict and unknown-outcome receipts stay distinct, and proof acquisition failure prevents commit. A linked hosted HTTP fixture now prepares and executes the exact corpus body against a real Raft-backed owner, validates its guarded prepare/commit path, and reads back the row. The complete pgwire/native sequence and distributed fault evidence remain missing, so the case remains unresolved.",
       "evidence": [
         {"path": "zig/pkg/antfly/src/sql/joined_mutation_test.zig", "test": "SQL original prepared CTE UPDATE DELETE and MERGE capture before one mutation", "gate": "sql-original-prepared-cte-runtime"},
         {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE", "gate": "pgwire-original-prepared-cte"},
-        {"path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL API cross-table MERGE retains both source and target range proofs", "gate": "sql-mounted-merge"}
+        {"path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL API cross-table MERGE retains both source and target range proofs", "gate": "sql-mounted-merge"},
+        {"path": "zig/pkg/antfly/src/api/hosted_self_fk_e2e.zig", "test": "mounted hosted CTE MERGE retains owner statement fences", "gate": "antfly-api-hosted-cte-merge-test"}
       ]
     },
     {

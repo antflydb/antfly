@@ -1789,6 +1789,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-sql-connections-test", "Run durable SQL connection ownership, DISCARD and crash-fence regressions")
         .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, sql_connection_tests, sql_connection_filters).step);
+    const sql_node_local_session_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{"api http server node-local durable sessions do not invent owner leases"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-sql-node-local-session-test", "Run node-local durable session configuration regression")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, sql_node_local_session_tests, &.{"api http server node-local durable sessions do not invent owner leases"}).step);
     const catalog_authority_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = &.{"unconfigured remote catalog authority skips background work without borrowing internal credentials"},

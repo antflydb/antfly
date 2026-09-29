@@ -4447,7 +4447,7 @@ pub const ApiHttpServer = struct {
             server.cfg = effective_cfg;
             server.txn_sessions = transactions_api.SessionRegistry.initWithOptions(
                 effective_cfg.session_store,
-                opened.leaseStore().*,
+                if (effective_cfg.session_owner_lease_ttl_ns != null) opened.leaseStore().* else null,
                 effective_cfg.session_owner_lease_ttl_ns,
                 effective_cfg.session_savepoint_limit,
                 effective_cfg.session_max_count,
@@ -40138,6 +40138,24 @@ test "api http server serves transaction session cleanup route" {
     var parsed_list = try std.json.parseFromSlice(transactions_api.SessionListResponse, std.testing.allocator, list_resp.body, .{});
     defer parsed_list.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed_list.value.session_count);
+}
+
+test "api http server node-local durable sessions do not invent owner leases" {
+    var session_path_tmp = try TestDirectory.init("antfly-api-node-local-sql-sessions");
+    defer session_path_tmp.cleanup();
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    var source: u8 = 0;
+    var server = try ApiHttpServer.initWithConfig(std.testing.allocator, .{ .session_store_path = session_path_tmp.path() }, .{
+        .ptr = &source,
+        .vtable = &.{ .status = Source.status },
+    }, null, null);
+    defer server.deinit();
+    try std.testing.expect(server.txn_sessions.durable != null);
+    try std.testing.expect(server.txn_sessions.lease_store == null);
 }
 
 test "api http server reloads durable transaction sessions after restart" {

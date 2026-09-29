@@ -1292,9 +1292,10 @@ compaction/selective-query performance comparison remains unmeasured.
   conflict and ambiguous-commit evidence. Source-only INSERT RETURNING has
   the same mounted proof and fault coverage. Expression and grouped predicate
   arms and a read-only CTE-backed MERGE have exact mounted coverage. A linked
-  hosted CTE self-MERGE also proves real Raft-owner statement-fence capture and
-  guarded prepare/commit through authenticated HTTP, but it is not the exact
-  prepared `sql-0008` corpus case; 1,381 cases remain unresolved.
+  hosted CTE self-MERGE now prepares and executes the exact `sql-0008` body
+  through authenticated HTTP, proving real Raft-owner statement-fence capture,
+  guarded prepare/commit and row read-back. The complete mounted pgwire path
+  and distributed fault evidence remain open; 1,381 cases remain unresolved.
 
 - Follow-up ReleaseSafe SQL suite: 168 tests. Membership benchmark (opt-in
   `ANTFLY_SQL_MEMBERSHIP_BENCHMARK=1`): 10,000 outer and 10,000 inner rows,

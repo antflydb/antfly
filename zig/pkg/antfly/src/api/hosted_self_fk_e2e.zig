@@ -104,7 +104,12 @@ fn sql(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []con
     return request(alloc, transport, headers, base, "/db/v1/sql", .POST, body);
 }
 fn table(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8) !http.HttpResponse {
-    return request(alloc, transport, headers, base, "/db/v1/tables/nodes", .GET, null);
+    return tableNamed(alloc, transport, headers, base, "nodes");
+}
+fn tableNamed(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, name: []const u8) !http.HttpResponse {
+    const suffix = try std.fmt.allocPrint(alloc, "/db/v1/tables/{s}", .{name});
+    defer alloc.free(suffix);
+    return request(alloc, transport, headers, base, suffix, .GET, null);
 }
 fn awaitConstraintCoverage(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, drivers: []const *const raft.ManagedProgressDriver) !void {
     const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
@@ -205,8 +210,11 @@ test "self-FK retries only a proven durable precommit abort" {
     }
 }
 fn awaitTable(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8) !u64 {
+    return awaitTableNamed(alloc, io, transport, headers, base, "nodes");
+}
+fn awaitTableNamed(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, name: []const u8) !u64 {
     for (0..600) |_| {
-        var response = try table(alloc, transport, headers, base);
+        var response = try tableNamed(alloc, transport, headers, base, name);
         defer response.deinit(alloc);
         if (response.status == 200) {
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
@@ -946,6 +954,8 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     defer alloc.free(meta_catalog);
     const data_catalog = try std.fmt.allocPrint(alloc, "{s}/data-catalog", .{root});
     defer alloc.free(data_catalog);
+    const session_path = try std.fmt.allocPrint(alloc, "{s}/sql-sessions", .{root});
+    defer alloc.free(session_path);
     const snapshots = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root});
     defer alloc.free(snapshots);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -982,7 +992,7 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
         .replica_root_dir = data_root,
         .replica_catalog_path = data_catalog,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
+        .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store_path = if (snapshot_probe) session_path else null, .session_owner_lease_ttl_ns = if (snapshot_probe) 30 * std.time.ns_per_s else null },
     }, metadata_uri);
     var data_live = true;
     defer if (data_live) {
@@ -1028,23 +1038,46 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     defer alloc.free(token);
     const headers = [_]http.RequestHeader{.{ .name = http_server.trusted_principal_header, .value = token }};
 
-    var create = try sql(alloc, transport, &headers, base, "CREATE TABLE nodes (id BIGINT PRIMARY KEY, parent_id BIGINT)");
+    var create = try sql(alloc, transport, &headers, base, if (snapshot_probe)
+        "CREATE TABLE usage_records (id TEXT PRIMARY KEY, status TEXT)"
+    else
+        "CREATE TABLE nodes (id BIGINT PRIMARY KEY, parent_id BIGINT)");
     defer create.deinit(alloc);
     // Placement may still be converging after the catalog commit, even for
     // one owner. awaitTable below is the public readiness barrier.
     try std.testing.expect(create.status == 200 or create.status == 202);
-    const table_id = try awaitTable(alloc, io, transport, &headers, base);
+    const table_id = if (snapshot_probe)
+        try awaitTableNamed(alloc, io, transport, &headers, base, "usage_records")
+    else
+        try awaitTable(alloc, io, transport, &headers, base);
     if (snapshot_probe) {
         const published_reads = if (data.http_server) |*server| server.table_reads orelse return error.OwnerReadNotReady else return error.OwnerReadNotReady;
         try std.testing.expect(published_reads.remote_statement_fences_safe);
         const physical = try tableGroup(alloc, &metadata, table_id);
         defer alloc.free(physical.name);
         try awaitRestartedLocalIntegrityCatalog(alloc, io, &data, physical.name, physical.group_id);
-        var inserted = try sql(alloc, transport, &headers, base, "INSERT INTO nodes (id,parent_id) VALUES (1,NULL)");
+        var inserted = try sql(alloc, transport, &headers, base, "INSERT INTO usage_records (id,status) VALUES ('prepared_id','open')");
         defer inserted.deinit(alloc);
         if (inserted.status != 200) std.debug.print("hosted MERGE seed status={d} body={s}\n", .{ inserted.status, inserted.body });
         try std.testing.expectEqual(@as(u16, 200), inserted.status);
-        var merged = try sql(alloc, transport, &headers, base, "WITH source_rows AS (SELECT id,parent_id FROM nodes) MERGE INTO nodes USING source_rows ON nodes.id = source_rows.id WHEN MATCHED THEN UPDATE SET parent_id = source_rows.parent_id");
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        defer corpus.deinit();
+        const original = for (corpus.value.object.get("entries").?.array.items) |entry| {
+            if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0008")) break entry.object.get("sql").?.string;
+        } else return error.TestMissingCorpusCase;
+        const separator = std.mem.indexOf(u8, original, " AS ") orelse return error.TestInvalidCorpusCase;
+        const prepare_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = original[separator + " AS ".len ..] }, .{});
+        defer alloc.free(prepare_body);
+        var prepared = try request(alloc, transport, &headers, base, "/db/v1/sql/prepared", .POST, prepare_body);
+        defer prepared.deinit(alloc);
+        if (prepared.status != 200) std.debug.print("hosted CTE MERGE prepare status={d} body={s}\n", .{ prepared.status, prepared.body });
+        try std.testing.expectEqual(@as(u16, 200), prepared.status);
+        var prepared_json = try std.json.parseFromSlice(std.json.Value, alloc, prepared.body, .{});
+        defer prepared_json.deinit();
+        const prepared_id = prepared_json.value.object.get("prepared_id").?.string;
+        const execute_suffix = try std.fmt.allocPrint(alloc, "/db/v1/sql/prepared/{s}/execute", .{prepared_id});
+        defer alloc.free(execute_suffix);
+        var merged = try request(alloc, transport, &headers, base, execute_suffix, .POST, "{}");
         defer merged.deinit(alloc);
         if (merged.status != 200) std.debug.print("hosted CTE MERGE status={d} body={s}\n", .{ merged.status, merged.body });
         try std.testing.expectEqual(@as(u16, 200), merged.status);
@@ -1052,6 +1085,15 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
         defer result.deinit();
         try std.testing.expectEqualStrings("MERGE", result.value.command_tag);
         try std.testing.expectEqual(@as(i64, 1), result.value.rows_affected);
+        var read_back = try sql(alloc, transport, &headers, base, "SELECT id,status FROM usage_records WHERE id = 'prepared_id'");
+        defer read_back.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), read_back.status);
+        var row_result = try std.json.parseFromSlice(std.json.Value, alloc, read_back.body, .{});
+        defer row_result.deinit();
+        const rows = row_result.value.object.get("rows").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqualStrings("prepared_id", rows[0].array.items[0].string);
+        try std.testing.expectEqualStrings("open", rows[0].array.items[1].string);
         return;
     }
     if (leader_transfer) {
