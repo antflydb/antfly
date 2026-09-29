@@ -1863,7 +1863,10 @@ following mechanisms are installed behind that gate:
   cannot advance them to a new Raft position. Receiver candidate preparation
   treats a present output without such a revision as stale before constructing
   an adopted proof; absent outputs can still acquire a tombstone revision in
-  ordered apply.
+  ordered apply. Selected direct-index preparation now owns the receiver
+  candidate, encoded adopted APF3, exact output positions and document
+  reference keys as one bundle before apply; releasing the imported proof
+  buffer cannot invalidate the prepared transaction inputs.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups

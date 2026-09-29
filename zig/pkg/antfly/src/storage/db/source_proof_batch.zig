@@ -526,6 +526,53 @@ pub fn buildAdoptedProofAlloc(alloc: std.mem.Allocator, candidate: *const Receiv
     return .{ .proof = proof, .encoded = encoded, .effects = effects };
 }
 
+/// Own all variable-size work for one selected proof before entering ordered
+/// apply. The encoded APF3 and reference keys borrow only the owned candidate,
+/// never the imported store value. Apply must still revalidate the candidate
+/// and the exact merge attempt in its writer transaction.
+pub const PreparedAdoption = struct {
+    candidate: ReceiverCandidate,
+    adopted: AdoptedProof,
+    references: provenance.PreparedDocumentReferences,
+    positions: []?publication.Position,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.positions);
+        self.references.deinit();
+        self.adopted.deinit(alloc);
+        self.candidate.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn prepareAdoption(
+    alloc: std.mem.Allocator,
+    txn: anytype,
+    receiver_namespace: publication.Namespace,
+    donor_range: @import("../byte_range.zig").ByteRange,
+    source_pin: publication.Digest,
+    donor_namespace: publication.Namespace,
+    proof_digest: publication.Digest,
+    producer_plan: *const ReceiverProducerPlan,
+) !?PreparedAdoption {
+    const imported_key = mergeKey(donor_namespace, source_pin, proof_digest);
+    const raw = txn.get(&imported_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    var decoded = try decodeValue(alloc, donor_namespace, proof_digest, raw);
+    defer decoded.deinit();
+    var candidate = (try prepareReceiverCandidate(alloc, txn, receiver_namespace, donor_range, source_pin, producer_plan, decoded)) orelse return null;
+    errdefer candidate.deinit();
+    var adopted = try buildAdoptedProofAlloc(alloc, &candidate);
+    errdefer adopted.deinit(alloc);
+    var references = try provenance.prepareAdoptedDocumentReferences(alloc, adopted.proof);
+    errdefer references.deinit();
+    const positions = try alloc.alloc(?publication.Position, candidate.effects.len);
+    for (candidate.effects, positions) |effect, *position| position.* = effect.input_position;
+    return .{ .candidate = candidate, .adopted = adopted, .references = references, .positions = positions };
+}
+
 test "ordered artifact inventory receiver producer mapping rejects donor identity drift" {
     const alloc = std.testing.allocator;
     const prefix = "AIDX\x02\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00g\x03\x02\x00\x00\x00{}";
@@ -944,6 +991,27 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     try std.testing.expect(mapped.effects[1].input_position == null);
     try std.testing.expectEqualSlices(u8, &row_digest, &mapped.sources[0].content_digest);
     try std.testing.expect(try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
+    const imported_key = mergeKey(proof.namespace, source_pin, proof.publication_digest);
+    const imported = try alloc.dupe(u8, value);
+    defer alloc.free(imported);
+    try receiver.values.put(&imported_key, imported);
+    var prepared = (try prepareAdoption(alloc, &receiver, receiver_namespace, donor_range, source_pin, proof.namespace, proof.publication_digest, &plan)) orelse return error.TestUnexpectedResult;
+    defer prepared.deinit(alloc);
+    const PreparationAllocationCheck = struct {
+        fn run(a: std.mem.Allocator, txn: *Fake, receiver_ns: publication.Namespace, range: @import("../byte_range.zig").ByteRange, pin: publication.Digest, donor_ns: publication.Namespace, digest: publication.Digest, mapping: *const ReceiverProducerPlan) !void {
+            var bundle = (try prepareAdoption(a, txn, receiver_ns, range, pin, donor_ns, digest, mapping)) orelse return error.TestUnexpectedResult;
+            defer bundle.deinit(a);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, PreparationAllocationCheck.run, .{ &receiver, receiver_namespace, donor_range, source_pin, proof.namespace, proof.publication_digest, &plan });
+    try std.testing.expect(receiver.values.remove(&imported_key));
+    @memset(imported, 0);
+    try std.testing.expectEqual(@as(usize, 2), prepared.positions.len);
+    try std.testing.expectEqualDeep(output_position, prepared.positions[0].?);
+    try std.testing.expect(prepared.positions[1] == null);
+    try std.testing.expectEqual(@as(usize, 1), prepared.references.entries.len);
+    try std.testing.expectEqualDeep(source_pin, prepared.adopted.proof.origin.?.source_pin);
+    try std.testing.expect(try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, prepared.candidate));
     const wrong_witness: publication.Digest = @splat(0);
     try receiver.values.put(&witness_key, &wrong_witness);
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
