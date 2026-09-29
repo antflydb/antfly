@@ -1530,6 +1530,6 @@ test "mounted hosted self-FK survives three-voter owner leadership transfer at A
     try mountedSelfFk(true, false, true, false);
 }
 
-test "mounted hosted CTE MERGE retains owner statement fences" {
+test "mounted hosted prepared CTE INSERT and MERGE retain owner statement fences" {
     try mountedSelfFk(false, false, false, true);
 }
