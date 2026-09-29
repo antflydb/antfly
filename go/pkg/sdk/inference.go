@@ -468,6 +468,22 @@ func (c *InferenceClient) ListModels(ctx context.Context) (*oapi.InferenceModels
 	return resp.JSON200, nil
 }
 
+// Decide answers named choice, score, and Boolean questions using a decision
+// capable inference model.
+func (c *InferenceClient) Decide(ctx context.Context, req oapi.InferenceDecideRequest) (*oapi.InferenceDecideResponse, error) {
+	resp, err := c.client.DecideWithResponse(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("sending request: %w", err)
+	}
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
+	}
+	if resp.JSON200 == nil {
+		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
+	}
+	return resp.JSON200, nil
+}
+
 // Extract runs schema-driven extraction through the canonical Antfly inference
 // extraction endpoint.
 func (c *InferenceClient) Extract(ctx context.Context, req oapi.ExtractionRequest) (*oapi.ExtractionResponse, error) {

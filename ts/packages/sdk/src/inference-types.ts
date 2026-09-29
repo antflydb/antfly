@@ -21,6 +21,8 @@ export type ExtractRequest = components["schemas"]["ExtractionRequest"];
 /** A strict mixed-task request; extractV2 supplies schema_version:2. */
 export type ExtractV2Request = Omit<ExtractRequest, "schema_version">;
 export type ExtractResponse = components["schemas"]["ExtractionResponse"];
+export type DecideRequest = components["schemas"]["InferenceDecideRequest"];
+export type DecideResponse = components["schemas"]["InferenceDecideResponse"];
 export type ExtractEntity = components["schemas"]["ExtractionEntity"];
 export type ExtractRelation = components["schemas"]["ExtractionRelation"];
 export type ExtractClassification = components["schemas"]["ExtractionClassification"];

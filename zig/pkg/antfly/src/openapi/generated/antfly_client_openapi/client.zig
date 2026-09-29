@@ -515,6 +515,17 @@ pub const Client = struct {
         return ApiResponse(types.InferenceChunkResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Answer named choice, ordinal score, and Boolean questions
+    /// POST /ai/v1/decide
+    pub fn decide(self: *@This(), body: types.InferenceDecideRequest) !ApiResponse(types.InferenceDecideResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/decide", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDecideResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Dictate speech into clean written text
     /// POST /ai/v1/dictate
     pub fn dictate(self: *@This(), body: types.InferenceDictateRequest) !RawResponse {

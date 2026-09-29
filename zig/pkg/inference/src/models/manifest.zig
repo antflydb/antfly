@@ -348,6 +348,8 @@ pub const ModelManifest = struct {
     /// (e.g. GLiNER2.5-Decide). Its classification runs the upstream
     /// `classifier` head on the schema_version:2 route.
     gliner_span_declared: bool = false,
+    /// The config declares a valid ModernBERT Laya decision head.
+    laya_declared: bool = false,
     gliner_default_labels: [][]const u8 = &.{},
     gliner_relation_labels: [][]const u8 = &.{},
     gliner_relation_threshold: f32 = 0.0,
@@ -2295,12 +2297,32 @@ fn findFirstGgufInDir(allocator: std.mem.Allocator, base_dir: []const u8, want_p
     return result;
 }
 
+fn configDeclaresLaya(obj: std.json.ObjectMap) bool {
+    const model_type = obj.get("model_type") orelse return false;
+    if (model_type != .string or
+        (!std.mem.eql(u8, model_type.string, "modernbert") and !std.mem.eql(u8, model_type.string, "modern_bert"))) return false;
+    const raw = obj.get("laya") orelse return false;
+    _ = @import("laya.zig").Config.parse(raw) catch return false;
+    return true;
+}
+
+test "decision architecture declaration requires a Laya ModernBERT config" {
+    const a = std.testing.allocator;
+    var good = try std.json.parseFromSlice(std.json.Value, a, "{\"model_type\":\"modernbert\",\"laya\":{}}", .{});
+    defer good.deinit();
+    try std.testing.expect(configDeclaresLaya(good.value.object));
+    var bad = try std.json.parseFromSlice(std.json.Value, a, "{\"model_type\":\"bert\",\"laya\":{}}", .{});
+    defer bad.deinit();
+    try std.testing.expect(!configDeclaresLaya(bad.value.object));
+}
+
 fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
     if (parsed.value != .object) return error.InvalidModelConfig;
     const obj = parsed.value.object;
+    manifest.laya_declared = configDeclaresLaya(obj);
     const jina_v5_embedding_config = isJinaV5TextEmbeddingConfig(&obj);
     applyVisionTargetFromModelConfig(manifest, obj);
 
@@ -2497,6 +2519,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
 
     if (parsed.value != .object) return error.InvalidModelConfig;
     const obj = parsed.value.object;
+    manifest.laya_declared = configDeclaresLaya(obj);
     applyVisionTargetFromModelConfig(manifest, obj);
 
     if (obj.get("architectures")) |v| {

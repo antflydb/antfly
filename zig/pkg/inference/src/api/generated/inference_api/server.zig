@@ -17,6 +17,11 @@ pub fn parseChunkTextBody(allocator: std.mem.Allocator, body: []const u8) !std.j
     return std.json.parseFromSlice(types.ChunkRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for decide.
+pub fn parseDecideBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DecideRequest) {
+    return std.json.parseFromSlice(types.DecideRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for dictate.
 pub fn parseDictateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DictateRequest) {
     return std.json.parseFromSlice(types.DictateRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -130,6 +135,7 @@ pub const Route = struct {
 pub const routes = [_]Route{
     .{ .method = "POST", .path = "/chat/completions", .operation_id = "chatCompletions", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/chunk", .operation_id = "chunkText", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/decide", .operation_id = "decide", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/dictate", .operation_id = "dictate", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/embed", .operation_id = "generateEmbeddings", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/embeddings", .operation_id = "createEmbedding", .request_body = .buffered, .streaming_response = false },
@@ -164,6 +170,7 @@ pub fn ServerRouter(comptime Impl: type) type {
     comptime {
         if (!@hasDecl(Impl, "chatCompletions")) @compileError("ServerRouter: Impl missing required method 'chatCompletions'");
         if (!@hasDecl(Impl, "chunkText")) @compileError("ServerRouter: Impl missing required method 'chunkText'");
+        if (!@hasDecl(Impl, "decide")) @compileError("ServerRouter: Impl missing required method 'decide'");
         if (!@hasDecl(Impl, "dictate")) @compileError("ServerRouter: Impl missing required method 'dictate'");
         if (!@hasDecl(Impl, "generateEmbeddings")) @compileError("ServerRouter: Impl missing required method 'generateEmbeddings'");
         if (!@hasDecl(Impl, "createEmbedding")) @compileError("ServerRouter: Impl missing required method 'createEmbedding'");
@@ -196,6 +203,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         pub fn register(self: *const @This(), server: anytype) !void {
             try server.post("/chat/completions", httpx.Handler.bind(self.impl, chatCompletions));
             try server.post("/chunk", httpx.Handler.bind(self.impl, chunkText));
+            try server.post("/decide", httpx.Handler.bind(self.impl, decide));
             try server.post("/dictate", httpx.Handler.bind(self.impl, dictate));
             try server.post("/embed", httpx.Handler.bind(self.impl, generateEmbeddings));
             try server.post("/embeddings", httpx.Handler.bind(self.impl, createEmbedding));
@@ -227,6 +235,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /chunk
         fn chunkText(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.chunkText(ctx);
+        }
+
+        /// Answer named choice, ordinal score, and Boolean questions
+        /// POST /decide
+        fn decide(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.decide(ctx);
         }
 
         /// Dictate speech into clean written text
@@ -359,6 +373,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //
 //   fn chatCompletions(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn chunkText(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn decide(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn dictate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn generateEmbeddings(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createEmbedding(self: *Impl, ctx: *httpx.Context) !httpx.Response
