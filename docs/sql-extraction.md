@@ -1803,7 +1803,10 @@ following mechanisms are installed behind that gate:
   snapshot publication and final-fence apply now reject a provenance-free
   certificate if producer authority activated after its immutable pin, so a
   late activation cannot turn a previously empty proof stream into an
-  apparently complete receiver cut.
+  apparently complete receiver cut. Import now also checks APF2 source order,
+  physical position namespace, artifact guard ownership, output key family,
+  duplicate outputs and document ownership before storing candidate bytes;
+  a valid checksum alone is not an adoption certificate.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups

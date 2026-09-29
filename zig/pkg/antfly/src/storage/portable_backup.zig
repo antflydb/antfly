@@ -3739,7 +3739,9 @@ test "ordered artifact inventory source proof export restores inert selected evi
         .{ .document_key = "a\x00b", .content_digest = @splat(3), .timestamp = 1, .input_position = null },
         .{ .document_key = "outside", .content_digest = @splat(4), .timestamp = 1, .input_position = null },
     };
-    const effect = publication.Mutation{ .family = .document_artifact, .key = "effect", .value = null, .source_index = 0 };
+    const effect_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, sources[0].document_key, "proof");
+    defer alloc.free(effect_key);
+    const effect = publication.Mutation{ .family = .base_vector, .key = effect_key, .value = null, .source_index = 0 };
     const command: publication.Command = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = active.catalog_digest, .producer_name = "proof", .producer_generation = 1, .producer_artifact_name = "proof", .sources = &sources, .mutations = (&effect)[0..1], .publication_digest = @splat(5) };
     const proof_effect = producer_provenance.Effect{ .family = effect.family, .key = effect.key, .source_index = 0, .value_digest = null, .value_bytes = 0 };
     const logical: producer_provenance.Proof = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = active.catalog_digest, .producer_kind = .index, .producer_name = "proof", .producer_generation = 1, .producer_artifact_name = "proof", .publication_digest = command.publication_digest, .input_digest = command.inputDigest(), .sources = &sources, .artifact_sources = &.{}, .effects = (&proof_effect)[0..1] };

@@ -73,6 +73,10 @@ pub fn decodeValue(alloc: std.mem.Allocator, namespace: publication.Namespace, d
     errdefer proof.deinit();
     if (!std.mem.eql(u8, &proof.proof.namespace, &namespace) or !std.mem.eql(u8, &proof.proof.publication_digest, &digest) or
         bitmap.len != (proof.proof.sources.len + 7) / 8) return error.SourceSnapshotCorrupt;
+    proof.proof.validatePortableShape(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.SourceSnapshotCorrupt,
+    };
     var outputs = std.StaticBitSet(publication.max_source_documents).initEmpty();
     for (proof.proof.effects) |effect| outputs.set(effect.source_index);
     var selected = false;
@@ -190,8 +194,10 @@ pub const Reader = struct {
 
 test "ordered artifact inventory source proof batch rejects forged bitmap and count without granting authority" {
     const alloc = std.testing.allocator;
+    const effect_key = try @import("../internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "index");
+    defer alloc.free(effect_key);
     const source = publication.Source{ .document_key = "doc", .content_digest = @splat(3), .timestamp = 1, .input_position = null };
-    const effect = provenance.Effect{ .family = .document_artifact, .key = "effect", .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    const effect = provenance.Effect{ .family = .base_vector, .key = effect_key, .source_index = 0, .value_digest = null, .value_bytes = 0 };
     var proof: provenance.Proof = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "asset", .publication_digest = @splat(4), .input_digest = undefined, .sources = (&source)[0..1], .artifact_sources = &.{}, .effects = (&effect)[0..1] };
     proof.input_digest = proof.inputCommand().inputDigest();
     const bytes = try provenance.encodeAlloc(alloc, proof);
@@ -205,6 +211,15 @@ test "ordered artifact inventory source proof batch rejects forged bitmap and co
     defer alloc.free(forged);
     forged[6] = 2;
     try std.testing.expectError(error.SourceSnapshotCorrupt, decodeValue(alloc, proof.namespace, proof.publication_digest, forged));
+    const foreign_key = try @import("../internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, "other", "index");
+    defer alloc.free(foreign_key);
+    const foreign_effect = provenance.Effect{ .family = .base_vector, .key = foreign_key, .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    proof.effects = (&foreign_effect)[0..1];
+    const foreign_proof = try provenance.encodeAlloc(alloc, proof);
+    defer alloc.free(foreign_proof);
+    const foreign_value = try encodeValueAlloc(alloc, &.{1}, foreign_proof);
+    defer alloc.free(foreign_value);
+    try std.testing.expectError(error.SourceSnapshotCorrupt, decodeValue(alloc, proof.namespace, proof.publication_digest, foreign_value));
     try std.testing.expectError(error.SourceSnapshotCorrupt, Reader.init("\xff\xff\xff\x7f"));
 }
 
@@ -213,8 +228,10 @@ test "ordered artifact inventory source proof descriptor resumes a certified lar
     const document = try alloc.alloc(u8, 2 * 1024 * 1024);
     defer alloc.free(document);
     @memset(document, 'd');
+    const effect_key = try @import("../internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, document, "index");
+    defer alloc.free(effect_key);
     const source = publication.Source{ .document_key = document, .content_digest = @splat(3), .timestamp = 1, .input_position = null };
-    const effect = provenance.Effect{ .family = .document_artifact, .key = "effect", .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    const effect = provenance.Effect{ .family = .base_vector, .key = effect_key, .source_index = 0, .value_digest = null, .value_bytes = 0 };
     var proof: provenance.Proof = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "asset", .publication_digest = @splat(4), .input_digest = undefined, .sources = (&source)[0..1], .artifact_sources = &.{}, .effects = (&effect)[0..1] };
     proof.input_digest = proof.inputCommand().inputDigest();
     const raw = try provenance.encodeAlloc(alloc, proof);
@@ -257,8 +274,10 @@ test "ordered artifact inventory merge proof payload is isolated and chunk-resum
     const document = try alloc.alloc(u8, 2 * pages.chunk_bytes);
     defer alloc.free(document);
     @memset(document, 'd');
+    const effect_key = try @import("../internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, document, "index");
+    defer alloc.free(effect_key);
     const source = publication.Source{ .document_key = document, .content_digest = @splat(3), .timestamp = 1, .input_position = null };
-    const effect = provenance.Effect{ .family = .document_artifact, .key = "effect", .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    const effect = provenance.Effect{ .family = .base_vector, .key = effect_key, .source_index = 0, .value_digest = null, .value_bytes = 0 };
     var proof: provenance.Proof = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "asset", .publication_digest = @splat(4), .input_digest = undefined, .sources = (&source)[0..1], .artifact_sources = &.{}, .effects = (&effect)[0..1] };
     proof.input_digest = proof.inputCommand().inputDigest();
     const raw = try provenance.encodeAlloc(alloc, proof);
@@ -275,7 +294,7 @@ test "ordered artifact inventory merge proof payload is isolated and chunk-resum
     const chunks = try pages.RowChunks(types.BatchRequest).init(request);
     const first = try chunks.requestAt(0);
     const second = try chunks.requestAt(pages.chunk_bytes);
-    const final = try chunks.requestAt(2 * pages.chunk_bytes);
+    const final = try chunks.requestAt(((value.len - 1) / pages.chunk_bytes) * pages.chunk_bytes);
     try std.testing.expectEqual(pages.ChunkPayload.provenance, first.merge_page.?.chunk.?.payload);
     try std.testing.expect(!first.merge_page.?.chunk.?.complete());
     try std.testing.expect(!second.merge_page.?.chunk.?.complete());

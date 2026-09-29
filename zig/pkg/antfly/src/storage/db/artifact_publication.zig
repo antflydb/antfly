@@ -1083,7 +1083,7 @@ fn tombstonedSource(sources: []const Source, document: []const u8) bool {
     return false;
 }
 
-fn validFamilyKey(family: Family, key: []const u8) bool {
+pub fn validFamilyKey(family: Family, key: []const u8) bool {
     return switch (family) {
         .base_vector => keys.isEmbeddingArtifactKey(key),
         .derived_vector => keys.isDerivedEmbeddingArtifactKey(key),

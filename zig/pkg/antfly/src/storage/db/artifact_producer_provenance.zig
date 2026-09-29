@@ -51,6 +51,51 @@ pub const Proof = struct {
             (effect.value_digest == null and effect.value_bytes != 0)) return error.ArtifactCatalogCorrupt;
     }
 
+    /// A transferred APF2 body is only candidate evidence. Before importing
+    /// it, recheck the canonical owner/key shape that local publication
+    /// admission checked, without loading any large output value. Receiver
+    /// input revisions and output bytes are validated again during adoption.
+    pub fn validatePortableShape(self: Proof, alloc: std.mem.Allocator) !void {
+        try self.validate();
+        if (std.mem.allEqual(u8, &self.namespace, 0) or std.mem.allEqual(u8, &self.catalog_digest, 0))
+            return error.ArtifactCatalogCorrupt;
+        const identity = publication.namespaceFromBytes(self.namespace);
+        for (self.sources, 0..) |source, index| {
+            if (source.document_key.len == 0 or (index != 0 and
+                std.mem.order(u8, self.sources[index - 1].document_key, source.document_key) != .lt))
+                return error.ArtifactCatalogCorrupt;
+            if (source.exists) {
+                if (source.timestamp == 0) return error.ArtifactCatalogCorrupt;
+            } else if (source.timestamp != 0 or !std.mem.allEqual(u8, &source.content_digest, 0) or source.input_position == null)
+                return error.ArtifactCatalogCorrupt;
+            if (source.input_position) |position| position.requireNamespace(identity) catch return error.ArtifactCatalogCorrupt;
+        }
+        for (self.artifact_sources, 0..) |source, index| {
+            if (source.source_index >= self.sources.len or !publication.guardedArtifactKey(source.key) or
+                (index != 0 and std.mem.order(u8, self.artifact_sources[index - 1].key, source.key) != .lt))
+                return error.ArtifactCatalogCorrupt;
+            if (source.input_position) |position| position.requireNamespace(identity) catch return error.ArtifactCatalogCorrupt;
+            const owner = @import("artifact_publication_owner.zig").documentAlloc(alloc, source.key) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.ArtifactCatalogCorrupt,
+            };
+            defer alloc.free(owner);
+            if (!std.mem.eql(u8, owner, self.sources[source.source_index].document_key)) return error.ArtifactCatalogCorrupt;
+        }
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(alloc);
+        for (self.effects) |effect| {
+            if (!publication.validFamilyKey(effect.family, effect.key) or
+                (try seen.getOrPut(alloc, effect.key)).found_existing) return error.ArtifactCatalogCorrupt;
+            const owner = @import("artifact_publication_owner.zig").documentAlloc(alloc, effect.key) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.ArtifactCatalogCorrupt,
+            };
+            defer alloc.free(owner);
+            if (!std.mem.eql(u8, owner, self.sources[effect.source_index].document_key)) return error.ArtifactCatalogCorrupt;
+        }
+    }
+
     /// Must be checked against the current owner's exact input snapshot.
     /// Cross-owner adoption first validates logical source equivalence and
     /// rewrites physical positions; copying donor authority is never valid.
