@@ -587,14 +587,46 @@ test "SQL catalog DDL authorizes before lookup and handles atomic conditional ou
     try std.testing.expectEqual(@as(usize, 3), source.calls);
 }
 
-test "SQL UUID prepared CREATE TABLE reaches mounted catalog mutation only on execute" {
+test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only on execute" {
+    const metadata_store = @import("../metadata/storage/raft_apply_store.zig");
+    const table_manager = @import("../metadata/table_manager.zig");
     const Source = struct {
+        store: *metadata_store.RaftApplyStore,
+        metadata_group_id: u64 = 21,
+        next_index: u64 = 1,
         mutations: usize = 0,
         output: ?*std.Io.Writer.Allocating = null,
         fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
-            return .{ .metadata_group_id = 1, .metrics = .{} };
+            return .{ .metadata_group_id = 21, .metrics = .{} };
         }
-        fn run(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: domain.Call) ![]u8 {
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: operation.RequestContext, _: u16) !void {}
+        pub fn validateTableTopologyProtocolReadinessWithContext(_: *@This(), _: operation.RequestContext, _: void) !void {}
+        pub fn ensureLinearizableReadWithContext(_: *@This(), _: operation.RequestContext) !void {}
+        pub fn lockCatalogMutation(_: *@This()) void {}
+        pub fn unlockCatalogMutation(_: *@This()) void {}
+        pub fn projectedStore(self: *@This()) ?*metadata_store.RaftApplyStore {
+            return self.store;
+        }
+        pub fn captureTableCreateGeneration(self: *@This(), alloc: std.mem.Allocator, table_id: u64) !u64 {
+            try self.store.ensureDerivedCatalogIndexes(self.metadata_group_id);
+            return self.store.captureTableCreateGeneration(alloc, self.metadata_group_id, table_id);
+        }
+        pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: metadata_store.TransitionCommand) !u64 {
+            const alloc = std.testing.allocator;
+            const encoded = try metadata_store.encodeTransitionCommand(alloc, command);
+            defer alloc.free(encoded);
+            const entries = try @import("../raft/state_machine/mod.zig").encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = self.next_index, .entry_type = .normal, .data = encoded }});
+            defer alloc.free(entries);
+            try self.store.snapshotBuilder().applyBatch(.{ .group_id = self.metadata_group_id, .commit_index = self.next_index, .entries_bytes = entries });
+            const receipt = self.next_index;
+            self.next_index += 1;
+            return receipt;
+        }
+        pub fn waitForTransitionAppliedWithContext(_: *@This(), _: u64, _: operation.RequestContext) !void {}
+        pub fn verifyTableCreateProjection(self: *@This(), alloc: std.mem.Allocator, table: table_manager.TableRecord, ranges: []const table_manager.RangeRecord) !void {
+            try self.store.verifyTableCreateProjectionExact(alloc, self.metadata_group_id, table, ranges);
+        }
+        fn run(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: domain.Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (call != .mutate) return error.UnexpectedCall;
             try std.testing.expect(std.mem.indexOf(u8, self.output.?.written(), "PREPARE\x00") != null);
@@ -613,10 +645,16 @@ test "SQL UUID prepared CREATE TABLE reaches mounted catalog mutation only on ex
             try std.testing.expectEqualStrings("id", property.name);
             try std.testing.expectEqualStrings("uuid", property.format.?);
             self.mutations += 1;
-            return alloc.dupe(u8, "{}");
+            return @import("../system_catalog/operations.zig").mutate(self, alloc, context, request);
         }
     };
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-uuid-catalog", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try metadata_store.RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
     const usermgr = @import("../usermgr/mod.zig");
     const casbin = @import("antfly_casbin");
     var user_store = usermgr.MemoryStore.init(alloc);
@@ -631,7 +669,7 @@ test "SQL UUID prepared CREATE TABLE reaches mounted catalog mutation only on ex
     defer user.deinit(alloc);
     var runtime = try @import("../storage/background_runtime.zig").BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
-    var source: Source = .{};
+    var source: Source = .{ .store = &store };
     var server = server_mod.ApiHttpServer.init(alloc, .{ .user_manager = &manager, .backend_runtime = runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run } }, null, null);
     defer server.deinit();
     var adapter: @import("sql_pgwire.zig").Adapter = .{ .server = &server };
@@ -673,4 +711,32 @@ test "SQL UUID prepared CREATE TABLE reaches mounted catalog mutation only on ex
     }
     try std.testing.expectEqual(@as(usize, 2), completions);
     try std.testing.expectEqual(@as(usize, 1), source.mutations);
+    const Verify = struct {
+        fn run(owner: *metadata_store.RaftApplyStore, allocator: std.mem.Allocator) !void {
+            const physical = (try owner.resolveSystemCatalogTable(allocator, 21, .{ .table = "prepared_usage_records" })) orelse return error.MissingSqlTable;
+            defer table_manager.freeTable(allocator, physical);
+            var snapshot = try owner.systemCatalogSnapshot(allocator, 21);
+            defer snapshot.deinit();
+            try std.testing.expectEqualStrings("prepared_usage_records", snapshot.value.find(.table, domain.default_namespace_id, "prepared_usage_records").?.name);
+            var schema = try tables.parseValidatedTableSchema(allocator, physical.schema_json);
+            defer schema.deinit(allocator);
+            try std.testing.expectEqualStrings("uuid", schema.document_schemas[0].properties[0].format.?);
+            const ranges = try owner.listRanges(allocator, 21);
+            defer owner.freeRanges(allocator, ranges);
+            try std.testing.expectEqual(@as(usize, 1), ranges.len);
+            try std.testing.expectEqual(physical.table_id, ranges[0].table_id);
+        }
+    };
+    try Verify.run(&store, alloc);
+    const snapshot_bytes = try store.snapshotBuilder().buildSnapshot(alloc, 21);
+    defer alloc.free(snapshot_bytes);
+    store.deinit();
+    store = try metadata_store.RaftApplyStore.init(alloc, .{ .root_dir = root });
+    try Verify.run(&store, alloc);
+    const restored_root = try std.fmt.allocPrint(alloc, "{s}-snapshot", .{root});
+    defer alloc.free(restored_root);
+    var restored = try metadata_store.RaftApplyStore.init(alloc, .{ .root_dir = restored_root });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(alloc, 21, 1, snapshot_bytes));
+    try Verify.run(&restored, alloc);
 }

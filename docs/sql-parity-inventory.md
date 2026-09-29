@@ -97,10 +97,14 @@ generation job and returns its pending receipt, not a false synchronous
 completion. The staged restore gate separately covers owner publication.
 For `sql-0004`, the exact prepared UUID CREATE TABLE now passes the authenticated
 mounted pgwire adapter: PREPARE makes no catalog mutation, and EXECUTE submits
-one validated typed schema. The native relational preparation path canonicalizes
-UUIDs before hashing and indexing, and pgwire accepts text and binary UUIDs.
-The case remains unresolved until a durable catalog replay and physical owner
-publication are observed; a mounted callback alone cannot prove that outcome.
+one validated typed schema through the production catalog mutation logic and
+committed metadata transition. The test reopens the metadata store and installs
+a Raft snapshot into a fresh store, verifying that the logical binding, UUID
+schema, physical table, and initial range survive together. The native
+relational preparation path canonicalizes UUIDs before hashing and indexing,
+and pgwire accepts text and binary UUIDs. The case remains
+unresolved until data-group owner provisioning and an owner-backed query or
+mutation are observed; metadata topology alone cannot prove owner publication.
 `sql-0037`, `sql-0039`, `sql-0041`, `sql-0043`, and `sql-0046` are tested
 supersessions of catalog/admin session mutations. Their exact public-namespace
 and one-millisecond timeout commands run through the pgwire session state
