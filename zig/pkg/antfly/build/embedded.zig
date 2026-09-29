@@ -193,21 +193,21 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     embedded_support_mod.addImport("antfly_transcribing", transcribing_mod);
 
     const embedded_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/embedded/root.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     embedded_mod.addImport("embedded_support", embedded_support_mod);
 
     const embedded_db_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/embedded/db.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/db.zig"),
         .target = target,
         .optimize = optimize,
     });
     embedded_db_mod.addImport("embedded_support", embedded_support_mod);
 
     const embedded_api_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/embedded/api.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/api.zig"),
         .target = target,
         .optimize = optimize,
     });

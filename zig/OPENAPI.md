@@ -71,7 +71,7 @@ into the dependent generated module.
 Generated Antfly and shared API modules live under:
 
 ```text
-pkg/antfly/src/openapi/generated/
+pkg/antfly-embedded/src/openapi/generated/
 ```
 
 The generated inference API module lives under:
@@ -83,13 +83,13 @@ pkg/inference/src/api/generated/inference_api/
 The shared generating module is generated under:
 
 ```text
-pkg/antfly/src/openapi/generated/antfly_generating_openapi/
+pkg/antfly-embedded/src/openapi/generated/antfly_generating_openapi/
 ```
 
 The shared AI extraction module is generated under:
 
 ```text
-pkg/antfly/src/openapi/generated/antfly_extraction_openapi/
+pkg/antfly-embedded/src/openapi/generated/antfly_extraction_openapi/
 ```
 
 Generated files start with:

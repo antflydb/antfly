@@ -8,6 +8,10 @@ appropriate design, guide, reference, or operations document and remove the
 plan. Preserve useful dated evidence in that topic's `history/` directory,
 linking back to the current documentation. See [placement rules](../README.md#placement-rules).
 
+## Active work
+
+- [Physical source boundary for embedded Antfly](embedded-source-boundary.md)
+
 ## Proposed work
 
 - [Agentic warehouse memory](agentic-warehouse-memory.md)

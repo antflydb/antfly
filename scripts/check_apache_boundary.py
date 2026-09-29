@@ -42,7 +42,6 @@ ENTRYPOINTS = (
     "runtime_enrichment_compute_root.zig",
     "lite_main.zig",
     "embedded_root.zig",
-    "embedded/root.zig",
     "runtime_memory_abi.zig",
     "runtime_failure_abi.zig",
     "runtime_failure_identity.zig",
@@ -52,6 +51,7 @@ ENTRYPOINTS = (
 )
 PACKAGE_ENTRYPOINTS = (
     "zig/pkg/antfly-embedded/src/root.zig",
+    "zig/pkg/antfly-embedded/src/engine/root.zig",
     "zig/examples/antfly_wasm.zig",
     "zig/pkg/inference/src/main.zig",
     "zig/pkg/inference/src/wasm_entry_wasm32.zig",
@@ -64,108 +64,108 @@ PACKAGE_ENTRYPOINTS = (
 SOURCE_MODULES = {
     "antfly_data_uri": ("zig/lib/scraping/src/data_uri.zig",),
     "antfly_websearch_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_websearch_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_websearch_openapi/root.zig",
     ),
     "antfly_usermgr_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_usermgr_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_usermgr_openapi/root.zig",
     ),
     "antfly_generating_api_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_generating_api_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_generating_api_openapi/root.zig",
     ),
     "antfly_eval_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_eval_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_eval_openapi/root.zig",
     ),
     "antfly_graph_identifier_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_graph_identifier_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_graph_identifier_openapi/root.zig",
     ),
     "antfly-client": ("zig/pkg/antfly-client/src/root.zig",),
     "antfly-json": ("zig/lib/json/src/mod.zig",),
     "antfly_audio_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_audio_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_audio_openapi/root.zig",
     ),
     "antfly_casbin": ("zig/lib/casbin/src/mod.zig",),
     "antfly_chunking": ("zig/lib/chunking/src/mod.zig",),
     "antfly_chunking_api_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_chunking_api_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_chunking_api_openapi/root.zig",
     ),
     "antfly_chunking_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_chunking_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_chunking_openapi/root.zig",
     ),
     "antfly_client_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_client_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_client_openapi/root.zig",
     ),
     "antfly_common_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_common_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_common_openapi/root.zig",
     ),
     "antfly_credentials": ("zig/lib/credentials/src/root.zig",),
     "antfly_embedded_api": ("zig/pkg/antfly-embedded/src/api.zig",),
     "antfly_embedded_db": ("zig/pkg/antfly-embedded/src/db.zig",),
     "antfly_embeddings": ("zig/lib/embeddings/src/mod.zig",),
     "antfly_embeddings_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_embeddings_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_embeddings_openapi/root.zig",
     ),
     "antfly_extracting": ("zig/lib/extracting/src/mod.zig",),
     "antfly_extraction_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_extraction_openapi/root.zig",
     ),
     "antfly_font": ("zig/lib/font/src/mod.zig",),
     "antfly_fst": ("zig/lib/fst/src/mod.zig",),
     "antfly_generating": ("zig/lib/generating/src/mod.zig",),
     "antfly_generating_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_generating_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_generating_openapi/root.zig",
     ),
     "antfly_google": ("zig/lib/google/src/root.zig",),
     "antfly_hash": ("zig/lib/hash/src/mod.zig",),
     "antfly_image": ("zig/lib/image/src/mod.zig",),
     "antfly_indexes_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_indexes_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_indexes_openapi/root.zig",
     ),
     "antfly_inference_config_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_inference_config_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_inference_config_openapi/root.zig",
     ),
     "antfly_jsonschema": ("zig/lib/jsonschema/src/mod.zig",),
     "antfly_logging_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_logging_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_logging_openapi/root.zig",
     ),
     "antfly_matcher": ("zig/lib/matcher/src/mod.zig",),
     "antfly_metadata_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_metadata_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_metadata_openapi/root.zig",
     ),
     "antfly_middleware_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_middleware_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_middleware_openapi/root.zig",
     ),
     "antfly_pdf": ("zig/lib/pdf/src/mod.zig",),
     "antfly_platform": ("zig/lib/platform/src/root.zig",),
     "antfly_provider_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_provider_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_provider_openapi/root.zig",
     ),
     "antfly_public_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_public_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_public_openapi/root.zig",
     ),
     "antfly_query_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_query_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_query_openapi/root.zig",
     ),
     "antfly_reader_config": ("zig/lib/readers/src/config.zig",),
     "antfly_readers": ("zig/lib/readers/src/mod.zig",),
     "antfly_regex": ("zig/lib/regex/src/mod.zig",),
     "antfly_reranking": ("zig/lib/reranking/src/mod.zig",),
     "antfly_reranking_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_reranking_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_reranking_openapi/root.zig",
     ),
     "antfly_resolver": ("zig/lib/resolver/src/mod.zig",),
     "antfly_root": ("zig/pkg/antfly/src/lite_capi_root.zig",),
     "antfly_s3_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_s3_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_s3_openapi/root.zig",
     ),
     "antfly_schema_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_schema_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_schema_openapi/root.zig",
     ),
     "antfly_scraping": ("zig/lib/scraping/src/mod.zig",),
     "antfly_scraping_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_scraping_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_scraping_openapi/root.zig",
     ),
     "antfly_sort_openapi": (
-        "zig/pkg/antfly/src/openapi/generated/antfly_sort_openapi/root.zig",
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_sort_openapi/root.zig",
     ),
     "antfly_source_root": ("zig/pkg/antfly/src/source_owner_lite.zig",),
     "antfly_storage_root": ("zig/pkg/antfly/src/lite_capi_root.zig",),
@@ -176,10 +176,10 @@ SOURCE_MODULES = {
     "bloom": ("zig/lib/bloom/src/mod.zig",),
     "build_info": ("zig/lib/build_info/src/root.zig",),
     "cuda_jit_identity": ("zig/pkg/inference/tools/jit_identity.zig",),
-    "embedded_api_surface": ("zig/pkg/antfly/src/embedded/api.zig",),
-    "embedded_db_surface": ("zig/pkg/antfly/src/embedded/db.zig",),
+    "embedded_api_surface": ("zig/pkg/antfly-embedded/src/engine/api.zig",),
+    "embedded_db_surface": ("zig/pkg/antfly-embedded/src/engine/db.zig",),
     "embedded_support": ("zig/pkg/antfly/src/embedded_root.zig",),
-    "embedded_surface": ("zig/pkg/antfly/src/embedded/root.zig",),
+    "embedded_surface": ("zig/pkg/antfly-embedded/src/engine/root.zig",),
     "enrichment_compute_abi": (
         "zig/pkg/antfly/src/storage/enrichment_compute_abi.zig",
     ),
@@ -221,7 +221,7 @@ SOURCE_MODULES = {
     "objectstore": ("zig/lib/objectstore/src/root.zig",),
     "onnx_data": ("zig/lib/onnx/src/data.zig",),
     "onnx_graph": ("zig/lib/onnx/src/root.zig",),
-    "openai_api": ("zig/pkg/antfly/src/openapi/generated/openai_api/root.zig",),
+    "openai_api": ("zig/pkg/antfly-embedded/src/openapi/generated/openai_api/root.zig",),
     "pdf_standard_fonts": ("zig/pdf_standard_fonts.zig",),
     "pjrt": ("zig/lib/pjrt/src/root.zig",),
     "prometheus": ("zig/lib/prometheus/src/root.zig",),

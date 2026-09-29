@@ -153,7 +153,7 @@ pub fn addOpenApiSourceSteps(
     // and extra files must be detected without mutating the source tree.
     check.has_side_effects = true;
 
-    const antfly_generated_root = "pkg/antfly/src/openapi/generated";
+    const antfly_generated_root = "pkg/antfly-embedded/src/openapi/generated";
     const inference_generated_root = "pkg/inference/src/api/generated";
     const public_spec = addPrefixedPublicOpenApiSpec(b);
     const modules = [_]GeneratedModule{

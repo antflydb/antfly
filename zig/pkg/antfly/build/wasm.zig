@@ -20,7 +20,7 @@ const platform_build = @import("../../../lib/platform/build_support.zig");
 const image_build = @import("../../../lib/image/build_support.zig");
 const pdf_build = @import("../../../lib/pdf/build_support.zig");
 const tokenizer_build = @import("../../../lib/tokenizer/build_support.zig");
-const codegen = @import("codegen.zig");
+const codegen = @import("../../antfly-embedded/build/codegen.zig");
 const configureEmbeddedModule = @import("embedded.zig").configureModule;
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 
@@ -45,7 +45,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const httpx_mod = b.createModule(.{ .root_source_file = b.path("lib/httpx/src/httpx.zig"), .target = wasm_target, .optimize = optimize });
     httpx_mod.addImport("antfly-json", json_mod);
     const api = codegen.createCommittedModules(b, .{
-        .root = b.path("pkg/antfly/src/openapi/generated"),
+        .root = b.path("pkg/antfly-embedded/src/openapi/generated"),
         .target = wasm_target,
         .optimize = optimize,
         .json = json_mod,
@@ -187,21 +187,21 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     }));
 
     const embedded_wasm_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/embedded/root.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/root.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
     embedded_wasm_mod.addImport("embedded_support", embedded_support_wasm_mod);
 
     const embedded_db_wasm_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/embedded/db.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/db.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
     embedded_db_wasm_mod.addImport("embedded_support", embedded_support_wasm_mod);
 
     const embedded_api_wasm_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/embedded/api.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/api.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
