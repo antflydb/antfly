@@ -132,6 +132,13 @@ hosted test now runs the exact pgwire PREPARE/EXECUTE sequence against that owne
 asserts the `MERGE 1` completion and typed read-back, and retries only a proven
 precommit read-unavailable error. Distributed fault evidence remains missing;
 the case stays unresolved.
+For `sql-0009` and `sql-0010`, the exact prepared recursive CTE read and UPDATE
+now run through authenticated hosted pgwire against a Raft-backed relational
+owner. A parent and child exercise a nontrivial `UNION ALL` delta: the read
+returns the child twice (`SELECT 3` total), while the mutation deduplicates
+targets (`UPDATE 2`) and a typed read verifies its result. Multi-owner
+coordination, failover and distributed cancellation remain unproven, so both
+cases stay unresolved.
 `sql-0037`, `sql-0039`, `sql-0041`, `sql-0043`, and `sql-0046` are tested
 supersessions of catalog/admin session mutations. Their exact public-namespace
 and one-millisecond timeout commands run through the pgwire session state

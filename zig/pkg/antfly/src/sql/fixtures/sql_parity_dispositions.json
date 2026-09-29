@@ -102,8 +102,8 @@
       "cwd": "zig",
       "timeout_seconds": 600
     },
-    "antfly-api-hosted-cte-mutation-test": {
-      "command": ["zig", "build", "antfly-api-hosted-cte-mutation-test", "--cache-dir", ".zig-cache/sql-parity-evidence"],
+    "antfly-api-hosted-cte-runtime-test": {
+      "command": ["zig", "build", "antfly-api-hosted-cte-runtime-test", "--cache-dir", ".zig-cache/sql-parity-evidence"],
       "cwd": "zig",
       "timeout_seconds": 600
     },
@@ -158,7 +158,7 @@
         {"path": "zig/pkg/antfly/src/sql/insert_test.zig", "test": "SQL original prepared CTE INSERT captures source before one target mutation", "gate": "sql-original-prepared-cte-runtime"},
         {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE INSERT defers mutation until execute", "gate": "pgwire-original-prepared-cte"},
         {"path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL API cross-table MERGE retains both source and target range proofs", "gate": "sql-mounted-merge"},
-        {"path": "zig/pkg/antfly/src/api/hosted_self_fk_e2e.zig", "test": "mounted hosted prepared CTE INSERT and MERGE retain owner statement fences", "gate": "antfly-api-hosted-cte-mutation-test"}
+        {"path": "zig/pkg/antfly/src/api/hosted_self_fk_e2e.zig", "test": "mounted hosted prepared CTE mutations and recursive read retain owner fences", "gate": "antfly-api-hosted-cte-runtime-test"}
       ]
     },
     {
@@ -189,18 +189,20 @@
         {"path": "zig/pkg/antfly/src/sql/joined_mutation_test.zig", "test": "SQL original prepared CTE UPDATE DELETE and MERGE capture before one mutation", "gate": "sql-original-prepared-cte-runtime"},
         {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE", "gate": "pgwire-original-prepared-cte"},
         {"path": "zig/pkg/antfly/src/api/sql_execution.zig", "test": "SQL API cross-table MERGE retains both source and target range proofs", "gate": "sql-mounted-merge"},
-        {"path": "zig/pkg/antfly/src/api/hosted_self_fk_e2e.zig", "test": "mounted hosted prepared CTE INSERT and MERGE retain owner statement fences", "gate": "antfly-api-hosted-cte-mutation-test"}
+        {"path": "zig/pkg/antfly/src/api/hosted_self_fk_e2e.zig", "test": "mounted hosted prepared CTE mutations and recursive read retain owner fences", "gate": "antfly-api-hosted-cte-runtime-test"}
       ]
     },
     {
       "id": "sql-0009",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "The exact prepared recursive CTE read now runs through authenticated hosted pgwire against a Raft-backed relational owner. The source contains a parent and child: the anchor emits both, the recursive UNION ALL delta emits the child again, and pgwire returns SELECT 3 with the exact typed multiset. This one-owner fixture does not prove multi-owner snapshot coordination, failover, or distributed cancellation, so the case remains unresolved.",
+      "evidence": [{"path": "zig/pkg/antfly/src/api/hosted_self_fk_e2e.zig", "test": "mounted hosted prepared CTE mutations and recursive read retain owner fences", "gate": "antfly-api-hosted-cte-runtime-test"}]
     },
     {
       "id": "sql-0010",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "The exact prepared recursive CTE UPDATE now executes through authenticated hosted pgwire and a Raft-backed relational owner. A parent and child produce a nontrivial recursive UNION ALL worklist; membership deduplicates mutation targets, pgwire reports UPDATE 2, and a typed read verifies the child status. This one-owner fixture does not prove multi-owner snapshot coordination, failover, or distributed cancellation, so the case remains unresolved.",
+      "evidence": [{"path": "zig/pkg/antfly/src/api/hosted_self_fk_e2e.zig", "test": "mounted hosted prepared CTE mutations and recursive read retain owner fences", "gate": "antfly-api-hosted-cte-runtime-test"}]
     },
     {
       "id": "sql-0011",

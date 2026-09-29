@@ -1299,7 +1299,10 @@ compaction/selective-query performance comparison remains unmeasured.
   completion and typed row, and distinguishes precommit read unavailability
   from an ambiguous write outcome. The same hosted fixture now mounts the exact
   `sql-0005` pgwire cross-table CTE INSERT and verifies `INSERT 0 1` plus typed
-  target read-back. Multi-owner and distributed fault evidence remain open;
+  target read-back. The exact `sql-0009` recursive prepared read emits three
+  rows from a parent/child worklist, and `sql-0010` updates the two distinct
+  targets through the same hosted owner path. Multi-owner and distributed fault
+  evidence remain open;
   1,381 cases remain unresolved.
 
 - Follow-up ReleaseSafe SQL suite: 168 tests. Membership benchmark (opt-in
