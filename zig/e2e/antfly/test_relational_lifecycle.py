@@ -8,7 +8,7 @@ import json
 import pytest
 import test_auth as auth
 from helpers import wait_until
-from test_auth import _basic_auth
+from test_auth import AUTH_BOOTSTRAP_PASSWORD, _basic_auth
 from test_relational_sessions import _schema
 
 auth_api = auth.auth_api
@@ -41,7 +41,7 @@ def _enforced(api, table):
 @pytest.mark.parametrize("permissions", ["admin", "both", "parent_only"])
 def test_cascade_session_keeps_logical_authorization(auth_api, permissions):
     api = auth_api
-    api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     for table, schema in [("parent", _schema()), ("child", _schema("parent"))]:
         api.post(f"/tables/{table}", {"schema": schema})
         _enforced(api, table)

@@ -24,8 +24,10 @@ The AntflyTransaction TLA+ spec models these txnStatus transitions:
   aborting → aborted (AbortTransaction)
   committed/aborted → (ResolveIntentsOnShard, CleanupTxnRecord)
 
-Events from recovery tests, retries, or external aborts don't match the spec
-and are dropped. Incomplete-but-valid prefixes are kept (CHECK_DEADLOCK FALSE).
+Events from recovery tests, retries, or external aborts don't match the spec.
+They and every transaction in their key-connected component are dropped: a
+modeled transaction can otherwise depend on an omitted writer or live intent.
+Independent incomplete-but-valid prefixes are kept (CHECK_DEADLOCK FALSE).
 
 Usage:
   python3 tla-filter-txn-trace.py < trace.ndjson > filtered.ndjson
@@ -33,7 +35,9 @@ Usage:
 
 import json
 import sys
-from collections import defaultdict
+from collections import defaultdict, deque
+
+KEY_FIELDS = ("writeKeys", "deleteKeys", "predicateKeys")
 
 # Valid next events for each TLA+ txnStatus state.
 # AbortTransaction from predicatesChecked/preparing is allowed (DirectAbort).
@@ -70,6 +74,8 @@ def main():
     # Collect events per transaction, preserving global order
     all_events = []
     events_by_txn = defaultdict(list)
+    keys_by_txn = defaultdict(set)
+    txns_by_key = defaultdict(set)
 
     for line in sys.stdin:
         line = line.strip()
@@ -82,6 +88,11 @@ def main():
         idx = len(all_events)
         all_events.append((idx, obj))
         events_by_txn[txn_id].append((idx, obj))
+        state = obj["event"].get("state") or {}
+        for field in KEY_FIELDS:
+            for key in state.get(field, []):
+                keys_by_txn[txn_id].add(key)
+                txns_by_key[key].add(txn_id)
 
     # Check each transaction's lifecycle
     valid_txns = set()
@@ -102,9 +113,24 @@ def main():
         if valid:
             valid_txns.add(txn_id)
 
-    # Output events for valid transactions in original order
+    # A dropped transaction may still have held an intent or changed the
+    # committed version seen by another transaction. Project only complete
+    # key-connected components onto the single-shard model; otherwise a real
+    # IntentConflict can look impossible after its writer was filtered out.
+    tainted_txns = set(events_by_txn) - valid_txns
+    pending = deque(tainted_txns)
+    while pending:
+        txn_id = pending.popleft()
+        for key in keys_by_txn[txn_id]:
+            for neighbor in txns_by_key.pop(key, ()):
+                if neighbor not in tainted_txns:
+                    tainted_txns.add(neighbor)
+                    pending.append(neighbor)
+
+    # Output independent, model-compatible components in original order.
+    retained_txns = valid_txns - tainted_txns
     for _, obj in all_events:
-        if obj["event"]["txnId"] in valid_txns:
+        if obj["event"]["txnId"] in retained_txns:
             print(json.dumps(obj, separators=(",", ":")))
 
 

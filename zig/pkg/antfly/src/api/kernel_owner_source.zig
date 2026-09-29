@@ -2675,6 +2675,17 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .ok;
     }
 
+    fn transactionRecoveryAcknowledgeMany(ptr: ?*anyopaque, txn_id: *const abi.TxnId, owner_participant: abi.BorrowedBytes, participants_ptr: ?[*]const abi.BorrowedBytes, participants_len: usize) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const source = self.transaction_recovery_source orelse return .invalid_argument;
+        if (participants_len == 0 or participants_len > 64) return .invalid_argument;
+        const bytes = (participants_ptr orelse return .invalid_argument)[0..participants_len];
+        var members: [64][]const u8 = undefined;
+        for (bytes, members[0..participants_len]) |item, *member| member.* = item.slice();
+        source.acknowledgeMany(txn_id.bytes, owner_participant.slice(), members[0..participants_len]) catch |err| return transactionRecoveryStatus(err);
+        return .ok;
+    }
+
     fn transactionRecoveryCleanup(
         ptr: ?*anyopaque,
         txn_id: *const abi.TxnId,
@@ -2708,6 +2719,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .resolve_participant_fn = transactionRecoveryResolve,
             .owns_recovery_fn = if (options.replicated_metadata) transactionRecoveryOwns else null,
             .acknowledge_participant_fn = if (options.replicated_metadata) transactionRecoveryAcknowledge else null,
+            .acknowledge_participants_fn = if (options.replicated_metadata) transactionRecoveryAcknowledgeMany else null,
             .cleanup_transaction_fn = if (options.replicated_metadata) transactionRecoveryCleanup else null,
         };
     }
@@ -4419,7 +4431,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn restoreDescriptorUseForBatch(req: db_types.BatchRequest) RestoreDescriptorUse {
         if (req.transaction) |txn| switch (txn) {
-            .resolve, .acknowledge, .cleanup => return .resolve,
+            .resolve, .acknowledge, .acknowledge_many, .cleanup => return .resolve,
             else => {},
         };
         return .mutate;
@@ -4434,7 +4446,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             return self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation });
         }
         if (req.transaction) |txn| switch (txn) {
-            .resolve, .acknowledge => if (try self.acquireHiddenTransactionOwner(group_id, table_name)) |lease| return lease,
+            .resolve, .acknowledge, .acknowledge_many => if (try self.acquireHiddenTransactionOwner(group_id, table_name)) |lease| return lease,
             else => {},
         };
         return self.acquire(group_id, table_name);
@@ -5971,4 +5983,45 @@ test "publication cancellation and timeout release admission without invalidatin
         var replacement = try source.acquireDescriptor(1, "docs", path, descriptor);
         defer replacement.deinit();
     }
+}
+
+test "owner recovery bulk callback preserves bounded identities and uncertain status" {
+    const Recorder = struct {
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        fn options(_: *anyopaque) transaction_recovery_source.Options {
+            return .{};
+        }
+        fn owns(_: *anyopaque, _: []const u8) bool {
+            return true;
+        }
+        fn resolve(_: *anyopaque, _: @import("../storage/db/types.zig").TxnId, _: []const u8, _: @import("../storage/db/types.zig").TxnStatus, _: u64) !void {}
+        fn single(_: *anyopaque, _: @import("../storage/db/types.zig").TxnId, _: []const u8, _: []const u8) !void {
+            return error.TestUnexpectedSingle;
+        }
+        fn cleanup(_: *anyopaque, _: @import("../storage/db/types.zig").TxnId, _: []const u8, _: u64, _: u64) !void {}
+        fn many(ptr: *anyopaque, txn: @import("../storage/db/types.zig").TxnId, owner: []const u8, participants: []const []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual([_]u8{4} ** 16, txn);
+            try std.testing.expectEqualStrings("owner", owner);
+            try std.testing.expectEqual(@as(usize, 2), participants.len);
+            try std.testing.expectEqualStrings("first", participants[0]);
+            try std.testing.expectEqualStrings("second", participants[1]);
+            if (self.failure) |err| return err;
+        }
+    };
+    var recorder: Recorder = .{};
+    var owner: ProvisionedKernelOwnerSource = undefined;
+    owner.transaction_recovery_source = .{ .ptr = &recorder, .vtable = &.{ .options = Recorder.options, .owns = Recorder.owns, .resolve = Recorder.resolve, .acknowledge = Recorder.single, .acknowledge_many = Recorder.many, .cleanup = Recorder.cleanup } };
+    const txn: abi.TxnId = .{ .bytes = @splat(4) };
+    const participants = [_]abi.BorrowedBytes{ .fromSlice("first"), .fromSlice("second") };
+    try std.testing.expectEqual(abi.Status.ok, ProvisionedKernelOwnerSource.transactionRecoveryAcknowledgeMany(&owner, &txn, .fromSlice("owner"), &participants, participants.len));
+    for ([_]anyerror{ error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion, error.RaftBatchWriteOutcomeUnknown }) |err| {
+        recorder.failure = err;
+        try std.testing.expectEqual(kernel_error_identity.statusFromError(err), ProvisionedKernelOwnerSource.transactionRecoveryAcknowledgeMany(&owner, &txn, .fromSlice("owner"), &participants, participants.len));
+    }
+    try std.testing.expectEqual(abi.Status.invalid_argument, ProvisionedKernelOwnerSource.transactionRecoveryAcknowledgeMany(&owner, &txn, .fromSlice("owner"), &participants, 65));
+    try std.testing.expectEqual(abi.Status.invalid_argument, ProvisionedKernelOwnerSource.transactionRecoveryAcknowledgeMany(&owner, &txn, .fromSlice("owner"), null, 2));
+    try std.testing.expectEqual(@as(usize, 4), recorder.calls);
 }

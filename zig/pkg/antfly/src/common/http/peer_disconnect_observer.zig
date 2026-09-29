@@ -72,14 +72,14 @@ pub const Observer = struct {
 
     const PeerAction = struct {
         cancellation: *http_common.RequestCancellation,
-        peer_disconnects_total: ?*std.atomic.Value(u64),
-        observer_failures_total: ?*std.atomic.Value(u64),
+        peer_disconnects_total: ?*@import("antfly_platform").atomic.Value(u64),
+        observer_failures_total: ?*@import("antfly_platform").atomic.Value(u64),
     };
 
     const DeadlineAction = struct {
         state: *Deadline,
         expires_at_ns: u64,
-        expirations_total: ?*std.atomic.Value(u64),
+        expirations_total: ?*@import("antfly_platform").atomic.Value(u64),
     };
 
     const ProbeAction = struct {
@@ -133,7 +133,7 @@ pub const Observer = struct {
     active_count: std.atomic.Value(usize) = .init(0),
     active_peer_count: std.atomic.Value(usize) = .init(0),
     active_deadline_count: std.atomic.Value(usize) = .init(0),
-    deadline_expirations_total: std.atomic.Value(u64) = .init(0),
+    deadline_expirations_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
     // One reserved worker for all registrations, independent of request Io.
     scheduling_io: ?std.Io = null,
@@ -219,8 +219,8 @@ pub const Observer = struct {
         self: *Observer,
         fd: std.posix.fd_t,
         cancellation: *http_common.RequestCancellation,
-        peer_disconnects_total: ?*std.atomic.Value(u64),
-        observer_failures_total: ?*std.atomic.Value(u64),
+        peer_disconnects_total: ?*@import("antfly_platform").atomic.Value(u64),
+        observer_failures_total: ?*@import("antfly_platform").atomic.Value(u64),
     ) !Registration {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return .{};
         if (!self.running.load(.acquire) or self.stopping.load(.acquire)) return error.ObserverUnavailable;
@@ -254,7 +254,7 @@ pub const Observer = struct {
         fd: std.posix.fd_t,
         timeout_ms: u32,
         state: *Deadline,
-        expirations_total: ?*std.atomic.Value(u64),
+        expirations_total: ?*@import("antfly_platform").atomic.Value(u64),
     ) !Registration {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding)
             return error.ObserverUnavailable;

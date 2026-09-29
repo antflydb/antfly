@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 65;
+pub const abi_version: u32 = 66;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -856,6 +856,13 @@ pub const TransactionRecoveryAcknowledgeFn = *const fn (
     BorrowedBytes,
     BorrowedBytes,
 ) callconv(.c) Status;
+pub const TransactionRecoveryAcknowledgeManyFn = *const fn (
+    ?*anyopaque,
+    *const TxnId,
+    BorrowedBytes,
+    ?[*]const BorrowedBytes,
+    usize,
+) callconv(.c) Status;
 pub const TransactionRecoveryCleanupFn = *const fn (
     ?*anyopaque,
     *const TxnId,
@@ -879,6 +886,7 @@ pub const TransactionRecoveryConfig = extern struct {
     resolve_participant_fn: ?TransactionRecoveryResolveFn = null,
     owns_recovery_fn: ?TransactionRecoveryOwnsFn = null,
     acknowledge_participant_fn: ?TransactionRecoveryAcknowledgeFn = null,
+    acknowledge_participants_fn: ?TransactionRecoveryAcknowledgeManyFn = null,
     cleanup_transaction_fn: ?TransactionRecoveryCleanupFn = null,
 };
 

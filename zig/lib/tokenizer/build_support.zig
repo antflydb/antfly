@@ -25,6 +25,7 @@ pub fn create(b: *std.Build, options: struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     protobuf: *std.Build.Module,
+    platform: *std.Build.Module,
     sentencepiece_proto: *std.Build.Module,
 }) Modules {
     const tokenizer = b.createModule(.{
@@ -33,6 +34,7 @@ pub fn create(b: *std.Build, options: struct {
         .optimize = options.optimize,
         .imports = &.{
             .{ .name = "protobuf", .module = options.protobuf },
+            .{ .name = "antfly_platform", .module = options.platform },
             .{ .name = "sentencepiece_proto", .module = options.sentencepiece_proto },
         },
     });
@@ -40,7 +42,10 @@ pub fn create(b: *std.Build, options: struct {
         .root_source_file = options.root.path(b, "src/hf_root.zig"),
         .target = options.target,
         .optimize = options.optimize,
-        .imports = &.{.{ .name = "inference_tokenizer", .module = tokenizer }},
+        .imports = &.{
+            .{ .name = "inference_tokenizer", .module = tokenizer },
+            .{ .name = "antfly_platform", .module = options.platform },
+        },
     });
     const files = b.addWriteFiles();
     _ = files.addCopyFile(options.root.path(b, "testdata/embedder/tokenizer.json"), "tokenizer.json");

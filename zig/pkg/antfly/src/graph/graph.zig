@@ -42,17 +42,6 @@ const backend_scan = @import("../storage/backend_scan.zig");
 const docstore = @import("../storage/docstore.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const backfill_state_mod = @import("../storage/db/backfill_state.zig");
-const supports_native_reverse_lmdb = builtin.is_test or
-    (builtin.os.tag != .freestanding and build_options.lmdb_enabled);
-const lmdb_backend = if (supports_native_reverse_lmdb) @import("../storage/lmdb_backend.zig") else struct {
-    pub const Backend = struct {
-        pub fn close(_: *@This()) void {}
-
-        pub fn sync(_: *@This(), _: bool) !void {
-            return error.UnsupportedPlatform;
-        }
-    };
-};
 const mem_backend = @import("../storage/mem_backend.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 
@@ -905,7 +894,6 @@ const graph_metric_partition_plan_checksum_seed: u64 = 0xA17F_504C_414E_0007;
 const graph_metric_rank_entry_limit: usize = 10_000;
 
 pub const ReverseBackend = enum {
-    lmdb,
     mem,
     lsm_memory,
     lsm,
@@ -960,17 +948,12 @@ pub const GraphIndex = struct {
 
     const ReverseStoreOwner = union(enum) {
         none,
-        lmdb: *lmdb_backend.Backend,
         mem: *mem_backend.Backend,
         lsm: lsm_backend.BackendHandle,
 
         fn close(self: *ReverseStoreOwner, alloc: Allocator) void {
             switch (self.*) {
                 .none => {},
-                .lmdb => |backend| {
-                    backend.close();
-                    alloc.destroy(backend);
-                },
                 .mem => |backend| {
                     backend.close();
                     alloc.destroy(backend);
@@ -983,10 +966,6 @@ pub const GraphIndex = struct {
         fn abandonAfterCrash(self: *ReverseStoreOwner, alloc: Allocator) void {
             switch (self.*) {
                 .none => {},
-                .lmdb => |backend| {
-                    backend.close();
-                    alloc.destroy(backend);
-                },
                 .mem => |backend| {
                     backend.close();
                     alloc.destroy(backend);
@@ -999,14 +978,13 @@ pub const GraphIndex = struct {
         fn sync(self: *ReverseStoreOwner, force: bool) !void {
             switch (self.*) {
                 .none, .mem => {},
-                .lmdb => |backend| try backend.sync(force),
                 .lsm => |*handle| try handle.backend.sync(force),
             }
         }
 
         fn ensureDurableEmptyManifest(self: *ReverseStoreOwner) !void {
             switch (self.*) {
-                .none, .mem, .lmdb => {},
+                .none, .mem => {},
                 .lsm => |*handle| {
                     if (handle.backend.options.backend.read_only) return;
                     if (handle.backend.manifest_backing != null) return;
@@ -1018,7 +996,7 @@ pub const GraphIndex = struct {
 
         fn checkpointLsmWalAfterDurableBoundary(self: *ReverseStoreOwner) !void {
             switch (self.*) {
-                .none, .mem, .lmdb => {},
+                .none, .mem => {},
                 .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
             }
         }
@@ -1026,7 +1004,7 @@ pub const GraphIndex = struct {
         fn pinNativeCheckpoint(self: *ReverseStoreOwner) !lsm_backend.Backend.NativeCheckpoint {
             return switch (self.*) {
                 .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
-                .none, .mem, .lmdb => error.Unsupported,
+                .none, .mem => error.Unsupported,
             };
         }
     };
@@ -4523,7 +4501,7 @@ pub const GraphIndex = struct {
                 while (leaf_index < graph_metric_build_max_partition_pages) : (leaf_index += 1) {
                     if (active) |work| {
                         if (leaf_index >= work.count) break;
-                        if (work.counts[leaf_index] == 0) continue;
+                        if (work.counts[@intCast(leaf_index)] == 0) continue;
                     }
                     const leaf = try self.metricBuildPage(&batch, metric_name, job_id, phase, iteration, graph_metric_build_summary_leaf_base + leaf_index) orelse {
                         if (active != null) return error.InvalidGraphMetricBuildManifest;
@@ -6364,31 +6342,6 @@ pub const GraphIndex = struct {
 
     fn openEdgeStore(alloc: Allocator, path: [*:0]const u8, opts: GraphIndexOptions) !OpenedReverseStore {
         switch (opts.reverse_backend) {
-            .lmdb => {
-                if (!supports_native_reverse_lmdb) return error.UnsupportedPlatform;
-                const backend = try alloc.create(lmdb_backend.Backend);
-                errdefer alloc.destroy(backend);
-                backend.* = try lmdb_backend.Backend.open(alloc, path, .{
-                    .backend = .{
-                        .durability = if (opts.no_sync) .none else .full,
-                    },
-                    .env = .{
-                        .map_size = opts.map_size,
-                        .no_sync = opts.no_sync,
-                        .no_meta_sync = opts.no_meta_sync,
-                        .no_tls = true,
-                        .max_dbs = 1,
-                    },
-                });
-                errdefer backend.close();
-
-                var runtime = try backend.runtimeStore(alloc, .{});
-                errdefer runtime.deinit();
-                return .{
-                    .store = runtime,
-                    .owner = .{ .lmdb = backend },
-                };
-            },
             .mem => {
                 const backend = try alloc.create(mem_backend.Backend);
                 errdefer alloc.destroy(backend);
@@ -10956,7 +10909,7 @@ pub const GraphIndex = struct {
             if (self.target_chunk == chunk) return;
             @memset(&self.targets, std.math.maxInt(u16));
             for (slots, 0..) |slot, i| if (slot / vector_chunk.entries == chunk) {
-                self.targets[slot % vector_chunk.entries] = @intCast(i);
+                self.targets[@intCast(slot % vector_chunk.entries)] = @intCast(i);
             };
             self.target_chunk = chunk;
         }
@@ -10976,7 +10929,7 @@ pub const GraphIndex = struct {
             const value = rank * damping;
             if (!std.math.isFinite(value) or value < 0) return error.InvalidGraphMetricScore;
             if (target / vector_chunk.entries != chunk) return error.InvalidGraphMetricBuildManifest;
-            const index = scratch.targets[target % vector_chunk.entries];
+            const index = scratch.targets[@intCast(target % vector_chunk.entries)];
             if (index == std.math.maxInt(u16)) continue;
             const sum = fold.sums[index] + value;
             fold.corrections[index] += if (@abs(fold.sums[index]) >= @abs(value)) (fold.sums[index] - sum) + value else (value - sum) + fold.sums[index];

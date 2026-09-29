@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -132,6 +133,27 @@ def test_process_worker_configuration_rejects_non_positive_values() -> None:
         match="--e2e-process-workers must be a positive integer",
     ):
         pytest_configure(config)  # type: ignore[arg-type]
+
+
+def test_nested_pytest_does_not_publish_parent_duration_history(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import e2e_scheduler as scheduler
+
+    duration_file = tmp_path / "durations.json"
+    options = {"e2e_process_slots": 2, "e2e_duration_file": str(duration_file)}
+    config = SimpleNamespace(
+        getoption=lambda name, default=None: options.get(name, default)
+    )
+    monkeypatch.setenv(scheduler._DURATION_OWNER_PID, str(os.getpid() + 1))
+    pytest_configure(config)  # type: ignore[arg-type]
+    assert scheduler._duration_history is None
+
+    monkeypatch.delenv(scheduler._DURATION_OWNER_PID)
+    pytest_configure(config)  # type: ignore[arg-type]
+    assert scheduler._duration_history is not None
+    assert os.environ[scheduler._DURATION_OWNER_PID] == str(os.getpid())
+    monkeypatch.setattr(scheduler, "_duration_history", None)
 
 
 def test_one_process_worker_allows_mixed_group_and_parallel_light_work(
@@ -826,6 +848,49 @@ def test_duration_reports_exclude_skips_but_keep_full_executed_protocol(
     assert history.observed == {"test_real.py::test_executed": 8.0}
     assert e2e_scheduler_module._duration_report_totals == {}
     assert e2e_scheduler_module._executed_duration_nodeids == set()
+
+
+def test_failed_report_flushes_diagnostic_before_session_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = sys.modules[DurationHistory.__module__]
+    output: list[object] = []
+    reporter = SimpleNamespace(
+        write_sep=lambda separator, title: output.append(title),
+        write_line=lambda line: output.append(line),
+        flush=lambda: output.append("flushed"),
+    )
+    monkeypatch.setattr(module, "_failure_reporter", reporter)
+    monkeypatch.setattr(module, "_duration_history", None)
+    report = SimpleNamespace(
+        nodeid="test_autoschema.py::test_failed@group",
+        when="call",
+        failed=True,
+        longreprtext="assertion and server diagnostics",
+    )
+    module.pytest_runtest_logreport(report)
+    assert output == [
+        "Immediate E2E failure: test_autoschema.py::test_failed@group (call)",
+        "assertion and server diagnostics",
+        "flushed",
+    ]
+    assert report.failed is True
+
+
+@pytest.mark.parametrize("worker", [False, True])
+def test_only_controller_emits_immediate_failure_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, worker: bool
+) -> None:
+    module = sys.modules[DurationHistory.__module__]
+    reporter = object()
+    config = SimpleNamespace(
+        pluginmanager=SimpleNamespace(get_plugin=lambda name: reporter),
+    )
+    if worker:
+        config.workerinput = {}
+    monkeypatch.setattr(module, "_failure_reporter", None)
+    module.pytest_sessionstart(SimpleNamespace(config=config))
+    assert module._failure_reporter is (None if worker else reporter)
 
 
 def test_scheduler_prefers_longest_eligible_work_without_exceeding_process_slots(

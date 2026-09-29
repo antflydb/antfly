@@ -379,6 +379,16 @@ const StorageOwnerTransactionRecovery = struct {
         ));
     }
 
+    fn acknowledgeParticipants(ptr: *anyopaque, txn_id: transactions_mod.TxnId, owner_participant: []const u8, participants: []const []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.config.acknowledge_participants_fn orelse return error.UnsupportedOperation;
+        if (participants.len == 0 or participants.len > 64) return error.InvalidParticipant;
+        var members: [64]kernel_owner_abi.BorrowedBytes = undefined;
+        for (participants, members[0..participants.len]) |participant, *member| member.* = .fromSlice(participant);
+        const abi_txn_id = kernel_owner_abi.TxnId{ .bytes = txn_id };
+        try callbackStatus(callback(self.config.callback_ctx, &abi_txn_id, .fromSlice(owner_participant), &members, participants.len));
+    }
+
     fn cleanupTransaction(
         ptr: *anyopaque,
         txn_id: transactions_mod.TxnId,
@@ -410,6 +420,7 @@ const StorageOwnerTransactionRecovery = struct {
             .replicated_metadata = self.config.replicated_metadata != 0,
             .owns_recovery_fn = if (self.config.replicated_metadata != 0) ownsRecovery else null,
             .acknowledge_participant_fn = if (self.config.replicated_metadata != 0) acknowledgeParticipant else null,
+            .acknowledge_participants_fn = if (self.config.replicated_metadata != 0 and self.config.acknowledge_participants_fn != null) acknowledgeParticipants else null,
             .cleanup_transaction_fn = if (self.config.replicated_metadata != 0) cleanupTransaction else null,
         };
     }
@@ -1852,7 +1863,7 @@ pub fn HandleRegistryOf(comptime T: type) type {
         const Slot = struct {
             /// `generation << 1 | closing`. The slot is open for `generation`
             /// exactly when the closing bit is clear.
-            state: std.atomic.Value(u64) = .init(0),
+            state: @import("antfly_platform").atomic.Value(u64) = .init(0),
             /// Calls that have entered, or are trying to, for any generation.
             active: std.atomic.Value(u32) = .init(0),
             handle: std.atomic.Value(?*T) = .init(null),
@@ -1970,7 +1981,7 @@ pub fn HandleRegistryOf(comptime T: type) type {
             var spins: u32 = 0;
             while (slot.active.load(.seq_cst) != 0) : (spins +|= 1) {
                 if (spins < 64) {
-                    std.Thread.yield() catch {};
+                    @import("antfly_platform").time.yieldNow();
                 } else {
                     handleLockIo().sleep(.fromMicroseconds(500), .awake) catch {};
                 }
@@ -2463,6 +2474,7 @@ const JsonScanResult = struct {
 const JsonDBStats = struct {
     doc_count: u64,
     index_count: u32,
+    indexes_available: bool,
     indexes: []JsonDBIndexStats,
     repair_degraded: bool,
     repair_issue_count: u64,
@@ -2479,6 +2491,11 @@ const JsonDBStats = struct {
 const JsonDBIndexStats = struct {
     name: []const u8,
     kind: []const u8,
+    replay_applied_sequence: u64,
+    replay_target_sequence: u64,
+    replay_catch_up_required: bool,
+    catch_up_active: bool,
+    catch_up_phase: []const u8,
     doc_count: u64,
     term_count: u64,
     edge_count: u64,
@@ -8249,6 +8266,39 @@ test "storage owner runtime status does not wait behind apply writer" {
     try std.testing.expectEqual(@as(u64, 0), response.len);
 }
 
+test "lite status marks index inventory unavailable during apply contention" {
+    const alloc = std.testing.allocator;
+    var test_tmp = try TestDirectory.init("lite-index-status-busy");
+    defer test_tmp.cleanup();
+    const path = try tempTestPath(alloc, test_tmp.path(), "db");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+
+    var handle = Handle{ .alloc = std.heap.c_allocator, .db = try db_mod.DB.open(alloc, path, .{}) };
+    defer handle.db.close();
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
+
+    var status: capi.Buffer = .{};
+    {
+        handle.db.core.lockApplyExclusive();
+        defer handle.db.core.unlockApplyExclusive();
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_status_json(handle_id, &status));
+        defer antfly_buffer_free(&status);
+        try std.testing.expect(std.mem.indexOf(u8, status.ptr.?[0..status.len], "\"indexes_available\":false") != null);
+        var stats: capi.Buffer = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(handle_id, &stats));
+        defer antfly_buffer_free(&stats);
+        try std.testing.expect(std.mem.indexOf(u8, stats.ptr.?[0..stats.len], "\"indexes_available\":false") != null);
+    }
+
+    status = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_status_json(handle_id, &status));
+    try std.testing.expect(std.mem.indexOf(u8, status.ptr.?[0..status.len], "\"indexes_available\":true") != null);
+    antfly_buffer_free(&status);
+}
+
 test "storage owner runtime status distinguishes absent and busy source vectors" {
     const alloc = std.testing.allocator;
     var test_tmp = try TestDirectory.init("storage-owner-source-status-busy");
@@ -11045,6 +11095,11 @@ fn dbIndexStatsProjectionAlloc(alloc: Allocator, stats: db_mod.types.DBStats) ![
         indexes[i] = .{
             .name = item.name,
             .kind = @tagName(item.kind),
+            .replay_applied_sequence = item.replay_applied_sequence,
+            .replay_target_sequence = item.replay_target_sequence,
+            .replay_catch_up_required = item.replay_catch_up_required,
+            .catch_up_active = item.catch_up_active,
+            .catch_up_phase = @tagName(item.catch_up_phase),
             .doc_count = item.doc_count,
             .term_count = item.term_count,
             .edge_count = item.edge_count,
@@ -11067,6 +11122,7 @@ fn jsonDBStatsProjection(stats: db_mod.types.DBStats, indexes: []JsonDBIndexStat
     return JsonDBStats{
         .doc_count = stats.doc_count,
         .index_count = stats.index_count,
+        .indexes_available = stats.indexes_available,
         .indexes = indexes,
         .repair_degraded = stats.repair_degraded,
         .repair_issue_count = stats.repair_issue_count,
@@ -16835,7 +16891,7 @@ fn hiddenRestoreJson(alloc: std.mem.Allocator, db: *db_mod.DB, request: *const k
 
 fn captureOwnerSeedSnapshot(alloc: std.mem.Allocator, db: *db_mod.DB, request: *const kernel_owner_abi.HiddenRestoreRequest) !void {
     switch (db.primary_backend) {
-        .lmdb, .lsm => {},
+        .lsm => {},
         .mem, .lsm_memory => return error.HASeedSnapshotUnsupportedBackend,
     }
     const token = request.snapshot_token.slice();
@@ -16890,4 +16946,37 @@ pub fn storageOwnerMergeArtifactsPage(owner_ptr: ?*anyopaque, request: *const ke
         return storageOwnerStatusFromError(err);
     out_result.* = .{ .ptr = encoded.ptr, .len = @intCast(encoded.len) };
     return .ok;
+}
+
+test "storage owner runtime status bulk recovery bridge preserves identities capability and debt" {
+    const Capture = struct {
+        calls: usize = 0,
+        result: kernel_owner_abi.Status = .ok,
+        fn acknowledge(ptr: ?*anyopaque, txn: *const kernel_owner_abi.TxnId, owner: kernel_owner_abi.BorrowedBytes, items: ?[*]const kernel_owner_abi.BorrowedBytes, len: usize) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            std.testing.expectEqual([_]u8{5} ** 16, txn.bytes) catch return .internal;
+            std.testing.expectEqualStrings("owner", owner.slice()) catch return .internal;
+            std.testing.expectEqual(@as(usize, 2), len) catch return .internal;
+            std.testing.expectEqualStrings("first", items.?[0].slice()) catch return .internal;
+            std.testing.expectEqualStrings("second", items.?[1].slice()) catch return .internal;
+            return self.result;
+        }
+    };
+    var capture: Capture = .{};
+    var bridge: StorageOwnerTransactionRecovery = undefined;
+    var owner_id = [_]u8{ 'o', 'w', 'n', 'e', 'r' };
+    bridge.owner_id = &owner_id;
+    bridge.config = .{ .callback_ctx = &capture, .replicated_metadata = 1, .acknowledge_participants_fn = Capture.acknowledge };
+    const config = bridge.dbConfig();
+    try std.testing.expect(config.acknowledge_participants_fn != null);
+    try StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{ "first", "second" });
+    for ([_]anyerror{ error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion, error.RaftBatchWriteOutcomeUnknown }) |err| {
+        capture.result = kernel_error_identity.statusFromError(err);
+        try std.testing.expectError(err, StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{ "first", "second" }));
+    }
+    try std.testing.expectError(error.InvalidParticipant, StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{}));
+    try std.testing.expectEqual(@as(usize, 4), capture.calls);
+    bridge.config.acknowledge_participants_fn = null;
+    try std.testing.expect(bridge.dbConfig().acknowledge_participants_fn == null);
 }

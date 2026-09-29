@@ -849,6 +849,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const embedded_db_tests = b.addTest(.{
         .root_module = embedded_db_mod,
         .filters = &.{
+            "embedded custom storage owns its physical namespace",
             "embedded db openLite persists documents in aflite file",
             "embedded db openLite close syncs unsynced batch before readonly reopen",
             "embedded db openLite propagates no_sync to aflite backend",
@@ -1764,6 +1765,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lite_native_tests = addFilteredTestRunArtifact(b, lite_native_tests);
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
+    const portable_wal_tests = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .filters = &.{"portable WAL"},
+    });
+    const run_portable_wal_tests = b.addRunArtifact(portable_wal_tests);
+    b.step("portable-wal-test", "Run hosted WAL durability and read-only tests").dependOn(&run_portable_wal_tests.step);
+    lite_native_test_step.dependOn(&run_portable_wal_tests.step);
     const lite_benchmark = b.addTest(.{
         .root_module = lite_native_test_mod,
         .filters = &.{"lite throughput benchmark"},
@@ -1885,6 +1893,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_runtime_default_filters = [_][]const u8{
         "http host reserves service workers through its runtime and rolls back overcommit",
         "managed raft progress driver advances independently and joins on stop",
+        "managed raft progress driver coalesces request wakes without accelerating ticks",
+        "managed raft progress driver retains stop across wake reset",
+        "managed raft progress driver releases source ownership after startup refusal",
         "managed raft progress driver publishes source failure",
         "managed raft progress driver reports a wedged round unhealthy",
         "managed raft progress driver ignores a completed observed generation",
@@ -2361,6 +2372,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "table workflow can drive real metadata service topology and split setup",
             "table workflow can drive placement intents through the real metadata control loop",
             "metadata http service catalog cache is independent from volatile projection traffic",
+            "metadata http service linearizable reads leave elections to the cadence driver",
             "lifecycle listener detach drains callbacks and preserves unrelated listeners",
             "metadata.table mutation routing forwards only to a routable remote leader",
             "metadata http client forwards table create and drop to the internal route",
@@ -2372,6 +2384,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "metadata http client preserves unrecognized server outcomes for forwarded table mutations",
             "metadata http client does not replay unmarked table mutation rejection proof",
             "metadata http client round-trips server endpoints",
+            "metadata http client v0.2 snapshot fallback preserves proof budget and cancellation",
             "stamped definition replacement falls back to v0.2 text route",
             "definition replacement does not replay an ambiguous admitted request",
             "routed table mutation",
@@ -2860,6 +2873,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_vopr_cli_registry_tests = b.addRunArtifact(vopr_cli_registry_tests);
     const vopr_registry_test_step = b.step("vopr-registry-test", "Record and exact-replay every context-free VOPR scenario through the CLI registry");
     vopr_registry_test_step.dependOn(&run_vopr_cli_registry_tests.step);
+
+    const abort_regression_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"distributed txn"},
+    });
+    const abort_regression_step = b.step("antfly-transaction-abort-test", "Run transaction coordinator and bounded abort regressions");
+    abort_regression_step.dependOn(&b.addRunArtifact(abort_regression_tests).step);
 
     const transaction_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -4407,6 +4427,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
     raft_runtime_test_step.dependOn(&run_raft_ready_continuation_tests.step);
 
+    const raft_host_progress_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "raft integration module compiles", "host drops stale inbound", "host queues live snapshot" },
+    });
+    b.step("antfly-raft-host-progress-test", "Run host progress notification and bounded inbound drain regressions").dependOn(&b.addRunArtifact(raft_host_progress_tests).step);
+
     const raft_restore_test_step = b.step("antfly-raft-restore-test", "Run focused Raft restore authority and restart tests");
     raft_restore_test_step.dependOn(&run_raft_restore_tests.step);
 
@@ -4485,7 +4511,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lmdb_test_step = b.step("lmdb-test", "Run Zig LMDB port unit tests");
     lmdb_test_step.dependOn(&run_lmdb_unit_tests.step);
 
-    const storage_lmdb_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    const storage_lmdb_test_mod = makeLmdbModule(b, "lib/lmdb/src/lmdb.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     const storage_lmdb_unit_tests = b.addTest(.{
         .root_module = storage_lmdb_test_mod,
     });
@@ -4502,7 +4528,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const storage_lmdb_replay_step = b.step("lmdb-replay-fixtures", "Run only the LMDB replay fixture test");
     storage_lmdb_replay_step.dependOn(&run_storage_lmdb_replay_tests.step);
 
-    const lmdb_vopr_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb_vopr.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    const lmdb_vopr_test_mod = makeLmdbModule(b, "lib/lmdb/src/lmdb_vopr.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     lmdb_vopr_test_mod.addImport("vopr", vopr_mod);
     const lmdb_vopr_tests = b.addTest(.{
         .root_module = lmdb_vopr_test_mod,
@@ -4529,7 +4555,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const storage_lmdb_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const storage_lmdb_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, storage_lmdb_soak_build_options);
-    const storage_lmdb_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod, hash_mod);
+    const storage_lmdb_soak_test_mod = makeLmdbModule(b, "lib/lmdb/src/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod, hash_mod);
     const storage_lmdb_soak_tests = b.addTest(.{
         .root_module = storage_lmdb_soak_test_mod,
         .filters = &.{"LMDB sim soak stays green"},
@@ -4541,23 +4567,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     docstore_test_mod.addImport("bloom", bloom_mod);
     docstore_test_mod.addImport("antfly_pdf", pdf_mod);
+    docstore_test_mod.addImport("antfly_regex", options.antfly_imports.regex);
+    docstore_test_mod.addImport("antfly_schema_openapi", options.antfly_imports.schema_openapi);
+    options.antfly_imports.configure(b, docstore_test_mod, true);
     const docstore_unit_tests = b.addTest(.{
         .root_module = docstore_test_mod,
+        .filters = &.{ "storage.docstore.", "storage.transactions." },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    const run_docstore_unit_tests = b.addRunArtifact(docstore_unit_tests);
+    const run_docstore_unit_tests = addCuratedTestRunArtifact(b, docstore_unit_tests, &.{ "storage.docstore.", "storage.transactions." });
 
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
     const retained_effects_tests = b.addTest(.{
-        .root_module = docstore_test_mod,
-        .filters = &.{"retained"},
+        .root_module = antfly_test_mod,
+        .filters = &.{ "storage.docstore.", "storage.transactions." },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("docstore-retained-effects-test", "Run atomic source row retention, restart, bounds and GC regressions")
-        .dependOn(&addFilteredTestRunArtifact(b, retained_effects_tests).step);
+        .dependOn(&addCuratedTestRunArtifact(b, retained_effects_tests, &.{"retained"}).step);
     const retained_transaction_tests = b.addTest(.{
-        .root_module = docstore_test_mod,
+        .root_module = antfly_test_mod,
         .filters = &.{"storage.transactions."},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
@@ -4615,8 +4645,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     wal_test_mod.addImport("bloom", bloom_mod);
     wal_test_mod.addImport("structlog", structlog_mod);
     wal_test_mod.addImport("vopr", vopr_mod);
+    wal_test_mod.addImport("antfly_pdf", pdf_mod);
+    wal_test_mod.addImport("antfly_regex", options.antfly_imports.regex);
+    wal_test_mod.addImport("antfly_schema_openapi", options.antfly_imports.schema_openapi);
+    options.antfly_imports.configure(b, wal_test_mod, true);
     const wal_unit_tests = b.addTest(.{
         .root_module = wal_test_mod,
+        .filters = &.{"wal"},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4694,6 +4729,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     persistent_test_mod.addImport("antfly_reranking", reranking_mod);
     persistent_test_mod.addImport("structlog", structlog_mod);
     persistent_test_mod.addImport("vopr", vopr_mod);
+    options.antfly_imports.configure(b, persistent_test_mod, true);
     const persistent_rebuild_tests = b.addTest(.{
         .root_module = persistent_test_mod,
         .filters = &.{"persistent rebuild page"},
@@ -4703,6 +4739,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const persistent_unit_tests = b.addTest(.{
         .root_module = persistent_test_mod,
+        .filters = &.{"storage.persistent."},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4923,7 +4960,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // This bounded smoke shares the storage compilation with its unit coverage.
         "db graph metric runtime background coordinator and worker pool loops publish pagerank",
         "graph maintenance",
-        "lmdb backend read forks",
         "graph metric tree batch validation",
         "graph rebuildReverseFromOwnedOutgoingEdges",
         "db graph reverse rebuild resumes after interrupted reopen",
@@ -5433,8 +5469,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "backend runtime separates native operation IO from outbound network IO",
         "backend runtime threaded durable lane rejects jobs after owner close",
         "storage.sim_runtime.",
-        "storage.lmdb.test.LMDB sim soak",
-        "storage.lmdb.test.zig backend soak:",
     };
     const sparse_unit_tests = b.addTest(.{
         .root_module = sparse_test_mod,
@@ -5618,6 +5652,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.persistent.",
             "storage.persistent_vopr.",
             "storage.portable_backup.",
+            "storage.portable_wal.",
             "storage.posting_segment_store.",
             "storage.resource_manager.",
             "storage.retained_effects.",

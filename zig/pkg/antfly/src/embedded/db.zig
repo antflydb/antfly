@@ -166,7 +166,11 @@ pub const DB = struct {
         }
         self.inner.closeOwned();
         if (self.owned_lite_backend) |*lite_backend| {
-            lite_backend.deinit();
+            if (comptime @import("builtin").os.tag == .freestanding) {
+                unreachable;
+            } else {
+                lite_backend.deinit();
+            }
         }
         self.* = undefined;
     }
@@ -377,6 +381,15 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
         // because `self.enrichment_runtime` never gets constructed.
         .enrichment = opts.enrichment,
     };
+    if (opts.storage) |storage| {
+        // Logical host storage may not refer to process filesystem paths.
+        // Native generation leases require both explicit host capabilities.
+        if (!storage.supportsNativePathLocks() or !storage.supportsHostPathGenerationPublication()) {
+            resolved.physical_root_mode = .external_backend;
+            resolved.index_repair_checkpoint_storage = storage;
+            resolved.external_derived_checkpoints = false;
+        }
+    }
     if (profile == .hosted) {
         resolved.executor = .{ .backend = .manual };
         resolved.ttl_cleanup = .{ .enabled = false };
@@ -389,6 +402,24 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
 
 fn openModeRequiresReadOnlyBackends(open_mode: db_mod.OpenOptions.OpenMode) bool {
     return open_mode == .query_readonly or open_mode == .status_only;
+}
+
+test "embedded custom storage owns its physical namespace" {
+    var memory = lsm_storage.MemoryStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    const storage = memory.storage();
+    inline for ([_]Profile{ .native, .hosted }) |profile| {
+        const options = toDbOpenOptions(.{ .storage = storage }, profile);
+        try std.testing.expectEqual(.external_backend, options.physical_root_mode);
+        try std.testing.expectEqual(storage.ptr, options.index_repair_checkpoint_storage.?.ptr);
+        try std.testing.expect(!options.external_derived_checkpoints);
+    }
+    var native_paths = storage.vtable.*;
+    native_paths.supports_native_path_locks = true;
+    const lock_only: lsm_storage.Storage = .{ .ptr = storage.ptr, .vtable = &native_paths };
+    try std.testing.expectEqual(.external_backend, toDbOpenOptions(.{ .storage = lock_only }, .hosted).physical_root_mode);
+    native_paths.supports_host_path_generation_publication = true;
+    try std.testing.expectEqual(.filesystem_managed, toDbOpenOptions(.{ .storage = lock_only }, .hosted).physical_root_mode);
 }
 
 fn liteIo(opts: OpenOptions) ?std.Io {

@@ -152,6 +152,7 @@ fn verifyInventory(alloc: Allocator, io: std.Io, root: []const u8, handle: seal.
 /// Caller holds the DB apply lock. The normal path never exposes prepared
 /// admission to another writer. Restart retries complete this same frozen cut.
 pub fn ensureAssumeApply(db: *DB, scope: ledger.Scope) !void {
+    if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
     const alloc = db.alloc;
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     const progress = try db.onlineSourceStatus(scope);
@@ -355,6 +356,8 @@ pub fn reconcileReleased(db: *DB) !void {
 }
 
 pub fn reconcileReleasedWithBudget(db: *DB, budget: CleanupBudget) !CleanupWork {
+    // Replica-local source pins are native filesystem artifacts.
+    if (comptime @import("builtin").os.tag == .freestanding) return CleanupWork.init(.failing, budget);
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     var work = CleanupWork.init(io, budget);
     const epoch = db.source_pin_gc_epoch.load(.acquire);

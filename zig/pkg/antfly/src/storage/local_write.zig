@@ -70,7 +70,7 @@ pub fn nativeSnapshotAttemptTokenAlloc(
     shard_label: []const u8,
 ) ![]u8 {
     var entropy: [16]u8 = undefined;
-    try io.randomSecure(&entropy);
+    try @import("antfly_platform").entropy.fill(io, &entropy);
     const nonce = std.fmt.bytesToHex(entropy, .lower);
     return try std.fmt.allocPrint(alloc, "{s}-{s}-attempt-{s}", .{ backup_id, shard_label, &nonce });
 }
@@ -488,6 +488,13 @@ pub fn applyReplicatedTransactionMutationInternal(
             // Cleanup and acknowledgements are independently retryable Raft
             // commands. Once cleanup wins, a late acknowledgement is a safe
             // no-op and must not recreate coordinator sidecar metadata.
+            transactions_mod.TxnError.TxnNotFound => {},
+            else => return err,
+        },
+        .acknowledge_many => |ack| (if (raft_entry) |entry|
+            db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(ack.txn_id, ack.participants, entry)
+        else
+            db.markTransactionParticipantsResolved(ack.txn_id, ack.participants)) catch |err| switch (err) {
             transactions_mod.TxnError.TxnNotFound => {},
             else => return err,
         },

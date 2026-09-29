@@ -108,12 +108,14 @@ pub const BackendRuntimeLaneLimits = struct {
 pub const serverless_object_store: u32 = service;
 
 pub fn initService(alloc: std.mem.Allocator) std.Io.Threaded {
+    if (comptime @import("builtin").os.tag == .freestanding) return std.Io.Threaded.init(alloc, .{});
     return std.Io.Threaded.init(alloc, .{
         .concurrent_limit = .limited(service),
     });
 }
 
 pub fn initServerlessObjectStore(alloc: std.mem.Allocator) std.Io.Threaded {
+    if (comptime @import("builtin").os.tag == .freestanding) return std.Io.Threaded.init(alloc, .{});
     return std.Io.Threaded.init(alloc, .{
         .concurrent_limit = .limited(serverless_object_store),
     });

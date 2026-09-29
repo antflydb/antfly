@@ -429,7 +429,7 @@ pub const FileStore = struct {
     entries: std.StringArrayHashMapUnmanaged(StoredSecret) = .{},
     observed_metadata: ?FileMetadata = null,
     generation_value: u64 = 0,
-    generation_snapshot: std.atomic.Value(u64) = .init(0),
+    generation_snapshot: @import("antfly_platform").atomic.Value(u64) = .init(0),
     content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
     source_generation: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
     last_reload_failed: bool = false,
@@ -437,7 +437,7 @@ pub const FileStore = struct {
     reload_failure_count: u64 = 0,
     last_success_ns: u64 = 0,
     last_failure_ns: u64 = 0,
-    next_throttled_refresh_ns: std.atomic.Value(u64) = .init(0),
+    next_throttled_refresh_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileStore {
         return initWithIo(alloc, std.Options.debug_io, path);

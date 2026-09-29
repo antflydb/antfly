@@ -30,7 +30,6 @@ const PrimaryKind = enum {
     lsm,
     lsm_memory,
     mem,
-    lmdb,
 };
 
 const MutationMode = enum {
@@ -140,7 +139,6 @@ fn parsePrimary(raw: []const u8) ?PrimaryKind {
     if (std.mem.eql(u8, raw, "lsm")) return .lsm;
     if (std.mem.eql(u8, raw, "lsm_memory")) return .lsm_memory;
     if (std.mem.eql(u8, raw, "mem")) return .mem;
-    if (std.mem.eql(u8, raw, "lmdb")) return .lmdb;
     return null;
 }
 
@@ -265,7 +263,6 @@ fn openOptions(cfg: Config) db_mod.OpenOptions {
         .lsm => {},
         .lsm_memory => opts.primary_backend = .{ .lsm_memory = .{} },
         .mem => opts.primary_backend = .{ .mem = .{} },
-        .lmdb => opts.primary_backend = .lmdb,
     }
     return opts;
 }

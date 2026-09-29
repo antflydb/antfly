@@ -1990,14 +1990,14 @@ pub const NativeFile = struct {
     free_pages_verified: bool = false,
     // Structural scaling assertions count page operations, independent of
     // filesystem speed and cache warmth. No counters exist in production.
-    test_value_read_bytes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
-    test_value_read_calls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
-    test_page_reads: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
-    test_index_view_hits: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
-    test_index_comparisons: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
-    test_page_writes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_value_read_bytes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_value_read_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_page_reads: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_index_view_hits: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_index_comparisons: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_page_writes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
 
-    test_page_write_calls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_page_write_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_write_fail_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
@@ -11394,7 +11394,7 @@ test "lite grouped pinned readers never inspect private staging during mutation"
         reader.done.store(true, .release);
         thread.join();
     };
-    while (!reader.ready.load(.acquire)) std.Thread.yield() catch {};
+    while (!reader.ready.load(.acquire)) @import("antfly_platform").time.yieldNow();
     for (0..8) |group| {
         try file.beginTransaction();
         errdefer file.abortTransaction();

@@ -296,6 +296,12 @@ pub const TransactionMutation = union(enum) {
         txn_id: TxnId,
         participant: []const u8,
     },
+    /// A bounded coordinator acknowledgement set, replicated atomically after
+    /// each member has independently proved terminal resolution.
+    acknowledge_many: struct {
+        txn_id: TxnId,
+        participants: []const []const u8,
+    },
     /// Deterministic coordinator/participant metadata cleanup. The cutoff is
     /// carried in the command so every replica evaluates the same predicate.
     cleanup: struct {
@@ -3457,6 +3463,8 @@ pub const DBStats = struct {
     schema_index_state: []const u8 = "none",
     doc_count: u64 = 0,
     index_count: u32 = 0,
+    /// False when operational stats skipped index inventory under apply-lock contention.
+    indexes_available: bool = true,
     indexes: []DBIndexStats = &.{},
     repair_degraded: bool = false,
     repair_issue_count: u64 = 0,

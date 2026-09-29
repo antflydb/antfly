@@ -11252,7 +11252,7 @@ pub fn batchInsertWithMetadataTxnOptions(
                 const leaf_id = try posting.CentroidDirectory.findPosting(self, txn, self.metadata.root_node, effective_transformed, allow_quantized_routing);
                 self.write_profile.insert_find_leaf_ns += elapsedSinceU64Fixed(find_leaf_start);
                 self.write_profile.insert_find_leaf_calls += 1;
-                route = .{ .existing_leaf = existing_leaf_id, .target_leaf = leaf_id, .centroid_cache = if (options.skip_vector_store and options.defer_quantized_rebuild) &centroid_cache[existing_leaf_id % centroid_cache.len] else null };
+                route = .{ .existing_leaf = existing_leaf_id, .target_leaf = leaf_id, .centroid_cache = if (options.skip_vector_store and options.defer_quantized_rebuild) &centroid_cache[@intCast(existing_leaf_id % centroid_cache.len)] else null };
                 if (existing_leaf_id == leaf_id) {
                     if (try tryCoalesceExistingVectorInLeafTxnOptions(
                         self,

@@ -264,3 +264,64 @@ test "resident session Metal rejects nonfinite cotangents stale decisions and ca
     defer recovered.deinit();
     try finish(a, &cb, &recovered, &wrt);
 }
+
+test "resident session Metal batched matmul with transposed right operand matches the interpreter" {
+    if (comptime !options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var device = try fixture.Device.init(a);
+    defer device.deinit();
+    const metal = device.backend.computeBackend();
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cpu = compute.computeBackend();
+    const Case = struct { batch: i64, rows: i64, cols: i64, depth: i64 };
+    var failed = false;
+    for ([_]Case{
+        .{ .batch = 8, .rows = 56, .cols = 56, .depth = 16 },
+        .{ .batch = 8, .rows = 64, .cols = 64, .depth = 16 },
+        .{ .batch = 8, .rows = 56, .cols = 56, .depth = 64 },
+        .{ .batch = 1, .rows = 56, .cols = 56, .depth = 16 },
+        .{ .batch = 8, .rows = 56, .cols = 56, .depth = 2 },
+        .{ .batch = 8, .rows = 32, .cols = 32, .depth = 16 },
+        .{ .batch = 2, .rows = 7, .cols = 5, .depth = 3 },
+    }) |case| {
+        var graph = ml.Graph.init(a);
+        defer graph.deinit();
+        var b = ml.Builder.init(&graph);
+        const left = try b.parameter("left", ml.Shape.init(.f32, &.{ case.batch, case.rows, case.depth }));
+        const right = try b.parameter("right", ml.Shape.init(.f32, &.{ case.batch, case.cols, case.depth }));
+        const product = try b.matmul3DTransB(left, right);
+        const cotangent = try b.parameter("__cotangent", graph.node(product).output_shape);
+        try graph.markOutput(product);
+        const sizes = [_]usize{ @intCast(case.batch * case.rows * case.depth), @intCast(case.batch * case.cols * case.depth) };
+        var values: [2][]f32 = undefined;
+        for (&values, sizes, 0..) |*out, size, which| {
+            out.* = try a.alloc(f32, size);
+            for (out.*, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i * 7 + which * 3 + 1)) * 0.37);
+        }
+        defer for (values) |v| a.free(v);
+        const dims = [2][3]i32{ .{ @intCast(case.batch), @intCast(case.rows), @intCast(case.depth) }, .{ @intCast(case.batch), @intCast(case.cols), @intCast(case.depth) } };
+        const cpu_inputs = [_]interpreter.RuntimeInput{ .{ .node_id = left, .value = try cpu.fromFloat32Shape(values[0], &dims[0]) }, .{ .node_id = right, .value = try cpu.fromFloat32Shape(values[1], &dims[1]) } };
+        defer for (cpu_inputs) |input| cpu.free(input.value);
+        var reference = try interpreter.execute(a, &graph, &cpu, .{ .runtime_inputs = &cpu_inputs });
+        defer reference.deinit(&cpu);
+        const metal_inputs = [_]interpreter.RuntimeInput{ .{ .node_id = left, .value = try metal.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = values[0], .shape = &dims[0] } }, .{}) }, .{ .node_id = right, .value = try metal.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = values[1], .shape = &dims[1] } }, .{}) } };
+        defer for (metal_inputs) |input| metal.free(input.value);
+        var session = try seeded.Session.init(a, &graph, &.{.{ .output = product, .cotangent = cotangent }}, &.{ left, right }, execution_options);
+        defer session.deinit();
+        var tape = try session.forward(&metal, &metal_inputs, identity, null);
+        defer tape.deinit();
+        const want = try cpu.toFloat32(reference.outputs[0], a);
+        defer a.free(want);
+        const got = try metal.toFloat32(try tape.logits(0), a);
+        defer a.free(got);
+        var worst: f32 = 0;
+        for (want, got) |w, g| worst = @max(worst, @abs(w - g));
+        std.debug.print("matmul3DTransB batch={d} rows={d} cols={d} depth={d}: max error {d}\n", .{ case.batch, case.rows, case.cols, case.depth, worst });
+        failed = failed or worst > 1e-3;
+    }
+    try std.testing.expect(!failed);
+}

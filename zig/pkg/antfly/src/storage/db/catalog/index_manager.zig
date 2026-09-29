@@ -64,14 +64,6 @@ const schema_api = @import("../../../schema/mod.zig");
 const schema_registry_mod = @import("../schema_registry.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const ttl_mod = @import("../../ttl.zig");
-const lmdb = if (storage_build_options.lmdb_enabled or builtin.is_test) @import("../../lmdb.zig") else struct {
-    pub const CommitPublishPhase = enum {
-        before_publish,
-        after_data_sync,
-        after_meta_write,
-        after_meta_sync,
-    };
-};
 const mapper = @import("../document_mapper.zig");
 const relational_store = @import("../relational_store.zig");
 const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
@@ -152,7 +144,7 @@ const repair_shadow_root_prefix = ".repair-shadow-";
 const canonical_algebraic_generation = "canonical";
 const repair_shadow_in_progress_file = ".antfly-repair-shadow-in-progress";
 const repair_shadow_in_progress_magic = "antfly-repair-shadow-in-progress-v1\n";
-var fresh_dense_native_generation_nonce: std.atomic.Value(u64) = .init(1);
+var fresh_dense_native_generation_nonce: @import("antfly_platform").atomic.Value(u64) = .init(1);
 
 const RepairShadowCleanupTestHook = struct {
     context: *anyopaque,
@@ -1263,7 +1255,7 @@ const SharedVectorBlockGeneration = struct {
     opened: vector_block_store_mod.Opened,
     source_snapshot: ?vector_block_store_mod.Opened = null,
     member_bindings: ?*vector_block_store_mod.member_bindings.Cache = null,
-    refs: std.atomic.Value(u64) = .init(1),
+    refs: @import("antfly_platform").atomic.Value(u64) = .init(1),
 
     fn create(alloc: Allocator, opened: vector_block_store_mod.Opened) !*SharedVectorBlockGeneration {
         const generation = try alloc.create(SharedVectorBlockGeneration);
@@ -1382,20 +1374,20 @@ pub const IndexManager = struct {
     // posting state for this same source transaction. Ordinary maintenance
     // must never infer mutation identity from cardinality and a merely newer
     // generation.
-    vector_block_stable_tip_sequence: std.atomic.Value(u64) = .init(0),
+    vector_block_stable_tip_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
     vector_block_stable_tip_index: std.atomic.Value(usize) = .init(0),
     vector_block_generation: ?*SharedVectorBlockGeneration = null,
     /// Wake deferred posting acceleration for same-sequence vector rebuilds
     /// as well as new source writes. No borrowed pointer/ABA identity escapes.
-    vector_block_publication_revision: std.atomic.Value(u64) = .init(1),
+    vector_block_publication_revision: @import("antfly_platform").atomic.Value(u64) = .init(1),
     // Once a source transaction changes dense artifacts, an older immutable
     // base must never receive later coverage-only watermarks. Keeping CURRENT
     // at its last genuinely covered sequence is also the crash-safe dirty
     // marker: restart can prove that a replacement base is required without
     // relying on this process-local bit.
     vector_block_projection_dirty: std.atomic.Value(bool) = .init(false),
-    vector_block_candidate_sequence: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    vector_block_candidate_since_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    vector_block_candidate_sequence: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
+    vector_block_candidate_since_ns: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     /// 0 = idle, 1 = queued/running, 2 = rerun requested while active.
     repair_cleanup_state: std.atomic.Value(u8) = .init(0),
@@ -1407,19 +1399,19 @@ pub const IndexManager = struct {
     // compacting an older schema generation) for CPU, mmap residency, and the
     // shared text-merge resource budget.
     text_backfill_active: std.atomic.Value(u32) = .init(0),
-    next_text_index_instance_id: std.atomic.Value(u64) = .init(1),
+    next_text_index_instance_id: @import("antfly_platform").atomic.Value(u64) = .init(1),
     /// Process-local generation of the extraction plan consumed by writes.
     /// Prepared batches compare this scalar instead of rereading and hashing
     /// the serialized catalog under the DB apply lock.
-    write_plan_generation: std.atomic.Value(u64) = .init(1),
+    write_plan_generation: @import("antfly_platform").atomic.Value(u64) = .init(1),
     write_plan_cache_mutex: std.Io.Mutex = .init,
     /// Non-zero while one request is constructing the immutable plan for a
     /// cold generation. Publication is rare; acquisitions remain lock-free
     /// apart from the short cache pointer fence and never duplicate the owned
     /// catalog clone under a thundering herd.
-    write_plan_build_generation: std.atomic.Value(u64) = .init(0),
+    write_plan_build_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
     write_plan_cache: ?*WritePlanSnapshotEpoch = null,
-    next_dense_capture_incarnation: std.atomic.Value(u64) = .init(1),
+    next_dense_capture_incarnation: @import("antfly_platform").atomic.Value(u64) = .init(1),
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
@@ -1458,7 +1450,7 @@ pub const IndexManager = struct {
     /// A fresh value is assigned on every insertion, including same-name,
     /// same-config recreation, so detached work never derives identity from
     /// mutable record contents. Zero remains reserved as "no incarnation".
-    next_failed_index_load_incarnation_id: std.atomic.Value(u64) = .init(1),
+    next_failed_index_load_incarnation_id: @import("antfly_platform").atomic.Value(u64) = .init(1),
     /// Stable resident retry ring. Every quarantined index is safe to reopen,
     /// even when destructive reconstruction requires operator authorization.
     /// Entries borrow the owned map keys and are updated under catalog_mutex.
@@ -6581,7 +6573,7 @@ pub const IndexManager = struct {
         // Manually configured managers may not own an executor. Their worker
         // sweeps are normally synchronous; retain the established teardown
         // fallback for a structural mutation racing such a sweep.
-        while (self.graph_metric_schedule_pins.load(.acquire) != 0) std.Thread.yield() catch {};
+        while (self.graph_metric_schedule_pins.load(.acquire) != 0) @import("antfly_platform").time.yieldNow();
     }
 
     pub fn deinit(self: *IndexManager) void {
@@ -8940,8 +8932,6 @@ pub const IndexManager = struct {
         stats.text_indexes = @intCast(self.text_indexes.items.len);
         for (self.text_indexes.items) |*entry| {
             const persistent_memory = entry.persistent.memoryStatsSnapshot();
-            stats.configured_lmdb_main_map_bytes +|= persistent_memory.configured_lmdb_main_map_bytes;
-            stats.configured_lmdb_wal_map_bytes +|= persistent_memory.configured_lmdb_wal_map_bytes;
             stats.text_segment_estimated_resident_bytes +|= persistent_memory.segment_estimated_resident_bytes;
             stats.text_segment_recently_touched_bytes +|= persistent_memory.segment_recently_touched_bytes;
             stats.text_segment_cold_mapped_bytes +|= persistent_memory.segment_cold_mapped_bytes;
@@ -9081,7 +9071,7 @@ pub const IndexManager = struct {
         const footprint_after_lsm_resource_gap = memory.footprint_bytes -| lsm_resource_used;
 
         std.log.info(
-            "antfly_bench_memory_attribution label={s} source_docs={d} projection_docs={d} batch_segments={d} rss_bytes={d} footprint_bytes={d} peak_footprint_bytes={d} malloc_available={any} malloc_allocated_bytes={d} malloc_zone_bytes={d} text_indexes={d} text_segments={d} text_segment_bytes={d} mapped_segment_bytes={d} text_mmap_segment_bytes={d} text_heap_segment_bytes={d} text_max_segment_bytes={d} text_segment_estimated_resident_bytes={d} text_segment_recently_touched_bytes={d} text_segment_cold_mapped_bytes={d} text_segment_residency_evictions={d} configured_lmdb_main_map_bytes={d} configured_lmdb_wal_map_bytes={d}",
+            "antfly_bench_memory_attribution label={s} source_docs={d} projection_docs={d} batch_segments={d} rss_bytes={d} footprint_bytes={d} peak_footprint_bytes={d} malloc_available={any} malloc_allocated_bytes={d} malloc_zone_bytes={d} text_indexes={d} text_segments={d} text_segment_bytes={d} mapped_segment_bytes={d} text_mmap_segment_bytes={d} text_heap_segment_bytes={d} text_max_segment_bytes={d} text_segment_estimated_resident_bytes={d} text_segment_recently_touched_bytes={d} text_segment_cold_mapped_bytes={d} text_segment_residency_evictions={d}",
             .{
                 label,
                 source_docs,
@@ -9104,8 +9094,6 @@ pub const IndexManager = struct {
                 text_stats.text_segment_recently_touched_bytes,
                 text_stats.text_segment_cold_mapped_bytes,
                 text_stats.text_segment_residency_evictions,
-                text_stats.configured_lmdb_main_map_bytes,
-                text_stats.configured_lmdb_wal_map_bytes,
             },
         );
         std.log.info(
@@ -11266,7 +11254,10 @@ pub const IndexManager = struct {
     }
 
     pub fn checkpointIo(self: *const IndexManager) std.Io {
-        return self.io orelse std.Io.Threaded.global_single_threaded.io();
+        return self.io orelse if (comptime builtin.os.tag == .freestanding)
+            .failing
+        else
+            std.Io.Threaded.global_single_threaded.io();
     }
 
     /// Binds rebuild cursors to the same storage backend as their index kind.
@@ -11351,7 +11342,7 @@ pub const IndexManager = struct {
         try self.prepareStorageForFreshCatalogEntry(store, stored_cfg);
         try self.provisionConfiguredIndexDirDurable(stored_cfg);
 
-        const create_fresh_native_v2 = if (comptime @TypeOf(store) == *docstore_mod.DocStore)
+        const create_fresh_native_v2 = if (comptime @TypeOf(store) == *docstore_mod.DocStore and builtin.os.tag != .freestanding)
             self.freshDenseNativeV2Permitted(stored_cfg)
         else
             false;
@@ -11387,7 +11378,7 @@ pub const IndexManager = struct {
         errdefer {
             self.removeInMemory(stored_cfg.name);
         }
-        if (comptime @TypeOf(store) == *docstore_mod.DocStore) {
+        if (comptime @TypeOf(store) == *docstore_mod.DocStore and builtin.os.tag != .freestanding) {
             if (fresh_native_generation) |*generation| {
                 try self.completeFreshDenseNativeGeneration(
                     store,
@@ -19209,6 +19200,7 @@ pub const IndexManager = struct {
         self: *IndexManager,
         cfg: types.IndexConfig,
     ) !FreshDenseNativeGeneration {
+        if (builtin.os.tag == .freestanding) return error.DenseNativeV2NotPermitted;
         if (!self.freshDenseNativeV2Permitted(cfg)) return error.DenseNativeV2NotPermitted;
         try fs_paths.createDirPathPortable(self.checkpointIo(), self.base_path);
 
@@ -19294,6 +19286,8 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
         generation: *const FreshDenseNativeGeneration,
     ) void {
+        // Browser indexes never allocate a native filesystem generation.
+        if (builtin.os.tag == .freestanding) return;
         const canonical_path = self.indexPath(cfg.name) catch return;
         defer self.alloc.free(canonical_path);
         self.clearActiveIndexRootPointer(canonical_path) catch {};
@@ -19680,7 +19674,7 @@ pub const IndexManager = struct {
     /// Returns the authenticated physical root currently selected for an
     /// index. Callers that retain this path across a mutation must also hold
     /// the appropriate catalog/structural lease.
-    pub fn activeIndexPath(self: *const IndexManager, name: []const u8) ![]u8 {
+    pub fn activeIndexPath(self: *const IndexManager, name: []const u8) anyerror![]u8 {
         const canonical_path = try self.indexPath(name);
         errdefer self.alloc.free(canonical_path);
         if (try self.readActiveIndexRootPointer(canonical_path, name)) |relative_active_path| {
@@ -19752,13 +19746,17 @@ pub const IndexManager = struct {
         defer self.alloc.free(relative_active_path);
         const active_path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, relative_active_path });
         errdefer self.alloc.free(active_path);
-        _ = try index_generation_manifest.validateReady(
-            self.alloc,
-            active_path,
-            null,
-            cfg.name,
-            types.indexConfigHash(cfg),
-        );
+        if (comptime builtin.os.tag == .freestanding) {
+            return error.UnsupportedPlatform;
+        } else {
+            _ = try index_generation_manifest.validateReady(
+                self.alloc,
+                active_path,
+                null,
+                cfg.name,
+                types.indexConfigHash(cfg),
+            );
+        }
         self.alloc.free(canonical_path);
         return active_path;
     }
@@ -21538,41 +21536,41 @@ pub const IndexManager = struct {
         defer task_alloc.free(deleted_docs);
         for (task.source, 0..) |source, i| deleted_docs[i] = source.deleted;
 
-        if (task.persistent.prepareMergedSegmentToFileWithAllocatorsAndDeletes(
-            task_alloc,
-            task.mergeAllocator(),
-            task.snapshot,
-            task.merge_indices,
-            deleted_docs,
-        )) |prepared| {
-            var output_bytes: u64 = 0;
-            for (prepared) |*segment| output_bytes +|= @intCast(segment.data.bytes().len);
-            logTextMergeTaskMemory("after_build", task, output_bytes);
-            task.discardSourceCleanPages();
-            logTextMergeTaskMemory("after_source_discard", task, output_bytes);
-            var result = TextMergeResult{
-                .prepared_segments = prepared,
-                .prepared_owner = task.persistent,
-                .owned_alloc = task.mergeAllocator(),
-                .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
-            };
-            errdefer result.deinit(alloc);
-            return result;
-        } else |err| switch (err) {
-            error.EmptySegment => return .{
-                .segments = &.{},
-                .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
-            },
-            error.Unsupported => {},
-            else => {
-                if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
-                if (builtin.os.tag != .freestanding) {
+        if (comptime builtin.os.tag != .freestanding) {
+            if (task.persistent.prepareMergedSegmentToFileWithAllocatorsAndDeletes(
+                task_alloc,
+                task.mergeAllocator(),
+                task.snapshot,
+                task.merge_indices,
+                deleted_docs,
+            )) |prepared| {
+                var output_bytes: u64 = 0;
+                for (prepared) |*segment| output_bytes +|= @intCast(segment.data.bytes().len);
+                logTextMergeTaskMemory("after_build", task, output_bytes);
+                task.discardSourceCleanPages();
+                logTextMergeTaskMemory("after_source_discard", task, output_bytes);
+                var result = TextMergeResult{
+                    .prepared_segments = prepared,
+                    .prepared_owner = task.persistent,
+                    .owned_alloc = task.mergeAllocator(),
+                    .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+                    .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
+                };
+                errdefer result.deinit(alloc);
+                return result;
+            } else |err| switch (err) {
+                error.EmptySegment => return .{
+                    .segments = &.{},
+                    .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+                    .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
+                },
+                error.Unsupported => {},
+                else => {
+                    if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
                     std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
-                }
-                return err;
-            },
+                    return err;
+                },
+            }
         }
 
         const merged = merger_mod.mergeSegmentsBounded(task_alloc, task.snapshot, task.merge_indices, .{
@@ -29360,6 +29358,7 @@ fn isPrimaryDocumentCandidate(key: []const u8) bool {
 
 fn newCoverageGeneration(runtime_io: ?std.Io) !u64 {
     if (runtime_io) |io| return try coverage_identity.generate(io);
+    if (builtin.os.tag == .freestanding) return try coverage_identity.generate(.failing);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try coverage_identity.generate(io_impl.io());
@@ -30514,7 +30513,7 @@ fn openTextPersistentIndexWithRetry(
     opts: persistent_mod.PersistentIndexOptions,
 ) !persistent_mod.PersistentIndex {
     const max_attempts: usize = 6;
-    const debug_open = std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+    const debug_open = @import("antfly_platform").env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         if (debug_open) {
@@ -30570,7 +30569,7 @@ fn sleepBeforeTextPersistentOpenRetry(attempt: usize) void {
             else => return,
         };
     } else {
-        const spins = 64 * (capped + 1);
+        const spins: usize = 64 * (@as(usize, capped) + 1);
         for (0..spins) |_| std.atomic.spinLoopHint();
     }
 }
@@ -32489,36 +32488,6 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
     try std.Io.Dir.cwd().access(std.testing.io, active_path, .{});
 }
 
-test "fresh dense admission stays legacy when its backend cannot host the native mutation store" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
-    defer alloc.free(path_z);
-    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
-    defer store.close();
-    var manager = try IndexManager.initWithOptions(alloc, path, .{
-        .dense_storage_backend = .lmdb,
-    });
-    defer manager.deinit();
-    manager.updateRange(.{ .start = "", .end = "" });
-    const cfg: types.IndexConfig = .{
-        .name = "dv_lmdb",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-    };
-
-    try manager.addManaged(&store, cfg, null);
-    const entry = manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(!entry.native_physical_v2);
-    try std.testing.expect(!entry.index.experimentalPostingWalAuthoritative());
-    try std.testing.expect(!entry.index.nativePostingMutationStoreEnabled());
-    try std.testing.expect(!manager.densePostingSidecarEnabledForEntry(entry));
-    try std.testing.expect(!try manager.denseNativePhysicalMigrationRequired(cfg.name));
-}
-
 test "native pointer validation reads authority through configured storage" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -33624,9 +33593,9 @@ const IndexManagerSimRuntime = struct {
 
     fn init(alloc: Allocator, source_path: [*:0]const u8, dest_path: [*:0]const u8) !IndexManagerSimRuntime {
         return try initWithOptions(alloc, source_path, dest_path, .{
-            .text_main_backend = .lmdb,
-            .dense_storage_backend = .lmdb,
-            .graph_reverse_backend = .lmdb,
+            .text_main_backend = .lsm,
+            .dense_storage_backend = .lsm,
+            .graph_reverse_backend = .lsm,
         });
     }
 
@@ -33791,13 +33760,6 @@ const IndexManagerSimRuntime = struct {
         }
     }
 
-    fn applyCrashAction(self: *IndexManagerSimRuntime, action: IndexManagerSimAction, step: usize, phase: lmdb.CommitPublishPhase) !void {
-        switch (action) {
-            .add_doc => |spec| try self.applyWriteAtPhase(spec, step, phase),
-            else => return error.InvalidFixture,
-        }
-    }
-
     fn applySplitHandoff(self: *IndexManagerSimRuntime) !void {
         if (self.split_active) return error.InvalidFixture;
 
@@ -33818,24 +33780,10 @@ const IndexManagerSimRuntime = struct {
             for (writes) |*write| write.deinit(self.alloc);
             self.alloc.free(writes);
         }
-        try self.routeAndApplyWrites(writes, false, null);
+        try self.routeAndApplyWrites(writes);
     }
 
-    fn applyWriteAtPhase(self: *IndexManagerSimRuntime, spec: IndexManagerSimDocSpec, step: usize, phase: lmdb.CommitPublishPhase) !void {
-        const writes = try buildIndexManagerWrites(self.alloc, spec, step);
-        defer {
-            for (writes) |*write| write.deinit(self.alloc);
-            self.alloc.free(writes);
-        }
-        try self.routeAndApplyWrites(writes, true, phase);
-    }
-
-    fn routeAndApplyWrites(
-        self: *IndexManagerSimRuntime,
-        writes: []const IndexManagerOwnedWrite,
-        crash_phase: bool,
-        phase: ?lmdb.CommitPublishPhase,
-    ) !void {
+    fn routeAndApplyWrites(self: *IndexManagerSimRuntime, writes: []const IndexManagerOwnedWrite) !void {
         var source_store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer source_store_writes.deinit(self.alloc);
         var source_index_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
@@ -33858,57 +33806,8 @@ const IndexManagerSimRuntime = struct {
         try self.source_store.putBatch(source_store_writes.items, &.{});
         try self.dest_store.putBatch(dest_store_writes.items, &.{});
 
-        if (crash_phase) {
-            const crash_publish_phase = phase orelse return error.InvalidFixture;
-            if (source_index_writes.items.len != 0 and dest_index_writes.items.len != 0) return error.InvalidFixture;
-            if (source_index_writes.items.len != 0) {
-                const entry = self.source_manager.textIndexEntry(index_manager_sim_index_name) orelse return error.IndexNotFound;
-                try self.indexTextBatchEntryAtPhaseForTest(&self.source_manager, entry, source_index_writes.items, crash_publish_phase);
-                return;
-            }
-            if (dest_index_writes.items.len != 0) {
-                const entry = self.dest_manager.textIndexEntry(index_manager_sim_index_name) orelse return error.IndexNotFound;
-                try self.indexTextBatchEntryAtPhaseForTest(&self.dest_manager, entry, dest_index_writes.items, crash_publish_phase);
-            }
-            return;
-        }
-
         try self.source_manager.indexTextBatchByName(&self.source_store, index_manager_sim_index_name, source_index_writes.items);
         try self.dest_manager.indexTextBatchByName(&self.dest_store, index_manager_sim_index_name, dest_index_writes.items);
-    }
-
-    fn indexTextBatchEntryAtPhaseForTest(
-        self: *IndexManagerSimRuntime,
-        manager: *IndexManager,
-        entry: *IndexManager.TextIndex,
-        writes: []const types.BatchWrite,
-        phase: lmdb.CommitPublishPhase,
-    ) !void {
-        var filtered_count: usize = 0;
-        for (writes) |write| {
-            if (!try textIndexShouldConsumeDoc(manager, entry, write.key)) continue;
-            filtered_count += 1;
-        }
-        if (filtered_count == 0) return;
-
-        const docs = try self.alloc.alloc(mapper.MapperDoc, filtered_count);
-        defer self.alloc.free(docs);
-
-        var mapped_idx: usize = 0;
-        for (writes) |write| {
-            if (!try textIndexShouldConsumeDoc(manager, entry, write.key)) continue;
-            docs[mapped_idx] = .{
-                .key = write.key,
-                .value = write.value,
-            };
-            mapped_idx += 1;
-        }
-
-        const segment = try mapper.buildTextSegmentFromDocuments(self.alloc, docs, entry.text_analysis, entry.runtime_schema);
-        if (segment) |seg| {
-            defer self.alloc.free(seg);
-            try persistent_mod.indexSegmentPublishPhaseForTest(&entry.persistent, seg, phase);
-        }
     }
 
     fn summary(self: *IndexManagerSimRuntime, alloc: Allocator) !IndexManagerSimSummary {
@@ -34187,39 +34086,6 @@ fn writeIndexManagerReplayFixtureArtifact(
     return path;
 }
 
-fn writeIndexManagerCrashFixtureArtifact(
-    alloc: Allocator,
-    case_label: []const u8,
-    seed: u64,
-    phase: lmdb.CommitPublishPhase,
-    expectation_note: []const u8,
-    summary: IndexManagerSimSummary,
-    prelude_actions: []const IndexManagerSimAction,
-    crash_action: IndexManagerSimAction,
-) !?[]u8 {
-    var path_buf: [256]u8 = undefined;
-    const artifact_path = indexManagerReplayArtifactPath(&path_buf, case_label);
-    const path = try alloc.dupe(u8, artifact_path);
-    errdefer alloc.free(path);
-
-    var opts = fixtureOptionsFromIndexManagerSummary(summary);
-    opts.expected_outcome = .committed;
-    const normalized = try index_manager_sim_fixture.renderCrashArtifact(
-        alloc,
-        opts,
-        case_label,
-        seed,
-        @tagName(phase),
-        expectation_note,
-        prelude_actions,
-        crash_action,
-    );
-    defer alloc.free(normalized);
-
-    try writeIndexManagerReplayArtifactFile(path, normalized);
-    return path;
-}
-
 fn printIndexManagerAction(action: IndexManagerSimAction) !void {
     const line = try index_manager_sim_fixture.renderAction(std.testing.allocator, action);
     defer std.testing.allocator.free(line);
@@ -34233,9 +34099,9 @@ fn replayIndexManagerActionsAtPaths(
     actions: []const IndexManagerSimAction,
 ) !IndexManagerSimSummary {
     return try replayIndexManagerActionsAtPathsWithOptions(alloc, source_path, dest_path, .{
-        .text_main_backend = .lmdb,
-        .dense_storage_backend = .lmdb,
-        .graph_reverse_backend = .lmdb,
+        .text_main_backend = .lsm,
+        .dense_storage_backend = .lsm,
+        .graph_reverse_backend = .lsm,
     }, actions);
 }
 
@@ -34254,50 +34120,6 @@ fn replayIndexManagerActionsAtPathsWithOptions(
     }
     try runtime.reopen();
     return try runtime.summary(alloc);
-}
-
-fn replayIndexManagerCrashWorkload(
-    alloc: Allocator,
-    case_label: []const u8,
-    prelude_actions: []const IndexManagerSimAction,
-    crash_action: IndexManagerSimAction,
-    phase: lmdb.CommitPublishPhase,
-) !IndexManagerSimCrashOutcome {
-    _ = case_label;
-    var source_expected_buf: [256]u8 = undefined;
-    var dest_expected_buf: [256]u8 = undefined;
-    const source_expected_path = indexManagerTmpPathWithSuffix(&source_expected_buf, "expected-src");
-    const dest_expected_path = indexManagerTmpPathWithSuffix(&dest_expected_buf, "expected-dst");
-    defer cleanupIndexManagerDir(source_expected_path);
-    defer cleanupIndexManagerDir(dest_expected_path);
-
-    var source_actual_buf: [256]u8 = undefined;
-    var dest_actual_buf: [256]u8 = undefined;
-    const source_actual_path = indexManagerTmpPathWithSuffix(&source_actual_buf, "actual-src");
-    const dest_actual_path = indexManagerTmpPathWithSuffix(&dest_actual_buf, "actual-dst");
-    defer cleanupIndexManagerDir(source_actual_path);
-    defer cleanupIndexManagerDir(dest_actual_path);
-
-    var expected_runtime = try IndexManagerSimRuntime.init(alloc, source_expected_path, dest_expected_path);
-    defer expected_runtime.deinit();
-    for (prelude_actions, 0..) |action, step| {
-        try expected_runtime.applyReplayAction(action, step);
-    }
-    try expected_runtime.applyReplayAction(crash_action, prelude_actions.len);
-    try expected_runtime.reopen();
-    const expected = try expected_runtime.summary(alloc);
-
-    var actual_runtime = try IndexManagerSimRuntime.init(alloc, source_actual_path, dest_actual_path);
-    defer actual_runtime.deinit();
-    for (prelude_actions, 0..) |action, step| {
-        try actual_runtime.applyReplayAction(action, step);
-    }
-    try actual_runtime.applyCrashAction(crash_action, prelude_actions.len, phase);
-    try actual_runtime.reopen();
-    const actual = try actual_runtime.summary(alloc);
-
-    try expectIndexManagerSummaryEqual("index-manager-crash", expected, actual);
-    return .committed;
 }
 
 fn reportReducedIndexManagerSchedule(
@@ -34345,58 +34167,6 @@ fn reportReducedIndexManagerSchedule(
     std.debug.print("reduced failing index-manager schedule ({d} actions):\n", .{reduced.len});
     if (artifact_path) |path| std.debug.print("replay fixture: {s}\n", .{path});
     for (reduced) |action| try printIndexManagerAction(action);
-}
-
-fn reportReducedIndexManagerCrashSchedule(
-    alloc: Allocator,
-    case_label: []const u8,
-    seed: u64,
-    phase: lmdb.CommitPublishPhase,
-    prelude_actions: []const IndexManagerSimAction,
-    crash_action: IndexManagerSimAction,
-) !void {
-    const Replayer = struct {
-        alloc: Allocator,
-        case_label: []const u8,
-        phase: lmdb.CommitPublishPhase,
-        crash_action: IndexManagerSimAction,
-
-        pub fn replay(self: @This(), candidate: []const IndexManagerSimAction) !void {
-            _ = try replayIndexManagerCrashWorkload(self.alloc, self.case_label, candidate, self.crash_action, self.phase);
-        }
-    };
-
-    const reduced = try zig_lmdb.sim.reduceFailingSequence(IndexManagerSimAction, alloc, prelude_actions, Replayer{
-        .alloc = alloc,
-        .case_label = case_label,
-        .phase = phase,
-        .crash_action = crash_action,
-    });
-    defer alloc.free(reduced);
-
-    const full_actions = try alloc.alloc(IndexManagerSimAction, reduced.len + 1);
-    defer alloc.free(full_actions);
-    @memcpy(full_actions[0..reduced.len], reduced);
-    full_actions[reduced.len] = crash_action;
-    const summary = try expectedIndexManagerSummary(full_actions);
-
-    const artifact_path = writeIndexManagerCrashFixtureArtifact(
-        alloc,
-        case_label,
-        seed,
-        phase,
-        "expected index-manager reopen to preserve the committed text batch once the underlying persistent WAL append has completed",
-        summary,
-        reduced,
-        crash_action,
-    ) catch |err| blk: {
-        std.debug.print("failed to write index-manager crash artifact for {s}: {s}\n", .{ case_label, @errorName(err) });
-        break :blk null;
-    };
-    defer if (artifact_path) |path| alloc.free(path);
-
-    std.debug.print("reduced failing index-manager crash prelude ({d} actions):\n", .{reduced.len});
-    if (artifact_path) |path| std.debug.print("replay fixture: {s}\n", .{path});
 }
 
 fn randomIndexManagerWriteSpec(random: std.Random) IndexManagerSimDocSpec {
@@ -34588,19 +34358,7 @@ fn runIndexManagerReplayFixtures(alloc: Allocator) !void {
                 const actual = try replayIndexManagerActionsAtPaths(alloc, source_path, dest_path, fixture.actions);
                 try expectIndexManagerFixtureExpectation(fixture_name, fixture.opts, actual);
             },
-            .crash => {
-                if (!zig_lmdb.is_zig_backend) continue;
-                const phase = std.meta.stringToEnum(lmdb.CommitPublishPhase, fixture.phase orelse return error.InvalidFixture) orelse return error.InvalidFixture;
-                const crash_action = fixture.crash_action orelse return error.InvalidFixture;
-                const outcome = try replayIndexManagerCrashWorkload(alloc, fixture_name, fixture.prelude_actions, crash_action, phase);
-                try sim_fixture.expectFieldEqual(fixture_name, "expected_outcome", fixture.opts.expected_outcome orelse .committed, outcome);
-
-                const full_actions = try alloc.alloc(IndexManagerSimAction, fixture.prelude_actions.len + 1);
-                defer alloc.free(full_actions);
-                @memcpy(full_actions[0..fixture.prelude_actions.len], fixture.prelude_actions);
-                full_actions[fixture.prelude_actions.len] = crash_action;
-                try expectIndexManagerFixtureExpectation(fixture_name, fixture.opts, try expectedIndexManagerSummary(full_actions));
-            },
+            .crash => {},
         }
     }
 }

@@ -123,7 +123,7 @@ else
         }
     };
 
-var file_pin_release_epoch: std.atomic.Value(u64) = .init(0);
+var file_pin_release_epoch: @import("antfly_platform").atomic.Value(u64) = .init(0);
 
 const ObsoletePathRefRegistry = struct {
     mutex: std.atomic.Mutex = .unlocked,
@@ -1973,20 +1973,22 @@ pub const Backend = struct {
     }
 
     pub fn prepareWalOperationLockFile(self: *Backend) !void {
-        if (!self.options.wal_enabled or self.root_dir == null or !self.storage.?.supportsNativePathLocks()) return;
-        if (self.wal_operation_lock_file != null) return;
+        if (comptime builtin.os.tag != .freestanding) {
+            if (!self.options.wal_enabled or self.root_dir == null or !self.storage.?.supportsNativePathLocks()) return;
+            if (self.wal_operation_lock_file != null) return;
 
-        const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
-        defer self.allocator.free(lock_path);
-        self.wal_operation_lock_file = storage_io.openNativePathLockFileWithPool(
-            self.allocator,
-            lock_path,
-            .{ .create_if_missing = true },
-            self.options.native_storage_pool,
-        ) catch |err| switch (err) {
-            error.FileNotFound => if (self.options.backend.read_only) return else return err,
-            else => return err,
-        };
+            const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
+            defer self.allocator.free(lock_path);
+            self.wal_operation_lock_file = storage_io.openNativePathLockFileWithPool(
+                self.allocator,
+                lock_path,
+                .{ .create_if_missing = true },
+                self.options.native_storage_pool,
+            ) catch |err| switch (err) {
+                error.FileNotFound => if (self.options.backend.read_only) return else return err,
+                else => return err,
+            };
+        }
     }
 
     pub fn closeWalOperationLockFile(self: *Backend) void {
@@ -5729,7 +5731,7 @@ pub const Backend = struct {
         return live.tree.root == durable.tree.root;
     }
 
-    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool) !usize {
+    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool) !u64 {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         var turn = try self.beginManifestTurn();
         defer turn.deinit();
@@ -5738,7 +5740,7 @@ pub const Backend = struct {
 
     /// Caller owns the publication lane and backend lock. Administrative callers
     /// acquire that lane before constructing their prospective ownership graph.
-    fn writeRunSetManifestSnapshotInTurnLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool, waited: bool) !usize {
+    fn writeRunSetManifestSnapshotInTurnLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool, waited: bool) !u64 {
         std.debug.assert(self.manifest_publish_in_flight);
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         self.manifest_publish_allow_concurrency = live;
@@ -8136,22 +8138,18 @@ pub const Backend = struct {
         const runs_dir = try std.fs.path.join(self.allocator, &.{ root_dir, "runs" });
         defer self.allocator.free(runs_dir);
 
-        var io_impl = std.Io.Threaded.init(self.allocator, .{});
-        defer io_impl.deinit();
-
-        var dir = std.Io.Dir.cwd().openDir(io_impl.io(), runs_dir, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return .{},
+        const storage = self.storage.?;
+        const names = storage.listFileNamesAlloc(self.allocator, runs_dir) catch |err| switch (err) {
+            error.FileNotFound, error.DirectoryListingUnsupported => return .{},
             else => return err,
         };
-        defer dir.close(io_impl.io());
+        defer storage_io.Storage.freeFileNames(self.allocator, names);
 
         var stats = RecoveredRunFileCleanupStats{};
-        var it = dir.iterate();
-        while (try it.next(io_impl.io())) |entry| {
-            if (entry.kind != .file) continue;
-            _ = parseRunIdFromRecoveredTableTempFileName(entry.name) orelse continue;
+        for (names) |name| {
+            _ = parseRunIdFromRecoveredTableTempFileName(name) orelse continue;
 
-            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, entry.name });
+            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, name });
             defer self.allocator.free(path);
             const size = self.storage.?.fileSize(path) catch 0;
             repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, path) catch |err| switch (err) {
@@ -8172,23 +8170,19 @@ pub const Backend = struct {
         const runs_dir = try std.fs.path.join(self.allocator, &.{ root_dir, "runs" });
         defer self.allocator.free(runs_dir);
 
-        var io_impl = std.Io.Threaded.init(self.allocator, .{});
-        defer io_impl.deinit();
-
-        var dir = std.Io.Dir.cwd().openDir(io_impl.io(), runs_dir, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return .{},
+        const storage = self.storage.?;
+        const names = storage.listFileNamesAlloc(self.allocator, runs_dir) catch |err| switch (err) {
+            error.FileNotFound, error.DirectoryListingUnsupported => return .{},
             else => return err,
         };
-        defer dir.close(io_impl.io());
+        defer storage_io.Storage.freeFileNames(self.allocator, names);
 
         var stats: RecoveredRunFileCleanupStats = .{};
-        var it = dir.iterate();
-        while (try it.next(io_impl.io())) |entry| {
-            if (entry.kind != .file) continue;
-            const run_id = parseRunIdFromTableFileName(entry.name) orelse continue;
+        for (names) |name| {
+            const run_id = parseRunIdFromTableFileName(name) orelse continue;
             if (self.runIdTrackedByManifestLocked(run_id)) continue;
 
-            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, entry.name });
+            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, name });
             defer self.allocator.free(path);
             if (self.pathTrackedByManifestLocked(path) or self.obsoletePathPinnedByOpenVersion(path)) continue;
 
@@ -8200,9 +8194,14 @@ pub const Backend = struct {
             stats.files_deleted +|= 1;
             stats.bytes_deleted +|= size;
         }
-        const manifest_stats = try self.cleanupOrphanedManifestFilesForSet(io_impl.io());
-        stats.files_deleted +|= manifest_stats.files_deleted;
-        stats.bytes_deleted +|= manifest_stats.bytes_deleted;
+        // Manifest-set inventory requires the native exclusive writer lease.
+        if (builtin.os.tag != .freestanding) {
+            var io_impl = std.Io.Threaded.init(self.allocator, .{});
+            defer io_impl.deinit();
+            const manifest_stats = try self.cleanupOrphanedManifestFilesForSet(io_impl.io());
+            stats.files_deleted +|= manifest_stats.files_deleted;
+            stats.bytes_deleted +|= manifest_stats.bytes_deleted;
+        }
         return stats;
     }
 

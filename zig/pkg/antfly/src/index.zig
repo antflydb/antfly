@@ -140,7 +140,7 @@ pub const SegmentShared = struct {
     /// intact when this transitions to cold; only clean file-backed pages are
     /// advised away. A subsequent query marks the segment resident again.
     mapped_residency_state: std.atomic.Value(u8) = .init(mapped_residency_cold),
-    last_mapped_access_ns: std.atomic.Value(u64) = .init(0),
+    last_mapped_access_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     active_mapped_readers: std.atomic.Value(u32) = .init(0),
     /// Deletion bitmap shared by every snapshot referencing this segment.
     /// `deletion_lock` protects the bitmap's reallocatable containers. The
@@ -227,11 +227,19 @@ pub const TypedDocValuesFieldCoverage = struct {
         // The winner can spend meaningful time validating and decompressing a
         // large column. Park concurrent request workers instead of repeatedly
         // yielding them for the duration of that scan.
-        std.Io.Threaded.mutexLock(&self.initialization_mutex);
+        if (comptime builtin.os.tag == .freestanding) {
+            self.initialization_mutex.lockUncancelable(.failing);
+        } else {
+            std.Io.Threaded.mutexLock(&self.initialization_mutex);
+        }
     }
 
     fn unlockInitialization(self: *TypedDocValuesFieldCoverage) void {
-        std.Io.Threaded.mutexUnlock(&self.initialization_mutex);
+        if (comptime builtin.os.tag == .freestanding) {
+            self.initialization_mutex.unlock(.failing);
+        } else {
+            std.Io.Threaded.mutexUnlock(&self.initialization_mutex);
+        }
     }
 
     fn status(self: *const TypedDocValuesFieldCoverage) TypedDocValuesCoverageStatus {
@@ -1398,7 +1406,7 @@ pub const IndexWriter = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     mapped_residency_mu: std.atomic.Mutex,
     mapped_residency_accounted_bytes: u64,
-    mapped_residency_next_check_ns: std.atomic.Value(u64),
+    mapped_residency_next_check_ns: @import("antfly_platform").atomic.Value(u64),
     mapped_residency_evictions: u64,
 
     /// A completely allocated replacement snapshot held behind the writer

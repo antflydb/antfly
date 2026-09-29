@@ -985,23 +985,23 @@ pub const BackendRuntime = struct {
     borrowed_io: ?BorrowedIo = null,
     api_lane_gate: LaneLeaseGate = .{},
     api_lane_peak_leases: std.atomic.Value(usize) = .init(0),
-    api_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
-    api_lane_rejections_total: std.atomic.Value(u64) = .init(0),
+    api_lane_acquisitions_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    api_lane_rejections_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     inference_lane_gate: LaneLeaseGate = .{},
     inference_lane_peak_leases: std.atomic.Value(usize) = .init(0),
-    inference_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
-    inference_lane_rejections_total: std.atomic.Value(u64) = .init(0),
+    inference_lane_acquisitions_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    inference_lane_rejections_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     pdf_render_lane_gate: LaneLeaseGate = .{},
     pdf_render_lane_peak_leases: std.atomic.Value(usize) = .init(0),
-    pdf_render_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
-    pdf_render_lane_rejections_total: std.atomic.Value(u64) = .init(0),
+    pdf_render_lane_acquisitions_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    pdf_render_lane_rejections_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     worker_lane_gate: LaneLeaseGate = .{},
     reserved_workers: std.atomic.Value(usize) = .init(0),
     peak_reserved_workers: std.atomic.Value(usize) = .init(0),
     control_lane_gate: LaneLeaseGate = .{},
     control_lane_peak_leases: std.atomic.Value(usize) = .init(0),
-    control_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
-    control_lane_rejections_total: std.atomic.Value(u64) = .init(0),
+    control_lane_acquisitions_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    control_lane_rejections_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     threaded_jobs: ?*ThreadedDurableJobLane = null,
     durable_jobs: DurableJobLane,
     db_open_configurator: ?DbOpenConfigurator = null,
@@ -1122,7 +1122,11 @@ pub const BackendRuntime = struct {
             deinitIoLane(self.alloc, io_impl);
         }
         if (self.pdf_render_executor.swap(null, .acq_rel)) |executor| {
-            executor.destroy();
+            if (comptime builtin.os.tag == .freestanding) {
+                unreachable;
+            } else {
+                executor.destroy();
+            }
         }
         if (self.control_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
@@ -1217,6 +1221,7 @@ pub const BackendRuntime = struct {
     }
 
     pub fn storage(self: *BackendRuntime) ?storage_io.Storage {
+        if (comptime builtin.os.tag == .freestanding) return null;
         if (self.borrowed_storage) |*borrowed| return borrowed.storage();
         return null;
     }
@@ -1846,15 +1851,18 @@ pub const BackendRuntimeHandle = struct {
     }
 
     pub fn initManualWithOwnedFilesystemIo(alloc: Allocator) !BackendRuntimeHandle {
-        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-        const filesystem_io = try initIoLane(alloc, threaded_io_limits.backend_runtime_durable_background);
-        errdefer deinitIoLane(alloc, filesystem_io);
-        var handle = try init(alloc, .{
-            .backend = .manual,
-            .filesystem_io = filesystem_io.io(),
-        });
-        handle.owned_filesystem_io = filesystem_io;
-        return handle;
+        if (comptime builtin.os.tag == .freestanding) {
+            return error.UnsupportedPlatform;
+        } else {
+            const filesystem_io = try initIoLane(alloc, threaded_io_limits.backend_runtime_durable_background);
+            errdefer deinitIoLane(alloc, filesystem_io);
+            var handle = try init(alloc, .{
+                .backend = .manual,
+                .filesystem_io = filesystem_io.io(),
+            });
+            handle.owned_filesystem_io = filesystem_io;
+            return handle;
+        }
     }
 
     pub fn deinit(self: *BackendRuntimeHandle) void {
@@ -3313,7 +3321,7 @@ test "backend runtime shutdown drains PDF render leases before worker destructio
         }
     }.run, .{ &handle, &deinitialized });
 
-    while (!runtime.pdf_render_lane_gate.isClosed()) std.Thread.yield() catch {};
+    while (!runtime.pdf_render_lane_gate.isClosed()) @import("antfly_platform").time.yieldNow();
     try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquirePdfRenderLane());
     try std.testing.expect(!deinitialized.load(.acquire));
     lease.release();

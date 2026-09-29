@@ -89,4 +89,7 @@ const stats = api.stats();
 if (typeof stats.doc_count !== "number") throw new Error("stats failed");
 
 api.close();
+if (api.exports.antfly_embedded_smoke_run() !== 0) {
+    throw new Error("hosted text index did not survive close/reopen");
+}
 console.log("antfly embedded shared smoke passed: ok");

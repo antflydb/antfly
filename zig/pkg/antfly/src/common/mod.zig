@@ -13,6 +13,7 @@
 // limitations.
 
 pub const provider_registry = @import("provider_registry.zig");
+pub const listener_security = @import("listener_security.zig");
 pub const config = @import("config.zig");
 pub const vector_migration = @import("vector_migration.zig");
 pub const table_storage = @import("table_storage.zig");

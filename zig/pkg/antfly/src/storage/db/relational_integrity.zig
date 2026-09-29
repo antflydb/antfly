@@ -39,23 +39,73 @@ pub const Kind = @import("relational_integrity_contract.zig").Kind;
 pub const CurrentView = struct {
     probe: @import("../docstore.zig").DocStore.Txn,
     scan: @import("../docstore.zig").DocStore.Txn,
+    intent_read_guard: ?transactions.IntentReadGuard = null,
     pub fn init(store: *@import("../docstore.zig").DocStore) !CurrentView {
         var probe = try store.beginProbeTxn();
         errdefer probe.abort();
         const scan = try store.beginCurrentScanTxn();
         return .{ .probe = probe, .scan = scan };
     }
+    pub fn initForTransaction(store: *@import("../docstore.zig").DocStore, alloc: Allocator, txn: transactions.TxnId) !CurrentView {
+        var result = try init(store);
+        result.intent_read_guard = .init(alloc, txn);
+        return result;
+    }
     pub fn deinit(self: *CurrentView) void {
+        if (self.intent_read_guard) |*guard| guard.deinit();
         self.scan.abort();
         self.probe.abort();
         self.* = undefined;
     }
     pub fn get(self: *CurrentView, key: []const u8) ![]const u8 {
+        try self.checkRead(key);
         return self.probe.get(key);
     }
-    pub fn openCursor(self: *CurrentView) !@import("../docstore.zig").DocStore.Txn.CursorAdapter {
-        return self.scan.openCursor();
+    fn checkRead(self: *CurrentView, key: []const u8) !void {
+        if (self.intent_read_guard) |*guard| try guard.check(&self.probe, key);
     }
+    pub fn openCursor(self: *CurrentView) !Cursor {
+        return .{ .view = self, .inner = try self.scan.openCursor() };
+    }
+    pub const Cursor = struct {
+        view: *CurrentView,
+        inner: @import("../docstore.zig").DocStore.Txn.CursorAdapter,
+        upper_bound: ?[]const u8 = null,
+        const Entry = @import("../backend_erased.zig").Entry;
+        pub fn close(self: *Cursor) void {
+            self.inner.close();
+            self.* = undefined;
+        }
+        fn checked(self: *Cursor, entry: ?Entry) !?Entry {
+            if (entry) |item| {
+                if (self.upper_bound) |upper| if (std.mem.order(u8, item.key, upper) != .lt) return null;
+                try self.view.checkRead(item.key);
+            }
+            return entry;
+        }
+        pub fn first(self: *Cursor) !?Entry {
+            return self.checked(try self.inner.first());
+        }
+        pub fn last(self: *Cursor) !?Entry {
+            return self.checked(try self.inner.last());
+        }
+        pub fn next(self: *Cursor) !?Entry {
+            return self.checked(try self.inner.next());
+        }
+        pub fn prev(self: *Cursor) !?Entry {
+            return self.checked(try self.inner.prev());
+        }
+        pub fn seekAtOrAfter(self: *Cursor, key: []const u8) !?Entry {
+            return self.checked(try self.inner.seekAtOrAfter(key));
+        }
+        pub fn seekAtOrBefore(self: *Cursor, key: []const u8) !?Entry {
+            return self.checked(try self.inner.seekAtOrBefore(key));
+        }
+        pub fn setUpperBound(self: *Cursor, upper: ?[]const u8) void {
+            self.upper_bound = upper;
+            self.inner.setUpperBound(upper);
+        }
+    };
 };
 
 const hash = @import("relational_integrity_contract.zig").hash;
@@ -162,6 +212,8 @@ const Builder = struct {
         for (self.operations.items) |op| if (op.kind == .put and std.mem.startsWith(u8, op.key, &prefix)) return error.ForeignKeyReferenced;
         var cursor = try txn.openCursor();
         defer cursor.close();
+        var upper = prefix;
+        cursor.setUpperBound(prefixUpperBound(&upper));
         var entry = try cursor.seekAtOrAfter(&prefix);
         while (entry) |item| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, item.key, &prefix)) break;
@@ -351,11 +403,27 @@ pub fn predicate(op: Operation) transactions.VersionPredicate {
     return .{ .key = op.key, .comparison = .exact_value, .expected_value = op.expected_value };
 }
 
+// Keep intent-aware semantic scans inside the requested tuple. An iterator's
+// first successor outside the prefix is an emptiness proof, not a value read;
+// an unrelated transaction must not turn that proof into false contention.
+fn prefixUpperBound(bytes: []u8) ?[]const u8 {
+    var i = bytes.len;
+    while (i > 0) {
+        i -= 1;
+        if (bytes[i] == 255) continue;
+        bytes[i] += 1;
+        return bytes[0 .. i + 1];
+    }
+    return null;
+}
+
 fn requireEmptyOperations(txn: anytype, address: Address, operations: []const Operation, overlay: *const std.StringHashMapUnmanaged(usize)) !void {
     const prefix = address.referencePrefix();
     for (operations) |candidate| if (candidate.kind == .put and std.mem.startsWith(u8, candidate.key, &prefix)) return error.ForeignKeyReferenced;
     var cursor = try txn.openCursor();
     defer cursor.close();
+    var upper = prefix;
+    cursor.setUpperBound(prefixUpperBound(&upper));
     var entry = try cursor.seekAtOrAfter(&prefix);
     while (entry) |item| : (entry = try cursor.next()) {
         if (!std.mem.startsWith(u8, item.key, &prefix)) break;
@@ -369,6 +437,8 @@ fn requireReboundReferences(txn: anytype, address: Address, operations: []const 
     const prefix = address.referencePrefix();
     var cursor = try txn.openCursor();
     defer cursor.close();
+    var upper = prefix;
+    cursor.setUpperBound(prefixUpperBound(&upper));
     var entry = try cursor.seekAtOrAfter(&prefix);
     while (entry) |item| : (entry = try cursor.next()) {
         if (!std.mem.startsWith(u8, item.key, &prefix)) break;
@@ -520,6 +590,8 @@ pub fn actionPageWithBudget(alloc: Allocator, io: ?std.Io, txn: anytype, address
     const prefix = address.referencePrefix();
     var cursor = try txn.openCursor();
     defer cursor.close();
+    var upper = prefix;
+    cursor.setUpperBound(prefixUpperBound(&upper));
     var references: std.ArrayList(Reference) = .empty;
     var bytes: usize = 0;
     var entry = try cursor.seekAtOrAfter(if (job.phase == .validating and job.cursor.len != 0) job.cursor else &prefix);
@@ -575,6 +647,7 @@ test "relational integrity preparation cleans up every allocation failure and bo
             const Cursor = struct {
                 const Entry = struct { key: []const u8, value: []const u8 };
                 pub fn close(_: *@This()) void {}
+                pub fn setUpperBound(_: *@This(), _: ?[]const u8) void {}
                 pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
                     return null;
                 }
@@ -771,4 +844,71 @@ test "distributed txn deferred reference handoff commits atomically and rejects 
     defer committed.deinit();
     try std.testing.expectEqualStrings("replacement", (try Claim.decode(&address.claimKey(), try committed.get(&address.claimKey()))).parent_key);
     _ = try Reference.decode(&try child.key(address), try committed.get(&try child.key(address)));
+}
+
+test "relational integrity transaction reads preserve shared guards and isolate reference prefixes" {
+    const alloc = std.testing.allocator;
+    const DocStore = @import("../docstore.zig").DocStore;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime = try backend.runtimeStore(alloc, .{});
+    var store = try DocStore.openRuntime(alloc, runtime);
+    defer store.close();
+    var manager = try transactions.TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const address = try Address.init(@splat(1), "tuple");
+    const claim: Claim = .{ .tuple = "tuple", .parent_table = "parent", .parent_key = "p", .schema_version = 1 };
+    const first: Reference = .{ .child_table = "child", .child_key = "a", .constraint_name = "fk", .constraint_generation = @splat(2) };
+    const second: Reference = .{ .child_table = "child", .child_key = "b", .constraint_name = "fk", .constraint_generation = @splat(2) };
+    try testCommands(&store, &manager, @splat(1), &.{.{ .address = address, .operation = .{ .establish = claim } }}, true);
+    try testCommands(&store, &manager, @splat(2), &.{.{ .address = address, .operation = .{ .attach = first } }}, false);
+    {
+        var read = try CurrentView.initForTransaction(&store, alloc, @splat(3));
+        defer read.deinit();
+        // Independent child readers do not serialize behind shared claim guards.
+        var effects = try prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .attach = second } }});
+        defer effects.deinit();
+    }
+    try manager.resolveIntents(@splat(2), .committed, 2);
+    try testCommands(&store, &manager, @splat(4), &.{.{ .address = address, .operation = .{ .detach = first } }}, false);
+    const release = [_]Command{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "p" } } }};
+    {
+        var read = try CurrentView.initForTransaction(&store, alloc, @splat(5));
+        defer read.deinit();
+        // Both point and prefix reads must defer stale semantic conclusions.
+        try std.testing.expectError(error.IntentConflict, prepare(alloc, &read, &release));
+        try std.testing.expectError(error.IntentConflict, prepare(alloc, &read, &.{.{ .address = address, .operation = .{ .detach = first } }}));
+    }
+    {
+        var own = try CurrentView.initForTransaction(&store, alloc, @splat(4));
+        defer own.deinit();
+        var effects = try prepare(alloc, &own, &.{.{ .address = address, .operation = .{ .detach = first } }});
+        defer effects.deinit();
+    }
+    try manager.resolveIntents(@splat(4), .aborted, 3);
+    {
+        var read = try CurrentView.initForTransaction(&store, alloc, @splat(5));
+        defer read.deinit();
+        try std.testing.expectError(error.ForeignKeyReferenced, prepare(alloc, &read, &release));
+    }
+    try testCommands(&store, &manager, @splat(6), &.{.{ .address = address, .operation = .{ .detach = first } }}, true);
+    const prefix = address.referencePrefix();
+    const other = other: {
+        for (2..256) |i| {
+            const candidate = try Address.init(@splat(@intCast(i)), "tuple");
+            if (std.mem.order(u8, &candidate.referencePrefix(), &prefix) == .gt) break :other candidate;
+        }
+        return error.TestNoSuccessorAddress;
+    };
+    try testCommands(&store, &manager, @splat(7), &.{ .{ .address = other, .operation = .{ .establish = claim } }, .{ .address = other, .operation = .{ .attach = first } } }, true);
+    try testCommands(&store, &manager, @splat(8), &.{.{ .address = other, .operation = .{ .detach = first } }}, false);
+    {
+        var read = try CurrentView.initForTransaction(&store, alloc, @splat(9));
+        defer read.deinit();
+        var effects = try prepare(alloc, &read, &release);
+        defer effects.deinit();
+        try validatePreparedEffects(alloc, &read, effects.operations);
+        try std.testing.expectEqual(@as(usize, 1), effects.operations.len);
+        try std.testing.expectEqual(.delete, effects.operations[0].kind);
+    }
 }

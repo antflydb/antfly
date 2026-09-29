@@ -140,6 +140,7 @@ pub const MmapRegion = struct {
     /// Enforce admission on the opened descriptor before mapping its bytes.
     /// Checking the same descriptor avoids a stat/open substitution window.
     pub fn initLimited(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) !MmapRegion {
+        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         const path_z = try allocator.dupeZ(u8, path);
         defer allocator.free(path_z);
 
@@ -212,6 +213,10 @@ pub const MmapRegion = struct {
     }
 
     pub fn deinit(self: *MmapRegion) void {
+        if (comptime builtin.os.tag == .freestanding) {
+            self.* = undefined;
+            return;
+        }
         const mapped_len = self.data.len;
         const fd = self.fd;
         // Model eviction must release both the process mapping and its clean
@@ -692,6 +697,7 @@ fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
 }
 
 fn closeFd(fd: std.posix.fd_t) void {
+    if (comptime builtin.os.tag == .freestanding) return;
     if (comptime builtin.link_libc) {
         _ = c.close(fd);
     } else {

@@ -31,6 +31,8 @@ fn expected(backbone: model.Backbone) bundle.Identity {
             .{ .size_bytes = 16035853, .sha256 = "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a".* },
             tokenizer_config,
         } },
+        // No published ModernBERT checkpoint is pinned.
+        .modern_bert => unreachable,
     };
 }
 

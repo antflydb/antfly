@@ -40,7 +40,7 @@ fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
 }
 
 fn spinOrYield() void {
-    if (builtin.os.tag == .freestanding) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
+    if (builtin.os.tag == .freestanding) std.atomic.spinLoopHint() else @import("antfly_platform").time.yieldNow();
 }
 
 fn sleepPollInterval() void {
@@ -74,8 +74,6 @@ pub fn lockApply(db: anytype) void {
 }
 
 pub fn stressDenseBackend() hbc_mod.StorageBackend {
-    const raw = getenv("ANTFLY_STRESS_DENSE_BACKEND") orelse return .lsm;
-    if (std.ascii.eqlIgnoreCase(raw, "lmdb")) return .lmdb;
     return .lsm;
 }
 

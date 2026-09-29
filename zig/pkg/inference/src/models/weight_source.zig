@@ -186,6 +186,46 @@ pub const QuantizedStorage = struct {
     }
 };
 
+/// Quantize a dense `[out, in]` f32/f16/bf16 weight to Q8_0 blocks along
+/// each row, in the layout GGUF-backed storage uses. `in` must be a multiple
+/// of 32. The storage owns its bytes and shape.
+pub fn quantizeDenseQ8_0(allocator: std.mem.Allocator, tensor: *const Tensor) !QuantizedStorage {
+    if (tensor.shape.len != 2 or tensor.shape[0] <= 0 or tensor.shape[1] <= 0 or @rem(tensor.shape[1], 32) != 0)
+        return error.InvalidQuantizedInputSize;
+    const count: usize = @intCast(tensor.shape[0] * tensor.shape[1]);
+    const values = try allocator.alloc(f32, count);
+    defer allocator.free(values);
+    const width = tensor.dtype.byteSize();
+    if (tensor.data.len != count * width) return error.InvalidTensorShape;
+    for (values, 0..) |*value, i| value.* = switch (tensor.dtype) {
+        .f32 => @bitCast(std.mem.readInt(u32, tensor.data[i * 4 ..][0..4], .little)),
+        .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, tensor.data[i * 2 ..][0..2], .little)))),
+        .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, tensor.data[i * 2 ..][0..2], .little)) << 16),
+        else => return error.UnsupportedTensorType,
+    };
+    const raw = try @import("../gguf/quant_codec.zig").quantizeQ8_0FromF32(allocator, values);
+    errdefer allocator.free(raw);
+    const shape = try allocator.dupe(i64, tensor.shape);
+    return .{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = raw, .shape = shape, .allocator = allocator };
+}
+
+test "dense Q8_0 quantization round-trips within one step of each block scale" {
+    const a = std.testing.allocator;
+    var values: [2 * 64]f32 = undefined;
+    for (&values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.37) * 3;
+    var tensor = try Tensor.initFloat32(a, "w", &.{ 2, 64 }, &values);
+    defer tensor.deinit();
+    var storage = try quantizeDenseQ8_0(a, &tensor);
+    defer storage.deinit();
+    try std.testing.expectEqualSlices(i64, &.{ 2, 64 }, storage.shape);
+    var back: [values.len]f32 = undefined;
+    try @import("../gguf/quant_codec.zig").dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, &back);
+    for (values, back) |want, got| try std.testing.expect(@abs(want - got) <= 3.0 / 127.0);
+    var odd = try Tensor.initFloat32(a, "w", &.{ 1, 3 }, &.{ 1, 2, 3 });
+    defer odd.deinit();
+    try std.testing.expectError(error.InvalidQuantizedInputSize, quantizeDenseQ8_0(a, &odd));
+}
+
 /// A loaded weight with optional quantization metadata.
 pub const LoadedWeight = struct {
     tensor: Tensor,

@@ -84,7 +84,7 @@ else
 const mapper = @import("../document_mapper.zig");
 const relational_store = @import("../relational_store.zig");
 
-var activity_epoch_salt = std.atomic.Value(u64).init(1);
+var activity_epoch_salt = @import("antfly_platform").atomic.Value(u64).init(1);
 
 fn newActivityEpoch(config: Config, clock: platform_clock.Clock) u64 {
     var hasher = std.hash.Wyhash.init(0x414e54464c594143);
@@ -2232,10 +2232,22 @@ fn batchFailureFingerprint(comptime Item: type, items: []const Item) u64 {
     return finishFailureFingerprint(&hasher);
 }
 
+fn lockRuntime(runtime: *EnrichmentRuntime) ?std.Io {
+    if (comptime builtin.os.tag == .freestanding) return null;
+    const io_impl = runtime.io_impl orelse return null;
+    const io = io_impl.io();
+    runtime.mutex.lockUncancelable(io);
+    return io;
+}
+
+fn unlockRuntime(runtime: *EnrichmentRuntime, maybe_io: ?std.Io) void {
+    if (comptime builtin.os.tag == .freestanding) return;
+    if (maybe_io) |io| runtime.mutex.unlock(io);
+}
+
 fn setActiveFailureFingerprint(runtime: *EnrichmentRuntime, fingerprint: u64) void {
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
-    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
-    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    const maybe_io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, maybe_io);
     runtime.active_failure_fingerprint = fingerprint;
     // Authorization to reuse a request fingerprint applies only to the error
     // that just passed shouldYieldRequestError. Starting or clearing any other
@@ -2245,9 +2257,8 @@ fn setActiveFailureFingerprint(runtime: *EnrichmentRuntime, fingerprint: u64) vo
 }
 
 fn replaceActiveFailureFingerprint(runtime: *EnrichmentRuntime, fingerprint: u64) u64 {
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
-    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
-    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    const maybe_io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, maybe_io);
     const previous = runtime.active_failure_fingerprint;
     runtime.active_failure_fingerprint = fingerprint;
     runtime.retry_error_has_request_identity = false;
@@ -2255,9 +2266,8 @@ fn replaceActiveFailureFingerprint(runtime: *EnrichmentRuntime, fingerprint: u64
 }
 
 fn clearRequestRetryAuthorization(runtime: *EnrichmentRuntime) void {
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
-    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
-    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    const maybe_io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, maybe_io);
     runtime.retry_error_has_request_identity = false;
 }
 
@@ -2267,17 +2277,15 @@ fn setRetryAfterHint(runtime: *EnrichmentRuntime, retry_after_ms: ?u64) void {
         runtime.retry_after_hint_ms = @max(runtime.retry_after_hint_ms, value);
         return;
     }
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
-    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
-    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    const maybe_io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, maybe_io);
     runtime.retry_after_hint_ms = @max(runtime.retry_after_hint_ms, value);
 }
 
 fn restoreDeferredRequestRetryAuthorization(runtime: *EnrichmentRuntime, fingerprint: u64) void {
     std.debug.assert(fingerprint != 0);
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
-    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
-    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    const maybe_io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, maybe_io);
     runtime.active_failure_fingerprint = fingerprint;
     // shouldYieldRequestError already admitted this exact request against its
     // durable budget. Independent work may temporarily replace the active
@@ -2287,9 +2295,8 @@ fn restoreDeferredRequestRetryAuthorization(runtime: *EnrichmentRuntime, fingerp
 }
 
 fn requestAttemptNumber(runtime: *EnrichmentRuntime) u64 {
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
-    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
-    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    const maybe_io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, maybe_io);
     const prior_attempts = requestPriorAttempts(
         runtime.active_failure_fingerprint,
         runtime.retry_failure_fingerprint,
@@ -2308,9 +2315,8 @@ fn retryBudgetAllowsYield(consecutive_retry_count: u32, max_attempts: u32) bool 
 }
 
 fn activeRequestRetryBudgetAllowsYield(runtime: *EnrichmentRuntime) bool {
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
-    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
-    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    const maybe_io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, maybe_io);
     if (runtime.active_failure_fingerprint == 0) {
         runtime.retry_error_has_request_identity = false;
         return true;
@@ -2334,9 +2340,8 @@ fn activeRequestRetryBudgetAllowsYield(runtime: *EnrichmentRuntime) bool {
 /// error reaches the supervisor.
 fn requestRetryBudgetAllowsYieldFor(runtime: *EnrichmentRuntime, fingerprint: u64) bool {
     if (fingerprint == 0) return true;
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
-    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
-    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    const maybe_io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, maybe_io);
     const prior_attempts = requestPriorAttempts(
         fingerprint,
         runtime.retry_failure_fingerprint,
@@ -2358,9 +2363,8 @@ fn shouldYieldRequestErrorFor(runtime: *EnrichmentRuntime, fingerprint: u64, err
 
 /// `requestAttemptNumber` for an explicit identity.
 fn requestAttemptNumberFor(runtime: *EnrichmentRuntime, fingerprint: u64) u64 {
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
-    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
-    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    const maybe_io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, maybe_io);
     const prior_attempts = requestPriorAttempts(
         fingerprint,
         runtime.retry_failure_fingerprint,
@@ -2446,9 +2450,8 @@ const WorkerRetryScope = enum {
 };
 
 fn workerLoopRetryScopeIfAllowed(runtime: *EnrichmentRuntime, err: anyerror) ?WorkerRetryScope {
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
-    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
-    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    const maybe_io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, maybe_io);
 
     // Request-owned failures have already been admitted by
     // shouldYieldRequestError against their exact durable identity budget.
@@ -3239,7 +3242,7 @@ fn assetProviderRequestContext(runtime: *EnrichmentRuntime) inference_request_co
     const deadline = guard.deadline_ns orelse
         runtime_now +| @max(runtime.config.sync_wait_timeout_ms, 1) *| std.time.ns_per_ms;
     return .{
-        .io = if (runtime.io_impl) |io_impl| io_impl.io() else std.Io.Threaded.global_single_threaded.io(),
+        .io = concurrencyIo(runtime),
         .deadline_ns = native_now +| (deadline -| runtime_now),
         .cancellation = if (cancellation.ptr != null) cancellation else null,
         .progress = .{ .ptr = runtime, .update_fn = noteInferenceProgress },
@@ -4190,6 +4193,7 @@ fn inheritProcessTelemetryUnlocked(runtime: anytype, previous: types.EnrichmentS
 
 pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     alloc: Allocator,
+    status_hook: ?StatusHook = null,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
     /// before releasing BackendRuntime.
@@ -4279,8 +4283,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     total_extract_ns: u64 = 0,
     inference_recovery_mutex: std.atomic.Mutex = .unlocked,
     inference_recovery: std.AutoHashMapUnmanaged(InferenceRecoveryKey, InferenceRecoveryState) = .empty,
-    inference_timeout_count: std.atomic.Value(u64) = .init(0),
-    inference_cancel_count: std.atomic.Value(u64) = .init(0),
+    inference_timeout_count: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    inference_cancel_count: @import("antfly_platform").atomic.Value(u64) = .init(0),
     dense_artifact_bytes_written: u64 = 0,
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
@@ -4398,8 +4402,15 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn setStatusHook(self: *@This(), hook: ?StatusHook) void {
-        _ = self;
-        _ = hook;
+        self.status_hook = hook;
+    }
+
+    fn notifyActivityHook(self: *@This()) void {
+        if (self.status_hook) |hook| hook.notifyActivity();
+    }
+
+    fn notifyStatusHook(self: *@This()) void {
+        if (self.status_hook) |hook| hook.notify();
     }
 
     pub fn setRelationalBaseRows(self: *@This(), enabled: bool) void {
@@ -4784,8 +4795,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     total_extract_ns: u64 = 0,
     inference_recovery_mutex: std.atomic.Mutex = .unlocked,
     inference_recovery: std.AutoHashMapUnmanaged(InferenceRecoveryKey, InferenceRecoveryState) = .empty,
-    inference_timeout_count: std.atomic.Value(u64) = .init(0),
-    inference_cancel_count: std.atomic.Value(u64) = .init(0),
+    inference_timeout_count: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    inference_cancel_count: @import("antfly_platform").atomic.Value(u64) = .init(0),
     dense_artifact_bytes_written: u64 = 0,
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
@@ -5527,6 +5538,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
 /// condition variable retains replay-pass coordination semantics; the epoch
 /// gives synchronous visibility waiters a cancelable, deadline-aware futex.
 fn broadcastRuntimeStateChanged(runtime: *EnrichmentRuntime, io: Io) void {
+    if (comptime builtin.os.tag == .freestanding) return;
     if (runtime.backend_runtime) |backend| backend.wakeMaintenance(runtime);
     runtime.cond.broadcast(io);
     if (runtime.sync_waiter_count.load(.acquire) == 0) return;
@@ -6063,8 +6075,7 @@ fn freeAffectedIndexes(runtime: *EnrichmentRuntime, indexes: [][]u8) void {
 /// generated batch or a request that has been terminally parked/covered.
 /// Merely changing error identity never calls this function.
 fn noteDurableRetryProgress(runtime: *EnrichmentRuntime, completed_failure_fingerprint: u64) !void {
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
-    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
+    const maybe_io = lockRuntime(runtime);
     const had_retry_debt = runtime.consecutive_retry_count != 0 or
         runtime.retry_failure_fingerprint != 0 or runtime.retry_failure_count != 0;
     runtime.consecutive_retry_count = 0;
@@ -6082,7 +6093,7 @@ fn noteDurableRetryProgress(runtime: *EnrichmentRuntime, completed_failure_finge
         runtime.retry_failure_count = 0;
     }
     const status = runtimeStatusSnapshot(runtime);
-    if (maybe_io) |io| runtime.mutex.unlock(io);
+    unlockRuntime(runtime, maybe_io);
     // The healthy path never pays an extra status write. Persist exactly once
     // when durable replay progress retires an existing retry episode so a
     // crash cannot resurrect stale retry debt.
@@ -6217,8 +6228,7 @@ fn noteTerminalRequestFailure(
     artifact_name: []const u8,
     completed_failure_fingerprint: u64,
 ) !void {
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
-    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
+    const maybe_io = lockRuntime(runtime);
     const interval = mergedTerminalFailureInterval(
         runtime.terminal_failure_min_sequence,
         runtime.terminal_failure_max_sequence,
@@ -6251,7 +6261,7 @@ fn noteTerminalRequestFailure(
     const status = runtimeStatusSnapshot(runtime);
     if (maybe_io) |io| {
         broadcastRuntimeStateChanged(runtime, io);
-        runtime.mutex.unlock(io);
+        unlockRuntime(runtime, io);
     }
     // The repair ledger entry was published before this call. Persist the
     // source-sequence interval now so a stable transaction replay after a
@@ -7019,7 +7029,7 @@ fn runForegroundCatchUpPassOwned(
         clearPublishedGeneratedArtifacts(runtime);
         status = runtimeStatusSnapshot(runtime);
         broadcastRuntimeStateChanged(runtime, io);
-        runtime.mutex.unlock(io);
+        unlockRuntime(runtime, io);
         try saveRuntimeStatusWithRetry(runtime, scope_name, status);
         runtime.notifyStatusHook();
     } else if (pending.len == 0) {
@@ -7036,7 +7046,7 @@ fn runForegroundCatchUpPassOwned(
         runtime.retry_error_has_request_identity = false;
         status = runtimeStatusSnapshot(runtime);
         broadcastRuntimeStateChanged(runtime, io);
-        runtime.mutex.unlock(io);
+        unlockRuntime(runtime, io);
         try saveRuntimeStatusWithRetry(runtime, scope_name, status);
         runtime.notifyStatusHook();
     }
@@ -7804,7 +7814,7 @@ const SharedPdfWindowScheduler = struct {
             while (true) {
                 if (!consumer.enabled) return error.DocumentExtractionWorkingSetTooLarge;
                 if (consumer.err) |err| return err;
-                return PdfWindowConsumerLease.initIndependent(std.heap.smp_allocator, runtime.config.resource_manager orelse runtime.index_manager.resource_manager, required) catch |err| {
+                return PdfWindowConsumerLease.initIndependent(@import("antfly_platform").allocator.concurrentFallback(), runtime.config.resource_manager orelse runtime.index_manager.resource_manager, required) catch |err| {
                     if (err != error.DocumentExtractionWorkingSetTooLarge or self.count == 0) return err;
                     try self.retireOne();
                     continue;
@@ -8763,7 +8773,7 @@ const RuntimePdfPageTextSpool = struct {
         };
         // An unrelated executor may reclaim this buffer. Neither its payloads
         // nor its control object may borrow a task-confined backing allocator.
-        if (self.segment == null) self.segment = try WriteBuffer.create(std.heap.smp_allocator, self.manager());
+        if (self.segment == null) self.segment = try WriteBuffer.create(@import("antfly_platform").allocator.concurrentFallback(), self.manager());
         const alloc = self.segment.?.allocator();
         {
             const key = try self.keyAlloc(alloc, page);
@@ -9044,7 +9054,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 while (!self.embedding_started.load(.acquire)) {
                     try context.check();
                     if (platform_time.monotonicNs() > deadline) return error.TextDidNotOverlapEmbedding;
-                    std.Thread.yield() catch {};
+                    @import("antfly_platform").time.yieldNow();
                 }
             }
             if (self.text_batch_failure) |err| return err;
@@ -9097,7 +9107,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 while (!self.text_started.load(.acquire) or !self.owner_released.load(.acquire)) {
                     try context.check();
                     if (platform_time.monotonicNs() > deadline) return error.OwnerDidNotOverlapPeers;
-                    std.Thread.yield() catch {};
+                    @import("antfly_platform").time.yieldNow();
                 }
             }
             if (self.worker_failure) |err| return err;
@@ -9105,12 +9115,12 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             if (self.prefetch_started) |started| while (!started.load(.acquire)) {
                 try context.check();
                 if (platform_time.monotonicNs() > deadline) return error.PrefetchDidNotOverlapPeers;
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             };
             while (self.wait_for_cancel) {
                 try context.check();
                 if (@import("antfly_platform").time.monotonicNs() > deadline) return error.SharedConsumerWasNotCanceled;
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
             if (self.single_slot) {
                 if (self.active.swap(true, .acq_rel)) {
@@ -9121,7 +9131,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 while (!self.admission_denied.load(.acquire)) {
                     try context.check();
                     if (@import("antfly_platform").time.monotonicNs() > deadline) return error.MissingConcurrentAdmissionAttempt;
-                    std.Thread.yield() catch {};
+                    @import("antfly_platform").time.yieldNow();
                 }
                 return embed(ptr, a, name, parts, dims);
             }
@@ -9555,7 +9565,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                                 job.err = error.CompletedGrantWasRetained;
                                 return;
                             }
-                            std.Thread.yield() catch {};
+                            @import("antfly_platform").time.yieldNow();
                         }
                     }
                 };
@@ -9841,7 +9851,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
 
     if (text_session) |session| {
         {
-            const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(alloc, std.heap.smp_allocator, null, 30_000, config, session);
+            const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(alloc, @import("antfly_platform").allocator.concurrentFallback(), null, 30_000, config, session);
             defer coordinator.destroy();
             const single = try Harness.partMemory(&harness, "visual", .{ .item_count = 1 }, 2, null);
             const plans = [_]inference_work.InvocationMemoryPlan{ undefined, single, single };
@@ -9950,7 +9960,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             };
             var owner = PixelOwner{};
             const bounded_producer = asset_producer_mod.Producer{ .ptr = &owner, .vtable = &.{ .produce = PixelOwner.one, .produce_batch = PixelOwner.produceMany, .can_produce_batch = PixelOwner.can, .invocation_memory_for_requests = PixelOwner.memory } };
-            const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(alloc, std.heap.smp_allocator, null, 30_000, config, session);
+            const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(alloc, @import("antfly_platform").allocator.concurrentFallback(), null, 30_000, config, session);
             defer coordinator.destroy();
             var pending = [_]document_extraction_mod.Unit{
                 try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 1, .extraction_status = @constCast("pending_ocr") }),
@@ -10154,7 +10164,10 @@ const PreparedDocumentSourceCache = struct {
         const manager = runtime.config.resource_manager orelse runtime.index_manager.resource_manager;
         return .{
             .backing_alloc = runtime.alloc,
-            .io = runtime.config.io orelse Io.Threaded.global_single_threaded.io(),
+            .io = runtime.config.io orelse if (comptime builtin.os.tag == .freestanding)
+                .failing
+            else
+                Io.Threaded.global_single_threaded.io(),
             .budgeted = if (manager) |value|
                 resource_manager_mod.BudgetedAllocator.init(
                     value,
@@ -10242,8 +10255,8 @@ const PreparedDocumentSourceCache = struct {
         std.debug.assert(self.pending_pdfs.items.len == 0);
         for (self.entries.items) |entry| self.destroyEntry(entry);
         self.entries.deinit(alloc);
-        self.pending_sources.deinit(std.heap.smp_allocator);
-        self.pending_pdfs.deinit(std.heap.smp_allocator);
+        self.pending_sources.deinit(@import("antfly_platform").allocator.concurrentFallback());
+        self.pending_pdfs.deinit(@import("antfly_platform").allocator.concurrentFallback());
         if (self.budgeted) |*budgeted| budgeted.deinit();
         self.mutex.unlock(self.io);
         self.* = undefined;
@@ -10352,23 +10365,23 @@ const PreparedDocumentSourceCache = struct {
                 continue;
             }
             const owned_credential = if (credential_name) |value|
-                std.heap.smp_allocator.dupe(u8, value) catch |err| {
+                @import("antfly_platform").allocator.concurrentFallback().dupe(u8, value) catch |err| {
                     self.mutex.unlock(self.io);
                     return err;
                 }
             else
                 null;
-            self.pending_sources.append(std.heap.smp_allocator, .{
+            self.pending_sources.append(@import("antfly_platform").allocator.concurrentFallback(), .{
                 .source_identity = identity,
                 .credential_name = owned_credential,
             }) catch |err| {
-                if (owned_credential) |value| std.heap.smp_allocator.free(value);
+                if (owned_credential) |value| @import("antfly_platform").allocator.concurrentFallback().free(value);
                 self.mutex.unlock(self.io);
                 return err;
             };
             self.active_preparations = std.math.add(usize, self.active_preparations, 1) catch {
                 const removed = self.pending_sources.pop().?;
-                if (removed.credential_name) |value| std.heap.smp_allocator.free(value);
+                if (removed.credential_name) |value| @import("antfly_platform").allocator.concurrentFallback().free(value);
                 self.mutex.unlock(self.io);
                 return error.PreparedDocumentCacheReferenceOverflow;
             };
@@ -10455,7 +10468,7 @@ const PreparedDocumentSourceCache = struct {
             if (!std.mem.eql(u8, pending.source_identity[0..], identity[0..]) or
                 !optionalStringsEqual(pending.credential_name, credential_name)) continue;
             const removed = self.pending_sources.swapRemove(index);
-            if (removed.credential_name) |value| std.heap.smp_allocator.free(value);
+            if (removed.credential_name) |value| @import("antfly_platform").allocator.concurrentFallback().free(value);
             std.debug.assert(self.active_preparations > 0);
             self.active_preparations -= 1;
             self.drained.broadcast(self.io);
@@ -10578,7 +10591,7 @@ const PreparedDocumentSourceCache = struct {
                 self.mutex.unlock(self.io);
                 continue;
             }
-            self.pending_pdfs.append(std.heap.smp_allocator, .{
+            self.pending_pdfs.append(@import("antfly_platform").allocator.concurrentFallback(), .{
                 .entry = entry,
                 .decode_limits = decode_limits,
             }) catch |err| {
@@ -10959,7 +10972,7 @@ test "prepared document cache single-flights concurrent PDF variants and drains 
             };
             defer source.deinit();
             _ = self.source_ready.fetchAdd(1, .release);
-            while (!self.start.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.start.load(.acquire)) @import("antfly_platform").time.yieldNow();
             var prepared = self.cache.preparePdf(&source, .{
                 .max_decoded_stream_bytes = 1024,
                 .max_working_set_bytes = 2048,
@@ -10970,7 +10983,7 @@ test "prepared document cache single-flights concurrent PDF variants and drains 
             defer prepared.deinit();
             self.sessions[index] = prepared.session();
             _ = self.lease_ready.fetchAdd(1, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
         }
     };
     const DeinitContext = struct {
@@ -10999,16 +11012,16 @@ test "prepared document cache single-flights concurrent PDF variants and drains 
     var workers = WorkerContext{ .cache = &cache };
     const first = try std.Thread.spawn(.{}, WorkerContext.run, .{ &workers, @as(usize, 0) });
     const second = try std.Thread.spawn(.{}, WorkerContext.run, .{ &workers, @as(usize, 1) });
-    while (workers.source_ready.load(.acquire) != 2) std.Thread.yield() catch {};
+    while (workers.source_ready.load(.acquire) != 2) @import("antfly_platform").time.yieldNow();
     workers.start.store(true, .release);
-    while (workers.lease_ready.load(.acquire) != 2) std.Thread.yield() catch {};
+    while (workers.lease_ready.load(.acquire) != 2) @import("antfly_platform").time.yieldNow();
 
     try std.testing.expectEqual(@as(usize, 1), FakePreparation.calls.load(.acquire));
     try std.testing.expectEqual(workers.sessions[0].?, workers.sessions[1].?);
 
     var deinit_context = DeinitContext{ .cache = &cache };
     const deinit_thread = try std.Thread.spawn(.{}, DeinitContext.run, .{&deinit_context});
-    while (!cache.isShuttingDown()) std.Thread.yield() catch {};
+    while (!cache.isShuttingDown()) @import("antfly_platform").time.yieldNow();
     try std.testing.expect(!deinit_context.done.load(.acquire));
     workers.release.store(true, .release);
     first.join();
@@ -11039,7 +11052,7 @@ test "prepared document cache prepares unrelated PDF keys concurrently" {
             while (now_active > observed) {
                 observed = peak.cmpxchgWeak(observed, now_active, .acq_rel, .acquire) orelse break;
             }
-            while (!release.load(.acquire)) std.Thread.yield() catch {};
+            while (!release.load(.acquire)) @import("antfly_platform").time.yieldNow();
             _ = active.fetchSub(1, .acq_rel);
             return .{ .parsed = .{} };
         }
@@ -11094,7 +11107,7 @@ test "prepared document cache prepares unrelated PDF keys concurrently" {
     const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});
     for (0..100_000) |_| {
         if (FakePreparation.calls.load(.acquire) == 2) break;
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     FakePreparation.release.store(true, .release);
     first_thread.join();
@@ -11284,7 +11297,11 @@ const DenseExecutionLane = struct {
 };
 
 fn concurrencyIo(runtime: *EnrichmentRuntime) Io {
-    return if (runtime.io_impl) |impl| impl.io() else std.Io.Threaded.global_single_threaded.io();
+    if (comptime builtin.os.tag == .freestanding) {
+        return .failing;
+    } else {
+        return if (runtime.io_impl) |impl| impl.io() else std.Io.Threaded.global_single_threaded.io();
+    }
 }
 
 fn prepareAssetLane(
@@ -14502,7 +14519,7 @@ const SharedPdfPngWindow = struct {
                 if (count > 0 and peak > available) break;
                 const grant = @min(peak, available);
                 if (grant == 0) return;
-                self.pages[i].lease = PdfWindowConsumerLease.init(std.heap.smp_allocator, runtime.config.resource_manager orelse runtime.index_manager.resource_manager, parent, grant) catch break;
+                self.pages[i].lease = PdfWindowConsumerLease.init(@import("antfly_platform").allocator.concurrentFallback(), runtime.config.resource_manager orelse runtime.index_manager.resource_manager, parent, grant) catch break;
                 self.pages[i].attempted = true;
                 self.pages[i].deadline_ns = self.deadline_ns;
                 var singleton = raster;
@@ -15675,14 +15692,14 @@ test "PDF window output allocator enforces one ceiling across concurrent workers
         succeeded: bool = false,
 
         fn run(self: *@This()) void {
-            while (!self.start.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.start.load(.acquire)) @import("antfly_platform").time.yieldNow();
             const memory = self.alloc.alloc(u8, allocation_bytes) catch {
                 _ = self.attempted.fetchAdd(1, .release);
                 return;
             };
             self.succeeded = true;
             _ = self.attempted.fetchAdd(1, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
             self.alloc.free(memory);
         }
     };
@@ -15705,7 +15722,7 @@ test "PDF window output allocator enforces one ceiling across concurrent workers
         spawned += 1;
     }
     start.store(true, .release);
-    while (attempted.load(.acquire) != worker_count) std.Thread.yield() catch {};
+    while (attempted.load(.acquire) != worker_count) @import("antfly_platform").time.yieldNow();
     const live_at_peak = output.liveBytes();
     release.store(true, .release);
     for (threads) |thread| thread.join();
@@ -16633,7 +16650,7 @@ const RuntimePdfRenderWindowPreparer = struct {
         policy.defer_render_pressure = speculative;
         var window = try renderRuntimePdfWindow(
             self.runtime,
-            std.heap.smp_allocator,
+            @import("antfly_platform").allocator.concurrentFallback(),
             self.producer,
             &self.coordinator.session,
             self.config,
@@ -23566,7 +23583,7 @@ const PdfEmbeddingWindowPreparer = struct {
         // allocations reachable from that task on a thread-safe allocator;
         // the composite lease and ResourceManager still enforce the large
         // scratch/output ceilings independently of the backing allocator.
-        const concurrent_alloc = std.heap.smp_allocator;
+        const concurrent_alloc = @import("antfly_platform").allocator.concurrentFallback();
         self.coordinator.beginOperation(self.runtime.config.sync_wait_timeout_ms);
         self.coordinator.session.setCancellationProbe(self.cancellationProbe());
         if (first_item >= self.pending_pages.len) return error.InvalidPdfRenderWindow;
@@ -24045,8 +24062,8 @@ fn processPdfPageImageEmbeddingWithAllocator(
     // the current window, so the cloned render session must not share the
     // enrichment worker's task-confined allocator.
     const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(
-        std.heap.smp_allocator,
-        std.heap.smp_allocator,
+        @import("antfly_platform").allocator.concurrentFallback(),
+        @import("antfly_platform").allocator.concurrentFallback(),
         resource_tracker.manager,
         runtime.config.sync_wait_timeout_ms,
         render_config,
@@ -29079,9 +29096,9 @@ const RuntimeLeaseHeartbeatGuard = struct {
         // with the enrichment owner. Give its cloned lease and JSON scratch a
         // dedicated system allocator and snapshot immutable tenure identity
         // before starting the task.
-        self.owner_id = try std.heap.smp_allocator.dupe(u8, self.runtime.ownership.owner_id);
+        self.owner_id = try @import("antfly_platform").allocator.concurrentFallback().dupe(u8, self.runtime.ownership.owner_id);
         errdefer {
-            std.heap.smp_allocator.free(self.owner_id);
+            @import("antfly_platform").allocator.concurrentFallback().free(self.owner_id);
             self.owner_id = &.{};
         }
         self.epoch = self.runtime.ownership.lease_epoch;
@@ -29089,7 +29106,7 @@ const RuntimeLeaseHeartbeatGuard = struct {
         if (!self.runtime.ownership.has_lease or self.epoch == 0)
             return error.EnrichmentLeaseFenceLost;
         self.lease = try lease_mod.Lease.init(
-            std.heap.smp_allocator,
+            @import("antfly_platform").allocator.concurrentFallback(),
             self.runtime.store,
             enrichment_lease.default_lease_key,
         );
@@ -29110,7 +29127,7 @@ const RuntimeLeaseHeartbeatGuard = struct {
         }
         if (self.lease) |*lease| lease.deinit();
         self.lease = null;
-        if (self.owner_id.len > 0) std.heap.smp_allocator.free(self.owner_id);
+        if (self.owner_id.len > 0) @import("antfly_platform").allocator.concurrentFallback().free(self.owner_id);
         self.owner_id = &.{};
     }
 

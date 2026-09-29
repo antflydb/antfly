@@ -21,6 +21,7 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("portable_wal.zig");
     _ = @import("relational_index.zig");
     _ = @import("db/relational_index_keys.zig");
     _ = @import("db/relational_index_plan.zig");
@@ -274,9 +275,6 @@ comptime {
     _ = @import("lite/secret_store.zig");
     _ = @import("lite/snapshot_test.zig");
     _ = @import("local_write.zig");
-    _ = @import("lmdb.zig");
-    _ = @import("lmdb_backend.zig");
-    _ = @import("lmdb_vopr.zig");
     _ = @import("lsm/binary_search.zig");
     _ = @import("lsm/k_way_merge.zig");
     _ = @import("lsm/manifest.zig");

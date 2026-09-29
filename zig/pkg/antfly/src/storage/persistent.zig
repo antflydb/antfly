@@ -44,38 +44,6 @@ const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const native_artifact_sink = @import("native_artifact_sink.zig");
-const supports_main_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
-const lmdb = if (supports_main_lmdb) @import("lmdb.zig") else struct {
-    pub const CommitBackend = enum {
-        sync,
-        worker_thread,
-        async_io,
-        adaptive,
-    };
-
-    pub const CommitStats = struct {};
-};
-const lmdb_backend = if (supports_main_lmdb) @import("lmdb_backend.zig") else struct {
-    pub const Backend = struct {
-        pub fn open(_: Allocator, _: [*:0]const u8, _: anytype) !@This() {
-            return error.UnsupportedPlatform;
-        }
-
-        pub fn close(_: *@This()) void {}
-
-        pub fn sync(_: *@This(), _: bool) !void {
-            return error.UnsupportedPlatform;
-        }
-
-        pub fn commitStatsSnapshot(_: *@This()) ?lmdb.CommitStats {
-            return null;
-        }
-
-        pub fn runtimeNamespaceStore(_: *@This(), _: Allocator) !backend_erased.NamespaceStore {
-            return error.UnsupportedPlatform;
-        }
-    };
-};
 const mem_backend = @import("mem_backend.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
 const storage_io = lsm_backend.storage_io;
@@ -83,6 +51,8 @@ const fs_paths = @import("../common/fs_paths.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const platform_time = @import("antfly_platform").time;
 const wal_mod = if (builtin.os.tag == .freestanding) @import("portable_wal.zig") else @import("wal.zig");
+const CommitBackend = wal_mod.CommitBackend;
+const CommitStats = wal_mod.CommitStats;
 const storage_sim = @import("sim_runtime.zig");
 const sim_fixture = @import("sim_fixture.zig");
 const persistent_sim_fixture = @import("persistent_sim_fixture.zig");
@@ -148,8 +118,8 @@ pub const PersistentIndexOptions = struct {
     main_no_sync: bool = false,
     main_no_meta_sync: bool = false,
     wal_no_sync: bool = false,
-    main_commit_backend: lmdb.CommitBackend = .sync,
-    wal_commit_backend: lmdb.CommitBackend = .adaptive,
+    main_commit_backend: CommitBackend = .sync,
+    wal_commit_backend: CommitBackend = .adaptive,
     wal_group_commit_window_ns: u64 = 0,
     wal_group_commit_max_requests: usize = 64,
     wal_clock: storage_sim.Clock = storage_sim.real_clock,
@@ -159,7 +129,7 @@ pub const PersistentIndexOptions = struct {
     pub fn resolvedWalBackend(self: PersistentIndexOptions) wal_mod.StorageBackend {
         return self.wal_backend orelse switch (self.main_backend) {
             .lsm_memory, .mem => .lsm_memory,
-            .lmdb, .lsm => .lsm,
+            .lsm => .lsm,
         };
     }
 };
@@ -230,12 +200,10 @@ test "persistent index routes wal lsm profile options" {
 
     switch (idx.wal.store_owner) {
         .lsm => |handle| try std.testing.expectEqual(@as(usize, 88), handle.backend.options.flush_threshold),
-        else => return error.TestUnexpectedResult,
     }
 }
 
 pub const MainBackend = enum {
-    lmdb,
     mem,
     lsm_memory,
     lsm,
@@ -243,12 +211,10 @@ pub const MainBackend = enum {
 
 pub const PersistentIndexStats = struct {
     wal: wal_mod.WalStats,
-    main_commit: ?lmdb.CommitStats,
+    main_commit: ?CommitStats,
 };
 
 pub const PersistentIndexMemoryStats = struct {
-    configured_lmdb_main_map_bytes: u64 = 0,
-    configured_lmdb_wal_map_bytes: u64 = 0,
     segment_virtual_mapped_bytes: u64 = 0,
     segment_estimated_resident_bytes: u64 = 0,
     segment_recently_touched_bytes: u64 = 0,
@@ -320,6 +286,7 @@ const SegmentFileStore = struct {
     }
 
     fn mapFile(self: *SegmentFileStore, path: []const u8) ![]align(std.heap.page_size_min) u8 {
+        if (comptime builtin.os.tag == .freestanding) return error.Unsupported;
         const owner = self.storage_owner orelse return error.Unsupported;
         var permit = try owner.acquireFdPermit();
         defer permit.release();
@@ -342,19 +309,21 @@ const SegmentFileStore = struct {
         defer self.allocator.free(path);
         errdefer if (delete_final_on_error) self.delete(seg_id);
 
-        if (self.storage_owner) |owner| {
-            var admission = try NativeSegmentPublicationAdmission.init(owner);
-            defer admission.deinit();
-            var writer = try admission.beginAtomicWrite(self.allocator, path);
-            var active = true;
-            defer if (active) writer.abort();
-            try writer.appendSlice(bytes);
-            active = false;
-            writer.finish() catch |err| {
-                if (builtin.os.tag != .freestanding) std.log.warn("text segment atomic finish failed: {s}", .{@errorName(err)});
-                return err;
-            };
-            return .fromMapped(try admission.mapFile(path));
+        if (comptime builtin.os.tag != .freestanding) {
+            if (self.storage_owner) |owner| {
+                var admission = try NativeSegmentPublicationAdmission.init(owner);
+                defer admission.deinit();
+                var writer = try admission.beginAtomicWrite(self.allocator, path);
+                var active = true;
+                defer if (active) writer.abort();
+                try writer.appendSlice(bytes);
+                active = false;
+                writer.finish() catch |err| {
+                    std.log.warn("text segment atomic finish failed: {s}", .{@errorName(err)});
+                    return err;
+                };
+                return .fromMapped(try admission.mapFile(path));
+            }
         }
 
         var writer = try self.storage.beginAtomicWrite(self.allocator, path);
@@ -815,7 +784,7 @@ const atomic_segment_sink_vtable = segment_mod.SegmentSink.VTable{
     .crc32_range = AtomicSegmentSink.crc32Range,
 };
 
-fn walCommitBackendForOptions(backend: lmdb.CommitBackend) wal_mod.CommitBackend {
+fn walCommitBackendForOptions(backend: CommitBackend) wal_mod.CommitBackend {
     return switch (backend) {
         .sync => .sync,
         .worker_thread => .worker_thread,
@@ -893,7 +862,7 @@ pub const PreparedMergeSegment = struct {
     }
 };
 
-/// Meta keys in the LMDB metadata database.
+/// Meta keys in persistent storage.
 const meta_committed_lsn = "committed_lsn";
 const meta_rebuild_cursor = "rebuild_snapshot_cursor";
 const meta_next_seg_id = "next_seg_id";
@@ -907,7 +876,10 @@ const meta_db_name = "meta";
 const deletions_db_name = "deletions";
 
 fn persistentStorageIo(runtime_io: ?std.Io) std.Io {
-    return runtime_io orelse std.Io.Threaded.global_single_threaded.io();
+    return runtime_io orelse if (comptime @import("builtin").os.tag == .freestanding)
+        .failing
+    else
+        std.Io.Threaded.global_single_threaded.io();
 }
 
 test "persistent storage contention yields through borrowed IO during cancellation cleanup" {
@@ -967,16 +939,11 @@ fn runtimeNamespace(keyspace: MainKeyspace) backend_types.Namespace {
 }
 
 const MainStoreOwner = union(enum) {
-    lmdb: *lmdb_backend.Backend,
     mem: *mem_backend.Backend,
     lsm: lsm_backend.BackendHandle,
 
     fn close(self: *MainStoreOwner, alloc: Allocator) void {
         switch (self.*) {
-            .lmdb => |backend| {
-                backend.close();
-                alloc.destroy(backend);
-            },
             .mem => |backend| {
                 backend.close();
                 alloc.destroy(backend);
@@ -988,10 +955,6 @@ const MainStoreOwner = union(enum) {
 
     fn abandonAfterCrash(self: *MainStoreOwner, alloc: Allocator) void {
         switch (self.*) {
-            .lmdb => |backend| {
-                backend.close();
-                alloc.destroy(backend);
-            },
             .mem => |backend| {
                 backend.close();
                 alloc.destroy(backend);
@@ -1003,7 +966,6 @@ const MainStoreOwner = union(enum) {
 
     fn sync(self: *MainStoreOwner, force: bool) !void {
         switch (self.*) {
-            .lmdb => |backend| try backend.sync(force),
             .mem => {},
             .lsm => |*handle| try handle.backend.sync(force),
         }
@@ -1011,70 +973,69 @@ const MainStoreOwner = union(enum) {
 
     fn lsmMaintenanceScore(self: *const MainStoreOwner) u64 {
         return switch (self.*) {
-            .lmdb, .mem => 0,
+            .mem => 0,
             .lsm => |handle| handle.backend.maintenanceScore(),
         };
     }
 
     fn snapshotLsmMaintenanceStats(self: *const MainStoreOwner) ?lsm_backend.Backend.MaintenanceStats {
         return switch (self.*) {
-            .lmdb, .mem => null,
+            .mem => null,
             .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
         };
     }
 
     fn snapshotLsmWriteStats(self: *const MainStoreOwner) ?lsm_backend.Backend.WriteStats {
         return switch (self.*) {
-            .lmdb, .mem => null,
+            .mem => null,
             .lsm => |handle| handle.backend.snapshotWriteStats(),
         };
     }
 
     fn snapshotLsmOpenStats(self: *const MainStoreOwner) ?lsm_backend.Backend.OpenStats {
         return switch (self.*) {
-            .lmdb, .mem => null,
+            .mem => null,
             .lsm => |handle| handle.backend.snapshotOpenStats(),
         };
     }
 
     fn checkpointLsmWalAfterDurableBoundary(self: *MainStoreOwner) !void {
         switch (self.*) {
-            .lmdb, .mem => {},
+            .mem => {},
             .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
         }
     }
 
     fn pinNativeCheckpoint(self: *MainStoreOwner) !lsm_backend.Backend.NativeCheckpoint {
         return switch (self.*) {
-            .lmdb, .mem => error.Unsupported,
+            .mem => error.Unsupported,
             .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
         };
     }
 
     fn snapshotLsmNativeStorageStats(self: *const MainStoreOwner) ?lsm_backend.NativeStorageStats {
         return switch (self.*) {
-            .lmdb, .mem => null,
+            .mem => null,
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),
         };
     }
 
     fn runLsmMaintenanceStep(self: *MainStoreOwner) !bool {
         return switch (self.*) {
-            .lmdb, .mem => false,
+            .mem => false,
             .lsm => |*handle| try handle.backend.runMaintenanceStep(),
         };
     }
 
     fn runLsmMaintenanceStepBestEffort(self: *MainStoreOwner) !bool {
         return switch (self.*) {
-            .lmdb, .mem => false,
+            .mem => false,
             .lsm => |*handle| try handle.backend.runMaintenanceStepBestEffort(),
         };
     }
 
-    fn commitStatsSnapshot(self: *MainStoreOwner) ?lmdb.CommitStats {
+    fn commitStatsSnapshot(self: *MainStoreOwner) ?CommitStats {
         return switch (self.*) {
-            .lmdb => |backend| backend.commitStatsSnapshot(),
             .mem, .lsm => null,
         };
     }
@@ -1362,33 +1323,8 @@ pub const PersistentIndex = struct {
         return snap.segments.len != 0;
     }
 
-    fn openMainStore(alloc: Allocator, index_path_z: [*:0]const u8, index_path: []const u8, opts: PersistentIndexOptions) !OpenedMainStore {
+    fn openMainStore(alloc: Allocator, index_path: []const u8, opts: PersistentIndexOptions) !OpenedMainStore {
         switch (opts.main_backend) {
-            .lmdb => {
-                if (!supports_main_lmdb) return error.UnsupportedPlatform;
-                const backend = try alloc.create(lmdb_backend.Backend);
-                errdefer alloc.destroy(backend);
-                backend.* = try lmdb_backend.Backend.open(alloc, index_path_z, .{
-                    .backend = .{
-                        .durability = if (opts.main_no_sync) .none else .full,
-                    },
-                    .env = .{
-                        .max_dbs = 3,
-                        .map_size = opts.main_map_size,
-                        .no_sync = opts.main_no_sync,
-                        .no_meta_sync = opts.main_no_meta_sync,
-                        .commit_backend = opts.main_commit_backend,
-                    },
-                });
-                errdefer backend.close();
-
-                var store = try backend.runtimeNamespaceStore(alloc);
-                errdefer store.deinit();
-                return .{
-                    .store = store,
-                    .owner = .{ .lmdb = backend },
-                };
-            },
             .mem => {
                 const backend = try alloc.create(mem_backend.Backend);
                 errdefer alloc.destroy(backend);
@@ -1436,9 +1372,7 @@ pub const PersistentIndex = struct {
         const path_span = std.mem.span(opts.path);
         const wal_storage = opts.wal_storage orelse opts.main_lsm_storage;
         const needs_host_dirs =
-            opts.main_backend == .lmdb or
             (opts.main_backend == .lsm and opts.main_lsm_storage == null) or
-            opts.resolvedWalBackend() == .lmdb or
             (opts.resolvedWalBackend() == .lsm and wal_storage == null);
 
         // Create subdirectories
@@ -1460,7 +1394,7 @@ pub const PersistentIndex = struct {
         defer alloc.free(wal_path);
 
         var segment_files: ?SegmentFileStore = null;
-        if (supports_main_lmdb) {
+        if (builtin.os.tag != .freestanding or opts.main_lsm_storage != null) {
             var segments_buf: [512]u8 = undefined;
             const segments_path = std.fmt.bufPrint(&segments_buf, "{s}/segments", .{path_span}) catch return error.PathTooLong;
             segment_files = try SegmentFileStore.open(
@@ -1492,7 +1426,7 @@ pub const PersistentIndex = struct {
         errdefer wal.close();
 
         // Open main backing store
-        var opened_main = try openMainStore(alloc, index_path.ptr, index_path_span, opts);
+        var opened_main = try openMainStore(alloc, index_path_span, opts);
         errdefer {
             opened_main.store.deinit();
             opened_main.owner.close(alloc);
@@ -1541,14 +1475,16 @@ pub const PersistentIndex = struct {
                 } else if (segment_files) |*store| blk: {
                     const segment_path = try store.pathAlloc(seg_id);
                     defer store.allocator.free(segment_path);
-                    if (store.storage_owner != null) {
-                        break :blk index_mod.SegmentData.fromMapped(store.mapFile(segment_path) catch |err| switch (err) {
-                            error.FileNotFound => {
-                                try stale_active_ids.append(alloc, seg_id);
-                                continue;
-                            },
-                            else => return err,
-                        });
+                    if (comptime builtin.os.tag != .freestanding) {
+                        if (store.storage_owner != null) {
+                            break :blk index_mod.SegmentData.fromMapped(store.mapFile(segment_path) catch |err| switch (err) {
+                                error.FileNotFound => {
+                                    try stale_active_ids.append(alloc, seg_id);
+                                    continue;
+                                },
+                                else => return err,
+                            });
+                        }
                     }
                     const loaded = store.storage.readFileAlloc(alloc, segment_path, std.math.maxInt(usize)) catch |err| switch (err) {
                         error.FileNotFound => {
@@ -1902,21 +1838,21 @@ pub const PersistentIndex = struct {
 
     pub fn lsmMaintenanceDebtHint(self: *const PersistentIndex) u64 {
         return switch (self.main_store_owner) {
-            .lmdb, .mem => 0,
+            .mem => 0,
             .lsm => |handle| handle.backend.maintenanceDebtHint(),
         };
     }
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PersistentIndex) ?u64 {
         return switch (self.main_store_owner) {
-            .lmdb, .mem => null,
+            .mem => null,
             .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
         };
     }
 
     pub fn refreshLsmMaintenanceDebtHint(self: *PersistentIndex) void {
         switch (self.main_store_owner) {
-            .lmdb, .mem => {},
+            .mem => {},
             .lsm => |handle| handle.backend.refreshMaintenanceDebtHint(),
         }
     }
@@ -2201,7 +2137,7 @@ pub const PersistentIndex = struct {
         ctx: *anyopaque,
         build_fn: SegmentSinkBuildFn,
     ) !usize {
-        if (self.segment_files == null or self.segment_files.?.storage_owner == null) {
+        if (builtin.os.tag == .freestanding or self.segment_files == null or self.segment_files.?.storage_owner == null) {
             var sink_impl = segment_mod.MemorySegmentSink.init(self.alloc);
             errdefer sink_impl.deinit();
             var sink = sink_impl.sink();
@@ -2364,7 +2300,7 @@ pub const PersistentIndex = struct {
         return self.wal.statsSnapshot();
     }
 
-    pub fn commitStatsSnapshot(self: *PersistentIndex) ?lmdb.CommitStats {
+    pub fn commitStatsSnapshot(self: *PersistentIndex) ?CommitStats {
         return self.main_store_owner.commitStatsSnapshot();
     }
 
@@ -2378,8 +2314,6 @@ pub const PersistentIndex = struct {
     pub fn memoryStatsSnapshot(self: *PersistentIndex) PersistentIndexMemoryStats {
         const residency = self.writer.mappedResidencyStats();
         return .{
-            .configured_lmdb_main_map_bytes = if (self.main_backend == .lmdb) @intCast(self.main_map_size) else 0,
-            .configured_lmdb_wal_map_bytes = if (self.wal_backend == .lmdb) @intCast(self.wal_map_size) else 0,
             .segment_virtual_mapped_bytes = residency.virtual_mapped_bytes,
             .segment_estimated_resident_bytes = residency.estimated_resident_bytes,
             .segment_recently_touched_bytes = residency.recently_touched_bytes,
@@ -3100,8 +3034,10 @@ pub const PersistentIndex = struct {
     }
 
     fn materializeSegmentData(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8) !index_mod.SegmentData {
-        if (self.segment_files) |*store| {
-            return try store.publish(seg_id, segment_bytes);
+        if (comptime @import("builtin").os.tag != .freestanding) {
+            if (self.segment_files) |*store| {
+                return try store.publish(seg_id, segment_bytes);
+            }
         }
         return index_mod.SegmentData.fromOwnedHeap(try self.alloc.dupe(u8, segment_bytes));
     }
@@ -4070,7 +4006,7 @@ test "persistent index keeps high-frequency keyword postings across many segment
     try std.testing.expectEqual(@as(u32, 763), draft.total_count);
 }
 
-test "persistent index exposes wal and lmdb commit stats" {
+test "persistent segment-file publication does not append to WAL" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = persistTmpPath(&path_buf);
@@ -4088,19 +4024,9 @@ test "persistent index exposes wal and lmdb commit stats" {
     try pi.indexSegment(seg);
 
     const stats = pi.statsSnapshot();
-    if (supports_main_lmdb) {
-        try std.testing.expectEqual(@as(u64, 0), stats.wal.append_calls);
-    } else {
-        try std.testing.expectEqual(@as(u64, 1), stats.wal.append_calls);
-        try std.testing.expect(stats.wal.physical_commits >= 1);
-    }
-    if (stats.main_commit) |commit| {
-        try std.testing.expect(commit.publish_calls >= 1);
-        try std.testing.expect(commit.full_publish_calls >= 1);
-        try std.testing.expect(commit.page_images_written > 0);
-        try std.testing.expect(commit.bytes_written > 0);
-        try std.testing.expect(commit.total_publish_ns > 0);
-    }
+    try std.testing.expectEqual(@as(u64, 0), stats.wal.logical_entries);
+    try std.testing.expectEqual(@as(u64, 0), stats.wal.physical_commits);
+    try std.testing.expect(stats.main_commit == null);
 }
 
 test "persistent index persists segment key ranges across reopen" {
@@ -4917,8 +4843,6 @@ test "persistent index lsm maintenance debt hint tracks segment store writes" {
 }
 
 test "persistent index snapshots use mapped segment files when native storage is available" {
-    if (!supports_main_lmdb) return error.SkipZigTest;
-
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = persistTmpPath(&path_buf);
@@ -4942,8 +4866,6 @@ test "persistent index snapshots use mapped segment files when native storage is
 }
 
 test "persistent index deletes replaced segment files only after retained snapshot release" {
-    if (!supports_main_lmdb) return error.SkipZigTest;
-
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = persistTmpPath(&path_buf);
@@ -4991,8 +4913,6 @@ test "persistent index deletes replaced segment files only after retained snapsh
 }
 
 test "retired cleanup cannot reuse segment ids across reset" {
-    if (!supports_main_lmdb) return error.SkipZigTest;
-
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = persistTmpPath(&path_buf);
@@ -5029,8 +4949,6 @@ test "retired cleanup cannot reuse segment ids across reset" {
 }
 
 test "removed segment high-water survives close with a retained snapshot" {
-    if (!supports_main_lmdb) return error.SkipZigTest;
-
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = persistTmpPath(&path_buf);
@@ -5066,8 +4984,6 @@ test "removed segment high-water survives close with a retained snapshot" {
 }
 
 test "crash rollback fence disarms retained segment cleanup" {
-    if (!supports_main_lmdb) return error.SkipZigTest;
-
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = persistTmpPath(&path_buf);
@@ -5275,18 +5191,6 @@ fn expectPersistentCrashOutcome(
     }
 }
 
-fn classifyPersistentCrashSummary(
-    before: PersistentSimSummary,
-    after: PersistentSimSummary,
-    actual: PersistentSimSummary,
-    phase: lmdb.CommitPublishPhase,
-) !PersistentCrashOutcome {
-    _ = before;
-    _ = phase;
-    try expectPersistentSummariesEqual("persistent-crash-committed", after, actual);
-    return .committed;
-}
-
 fn persistentSimSegment(alloc: Allocator, spec: PersistentSimSegmentSpec, step: usize) ![]u8 {
     return switch (spec) {
         .alpha => blk: {
@@ -5363,63 +5267,6 @@ fn replayPersistentSimActionsAtPath(
     return try persistentSimSummaryFromIndex(alloc, &pi);
 }
 
-fn persistSegmentAtPhaseForTest(
-    self: *PersistentIndex,
-    seg_id: u64,
-    segment_bytes: []const u8,
-    lsn: u64,
-    phase: lmdb.CommitPublishPhase,
-) !void {
-    const backend = switch (self.main_store_owner) {
-        .lmdb => |backend| backend,
-        else => return error.Unsupported,
-    };
-
-    var key_range = try extractSegmentKeyRange(self.alloc, segment_bytes);
-    defer key_range.deinit(self.alloc);
-
-    var raw = try backend.env.begin(.{});
-    defer raw.abort();
-    const segments_dbi = try raw.openDb(segments_db_name, .{ .create = true });
-    const meta_dbi = try raw.openDb(meta_db_name, .{ .create = true });
-
-    const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
-
-    try raw.put(segments_dbi, &seg_key, segment_bytes, .{});
-
-    const range_key = segmentRangeMetaKey(seg_id);
-    var buf = try self.alloc.alloc(u8, 8 + key_range.min_doc_key.len + key_range.max_doc_key.len);
-    defer self.alloc.free(buf);
-    buf[0..4].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(key_range.min_doc_key.len))));
-    @memcpy(buf[4..][0..key_range.min_doc_key.len], key_range.min_doc_key);
-    const max_off = 4 + key_range.min_doc_key.len;
-    buf[max_off..][0..4].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(key_range.max_doc_key.len))));
-    @memcpy(buf[max_off + 4 ..][0..key_range.max_doc_key.len], key_range.max_doc_key);
-    try raw.put(meta_dbi, &range_key, buf, .{});
-
-    const active_key = activeSegmentMetaKey(seg_id);
-    try raw.put(meta_dbi, &active_key, &.{1}, .{});
-
-    const lsn_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, lsn));
-    try raw.put(meta_dbi, meta_committed_lsn, &lsn_bytes, .{});
-    try raw.publishCommitPhaseForTest(phase);
-}
-
-pub fn indexSegmentPublishPhaseForTest(
-    self: *PersistentIndex,
-    segment_bytes: []const u8,
-    phase: lmdb.CommitPublishPhase,
-) !void {
-    const lsn = try self.wal.append(segment_bytes);
-
-    self.writer.lockMutex();
-    const seg_id = self.writer.next_segment_id;
-    self.writer.next_segment_id += 1;
-    self.writer.mu.unlock();
-
-    try persistSegmentAtPhaseForTest(self, seg_id, segment_bytes, lsn, phase);
-}
-
 fn applyCommittedPersistentActionAtPath(
     alloc: Allocator,
     path: [*:0]const u8,
@@ -5431,59 +5278,6 @@ fn applyCommittedPersistentActionAtPath(
     var pi = try PersistentIndex.open(alloc, opts);
     defer pi.close();
     try applyPersistentReplayAction(&pi, alloc, action, step);
-}
-
-fn applyPersistentCrashActionAtPath(
-    alloc: Allocator,
-    path: [*:0]const u8,
-    opts: PersistentIndexOptions,
-    step: usize,
-    action: PersistentSimAction,
-    phase: lmdb.CommitPublishPhase,
-) !void {
-    _ = path;
-    var pi = try PersistentIndex.open(alloc, opts);
-    defer pi.close();
-
-    switch (action) {
-        .reopen => return error.InvalidFixture,
-        .index_segment => |spec| {
-            const segment = try persistentSimSegment(alloc, spec, step);
-            defer alloc.free(segment);
-            try indexSegmentPublishPhaseForTest(&pi, segment, phase);
-        },
-    }
-}
-
-fn replayPersistentCrashWorkload(
-    alloc: Allocator,
-    opts: PersistentIndexOptions,
-    case_label: []const u8,
-    prelude_actions: []const PersistentSimAction,
-    crash_action: PersistentSimAction,
-    phase: lmdb.CommitPublishPhase,
-) !PersistentCrashOutcome {
-    var committed_path_buf: [256]u8 = undefined;
-    const committed_path = persistTmpPathWithSuffix(&committed_path_buf, "sim-crash-committed");
-    defer cleanupPersistDir(committed_path);
-
-    var crash_path_buf: [256]u8 = undefined;
-    const crash_path = persistTmpPathWithSuffix(&crash_path_buf, "sim-crash-phase");
-    defer cleanupPersistDir(crash_path);
-
-    _ = try replayPersistentSimActionsAtPath(alloc, committed_path, persistentSimOptionsAtPath(committed_path, opts), prelude_actions);
-    _ = try replayPersistentSimActionsAtPath(alloc, crash_path, persistentSimOptionsAtPath(crash_path, opts), prelude_actions);
-
-    const before = try replayPersistentSimActionsAtPath(alloc, committed_path, persistentSimOptionsAtPath(committed_path, opts), &.{});
-
-    try applyCommittedPersistentActionAtPath(alloc, committed_path, persistentSimOptionsAtPath(committed_path, opts), prelude_actions.len, crash_action);
-    const after = try replayPersistentSimActionsAtPath(alloc, committed_path, persistentSimOptionsAtPath(committed_path, opts), &.{});
-
-    try applyPersistentCrashActionAtPath(alloc, crash_path, persistentSimOptionsAtPath(crash_path, opts), prelude_actions.len, crash_action, phase);
-    const actual = try replayPersistentSimActionsAtPath(alloc, crash_path, persistentSimOptionsAtPath(crash_path, opts), &.{});
-
-    _ = case_label;
-    return try classifyPersistentCrashSummary(before, after, actual, phase);
 }
 
 fn persistentSimOptionsAtPath(path: [*:0]const u8, opts: PersistentIndexOptions) PersistentIndexOptions {
@@ -5553,42 +5347,6 @@ fn writePersistentReplayFixtureArtifact(
     return path;
 }
 
-fn writePersistentCrashFixtureArtifact(
-    alloc: Allocator,
-    opts: PersistentIndexOptions,
-    case_label: []const u8,
-    seed: u64,
-    phase: lmdb.CommitPublishPhase,
-    expectation_note: []const u8,
-    expected_outcome: PersistentCrashOutcome,
-    prelude_actions: []const PersistentSimAction,
-    crash_action: PersistentSimAction,
-) !?[]u8 {
-    var path_buf: [256]u8 = undefined;
-    const artifact_path = persistentReplayArtifactPath(&path_buf, case_label);
-    const path = try alloc.dupe(u8, artifact_path);
-    errdefer alloc.free(path);
-
-    const normalized = try persistent_sim_fixture.renderCrashArtifact(
-        alloc,
-        blk: {
-            var fixture_opts = fixtureOptionsFromPersistentOptions(opts);
-            fixture_opts.expected_outcome = expected_outcome;
-            break :blk fixture_opts;
-        },
-        case_label,
-        seed,
-        @tagName(phase),
-        expectation_note,
-        prelude_actions,
-        crash_action,
-    );
-    defer alloc.free(normalized);
-
-    try writePersistentReplayArtifactFile(path, normalized);
-    return path;
-}
-
 fn printPersistentAction(action: PersistentSimAction) !void {
     const line = try persistent_sim_fixture.renderAction(std.testing.allocator, action);
     defer std.testing.allocator.free(line);
@@ -5645,79 +5403,6 @@ fn reportReducedPersistentSchedule(
     for (reduced) |action| try printPersistentAction(action);
 }
 
-fn reportReducedPersistentCrashSchedule(
-    alloc: Allocator,
-    opts: PersistentIndexOptions,
-    case_label: []const u8,
-    seed: u64,
-    phase: lmdb.CommitPublishPhase,
-    prelude_actions: []const PersistentSimAction,
-    crash_action: PersistentSimAction,
-) !void {
-    const Replayer = struct {
-        alloc: Allocator,
-        opts: PersistentIndexOptions,
-        case_label: []const u8,
-        phase: lmdb.CommitPublishPhase,
-        crash_action: PersistentSimAction,
-
-        pub fn replay(self: @This(), candidate: []const PersistentSimAction) !void {
-            _ = try replayPersistentCrashWorkload(self.alloc, self.opts, self.case_label, candidate, self.crash_action, self.phase);
-        }
-    };
-
-    const reduced = try zig_lmdb.sim.reduceFailingSequence(
-        PersistentSimAction,
-        alloc,
-        prelude_actions,
-        Replayer{
-            .alloc = alloc,
-            .opts = opts,
-            .case_label = case_label,
-            .phase = phase,
-            .crash_action = crash_action,
-        },
-    );
-    defer alloc.free(reduced);
-
-    var expected_path_buf: [256]u8 = undefined;
-    const expected_path = persistTmpPathWithSuffix(&expected_path_buf, "sim-crash-expected");
-    defer cleanupPersistDir(expected_path);
-
-    _ = try replayPersistentSimActionsAtPath(alloc, expected_path, persistentSimOptionsAtPath(expected_path, opts), reduced);
-    const before = try replayPersistentSimActionsAtPath(alloc, expected_path, persistentSimOptionsAtPath(expected_path, opts), &.{});
-    try applyCommittedPersistentActionAtPath(alloc, expected_path, persistentSimOptionsAtPath(expected_path, opts), reduced.len, crash_action);
-    const after = try replayPersistentSimActionsAtPath(alloc, expected_path, persistentSimOptionsAtPath(expected_path, opts), &.{});
-
-    var actual_path_buf: [256]u8 = undefined;
-    const actual_path = persistTmpPathWithSuffix(&actual_path_buf, "sim-crash-actual");
-    defer cleanupPersistDir(actual_path);
-
-    _ = try replayPersistentSimActionsAtPath(alloc, actual_path, persistentSimOptionsAtPath(actual_path, opts), reduced);
-    try applyPersistentCrashActionAtPath(alloc, actual_path, persistentSimOptionsAtPath(actual_path, opts), reduced.len, crash_action, phase);
-    const actual = try replayPersistentSimActionsAtPath(alloc, actual_path, persistentSimOptionsAtPath(actual_path, opts), &.{});
-    const expected_outcome = try classifyPersistentCrashSummary(before, after, actual, phase);
-
-    const artifact_path = writePersistentCrashFixtureArtifact(
-        alloc,
-        opts,
-        case_label,
-        seed,
-        phase,
-        "expected persistent reopen to recover the committed snapshot once the WAL append has completed",
-        expected_outcome,
-        reduced,
-        crash_action,
-    ) catch |err| blk: {
-        std.debug.print("failed to write persistent crash artifact for {s}: {s}\n", .{ case_label, @errorName(err) });
-        break :blk null;
-    };
-    defer if (artifact_path) |path| alloc.free(path);
-
-    std.debug.print("reduced failing persistent crash prelude ({d} actions):\n", .{reduced.len});
-    if (artifact_path) |path| std.debug.print("replay fixture: {s}\n", .{path});
-}
-
 fn randomPersistentAction(random: std.Random) PersistentSimAction {
     if (random.uintLessThan(u8, 5) == 0) return .reopen;
     const spec_index = random.uintLessThan(u8, 4);
@@ -5752,44 +5437,6 @@ fn runPersistentReplayCase(
     try expectPersistentSummariesEqual(case_label, expectedPersistentSummary(actions.items), actual);
 }
 
-fn randomPersistentCrashAction(random: std.Random) PersistentSimAction {
-    return .{ .index_segment = @enumFromInt(random.uintLessThan(u8, 4)) };
-}
-
-fn runPersistentCrashCase(
-    alloc: Allocator,
-    opts: PersistentIndexOptions,
-    case_label: []const u8,
-    seed: u64,
-    steps: usize,
-) !void {
-    if (!zig_lmdb.is_zig_backend) return;
-
-    const phases = [_]lmdb.CommitPublishPhase{
-        .before_data_sync,
-        .after_data_sync_before_meta,
-        .after_meta_write_before_meta_sync,
-        .fully_published,
-    };
-
-    var prng = std.Random.DefaultPrng.init(seed);
-    const random = prng.random();
-
-    var prelude = std.ArrayListUnmanaged(PersistentSimAction).empty;
-    defer prelude.deinit(alloc);
-    for (0..steps) |_| {
-        try prelude.append(alloc, randomPersistentAction(random));
-    }
-
-    for (phases, 0..) |phase, phase_index| {
-        const crash_action = randomPersistentCrashAction(random);
-        _ = replayPersistentCrashWorkload(alloc, opts, case_label, prelude.items, crash_action, phase) catch |err| {
-            reportReducedPersistentCrashSchedule(alloc, opts, case_label, seed + phase_index, phase, prelude.items, crash_action) catch {};
-            return err;
-        };
-    }
-}
-
 fn replayPersistentFixtureFile(alloc: Allocator, name: []const u8) !void {
     const path = try std.fmt.allocPrint(alloc, "pkg/antfly/src/storage/persistent_sim_fixtures/{s}", .{name});
     defer alloc.free(path);
@@ -5804,25 +5451,13 @@ fn replayPersistentFixtureFile(alloc: Allocator, name: []const u8) !void {
     const tmp_path = persistTmpPathWithSuffix(&path_buf, "fixture");
     defer cleanupPersistDir(tmp_path);
 
-    var opts = persistentSimOptionsToIndexOptions(tmp_path, fixture.opts);
-    if (fixture.mode == .crash) opts.main_backend = .lmdb;
+    const opts = persistentSimOptionsToIndexOptions(tmp_path, fixture.opts);
     switch (fixture.mode) {
         .replay => {
             const summary = try replayPersistentSimActionsAtPath(alloc, tmp_path, opts, fixture.actions);
             try expectPersistentSummaryFields(fixture.case_label orelse fixture.label orelse name, fixture.opts, summary);
         },
-        .crash => {
-            if (!zig_lmdb.is_zig_backend) return;
-            const outcome = try replayPersistentCrashWorkload(
-                alloc,
-                opts,
-                fixture.case_label orelse fixture.label orelse name,
-                fixture.prelude_actions,
-                fixture.crash_action orelse return error.InvalidFixture,
-                std.meta.stringToEnum(lmdb.CommitPublishPhase, fixture.phase orelse return error.InvalidFixture) orelse return error.InvalidFixture,
-            );
-            try expectPersistentCrashOutcome(fixture.case_label orelse fixture.label orelse name, fixture.opts, outcome);
-        },
+        .crash => try replayModeledPersistentFixtureFile(alloc, name),
     }
 }
 
@@ -6338,22 +5973,12 @@ fn runPersistentSoak(alloc: Allocator) !void {
         0xA17F_B203,
         60,
     );
-    try runPersistentCrashCase(alloc, .{ .path = "", .main_backend = .lmdb }, "persistent-soak-crash-default", 0xA17F_B204, 16);
-    try runPersistentCrashCase(
-        alloc,
-        .{ .path = "", .main_backend = .lmdb, .main_commit_backend = .async_io },
-        "persistent-soak-crash-async-main",
-        0xA17F_B205,
-        16,
-    );
 }
 
 test "persistent sim workloads stay green" {
     const alloc = std.testing.allocator;
     try runPersistentReplayCase(alloc, .{ .path = "" }, "persistent-default", 0xA17F_B001, 16);
     try runPersistentReplayCase(alloc, .{ .path = "", .main_commit_backend = .async_io, .wal_commit_backend = .worker_thread }, "persistent-async-main", 0xA17F_B002, 14);
-    try runPersistentCrashCase(alloc, .{ .path = "", .main_backend = .lmdb }, "persistent-crash-default", 0xA17F_B101, 6);
-    try runPersistentCrashCase(alloc, .{ .path = "", .main_backend = .lmdb, .main_commit_backend = .async_io }, "persistent-crash-async-main", 0xA17F_B102, 6);
 }
 
 test "persistent replay fixtures stay green" {

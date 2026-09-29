@@ -6,7 +6,7 @@ const std = @import("std");
 pub const CORSConfig = struct {
     /// Controls whether CORS is enabled
     enabled: ?bool = null,
-    /// List of allowed origins for CORS requests. Use ['*'] to allow all origins. Defaults to ['*'] if empty and enabled is true. Credentialed CORS rejects both '*' and the opaque 'null' origin.
+    /// List of allowed origins for CORS requests. Use ['*'] to allow all origins. Omitted or empty lists deny cross-origin access, even when enabled is true. Wildcard access requires explicitly configuring ['*']. Credentialed CORS rejects both '*' and the opaque 'null' origin.
     allowed_origins: ?[]const []const u8 = null,
     /// HTTP methods allowed for CORS requests
     allowed_methods: ?[]const []const u8 = null,
