@@ -62,9 +62,27 @@ fn propertyType(property: anytype) ast.ColumnType {
     if (std.mem.eql(u8, name, "number") or std.mem.eql(u8, name, "numeric")) return .number;
     if (std.mem.eql(u8, name, "boolean")) return .boolean;
     if (std.mem.eql(u8, name, "datetime")) return .datetime;
+    if (property.format != null and std.mem.eql(u8, property.format.?, "uuid") and
+        (std.mem.eql(u8, name, "keyword") or std.mem.eql(u8, name, "string") or std.mem.eql(u8, name, "text"))) return .uuid;
     if (std.mem.eql(u8, name, "string") or std.mem.eql(u8, name, "text") or
         std.mem.eql(u8, name, "keyword") or std.mem.eql(u8, name, "html") or std.mem.eql(u8, name, "link")) return .string;
     return .json;
+}
+
+test "SQL UUID schema projection retains typed column and canonical cell" {
+    const Property = struct { name: []const u8, field_type: ?[]const u8 = "keyword", format: ?[]const u8 = "uuid", integer_only: bool = false, allows_null: bool = false };
+    const Document = struct { properties: []const Property, required_fields: []const []const u8 = &.{"id"} };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const columns = try deriveColumns(alloc, .{ .document_schemas = &[_]Document{.{ .properties = &.{.{ .name = "id" }} }} });
+    try std.testing.expectEqual(ast.ColumnType.uuid, columns[0].type);
+    const projected = try projectValue(alloc, .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = columns }, "key", 1, .{ .object = blk: {
+        var value: std.json.ObjectMap = .empty;
+        try value.put(alloc, "id", .{ .string = "A0EEBC999C0B4EF8BB6D6BB9BD380A11" });
+        break :blk value;
+    } }, &.{"id"});
+    try std.testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", projected.value.object.get("id").?.string);
 }
 
 pub fn decode(alloc: std.mem.Allocator, table: catalog.Table, id: []const u8, version: u64, bytes: []const u8, fields: []const []const u8) !catalog.Row {
@@ -149,6 +167,10 @@ fn coerce(alloc: std.mem.Allocator, value: Json, kind: ast.ColumnType) !Json {
         },
         .boolean => if (value == .bool) value else error.SqlTypeMismatch,
         .string => if (value == .string) typed_json.clone(alloc, value) else error.SqlTypeMismatch,
+        .uuid => if (value == .string) .{ .string = @import("../common/uuid.zig").canonicalAlloc(alloc, value.string) catch |err| switch (err) {
+            error.InvalidUuid => return error.SqlTypeMismatch,
+            else => return err,
+        } } else error.SqlTypeMismatch,
         .datetime => blk: {
             const ns: u64 = switch (value) {
                 .integer => |integer| std.math.cast(u64, integer) orelse return error.SqlTypeMismatch,
@@ -247,7 +269,7 @@ test "SQL document integer decoding is exact and bounded" {
 
 test "SQL document declared shape and projection clean up allocation failures" {
     const Fixture = struct {
-        const Property = struct { name: []const u8, field_type: ?[]const u8 = null, integer_only: bool = false, allows_null: bool = false };
+        const Property = struct { name: []const u8, field_type: ?[]const u8 = null, format: ?[]const u8 = null, integer_only: bool = false, allows_null: bool = false };
         const Document = struct { properties: []const Property, required_fields: []const []const u8 = &.{} };
         fn run(backing: std.mem.Allocator) !void {
             var arena = std.heap.ArenaAllocator.init(backing);

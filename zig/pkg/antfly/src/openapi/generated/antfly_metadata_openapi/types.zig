@@ -12026,6 +12026,7 @@ pub const SQLColumn = struct {
 /// Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
 pub const SQLColumnType = enum {
     string,
+    uuid,
     integer,
     number,
     boolean,
@@ -12036,6 +12037,7 @@ pub const SQLColumnType = enum {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .string => "string",
+            .uuid => "uuid",
             .integer => "integer",
             .number => "number",
             .boolean => "boolean",
@@ -12053,6 +12055,7 @@ pub const SQLColumnType = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "string", .string },
+            .{ "uuid", .uuid },
             .{ "integer", .integer },
             .{ "number", .number },
             .{ "boolean", .boolean },

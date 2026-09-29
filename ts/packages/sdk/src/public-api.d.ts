@@ -4360,7 +4360,7 @@ export interface components {
          * @description Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
          * @enum {string}
          */
-        SQLColumnType: "string" | "integer" | "number" | "boolean" | "datetime" | "json" | "unknown";
+        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "unknown";
         SQLColumn: {
             /** @description Display label. Labels need not be unique; rows use matching ordinal positions. */
             name: string;

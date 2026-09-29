@@ -586,3 +586,91 @@ test "SQL catalog DDL authorizes before lookup and handles atomic conditional ou
     try std.testing.expectEqual(catalog.MutationOutcome.committed, (try execute(&server, null, .{}, "default", "public", alloc, .{ .drop_table = .{ .table = input.create_table.name, .if_exists = true } })).mutation_outcome);
     try std.testing.expectEqual(@as(usize, 3), source.calls);
 }
+
+test "SQL UUID prepared CREATE TABLE reaches mounted catalog mutation only on execute" {
+    const Source = struct {
+        mutations: usize = 0,
+        output: ?*std.Io.Writer.Allocating = null,
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn run(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: domain.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call != .mutate) return error.UnexpectedCall;
+            try std.testing.expect(std.mem.indexOf(u8, self.output.?.written(), "PREPARE\x00") != null);
+            const request = call.mutate;
+            try std.testing.expectEqual(domain.Kind.table, request.mutation.kind);
+            try std.testing.expectEqual(domain.Action.create, request.mutation.action);
+            try std.testing.expectEqualStrings("prepared_usage_records", request.mutation.name);
+            try std.testing.expectEqualStrings("default", request.mutation.database);
+            try std.testing.expectEqualStrings("public", request.mutation.namespace);
+            try std.testing.expect(std.mem.startsWith(u8, request.physical_name.?, "table:"));
+            var stored = try tables.parseStoredCreateTableRequest(alloc, request.create_table_json.?);
+            defer stored.deinit(alloc);
+            var validated = try tables.parseValidatedTableSchema(alloc, stored.schema_json.?);
+            defer validated.deinit(alloc);
+            const property = validated.document_schemas[0].properties[0];
+            try std.testing.expectEqualStrings("id", property.name);
+            try std.testing.expectEqualStrings("uuid", property.format.?);
+            self.mutations += 1;
+            return alloc.dupe(u8, "{}");
+        }
+    };
+    const alloc = std.testing.allocator;
+    const usermgr = @import("../usermgr/mod.zig");
+    const casbin = @import("antfly_casbin");
+    var user_store = usermgr.MemoryStore.init(alloc);
+    defer user_store.deinit();
+    var policies = casbin.MemoryAdapter.init(alloc);
+    defer policies.deinit();
+    var manager = try usermgr.UserManager.init(alloc, user_store.iface(), try usermgr.initDefaultEnforcer(alloc, policies.iface()));
+    defer manager.deinit();
+    var permission = try usermgr.Permission.initOwned(alloc, .table, "prepared_usage_records", .admin);
+    defer permission.deinit(alloc);
+    var user = try manager.createUser("ddl_admin", "secret", &.{permission});
+    defer user.deinit(alloc);
+    var runtime = try @import("../storage/background_runtime.zig").BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var source: Source = .{};
+    var server = server_mod.ApiHttpServer.init(alloc, .{ .user_manager = &manager, .backend_runtime = runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run } }, null, null);
+    defer server.deinit();
+    var adapter: @import("sql_pgwire.zig").Adapter = .{ .server = &server };
+    const Wire = struct {
+        fn frame(out: *std.Io.Writer, tag: u8, payload: []const u8) !void {
+            try out.writeByte(tag);
+            try out.writeInt(u32, @intCast(payload.len + 4), .big);
+            try out.writeAll(payload);
+        }
+    };
+    var input = std.Io.Writer.Allocating.init(alloc);
+    defer input.deinit();
+    const startup = "user\x00ddl_admin\x00database\x00default\x00\x00";
+    try input.writer.writeInt(u32, @intCast(startup.len + 8), .big);
+    try input.writer.writeInt(u32, 196608, .big);
+    try input.writer.writeAll(startup);
+    try Wire.frame(&input.writer, 'p', "secret\x00");
+    try Wire.frame(&input.writer, 'Q', "PREPARE create_usage_plan AS CREATE TABLE prepared_usage_records (id uuid)\x00");
+    try Wire.frame(&input.writer, 'Q', "EXECUTE create_usage_plan\x00");
+    try Wire.frame(&input.writer, 'X', "");
+    var reader = std.Io.Reader.fixed(input.written());
+    var output = std.Io.Writer.Allocating.init(alloc);
+    defer output.deinit();
+    source.output = &output;
+    var session: @import("../pgwire/protocol.zig").Session = .{ .alloc = alloc, .io = std.testing.io, .source = adapter.backend(), .reader = &reader, .writer = &output.writer };
+    defer session.deinit();
+    try session.run();
+    var frames: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = output.written() };
+    var completions: usize = 0;
+    while (frames.offset < frames.bytes.len) {
+        const tag = try frames.int(u8);
+        const size = try frames.int(u32);
+        const payload = try frames.take(size - 4);
+        if (tag == 'E') return error.UnexpectedPgwireError;
+        if (tag == 'C') {
+            try std.testing.expectEqualStrings(if (completions == 0) "PREPARE\x00" else "CREATE TABLE\x00", payload);
+            completions += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), completions);
+    try std.testing.expectEqual(@as(usize, 1), source.mutations);
+}

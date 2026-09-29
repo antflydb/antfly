@@ -12065,6 +12065,7 @@ components:
         in every client.
       enum:
         - string
+        - uuid
         - integer
         - number
         - boolean

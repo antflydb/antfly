@@ -95,9 +95,12 @@ catalog identity and row-policy state.
 authenticated mounted pgwire adapter; EXECUTE admits one durable TRUNCATE
 generation job and returns its pending receipt, not a false synchronous
 completion. The staged restore gate separately covers owner publication.
-For `sql-0004`, a pgwire regression proves PREPARE defers execution and EXECUTE
-retains a pending-DDL receipt without a false success, but the case remains
-unresolved until its CREATE TABLE form has mounted catalog/owner evidence.
+For `sql-0004`, the exact prepared UUID CREATE TABLE now passes the authenticated
+mounted pgwire adapter: PREPARE makes no catalog mutation, and EXECUTE submits
+one validated typed schema. The native relational preparation path canonicalizes
+UUIDs before hashing and indexing, and pgwire accepts text and binary UUIDs.
+The case remains unresolved until a durable catalog replay and physical owner
+publication are observed; a mounted callback alone cannot prove that outcome.
 `sql-0037`, `sql-0039`, `sql-0041`, `sql-0043`, and `sql-0046` are tested
 supersessions of catalog/admin session mutations. Their exact public-namespace
 and one-millisecond timeout commands run through the pgwire session state

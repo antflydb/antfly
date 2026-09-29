@@ -100,6 +100,7 @@ func TestPreparedSQLLifecycleAndTransportPolicy(t *testing.T) {
 	const id = "0123456789abcdef0123456789abcdef"
 	calls := 0
 	status := http.StatusOK
+	sawConnectionHeader := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		if status != http.StatusOK {
@@ -116,6 +117,9 @@ func TestPreparedSQLLifecycleAndTransportPolicy(t *testing.T) {
 		case "/db/v1/sql/prepared/" + id:
 			if r.Method != http.MethodDelete {
 				t.Errorf("close method: %s", r.Method)
+			}
+			if r.Header.Get("X-Antfly-SQL-Connection-Id") == id {
+				sawConnectionHeader = true
 			}
 			_, _ = io.WriteString(w, `{}`)
 		default:
@@ -137,6 +141,12 @@ func TestPreparedSQLLifecycleAndTransportPolicy(t *testing.T) {
 	}
 	if err := client.ClosePreparedSQL(context.Background(), id); err != nil {
 		t.Fatal(err)
+	}
+	if err := client.ClosePreparedSQL(context.Background(), id, id); err != nil {
+		t.Fatal(err)
+	}
+	if !sawConnectionHeader {
+		t.Fatal("connection-bound close did not forward the connection ID")
 	}
 	operations := []func() error{
 		func() error {

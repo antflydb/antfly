@@ -671,8 +671,19 @@ func (c *AntflyClient) ExecutePreparedSQL(ctx context.Context, preparedID string
 }
 
 // ClosePreparedSQL releases a resource without canceling admitted executions.
-func (c *AntflyClient) ClosePreparedSQL(ctx context.Context, preparedID string) error {
-	resp, err := c.client.ClosePreparedSQL(ctx, preparedID)
+// Connection-bound resources require their connection ID; durable resources do not.
+func (c *AntflyClient) ClosePreparedSQL(ctx context.Context, preparedID string, connectionID ...string) error {
+	if len(connectionID) > 1 {
+		return fmt.Errorf("close prepared SQL accepts at most one connection ID")
+	}
+	var params *oapi.ClosePreparedSQLParams
+	if len(connectionID) == 1 {
+		if connectionID[0] == "" {
+			return fmt.Errorf("close prepared SQL connection ID cannot be empty")
+		}
+		params = &oapi.ClosePreparedSQLParams{XAntflySQLConnectionId: connectionID[0]}
+	}
+	resp, err := c.client.ClosePreparedSQL(ctx, preparedID, params)
 	if err != nil {
 		return err
 	}

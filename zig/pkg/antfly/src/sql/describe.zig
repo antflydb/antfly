@@ -416,7 +416,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         for (bound.columns[0..insertion.columns.len], insertion.columns) |source_column, name| {
             const destination = try table.column(name);
             const untyped_null = source_column.untyped_null;
-            if (!untyped_null and source_column.type != destination.type and !(source_column.type == .integer and destination.type == .number) and !(insertion.values_source_rows.len != 0 and source_column.type == .string and (destination.type == .datetime or destination.type == .json))) return error.SqlTypeMismatch;
+            if (!untyped_null and source_column.type != destination.type and !(source_column.type == .integer and destination.type == .number) and !(insertion.values_source_rows.len != 0 and source_column.type == .string and (destination.type == .datetime or destination.type == .json or destination.type == .uuid))) return error.SqlTypeMismatch;
         }
         result.insert_source = bound;
         result.parameter_types = bound.parameter_types;
@@ -684,6 +684,10 @@ const Context = struct {
 /// Parsed data belongs to the caller's request arena.
 pub fn bindLiteral(allocator: std.mem.Allocator, node: ast.Value, kind: ast.ColumnType) !Json {
     if (node == .parameter) return error.InvalidSqlParameters;
+    if (node == .string and kind == .uuid) return .{ .string = @import("../common/uuid.zig").canonicalAlloc(allocator, node.string) catch |err| switch (err) {
+        error.InvalidUuid => return error.SqlTypeMismatch,
+        else => return err,
+    } };
     if (node == .string and kind == .json) {
         // Admit nesting before constructing the tree: otherwise a 1 MiB SQL
         // string of brackets could allocate a huge dynamic JSON value before
@@ -785,6 +789,11 @@ pub fn coerce(raw: Json, kind: ast.ColumnType) !Json {
         },
         .boolean => if (raw == .bool) raw else error.SqlTypeMismatch,
         .string, .datetime => if (raw == .string) raw else error.SqlTypeMismatch,
+        .uuid => blk: {
+            if (raw != .string) return error.SqlTypeMismatch;
+            _ = @import("../common/uuid.zig").parse(raw.string) catch return error.SqlTypeMismatch;
+            break :blk raw;
+        },
         .json => raw,
     };
 }

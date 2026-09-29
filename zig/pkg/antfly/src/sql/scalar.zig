@@ -142,8 +142,11 @@ pub fn bindExpectedWithSettings(alloc: Allocator, expression: *const ast.Scalar,
 fn numeric(kind: ?ast.ColumnType) bool {
     return kind == .integer or kind == .number;
 }
+fn uuidTextOperand(expression: *const ast.Scalar) bool {
+    return expression.* == .literal and expression.literal == .string;
+}
 fn common(left: Type, right: Type) !Type {
-    const kind = if (left.kind == null) right.kind else if (right.kind == null) left.kind else if (left.kind == right.kind) left.kind else if (numeric(left.kind) and numeric(right.kind)) ast.ColumnType.number else return error.SqlTypeMismatch;
+    const kind = if (left.kind == null) right.kind else if (right.kind == null) left.kind else if (left.kind == right.kind) left.kind else if ((left.kind == .uuid and right.kind == .string) or (left.kind == .string and right.kind == .uuid)) ast.ColumnType.uuid else if (numeric(left.kind) and numeric(right.kind)) ast.ColumnType.number else return error.SqlTypeMismatch;
     return .{ .kind = kind, .nullable = left.nullable or right.nullable };
 }
 fn literalType(value: ast.Value) Type {
@@ -219,6 +222,8 @@ const Binder = struct {
             .binary => |binary| blk: {
                 const left = try self.infer(binary.left, depth + 1);
                 const right = try self.infer(binary.right, depth + 1);
+                if ((left.kind == .uuid and right.kind == .string and !uuidTextOperand(binary.right)) or
+                    (left.kind == .string and right.kind == .uuid and !uuidTextOperand(binary.left))) return error.SqlTypeMismatch;
                 if (binary.op == .json_get or binary.op == .json_text) {
                     if (left.kind != null and left.kind != .json) return error.SqlTypeMismatch;
                     if (right.kind != null and right.kind != .string and right.kind != .integer) return error.SqlTypeMismatch;
@@ -303,6 +308,7 @@ const Binder = struct {
         if (depth >= self.limits.depth or self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
         var kind = try self.infer(expression, depth);
         if (kind.kind == null) kind.kind = expected;
+        if (expected == .uuid and expression.* == .literal and expression.literal == .string) kind.kind = .uuid;
         var instruction: Instruction = .{ .type = kind, .operation = undefined };
         instruction.operation = switch (expression.*) {
             .literal => |value| if (value == .parameter) blk: {
@@ -320,7 +326,10 @@ const Binder = struct {
                 .boolean => |v| .{ .bool = v },
                 .integer => |v| .{ .integer = v },
                 .number => |v| .{ .float = v },
-                .string => |v| .{ .string = try self.alloc.dupe(u8, v) },
+                .string => |v| .{ .string = if (kind.kind == .uuid) @import("../common/uuid.zig").canonicalAlloc(self.alloc, v) catch |err| switch (err) {
+                    error.InvalidUuid => return error.SqlTypeMismatch,
+                    else => return err,
+                } else try self.alloc.dupe(u8, v) },
                 .parameter => unreachable,
             } },
             .column => |name| blk: {
@@ -387,19 +396,27 @@ const Binder = struct {
                         else => kind.kind,
                     };
                     const actual = try self.infer(arg, depth + 1);
-                    if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
+                    if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
                     out.* = try self.compile(arg, desired, depth + 1);
                 }
                 break :blk .{ .call = .{ .function = function, .args = args } };
             },
             .case_when => |case| blk: {
                 const branches = try self.alloc.alloc(Instruction.Branch, case.branches.len);
-                for (case.branches, branches) |branch, *out| out.* = .{ .condition = try self.compile(branch.condition, .boolean, depth + 1), .value = try self.compile(branch.value, kind.kind, depth + 1) };
+                for (case.branches, branches) |branch, *out| {
+                    if (kind.kind == .uuid and (try self.infer(branch.value, depth + 1)).kind == .string and !uuidTextOperand(branch.value)) return error.SqlTypeMismatch;
+                    out.* = .{ .condition = try self.compile(branch.condition, .boolean, depth + 1), .value = try self.compile(branch.value, kind.kind, depth + 1) };
+                }
+                if (case.otherwise) |other| if (kind.kind == .uuid and (try self.infer(other, depth + 1)).kind == .string and !uuidTextOperand(other)) return error.SqlTypeMismatch;
                 break :blk .{ .case_when = .{ .branches = branches, .otherwise = if (case.otherwise) |other| try self.compile(other, kind.kind, depth + 1) else null } };
             },
             .in_list => |list| blk: {
                 var merged = try self.infer(list.operand, depth + 1);
                 for (list.values) |item| merged = try common(merged, try self.infer(item, depth + 1));
+                if (merged.kind == .uuid) {
+                    if ((try self.infer(list.operand, depth + 1)).kind == .string and !uuidTextOperand(list.operand)) return error.SqlTypeMismatch;
+                    for (list.values) |item| if ((try self.infer(item, depth + 1)).kind == .string and !uuidTextOperand(item)) return error.SqlTypeMismatch;
+                }
                 const values = try self.alloc.alloc(u32, list.values.len);
                 for (list.values, values) |item, *out| out.* = try self.compile(item, merged.kind, depth + 1);
                 break :blk .{ .in_list = .{ .operand = try self.compile(list.operand, merged.kind, depth + 1), .values = values, .negated = list.negated } };
@@ -688,6 +705,10 @@ const Evaluator = struct {
                 else => error.SqlTypeMismatch,
             },
             .string => .{ .string = try self.formatText(value) },
+            .uuid => if (value == .string) .{ .string = @import("../common/uuid.zig").canonicalAlloc(self.alloc, value.string) catch |err| switch (err) {
+                error.InvalidUuid => return error.SqlTypeMismatch,
+                else => return err,
+            } } else error.SqlTypeMismatch,
             .datetime => blk: {
                 if (value != .string) return error.SqlTypeMismatch;
                 const ns = datetime.parseDateTimeToNs(value.string) orelse return error.InvalidSqlDateTime;
@@ -1091,6 +1112,33 @@ test "SQL scalar binding resolves ordinals and parameter types once" {
     try std.testing.expectEqual(@as(i64, 23), (try program.evaluate(std.testing.allocator, &.{Datum.json(.{ .integer = 7 })}, &.{.{ .integer = 3 }}, .{})).value.integer);
     try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(std.testing.allocator, &.{Datum.json(.{ .integer = std.math.maxInt(i64) })}, &.{.{ .integer = 3 }}, .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(std.testing.allocator, &.{Datum.json(.{ .integer = 7 })}, &.{.{ .integer = 3 }}, .{ .steps = 1 }));
+}
+
+test "SQL UUID comparison and cast canonicalize typed literals and parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const canonical = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
+    var comparison_expr = try @import("compiler.zig").compileScalar(std.testing.allocator, "id = 'A0EEBC999C0B4EF8BB6D6BB9BD380A11'", .{});
+    defer comparison_expr.deinit();
+    var program = try bind(std.testing.allocator, comparison_expr.expression, &.{.{ .name = "id", .type = .uuid }}, &.{}, .{});
+    defer program.deinit();
+    const result = try program.evaluate(alloc, &.{Datum.json(.{ .string = canonical })}, &.{}, .{});
+    try std.testing.expect(result.value.bool);
+
+    var parameter = try @import("compiler.zig").compileScalar(std.testing.allocator, "id = $1", .{});
+    defer parameter.deinit();
+    var bound = try bind(std.testing.allocator, parameter.expression, &.{.{ .name = "id", .type = .uuid }}, &.{}, .{});
+    defer bound.deinit();
+    try std.testing.expectEqual(ast.ColumnType.uuid, bound.parameter_types[0].?);
+    try std.testing.expect((try bound.evaluate(alloc, &.{Datum.json(.{ .string = canonical })}, &.{.{ .string = "{A0EEBC999C0B4EF8BB6D6BB9BD380A11}" }}, .{})).value.bool);
+    try std.testing.expectError(error.SqlTypeMismatch, bound.evaluate(alloc, &.{Datum.json(.{ .string = canonical })}, &.{.{ .string = "bad" }}, .{}));
+    var mismatched = try @import("compiler.zig").compileScalar(std.testing.allocator, "id = label", .{});
+    defer mismatched.deinit();
+    try std.testing.expectError(error.SqlTypeMismatch, bind(std.testing.allocator, mismatched.expression, &.{ .{ .name = "id", .type = .uuid }, .{ .name = "label", .type = .string } }, &.{}, .{}));
+    var mismatched_list = try @import("compiler.zig").compileScalar(std.testing.allocator, "id IN (label)", .{});
+    defer mismatched_list.deinit();
+    try std.testing.expectError(error.SqlTypeMismatch, bind(std.testing.allocator, mismatched_list.expression, &.{ .{ .name = "id", .type = .uuid }, .{ .name = "label", .type = .string } }, &.{}, .{}));
 }
 
 test "SQL discarded EXISTS projection binds parameters without retaining column dependencies" {

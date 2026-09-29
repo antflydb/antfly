@@ -127,7 +127,7 @@
     {
       "id": "sql-0004",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "The exact prepared CREATE TABLE statement now compiles a typed UUID schema and reaches one authenticated mounted catalog mutation only on EXECUTE. UUID normalization is shared by SQL, pgwire, and relational row preparation, but this case still lacks a durable metadata replay and owner-publication observation after CREATE; a callback-only mutation is not sufficient parity evidence."
     },
     {
       "id": "sql-0005",

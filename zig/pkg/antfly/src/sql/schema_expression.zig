@@ -24,7 +24,11 @@ pub fn lowerTyped(alloc: std.mem.Allocator, schema: Json, expression: *const ast
     var columns = std.ArrayList(scalar.Column).empty;
     for (properties.object.keys(), properties.object.values()) |name, property| {
         const wire_type = property.object.get("type").?.string;
-        const kind: ast.ColumnType = if (std.mem.eql(u8, wire_type, "keyword")) .string else std.meta.stringToEnum(ast.ColumnType, wire_type) orelse return error.UnsupportedSqlShape;
+        const format = property.object.get("format") orelse .null;
+        const kind: ast.ColumnType = if (format == .string and std.mem.eql(u8, format.string, "uuid") and
+            (std.mem.eql(u8, wire_type, "keyword") or std.mem.eql(u8, wire_type, "string") or std.mem.eql(u8, wire_type, "text")))
+            .uuid
+        else if (std.mem.eql(u8, wire_type, "keyword")) .string else std.meta.stringToEnum(ast.ColumnType, wire_type) orelse return error.UnsupportedSqlShape;
         try columns.append(alloc, .{ .name = name, .type = kind });
     }
     return lowerColumns(alloc, columns.items, expression, expected);
@@ -38,7 +42,7 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
     for (program.instructions, values) |instruction, *out| {
         const kind = instruction.type.kind orelse return error.SqlTypeMismatch;
         out.* = switch (instruction.operation) {
-            .literal => |literal| try json(alloc, .{ .op = "literal", .type = @tagName(kind), .value = literal }),
+            .literal => |literal| try json(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = literal }),
             .column => |ordinal| try json(alloc, .{ .op = "column", .column = columns[ordinal].name }),
             .parameter => return error.InvalidSqlParameters,
             .unary => |part| blk: {

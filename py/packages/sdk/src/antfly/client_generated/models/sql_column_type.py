@@ -9,6 +9,7 @@ class SQLColumnType(StrEnum):
     NUMBER = "number"
     STRING = "string"
     UNKNOWN = "unknown"
+    UUID = "uuid"
 
     def __str__(self) -> str:
         return str(self.value)

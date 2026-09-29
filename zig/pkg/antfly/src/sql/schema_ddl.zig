@@ -137,7 +137,7 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
                 const nulls: []const u8 = if (key.nulls_first orelse key.descending) "first" else "last";
                 if (key.expression) |expression| {
                     const lowered = try @import("schema_expression.zig").lowerTyped(alloc, schema.*, expression, null);
-                    try keys.append(alloc, try value(alloc, .{ .expression = lowered.expression, .result_type = @tagName(lowered.type), .direction = if (key.descending) "desc" else "asc", .nulls = nulls }));
+                    try keys.append(alloc, try value(alloc, .{ .expression = lowered.expression, .result_type = if (lowered.type == .uuid) "string" else @tagName(lowered.type), .direction = if (key.descending) "desc" else "asc", .nulls = nulls }));
                 } else try keys.append(alloc, try value(alloc, .{ .column = key.field, .direction = if (key.descending) "desc" else "asc", .nulls = nulls }));
                 try columns.append(alloc, key.field);
             }
@@ -214,9 +214,13 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
                 if (named(defaults.items, column_name, "column")) |i| _ = defaults.orderedRemove(i);
                 if (change == .set_default) {
                     const type_name = property.object.get("type").?.string;
-                    const column_type: ast.ColumnType = if (std.mem.eql(u8, type_name, "keyword")) .string else std.meta.stringToEnum(ast.ColumnType, type_name) orelse return error.UnsupportedSqlShape;
+                    const format = property.object.get("format") orelse .null;
+                    const column_type: ast.ColumnType = if (format == .string and std.mem.eql(u8, format.string, "uuid") and
+                        (std.mem.eql(u8, type_name, "keyword") or std.mem.eql(u8, type_name, "string") or std.mem.eql(u8, type_name, "text")))
+                        .uuid
+                    else if (std.mem.eql(u8, type_name, "keyword")) .string else std.meta.stringToEnum(ast.ColumnType, type_name) orelse return error.UnsupportedSqlShape;
                     const literal = try @import("describe.zig").bindLiteral(alloc, change.set_default.value, column_type);
-                    try defaults.append(try value(alloc, .{ .column = column_name, .expression = .{ .op = "literal", .type = @tagName(column_type), .value = literal } }));
+                    try defaults.append(try value(alloc, .{ .column = column_name, .expression = .{ .op = "literal", .type = if (column_type == .uuid) "string" else @tagName(column_type), .value = literal } }));
                 }
             }
         },

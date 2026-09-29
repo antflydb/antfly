@@ -225,7 +225,7 @@ pub const Context = struct {
         if (input != .parameter) return describe.bindLiteral(self.arena, input, column.type);
         const index = input.parameter;
         if (index == 0 or index > self.parameters.len) return error.InvalidSqlParameters;
-        return coerce(self.parameters[index - 1], column.type);
+        return coerce(self.arena, self.parameters[index - 1], column.type);
     }
 
     pub fn count(self: Context, input: ?ast.Value, default: usize) !usize {
@@ -408,7 +408,7 @@ pub const Context = struct {
                         .expression => |index| try self.binding.scalars.orders[index].?.evaluate(page_arena.allocator(), expression_cells, self.parameters, .{}),
                         .column => |column| blk: {
                             const cell = try row.cell(column.path);
-                            break :blk .{ .value = try coerce(cell.value, column.type), .sql_null = cell.sql_null };
+                            break :blk .{ .value = try coerce(page_arena.allocator(), cell.value, column.type), .sql_null = cell.sql_null };
                         },
                     };
                     try operator.add(.{ .values = values, .keys = keys, .ordinal = visited });
@@ -427,7 +427,7 @@ pub const Context = struct {
                         const evaluated = try expression.evaluate(page_arena.allocator(), expression_cells, self.parameters, .{});
                         break :blk .{ .value = evaluated.value, .sql_null = evaluated.sql_null };
                     } else try row.cell(field);
-                    const typed = try coerce(input_cell.value, column.type);
+                    const typed = try coerce(self.arena, input_cell.value, column.type);
                     is_null.* = input_cell.sql_null;
                     // SQL bigint results are lossless even in JS SDKs.
                     cell.* = try self.outputValue(typed);
@@ -480,7 +480,7 @@ pub const Context = struct {
                 const cell = try row.cell(field);
                 break :blk Datum{ .value = cell.value, .sql_null = cell.sql_null };
             };
-            out.* = .{ .value = try coerce(input.value, column.type), .sql_null = input.sql_null };
+            out.* = .{ .value = try coerce(alloc, input.value, column.type), .sql_null = input.sql_null };
         }
         return values;
     }
@@ -598,8 +598,8 @@ pub const Context = struct {
                 if (statement.isDefault(row_index, cell_index)) continue;
                 if (sql_null and value_ != .null) return error.InvalidSqlBackendResponse;
                 if (sql_null and !target.nullable) return error.SqlNotNullViolation;
-                if (!sql_null and source_column.type != target.type and !(source_column.type == .integer and target.type == .number) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json))) return error.SqlTypeMismatch;
-                const typed = try coerce(value_, target.type);
+                if (!sql_null and source_column.type != target.type and !(source_column.type == .integer and target.type == .number) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json or target.type == .uuid))) return error.SqlTypeMismatch;
+                const typed = try coerce(self.arena, value_, target.type);
                 if (std.mem.eql(u8, target.name, "_id")) {
                     if (sql_null or typed != .string or typed.string.len == 0) return error.SqlRowIdentityRequired;
                     if (!std.unicode.utf8ValidateSlice(typed.string)) return error.SqlTypeMismatch;
@@ -625,7 +625,7 @@ pub const Context = struct {
     fn insertValue(self: Context, literal: ast.Value, column: catalog.Column, row: usize, cell: usize) !@import("scalar.zig").Datum {
         if (self.binding.scalars.insert_rows.len != 0) if (self.binding.scalars.insert_rows[row][cell]) |program| {
             const result = try program.evaluate(self.arena, &.{}, self.parameters, .{});
-            return .{ .value = try coerce(result.value, column.type), .sql_null = result.sql_null };
+            return .{ .value = try coerce(self.arena, result.value, column.type), .sql_null = result.sql_null };
         };
         const result = try self.value(literal, column);
         return .{ .value = result, .sql_null = result == .null and !(column.type == .json and literal == .string) };
@@ -742,7 +742,7 @@ pub const Context = struct {
                             const evaluated = try program.evaluate(page_arena.allocator(), expression_cells, self.parameters, .{});
                             if (evaluated.sql_null and !bound.column.nullable) return error.SqlNotNullViolation;
                             if (!evaluated.sql_null and evaluated.value == .null) try json_null_fields.append(self.arena, bound.column.path);
-                            break :blk try clone(self.arena, try coerce(evaluated.value, bound.column.type));
+                            break :blk try clone(self.arena, try coerce(self.arena, evaluated.value, bound.column.type));
                         } else blk: {
                             if (!bound.sql_null and bound.value == .null) try json_null_fields.append(self.arena, bound.column.path);
                             break :blk bound.value;
@@ -877,7 +877,14 @@ pub const Context = struct {
     }
 };
 
-fn coerce(raw: Json, kind: ast.ColumnType) !Json {
+fn coerce(alloc: std.mem.Allocator, raw: Json, kind: ast.ColumnType) !Json {
+    if (kind == .uuid and raw != .null) {
+        if (raw != .string) return error.SqlTypeMismatch;
+        return .{ .string = @import("../common/uuid.zig").canonicalAlloc(alloc, raw.string) catch |err| switch (err) {
+            error.InvalidUuid => return error.SqlTypeMismatch,
+            else => return err,
+        } };
+    }
     return describe.coerce(raw, kind);
 }
 

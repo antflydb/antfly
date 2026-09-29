@@ -1400,7 +1400,7 @@ components:
     SQLColumnType:
       type: string
       description: Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
-      enum: [string, integer, number, boolean, datetime, json, unknown]
+      enum: [string, uuid, integer, number, boolean, datetime, json, unknown]
     SQLColumn:
       type: object
       additionalProperties: false

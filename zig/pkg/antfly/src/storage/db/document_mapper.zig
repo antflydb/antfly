@@ -6365,6 +6365,26 @@ test "relational JSON cells have canonical physical bytes" {
     try std.testing.expectEqualSlices(u8, left_row, right_row);
 }
 
+test "relational UUID ingress shares canonical typed bytes and semantic hash" {
+    const alloc = std.testing.allocator;
+    const parsed = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","format":"uuid"}},"additionalProperties":false}}}}
+    );
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var validator = try schema_api.CompiledTableValidator.takeParsed(alloc, parsed);
+    defer validator.deinit(alloc);
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    var upper = try PreparedRelationalWrite.init(alloc, "row", "{\"id\":\"{A0EEBC999C0B4EF8BB6D6BB9BD380A11}\"}", validator, schema, &layout);
+    defer upper.deinit(alloc);
+    var lower = try PreparedRelationalWrite.init(alloc, "row", "{\"id\":\"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\"}", validator, schema, &layout);
+    defer lower.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &upper.semantic_hash, &lower.semantic_hash);
+    try std.testing.expectEqualSlices(u8, upper.packed_row, lower.packed_row);
+    try std.testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", upper.parsedValue().object.get("id").?.string);
+}
+
 test "sparse relational preparation preserves canonical hash order with one physical sort" {
     const alloc = std.testing.allocator;
     const columns = [_]runtime_schema.RelationalColumn{

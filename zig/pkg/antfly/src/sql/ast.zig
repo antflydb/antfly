@@ -168,7 +168,7 @@ pub const Merge = struct {
         };
     };
 };
-pub const ColumnType = enum { string, integer, number, boolean, datetime, json };
+pub const ColumnType = enum { string, uuid, integer, number, boolean, datetime, json };
 pub const Column = struct { name: []const u8, type: ColumnType, nullable: bool = true, default_value: ?Value = null };
 pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null };
 pub const DropTable = struct { table: Name, if_exists: bool = false };

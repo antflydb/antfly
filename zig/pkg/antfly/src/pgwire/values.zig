@@ -22,6 +22,7 @@ pub fn oid(kind: Type) u32 {
         .number => 701,
         .datetime => 1184,
         .json => 3802,
+        .uuid => 2950,
         .string, .unknown => 25,
     };
 }
@@ -35,6 +36,7 @@ pub fn fromOid(value: u32) !Type {
         25, 1043 => .string,
         1184 => .datetime,
         114, 3802 => .json,
+        2950 => .uuid,
         else => error.UnsupportedParameterType,
     };
 }
@@ -42,6 +44,7 @@ pub fn fromOid(value: u32) !Type {
 pub fn typeSize(kind: Type) i16 {
     return switch (kind) {
         .boolean => 1,
+        .uuid => 16,
         .integer, .number, .datetime => 8,
         else => -1,
     };
@@ -61,6 +64,10 @@ pub fn decode(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []co
                 break :blk value;
             },
             .json => try parseJson(alloc, bytes),
+            .uuid => .{ .string = @import("../common/uuid.zig").canonicalAlloc(alloc, bytes) catch |err| switch (err) {
+                error.InvalidUuid => return error.InvalidParameter,
+                else => return err,
+            } },
             else => .{ .string = try alloc.dupe(u8, bytes) },
         };
     }
@@ -79,6 +86,10 @@ pub fn decode(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []co
         },
         114 => try parseJson(alloc, bytes),
         3802 => if (bytes.len > 0 and bytes[0] == 1) try parseJson(alloc, bytes[1..]) else error.InvalidParameter,
+        2950 => if (bytes.len == 16) .{ .string = blk: {
+            const canonical = @import("../common/uuid.zig").format(bytes[0..16].*);
+            break :blk try alloc.dupe(u8, &canonical);
+        } } else error.InvalidParameter,
         25, 1043 => if (std.unicode.utf8ValidateSlice(bytes) and std.mem.indexOfScalar(u8, bytes, 0) == null) .{ .string = try alloc.dupe(u8, bytes) } else error.InvalidParameter,
         // PostgreSQL NUMERIC binary is not IEEE float. Reject it explicitly;
         // its exact text representation remains supported without rounding.
@@ -145,6 +156,10 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
         .integer => try std.fmt.allocPrint(alloc, "{d}", .{try integer(value)}),
         .datetime => try timestampText(alloc, value),
         .json => try std.json.Stringify.valueAlloc(alloc, value, .{}),
+        .uuid => if (value == .string) @import("../common/uuid.zig").canonicalAlloc(alloc, value.string) catch |err| switch (err) {
+            error.InvalidUuid => return error.InvalidResult,
+            else => return err,
+        } else error.InvalidResult,
         else => if (value == .string) try alloc.dupe(u8, value.string) else try std.json.Stringify.valueAlloc(alloc, value, .{}),
     };
     return switch (kind) {
@@ -170,6 +185,10 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
             defer alloc.free(json);
             break :blk try std.mem.concat(alloc, u8, &.{ &.{1}, json });
         },
+        .uuid => if (value == .string) blk: {
+            const parsed = @import("../common/uuid.zig").parse(value.string) catch return error.InvalidResult;
+            break :blk try alloc.dupe(u8, &parsed);
+        } else error.InvalidResult,
         .string => if (value == .string) try alloc.dupe(u8, value.string) else error.InvalidResult,
         .unknown => if (value == .string) try alloc.dupe(u8, value.string) else try std.json.Stringify.valueAlloc(alloc, value, .{}),
     };
@@ -225,6 +244,23 @@ test "pgwire typed parameters preserve exact integers and reject binary guesses"
     try std.testing.expectError(error.InvalidParameter, decode(alloc, 20, 0, "1; DROP TABLE x"));
     const encoded = try encode(alloc, .integer, 1, .{ .string = "9007199254740993" });
     try std.testing.expectEqual(@as(i64, 9007199254740993), std.mem.readInt(i64, encoded[0..8], .big));
+}
+
+test "pgwire UUID text and binary preserve canonical typed value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const canonical = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
+    const input = "{A0EEBC999C0B4EF8BB6D6BB9BD380A11}";
+    try std.testing.expectEqual(@as(u32, 2950), oid(.uuid));
+    try std.testing.expectEqual(@as(i16, 16), typeSize(.uuid));
+    try std.testing.expectEqualStrings(canonical, (try decode(alloc, 2950, 0, input)).string);
+    const binary = try encode(alloc, .uuid, 1, .{ .string = input });
+    try std.testing.expectEqual(@as(usize, 16), binary.len);
+    try std.testing.expectEqualStrings(canonical, (try decode(alloc, 2950, 1, binary)).string);
+    try std.testing.expectEqualStrings(canonical, try encode(alloc, .uuid, 0, .{ .string = input }));
+    try std.testing.expectError(error.InvalidParameter, decode(alloc, 2950, 0, "not-a-uuid"));
+    try std.testing.expectError(error.InvalidParameter, decode(alloc, 2950, 1, binary[0..15]));
 }
 
 test "pgwire JSON parameter nesting is bounded independently of frame bytes" {

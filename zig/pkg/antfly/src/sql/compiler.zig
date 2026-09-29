@@ -1399,13 +1399,14 @@ const Parser = struct {
         // lookup; never silently reinterpret them as builtins.
         if (t.owned) return self.fail(error.UnsupportedSqlShape, "user-defined column types are not supported");
         const pairs = .{
-            .{ "text", ast.ColumnType.string },       .{ "string", ast.ColumnType.string },
-            .{ "bigint", ast.ColumnType.integer },    .{ "int8", ast.ColumnType.integer },
-            .{ "integer", ast.ColumnType.integer },   .{ "int", ast.ColumnType.integer },
-            .{ "float8", ast.ColumnType.number },     .{ "number", ast.ColumnType.number },
-            .{ "boolean", ast.ColumnType.boolean },   .{ "bool", ast.ColumnType.boolean },
-            .{ "datetime", ast.ColumnType.datetime }, .{ "timestamptz", ast.ColumnType.datetime },
-            .{ "json", ast.ColumnType.json },         .{ "jsonb", ast.ColumnType.json },
+            .{ "text", ast.ColumnType.string },          .{ "string", ast.ColumnType.string },
+            .{ "uuid", ast.ColumnType.uuid },            .{ "bigint", ast.ColumnType.integer },
+            .{ "int8", ast.ColumnType.integer },         .{ "integer", ast.ColumnType.integer },
+            .{ "int", ast.ColumnType.integer },          .{ "float8", ast.ColumnType.number },
+            .{ "number", ast.ColumnType.number },        .{ "boolean", ast.ColumnType.boolean },
+            .{ "bool", ast.ColumnType.boolean },         .{ "datetime", ast.ColumnType.datetime },
+            .{ "timestamptz", ast.ColumnType.datetime }, .{ "json", ast.ColumnType.json },
+            .{ "jsonb", ast.ColumnType.json },
         };
         inline for (pairs) |pair| if (std.ascii.eqlIgnoreCase(t.text, pair[0])) return pair[1];
         if (std.ascii.eqlIgnoreCase(t.text, "double")) {
