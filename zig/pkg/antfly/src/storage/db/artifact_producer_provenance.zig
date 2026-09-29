@@ -259,6 +259,118 @@ pub fn prepareDocumentReferences(alloc: std.mem.Allocator, command: publication.
     return .{ .arena = arena, .entries = entries.items };
 }
 
+/// A source-copy candidate, not an adoption certificate. The proof digest is
+/// backed by a current source reference in the same pinned snapshot. The
+/// exporter must still validate the proof's document association, causal
+/// inputs and output scope before committing portable evidence.
+pub const DocumentProofReference = struct {
+    document_key: []const u8,
+    index_key: []const u8,
+    receipt_hash: publication.Digest,
+    proof_digest: publication.Digest,
+};
+
+pub const DocumentProofPage = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: []const DocumentProofReference,
+    /// Exclusive physical resume key. Null only after the scoped range ends.
+    next_cursor: ?[]const u8,
+
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Enumerate one bounded, binary-key-safe source-evidence page from a pinned
+/// snapshot. The caller must retain that snapshot across pages; these local
+/// references are never portable authority. A single long key may exceed the
+/// byte target, but the entry count and maximum key size remain bounded.
+pub fn readDocumentProofPage(
+    alloc: std.mem.Allocator,
+    txn: anytype,
+    expected: publication.Authority,
+    range: @import("../byte_range.zig").ByteRange,
+    after: ?[]const u8,
+    max_entries: usize,
+    max_bytes: usize,
+) !DocumentProofPage {
+    if (max_entries == 0 or max_entries > 128 or max_bytes == 0) return error.InvalidBatchRequest;
+    const current = (try publication.authority(txn)) orelse return error.ArtifactCatalogDrift;
+    if (!std.meta.eql(current, expected)) return error.ArtifactCatalogDrift;
+    var scoped_storage: [document_reference_prefix.len + 24 + 8]u8 = undefined;
+    const scoped = scoped_storage[0..];
+    @memcpy(scoped[0..document_reference_prefix.len], document_reference_prefix);
+    @memcpy(scoped[document_reference_prefix.len..][0..24], &expected.namespace);
+    std.mem.writeInt(u64, scoped[document_reference_prefix.len + 24 ..][0..8], expected.epoch, .big);
+    // Construct bounds with a temporary arena so both encoded components and
+    // combined keys are released together, including allocation failures.
+    var bound_arena = std.heap.ArenaAllocator.init(alloc);
+    defer bound_arena.deinit();
+    const bounds = bound_arena.allocator();
+    const lower: []const u8 = if (range.start.len == 0) scoped else blk: {
+        const component = try bounds.alloc(u8, internal_keys.encodedComponentLen(range.start));
+        _ = internal_keys.encodeComponent(component, range.start);
+        break :blk try std.mem.concat(bounds, u8, &.{ scoped, component });
+    };
+    const upper: ?[]const u8 = if (range.end.len == 0) null else blk: {
+        const component = try bounds.alloc(u8, internal_keys.encodedComponentLen(range.end));
+        _ = internal_keys.encodeComponent(component, range.end);
+        break :blk try std.mem.concat(bounds, u8, &.{ scoped, component });
+    };
+    if (after) |cursor| {
+        if (!std.mem.startsWith(u8, cursor, scoped) or std.mem.order(u8, cursor, lower) == .lt or
+            (upper != null and std.mem.order(u8, cursor, upper.?) != .lt)) return error.InvalidBatchRequest;
+    }
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    var entries: std.ArrayList(DocumentProofReference) = .empty;
+    var cursor = try txn.openPhysicalCursorAdapter();
+    defer cursor.close();
+    var item = try cursor.seekAtOrAfter(after orelse lower);
+    if (after) |resume_key| {
+        if (item != null and std.mem.eql(u8, item.?.key, resume_key)) item = try cursor.next();
+    }
+    var bytes: usize = 0;
+    while (item) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, scoped) or (upper != null and std.mem.order(u8, entry.key, upper.?) != .lt)) break;
+        if (entries.items.len != 0 and (entries.items.len >= max_entries or bytes >= max_bytes)) break;
+        if (entry.key.len > scoped.len + 2 * @import("artifact_producer_obligations.zig").max_cursor_bytes + 32 or entry.value.len != 32)
+            return error.ArtifactCatalogCorrupt;
+        const end = internal_keys.findComponentTerminator(entry.key, scoped.len) orelse return error.ArtifactCatalogCorrupt;
+        if (end + 2 + 32 != entry.key.len) return error.ArtifactCatalogCorrupt;
+        const document = internal_keys.decodeBodyAlloc(owned, entry.key[scoped.len..end]) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.ArtifactCatalogCorrupt,
+        };
+        if (!range.contains(document)) return error.ArtifactCatalogCorrupt;
+        const receipt_hash: publication.Digest = entry.key[entry.key.len - 32 ..][0..32].*;
+        const proof_digest: publication.Digest = entry.value[0..32].*;
+        var reference: [reference_prefix.len + 24 + 8 + 32]u8 = undefined;
+        @memcpy(reference[0..reference_prefix.len], reference_prefix);
+        @memcpy(reference[reference_prefix.len..][0..24], &expected.namespace);
+        std.mem.writeInt(u64, reference[reference_prefix.len + 24 ..][0..8], expected.epoch, .big);
+        @memcpy(reference[reference.len - 32 ..], &receipt_hash);
+        const actual = txn.get(&reference) catch |err| switch (err) {
+            error.NotFound => return error.ArtifactCatalogCorrupt,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, actual, &proof_digest)) return error.ArtifactCatalogCorrupt;
+        const proof_bytes = txn.get(&key(expected.namespace, proof_digest)) catch |err| switch (err) {
+            error.NotFound => return error.ArtifactCatalogCorrupt,
+            else => return err,
+        };
+        if (proof_bytes.len < 40 or proof_bytes.len > max_encoded_bytes) return error.ArtifactCatalogCorrupt;
+        try entries.append(owned, .{ .document_key = document, .index_key = try owned.dupe(u8, entry.key), .receipt_hash = receipt_hash, .proof_digest = proof_digest });
+        bytes +|= entry.key.len + entry.value.len;
+        item = try cursor.next();
+    }
+    const next_cursor = if (item == null or !std.mem.startsWith(u8, item.?.key, scoped) or
+        (upper != null and std.mem.order(u8, item.?.key, upper.?) != .lt)) null else try owned.dupe(u8, entries.items[entries.items.len - 1].index_key);
+    return .{ .arena = arena, .entries = entries.items, .next_cursor = next_cursor };
+}
+
 fn artifactReferenceKey(authority: publication.Authority, artifact: []const u8) [artifact_prefix.len + 24 + 8 + 32]u8 {
     var result: [artifact_prefix.len + 24 + 8 + 32]u8 = undefined;
     @memcpy(result[0..artifact_prefix.len], artifact_prefix);
@@ -915,6 +1027,84 @@ test "ordered artifact inventory obsolete proof GC bounds pages and preserves cu
     try std.testing.expectError(error.NotFound, read.get(first_document_index.?));
     try std.testing.expectError(error.NotFound, read.get(&key(namespace, first_proof)));
     _ = try read.get(&current_reference);
+}
+
+test "ordered artifact inventory document proof pages seek binary ranges and reject drift" {
+    const alloc = std.testing.allocator;
+    const db_mod = @import("db.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/proof-page", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 4 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    var namespace: publication.Namespace = undefined;
+    @import("doc_identity.zig").encodeNamespace(&namespace, db.core.identity_namespace);
+    const active: publication.Authority = .{ .namespace = namespace, .epoch = 1, .catalog_digest = @splat(3) };
+    const documents = [_][]const u8{ "a", "a\x00b", "b", "c", "d" };
+    var tamper_key: ?[]u8 = null;
+    defer if (tamper_key) |value| alloc.free(value);
+    {
+        var writer = try db.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        try publication.stageAuthority(&writer, .{ .mode = .activate, .namespace = namespace, .authority_epoch = active.epoch, .catalog_digest = active.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        for (documents) |document| {
+            const output = try internal_keys.artifactNamedPrefixAlloc(alloc, document, "asset", "proof");
+            defer alloc.free(output);
+            const source = publication.Source{ .document_key = document, .content_digest = @splat(1), .timestamp = 1, .input_position = null };
+            const effect = publication.Mutation{ .family = .document_artifact, .key = output, .value = null, .source_index = 0 };
+            var digest: publication.Digest = undefined;
+            std.crypto.hash.sha2.Sha256.hash(document, &digest, .{});
+            const command: publication.Command = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = active.catalog_digest, .producer_name = "proof", .producer_generation = 1, .producer_artifact_name = "proof", .sources = (&source)[0..1], .mutations = (&effect)[0..1], .publication_digest = digest };
+            const encoded = try testEncodedProofAlloc(alloc, command);
+            defer alloc.free(encoded);
+            var indexed = try prepareDocumentReferences(alloc, command);
+            defer indexed.deinit();
+            try stageIndexed(&writer, command, encoded, .{ .raft = .{ .term = 1, .index = 1 } }, &indexed);
+            if (std.mem.eql(u8, document, "c")) tamper_key = try alloc.dupe(u8, indexed.entries[0].key);
+        }
+        try writer.commit();
+    }
+    var pinned = try db.core.store.beginReadTxn();
+    defer pinned.abort();
+    const range: @import("../byte_range.zig").ByteRange = .{ .start = "a\x00b", .end = "d" };
+    var byte_limited = try readDocumentProofPage(alloc, &pinned, active, range, null, 2, 1);
+    defer byte_limited.deinit();
+    try std.testing.expectEqual(@as(usize, 1), byte_limited.entries.len);
+    try std.testing.expect(byte_limited.next_cursor != null);
+    var first = try readDocumentProofPage(alloc, &pinned, active, range, null, 2, 4096);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 2), first.entries.len);
+    try std.testing.expectEqualStrings("a\x00b", first.entries[0].document_key);
+    try std.testing.expectEqualStrings("b", first.entries[1].document_key);
+    try std.testing.expect(first.next_cursor != null);
+    var second = try readDocumentProofPage(alloc, &pinned, active, range, first.next_cursor, 2, 4096);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), second.entries.len);
+    try std.testing.expectEqualStrings("c", second.entries[0].document_key);
+    try std.testing.expect(second.next_cursor == null);
+    try std.testing.expectError(error.InvalidBatchRequest, readDocumentProofPage(alloc, &pinned, active, range, "outside", 2, 4096));
+    const AllocationCheck = struct {
+        fn run(a: std.mem.Allocator, read: *@import("../docstore.zig").DocStore.Txn, authority_value: publication.Authority, selected: @import("../byte_range.zig").ByteRange) !void {
+            var page = try readDocumentProofPage(a, read, authority_value, selected, null, 2, 4096);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 2), page.entries.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &pinned, active, range });
+    {
+        var writer = try db.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        try writer.put(tamper_key.?, &([_]u8{9} ** 32));
+        try writer.commit();
+    }
+    var changed = try db.core.store.beginReadTxn();
+    defer changed.abort();
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, readDocumentProofPage(alloc, &changed, active, .{ .start = "c", .end = "d" }, null, 2, 4096));
+    // The pinned cut still observes its original, self-consistent evidence.
+    var unchanged = try readDocumentProofPage(alloc, &pinned, active, .{ .start = "c", .end = "d" }, null, 2, 4096);
+    defer unchanged.deinit();
+    try std.testing.expectEqual(@as(usize, 1), unchanged.entries.len);
 }
 
 test "ordered artifact inventory provenance shares receipts and reclaims superseded proof" {

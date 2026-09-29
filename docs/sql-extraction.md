@@ -1763,9 +1763,14 @@ following mechanisms are installed behind that gate:
   them with reference counts and proof bodies under an authority CAS. This is
   the range-seekable source evidence index
   needed for bounded snapshot export, not yet a portable proof stream or a
-  receiver-local adoption certificate. The 204-case ordered-artifact target
+  receiver-local adoption certificate. A pinned, document-range proof-reference
+  reader now seeks directly to encoded binary lower bounds, pages by entry and
+  byte limits, and checks each index against its live source reference and
+  proof-body presence. It is candidate enumeration, not portable validation of
+  the proof's causal input/output scope. The 205-case ordered-artifact target
   passes, including allocation faults, LSM apply, 129-proof paged retirement,
-  pinned-reader preservation, and current-epoch isolation.
+  binary range/resume, corrupted-reference rejection, pinned-reader preservation,
+  and current-epoch isolation.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups
