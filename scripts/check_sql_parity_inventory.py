@@ -173,14 +173,54 @@ def release_blockers(entries):
     return [entry for entry in entries if entry["status"] not in RESOLVED]
 
 
-def run_evidence(gate_ids, gates, root=ROOT):
+def evidence_runs(gate_ids, gates):
+    """Share one Zig test binary across gates that differ only by test filters."""
+    runs = []
+    grouped = {}
     for gate_id in gate_ids:
         gate = gates[gate_id]
-        print(f"Running evidence gate: {gate_id}", flush=True)
+        command = gate["command"]
+        separator = command.index("--") if "--" in command else -1
+        filters = command[separator + 1 :] if separator >= 0 else []
+        mergeable = (
+            command[:2] == ["zig", "build"]
+            and separator >= 0
+            and len(filters) >= 2
+            and len(filters) % 2 == 0
+            and all(flag == "--test-filter" for flag in filters[::2])
+        )
+        key = (gate["cwd"], tuple(command[:separator])) if mergeable else None
+        if key is not None and key in grouped:
+            run = grouped[key]
+            run["gate_ids"].append(gate_id)
+            existing = set(run["command"][run["command"].index("--") + 2 :: 2])
+            for value in filters[1::2]:
+                if value not in existing:
+                    run["command"].extend(("--test-filter", value))
+                    existing.add(value)
+            run["timeout_seconds"] = min(
+                3600, run["timeout_seconds"] + gate["timeout_seconds"]
+            )
+            continue
+        run = {
+            "gate_ids": [gate_id],
+            "command": list(command),
+            "cwd": gate["cwd"],
+            "timeout_seconds": gate["timeout_seconds"],
+        }
+        runs.append(run)
+        if key is not None:
+            grouped[key] = run
+    return runs
+
+
+def run_evidence(gate_ids, gates, root=ROOT):
+    for run in evidence_runs(gate_ids, gates):
+        print(f"Running evidence gates: {', '.join(run['gate_ids'])}", flush=True)
         subprocess.run(
-            gate["command"],
-            cwd=repository_path(root, gate["cwd"]),
-            timeout=gate["timeout_seconds"],
+            run["command"],
+            cwd=repository_path(root, run["cwd"]),
+            timeout=run["timeout_seconds"],
             check=True,
         )
 
@@ -196,7 +236,7 @@ def main(argv=None):
     mode.add_argument(
         "--evidence",
         action="store_true",
-        help="run evidence gates for resolved cases without claiming release readiness",
+        help="run referenced evidence gates without claiming release readiness",
     )
     parser.add_argument(
         "--source",

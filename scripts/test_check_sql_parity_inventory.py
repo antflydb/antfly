@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from check_sql_parity_inventory import (
     FIXTURES,
+    evidence_runs,
     release_blockers,
     run_evidence,
     validate,
@@ -99,6 +100,9 @@ class ParityInventoryTest(unittest.TestCase):
         partial["evidence"][1]["test"] = (
             "pgwire original prepared CTE INSERT defers mutation until execute"
         )
+        partial["evidence"][2]["test"] = (
+            "SQL document reads reject the relational stateless fallback before transport"
+        )
         with self.assertRaisesRegex(ValueError, "at least one cited evidence test"):
             validate(self.inventory, ledger)
 
@@ -106,18 +110,87 @@ class ParityInventoryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source checksum"):
             validate(self.inventory, self.ledger, source_bytes=b"{}")
 
-    def test_resolved_evidence_can_run_before_release_is_ready(self):
+    def test_referenced_evidence_can_run_before_release_is_ready(self):
         _, entries, gate_ids = validate(self.inventory, self.ledger)
         self.assertGreater(len(release_blockers(entries)), 0)
         self.assertTrue(gate_ids)
+        runs = evidence_runs(gate_ids, self.ledger["gates"])
+        self.assertLess(len(runs), len(gate_ids))
+        self.assertEqual(
+            gate_ids, sorted(gate for run in runs for gate in run["gate_ids"])
+        )
         with patch("check_sql_parity_inventory.subprocess.run") as run:
             run_evidence(gate_ids, self.ledger["gates"])
-        self.assertEqual(len(gate_ids), run.call_count)
-        for gate_id, call in zip(gate_ids, run.call_args_list, strict=True):
-            gate = self.ledger["gates"][gate_id]
-            self.assertEqual(gate["command"], call.args[0])
-            self.assertEqual(gate["timeout_seconds"], call.kwargs["timeout"])
+        self.assertEqual(len(runs), run.call_count)
+        for planned, call in zip(runs, run.call_args_list, strict=True):
+            self.assertEqual(planned["command"], call.args[0])
+            self.assertEqual(planned["timeout_seconds"], call.kwargs["timeout"])
             self.assertTrue(call.kwargs["check"])
+
+    def test_evidence_grouping_preserves_distinct_filters_and_isolation(self):
+        gates = {
+            "a": {
+                "command": ["zig", "build", "sql-test", "--", "--test-filter", "alpha"],
+                "cwd": "zig",
+                "timeout_seconds": 5,
+            },
+            "b": {
+                "command": [
+                    "zig",
+                    "build",
+                    "sql-test",
+                    "--",
+                    "--test-filter",
+                    "beta",
+                    "--test-filter",
+                    "alpha",
+                ],
+                "cwd": "zig",
+                "timeout_seconds": 7,
+            },
+            "c": {
+                "command": ["zig", "build", "sql-test", "--", "--test-filter", "gamma"],
+                "cwd": "other",
+                "timeout_seconds": 9,
+            },
+            "d": {
+                "command": [
+                    "zig",
+                    "build",
+                    "pgwire-test",
+                    "--",
+                    "--test-filter",
+                    "delta",
+                ],
+                "cwd": "zig",
+                "timeout_seconds": 11,
+            },
+            "e": {
+                "command": ["zig", "build", "sql-test", "--", "CTE materialization"],
+                "cwd": "zig",
+                "timeout_seconds": 13,
+            },
+        }
+        runs = evidence_runs(list(gates), gates)
+        self.assertEqual(4, len(runs))
+        self.assertEqual(["a", "b"], runs[0]["gate_ids"])
+        self.assertEqual(
+            [
+                "zig",
+                "build",
+                "sql-test",
+                "--",
+                "--test-filter",
+                "alpha",
+                "--test-filter",
+                "beta",
+            ],
+            runs[0]["command"],
+        )
+        self.assertEqual(12, runs[0]["timeout_seconds"])
+        self.assertEqual(["c"], runs[1]["gate_ids"])
+        self.assertEqual(["d"], runs[2]["gate_ids"])
+        self.assertEqual(["e"], runs[3]["gate_ids"])
 
 
 if __name__ == "__main__":

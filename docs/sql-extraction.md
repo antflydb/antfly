@@ -1235,6 +1235,11 @@ compaction/selective-query performance comparison remains unmeasured.
 - All 21 currently referenced `make sql-parity-evidence-check` gates pass,
   including partial evidence on unresolved original prepared CTE mutations;
   partial evidence does not grant release credit.
+  The evidence runner combines compatible Zig test filters for the same target
+  into seven build invocations, preserving all 21 gate identities and their
+  bounded aggregate timeouts. The grouped run passed all selected tests in
+  5m54s on this machine with a cold API test rebuild; this is not a controlled
+  before/after speedup measurement.
   The current SQL suite passes 227 tests, including the VALUES-subquery and
   observed-group Top-K admission cases.
   The dry-run EXPLAIN and mutation-subquery follow-up passes exact mounted
