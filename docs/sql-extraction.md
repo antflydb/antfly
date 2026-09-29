@@ -1826,7 +1826,12 @@ following mechanisms are installed behind that gate:
   semantic catalog; writer revalidation repeats the receiver catalog and
   active authority fence. APF3 can encode a receiver-owned adopted origin that
   commits the donor pin, proof checksum and selected subset into a local
-  publication digest; no caller installs receipts from it yet.
+  publication digest; no caller installs receipts from it yet. A reusable
+  receiver producer plan now validates both exact and semantic catalog
+  bindings once per source cut, maps index/graph producer names and kinds to
+  receiver-owned physical generations in O(1) per proof, and rejects donor
+  generation drift. It does not yet rebind graph effect bytes or map the
+  non-index producer families, so it is candidate identity, not acceptance.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups

@@ -5,6 +5,7 @@ const std = @import("std");
 const provenance = @import("artifact_producer_provenance.zig");
 const publication = @import("artifact_publication.zig");
 const inventory = @import("artifact_inventory.zig");
+const catalog_view = @import("artifact_catalog_view.zig");
 
 pub const import_prefix = "\x00\x00__metadata__:source_proof:";
 pub const merge_prefix = "\x00\x00__metadata__:merge_source_proof:";
@@ -93,6 +94,10 @@ pub const ReceiverCandidate = struct {
     arena: std.heap.ArenaAllocator,
     donor: DonorIdentity,
     receiver: struct { namespace: publication.Namespace, binding: inventory.Binding },
+    /// Physical producer generation is receiver-owned. Null means this
+    /// producer family still needs a dedicated catalog mapping before it can
+    /// be adopted; donor generations must never be used as a fallback.
+    receiver_producer_generation: ?u64,
     sources: []const publication.Source,
     artifact_sources: []const publication.ArtifactSource,
     effects: []const ReceiverEffect,
@@ -100,6 +105,66 @@ pub const ReceiverCandidate = struct {
     pub fn deinit(self: *@This()) void {
         self.arena.deinit();
         self.* = undefined;
+    }
+};
+
+/// Exact bindings certify each physical catalog; their semantic digests
+/// certify the cross-owner definition match. Match the producer by name and
+/// kind, then take only the receiver's physical generation. One plan serves
+/// all bounded proofs at a certified cut: catalog canonicalization and index
+/// parsing do not recur per row. Graph outputs additionally require value/key
+/// rebinding before this identity is usable.
+pub const ReceiverProducerPlan = struct {
+    const IndexBinding = struct { kind: u8, donor: u64, receiver: u64 };
+    arena: std.heap.ArenaAllocator,
+    donor_binding: inventory.Binding,
+    receiver_binding: inventory.Binding,
+    indexes: std.StringHashMapUnmanaged(IndexBinding),
+
+    pub fn init(alloc: std.mem.Allocator, donor_catalog: inventory.Catalogs, donor_binding: inventory.Binding, receiver_catalog: inventory.Catalogs, receiver_binding: inventory.Binding) !ReceiverProducerPlan {
+        if (!std.mem.eql(u8, &donor_catalog.digest(), &donor_binding.digest) or
+            !std.mem.eql(u8, &receiver_catalog.digest(), &receiver_binding.digest) or
+            !std.mem.eql(u8, &try donor_catalog.semanticDigest(alloc), &donor_binding.semantic_digest) or
+            !std.mem.eql(u8, &try receiver_catalog.semanticDigest(alloc), &receiver_binding.semantic_digest) or
+            !donor_binding.compatible(receiver_binding)) return error.SourceSnapshotCorrupt;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        var indexes: std.StringHashMapUnmanaged(IndexBinding) = .empty;
+        var receiver_indexes: std.StringHashMapUnmanaged(catalog_view.Entry) = .empty;
+        if (receiver_catalog.indexes.len != 0) {
+            var entries = try catalog_view.Iterator.init(receiver_catalog.indexes);
+            while (try entries.next()) |entry| {
+                const result = try receiver_indexes.getOrPut(owned, entry.name);
+                if (result.found_existing or entry.generation == 0) return error.SourceSnapshotCorrupt;
+                result.value_ptr.* = entry;
+            }
+        }
+        if (donor_catalog.indexes.len != 0) {
+            var entries = try catalog_view.Iterator.init(donor_catalog.indexes);
+            while (try entries.next()) |entry| {
+                const target = receiver_indexes.get(entry.name) orelse return error.SourceSnapshotCorrupt;
+                if (target.kind != entry.kind or entry.generation == 0) return error.SourceSnapshotCorrupt;
+                const result = try indexes.getOrPut(owned, try owned.dupe(u8, entry.name));
+                if (result.found_existing) return error.SourceSnapshotCorrupt;
+                result.value_ptr.* = .{ .kind = entry.kind, .donor = entry.generation, .receiver = target.generation };
+            }
+        }
+        if (indexes.count() != receiver_indexes.count()) return error.SourceSnapshotCorrupt;
+        return .{ .arena = arena, .donor_binding = donor_binding, .receiver_binding = receiver_binding, .indexes = indexes };
+    }
+
+    pub fn deinit(self: *ReceiverProducerPlan) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn generation(self: *const ReceiverProducerPlan, proof: provenance.Proof) !?u64 {
+        if (proof.producer_kind != .index and proof.producer_kind != .graph) return null;
+        const entry = self.indexes.get(proof.producer_name) orelse return error.SourceSnapshotCorrupt;
+        if ((entry.kind == 3) != (proof.producer_kind == .graph) or entry.donor != proof.producer_generation)
+            return error.SourceSnapshotCorrupt;
+        return entry.receiver;
     }
 };
 
@@ -113,7 +178,7 @@ pub fn prepareReceiverCandidate(
     receiver_namespace: publication.Namespace,
     donor_range: @import("../byte_range.zig").ByteRange,
     source_pin: publication.Digest,
-    donor_binding: inventory.Binding,
+    producer_plan: *const ReceiverProducerPlan,
     decoded: Decoded,
 ) !?ReceiverCandidate {
     if (std.mem.allEqual(u8, &source_pin, 0)) return error.SourceSnapshotCorrupt;
@@ -122,16 +187,18 @@ pub fn prepareReceiverCandidate(
     defer if (!returned) arena.deinit();
     const owned = arena.allocator();
     const proof = decoded.proof.proof;
+    const donor_binding = producer_plan.donor_binding;
     if (donor_binding.effect_protocol != 15 or donor_binding.epoch != proof.authority_epoch or
         !std.mem.eql(u8, &donor_binding.digest, &proof.catalog_digest)) return error.SourceSnapshotCorrupt;
     var ordered = (try inventory.load(alloc, txn)) orelse return null;
     defer ordered.deinit();
     const receiver_binding = ordered.value.command.binding;
     if (!std.mem.eql(u8, &ordered.value.command.namespace, &receiver_namespace) or
-        !donor_binding.compatible(receiver_binding)) return null;
+        !std.meta.eql(producer_plan.receiver_binding, receiver_binding)) return null;
     const active = (try publication.authority(txn)) orelse return null;
     if (!std.mem.eql(u8, &active.namespace, &receiver_namespace) or active.epoch != receiver_binding.epoch or
         !std.mem.eql(u8, &active.catalog_digest, &receiver_binding.digest)) return null;
+    const receiver_producer_generation = try producer_plan.generation(proof);
     for (proof.sources, 0..) |source, index| if (decoded.bitmap[index / 8] & (@as(u8, 1) << @intCast(index % 8)) != 0 and
         !donor_range.contains(source.document_key)) return error.SourceSnapshotCorrupt;
     const sources = try owned.alloc(publication.Source, proof.sources.len);
@@ -199,6 +266,7 @@ pub fn prepareReceiverCandidate(
     return .{
         .arena = arena,
         .receiver = .{ .namespace = receiver_namespace, .binding = receiver_binding },
+        .receiver_producer_generation = receiver_producer_generation,
         .donor = .{
             .source_pin = source_pin,
             .namespace = proof.namespace,
@@ -262,6 +330,42 @@ pub fn revalidateReceiverCandidate(
         } else if (selected.effect.value_digest != null) return false;
     }
     return true;
+}
+
+test "ordered artifact inventory receiver producer mapping rejects donor identity drift" {
+    const alloc = std.testing.allocator;
+    const prefix = "AIDX\x02\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00g\x03\x02\x00\x00\x00{}";
+    const donor: inventory.Catalogs = .{ .indexes = prefix ++ "\x05\x00\x00\x00\x00\x00\x00\x00" };
+    const receiver: inventory.Catalogs = .{ .indexes = prefix ++ "\x09\x00\x00\x00\x00\x00\x00\x00" };
+    const donor_binding: inventory.Binding = .{ .epoch = 3, .digest = donor.digest(), .semantic_digest = try donor.semanticDigest(alloc), .effect_protocol = 15 };
+    const receiver_binding: inventory.Binding = .{ .epoch = 4, .digest = receiver.digest(), .semantic_digest = try receiver.semanticDigest(alloc), .effect_protocol = 15 };
+    var plan = try ReceiverProducerPlan.init(alloc, donor, donor_binding, receiver, receiver_binding);
+    defer plan.deinit();
+    const source = publication.Source{ .document_key = "d", .content_digest = @splat(1), .timestamp = 1, .input_position = null };
+    const effect = provenance.Effect{ .family = .graph, .key = "effect", .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    var proof: provenance.Proof = .{ .namespace = @splat(1), .authority_epoch = 3, .catalog_digest = donor_binding.digest, .producer_kind = .graph, .producer_name = "g", .producer_generation = 5, .producer_artifact_name = "g", .publication_digest = @splat(2), .input_digest = undefined, .sources = (&source)[0..1], .artifact_sources = &.{}, .effects = (&effect)[0..1] };
+    proof.input_digest = proof.inputCommand().inputDigest();
+    try std.testing.expectEqual(@as(?u64, 9), try plan.generation(proof));
+    proof.producer_generation = 9;
+    try std.testing.expectError(error.SourceSnapshotCorrupt, plan.generation(proof));
+    proof.producer_generation = 5;
+    proof.producer_name = "missing";
+    try std.testing.expectError(error.SourceSnapshotCorrupt, plan.generation(proof));
+    proof.producer_name = "g";
+    proof.producer_kind = .index;
+    try std.testing.expectError(error.SourceSnapshotCorrupt, plan.generation(proof));
+    proof.producer_kind = .graph;
+    var forged = donor_binding;
+    forged.digest[0] ^= 1;
+    try std.testing.expectError(error.SourceSnapshotCorrupt, ReceiverProducerPlan.init(alloc, donor, forged, receiver, receiver_binding));
+    const AllocationCheck = struct {
+        fn run(a: std.mem.Allocator, source_catalog: inventory.Catalogs, source_binding: inventory.Binding, target_catalog: inventory.Catalogs, target_binding: inventory.Binding) !void {
+            var mapped = try ReceiverProducerPlan.init(a, source_catalog, source_binding, target_catalog, target_binding);
+            defer mapped.deinit();
+            try std.testing.expectEqual(@as(usize, 1), mapped.indexes.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ donor, donor_binding, receiver, receiver_binding });
 }
 
 pub fn decodeValue(alloc: std.mem.Allocator, namespace: publication.Namespace, digest: publication.Digest, raw: []const u8) !Decoded {
@@ -458,11 +562,16 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     try receiver.values.put(guard_key, guard_value);
     try receiver.values.put(output_key, output_value);
     const receiver_namespace: publication.Namespace = @splat(2);
-    const catalogs: inventory.Catalogs = .{};
-    const catalog_digest = catalogs.digest();
-    const semantic_digest = try catalogs.semanticDigest(alloc);
+    const index_prefix = "AIDX\x02\x00\x00\x00\x01\x00\x00\x00\x05\x00\x00\x00index\x00\x02\x00\x00\x00{}";
+    const donor_catalog: inventory.Catalogs = .{ .indexes = index_prefix ++ "\x01\x00\x00\x00\x00\x00\x00\x00" };
+    const catalogs: inventory.Catalogs = .{ .indexes = index_prefix ++ "\x09\x00\x00\x00\x00\x00\x00\x00" };
+    const catalog_digest = donor_catalog.digest();
+    const semantic_digest = try donor_catalog.semanticDigest(alloc);
     const donor_binding: inventory.Binding = .{ .epoch = 1, .digest = catalog_digest, .semantic_digest = semantic_digest, .effect_protocol = 15 };
-    const receiver_binding: inventory.Binding = .{ .epoch = 2, .digest = catalog_digest, .semantic_digest = semantic_digest, .effect_protocol = 15 };
+    const receiver_binding: inventory.Binding = .{ .epoch = 2, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc), .effect_protocol = 15 };
+    try std.testing.expect(donor_binding.compatible(receiver_binding));
+    var plan = try ReceiverProducerPlan.init(alloc, donor_catalog, donor_binding, catalogs, receiver_binding);
+    defer plan.deinit();
     const ordered: inventory.Ordered = .{ .command = .{ .namespace = receiver_namespace, .previous = donor_binding, .binding = receiver_binding, .catalogs = catalogs }, .applied_index = 4 };
     const ordered_bytes = try std.json.Stringify.valueAlloc(alloc, ordered, .{});
     defer alloc.free(ordered_bytes);
@@ -513,9 +622,10 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     try std.testing.expectEqualDeep(output_before, decoded.proof.proof.mutation_preconditions[0]);
     const donor_range: @import("../byte_range.zig").ByteRange = .{ .start = "doc", .end = "dop" };
     const source_pin: publication.Digest = @splat(9);
-    var mapped = (try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, donor_binding, decoded)) orelse return error.TestUnexpectedResult;
+    var mapped = (try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, &plan, decoded)) orelse return error.TestUnexpectedResult;
     defer mapped.deinit();
     try std.testing.expectEqualDeep(receiver_binding, mapped.receiver.binding);
+    try std.testing.expectEqual(@as(?u64, 9), mapped.receiver_producer_generation);
     try std.testing.expectEqualDeep(source_pin, mapped.donor.source_pin);
     try std.testing.expectEqualDeep(donor_binding, mapped.donor.binding);
     try std.testing.expectEqualDeep(decoded.proof_checksum, mapped.donor.proof_checksum);
@@ -543,7 +653,7 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     std.mem.writeInt(u64, authority_bytes[28..36], receiver_binding.epoch + 1, .little);
     std.crypto.hash.Blake3.hash(authority_bytes[0..68], authority_bytes[68..100], .{});
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
-    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, donor_binding, decoded)) == null);
+    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, &plan, decoded)) == null);
     std.mem.writeInt(u64, authority_bytes[28..36], receiver_binding.epoch, .little);
     std.crypto.hash.Blake3.hash(authority_bytes[0..68], authority_bytes[68..100], .{});
     try std.testing.expect(try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
@@ -554,23 +664,23 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     defer alloc.free(changed_ordered_bytes);
     try receiver.values.put(inventory.ordered_key, changed_ordered_bytes);
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
-    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, donor_binding, decoded)) == null);
+    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, &plan, decoded)) == null);
     try receiver.values.put(inventory.ordered_key, ordered_bytes);
     try std.testing.expect(try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
-    try std.testing.expectError(error.SourceSnapshotCorrupt, prepareReceiverCandidate(alloc, &receiver, receiver_namespace, .{ .start = "e", .end = "f" }, source_pin, donor_binding, decoded));
-    try std.testing.expectError(error.SourceSnapshotCorrupt, prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, @splat(0), donor_binding, decoded));
+    try std.testing.expectError(error.SourceSnapshotCorrupt, prepareReceiverCandidate(alloc, &receiver, receiver_namespace, .{ .start = "e", .end = "f" }, source_pin, &plan, decoded));
+    try std.testing.expectError(error.SourceSnapshotCorrupt, prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, @splat(0), &plan, decoded));
     var wrong_donor = donor_binding;
     wrong_donor.digest = @splat(3);
-    try std.testing.expectError(error.SourceSnapshotCorrupt, prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, wrong_donor, decoded));
+    try std.testing.expectError(error.SourceSnapshotCorrupt, ReceiverProducerPlan.init(alloc, donor_catalog, wrong_donor, catalogs, receiver_binding));
     const AllocationCheck = struct {
-        fn run(a: std.mem.Allocator, txn: *Fake, donor_namespace: publication.Namespace, receiver_ns: publication.Namespace, range: @import("../byte_range.zig").ByteRange, pin: publication.Digest, binding: inventory.Binding, digest: publication.Digest, encoded_value: []const u8, expected_position: publication.Position) !void {
+        fn run(a: std.mem.Allocator, txn: *Fake, donor_namespace: publication.Namespace, receiver_ns: publication.Namespace, range: @import("../byte_range.zig").ByteRange, pin: publication.Digest, producer_plan: *const ReceiverProducerPlan, digest: publication.Digest, encoded_value: []const u8, expected_position: publication.Position) !void {
             const transfer = try a.dupe(u8, encoded_value);
             var transfer_live = true;
             defer if (transfer_live) a.free(transfer);
             var candidate = try decodeValue(a, donor_namespace, digest, transfer);
             var candidate_live = true;
             defer if (candidate_live) candidate.deinit();
-            var receiver_inputs = (try prepareReceiverCandidate(a, txn, receiver_ns, range, pin, binding, candidate)) orelse return error.TestUnexpectedResult;
+            var receiver_inputs = (try prepareReceiverCandidate(a, txn, receiver_ns, range, pin, producer_plan, candidate)) orelse return error.TestUnexpectedResult;
             candidate.deinit();
             candidate_live = false;
             @memset(transfer, 0);
@@ -584,22 +694,22 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
             try std.testing.expect(try revalidateReceiverCandidate(a, txn, receiver_ns, receiver_inputs));
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &receiver, proof.namespace, receiver_namespace, donor_range, source_pin, donor_binding, proof.publication_digest, value, row_position });
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &receiver, proof.namespace, receiver_namespace, donor_range, source_pin, &plan, proof.publication_digest, value, row_position });
     try receiver.values.put(output_key, "changed output");
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
-    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, donor_binding, decoded)) == null);
+    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, &plan, decoded)) == null);
     try receiver.values.put(output_key, output_value);
     try receiver.values.put(tombstone_key, "resurrected");
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
-    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, donor_binding, decoded)) == null);
+    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, &plan, decoded)) == null);
     try std.testing.expect(receiver.values.remove(tombstone_key));
     try receiver.values.put(guard_key, "changed");
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
-    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, donor_binding, decoded)) == null);
+    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, &plan, decoded)) == null);
     try receiver.values.put(guard_key, guard_value);
     try receiver.values.put(row_key, "{\"v\":2}");
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
-    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, donor_binding, decoded)) == null);
+    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, &plan, decoded)) == null);
 }
 
 test "ordered artifact inventory source proof descriptor resumes a certified large body" {
