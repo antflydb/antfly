@@ -12,6 +12,8 @@ through declared Zig modules.
   Antfly inference provider adapters, C ABI, Lite CLI, shared local contracts,
   and their build owner.
 - `zig/pkg/inference`: native inference engine, host, worker, and CLI.
+- `zig/pkg/antfly-server-api`: Apache generated schemas and route interfaces
+  consumed only by the server; it does not become an embedded dependency.
 - `zig/pkg/antfly`: ELv2 server orchestration, distributed coordination,
   network APIs, and its build owner. It may import the embedded engine.
 - `zig/lib`: independently reusable Apache libraries.
@@ -105,7 +107,8 @@ should not be folded into the public SDK/documentation spec.
 Generated Zig modules should follow their consumers rather than the location
 of the authored YAML. Put embedded database and provider contracts under
 `pkg/antfly-embedded`, inference API contracts under `pkg/inference`, and
-server-only admin, internal, and authority/route modules under `pkg/antfly`.
+server-only admin, internal, and authority/route modules under an Apache
+`pkg/antfly-server-api` owner imported by the ELv2 server.
 Move any types genuinely shared between embedded and server into a small
 Apache schema owner instead of copying or generating the same type twice.
 The code-generation build support currently in
