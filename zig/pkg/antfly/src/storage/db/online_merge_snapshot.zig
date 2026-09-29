@@ -644,6 +644,11 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
                 const witness = try receiver.core.store.get(alloc, &witness_key);
                 defer alloc.free(witness);
                 try std.testing.expectEqualSlices(u8, &decoded.record_digest, witness);
+                var receiver_namespace: @import("artifact_publication.zig").Namespace = undefined;
+                @import("doc_identity.zig").encodeNamespace(&receiver_namespace, receiver_options.identity_namespace.?);
+                var receiver_read = try receiver.core.store.beginReadTxn();
+                defer receiver_read.abort();
+                try std.testing.expect((try @import("artifact_publication.zig").artifactRevision(&receiver_read, receiver_namespace, large_key)) != null);
             } else {
                 try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, &proof_key));
                 try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, &witness_key));
@@ -695,6 +700,11 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
         if (!checked_replay_without_catalog and request.merge_page.?.artifact_effects.len != 0) {
             // A delayed retry must retire its new Raft position without
             // consulting a projection catalog that may already have changed.
+            var receiver_namespace: @import("artifact_publication.zig").Namespace = undefined;
+            @import("doc_identity.zig").encodeNamespace(&receiver_namespace, receiver_options.identity_namespace.?);
+            const revision_key = @import("artifact_publication.zig").artifactRevisionKey(receiver_namespace, request.merge_page.?.artifact_effects[0].key);
+            const original_revision = try receiver.core.store.get(alloc, &revision_key);
+            defer alloc.free(original_revision);
             const inventory_key = @import("artifact_inventory.zig").ordered_key;
             const inventory = try receiver.core.store.get(alloc, inventory_key);
             defer alloc.free(inventory);
@@ -702,6 +712,9 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
             const replay = receiver.batchRaftReplicatedApply(request, .{ .term = 1, .index = index });
             try receiver.core.store.put(inventory_key, inventory);
             try replay;
+            const replay_revision = try receiver.core.store.get(alloc, &revision_key);
+            defer alloc.free(replay_revision);
+            try std.testing.expectEqualSlices(u8, original_revision, replay_revision);
             index += 1;
             checked_replay_without_catalog = true;
         }

@@ -9650,12 +9650,16 @@ pub const DB = struct {
         if (req.merge_page) |page| for (page.artifact_effects) |effect| {
             payload_bytes +|= effect.key.len;
             if (effect.value) |value| payload_bytes +|= value.len;
-            operations +|= 1;
+            // The receiver's revision witness is committed beside every
+            // imported value/tombstone, including an absent postimage.
+            payload_bytes +|= @sizeOf(@TypeOf(@import("artifact_publication.zig").artifactRevisionKey(@splat(0), ""))) + @import("artifact_publication.zig").Position.encoded_len;
+            operations +|= 2;
         };
         if (req.merge_page) |page| for (page.provenance_effects) |effect| {
             payload_bytes +|= effect.key.len;
             if (effect.value) |value| payload_bytes +|= value.len;
-            operations +|= 1;
+            payload_bytes +|= @import("source_proof_batch.zig").witness_prefix.len + 24 + 32 + 32 + 32;
+            operations +|= 2;
         };
         for (req.writes) |write| {
             payload_bytes +|= @intCast(write.key.len);
@@ -12631,7 +12635,21 @@ pub const DB = struct {
         }
         // Typed online artifact afterimages participate in the same primary,
         // derived replay and page-receipt transaction as ordinary artifacts.
+        var transferred_artifact_position_bytes: [@import("artifact_publication.zig").Position.encoded_len]u8 = undefined;
+        if (transferred_artifacts.len != 0) {
+            const entry = opts.raft_applied_entry_marker orelse return error.InvalidMergePage;
+            transferred_artifact_position_bytes = try (@import("artifact_publication.zig").Position{ .raft = .{ .term = entry.term, .index = entry.index } }).encode();
+        }
+        var receiver_artifact_namespace: @import("artifact_publication.zig").Namespace = undefined;
+        doc_identity.encodeNamespace(&receiver_artifact_namespace, self.core.identity_namespace);
         for (transferred_artifacts) |effect| {
+            const revision_key = @import("artifact_publication.zig").artifactRevisionKey(receiver_artifact_namespace, effect.key);
+            const owned_revision_key = try self.alloc.dupe(u8, &revision_key);
+            owned_store_keys.append(self.alloc, owned_revision_key) catch |err| {
+                self.alloc.free(owned_revision_key);
+                return err;
+            };
+            try store_writes.append(self.alloc, .{ .key = owned_revision_key, .value = &transferred_artifact_position_bytes });
             if (effect.value) |value| {
                 try store_writes.append(self.alloc, .{ .key = effect.key, .value = value });
                 // Both thin and materialized journals route these keys to

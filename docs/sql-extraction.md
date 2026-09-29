@@ -1851,6 +1851,10 @@ following mechanisms are installed behind that gate:
   with each inert APF3 record. It binds the already-verified APF3 checksum to
   the selected bitmap, avoiding a second multi-megabyte hash; writer
   revalidation CASes only the witness under the apply lock.
+  Online artifact-page apply now writes receiver-local artifact revisions in
+  the same batch as each transferred afterimage or deletion. Those revisions
+  are the exact output witnesses later adoption needs, and replay-only pages
+  cannot advance them to a new Raft position.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups
