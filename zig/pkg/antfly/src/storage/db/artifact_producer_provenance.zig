@@ -117,6 +117,8 @@ pub const Proof = struct {
 
 pub const Owned = struct {
     arena: std.heap.ArenaAllocator,
+    /// `decodeAlloc` owns all slices; `decodeBorrowed` retains a borrowed raw
+    /// buffer which its caller must keep alive until deinit.
     proof: Proof,
     pub fn deinit(self: *Owned) void {
         self.arena.deinit();
@@ -278,6 +280,17 @@ const ProofCursor = struct {
 };
 
 pub fn decodeAlloc(alloc: std.mem.Allocator, raw: []const u8) !Owned {
+    return decode(alloc, raw, true);
+}
+
+/// Borrow the immutable proof bytes for the decoded value's lifetime. Source
+/// export/import holds a pinned snapshot or certified AFB object throughout
+/// validation, avoiding a second proof-sized allocation for a large block.
+pub fn decodeBorrowed(alloc: std.mem.Allocator, raw: []const u8) !Owned {
+    return decode(alloc, raw, false);
+}
+
+fn decode(alloc: std.mem.Allocator, raw: []const u8, copy_bytes: bool) !Owned {
     if (raw.len < 4 + 1 + 1 + 24 + 8 + 32 + 8 + 32 + 32 + 4 * 6 + 32 or raw.len > max_encoded_bytes)
         return error.ArtifactCatalogCorrupt;
     var digest: publication.Digest = undefined;
@@ -285,7 +298,7 @@ pub fn decodeAlloc(alloc: std.mem.Allocator, raw: []const u8) !Owned {
     if (!std.mem.eql(u8, &digest, raw[raw.len - 32 ..])) return error.ArtifactCatalogCorrupt;
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    const owned_raw = try arena.allocator().dupe(u8, raw);
+    const owned_raw = if (copy_bytes) try arena.allocator().dupe(u8, raw) else raw;
     var cursor: ProofCursor = .{ .bytes = owned_raw[0 .. owned_raw.len - 32] };
     if (!std.mem.eql(u8, try cursor.take(4), proof_magic)) return error.ArtifactCatalogCorrupt;
     const version = try cursor.byte();
@@ -539,6 +552,47 @@ pub fn readDocumentProofPage(
     const next_cursor = if (item == null or !std.mem.startsWith(u8, item.?.key, scoped) or
         (upper != null and std.mem.order(u8, item.?.key, upper.?) != .lt)) null else try owned.dupe(u8, entries.items[entries.items.len - 1].index_key);
     return .{ .arena = arena, .entries = entries.items, .next_cursor = next_cursor };
+}
+
+/// Select exactly those output sources whose receipt still names this proof
+/// at the immutable source cut. The bitmap is deliberately portable evidence,
+/// not a receiver-local reference: adoption must recheck logical inputs and
+/// reconstruct positions under the receiver's own authority.
+pub fn selectedSourceBitmapAlloc(
+    alloc: std.mem.Allocator,
+    txn: anytype,
+    active: publication.Authority,
+    range: @import("../byte_range.zig").ByteRange,
+    proof: Proof,
+) !?[]u8 {
+    try proof.validate();
+    if (!std.mem.eql(u8, &proof.namespace, &active.namespace) or proof.authority_epoch != active.epoch or
+        !std.mem.eql(u8, &proof.catalog_digest, &active.catalog_digest)) return null;
+    var owners = std.StaticBitSet(publication.max_source_documents).initEmpty();
+    for (proof.effects) |effect| owners.set(effect.source_index);
+    var bitmap: [publication.max_source_documents / 8]u8 = @splat(0);
+    var found = false;
+    for (proof.sources, 0..) |source, source_index| {
+        if (!owners.isSet(source_index) or !range.contains(source.document_key)) continue;
+        const reference = referenceKey(proof.inputCommand(), source);
+        const raw = txn.get(&reference) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        if (raw.len != 32) return error.ArtifactCatalogCorrupt;
+        if (!std.mem.eql(u8, raw, &proof.publication_digest)) continue;
+        const index = try documentReferenceKeyAlloc(alloc, active.namespace, active.epoch, source.document_key, reference[reference.len - 32 ..]);
+        defer alloc.free(index);
+        const indexed = txn.get(index) catch |err| switch (err) {
+            error.NotFound => return error.ArtifactCatalogCorrupt,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, indexed, &proof.publication_digest)) return error.ArtifactCatalogCorrupt;
+        bitmap[source_index / 8] |= @as(u8, 1) << @intCast(source_index % 8);
+        found = true;
+    }
+    if (!found) return null;
+    return try alloc.dupe(u8, bitmap[0 .. (proof.sources.len + 7) / 8]);
 }
 
 fn artifactReferenceKey(authority: publication.Authority, artifact: []const u8) [artifact_prefix.len + 24 + 8 + 32]u8 {

@@ -64,6 +64,9 @@ pub const BlockType = enum(u8) {
     /// Certified online source-copy only. Preserves physical artifact
     /// ownership and incarnation state; never accepted by ordinary restore.
     source_artifact_batch = 0x1C,
+    /// Certified source-copy only. Inert producer proofs and a bitmap of
+    /// source-cut output owners; receivers must issue their own adoption.
+    source_proof_batch = 0x1D,
     blob_header = 0x20,
     blob_chunk = 0x21,
     footer_index = 0x22,

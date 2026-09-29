@@ -193,9 +193,10 @@ pub const Builder = struct {
                 if (next.certificate.integrity == null) return error.InvalidSourceSnapshot;
                 try next.append(kind, "", payload);
             },
-            // Source-copy graph ownership is an authenticated part of the
-            // logical cut, even though ordinary restore must reject it.
-            0x01, 0x02, 0x03, 0x10...0x17, 0x19, 0x1a, 0x1c, 0xf0 => try next.append(kind, "", payload),
+            // Source-copy graph ownership and inert producer provenance are
+            // authenticated parts of the logical cut, even though ordinary
+            // restore must reject either private stream.
+            0x01, 0x02, 0x03, 0x10...0x17, 0x19, 0x1a, 0x1c, 0x1d, 0xf0 => try next.append(kind, "", payload),
             else => return error.InvalidSourceSnapshot,
         }
         self.* = next;

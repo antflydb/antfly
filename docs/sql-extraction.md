@@ -1762,7 +1762,7 @@ following mechanisms are installed behind that gate:
   references and document entries outside its writer transaction, then retires
   them with reference counts and proof bodies under an authority CAS. This is
   the range-seekable source evidence index
-  needed for bounded snapshot export, not yet a portable proof stream or a
+  needed for bounded snapshot export, not itself a portable proof stream or a
   receiver-local adoption certificate. A pinned, document-range proof-reference
   reader now seeks directly to encoded binary lower bounds, pages by entry and
   byte limits, and checks each index against its live source reference and
@@ -1777,6 +1777,19 @@ following mechanisms are installed behind that gate:
   it does not itself add a portable proof block or confer receiver authority.
   The 206-case ordered-artifact target passes, including forged-field and
   allocation-failure codec tests.
+  Certified AFB2 source-copy snapshots now include APF2 proofs once per
+  publication digest, plus a compact bitmap naming only output sources whose
+  receipt still selects that proof at the immutable cut. Export checks the
+  document index and source reference in that pinned cut. The source
+  certificate covers the new private block; AFB2 reader capability v4 rejects
+  older decoders. One-pass and checkpointed import verify proof framing,
+  checksum, source namespace, selected output ordinals and ordering, then
+  store the bytes under an inert source-proof prefix, never donor receipt or
+  authority keys. Borrowed decode avoids another proof-sized allocation.
+  The 208-case ordered-artifact and 28-case retained-transfer targets pass,
+  including binary document keys, full source-pin reopen, source certificate
+  verification and checkpointed staging import. Receiver-local adoption and
+  retained-effect/tail provenance transfer remain open.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups

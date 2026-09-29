@@ -36,6 +36,8 @@ const public_table_schema = @import("../schema/mod.zig");
 const source_snapshot = @import("source_snapshot.zig");
 const db_types = @import("db/types.zig");
 const artifact_ids = @import("db/artifact_ids.zig");
+const producer_provenance = @import("db/artifact_producer_provenance.zig");
+const source_proof_batch = @import("db/source_proof_batch.zig");
 const enrichment_artifact_codec = @import("db/enrichment/artifact_codec.zig");
 const index_manager = @import("db/catalog/index_manager.zig");
 const enrichment_catalog = @import("db/catalog/enrichment_catalog.zig");
@@ -631,7 +633,9 @@ pub fn exportPortableToWriterWithOptions(
         .parent_manifest_sha256 = parent_manifest_sha256,
         .created_at_unix_ns = options.created_at_unix_ns,
         .compatibility = .{
-            .min_afb_reader = if (inventory_out.source_generation_admission_count != 0)
+            .min_afb_reader = if (options.source_copy != null)
+                backup_bundle.source_proof_reader_version
+            else if (inventory_out.source_generation_admission_count != 0)
                 backup_bundle.source_generation_admission_reader_version
             else
                 backup_bundle.base_afb_reader_version,
@@ -774,6 +778,49 @@ test "portable backup namespace seeks preserve adjacent binary and legacy keys" 
     try std.testing.expect(entry == null);
     try std.testing.expectEqual(@as(u64, 3), stats.excluded_namespace_seeks);
     try std.testing.expectEqual(@as(u64, 9), stats.data_cursor_entries);
+}
+
+fn exportSourceProofs(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutput, range: @import("byte_range.zig").ByteRange, namespace: [24]u8) !void {
+    const publication = @import("db/artifact_publication.zig");
+    const active = (try publication.authority(scan)) orelse return;
+    if (!std.mem.eql(u8, &active.namespace, &namespace)) return error.SourceSnapshotCutMismatch;
+    const scoped = try std.mem.concat(alloc, u8, &.{ producer_provenance.prefix, &active.namespace });
+    defer alloc.free(scoped);
+    var cursor = try scan.openPhysicalCursorAdapter();
+    defer cursor.close();
+    var batch: std.ArrayListUnmanaged(backup_codec.KeyValueEntry) = .empty;
+    defer deinitKeyValueBatch(alloc, &batch);
+    var batch_bytes: usize = 4;
+    var entry = try cursor.seekAtOrAfter(scoped);
+    while (entry) |item| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, scoped)) break;
+        try out.cancellation.check();
+        if (item.key.len != scoped.len + 32) return error.SourceSnapshotCorrupt;
+        const digest: publication.Digest = item.key[scoped.len..][0..32].*;
+        var proof = producer_provenance.decodeBorrowed(alloc, item.value) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.SourceSnapshotCorrupt,
+        };
+        defer proof.deinit();
+        if (!std.mem.eql(u8, &proof.proof.publication_digest, &digest)) return error.SourceSnapshotCorrupt;
+        const selected = try producer_provenance.selectedSourceBitmapAlloc(alloc, scan, active, range, proof.proof) orelse continue;
+        defer alloc.free(selected);
+        const value = try source_proof_batch.encodeValueAlloc(alloc, selected, item.value);
+        var value_owned = true;
+        errdefer if (value_owned) alloc.free(value);
+        if (batch.items.len != 0 and (batch_bytes +| 40 +| value.len > batch_target_bytes or batch_bytes +| 40 +| value.len > source_proof_batch.max_bytes or batch.items.len == source_proof_batch.max_entries)) {
+            try flushKeyValueBlock(alloc, out, &batch, .source_proof_batch);
+            batch_bytes = 4;
+        }
+        const owned_digest = try alloc.dupe(u8, &digest);
+        var digest_owned = true;
+        errdefer if (digest_owned) alloc.free(owned_digest);
+        try batch.append(alloc, .{ .key = owned_digest, .value = value });
+        value_owned = false;
+        digest_owned = false;
+        batch_bytes += 40 + value.len;
+    }
+    if (batch.items.len != 0) try flushKeyValueBlock(alloc, out, &batch, .source_proof_batch);
 }
 
 fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutput, cohort: ?CohortProof, source_copy: ?SourceCopyProof) !void {
@@ -1087,6 +1134,8 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     }
     try flushMetadataBatch(alloc, out, &metadata_batch);
     metadata_batch_bytes = 0;
+
+    if (source_copy) |proof| try exportSourceProofs(alloc, scan, out, source_range.?, proof.scope.namespace());
 
     // These owner-routed records are excluded from general metadata/data
     // traversal. Only the certified source-copy format may carry them; cohort
@@ -1644,6 +1693,7 @@ pub fn isPortableStoreKey(key: []const u8) bool {
     if (key.len == 0) return false;
     return key[0] == internal_keys.user_namespace or
         key[0] == internal_keys.identity_namespace or
+        std.mem.startsWith(u8, key, source_proof_batch.import_prefix) or
         isPortableMetadataKey(key);
 }
 
@@ -2318,6 +2368,7 @@ const CohortImportCheckpoint = struct {
     saw_relational: bool = false,
     saw_document: bool = false,
     source_integrity_last_key: []const u8 = "",
+    source_proof_last_digest: []const u8 = "",
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("db/relational_integrity_json.zig").write(self, jw);
     }
@@ -2365,6 +2416,10 @@ fn loadCohortArchive(alloc: Allocator, store: *DocStore, proof: StagedImportProo
     if (state.source_integrity_last_key.len > archive.source_integrity_last_key.len) return error.InvalidRestoreSourceCheckpoint;
     @memcpy(archive.source_integrity_last_key[0..state.source_integrity_last_key.len], state.source_integrity_last_key);
     archive.source_integrity_last_key_len = state.source_integrity_last_key.len;
+    if (state.source_proof_last_digest.len != 0) {
+        if (state.source_proof_last_digest.len != 32) return error.InvalidRestoreSourceCheckpoint;
+        archive.source_proof_last_digest = state.source_proof_last_digest[0..32].*;
+    }
     for ([_][]const u8{ cohort_proof_key, source_copy_proof_key, source_integrity_key, source_integrity_catalog_key, source_integrity_activation_key, storage_schema.schema_key, "\x00\x00__metadata__:schema_json", table_catalog.key, relational_index_catalog.head_key }) |key| {
         const value = store.get(alloc, key) catch |err| switch (err) {
             error.NotFound => continue,
@@ -2629,6 +2684,14 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
             // IDs nor derived artifact data is part of the logical decoder.
             try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, .{ .import_derived_indexes = false }, &archive);
             if (block.block_type == .integrity_batch) state.source_integrity_last_key = try owned.dupe(u8, archive.source_integrity_last_key[0..archive.source_integrity_last_key_len]);
+            if (block.block_type == .source_proof_batch) {
+                state.source_proof_last_digest = try owned.dupe(u8, &archive.source_proof_last_digest.?);
+                var proofs = try source_proof_batch.Reader.init(block.payload);
+                while (try proofs.next()) |entry| {
+                    const selected = source_proof_batch.importKey(proof.source_copy.scope.namespace(), entry.digest);
+                    try writes.append(owned, .{ .key = try owned.dupe(u8, &selected), .value = entry.value });
+                }
+            }
             if (block.block_type == .file_footer) {
                 if (state.expected_rows != null) return error.InvalidBackupManifest;
                 state.expected_rows = (try backup_codec.decodeFileFooter(block.payload)).total_documents;
@@ -2996,6 +3059,7 @@ fn validateAndImportPortableStagingAfterHeader(
             },
             .integrity_batch => try validateSourceIntegrityBatch(alloc, block.payload, &archive, store),
             .source_artifact_batch => try validateSourceArtifactBatch(alloc, block.payload, &archive, store),
+            .source_proof_batch => try validateSourceProofBatch(alloc, block.payload, &archive, store),
             .doc_identity_batch => {
                 // The importer validates the identity namespace while applying
                 // the same decoded entries to unpublished staging.
@@ -3163,6 +3227,7 @@ const PortableArchiveValidation = struct {
     source_integrity_activation: bool = false,
     source_integrity_last_key: [@import("db/relational_integrity_contract.zig").key_len + 32]u8 = undefined,
     source_integrity_last_key_len: usize = 0,
+    source_proof_last_digest: ?[32]u8 = null,
     source_generation_admissions: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
     durable_schemas: bool = false,
     schema_cache_bytes: usize = default_schema_cache_bytes,
@@ -3586,6 +3651,7 @@ fn validatePortableImportBlockPayload(
     switch (block_type) {
         .integrity_batch => try validateSourceIntegrityBatch(alloc, payload, archive, null),
         .source_artifact_batch => try validateSourceArtifactBatch(alloc, payload, archive, null),
+        .source_proof_batch => try validateSourceProofBatch(alloc, payload, archive, null),
         .document_batch => try validateDocumentBatchPayload(alloc, payload, archive),
         .doc_identity_batch => try validateIdentityBatchPayload(alloc, payload),
         .metadata_batch => try validateMetadataBatchPayload(alloc, payload, archive),
@@ -3618,6 +3684,96 @@ fn validateSourceArtifactBatch(alloc: Allocator, payload: []const u8, archive: *
         while (try reader.next()) |entry| writes.appendAssumeCapacity(.{ .key = entry.key, .value = entry.value });
         try destination.putBatch(writes.items, &.{});
     }
+}
+
+fn validateSourceProofBatch(alloc: Allocator, payload: []const u8, archive: *PortableArchiveValidation, store: ?*DocStore) !void {
+    const copy = archive.source_copy orelse return error.SourceCopyRestoreUnsupported;
+    if (!archive.saw_source_copy or archive.min_afb_reader < backup_bundle.source_proof_reader_version) return error.SourceCopyRestoreUnsupported;
+    var reader = try source_proof_batch.Reader.init(payload);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var writes: std.ArrayListUnmanaged(KVPair) = .empty;
+    while (try reader.next()) |entry| {
+        if (archive.source_proof_last_digest) |previous| if (std.mem.order(u8, &previous, &entry.digest) != .lt)
+            return error.SourceSnapshotCorrupt;
+        var decoded = try source_proof_batch.decodeValue(alloc, copy.scope.namespace(), entry.digest, entry.value);
+        decoded.deinit();
+        archive.source_proof_last_digest = entry.digest;
+        if (store != null) {
+            const selected = source_proof_batch.importKey(copy.scope.namespace(), entry.digest);
+            try writes.append(owned, .{ .key = try owned.dupe(u8, &selected), .value = entry.value });
+        }
+    }
+    if (store) |destination| try destination.putBatch(writes.items, &.{});
+}
+
+test "ordered artifact inventory source proof export restores inert selected evidence" {
+    const alloc = std.testing.allocator;
+    const publication = @import("db/artifact_publication.zig");
+    var source_tmp = std.testing.tmpDir(.{});
+    defer source_tmp.cleanup();
+    var destination_tmp = std.testing.tmpDir(.{});
+    defer destination_tmp.cleanup();
+    var source = try openTestStore(alloc, &source_tmp);
+    defer source.close();
+    var destination = try openTestStore(alloc, &destination_tmp);
+    defer destination.close();
+    const identity: doc_identity.Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+    var namespace: publication.Namespace = undefined;
+    doc_identity.encodeNamespace(&namespace, identity);
+    const active: publication.Authority = .{ .namespace = namespace, .epoch = 1, .catalog_digest = @splat(2) };
+    const sources = [_]publication.Source{
+        .{ .document_key = "a\x00b", .content_digest = @splat(3), .timestamp = 1, .input_position = null },
+        .{ .document_key = "outside", .content_digest = @splat(4), .timestamp = 1, .input_position = null },
+    };
+    const effect = publication.Mutation{ .family = .document_artifact, .key = "effect", .value = null, .source_index = 0 };
+    const command: publication.Command = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = active.catalog_digest, .producer_name = "proof", .producer_generation = 1, .producer_artifact_name = "proof", .sources = &sources, .mutations = (&effect)[0..1], .publication_digest = @splat(5) };
+    const proof_effect = producer_provenance.Effect{ .family = effect.family, .key = effect.key, .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    const logical: producer_provenance.Proof = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = active.catalog_digest, .producer_kind = .index, .producer_name = "proof", .producer_generation = 1, .producer_artifact_name = "proof", .publication_digest = command.publication_digest, .input_digest = command.inputDigest(), .sources = &sources, .artifact_sources = &.{}, .effects = (&proof_effect)[0..1] };
+    const encoded = try producer_provenance.encodeAlloc(alloc, logical);
+    defer alloc.free(encoded);
+    {
+        var writer = try source.beginWriteTxn();
+        errdefer writer.abort();
+        try publication.stageAuthority(&writer, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = active.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        var indexed = try producer_provenance.prepareDocumentReferences(alloc, command);
+        defer indexed.deinit();
+        try producer_provenance.stageIndexed(&writer, command, encoded, .{ .raft = .{ .term = 1, .index = 1 } }, &indexed);
+        try writer.commit();
+    }
+    var block_writer = std.Io.Writer.Allocating.init(alloc);
+    defer block_writer.deinit();
+    var objects: std.ArrayListUnmanaged(PortableObject) = .empty;
+    defer objects.deinit(alloc);
+    var output: PortableOutput = .{ .alloc = alloc, .writer = &block_writer.writer, .mode = .{ .inventory = &objects } };
+    var pinned = try source.beginReadTxn();
+    defer pinned.abort();
+    try exportSourceProofs(alloc, &pinned, &output, .{ .start = "a\x00b", .end = "outside" }, namespace);
+    try std.testing.expectEqual(@as(usize, 1), objects.items.len);
+    try std.testing.expectEqual(backup_codec.BlockType.source_proof_batch, objects.items[0].block_type);
+    const bytes = block_writer.written();
+    try std.testing.expectEqual(@as(u8, @intFromEnum(backup_codec.BlockType.source_proof_batch)), bytes[0]);
+    const payload = bytes[6 .. bytes.len - 4];
+    var archive: PortableArchiveValidation = .{ .format_version = 2, .min_afb_reader = backup_bundle.source_proof_reader_version };
+    try std.testing.expectError(error.SourceCopyRestoreUnsupported, validateSourceProofBatch(alloc, payload, &archive, null));
+    archive.source_copy = .{ .scope = .{ .fence = .{ .role = .merge_source, .transition_id = 1, .attempt = 1, .peer_group_id = 4, .owner_group_id = 2, .namespace = identity, .catalog_digest = @splat(7) }, .receiver_namespace = .{ .table_id = 1, .shard_id = 4, .range_id = 5 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } }, .applied_index = 1, .retained_start = 0 };
+    archive.saw_source_copy = true;
+    try validateSourceProofBatch(alloc, payload, &archive, &destination);
+    try std.testing.expectError(error.SourceSnapshotCorrupt, validateSourceProofBatch(alloc, payload, &archive, null));
+    var batch = try source_proof_batch.Reader.init(payload);
+    const entry = (try batch.next()).?;
+    try std.testing.expect((try batch.next()) == null);
+    const imported_key = source_proof_batch.importKey(namespace, entry.digest);
+    const imported = try destination.get(alloc, &imported_key);
+    defer alloc.free(imported);
+    try std.testing.expectEqualSlices(u8, entry.value, imported);
+    var decoded = try source_proof_batch.decodeValue(alloc, namespace, entry.digest, imported);
+    defer decoded.deinit();
+    try std.testing.expectEqualSlices(u8, &.{1}, decoded.bitmap);
+    try std.testing.expectError(error.NotFound, destination.get(alloc, publication.authority_key));
+    try std.testing.expectError(error.NotFound, destination.get(alloc, &producer_provenance.key(namespace, entry.digest)));
+    try std.testing.expectError(error.NotFound, destination.get(alloc, &producer_provenance.referenceKey(command, sources[0])));
 }
 
 test "ordinary portable restore rejects private source graph artifacts" {
