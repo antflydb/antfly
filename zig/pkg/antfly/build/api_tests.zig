@@ -2212,6 +2212,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-hosted-self-fk-test", "Run mounted public self-FK ADD/DROP/restart")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_diagnostic_tests).step);
+    const hosted_cte_merge_tests = b.addTest(.{
+        .root_module = hosted_self_fk_test_mod,
+        .filters = &.{"mounted hosted CTE MERGE retains owner statement fences"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-hosted-cte-merge-test", "Run linked hosted CTE MERGE owner-snapshot regression")
+        .dependOn(&addFilteredTestRunArtifact(b, hosted_cte_merge_tests).step);
     const hosted_self_fk_fault_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
         .filters = &.{"mounted hosted self-FK publication resumes after lost owner and metadata replies"},

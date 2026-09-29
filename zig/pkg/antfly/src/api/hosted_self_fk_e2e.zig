@@ -928,7 +928,7 @@ fn drivePublicationWithLostRepliesDiagnostic(
     return error.PublicationTimeout;
 }
 
-fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: bool) !void {
+fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: bool, snapshot_probe: bool) !void {
     const alloc = std.testing.allocator;
     const process_alloc = platform.allocator.processAllocator(alloc);
     const trusted_secret = "hosted-self-fk-trusted-v1";
@@ -1034,6 +1034,26 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     // one owner. awaitTable below is the public readiness barrier.
     try std.testing.expect(create.status == 200 or create.status == 202);
     const table_id = try awaitTable(alloc, io, transport, &headers, base);
+    if (snapshot_probe) {
+        const published_reads = if (data.http_server) |*server| server.table_reads orelse return error.OwnerReadNotReady else return error.OwnerReadNotReady;
+        try std.testing.expect(published_reads.remote_statement_fences_safe);
+        const physical = try tableGroup(alloc, &metadata, table_id);
+        defer alloc.free(physical.name);
+        try awaitRestartedLocalIntegrityCatalog(alloc, io, &data, physical.name, physical.group_id);
+        var inserted = try sql(alloc, transport, &headers, base, "INSERT INTO nodes (id,parent_id) VALUES (1,NULL)");
+        defer inserted.deinit(alloc);
+        if (inserted.status != 200) std.debug.print("hosted MERGE seed status={d} body={s}\n", .{ inserted.status, inserted.body });
+        try std.testing.expectEqual(@as(u16, 200), inserted.status);
+        var merged = try sql(alloc, transport, &headers, base, "WITH source_rows AS (SELECT id,parent_id FROM nodes) MERGE INTO nodes USING source_rows ON nodes.id = source_rows.id WHEN MATCHED THEN UPDATE SET parent_id = source_rows.parent_id");
+        defer merged.deinit(alloc);
+        if (merged.status != 200) std.debug.print("hosted CTE MERGE status={d} body={s}\n", .{ merged.status, merged.body });
+        try std.testing.expectEqual(@as(u16, 200), merged.status);
+        var result = try std.json.parseFromSlice(struct { command_tag: []const u8, rows_affected: i64 }, alloc, merged.body, .{ .ignore_unknown_fields = true });
+        defer result.deinit();
+        try std.testing.expectEqualStrings("MERGE", result.value.command_tag);
+        try std.testing.expectEqual(@as(i64, 1), result.value.rows_affected);
+        return;
+    }
     if (leader_transfer) {
         const physical = try tableGroup(alloc, &metadata, table_id);
         defer alloc.free(physical.name);
@@ -1301,17 +1321,21 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
 }
 
 test "mounted hosted self-FK ADD DROP restart" {
-    try mountedSelfFk(false, false, false);
+    try mountedSelfFk(false, false, false, false);
 }
 
 test "mounted hosted self-FK publication resumes after lost owner and metadata replies" {
-    try mountedSelfFk(true, false, false);
+    try mountedSelfFk(true, false, false, false);
 }
 
 test "mounted hosted self-FK resumes after metadata and owner cold restart at parent ACK" {
-    try mountedSelfFk(true, true, false);
+    try mountedSelfFk(true, true, false, false);
 }
 
 test "mounted hosted self-FK survives three-voter owner leadership transfer at ADD and DROP ACK" {
-    try mountedSelfFk(true, false, true);
+    try mountedSelfFk(true, false, true, false);
+}
+
+test "mounted hosted CTE MERGE retains owner statement fences" {
+    try mountedSelfFk(false, false, false, true);
 }

@@ -6642,6 +6642,11 @@ pub const DataServer = struct {
         if (comptime linked_storage) {
             const owner_source = try self.ensureKernelOwnerSource();
             _ = owner_source.withReadSafetyBarrier(self.read_source.read_safety_barrier);
+            // TableReadSource snapshots its remote-fence capability when it
+            // is constructed. The owner was first created before startup
+            // selected the Raft barrier; republish the source so remote SQL
+            // capture sees the live frozen-proof capability.
+            _ = self.read_source.withLocalReadSource(owner_source.readSource());
             // The owner is lazily constructed here on normal startup. Bind
             // the private port only after construction and read-barrier
             // selection, before the HTTP server copies its configuration.

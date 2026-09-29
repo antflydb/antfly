@@ -1056,7 +1056,15 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn prepareGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try self.writes.txnPrepareGroupLocal(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req)) orelse return error.UnknownGroup;
+        _ = (try self.writes.txnPrepareGroupLocalWithPreDecisionContext(
+            alloc,
+            group_id,
+            table_name,
+            req.txn_id,
+            req.topology_epoch,
+            req.req,
+            .{ .route_fence = req.route_fence },
+        )) orelse return error.UnknownGroup;
     }
 
     fn resolveGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
@@ -1101,6 +1109,59 @@ pub const LocalTableWriteParticipantWorker = struct {
         _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .none)) orelse return error.UnknownGroup;
     }
 };
+
+test "distributed txn local participant prepare preserves the guarded catalog route fence" {
+    const Probe = struct {
+        prepared: bool = false,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .txn_prepare_group_local_with_pre_decision_context = prepare,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.TestUnexpectedBatch;
+        }
+
+        fn prepare(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            _: u64,
+            req: db_mod.types.TransactionIntentRequest,
+            context: PreDecisionContext,
+        ) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 9), group_id);
+            try std.testing.expectEqual(@as(usize, 1), req.range_guards.len);
+            try std.testing.expectEqual(@as(u64, 9), context.route_fence.?.route.group_id);
+            self.prepared = true;
+            return {};
+        }
+    };
+
+    var probe = Probe{};
+    var worker = LocalTableWriteParticipantWorker.init(probe.source());
+    const fence: @import("../metadata/api.zig").CatalogRouteFence = .{
+        .metadata_group_id = 1,
+        .metadata_incarnation = @splat('1'),
+        .catalog_revision = 2,
+        .table_id = 7,
+        .topology_epoch = 3,
+        .route = .{ .group_id = 9, .range_id = 10, .identity_namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 10 } },
+    };
+    try worker.worker().prepareGroup(std.testing.allocator, 9, "docs", .{
+        .txn_id = @splat(1),
+        .topology_epoch = 3,
+        .route_fence = fence,
+        .req = .{ .range_guards = &.{.{ .bucket = 100, .generation = 7 }} },
+    });
+    try std.testing.expect(probe.prepared);
+}
 
 pub const ExecuteResult = contract.ExecuteResult;
 
