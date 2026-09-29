@@ -23346,7 +23346,8 @@ test "hbc index close does not clear shared namespace bytes" {
     defer cache.deinit();
 
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
-    defer idx.close();
+    var idx_open = true;
+    defer if (idx_open) idx.close();
     idx.attachSharedCache(&cache);
     idx.setRetainedVectorCacheEnabled(true);
 
@@ -23354,9 +23355,13 @@ test "hbc index close does not clear shared namespace bytes" {
     const namespace = idx.cache_namespace;
     try std.testing.expect(cache.namespaceStats(namespace).total_bytes > 0);
 
-    var second = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
-    second.attachSharedCache(&cache);
-    second.close();
+    // LSM permits one writer for a root. Register a second cache owner
+    // directly to exercise shared namespace lifetime without opening a
+    // second writer for the same path.
+    try std.testing.expect(cache.registerNamespacePath(namespace, std.mem.span(path)));
+    defer cache.unregisterNamespacePath(namespace, std.mem.span(path));
+    idx.close();
+    idx_open = false;
 
     try std.testing.expect(cache.namespaceStats(namespace).total_bytes > 0);
     try std.testing.expect(cache.namespaceStats(namespace).vector.used_bytes > 0);
@@ -23380,18 +23385,14 @@ test "hbc shared cache releases unused namespace path registrations" {
     const namespace = first.cache_namespace;
     try std.testing.expectEqual(@as(usize, 1), cache.namespace_paths.get(namespace).?.active_owners);
 
-    var second = try HBCIndex.open(alloc, path, .{ .dims = 4 });
-    var second_open = true;
-    defer if (second_open) second.close();
-    second.attachSharedCache(&cache);
+    try std.testing.expect(cache.registerNamespacePath(namespace, std.mem.span(path)));
     try std.testing.expectEqual(@as(usize, 2), cache.namespace_paths.get(namespace).?.active_owners);
 
     first.close();
     first_open = false;
     try std.testing.expectEqual(@as(usize, 1), cache.namespace_paths.get(namespace).?.active_owners);
 
-    second.close();
-    second_open = false;
+    cache.unregisterNamespacePath(namespace, std.mem.span(path));
     try std.testing.expect(!cache.namespace_paths.contains(namespace));
     try std.testing.expect(!cache.namespace_stats.contains(namespace));
 }

@@ -4960,7 +4960,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // This bounded smoke shares the storage compilation with its unit coverage.
         "db graph metric runtime background coordinator and worker pool loops publish pagerank",
         "graph maintenance",
-        "lmdb backend read forks",
         "graph metric tree batch validation",
         "graph rebuildReverseFromOwnedOutgoingEdges",
         "db graph reverse rebuild resumes after interrupted reopen",
@@ -5470,8 +5469,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "backend runtime separates native operation IO from outbound network IO",
         "backend runtime threaded durable lane rejects jobs after owner close",
         "storage.sim_runtime.",
-        "storage.lmdb.test.LMDB sim soak",
-        "storage.lmdb.test.zig backend soak:",
     };
     const sparse_unit_tests = b.addTest(.{
         .root_module = sparse_test_mod,
