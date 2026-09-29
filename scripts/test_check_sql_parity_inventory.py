@@ -85,13 +85,13 @@ class ParityInventoryTest(unittest.TestCase):
         self,
     ):
         _, entries, gate_ids = validate(self.inventory, self.ledger)
-        partial = next(entry for entry in entries if entry["id"] == "sql-0006")
+        partial = next(entry for entry in entries if entry["id"] == "sql-0008")
         self.assertEqual("unresolved", partial["status"])
         self.assertIn("sql-original-prepared-cte-runtime", gate_ids)
         self.assertIn("pgwire-original-prepared-cte", gate_ids)
         ledger = copy.deepcopy(self.ledger)
         partial = next(
-            entry for entry in ledger["entries"] if entry["id"] == "sql-0006"
+            entry for entry in ledger["entries"] if entry["id"] == "sql-0008"
         )
         partial["evidence"][0]["test"] = (
             "SQL joined mutation equality work scales with inputs not Cartesian candidates"

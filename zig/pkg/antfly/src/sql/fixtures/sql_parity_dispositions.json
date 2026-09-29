@@ -157,20 +157,22 @@
     },
     {
       "id": "sql-0006",
-      "status": "unresolved",
-      "reason": "The exact original prepared CTE UPDATE body has typed runtime coverage for one captured self-read, two versioned writes after capture closes, and source failure before mutation. The exact pgwire PREPARE/EXECUTE sequence is covered by a separate protocol fixture. Authenticated mounted pgwire/native execution and distributed fault evidence are still missing.",
+      "status": "superseded",
+      "reason": "The original catalog/admin PREPARE mutation is replaced by connection-owned pgwire preparation. The exact CTE UPDATE PREPARE/EXECUTE runs through an authenticated native relational owner; command count and a subsequent typed read verify the committed status change. The component fixture additionally covers captured self-read, versioned mutation after capture closes, and source failure before write. This one-owner fixture does not prove distributed failover or multi-owner snapshot behavior.",
       "evidence": [
         {"path": "zig/pkg/antfly/src/sql/joined_mutation_test.zig", "test": "SQL original prepared CTE UPDATE DELETE and MERGE capture before one mutation", "gate": "sql-original-prepared-cte-runtime"},
-        {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE", "gate": "pgwire-original-prepared-cte"}
+        {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE", "gate": "pgwire-original-prepared-cte"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"}
       ]
     },
     {
       "id": "sql-0007",
-      "status": "unresolved",
-      "reason": "The exact original prepared CTE DELETE body has typed runtime coverage for one captured self-read, two versioned deletes after capture closes, and source failure before mutation. The exact pgwire PREPARE/EXECUTE sequence is covered by a separate protocol fixture. Authenticated mounted pgwire/native execution and distributed fault evidence are still missing.",
+      "status": "superseded",
+      "reason": "The original catalog/admin PREPARE mutation is replaced by connection-owned pgwire preparation. The exact CTE DELETE PREPARE/EXECUTE runs through an authenticated native relational owner; command count and a subsequent empty typed read verify deletion. The component fixture additionally covers captured self-read, versioned mutation after capture closes, and source failure before write. This one-owner fixture does not prove distributed failover or multi-owner snapshot behavior.",
       "evidence": [
         {"path": "zig/pkg/antfly/src/sql/joined_mutation_test.zig", "test": "SQL original prepared CTE UPDATE DELETE and MERGE capture before one mutation", "gate": "sql-original-prepared-cte-runtime"},
-        {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE", "gate": "pgwire-original-prepared-cte"}
+        {"path": "zig/pkg/antfly/src/pgwire/protocol_test.zig", "test": "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE", "gate": "pgwire-original-prepared-cte"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"}
       ]
     },
     {

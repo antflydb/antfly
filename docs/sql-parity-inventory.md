@@ -112,13 +112,15 @@ prepared execution binds the source and target, captures the read-committed
 source snapshot, and admits one target native batch. The exact prepared pgwire
 sequence is not yet mounted on the native source/target path, so the case
 remains unresolved.
-For `sql-0006` through `sql-0008`, exact original CTE-backed UPDATE, DELETE,
-and MERGE bodies have typed component execution: one self-read capture closes
-before two versioned mutations, and a source-read failure performs no write.
-The MERGE fixture advertises atomic statement-read-set support, which is a
-component contract rather than owner proof. Separate pgwire fixtures execute
-the exact PREPARE/EXECUTE sequences. Mounted pgwire/native and distributed
-fault evidence are still needed, so these cases remain unresolved.
+For `sql-0006` and `sql-0007`, the exact prepared CTE UPDATE and DELETE now
+execute through authenticated mounted pgwire and a native relational owner.
+Command counts and typed reads prove the update and subsequent deletion;
+component fixtures also cover source-failure-before-write and versioned
+mutation after the captured self-read closes. These supersede the original
+catalog/admin PREPARE interpretation, not distributed failover coverage.
+`sql-0008` has exact protocol and typed MERGE component evidence, but its
+atomic read-set mock is not an owner-issued range-proof commit. Mounted native
+and distributed fault evidence remain missing, so it stays unresolved.
 `sql-0037`, `sql-0039`, `sql-0041`, `sql-0043`, and `sql-0046` are tested
 supersessions of catalog/admin session mutations. Their exact public-namespace
 and one-millisecond timeout commands run through the pgwire session state

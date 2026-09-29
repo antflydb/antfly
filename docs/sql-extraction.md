@@ -134,7 +134,7 @@ these results do not rely on a previously built binary without the capability
 checks.
 
 The current inventory check still has 1,586 original cases: 103 implemented,
-59 explicitly rejected, 41 superseded, and 1,383 unresolved dispositions.
+59 explicitly rejected, 43 superseded, and 1,381 unresolved dispositions.
 Unresolved dispositions are not a count of distinct missing features. These
 activation fixes do not replace the broader SQL parity/release gate.
 The exact prepared UUID CREATE TABLE case now has mounted pgwire, durable
@@ -1226,7 +1226,7 @@ compaction/selective-query performance comparison remains unmeasured.
   publication/restart evidence. `make sql-parity-evidence-check` runs referenced
   gates before the full corpus is resolved: the focused public API TRUNCATE
   suite passes eight tests without leaks and the staged-owner rewrite/empty-
-  generation driver passes two. The remaining 1,383 case dispositions still
+  generation driver passes two. The remaining 1,381 case dispositions still
   block release.
   The graph-index guard now inspects only selected tables after FK closure,
   so an unrelated graph table neither blocks admission nor incurs index-JSON
@@ -1244,7 +1244,7 @@ compaction/selective-query performance comparison remains unmeasured.
   The inventory validator now prevents a behavior-required original case from
   being marked `rejected`, or an original rejection from being marked
   `implemented` without a tested `superseded` disposition. This protects the
-  release gate from status-only waivers; the 1,383 unresolved cases remain
+  release gate from status-only waivers; the 1,381 unresolved cases remain
   blocking, and these focused evidence gates do not prove full distributed
   or workload parity.
 - The routed table-read suite passes 81 consumer tests, including an exact
@@ -1286,7 +1286,7 @@ compaction/selective-query performance comparison remains unmeasured.
   check. Four other exact MERGE cases additionally have case-specific source
   conflict and ambiguous-commit evidence. Source-only INSERT RETURNING has
   the same mounted proof and fault coverage. Expression and grouped predicate
-  arms and a read-only CTE-backed MERGE have exact mounted coverage; 1,383 cases
+  arms and a read-only CTE-backed MERGE have exact mounted coverage; 1,381 cases
   remain unresolved.
 
 - Follow-up ReleaseSafe SQL suite: 168 tests. Membership benchmark (opt-in

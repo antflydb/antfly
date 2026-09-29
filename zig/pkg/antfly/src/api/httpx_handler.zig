@@ -13880,6 +13880,22 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         try Wire.frame(&input.writer, 'Q', prepare_command);
         try Wire.frame(&input.writer, 'Q', "EXECUTE insert_usage_plan('prepared_id')\x00");
         try Wire.frame(&input.writer, 'Q', "SELECT id, status FROM usage_records WHERE id = 'prepared_id'\x00");
+        for ([_]struct { id: []const u8, execute: []const u8, verify: []const u8 }{
+            .{ .id = "sql-0006", .execute = "EXECUTE cte_write_plan\x00", .verify = "SELECT id, status FROM usage_records WHERE id = 'prepared_id'\x00" },
+            .{ .id = "sql-0007", .execute = "EXECUTE cte_delete_plan\x00", .verify = "SELECT id, status FROM usage_records WHERE id = 'prepared_id'\x00" },
+        }) |case| {
+            const original = for (corpus.value.object.get("entries").?.array.items) |entry| {
+                if (std.mem.eql(u8, entry.object.get("id").?.string, case.id)) break entry.object.get("sql").?.string;
+            } else return error.TestMissingCorpusCase;
+            const command = try std.fmt.allocPrint(alloc, "{s}\x00", .{original});
+            defer alloc.free(command);
+            try Wire.frame(&input.writer, 'Q', command);
+            // A typed read between PREPARE and EXECUTE proves native writes
+            // are deferred, not just that the protocol reports PREPARE.
+            try Wire.frame(&input.writer, 'Q', case.verify);
+            try Wire.frame(&input.writer, 'Q', case.execute);
+            try Wire.frame(&input.writer, 'Q', case.verify);
+        }
         try Wire.frame(&input.writer, 'X', "");
         var reader = std.Io.Reader.fixed(input.written());
         var output = std.Io.Writer.Allocating.init(alloc);
@@ -13890,6 +13906,8 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var frames: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = output.written() };
         var prepared_count: usize = 0;
         var insert_count: usize = 0;
+        var update_count: usize = 0;
+        var delete_count: usize = 0;
         var row_count: usize = 0;
         while (frames.offset < frames.bytes.len) {
             const tag = try frames.int(u8);
@@ -13901,19 +13919,23 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             }
             if (tag == 'C' and std.mem.eql(u8, payload, "PREPARE\x00")) prepared_count += 1;
             if (tag == 'C' and std.mem.eql(u8, payload, "INSERT 0 1\x00")) insert_count += 1;
+            if (tag == 'C' and std.mem.eql(u8, payload, "UPDATE 1\x00")) update_count += 1;
+            if (tag == 'C' and std.mem.eql(u8, payload, "DELETE 1\x00")) delete_count += 1;
             if (tag != 'D') continue;
             var row: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = payload };
             try std.testing.expectEqual(@as(u16, 2), try row.int(u16));
-            for ([_][]const u8{ "prepared_id", "prepared" }) |expected| {
+            for ([_][]const u8{ "prepared_id", if (row_count < 2) "prepared" else "done" }) |expected| {
                 const length = try row.int(i32);
                 try std.testing.expect(length >= 0);
                 try std.testing.expectEqualStrings(expected, try row.take(@intCast(length)));
             }
             row_count += 1;
         }
-        try std.testing.expectEqual(@as(usize, 1), prepared_count);
+        try std.testing.expectEqual(@as(usize, 3), prepared_count);
         try std.testing.expectEqual(@as(usize, 1), insert_count);
-        try std.testing.expectEqual(@as(usize, 1), row_count);
+        try std.testing.expectEqual(@as(usize, 1), update_count);
+        try std.testing.expectEqual(@as(usize, 1), delete_count);
+        try std.testing.expectEqual(@as(usize, 4), row_count);
     }
 }
 
