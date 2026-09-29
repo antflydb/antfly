@@ -12834,6 +12834,13 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             if (input == .write_validation) return std.json.Stringify.valueAlloc(a, .{ .schema_json = self.schema }, .{});
             if (input != .resolve_many) return error.UnexpectedCatalogCall;
             if (input.resolve_many.expected_revision) |revision| if (revision != 7) return error.CatalogGenerationChanged;
+            if (input.resolve_many.storage_names.len != 0) {
+                if (input.resolve_many.storage_names.len != 1 or !std.mem.eql(u8, input.resolve_many.storage_names[0], "usage_records")) return error.UnexpectedCatalogCall;
+                const name = try (system_catalog.Target{ .table = "usage_records" }).resourceNameAlloc(a);
+                defer a.free(name);
+                return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = &.{}, .logical_names = &.{name} }, .{});
+            }
+            if (input.resolve_many.targets.len == 0) return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = &.{} }, .{});
             if (input.resolve_many.targets.len != 1 or !std.mem.eql(u8, input.resolve_many.targets[0].table, "usage_records")) return error.UnexpectedCatalogCall;
             const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "usage_records", .query_definition = if (input.resolve_many.include_query_definitions) .{ .table_id = 7, .schema_json = self.schema, .read_schema_json = "", .indexes_json = "{}" } else null }};
             return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = &tables }, .{});
@@ -13818,6 +13825,95 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         try std.testing.expectEqual(expected_ids.len + prepared_seen.len, row_index);
         for (prepared_seen) |seen| try std.testing.expect(seen);
         try std.testing.expect(fetched_one and fetched_eight);
+    }
+    {
+        // sql-0002: exercise the original text-typed prepared INSERT through
+        // the authenticated listener and the native relational writer. The
+        // fixture uses a text id, matching the source statement's parameter.
+        const text_schema =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"additionalProperties":false}}}}
+        ;
+        var text_directory = try @import("../common/test_directory.zig").TestDirectory.init("antfly-pgwire-prepared-insert");
+        defer text_directory.cleanup();
+        var text_db = try db_mod.DB.open(alloc, text_directory.path(), .{});
+        defer text_db.close();
+        try text_db.setSchemaJson(alloc, text_schema);
+        var text_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &text_db, raft_mod.read_gate.alreadyReadSafeBarrier());
+        var text_writes = @import("table_writes.zig").BoundTableWriteSource.init("usage_records", &text_db);
+        var text_source: Source = .{ .schema = text_schema, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = text_schema }} };
+        var user_store = usermgr.MemoryStore.init(alloc);
+        defer user_store.deinit();
+        var policies = casbin.MemoryAdapter.init(alloc);
+        defer policies.deinit();
+        var manager = try usermgr.UserManager.init(alloc, user_store.iface(), try usermgr.initDefaultEnforcer(alloc, policies.iface()));
+        defer manager.deinit();
+        var read_grant = try usermgr.Permission.initOwned(alloc, .table, "usage_records", .read);
+        defer read_grant.deinit(alloc);
+        var write_grant = try usermgr.Permission.initOwned(alloc, .table, "usage_records", .write);
+        defer write_grant.deinit(alloc);
+        var user = try manager.createUser("prepared_writer", "secret", &.{ read_grant, write_grant });
+        defer user.deinit(alloc);
+        var text_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable, .user_manager = &manager }, .{ .ptr = &text_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, text_reads.source(), text_writes.source());
+        defer text_server.deinit();
+        var pg_adapter: @import("sql_pgwire.zig").Adapter = .{ .server = &text_server };
+        const Wire = struct {
+            fn frame(out: *std.Io.Writer, tag: u8, payload: []const u8) !void {
+                try out.writeByte(tag);
+                try out.writeInt(u32, @intCast(payload.len + 4), .big);
+                try out.writeAll(payload);
+            }
+        };
+        var input = std.Io.Writer.Allocating.init(alloc);
+        defer input.deinit();
+        const startup_body = "user\x00prepared_writer\x00database\x00default\x00\x00";
+        try input.writer.writeInt(u32, @intCast(startup_body.len + 8), .big);
+        try input.writer.writeInt(u32, 196608, .big);
+        try input.writer.writeAll(startup_body);
+        try Wire.frame(&input.writer, 'p', "secret\x00");
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        defer corpus.deinit();
+        const prepare_sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
+            if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0002")) break entry.object.get("sql").?.string;
+        } else return error.TestMissingCorpusCase;
+        const prepare_command = try std.fmt.allocPrint(alloc, "{s}\x00", .{prepare_sql});
+        defer alloc.free(prepare_command);
+        try Wire.frame(&input.writer, 'Q', prepare_command);
+        try Wire.frame(&input.writer, 'Q', "EXECUTE insert_usage_plan('prepared_id')\x00");
+        try Wire.frame(&input.writer, 'Q', "SELECT id, status FROM usage_records WHERE id = 'prepared_id'\x00");
+        try Wire.frame(&input.writer, 'X', "");
+        var reader = std.Io.Reader.fixed(input.written());
+        var output = std.Io.Writer.Allocating.init(alloc);
+        defer output.deinit();
+        var session: @import("../pgwire/protocol.zig").Session = .{ .alloc = alloc, .io = std.testing.io, .source = pg_adapter.backend(), .reader = &reader, .writer = &output.writer };
+        defer session.deinit();
+        try session.run();
+        var frames: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = output.written() };
+        var prepared_count: usize = 0;
+        var insert_count: usize = 0;
+        var row_count: usize = 0;
+        while (frames.offset < frames.bytes.len) {
+            const tag = try frames.int(u8);
+            const size = try frames.int(u32);
+            const payload = try frames.take(size - 4);
+            if (tag == 'E') {
+                std.debug.print("pgwire prepared insert error: {s}\n", .{payload});
+                return error.TestUnexpectedPgwireInsertError;
+            }
+            if (tag == 'C' and std.mem.eql(u8, payload, "PREPARE\x00")) prepared_count += 1;
+            if (tag == 'C' and std.mem.eql(u8, payload, "INSERT 0 1\x00")) insert_count += 1;
+            if (tag != 'D') continue;
+            var row: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = payload };
+            try std.testing.expectEqual(@as(u16, 2), try row.int(u16));
+            for ([_][]const u8{ "prepared_id", "prepared" }) |expected| {
+                const length = try row.int(i32);
+                try std.testing.expect(length >= 0);
+                try std.testing.expectEqualStrings(expected, try row.take(@intCast(length)));
+            }
+            row_count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), prepared_count);
+        try std.testing.expectEqual(@as(usize, 1), insert_count);
+        try std.testing.expectEqual(@as(usize, 1), row_count);
     }
 }
 

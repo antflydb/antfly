@@ -103,11 +103,18 @@
         {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"}
       ]
     },
-    {
-      "id": "sql-0002",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
-    },
+  {
+    "id": "sql-0002",
+    "status": "superseded",
+    "reason": "The original catalog/admin PREPARE model is replaced by a connection-owned text-typed prepared INSERT. The exact source PREPARE executes through authenticated pgwire into native relational storage; the INSERT command count and a subsequent typed read prove one committed row, while the writer retains catalog and row-policy admission.",
+    "evidence": [
+      {
+        "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+        "test": "httpx SQL executes one relational page with exact integer parameters",
+        "gate": "sql-mounted-read-shapes"
+      }
+    ]
+  },
     {
       "id": "sql-0003",
       "status": "unresolved",

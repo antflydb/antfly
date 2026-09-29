@@ -86,6 +86,11 @@ returns the three matching native rows, and requires read rather than catalog
 admin authority. `sql-0035` and `sql-0036` likewise replace the original
 catalog/admin-mutation model with connection-owned named and all-plan
 deallocation, with SQLSTATE 26000 after each removed plan is executed.
+`sql-0002` is a tested supersession of the catalog/admin PREPARE model: its
+exact typed-text INSERT plan runs through an authenticated pgwire session and
+the native relational writer. The INSERT command count and a subsequent typed
+read verify one committed row; write admission still resolves the current
+catalog identity and row-policy state.
 `sql-0037`, `sql-0039`, `sql-0041`, `sql-0043`, and `sql-0046` are tested
 supersessions of catalog/admin session mutations. Their exact public-namespace
 and one-millisecond timeout commands run through the pgwire session state

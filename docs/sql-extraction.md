@@ -134,7 +134,7 @@ these results do not rely on a previously built binary without the capability
 checks.
 
 The current inventory check still has 1,586 original cases: 103 implemented,
-59 explicitly rejected, 38 superseded, and 1,386 unresolved dispositions.
+59 explicitly rejected, 39 superseded, and 1,385 unresolved dispositions.
 Unresolved dispositions are not a count of distinct missing features. These
 activation fixes do not replace the broader SQL parity/release gate.
 
