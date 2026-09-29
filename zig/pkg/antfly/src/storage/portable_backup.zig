@@ -2400,13 +2400,9 @@ pub fn importSourceCopyFilePage(alloc: Allocator, store: *DocStore, io: std.Io, 
 /// Rows and their cursor share a transaction. Make that transaction recoverable
 /// before acknowledging the page, without flushing/compacting the LSM for each
 /// small manifest, schema or row step. Physical decoder publication has its own
-/// final barrier. Preserve force-sync semantics for the direct LMDB adapter.
+/// final barrier.
 fn syncImportCheckpoint(store: *DocStore) !void {
-    if (store.kind == .runtime) {
-        try store.syncReplayState();
-    } else {
-        try store.sync(true);
-    }
+    try store.syncReplayState();
 }
 
 fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: StagedImportProof, scope: [32]u8, max_rows: usize, cancellation: @import("../common/cancellation.zig").CancellationToken) !bool {

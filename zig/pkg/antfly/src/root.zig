@@ -187,15 +187,11 @@ pub const lite = @import("storage/lite/mod.zig");
 pub const lite_backend = lite.backend;
 pub const lite_native = lite.native;
 pub const storage_lsm = @import("storage/lsm/mod.zig");
-pub const lmdb_backend = @import("storage/lmdb_backend.zig");
 pub const mem_backend = @import("storage/mem_backend.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 pub const backend_conformance_test = @import("storage/backend_conformance_test.zig");
 pub const lsm_backend_sim_test = @import("storage/lsm_backend_sim_test.zig");
 pub const lsm_vopr = @import("storage/lsm_vopr.zig");
-pub const lmdb = @import("storage/lmdb.zig");
-pub const lmdb_vopr = @import("storage/lmdb_vopr.zig");
-pub const lmdb_engine = @import("lmdb_engine");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const posting_segment_store = @import("storage/posting_segment_store.zig");
 pub const vector_block_store = @import("storage/vector_block_store.zig");
@@ -368,9 +364,6 @@ test {
     _ = asset_producer_runtime;
 
     // Storage
-    _ = lmdb;
-    _ = lmdb_vopr;
-    _ = lmdb_engine;
     _ = hbc;
     _ = hot_standby;
     _ = standby_vopr;

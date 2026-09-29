@@ -32,15 +32,6 @@ const backend_erased = @import("../storage/backend_erased.zig");
 const backend_types = @import("../storage/backend_types.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
-const supports_native_sparse_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
-const lmdb_backend = if (supports_native_sparse_lmdb) @import("../storage/lmdb_backend.zig") else struct {
-    pub const Backend = struct {
-        pub fn close(_: *@This()) void {}
-        pub fn sync(_: *@This(), _: bool) !void {
-            return error.UnsupportedPlatform;
-        }
-    };
-};
 const mem_backend = @import("../storage/mem_backend.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 
@@ -1395,7 +1386,6 @@ pub const SparseIndexOptions = struct {
 };
 
 pub const SparseBackend = enum {
-    lmdb,
     mem,
     lsm_memory,
     lsm,
@@ -1416,17 +1406,12 @@ pub const SparseIndex = struct {
 
     const StoreOwner = union(enum) {
         none,
-        lmdb: *lmdb_backend.Backend,
         mem: *mem_backend.Backend,
         lsm: lsm_backend.BackendHandle,
 
         fn close(self: *StoreOwner, alloc: Allocator) void {
             switch (self.*) {
                 .none => {},
-                .lmdb => |backend| {
-                    backend.close();
-                    alloc.destroy(backend);
-                },
                 .mem => |backend| {
                     backend.close();
                     alloc.destroy(backend);
@@ -1439,10 +1424,6 @@ pub const SparseIndex = struct {
         fn abandonAfterCrash(self: *StoreOwner, alloc: Allocator) void {
             switch (self.*) {
                 .none => {},
-                .lmdb => |backend| {
-                    backend.close();
-                    alloc.destroy(backend);
-                },
                 .mem => |backend| {
                     backend.close();
                     alloc.destroy(backend);
@@ -1455,14 +1436,13 @@ pub const SparseIndex = struct {
         fn sync(self: *StoreOwner, force: bool) !void {
             switch (self.*) {
                 .none, .mem => {},
-                .lmdb => |backend| try backend.sync(force),
                 .lsm => |*handle| try handle.backend.sync(force),
             }
         }
 
         fn checkpointLsmWalAfterDurableBoundary(self: *StoreOwner) !void {
             switch (self.*) {
-                .none, .mem, .lmdb => {},
+                .none, .mem => {},
                 .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
             }
         }
@@ -1470,7 +1450,7 @@ pub const SparseIndex = struct {
         fn pinNativeCheckpoint(self: *StoreOwner) !lsm_backend.Backend.NativeCheckpoint {
             return switch (self.*) {
                 .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
-                .none, .mem, .lmdb => error.Unsupported,
+                .none, .mem => error.Unsupported,
             };
         }
     };
@@ -1493,28 +1473,6 @@ pub const SparseIndex = struct {
 
     fn openStore(alloc: Allocator, path: [*:0]const u8, opts: SparseIndexOptions) !OpenedStore {
         switch (opts.backend) {
-            .lmdb => {
-                if (!supports_native_sparse_lmdb) return error.UnsupportedPlatform;
-                const backend = try alloc.create(lmdb_backend.Backend);
-                errdefer alloc.destroy(backend);
-                backend.* = try lmdb_backend.Backend.open(alloc, path, .{
-                    .backend = .{
-                        .durability = if (opts.no_sync) .none else .full,
-                    },
-                    .env = .{
-                        .map_size = opts.map_size,
-                        .no_sync = opts.no_sync,
-                        .no_meta_sync = opts.no_meta_sync,
-                        .no_tls = true,
-                        .max_dbs = 1,
-                    },
-                });
-                errdefer backend.close();
-
-                var runtime = try backend.runtimeStore(alloc, .{});
-                errdefer runtime.deinit();
-                return .{ .store = runtime, .owner = .{ .lmdb = backend } };
-            },
             .mem => {
                 const backend = try alloc.create(mem_backend.Backend);
                 errdefer alloc.destroy(backend);

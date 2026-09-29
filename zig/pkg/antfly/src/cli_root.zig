@@ -36,7 +36,6 @@ pub const backup_bundle = @import("storage/backup_bundle.zig");
 pub const backup_bundle_io = @import("storage/backup_bundle_io.zig");
 pub const backup_repository = @import("storage/backup_repository.zig");
 pub const portable_backup = @import("storage/portable_backup.zig");
-pub const lmdb_engine = @import("lmdb_engine");
 pub const platform_clock = @import("antfly_platform").clock;
 pub const platform_time = @import("antfly_platform").time;
 
