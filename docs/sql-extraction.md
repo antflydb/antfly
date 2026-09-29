@@ -1819,7 +1819,9 @@ following mechanisms are installed behind that gate:
   replayable receiver transaction revalidates and installs local receipts.
   A receiver-side writer-transaction verifier now repeats the exact primary,
   artifact-input, and selected-output checks against local physical revisions,
-  including same-byte ABA changes. No caller installs receipts from it yet.
+  including same-byte ABA changes. Candidate preparation also owns the source
+  pin, APF2 checksum, donor producer identity and selected-source bitmap after
+  release of the transfer buffer. No caller installs receipts from it yet.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups

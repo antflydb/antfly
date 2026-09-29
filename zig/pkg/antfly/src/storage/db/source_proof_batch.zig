@@ -54,6 +54,7 @@ pub const Decoded = struct {
     /// Proof slices and bitmap borrow the certified batch value.
     proof: provenance.Owned,
     bitmap: []const u8,
+    proof_checksum: publication.Digest,
     pub fn deinit(self: *@This()) void {
         self.proof.deinit();
         self.* = undefined;
@@ -65,12 +66,32 @@ pub const ReceiverEffect = struct {
     input_position: ?publication.Position,
 };
 
+/// The certified source cut and APF2 body remain bound to an owned candidate
+/// after the transfer buffer is released. This identity is not local producer
+/// authority; a later ordered command must still fence its active catalog.
+pub const DonorIdentity = struct {
+    source_pin: publication.Digest,
+    namespace: publication.Namespace,
+    authority_epoch: u64,
+    catalog_digest: publication.Digest,
+    publication_digest: publication.Digest,
+    input_digest: publication.Digest,
+    proof_checksum: publication.Digest,
+    producer_kind: @FieldType(publication.Command, "producer_kind"),
+    producer_name: []const u8,
+    producer_generation: u64,
+    producer_artifact_name: []const u8,
+    producer_scope_key: []const u8,
+    selected_bitmap: []const u8,
+};
+
 /// Off-lock candidate evidence for a receiver-local publication. Physical
 /// positions are captured from the destination, never copied from APF2. This
 /// is not an adoption certificate: apply must revalidate it in its own writer
 /// transaction before staging receipts or activating a producer capability.
 pub const ReceiverCandidate = struct {
     arena: std.heap.ArenaAllocator,
+    donor: DonorIdentity,
     sources: []const publication.Source,
     artifact_sources: []const publication.ArtifactSource,
     effects: []const ReceiverEffect,
@@ -90,8 +111,10 @@ pub fn prepareReceiverCandidate(
     txn: anytype,
     receiver_namespace: publication.Namespace,
     donor_range: @import("../byte_range.zig").ByteRange,
+    source_pin: publication.Digest,
     decoded: Decoded,
 ) !?ReceiverCandidate {
+    if (std.mem.allEqual(u8, &source_pin, 0)) return error.SourceSnapshotCorrupt;
     var arena = std.heap.ArenaAllocator.init(alloc);
     var returned = false;
     defer if (!returned) arena.deinit();
@@ -156,8 +179,32 @@ pub fn prepareReceiverCandidate(
         };
         selected_count += 1;
     }
+    const producer_name = try owned.dupe(u8, proof.producer_name);
+    const producer_artifact_name = try owned.dupe(u8, proof.producer_artifact_name);
+    const producer_scope_key = try owned.dupe(u8, proof.producer_scope_key);
+    const selected_bitmap = try owned.dupe(u8, decoded.bitmap);
     returned = true;
-    return .{ .arena = arena, .sources = sources, .artifact_sources = artifact_sources, .effects = selected_effects[0..selected_count] };
+    return .{
+        .arena = arena,
+        .donor = .{
+            .source_pin = source_pin,
+            .namespace = proof.namespace,
+            .authority_epoch = proof.authority_epoch,
+            .catalog_digest = proof.catalog_digest,
+            .publication_digest = proof.publication_digest,
+            .input_digest = proof.input_digest,
+            .proof_checksum = decoded.proof_checksum,
+            .producer_kind = proof.producer_kind,
+            .producer_name = producer_name,
+            .producer_generation = proof.producer_generation,
+            .producer_artifact_name = producer_artifact_name,
+            .producer_scope_key = producer_scope_key,
+            .selected_bitmap = selected_bitmap,
+        },
+        .sources = sources,
+        .artifact_sources = artifact_sources,
+        .effects = selected_effects[0..selected_count],
+    };
 }
 
 /// The writer transaction must repeat this check before installing any local
@@ -225,7 +272,7 @@ pub fn decodeValue(alloc: std.mem.Allocator, namespace: publication.Namespace, d
         }
     }
     if (!selected) return error.SourceSnapshotCorrupt;
-    return .{ .proof = proof, .bitmap = bitmap };
+    return .{ .proof = proof, .bitmap = bitmap, .proof_checksum = raw[raw.len - 32 ..][0..32].* };
 }
 
 pub const Entry = struct { digest: publication.Digest, value: []const u8 };
@@ -428,8 +475,13 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     defer decoded.deinit();
     try std.testing.expectEqualDeep(output_before, decoded.proof.proof.mutation_preconditions[0]);
     const donor_range: @import("../byte_range.zig").ByteRange = .{ .start = "doc", .end = "dop" };
-    var mapped = (try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, decoded)) orelse return error.TestUnexpectedResult;
+    const source_pin: publication.Digest = @splat(9);
+    var mapped = (try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, decoded)) orelse return error.TestUnexpectedResult;
     defer mapped.deinit();
+    try std.testing.expectEqualDeep(source_pin, mapped.donor.source_pin);
+    try std.testing.expectEqualDeep(decoded.proof_checksum, mapped.donor.proof_checksum);
+    try std.testing.expectEqualSlices(u8, decoded.bitmap, mapped.donor.selected_bitmap);
+    try std.testing.expectEqualStrings("index", mapped.donor.producer_name);
     try std.testing.expectEqualDeep(row_position, mapped.sources[0].input_position.?);
     try std.testing.expectEqualDeep(guard_position, mapped.artifact_sources[0].input_position.?);
     try std.testing.expectEqual(@as(usize, 2), mapped.effects.len);
@@ -449,32 +501,46 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
     try receiver.values.put(&row_revision_key, &row_position_bytes);
     try std.testing.expect(try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
-    try std.testing.expectError(error.SourceSnapshotCorrupt, prepareReceiverCandidate(alloc, &receiver, receiver_namespace, .{ .start = "e", .end = "f" }, decoded));
+    try std.testing.expectError(error.SourceSnapshotCorrupt, prepareReceiverCandidate(alloc, &receiver, receiver_namespace, .{ .start = "e", .end = "f" }, source_pin, decoded));
+    try std.testing.expectError(error.SourceSnapshotCorrupt, prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, @splat(0), decoded));
     const AllocationCheck = struct {
-        fn run(a: std.mem.Allocator, txn: *Fake, donor_namespace: publication.Namespace, receiver_ns: publication.Namespace, range: @import("../byte_range.zig").ByteRange, digest: publication.Digest, encoded_value: []const u8, expected_position: publication.Position) !void {
-            var candidate = try decodeValue(a, donor_namespace, digest, encoded_value);
-            defer candidate.deinit();
-            var receiver_inputs = (try prepareReceiverCandidate(a, txn, receiver_ns, range, candidate)) orelse return error.TestUnexpectedResult;
+        fn run(a: std.mem.Allocator, txn: *Fake, donor_namespace: publication.Namespace, receiver_ns: publication.Namespace, range: @import("../byte_range.zig").ByteRange, pin: publication.Digest, digest: publication.Digest, encoded_value: []const u8, expected_position: publication.Position) !void {
+            const transfer = try a.dupe(u8, encoded_value);
+            var transfer_live = true;
+            defer if (transfer_live) a.free(transfer);
+            var candidate = try decodeValue(a, donor_namespace, digest, transfer);
+            var candidate_live = true;
+            defer if (candidate_live) candidate.deinit();
+            var receiver_inputs = (try prepareReceiverCandidate(a, txn, receiver_ns, range, pin, candidate)) orelse return error.TestUnexpectedResult;
+            candidate.deinit();
+            candidate_live = false;
+            @memset(transfer, 0);
+            a.free(transfer);
+            transfer_live = false;
             defer receiver_inputs.deinit();
             try std.testing.expectEqualDeep(expected_position, receiver_inputs.sources[0].input_position.?);
+            try std.testing.expectEqualDeep(pin, receiver_inputs.donor.source_pin);
+            try std.testing.expectEqualStrings("index", receiver_inputs.donor.producer_name);
+            try std.testing.expectEqualSlices(u8, &.{1}, receiver_inputs.donor.selected_bitmap);
+            try std.testing.expect(try revalidateReceiverCandidate(a, txn, receiver_ns, receiver_inputs));
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &receiver, proof.namespace, receiver_namespace, donor_range, proof.publication_digest, value, row_position });
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &receiver, proof.namespace, receiver_namespace, donor_range, source_pin, proof.publication_digest, value, row_position });
     try receiver.values.put(output_key, "changed output");
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
-    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, decoded)) == null);
+    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, decoded)) == null);
     try receiver.values.put(output_key, output_value);
     try receiver.values.put(tombstone_key, "resurrected");
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
-    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, decoded)) == null);
+    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, decoded)) == null);
     try std.testing.expect(receiver.values.remove(tombstone_key));
     try receiver.values.put(guard_key, "changed");
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
-    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, decoded)) == null);
+    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, decoded)) == null);
     try receiver.values.put(guard_key, guard_value);
     try receiver.values.put(row_key, "{\"v\":2}");
     try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
-    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, decoded)) == null);
+    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, decoded)) == null);
 }
 
 test "ordered artifact inventory source proof descriptor resumes a certified large body" {
