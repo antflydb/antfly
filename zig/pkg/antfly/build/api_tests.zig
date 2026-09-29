@@ -2033,6 +2033,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-sql-rewrite-receipt-test", "Run SQL rewrite receipt and unknown-admission response regression")
         .dependOn(&addFilteredTestRunArtifact(b, sql_rewrite_receipt_tests).step);
+    const sql_uuid_catalog_tests = b.addTest(.{
+        .root_module = api_backup_restore_test_mod,
+        .filters = &.{"SQL UUID prepared CREATE TABLE commits and replays catalog topology only on execute"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-sql-uuid-catalog-test", "Run prepared SQL UUID catalog and owner publication regression")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_uuid_catalog_tests).step);
     const pk_failure_abi_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/runtime_failure_abi.zig"),
         .target = target,

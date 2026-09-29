@@ -588,6 +588,7 @@ test "SQL catalog DDL authorizes before lookup and handles atomic conditional ou
 }
 
 test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only on execute" {
+    // sql-0004: exact original PREPARE/EXECUTE, then metadata and owner recovery.
     const metadata_store = @import("../metadata/storage/raft_apply_store.zig");
     const table_manager = @import("../metadata/table_manager.zig");
     const Source = struct {
@@ -654,7 +655,8 @@ test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only o
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-uuid-catalog", .{tmp.sub_path});
     defer alloc.free(root);
     var store = try metadata_store.RaftApplyStore.init(alloc, .{ .root_dir = root });
-    defer store.deinit();
+    var store_open = true;
+    defer if (store_open) store.deinit();
     const usermgr = @import("../usermgr/mod.zig");
     const casbin = @import("antfly_casbin");
     var user_store = usermgr.MemoryStore.init(alloc);
@@ -731,7 +733,9 @@ test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only o
     const snapshot_bytes = try store.snapshotBuilder().buildSnapshot(alloc, 21);
     defer alloc.free(snapshot_bytes);
     store.deinit();
+    store_open = false;
     store = try metadata_store.RaftApplyStore.init(alloc, .{ .root_dir = root });
+    store_open = true;
     try Verify.run(&store, alloc);
     const restored_root = try std.fmt.allocPrint(alloc, "{s}-snapshot", .{root});
     defer alloc.free(restored_root);
@@ -739,4 +743,35 @@ test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only o
     defer restored.deinit();
     try std.testing.expect(try restored.snapshotBuilder().installSnapshot(alloc, 21, 1, snapshot_bytes));
     try Verify.run(&restored, alloc);
+    const published_tables = try restored.listTables(alloc, 21);
+    defer restored.freeTables(alloc, published_tables);
+    const published_ranges = try restored.listRanges(alloc, 21);
+    defer restored.freeRanges(alloc, published_ranges);
+    const replica_root = try std.fmt.allocPrint(alloc, "{s}-owner", .{root});
+    defer alloc.free(replica_root);
+    const provisioner = @import("../metadata/table_provisioner.zig");
+    const summary = try provisioner.reconcileReplicaRoot(
+        alloc,
+        replica_root,
+        21,
+        &.{ 21, published_ranges[0].group_id },
+        published_tables,
+        published_ranges,
+    );
+    try std.testing.expectEqual(@as(usize, 1), summary.groups_considered);
+    try std.testing.expectEqual(@as(usize, 1), summary.dbs_opened);
+    const owner_path = try provisioner.groupDbPathFromReplicaRoot(alloc, replica_root, published_ranges[0].group_id);
+    defer alloc.free(owner_path);
+    {
+        var owner = try @import("../storage/db/selected_root.zig").db.DB.open(alloc, owner_path, .{});
+        defer owner.close();
+        try owner.batch(.{ .writes = &.{.{ .key = "doc:1", .value = "{\"id\":\"550E8400E29B41D4A716446655440000\"}" }}, .sync_level = .write });
+    }
+    {
+        var owner = try @import("../storage/db/selected_root.zig").db.DB.open(alloc, owner_path, .{});
+        defer owner.close();
+        const row = (try owner.get(alloc, "doc:1")) orelse return error.MissingSqlRow;
+        defer alloc.free(row);
+        try std.testing.expect(std.mem.indexOf(u8, row, "550e8400-e29b-41d4-a716-446655440000") != null);
+    }
 }

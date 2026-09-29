@@ -12,6 +12,11 @@
       "cwd": "zig",
       "timeout_seconds": 600
     },
+    "sql-uuid-catalog-owner": {
+      "command": ["zig", "build", "antfly-api-sql-uuid-catalog-test", "--cache-dir", ".zig-cache/sql-parity-evidence"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "pgwire-session-settings": {
       "command": ["zig", "build", "pgwire-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "--", "--test-filter", "pgwire client encoding remains UTF-8", "--test-filter", "pgwire UTF-8 encoding setting stays connection owned", "--test-filter", "pgwire RESET ALL is one complete", "--test-filter", "pgwire RESET ALL restores supported settings", "--test-filter", "pgwire DISCARD ALL requires one complete", "--test-filter", "pgwire DISCARD ALL releases active portal", "--test-filter", "pgwire DISCARD ALL inside a transaction"],
       "cwd": "zig",
@@ -126,8 +131,9 @@
     },
     {
       "id": "sql-0004",
-      "status": "unresolved",
-      "reason": "The exact prepared CREATE TABLE statement compiles a typed UUID schema and, only on EXECUTE, reaches the production catalog mutation logic and committed metadata transition through an authenticated mounted pgwire adapter. Reopening the metadata store and installing a Raft snapshot into a fresh store verify the logical binding, physical table, UUID schema, and initial range. UUID normalization is shared by SQL, pgwire, and relational row preparation. This case still lacks data-group owner provisioning and an owner-backed query or mutation after CREATE; metadata topology alone is not sufficient parity evidence."
+      "status": "superseded",
+      "reason": "The original catalog/admin PREPARE plan is replaced by a connection-owned authenticated pgwire prepared DDL. Its exact UUID CREATE TABLE statement performs no catalog mutation on PREPARE; EXECUTE runs production catalog admission and commits the logical binding, physical table, and initial range together. Metadata reopen and Raft snapshot installation preserve them. The shared provisioner creates the data-group owner from that restored topology; a UUID row is written, the owner is restarted, and a typed read verifies canonical UUID content. The test uses an in-process metadata proposal fixture, not a multi-node consensus or placement fault test.",
+      "evidence": [{"path": "zig/pkg/antfly/src/api/sql_catalog.zig", "test": "SQL UUID prepared CREATE TABLE commits and replays catalog topology only on execute", "gate": "sql-uuid-catalog-owner"}]
     },
     {
       "id": "sql-0005",
