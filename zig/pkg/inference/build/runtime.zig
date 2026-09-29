@@ -438,7 +438,7 @@ pub fn create(config: Config) Graph {
 pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "antfly-inference",
-        .max_rss = 7 * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = b.path(pathJoin(b, inference_root, "src/main.zig")),
             .target = target,

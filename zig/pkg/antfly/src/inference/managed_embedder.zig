@@ -6466,7 +6466,10 @@ fn effectiveInputType(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingT
     // Backward-compatible expert override: the legacy field applies to both
     // roles. New configurations should prefer the role-specific fields.
     if (entry.input_type.len > 0) return entry.input_type;
-    return task_type.cohereInputType();
+    return switch (task_type) {
+        .retrieval_query => "search_query",
+        .retrieval_document => "search_document",
+    };
 }
 
 fn effectiveInstruction(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) ?[]const u8 {

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const RequestContext = @import("antfly_inference_execution_context").RequestContext;
+const RequestContext = @import("antfly_inference_execution_control").RequestContext;
 
 pub const EmbeddingTaskType = enum {
     retrieval_query,
@@ -23,13 +23,6 @@ pub const EmbeddingTaskType = enum {
         return switch (self) {
             .retrieval_query => "RETRIEVAL_QUERY",
             .retrieval_document => "RETRIEVAL_DOCUMENT",
-        };
-    }
-
-    pub fn cohereInputType(self: EmbeddingTaskType) []const u8 {
-        return switch (self) {
-            .retrieval_query => "search_query",
-            .retrieval_document => "search_document",
         };
     }
 };

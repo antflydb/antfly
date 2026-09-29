@@ -9,8 +9,9 @@ through declared Zig modules.
 ## Intended ownership
 
 - `zig/pkg/antfly-embedded`: embedded engine, local database and API surfaces,
-  C ABI, Lite CLI, shared protocol types, and their build owner.
-- `zig/pkg/inference`: inference host, worker, and CLI.
+  Antfly inference provider adapters, C ABI, Lite CLI, shared protocol types,
+  and their build owner.
+- `zig/pkg/inference`: native inference engine, host, worker, and CLI.
 - `zig/pkg/antfly`: ELv2 server orchestration, distributed coordination,
   network APIs, and its build owner. It may import the embedded engine.
 - `zig/lib`: independently reusable Apache libraries.
@@ -23,9 +24,11 @@ formats, and WASM behavior remain the same.
 1. Move shared generated OpenAPI types and code generation into
    `antfly-embedded`; move source-text tests with those files. Done on the
    licensing branch.
-2. Move the inference host, worker execution, providers, and transport into
-   `inference`. Extract their shared request types and path helpers so the
-   host imports only named Apache modules; remove the server-side host facade.
+2. Move the inference host, worker execution, and transport into `inference`.
+   Place Antfly provider adapters, remote capability discovery, and endpoint
+   context in `antfly-embedded/src/inference`. Keep provider-neutral execution
+   control and request types with `inference`, so the host imports only named
+   Apache modules; remove the server-side host facade.
    Shared cancellation, cache budget, runtime ABI, diagnostics, template
    content, sparse embeddings, and public request limits get independent
    Apache owners. Done on the licensing branch.
@@ -48,3 +51,35 @@ references need declared module boundaries as owners move. The existing
 license and source dependency checks continue to guard each intermediate
 step; passing those checks alone does not establish the final physical
 boundary.
+
+## Raft and metadata split
+
+Classify these files by responsibility, not by their current `raft/` or
+`metadata/` directory names:
+
+- The generic Raft implementation stays in `zig/lib/raft`. The local replica
+  catalog and backup/restore storage, read-safety interfaces, and typed feature
+  reads belong with the embedded storage owner. This includes the current
+  `raft/storage/{catalog,backup_restore}.zig`, `raft/{read_gate,feature_reads}.zig`,
+  and `raft/state_machine/read_state_observer.zig`. Replace the thin
+  `raft/catalog.zig` re-export with direct named-module imports.
+- Local catalog cloning, index reconciliation, provisioning results, and
+  restore projections belong with embedded metadata and backup code. The
+  current `metadata/{local_catalog,local_index_reconcile,provision_contract,
+  restore_provisioning_contract}.zig` are the starting set. Move their storage,
+  API, and managed-embedder dependencies first so the new owners do not import
+  back into `pkg/antfly`.
+- Incarnation IDs, mutation stamps, topology wire versions, and reallocation
+  requests are shared durable/protocol contracts. Give them an Apache protocol
+  owner with narrow named modules; server coordination imports those types.
+  Split `backup_cohort.zig` at its pure plan/checkpoint transition and driver
+  interface: the reusable state machine remains Apache, while admission,
+  metadata locks, Raft persistence, and scheduling are server-owned.
+- Raft hosts, transport, placement planning, metadata authority, control loops,
+  and HTTP routes remain in `pkg/antfly`. They consume the embedded storage and
+  protocol modules rather than reaching into their source directories.
+
+Move one dependency layer at a time, then build Lite, the C ABI, and WASM from
+the Apache-only staged tree and run the server read-gate, metadata, restore,
+and standalone suites. The boundary check should reject an embedded import
+of `pkg/antfly` and a duplicate copy of any moved source file.
