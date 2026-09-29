@@ -554,6 +554,16 @@ pub fn stageArtifactRevisions(txn: anytype, command: Command, position: Position
     for (command.mutations) |mutation| try txn.put(&artifactRevisionKey(command.namespace, mutation.key), &encoded);
 }
 
+/// Adoption of an absent output can create its first local tombstone witness
+/// without replaying a donor mutation. The caller must CAS both absence and
+/// missing revision before staging this in the same writer transaction.
+pub fn stageArtifactTombstoneRevision(txn: anytype, namespace: Namespace, artifact_key: []const u8, position: Position) !void {
+    if (!guardedArtifactKey(artifact_key)) return error.InvalidBatchRequest;
+    try position.requireNamespace(namespaceFromBytes(namespace));
+    const encoded = try position.encode();
+    try txn.put(&artifactRevisionKey(namespace, artifact_key), &encoded);
+}
+
 pub fn guardedArtifactKey(key_bytes: []const u8) bool {
     // Head bytes are valid read-set witnesses, not generic artifact mutations.
     // Only the staged-output publication path may change generation visibility.

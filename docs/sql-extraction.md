@@ -1842,7 +1842,11 @@ following mechanisms are installed behind that gate:
   receipts and document/artifact references, and fences each artifact against
   its actual receiver-local revision. It still requires a certified-evidence
   fence and causal/postimage revalidation in the same ordered transaction;
-  absent outputs without a receiver revision and graph rebindings remain gated.
+  graph rebindings remain gated. For an absent selected output with no copied
+  revision, adoption staging can now CAS absence and mint a receiver-local
+  tombstone revision at its ordered apply position. A lost-response retry is
+  accepted only if that revision and proof reference still name the same
+  adopted proof; an unrelated same-position write cannot earn a receipt.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups

@@ -1244,21 +1244,52 @@ pub fn stageIndexed(txn: anytype, command: publication.Command, encoded_proof: [
 /// transaction participant, not a certificate: the caller must verify source
 /// evidence, receiver inputs and postimages before invoking it and abort the
 /// writer transaction on any error.
-pub fn stageAdoptedIndexed(txn: anytype, proof: Proof, encoded_proof: []const u8, positions: []const publication.Position, prepared: *const PreparedDocumentReferences, sequence: u64) !void {
+pub fn stageAdoptedIndexed(txn: anytype, proof: Proof, encoded_proof: []const u8, positions: []const ?publication.Position, adoption_position: publication.Position, prepared: *const PreparedDocumentReferences, sequence: u64) !void {
     try proof.validate();
+    if (proof.origin == null or proof.producer_kind != .index) return error.ArtifactAdoptionUnsupported;
     if (positions.len != proof.effects.len) return error.ArtifactCatalogCorrupt;
-    for (proof.effects, positions) |effect, position| {
-        try position.requireNamespace(publication.namespaceFromBytes(proof.namespace));
-        if (!std.meta.eql(try publication.artifactRevision(txn, proof.namespace, effect.key), @as(?publication.Position, position)))
+    try adoption_position.requireNamespace(publication.namespaceFromBytes(proof.namespace));
+    const authority: publication.Authority = .{ .namespace = proof.namespace, .epoch = proof.authority_epoch, .catalog_digest = proof.catalog_digest };
+    const encoded_adoption_position = try adoption_position.encode();
+    // Verify all effects before writing any tombstone revision. An imported
+    // present output must already carry its own exact local revision; only an
+    // absent postimage may acquire a new witness at adoption apply.
+    for (proof.effects, positions) |effect, maybe_position| {
+        if (effect.family == .graph or !publication.validFamilyKey(effect.family, effect.key)) return error.ArtifactAdoptionUnsupported;
+        if (maybe_position) |position| try position.requireNamespace(publication.namespaceFromBytes(proof.namespace));
+        const current_revision = try publication.artifactRevision(txn, proof.namespace, effect.key);
+        if (maybe_position) |position| {
+            if (!std.meta.eql(current_revision, @as(?publication.Position, position))) return error.EnrichmentSourceChanged;
+        } else if (current_revision) |position| {
+            if (!std.meta.eql(position, adoption_position)) return error.EnrichmentSourceChanged;
+            const previous = txn.get(&artifactReferenceKey(authority, effect.key)) catch |err| switch (err) {
+                error.NotFound => return error.EnrichmentSourceChanged,
+                else => return err,
+            };
+            if (previous.len != 32 + publication.Position.encoded_len or
+                !std.mem.eql(u8, previous[0..32], &proof.publication_digest) or
+                !std.mem.eql(u8, previous[32..], &encoded_adoption_position)) return error.EnrichmentSourceChanged;
+        }
+        if (maybe_position == null) {
+            if (effect.value_digest != null) return error.EnrichmentSourceChanged;
+            _ = txn.get(effect.key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
             return error.EnrichmentSourceChanged;
+        }
+    }
+    for (proof.effects, positions) |effect, maybe_position| {
+        if (maybe_position == null and (try publication.artifactRevision(txn, proof.namespace, effect.key)) == null)
+            try publication.stageArtifactTombstoneRevision(txn, proof.namespace, effect.key, adoption_position);
     }
     const owners = try selectedOwners(proof);
     const command = proof.inputCommand();
     try publication.stageSelectedReceipts(txn, command, proof.input_digest, owners, sequence);
-    try stageWithDocumentReferences(txn, command, encoded_proof, positions[0], prepared, .{ .proof = proof, .positions = positions });
+    try stageWithDocumentReferences(txn, command, encoded_proof, adoption_position, prepared, .{ .proof = proof, .positions = positions });
 }
 
-const AdoptedEffects = struct { proof: Proof, positions: []const publication.Position };
+const AdoptedEffects = struct { proof: Proof, positions: []const ?publication.Position };
 
 fn stageWithDocumentReferences(txn: anytype, command: publication.Command, encoded_proof: []const u8, position: publication.Position, prepared: ?*const PreparedDocumentReferences, adopted: ?AdoptedEffects) !void {
     const owners = if (adopted) |selected| try selectedOwners(selected.proof) else try command.outputSources();
@@ -1309,7 +1340,7 @@ fn stageWithDocumentReferences(txn: anytype, command: publication.Command, encod
     const effect_count = if (adopted) |selected| selected.proof.effects.len else command.mutations.len;
     for (0..effect_count) |effect_index| {
         const effect_key = if (adopted) |selected| selected.proof.effects[effect_index].key else command.mutations[effect_index].key;
-        const effect_position = if (adopted) |selected| try selected.positions[effect_index].encode() else encoded_position;
+        const effect_position = if (adopted) |selected| try (selected.positions[effect_index] orelse position).encode() else encoded_position;
         @memcpy(value[32..], &effect_position);
         const reference = artifactReferenceKey(authority, effect_key);
         const previous = txn.get(&reference) catch |err| switch (err) {
@@ -1378,7 +1409,12 @@ test "ordered artifact inventory adopted proof stages only selected receipts and
     };
     const output = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "a", "index");
     defer alloc.free(output);
-    const effects = [_]Effect{.{ .family = .base_vector, .key = output, .source_index = 0, .value_digest = null, .value_bytes = 0 }};
+    const removed = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "a", "removed");
+    defer alloc.free(removed);
+    const effects = [_]Effect{
+        .{ .family = .base_vector, .key = output, .source_index = 0, .value_digest = null, .value_bytes = 0 },
+        .{ .family = .base_vector, .key = removed, .source_index = 0, .value_digest = null, .value_bytes = 0 },
+    };
     var proof: Proof = .{
         .namespace = @splat(1),
         .authority_epoch = 4,
@@ -1404,23 +1440,38 @@ test "ordered artifact inventory adopted proof stages only selected receipts and
     try std.testing.expectEqual(@as(usize, 1), prepared.entries.len);
     // The imported output was written before the later adoption command.
     const position: publication.Position = .{ .raft = .{ .term = 1, .index = 9 } };
+    const adoption_position: publication.Position = .{ .raft = .{ .term = 1, .index = 11 } };
     const output_revision = try position.encode();
-    try std.testing.expectError(error.EnrichmentSourceChanged, stageAdoptedIndexed(&txn, proof, encoded, &.{position}, &prepared, 11));
+    try std.testing.expectError(error.EnrichmentSourceChanged, stageAdoptedIndexed(&txn, proof, encoded, &.{ position, null }, adoption_position, &prepared, 11));
     try txn.put(&publication.artifactRevisionKey(proof.namespace, output), &output_revision);
-    try stageAdoptedIndexed(&txn, proof, encoded, &.{position}, &prepared, 11);
-    try stageAdoptedIndexed(&txn, proof, encoded, &.{position}, &prepared, 11);
+    try txn.put(removed, "unexpected");
+    try std.testing.expectError(error.EnrichmentSourceChanged, stageAdoptedIndexed(&txn, proof, encoded, &.{ position, null }, adoption_position, &prepared, 11));
+    try txn.delete(removed);
+    try stageAdoptedIndexed(&txn, proof, encoded, &.{ position, null }, adoption_position, &prepared, 11);
+    try stageAdoptedIndexed(&txn, proof, encoded, &.{ position, null }, adoption_position, &prepared, 11);
     try std.testing.expectEqualDeep(proof.publication_digest, (try publication.readReceipt(&txn, proof.inputCommand(), sources[0])).?.publication_digest);
     try std.testing.expect((try publication.readReceipt(&txn, proof.inputCommand(), sources[1])) == null);
     try std.testing.expectEqualSlices(u8, encoded, try txn.get(&key(proof.namespace, proof.publication_digest)));
     try std.testing.expectEqualSlices(u8, &proof.publication_digest, try txn.get(prepared.entries[0].key));
-    try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, (try txn.get(&countKey(proof.namespace, proof.publication_digest)))[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, (try txn.get(&countKey(proof.namespace, proof.publication_digest)))[0..8], .little));
     const artifact_reference = artifactReferenceKey(.{ .namespace = proof.namespace, .epoch = proof.authority_epoch, .catalog_digest = proof.catalog_digest }, output);
     const stored_reference = try txn.get(&artifact_reference);
     try std.testing.expectEqualSlices(u8, &output_revision, stored_reference[32..]);
+    const removed_reference = artifactReferenceKey(.{ .namespace = proof.namespace, .epoch = proof.authority_epoch, .catalog_digest = proof.catalog_digest }, removed);
+    try std.testing.expectEqualSlices(u8, &try adoption_position.encode(), (try txn.get(&removed_reference))[32..]);
+    try std.testing.expectEqualDeep(adoption_position, (try publication.artifactRevision(&txn, proof.namespace, removed)).?);
+    const original_removed_reference = try alloc.dupe(u8, try txn.get(&removed_reference));
+    defer alloc.free(original_removed_reference);
+    var forged_reference = try alloc.dupe(u8, original_removed_reference);
+    defer alloc.free(forged_reference);
+    forged_reference[0] ^= 1;
+    try txn.put(&removed_reference, forged_reference);
+    try std.testing.expectError(error.EnrichmentSourceChanged, stageAdoptedIndexed(&txn, proof, encoded, &.{ position, null }, adoption_position, &prepared, 11));
+    try txn.put(&removed_reference, original_removed_reference);
     try std.testing.expectError(error.NotFound, txn.get(output));
     const later: publication.Position = .{ .raft = .{ .term = 1, .index = 12 } };
     try txn.put(&publication.artifactRevisionKey(proof.namespace, output), &try later.encode());
-    try std.testing.expectError(error.EnrichmentSourceChanged, stageAdoptedIndexed(&txn, proof, encoded, &.{position}, &prepared, 11));
+    try std.testing.expectError(error.EnrichmentSourceChanged, stageAdoptedIndexed(&txn, proof, encoded, &.{ position, null }, adoption_position, &prepared, 11));
 }
 
 test "ordered artifact inventory document proof index tracks absence replacement and retirement" {
