@@ -541,6 +541,11 @@ pub const VirtualHttpNetwork = struct {
         return self.partitioned_links.contains(link);
     }
 
+    pub fn hasConnectivityFaults(self: *const VirtualHttpNetwork) bool {
+        return self.partitioned_nodes.count() != 0 or self.partitioned_links.count() != 0 or
+            self.unavailable_nodes.count() != 0;
+    }
+
     pub fn dropNext(self: *VirtualHttpNetwork) void {
         self.drop_next_count +|= 1;
     }
