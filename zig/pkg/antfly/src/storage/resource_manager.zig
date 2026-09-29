@@ -923,6 +923,7 @@ pub const ResourceManager = struct {
     observer_identities: IdentityLedger(ObserverKey, ObserverIdentity) = .empty,
 
     pub fn init(options: Options) ResourceManager {
+        const cpu_count = if (comptime builtin.os.tag == .freestanding) 1 else std.Thread.getCpuCount() catch 1;
         var slices: [slice_count]MutableSlice = undefined;
         for (&slices, 0..) |*slice, i| {
             slice.* = .{
@@ -949,9 +950,9 @@ pub const ResourceManager = struct {
             .dense_search_bandwidth_capacity_bytes = options.dense_search_bandwidth_capacity_bytes orelse
                 options.budgets[@intFromEnum(Slice.dense_search_working_set)].soft_limit_bytes,
             .dense_read_extra_task_limit = options.dense_read_extra_task_limit orelse
-                @intCast(@min(std.math.maxInt(u32), (std.Thread.getCpuCount() catch 1) *| 2)),
-            .dense_rerank_admission = .{ .capacity = @intCast(std.Thread.getCpuCount() catch 1) },
-            .dense_driver_admission = .{ .capacity = @intCast(std.Thread.getCpuCount() catch 1) },
+                @intCast(@min(std.math.maxInt(u32), cpu_count *| 2)),
+            .dense_rerank_admission = .{ .capacity = @intCast(cpu_count) },
+            .dense_driver_admission = .{ .capacity = @intCast(cpu_count) },
             .dense_aggregate_admission = dense_perf.enabled("ANTFLY_EXPERIMENT_AGGREGATE_ADMISSION"),
             .dense_query_snapshot = dense_perf.enabled("ANTFLY_EXPERIMENT_QUERY_SNAPSHOT"),
             .dense_query_snapshot_native_only = dense_perf.enabled("ANTFLY_EXPERIMENT_QUERY_SNAPSHOT_NATIVE_ONLY"),

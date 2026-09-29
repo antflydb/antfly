@@ -10198,7 +10198,10 @@ const PreparedDocumentSourceCache = struct {
         const manager = runtime.config.resource_manager orelse runtime.index_manager.resource_manager;
         return .{
             .backing_alloc = runtime.alloc,
-            .io = runtime.config.io orelse Io.Threaded.global_single_threaded.io(),
+            .io = runtime.config.io orelse if (comptime builtin.os.tag == .freestanding)
+                .failing
+            else
+                Io.Threaded.global_single_threaded.io(),
             .budgeted = if (manager) |value|
                 resource_manager_mod.BudgetedAllocator.init(
                     value,
@@ -11401,8 +11404,11 @@ const DenseExecutionLane = struct {
 };
 
 fn concurrencyIo(runtime: *EnrichmentRuntime) Io {
-    if (builtin.os.tag == .freestanding) return std.Io.Threaded.global_single_threaded.io();
-    return if (runtime.io_impl) |impl| impl.io() else std.Io.Threaded.global_single_threaded.io();
+    if (comptime builtin.os.tag == .freestanding) {
+        return .failing;
+    } else {
+        return if (runtime.io_impl) |impl| impl.io() else std.Io.Threaded.global_single_threaded.io();
+    }
 }
 
 fn prepareAssetLane(

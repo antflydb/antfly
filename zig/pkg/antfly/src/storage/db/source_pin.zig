@@ -356,6 +356,8 @@ pub fn reconcileReleased(db: *DB) !void {
 }
 
 pub fn reconcileReleasedWithBudget(db: *DB, budget: CleanupBudget) !CleanupWork {
+    // Replica-local source pins are native filesystem artifacts.
+    if (comptime @import("builtin").os.tag == .freestanding) return CleanupWork.init(.failing, budget);
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     var work = CleanupWork.init(io, budget);
     const epoch = db.source_pin_gc_epoch.load(.acquire);

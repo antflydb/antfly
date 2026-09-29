@@ -1049,6 +1049,16 @@ pub const DocStore = struct {
         return session;
     }
 
+    fn createWritePayloadSession(self: *DocStore) !?*artifact_payload.Session {
+        // A Lite writer slot may be held by a dense-index transaction whose
+        // vector callback opens a primary probe. Do not hold the policy mutex
+        // while waiting for that slot: probes need it to capture their own
+        // payload session before the writer can finish.
+        self.lockPayloadPolicy();
+        defer self.unlockPayloadPolicy();
+        return try self.createPayloadSession();
+    }
+
     pub fn beginReadTxn(self: *DocStore) !Txn {
         return try self.beginReadTxnWithBlockCacheAdmission(.retain);
     }
@@ -1173,9 +1183,7 @@ pub const DocStore = struct {
 
     pub fn beginWriteTxn(self: *DocStore) !Txn {
         try self.ensurePortableImportOperational();
-        self.lockPayloadPolicy();
-        defer self.unlockPayloadPolicy();
-        const payload_session = try self.createPayloadSession();
+        const payload_session = try self.createWritePayloadSession();
         errdefer if (payload_session) |session| session.release();
         return .{
             .payload_session = payload_session,
@@ -1191,9 +1199,7 @@ pub const DocStore = struct {
 
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
         try self.ensurePortableImportOperational();
-        self.lockPayloadPolicy();
-        defer self.unlockPayloadPolicy();
-        const payload_session = try self.createPayloadSession();
+        const payload_session = try self.createWritePayloadSession();
         errdefer if (payload_session) |session| session.release();
         return .{
             .payload_session = payload_session,
@@ -3812,6 +3818,101 @@ test "docstore reopen preserves data" {
         const val = try store.get(std.testing.allocator, "persist_key");
         defer std.testing.allocator.free(val);
         try std.testing.expectEqualStrings("persist_val", val);
+    }
+}
+
+test "docstore releases payload policy before runtime writer admission" {
+    const Gate = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        released: std.atomic.Value(bool) = .init(false),
+
+        fn wait(self: *@This()) void {
+            self.entered.store(true, .release);
+            while (!self.released.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+    const Intercept = struct {
+        gate: *Gate,
+
+        fn beginWrite(_: Allocator, ptr: *anyopaque) anyerror!backend_erased.WriteTxn {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.gate.wait();
+            return error.TestWriterAdmissionReleased;
+        }
+
+        fn beginBatch(_: Allocator, ptr: *anyopaque) anyerror!backend_erased.Batch {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.gate.wait();
+            return error.TestWriterAdmissionReleased;
+        }
+
+        fn beginBatchWithOptions(alloc: Allocator, ptr: *anyopaque, _: backend_types.BatchOptions) anyerror!backend_erased.Batch {
+            return beginBatch(alloc, ptr);
+        }
+    };
+    const Mode = enum { transaction, batch };
+    const Runner = struct {
+        store: *DocStore,
+        mode: Mode,
+        done: std.atomic.Value(bool) = .init(false),
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            switch (self.mode) {
+                .transaction => {
+                    var txn = self.store.beginWriteTxn() catch |err| {
+                        self.result = err;
+                        return;
+                    };
+                    txn.abort();
+                },
+                .batch => {
+                    var batch = self.store.beginWriteBatchWithOptions(.{}) catch |err| {
+                        self.result = err;
+                        return;
+                    };
+                    batch.abort();
+                },
+            }
+            self.result = error.TestUnexpectedWriterAdmission;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+
+    const original_ptr = store.runtime_store.ptr;
+    const original_vtable = store.runtime_store.vtable;
+    defer {
+        store.runtime_store.ptr = original_ptr;
+        store.runtime_store.vtable = original_vtable;
+    }
+    var intercepted_vtable = original_vtable.*;
+    intercepted_vtable.begin_write = Intercept.beginWrite;
+    intercepted_vtable.begin_batch = Intercept.beginBatch;
+    intercepted_vtable.begin_batch_with_options = Intercept.beginBatchWithOptions;
+    store.runtime_store.vtable = &intercepted_vtable;
+
+    inline for (.{ Mode.transaction, Mode.batch }) |mode| {
+        var gate = Gate{};
+        var intercept = Intercept{ .gate = &gate };
+        store.runtime_store.ptr = &intercept;
+        var runner = Runner{ .store = &store, .mode = mode };
+        const thread = try std.Thread.spawn(.{}, Runner.run, .{&runner});
+        while (!gate.entered.load(.acquire) and !runner.done.load(.acquire))
+            std.Thread.yield() catch {};
+        const reached_backend = gate.entered.load(.acquire);
+        const policy_available = reached_backend and store.payload_policy_mutex.tryLock();
+        if (policy_available) store.unlockPayloadPolicy();
+        gate.released.store(true, .release);
+        thread.join();
+        try std.testing.expect(reached_backend);
+        try std.testing.expect(policy_available);
+        try std.testing.expectEqual(error.TestWriterAdmissionReleased, runner.result.?);
     }
 }
 

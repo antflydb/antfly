@@ -4735,19 +4735,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "storage.docstore.", "storage.transactions.", "storage.range_protection." },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    const run_docstore_unit_tests = b.addRunArtifact(docstore_unit_tests);
+    const run_docstore_unit_tests = addCuratedTestRunArtifact(b, docstore_unit_tests, &.{ "storage.docstore.", "storage.transactions." });
 
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
     const retained_effects_tests = b.addTest(.{
-        .root_module = docstore_test_mod,
-        .filters = &.{"retained"},
+        .root_module = antfly_test_mod,
+        .filters = &.{ "storage.docstore.", "storage.transactions." },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("docstore-retained-effects-test", "Run atomic source row retention, restart, bounds and GC regressions")
-        .dependOn(&addFilteredTestRunArtifact(b, retained_effects_tests).step);
+        .dependOn(&addCuratedTestRunArtifact(b, retained_effects_tests, &.{"retained"}).step);
     const retained_transaction_tests = b.addTest(.{
-        .root_module = docstore_test_mod,
+        .root_module = antfly_test_mod,
         .filters = &.{"storage.transactions."},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
@@ -5120,7 +5120,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // This bounded smoke shares the storage compilation with its unit coverage.
         "db graph metric runtime background coordinator and worker pool loops publish pagerank",
         "graph maintenance",
-        "lmdb backend read forks",
         "graph metric tree batch validation",
         "graph rebuildReverseFromOwnedOutgoingEdges",
         "db graph reverse rebuild resumes after interrupted reopen",
@@ -5647,8 +5646,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "backend runtime separates native operation IO from outbound network IO",
         "backend runtime threaded durable lane rejects jobs after owner close",
         "storage.sim_runtime.",
-        "storage.lmdb.test.LMDB sim soak",
-        "storage.lmdb.test.zig backend soak:",
     };
     const sparse_unit_tests = b.addTest(.{
         .root_module = sparse_test_mod,

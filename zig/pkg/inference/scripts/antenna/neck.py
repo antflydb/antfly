@@ -27,7 +27,9 @@ NECK = "gliner_neck"
 
 
 def declared(model_dir: Path) -> str | None:
-    value = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8")).get("antenna_neck")
+    value = json.loads(
+        (Path(model_dir) / "config.json").read_text(encoding="utf-8")
+    ).get("antenna_neck")
     if value not in (None, "linear"):
         raise ValueError(f"unsupported antenna_neck: {value!r}")
     return value
@@ -40,7 +42,9 @@ def attach(model: Any, weight: Any, bias: Any) -> Any:
     if getattr(model, NECK, None) is not None:
         raise ValueError("model already has a neck")
     parameter = next(model.parameters())
-    neck = torch.nn.Linear(weight.shape[1], weight.shape[0]).to(device=parameter.device, dtype=parameter.dtype)
+    neck = torch.nn.Linear(weight.shape[1], weight.shape[0]).to(
+        device=parameter.device, dtype=parameter.dtype
+    )
     with torch.no_grad():
         neck.weight.copy_(weight)
         neck.bias.copy_(bias)
@@ -85,5 +89,7 @@ def load(model_dir: Path | str, **kwargs: Any) -> Any:
     finally:
         boundary_model.load_checkpoint_state_dict = upstream_load
     if set(captured) != {NECK + ".weight", NECK + ".bias"}:
-        raise ValueError(f"{model_dir}: antenna_neck declared but tensors are {sorted(captured)}")
+        raise ValueError(
+            f"{model_dir}: antenna_neck declared but tensors are {sorted(captured)}"
+        )
     return attach(model, captured[NECK + ".weight"], captured[NECK + ".bias"])

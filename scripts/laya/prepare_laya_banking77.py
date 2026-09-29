@@ -37,7 +37,10 @@ def normalized(text: str) -> str:
 
 def read(path: Path) -> list[tuple[str, str]]:
     with path.open(newline="", encoding="utf-8") as stream:
-        rows = [(row["text"].strip(), row["category"].strip()) for row in csv.DictReader(stream)]
+        rows = [
+            (row["text"].strip(), row["category"].strip())
+            for row in csv.DictReader(stream)
+        ]
     if not rows or any(not text or not category for text, category in rows):
         raise ValueError(f"Empty text or category in {path}")
     return rows
@@ -64,7 +67,9 @@ def write(path: Path, records: list[dict]) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--train", type=Path, required=True)
     parser.add_argument("--test", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -119,7 +124,15 @@ def main():
     write(args.output / "train.jsonl", fit)
     write(args.output / "calibration.jsonl", calibration)
     write(args.output / "eval.jsonl", evaluation)
-    print(json.dumps({"train": len(fit), "calibration": len(calibration), "eval": len(evaluation)}))
+    print(
+        json.dumps(
+            {
+                "train": len(fit),
+                "calibration": len(calibration),
+                "eval": len(evaluation),
+            }
+        )
+    )
 
 
 if __name__ == "__main__":
