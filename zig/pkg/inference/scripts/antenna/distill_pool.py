@@ -44,24 +44,57 @@ import oracle
 TEXT_SETS = ("ag_news", "banking77")
 LABEL_SETS = ("banking77", "ag_news")
 TYPE_SETS = ("crossner_ai", "crossner_literature", "crossner_music", "mit_restaurant")
-GENERIC_TYPES = ("person", "organization", "location", "date", "product", "event", "money", "country", "city", "company")
+GENERIC_TYPES = (
+    "person",
+    "organization",
+    "location",
+    "date",
+    "product",
+    "event",
+    "money",
+    "country",
+    "city",
+    "company",
+)
 TASK_NAMES = ("intent", "topic", "category", "type")
 WIKIPEDIA_SHA256 = "a446ebb8721ce4dd262a8320ba65479a21b361140c639d8a6c4e198892382623"  # wiki-articles-10k-v001.json
-MIX_TASK_NAMES = TASK_NAMES + ("sentiment", "emotion", "domain", "subject", "request", "label")
+MIX_TASK_NAMES = TASK_NAMES + (
+    "sentiment",
+    "emotion",
+    "domain",
+    "subject",
+    "request",
+    "label",
+)
 
 HF = "https://huggingface.co/datasets"
 # Pool-only sources: pinned revision and SHA-256, permissive licenses.
 SOURCES = {
     # MIT; 1M web sentences with free-form entity types from an LLM.
-    "nuner": (f"{HF}/numind/NuNER/resolve/1784de71436044100ab9f153435f8a5c0ea4e1b6/data/entity-00001-of-00001.csv", "91b5533e7a2a89904d221fdb1ed468196411d1abd3327cee07eba7a4b7b63744"),
+    "nuner": (
+        f"{HF}/numind/NuNER/resolve/1784de71436044100ab9f153435f8a5c0ea4e1b6/data/entity-00001-of-00001.csv",
+        "91b5533e7a2a89904d221fdb1ed468196411d1abd3327cee07eba7a4b7b63744",
+    ),
     # Apache 2.0; MASSIVE English voice-assistant commands, 60 intents.
-    "massive": (f"{HF}/mteb/amazon_massive_intent/resolve/940fd47a81eaa7f2cc7b129674d945d618ac38c2/train/en.json.gz", "65e77f0f2596931671074e3d031a481bc798e5800daa2c886ce7aa26cc16cf22"),
+    "massive": (
+        f"{HF}/mteb/amazon_massive_intent/resolve/940fd47a81eaa7f2cc7b129674d945d618ac38c2/train/en.json.gz",
+        "65e77f0f2596931671074e3d031a481bc798e5800daa2c886ce7aa26cc16cf22",
+    ),
     # Apache 2.0; Reddit comments, 28 emotions.
-    "go_emotions": (f"{HF}/google-research-datasets/go_emotions/resolve/add492243ff905527e67aeb8b80c082af02207c3/simplified/train-00000-of-00001.parquet", "b7d74279616ae7c9b8374ab62ea9f9d6504d36a577bb17f745d720dc2b0d4e76"),
+    "go_emotions": (
+        f"{HF}/google-research-datasets/go_emotions/resolve/add492243ff905527e67aeb8b80c082af02207c3/simplified/train-00000-of-00001.parquet",
+        "b7d74279616ae7c9b8374ab62ea9f9d6504d36a577bb17f745d720dc2b0d4e76",
+    ),
     # CC BY-SA 4.0; SQuAD questions only.
-    "squad": (f"{HF}/rajpurkar/squad/resolve/7b6d24c440a36b6815f21b70d25016731768db1f/plain_text/train-00000-of-00001.parquet", "ea7f52bac024f6b1bdc7aaa2a4ee302cba8c2fdc8d4a235cf18a9a5196b6175b"),
+    "squad": (
+        f"{HF}/rajpurkar/squad/resolve/7b6d24c440a36b6815f21b70d25016731768db1f/plain_text/train-00000-of-00001.parquet",
+        "ea7f52bac024f6b1bdc7aaa2a4ee302cba8c2fdc8d4a235cf18a9a5196b6175b",
+    ),
     # CC BY-SA 3.0; DBpedia abstracts, 14 topics.
-    "dbpedia": (f"{HF}/fancyzhx/dbpedia_14/resolve/9abd46cf7fc8b4c64290f26993c540b92aa145ac/dbpedia_14/train-00000-of-00001.parquet", "0640e4664a99cc94c47db1d7b2e01c14455d5bbecb8183ad1f93bde59f3f28ee"),
+    "dbpedia": (
+        f"{HF}/fancyzhx/dbpedia_14/resolve/9abd46cf7fc8b4c64290f26993c540b92aa145ac/dbpedia_14/train-00000-of-00001.parquet",
+        "0640e4664a99cc94c47db1d7b2e01c14455d5bbecb8183ad1f93bde59f3f28ee",
+    ),
 }
 NUNER_MIN_TYPE_COUNT = 20
 
@@ -75,7 +108,9 @@ def wikipedia_passages(path: Path, limit: int) -> list[str]:
         article = json.loads(line)
         paragraphs = [p.strip() for p in article["body"].split("\n") if p.strip()]
         # The first line repeats the title; one-word lines ending in "." are section headings.
-        paragraphs = [p for p in paragraphs[1:] if not (len(p.split()) <= 3 and p.endswith("."))]
+        paragraphs = [
+            p for p in paragraphs[1:] if not (len(p.split()) <= 3 and p.endswith("."))
+        ]
         current: list[str] = []
         for paragraph in paragraphs:
             words = paragraph.split()
@@ -107,7 +142,12 @@ def _natural(identifier: str) -> str:
     """alarm_set -> alarm set; EducationalInstitution -> educational institution."""
     import re
 
-    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", identifier).replace("_", " ").strip().lower()
+    return (
+        re.sub(r"(?<=[a-z])(?=[A-Z])", " ", identifier)
+        .replace("_", " ")
+        .strip()
+        .lower()
+    )
 
 
 def _parquet_names(data: bytes, column: str) -> list[str]:
@@ -115,7 +155,9 @@ def _parquet_names(data: bytes, column: str) -> list[str]:
 
     import pyarrow.parquet as pq
 
-    features = json.loads(pq.read_schema(io.BytesIO(data)).metadata[b"huggingface"])["info"]["features"][column]
+    features = json.loads(pq.read_schema(io.BytesIO(data)).metadata[b"huggingface"])[
+        "info"
+    ]["features"][column]
     return list(features.get("names") or features["feature"]["names"])
 
 
@@ -137,19 +179,35 @@ def load_source(name: str) -> tuple[list[tuple[str, list[str]]], list[str]]:
                 spans = ast.literal_eval(row["output"])
             except (SyntaxError, ValueError):
                 continue
-            types = [part.split(" <> ", 1)[1].strip().lower() for part in spans if " <> " in part]
+            types = [
+                part.split(" <> ", 1)[1].strip().lower()
+                for part in spans
+                if " <> " in part
+            ]
             items.append((row["input"], list(dict.fromkeys(t for t in types if t))))
         return items, []
     if name == "massive":
-        rows = [json.loads(line) for line in gzip.decompress(data).decode("utf-8").splitlines()]
-        return [(row["text"], []) for row in rows], sorted({_natural(row["label_text"]) for row in rows})
+        rows = [
+            json.loads(line)
+            for line in gzip.decompress(data).decode("utf-8").splitlines()
+        ]
+        return [(row["text"], []) for row in rows], sorted(
+            {_natural(row["label_text"]) for row in rows}
+        )
     table = pq.read_table(io.BytesIO(data)).to_pylist()
     if name == "go_emotions":
-        return [(row["text"], []) for row in table], [_natural(n) for n in _parquet_names(data, "labels")]
+        return [(row["text"], []) for row in table], [
+            _natural(n) for n in _parquet_names(data, "labels")
+        ]
     if name == "squad":
-        return [(question, []) for question in dict.fromkeys(row["question"].strip() for row in table)], []
+        return [
+            (question, [])
+            for question in dict.fromkeys(row["question"].strip() for row in table)
+        ], []
     if name == "dbpedia":
-        return [(row["content"].strip(), []) for row in table], [_natural(n) for n in _parquet_names(data, "label")]
+        return [(row["content"].strip(), []) for row in table], [
+            _natural(n) for n in _parquet_names(data, "label")
+        ]
     raise KeyError(name)
 
 
@@ -162,7 +220,8 @@ def _interleave(rng: random.Random, groups: list[list[Any]]) -> list[Any]:
         for index, group in enumerate(groups):
             left = len(group) - cursors[index]
             if pick < left:
-                mixed.append(group[cursors[index]]); cursors[index] += 1
+                mixed.append(group[cursors[index]])
+                cursors[index] += 1
                 break
             pick -= left
     return mixed
@@ -177,31 +236,52 @@ def build_mix(args: argparse.Namespace) -> dict[str, Any]:
     splitter = WhitespaceTokenSplitter()
     rng = random.Random(args.seed)
     requested = dict(item.split("=", 1) for item in args.source)
-    labels = {name for dataset in LABEL_SETS for name in datasets.label_names(dataset)} \
-        | {kind for dataset in TYPE_SETS for kind in datasets.entity_types(dataset)}
-    types = {kind for dataset in TYPE_SETS for kind in datasets.entity_types(dataset)} | set(GENERIC_TYPES)
+    labels = {
+        name for dataset in LABEL_SETS for name in datasets.label_names(dataset)
+    } | {kind for dataset in TYPE_SETS for kind in datasets.entity_types(dataset)}
+    types = {
+        kind for dataset in TYPE_SETS for kind in datasets.entity_types(dataset)
+    } | set(GENERIC_TYPES)
     groups, counts, own_labels = [], {}, {}
     for name, rows in requested.items():
         if name in TEXT_SETS:
-            items = [(record["text"], []) for record in datasets.load_classification(name, "train")]
+            items = [
+                (record["text"], [])
+                for record in datasets.load_classification(name, "train")
+            ]
             names = datasets.label_names(name)
         elif name == "wikipedia":
             if not args.wikipedia:
                 raise oracle.ContractError("source wikipedia needs --wikipedia")
-            items, names = [(text, []) for text in wikipedia_passages(args.wikipedia, args.passage_words)], []
+            items, names = (
+                [
+                    (text, [])
+                    for text in wikipedia_passages(args.wikipedia, args.passage_words)
+                ],
+                [],
+            )
         else:
             items, names = load_source(name)
         if name == "nuner":
             frequency = Counter(t for _, own in items for t in own)
             # Brackets collide with the schema's reserved markers; parentheses are reserved in labels.
-            common = {t for t, n in frequency.items()
-                      if n >= NUNER_MIN_TYPE_COUNT and len(t.split()) <= 4 and not any(c in t for c in "()[]")}
+            common = {
+                t
+                for t, n in frequency.items()
+                if n >= NUNER_MIN_TYPE_COUNT
+                and len(t.split()) <= 4
+                and not any(c in t for c in "()[]")
+            }
             types |= common
             items = [(text, [t for t in own if t in common]) for text, own in items]
         labels |= set(names)
         own_labels[name] = names
         rng.shuffle(items)
-        items = [(name, text, own) for text, own in items if len(list(splitter(text, lower=False))) <= args.max_words][:int(rows)]
+        items = [
+            (name, text, own)
+            for text, own in items
+            if len(list(splitter(text, lower=False))) <= args.max_words
+        ][: int(rows)]
         counts[name] = len(items)
         groups.append(items)
     labels, types = sorted(labels), sorted(types)
@@ -214,8 +294,10 @@ def build_mix(args: argparse.Namespace) -> dict[str, Any]:
         entity = rng.random() < (0.8 if own else args.entity_share)
         if entity:
             count = rng.randint(2, 10)
-            chosen = own[:max(1, count - 1)]
-            chosen += rng.sample([t for t in types if t not in chosen], max(1, count - len(chosen)))
+            chosen = own[: max(1, count - 1)]
+            chosen += rng.sample(
+                [t for t in types if t not in chosen], max(1, count - len(chosen))
+            )
             rng.shuffle(chosen)
             schema = {"entities": chosen}
         else:
@@ -224,16 +306,39 @@ def build_mix(args: argparse.Namespace) -> dict[str, Any]:
             chosen = rng.sample(native, min(len(native), count // 2)) if native else []
             # Half the rest from label names, half from the (far wider) type vocabulary.
             rest = count - len(chosen)
-            chosen += rng.sample([l for l in labels if l not in chosen], rest - rest // 2)
+            chosen += rng.sample(
+                [l for l in labels if l not in chosen], rest - rest // 2
+            )
             chosen += rng.sample([t for t in types if t not in chosen], rest // 2)
             rng.shuffle(chosen)
-            schema = {"classifications": [{"name": rng.choice(MIX_TASK_NAMES), "labels": chosen}]}
-        rows.append({"version": 1, "id": f"pool-{len(rows)}", "text": text, "schema": schema})
-    return {"rows": rows, "manifest": {
-        "sources": {name: {"rows": counts[name], "url": SOURCES[name][0] if name in SOURCES else None} for name in requested},
-        "label_names": len(labels), "entity_types": len(types),
-        "wikipedia": {"sha256": WIKIPEDIA_SHA256, "passage_words": args.passage_words} if "wikipedia" in requested else None,
-    }}
+            schema = {
+                "classifications": [
+                    {"name": rng.choice(MIX_TASK_NAMES), "labels": chosen}
+                ]
+            }
+        rows.append(
+            {"version": 1, "id": f"pool-{len(rows)}", "text": text, "schema": schema}
+        )
+    return {
+        "rows": rows,
+        "manifest": {
+            "sources": {
+                name: {
+                    "rows": counts[name],
+                    "url": SOURCES[name][0] if name in SOURCES else None,
+                }
+                for name in requested
+            },
+            "label_names": len(labels),
+            "entity_types": len(types),
+            "wikipedia": {
+                "sha256": WIKIPEDIA_SHA256,
+                "passage_words": args.passage_words,
+            }
+            if "wikipedia" in requested
+            else None,
+        },
+    }
 
 
 def build(args: argparse.Namespace) -> dict[str, Any]:
@@ -242,16 +347,29 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     provenance, _ = oracle.prepare_runtime(args.upstream)
     if args.source:
         mix = build_mix(args)
-        return write(args, mix["rows"], {**mix["manifest"], "text_sets": None}, provenance)
+        return write(
+            args, mix["rows"], {**mix["manifest"], "text_sets": None}, provenance
+        )
     from gliner2.processing.word_splitter import WhitespaceTokenSplitter
 
     splitter = WhitespaceTokenSplitter()
     rng = random.Random(args.seed)
-    labels = sorted({name for dataset in LABEL_SETS for name in datasets.label_names(dataset)}
-                    | {kind for dataset in TYPE_SETS for kind in datasets.entity_types(dataset)})
-    types = sorted({kind for dataset in TYPE_SETS for kind in datasets.entity_types(dataset)} | set(GENERIC_TYPES))
-    texts = [record["text"] for dataset in TEXT_SETS for record in datasets.load_classification(dataset, "train")]
-    wikipedia = wikipedia_passages(args.wikipedia, args.passage_words) if args.wikipedia else []
+    labels = sorted(
+        {name for dataset in LABEL_SETS for name in datasets.label_names(dataset)}
+        | {kind for dataset in TYPE_SETS for kind in datasets.entity_types(dataset)}
+    )
+    types = sorted(
+        {kind for dataset in TYPE_SETS for kind in datasets.entity_types(dataset)}
+        | set(GENERIC_TYPES)
+    )
+    texts = [
+        record["text"]
+        for dataset in TEXT_SETS
+        for record in datasets.load_classification(dataset, "train")
+    ]
+    wikipedia = (
+        wikipedia_passages(args.wikipedia, args.passage_words) if args.wikipedia else []
+    )
     rng.shuffle(texts)
     rng.shuffle(wikipedia)
     if wikipedia:
@@ -260,9 +378,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         mixed, wi, ti = [], 0, 0
         while wi < len(wikipedia) or ti < len(texts):
             if ti >= len(texts) or (wi < len(wikipedia) and rng.random() < share):
-                mixed.append(wikipedia[wi]); wi += 1
+                mixed.append(wikipedia[wi])
+                wi += 1
             else:
-                mixed.append(texts[ti]); ti += 1
+                mixed.append(texts[ti])
+                ti += 1
         texts = mixed
     seen: set[str] = set()
     rows = []
@@ -275,15 +395,42 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         if rng.random() < args.entity_share:
             schema = {"entities": rng.sample(types, rng.randint(2, 10))}
         else:
-            schema = {"classifications": [{"name": rng.choice(TASK_NAMES), "labels": rng.sample(labels, rng.randint(4, 16))}]}
-        rows.append({"version": 1, "id": f"pool-{len(rows)}", "text": text, "schema": schema})
-    return write(args, rows, {
-        "text_sets": TEXT_SETS, "label_names": len(labels), "entity_types": len(types),
-        "wikipedia": {"sha256": WIKIPEDIA_SHA256, "passages": len(wikipedia), "passage_words": args.passage_words} if args.wikipedia else None,
-    }, provenance)
+            schema = {
+                "classifications": [
+                    {
+                        "name": rng.choice(TASK_NAMES),
+                        "labels": rng.sample(labels, rng.randint(4, 16)),
+                    }
+                ]
+            }
+        rows.append(
+            {"version": 1, "id": f"pool-{len(rows)}", "text": text, "schema": schema}
+        )
+    return write(
+        args,
+        rows,
+        {
+            "text_sets": TEXT_SETS,
+            "label_names": len(labels),
+            "entity_types": len(types),
+            "wikipedia": {
+                "sha256": WIKIPEDIA_SHA256,
+                "passages": len(wikipedia),
+                "passage_words": args.passage_words,
+            }
+            if args.wikipedia
+            else None,
+        },
+        provenance,
+    )
 
 
-def write(args: argparse.Namespace, rows: list[dict[str, Any]], details: dict[str, Any], provenance: dict[str, Any]) -> dict[str, Any]:
+def write(
+    args: argparse.Namespace,
+    rows: list[dict[str, Any]],
+    details: dict[str, Any],
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
     import antenna_datasets as datasets
 
     validation_count = max(1, int(len(rows) * args.validation_fraction))
@@ -292,21 +439,45 @@ def write(args: argparse.Namespace, rows: list[dict[str, Any]], details: dict[st
         files = {}
         for split, items in splits.items():
             path = directory / f"{split}.jsonl"
-            path.write_text("".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in items), encoding="utf-8")
-            files[split] = {"path": path.name, "records": len(items), "sha256": oracle.sha256_file(path)}
-        oracle.write_json(directory / "manifest.json", {
-            "dataset_format": "gliner_boundary_dataset.Row/version=1", "purpose": "antenna feature distillation (unlabeled)",
-            "files": files, **details,
-            "entity_share": args.entity_share, "seed": args.seed, "max_words": args.max_words,
-            "generator_sha256": oracle.sha256_file(Path(__file__)),
-            "datasets_module_sha256": oracle.sha256_file(Path(datasets.__file__)), "provenance": provenance,
-        })
+            path.write_text(
+                "".join(
+                    json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n"
+                    for item in items
+                ),
+                encoding="utf-8",
+            )
+            files[split] = {
+                "path": path.name,
+                "records": len(items),
+                "sha256": oracle.sha256_file(path),
+            }
+        oracle.write_json(
+            directory / "manifest.json",
+            {
+                "dataset_format": "gliner_boundary_dataset.Row/version=1",
+                "purpose": "antenna feature distillation (unlabeled)",
+                "files": files,
+                **details,
+                "entity_share": args.entity_share,
+                "seed": args.seed,
+                "max_words": args.max_words,
+                "generator_sha256": oracle.sha256_file(Path(__file__)),
+                "datasets_module_sha256": oracle.sha256_file(Path(datasets.__file__)),
+                "provenance": provenance,
+            },
+        )
         oracle.verify_upstream_checkout(args.upstream)
-    return {"status": "built", "output": str(args.output.resolve()), **{k: v["records"] for k, v in files.items()}}
+    return {
+        "status": "built",
+        "output": str(args.output.resolve()),
+        **{k: v["records"] for k, v in files.items()},
+    }
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--upstream", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rows", type=int, default=80000)
@@ -314,10 +485,19 @@ def main() -> int:
     parser.add_argument("--validation-fraction", type=float, default=0.01)
     parser.add_argument("--max-words", type=int, default=128)
     parser.add_argument("--seed", type=int, default=20260926)
-    parser.add_argument("--wikipedia", type=Path, help="wiki-articles-10k-v001.json (cdn.antfly.io/datasets/)")
+    parser.add_argument(
+        "--wikipedia",
+        type=Path,
+        help="wiki-articles-10k-v001.json (cdn.antfly.io/datasets/)",
+    )
     parser.add_argument("--passage-words", type=int, default=100)
-    parser.add_argument("--source", action="append", default=[], metavar="NAME=ROWS",
-                        help=f"sampled source mix instead of the default texts: {', '.join(TEXT_SETS + ('wikipedia',) + tuple(SOURCES))}")
+    parser.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        metavar="NAME=ROWS",
+        help=f"sampled source mix instead of the default texts: {', '.join(TEXT_SETS + ('wikipedia',) + tuple(SOURCES))}",
+    )
     print(json.dumps(build(parser.parse_args()), sort_keys=True))
     return 0
 

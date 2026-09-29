@@ -8,10 +8,24 @@ from prepare_laya_packed_distillation import blend, temperature, upstream_questi
 class LayaDistillationTests(unittest.TestCase):
     def test_upstream_questions_preserve_label_order_and_descriptions(self):
         base = {"id": "c/q", "instruction": "which?"}
-        choice = upstream_question({**base, "kind": "choice", "labels": ["search", "none"], "descriptions": ["topic", ""]})
+        choice = upstream_question(
+            {
+                **base,
+                "kind": "choice",
+                "labels": ["search", "none"],
+                "descriptions": ["topic", ""],
+            }
+        )
         self.assertEqual(choice["crit"], {"search": "topic", "none": None})
         self.assertEqual(list(choice["crit"]), ["search", "none"])
-        score = upstream_question({**base, "kind": "score", "labels": ["low", "high"], "descriptions": ["", "urgent"]})
+        score = upstream_question(
+            {
+                **base,
+                "kind": "score",
+                "labels": ["low", "high"],
+                "descriptions": ["", "urgent"],
+            }
+        )
         self.assertEqual(score["crit"], ["low", "urgent"])
         noul = upstream_question({**base, "kind": "noul", "labels": ["false", "true"]})
         self.assertEqual(noul["crit"], {"false": "", "true": ""})
@@ -19,7 +33,10 @@ class LayaDistillationTests(unittest.TestCase):
             upstream_question({**base, "kind": "noul", "labels": ["true", "false"]})
 
     def test_calibration_bucket_precedes_type_temperature(self):
-        decision = {"temperature": [2, 3, 4], "temperature_by_options": {"choice:3-5": 1.5}}
+        decision = {
+            "temperature": [2, 3, 4],
+            "temperature_by_options": {"choice:3-5": 1.5},
+        }
         self.assertEqual(temperature(decision, "choice", 4), 1.5)
         self.assertEqual(temperature(decision, "choice", 2), 2)
         self.assertEqual(temperature(decision, "noul", 2), 4)

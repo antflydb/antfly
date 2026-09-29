@@ -68,7 +68,11 @@ import time
 from pathlib import Path
 
 QTYPES = {"choice": 0, "score": 1, "noul": 2}
-KIND_NAME = {"choice": "a single choice", "score": "an ordinal level", "noul": "a yes/no question"}
+KIND_NAME = {
+    "choice": "a single choice",
+    "score": "an ordinal level",
+    "noul": "a yes/no question",
+}
 SCORE_MODES = ("raw-sum", "length-normalized")
 MIN_BUCKET_SAMPLES = 15
 
@@ -81,7 +85,9 @@ def load_module(path: Path, name: str):
 
 
 def load_records(path: Path) -> list[dict]:
-    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    records = [
+        json.loads(line) for line in path.read_text().splitlines() if line.strip()
+    ]
     if not records:
         raise ValueError(f"Empty dataset: {path}")
     return records
@@ -133,11 +139,20 @@ def state_fits(laya_tok, record: dict, decision: dict, build_sequence) -> bool:
     prepare_laya_packed_distillation.state_fits exactly, so the two scripts
     partition a dataset without overlap or gaps."""
     ids, _ = build_sequence(
-        laya_tok, record["text"], upstream_question(record), decision["max_len"], decision["head_max_len"]
+        laya_tok,
+        record["text"],
+        upstream_question(record),
+        decision["max_len"],
+        decision["head_max_len"],
     )
-    state = laya_tok(record["text"].replace(laya_tok.mask_token, " "), add_special_tokens=False)["input_ids"]
+    state = laya_tok(
+        record["text"].replace(laya_tok.mask_token, " "), add_special_tokens=False
+    )["input_ids"]
     head_and_options = len(ids) - len(state) - 1
-    return head_and_options >= 0 and ids[head_and_options : head_and_options + len(state)] == state
+    return (
+        head_and_options >= 0
+        and ids[head_and_options : head_and_options + len(state)] == state
+    )
 
 
 # --- Long-context teacher (MLX) -----------------------------------------------------------------
@@ -159,13 +174,17 @@ def build_prompt(record: dict) -> str:
     for label, desc in zip(labels, descriptions):
         lines.append(f"- {label}: {desc}" if desc else f"- {label}")
     lines.append("")
-    lines.append("Answer with exactly one label from the list above, verbatim, and nothing else.")
+    lines.append(
+        "Answer with exactly one label from the list above, verbatim, and nothing else."
+    )
     return "\n".join(lines)
 
 
 def teacher_prompt_ids(tok, record: dict) -> list[int]:
     return tok.apply_chat_template(
-        [{"role": "user", "content": build_prompt(record)}], add_generation_prompt=True, enable_thinking=False
+        [{"role": "user", "content": build_prompt(record)}],
+        add_generation_prompt=True,
+        enable_thinking=False,
     )
 
 
@@ -180,7 +199,9 @@ def fork_cache(cache_mod, saved_state):
     return fresh
 
 
-def score_labels(model, tok, mx, cache_mod, saved_state, last_logits, record: dict) -> tuple[list[float], list[float], int]:
+def score_labels(
+    model, tok, mx, cache_mod, saved_state, last_logits, record: dict
+) -> tuple[list[float], list[float], int]:
     """Each label's raw-sum and length-normalized (average per token)
     log-likelihood after the prompt whose cache is `saved_state` and whose
     final logits are `last_logits`: the first label token is read off the
@@ -198,10 +219,14 @@ def score_labels(model, tok, mx, cache_mod, saved_state, last_logits, record: di
         tokens += len(cont_ids)
         logprob = float(last_logprobs[cont_ids[0]])
         if len(cont_ids) > 1:
-            cont_logits = model(mx.array([cont_ids[:-1]]), cache=fork_cache(cache_mod, saved_state))
+            cont_logits = model(
+                mx.array([cont_ids[:-1]]), cache=fork_cache(cache_mod, saved_state)
+            )
             mx.eval(cont_logits)
             step_logprobs = cont_logits[0].astype(mx.float32)
-            step_logprobs = step_logprobs - mx.logsumexp(step_logprobs, axis=-1, keepdims=True)
+            step_logprobs = step_logprobs - mx.logsumexp(
+                step_logprobs, axis=-1, keepdims=True
+            )
             for i, next_id in enumerate(cont_ids[1:]):
                 logprob += float(step_logprobs[i, next_id])
         raw_scores.append(logprob)
@@ -221,7 +246,9 @@ def shared_prefix_len(all_ids: list[list[int]]) -> int:
     return n
 
 
-def score_group(model, tok, mx, cache_mod, group: list[dict], share_prefix: bool) -> list[tuple[list[float], list[float], int]]:
+def score_group(
+    model, tok, mx, cache_mod, group: list[dict], share_prefix: bool
+) -> list[tuple[list[float], list[float], int]]:
     """Score the records of one case. With `share_prefix`, the prompts' common
     token prefix (the state: build_prompt puts it before the question and
     labels) is prefilled once and every question branches off a copy of that
@@ -239,17 +266,25 @@ def score_group(model, tok, mx, cache_mod, group: list[dict], share_prefix: bool
         base = [c.state for c in cache]
     results = []
     for n, (record, ids) in enumerate(zip(group, all_ids)):
-        cache = fork_cache(cache_mod, base) if prefix else cache_mod.make_prompt_cache(model)
+        cache = (
+            fork_cache(cache_mod, base)
+            if prefix
+            else cache_mod.make_prompt_cache(model)
+        )
         logits = model(mx.array([ids[prefix:]]), cache=cache)
         mx.eval(logits)
         raw, norm, label_tokens = score_labels(
             model, tok, mx, cache_mod, [c.state for c in cache], logits[0, -1], record
         )
-        results.append((raw, norm, len(ids) - prefix + label_tokens + (prefix if n == 0 else 0)))
+        results.append(
+            (raw, norm, len(ids) - prefix + label_tokens + (prefix if n == 0 else 0))
+        )
     return results
 
 
-def score_records(model, tok, mx, cache_mod, records: list[dict], share_prefix: bool) -> list[tuple[list[float], list[float], int]]:
+def score_records(
+    model, tok, mx, cache_mod, records: list[dict], share_prefix: bool
+) -> list[tuple[list[float], list[float], int]]:
     """score_group over `records` grouped by case (`group_id`; a record
     without one is its own case), returned in input order."""
     groups: dict = collections.OrderedDict()
@@ -257,7 +292,12 @@ def score_records(model, tok, mx, cache_mod, records: list[dict], share_prefix: 
         groups.setdefault(record.get("group_id", ("record", n)), []).append(n)
     results: list = [None] * len(records)
     for members in groups.values():
-        for n, result in zip(members, score_group(model, tok, mx, cache_mod, [records[m] for m in members], share_prefix)):
+        for n, result in zip(
+            members,
+            score_group(
+                model, tok, mx, cache_mod, [records[m] for m in members], share_prefix
+            ),
+        ):
             results[n] = result
     return results
 
@@ -266,7 +306,9 @@ def score_records(model, tok, mx, cache_mod, records: list[dict], share_prefix: 
 
 
 def option_bucket(count: int) -> str:
-    return "2" if count <= 2 else "3-5" if count <= 5 else "6-10" if count <= 10 else "11+"
+    return (
+        "2" if count <= 2 else "3-5" if count <= 5 else "6-10" if count <= 10 else "11+"
+    )
 
 
 def softmax_with_temperature(scores: list[float], temp: float) -> list[float]:
@@ -289,7 +331,9 @@ def fit_temperature(scored: list[tuple[list[float], list[float]]]) -> float:
         return 1.0
 
     def mean_ce(temp: float) -> float:
-        return sum(cross_entropy(softmax_with_temperature(s, temp), t) for s, t in scored) / len(scored)
+        return sum(
+            cross_entropy(softmax_with_temperature(s, temp), t) for s, t in scored
+        ) / len(scored)
 
     def search(lo: float, hi: float, steps: int) -> float:
         best_t, best_ce = 1.0, math.inf
@@ -304,7 +348,9 @@ def fit_temperature(scored: list[tuple[list[float], list[float]]]) -> float:
     return search(max(0.005, coarse / 3), coarse * 3, 40)
 
 
-def fit_temperatures_bucketed(scored: list[tuple[str, int, list[float], list[float]]]) -> dict:
+def fit_temperatures_bucketed(
+    scored: list[tuple[str, int, list[float], list[float]]],
+) -> dict:
     """scored: (kind, label_count, scores, target) rows, one per calibration
     decision. Fits a temperature per (kind, option-count bucket) -- the same
     shape as Laya's own `temperature_by_options` -- with a fallback per kind
@@ -316,7 +362,9 @@ def fit_temperatures_bucketed(scored: list[tuple[str, int, list[float], list[flo
         by_bucket_groups[f"{kind}:{option_bucket(count)}"].append((scores, target))
     by_kind = {kind: fit_temperature(rows) for kind, rows in by_kind_groups.items()}
     by_bucket = {
-        key: fit_temperature(rows) for key, rows in by_bucket_groups.items() if len(rows) >= MIN_BUCKET_SAMPLES
+        key: fit_temperature(rows)
+        for key, rows in by_bucket_groups.items()
+        if len(rows) >= MIN_BUCKET_SAMPLES
     }
     return {"by_bucket": by_bucket, "by_kind": by_kind}
 
@@ -330,7 +378,9 @@ def temperature_lookup(temperatures: dict, kind: str, count: int) -> float:
     return 1.0
 
 
-def mean_ce_with_temperatures(scored: list[tuple[str, int, list[float], list[float]]], temperatures: dict) -> float:
+def mean_ce_with_temperatures(
+    scored: list[tuple[str, int, list[float], list[float]]], temperatures: dict
+) -> float:
     if not scored:
         return math.inf
     total = 0.0
@@ -376,7 +426,12 @@ def metrics_for(items: list[tuple[str, list[float], list[float]]]) -> dict:
             bins[b][1] += confidence
             bins[b][2] += correct
         ece = sum(c / n * abs(conf / c - corr / c) for c, conf, corr in bins if c > 0)
-        return {"decisions": n, "accuracy": accuracy / n, "soft_ce": soft_ce / n, "ece": ece}
+        return {
+            "decisions": n,
+            "accuracy": accuracy / n,
+            "soft_ce": soft_ce / n,
+            "ece": ece,
+        }
 
     out = {"overall": compute(items)}
     for kind in QTYPES:
@@ -400,7 +455,9 @@ def load_laya_temperature(decision: dict):
     return temperature
 
 
-def score_laya_baseline(laya_model: Path, common, decision: dict, records: list[dict]) -> list[list[float]]:
+def score_laya_baseline(
+    laya_model: Path, common, decision: dict, records: list[dict]
+) -> list[list[float]]:
     """Score records with the actual unpacked Laya checkpoint via upstream's own
     code, exactly as laya_upstream_baseline.py does. `common.build_sequence`
     truncates a long state to fit the fixed budget, so this reproduces the
@@ -414,7 +471,9 @@ def score_laya_baseline(laya_model: Path, common, decision: dict, records: list[
     cfg = ModernBertConfig.from_dict(raw)
     cfg._attn_implementation = "eager"
     model = common.DecisionModel(
-        ModernBertModel(cfg), head_layers=decision["head_layers"], n_act=len(decision.get("act_costs", {})) + 1
+        ModernBertModel(cfg),
+        head_layers=decision["head_layers"],
+        n_act=len(decision.get("act_costs", {})) + 1,
     ).eval()
     model.load_state_dict(load_file(laya_model / "model.safetensors"), strict=True)
     tok = PreTrainedTokenizerFast.from_pretrained(laya_model)
@@ -423,13 +482,33 @@ def score_laya_baseline(laya_model: Path, common, decision: dict, records: list[
     results = []
     for r in records:
         ids, markers = common.build_sequence(
-            tok, r["text"], upstream_question(r), decision["max_len"], decision["head_max_len"]
+            tok,
+            r["text"],
+            upstream_question(r),
+            decision["max_len"],
+            decision["head_max_len"],
         )
-        batch = common.collate_items([[{"ids": ids, "markers": markers, "qtype": QTYPES[r["kind"]]}]], tok.pad_token_id)
+        batch = common.collate_items(
+            [[{"ids": ids, "markers": markers, "qtype": QTYPES[r["kind"]]}]],
+            tok.pad_token_id,
+        )
         with torch.no_grad():
-            logits, _ = model(*(batch[k] for k in ("input_ids", "attention_mask", "marker_pos", "marker_mask", "qtype")))
+            logits, _ = model(
+                *(
+                    batch[k]
+                    for k in (
+                        "input_ids",
+                        "attention_mask",
+                        "marker_pos",
+                        "marker_mask",
+                        "qtype",
+                    )
+                )
+            )
         n = len(r["labels"])
-        probs = torch.softmax(logits[0, :n].double() / temperature(r["kind"], n), -1).tolist()
+        probs = torch.softmax(
+            logits[0, :n].double() / temperature(r["kind"], n), -1
+        ).tolist()
         results.append(probs)
     return results
 
@@ -443,18 +522,36 @@ def digest(path: Path) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("records", type=Path)
-    parser.add_argument("--teacher-model", type=Path, required=True, help="Local MLX long-context teacher directory")
-    parser.add_argument("--laya-model", type=Path, required=True, help="Prepared unpacked Laya directory")
-    parser.add_argument("--common", type=Path, required=True, help="Upstream laya/common.py")
+    parser.add_argument(
+        "--teacher-model",
+        type=Path,
+        required=True,
+        help="Local MLX long-context teacher directory",
+    )
+    parser.add_argument(
+        "--laya-model",
+        type=Path,
+        required=True,
+        help="Prepared unpacked Laya directory",
+    )
+    parser.add_argument(
+        "--common", type=Path, required=True, help="Upstream laya/common.py"
+    )
     parser.add_argument(
         "--calibration",
         type=Path,
         help="Native records with gold targets to fit temperatures on (every record is used, "
         "regardless of Laya eligibility: the teacher scores every state itself)",
     )
-    parser.add_argument("--temperatures", type=Path, help="Reuse score_mode/temperatures from a prior run's provenance JSON")
+    parser.add_argument(
+        "--temperatures",
+        type=Path,
+        help="Reuse score_mode/temperatures from a prior run's provenance JSON",
+    )
     parser.add_argument(
         "--score-mode",
         choices=("auto",) + SCORE_MODES,
@@ -470,12 +567,28 @@ def main():
         "per-question: prefill every question's whole prompt, as runs before 2026-09-26 did",
     )
     parser.add_argument("--gold-weight", type=float, default=0.5)
-    parser.add_argument("--score-all", action="store_true", help="Score every record, ignoring Laya eligibility")
-    parser.add_argument("--compare-laya", action="store_true", help="Also score with the unpacked Laya checkpoint")
+    parser.add_argument(
+        "--score-all",
+        action="store_true",
+        help="Score every record, ignoring Laya eligibility",
+    )
+    parser.add_argument(
+        "--compare-laya",
+        action="store_true",
+        help="Also score with the unpacked Laya checkpoint",
+    )
     parser.add_argument("--limit", type=int, help="Bounded, shuffled sample size")
     parser.add_argument("--seed", type=int, default=20260925)
-    parser.add_argument("--output", type=Path, help="Distilled records output (optional if only measuring)")
-    parser.add_argument("--metrics-output", type=Path, help="Write an accuracy/soft-CE/ECE comparison report here")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Distilled records output (optional if only measuring)",
+    )
+    parser.add_argument(
+        "--metrics-output",
+        type=Path,
+        help="Write an accuracy/soft-CE/ECE comparison report here",
+    )
     args = parser.parse_args()
     if args.output and args.output.exists():
         parser.error(f"Output already exists: {args.output}")
@@ -494,7 +607,9 @@ def main():
     laya_tok = PreTrainedTokenizerFast.from_pretrained(args.laya_model)
 
     records = load_records(args.records)
-    eligible_mask = [state_fits(laya_tok, r, decision, common.build_sequence) for r in records]
+    eligible_mask = [
+        state_fits(laya_tok, r, decision, common.build_sequence) for r in records
+    ]
     if args.score_all:
         targets = list(range(len(records)))
     else:
@@ -528,10 +643,19 @@ def main():
         cal_records = load_records(args.calibration)
         cal_scored = {"raw-sum": [], "length-normalized": []}
         for r, (raw, norm, _) in zip(cal_records, score(cal_records)):
-            cal_scored["raw-sum"].append((r["kind"], len(r["labels"]), raw, r["target"]))
-            cal_scored["length-normalized"].append((r["kind"], len(r["labels"]), norm, r["target"]))
-        fitted = {mode: fit_temperatures_bucketed(cal_scored[mode]) for mode in SCORE_MODES}
-        mean_ce = {mode: mean_ce_with_temperatures(cal_scored[mode], fitted[mode]) for mode in SCORE_MODES}
+            cal_scored["raw-sum"].append(
+                (r["kind"], len(r["labels"]), raw, r["target"])
+            )
+            cal_scored["length-normalized"].append(
+                (r["kind"], len(r["labels"]), norm, r["target"])
+            )
+        fitted = {
+            mode: fit_temperatures_bucketed(cal_scored[mode]) for mode in SCORE_MODES
+        }
+        mean_ce = {
+            mode: mean_ce_with_temperatures(cal_scored[mode], fitted[mode])
+            for mode in SCORE_MODES
+        }
         if args.score_mode == "auto":
             score_mode = min(SCORE_MODES, key=lambda m: mean_ce[m])
         else:
@@ -544,30 +668,48 @@ def main():
             "temperatures_by_mode": fitted,
         }
     else:
-        score_mode = "length-normalized" if args.score_mode == "auto" else args.score_mode
+        score_mode = (
+            "length-normalized" if args.score_mode == "auto" else args.score_mode
+        )
         temperatures = {"by_bucket": {}, "by_kind": {}}
 
     chosen_scores = scores_by_mode[score_mode]
     calibrated: dict[int, list[float]] = {
-        i: softmax_with_temperature(scores, temperature_lookup(temperatures, records[i]["kind"], len(records[i]["labels"])))
+        i: softmax_with_temperature(
+            scores,
+            temperature_lookup(
+                temperatures, records[i]["kind"], len(records[i]["labels"])
+            ),
+        )
         for i, scores in chosen_scores.items()
     }
 
     laya_probs: dict[int, list[float]] = {}
     if args.compare_laya:
         laya_records = [records[i] for i in chosen]
-        for i, probs in zip(chosen, score_laya_baseline(args.laya_model, common, decision, laya_records)):
+        for i, probs in zip(
+            chosen, score_laya_baseline(args.laya_model, common, decision, laya_records)
+        ):
             laya_probs[i] = probs
 
     if args.output:
         temporary = None
         try:
-            with tempfile.NamedTemporaryFile(mode="w", dir=args.output.parent, delete=False) as out:
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=args.output.parent, delete=False
+            ) as out:
                 temporary = Path(out.name)
                 for i, record in enumerate(records):
                     if i in calibrated:
-                        record = {**record, "target": blend(record["target"], calibrated[i], args.gold_weight)}
-                    out.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+                        record = {
+                            **record,
+                            "target": blend(
+                                record["target"], calibrated[i], args.gold_weight
+                            ),
+                        }
+                    out.write(
+                        json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
+                    )
                 out.flush()
                 os.fsync(out.fileno())
             os.link(temporary, args.output)
@@ -591,12 +733,24 @@ def main():
         }
         if calibration_report:
             report["calibration"] = calibration_report
-        raw_items = [(records[i]["kind"], softmax_with_temperature(chosen_scores[i], 1.0), records[i]["target"]) for i in chosen]
-        calibrated_items = [(records[i]["kind"], calibrated[i], records[i]["target"]) for i in chosen]
+        raw_items = [
+            (
+                records[i]["kind"],
+                softmax_with_temperature(chosen_scores[i], 1.0),
+                records[i]["target"],
+            )
+            for i in chosen
+        ]
+        calibrated_items = [
+            (records[i]["kind"], calibrated[i], records[i]["target"]) for i in chosen
+        ]
         report["teacher_uncalibrated"] = metrics_for(raw_items)
         report["teacher_calibrated"] = metrics_for(calibrated_items)
         if laya_probs:
-            laya_items = [(records[i]["kind"], laya_probs[i], records[i]["target"]) for i in chosen]
+            laya_items = [
+                (records[i]["kind"], laya_probs[i], records[i]["target"])
+                for i in chosen
+            ]
             report["laya_teacher"] = metrics_for(laya_items)
         args.metrics_output.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report, indent=2))
@@ -616,7 +770,9 @@ def main():
             "teacher_config_sha256": digest(args.teacher_model / "config.json"),
             "laya_model": str(args.laya_model),
             "common_sha256": digest(args.common),
-            "prompt_template_sha256": hashlib.sha256(inspect.getsource(build_prompt).encode()).hexdigest(),
+            "prompt_template_sha256": hashlib.sha256(
+                inspect.getsource(build_prompt).encode()
+            ).hexdigest(),
             "output_sha256": digest(args.output),
         }
         if calibration_report:
