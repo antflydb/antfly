@@ -5557,18 +5557,20 @@ pub const ModelManager = struct {
         self: *const ModelManager,
         model_path: []const u8,
         backend_runtime: backends.BackendRuntime,
+        load_plan_floor: runtime.tier.memory.Limits,
     ) !runtime.tier.memory.Limits {
-        var limits = self.admissionLimitsForBackend(backend_runtime);
+        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
+            admissionBackendClassForRuntime(backend_runtime),
+            self.process_memory_limit_bytes,
+        );
         limits = try session_factory.widenBudgetLimitsForModelPath(
             self.allocator,
             model_path,
             limits,
             backend_runtime.backend,
         );
-        return runtime.tier.memory.applyLimitOverrides(
-            limits,
-            self.admission_limit_overrides,
-        );
+        limits = runtime.tier.memory.maxCompositeLimits(limits, load_plan_floor);
+        return runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
     }
 
     /// Architecture sessions may carry a minimum safe cache/workspace floor
@@ -5673,6 +5675,7 @@ pub const ModelManager = struct {
                 admission_limits = self.admissionLimitsForModelPath(
                     model_path,
                     backend_runtime,
+                    admission_plan.limit_floor,
                 ) catch |err| {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
@@ -8481,6 +8484,9 @@ const ModelLoadAdmissionPlan = struct {
     peak: runtime.tier.memory.AdmissionAmounts,
     /// Bytes retained by the completed backend session.
     resident: runtime.tier.memory.AdmissionAmounts,
+    /// Minimum serving envelope justified by the same resolved load plan.
+    /// Operator overrides are applied after this floor.
+    limit_floor: runtime.tier.memory.Limits = .{},
 };
 
 fn modelRunWorkspaceAllowance(weight_bytes: usize) usize {
@@ -8854,7 +8860,18 @@ fn a4bGpuModelLoadAdmission(
     // resident representation. Metal maps the encoded artifact directly and
     // does not retain a second host copy.
     if (backend == .cuda) peak.host_weight_bytes = encoded_artifact_bytes;
-    return .{ .peak = peak, .resident = resident };
+    const host_staging = if (backend == .cuda) encoded_artifact_bytes else 0;
+    return .{
+        .peak = peak,
+        .resident = resident,
+        .limit_floor = .{
+            .host_limit_bytes = host_staging,
+            .backend_limit_bytes = budget,
+            .combined_limit_bytes = budget +| host_staging,
+            .kv_limit_bytes = kv,
+            .scratch_limit_bytes = scratch,
+        },
+    };
 }
 
 test "A4B GPU admission lease equals the configured memory envelope" {
@@ -8873,6 +8890,49 @@ test "A4B GPU admission lease equals the configured memory envelope" {
     try std.testing.expectEqual(cuda_plan.resident.backendTotalBytes(), cuda_plan.peak.backendTotalBytes());
     try std.testing.expectEqual(@as(usize, 1234), cuda_plan.peak.host_weight_bytes);
     try std.testing.expectEqual(@as(usize, 0), cuda_plan.resident.host_weight_bytes);
+}
+
+test "CUDA A4B load plan widens explicit budget above default" {
+    const requested_budget_mb: u64 = 24 * 1024;
+    const config = try backend_contracts.buildCudaA4bInferenceConfig(
+        .{
+            .residency_mode = .resident,
+            .memory_budget_mb = requested_budget_mb,
+        },
+        backend_contracts.qualified_a4b_geometries[0],
+    );
+    const encoded_artifact_bytes = 4 * 1024 * 1024 * 1024;
+    const plan = a4bGpuModelLoadAdmission(config, encoded_artifact_bytes, .cuda);
+    try std.testing.expectEqual(
+        @as(usize, requested_budget_mb) * 1024 * 1024,
+        plan.limit_floor.backend_limit_bytes,
+    );
+    try std.testing.expectEqual(
+        plan.limit_floor.backend_limit_bytes + encoded_artifact_bytes,
+        plan.limit_floor.combined_limit_bytes,
+    );
+}
+
+test "CUDA A4B operator cap remains authoritative over load-plan floor" {
+    const config = try backend_contracts.buildCudaA4bInferenceConfig(
+        null,
+        backend_contracts.qualified_a4b_geometries[0],
+    );
+    const plan = a4bGpuModelLoadAdmission(config, 4 * 1024 * 1024 * 1024, .cuda);
+    const capped = runtime.tier.memory.applyLimitOverrides(
+        plan.limit_floor,
+        .{ .backend_limit_bytes = 8 * 1024 * 1024 * 1024 },
+    );
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), capped.backend_limit_bytes);
+    try std.testing.expectEqual(
+        capped.host_limit_bytes + capped.backend_limit_bytes,
+        capped.combined_limit_bytes,
+    );
+    var run_budget = runtime.tier.memory.RunBudget.init(capped);
+    try std.testing.expectError(
+        error.MemoryBudgetExceeded,
+        run_budget.tryReserveWeight(.backend, plan.resident.backendTotalBytes()),
+    );
 }
 
 fn onnxModelLoadAdmission(
@@ -9075,6 +9135,7 @@ fn loadSessionForPreferredBackends(
             admission_limits = manager.admissionLimitsForModelPath(
                 model_dir,
                 backend_runtime,
+                admission_plan.limit_floor,
             ) catch |err| {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
