@@ -19,6 +19,11 @@ const addSnowballModule = @import("snowball.zig").addSnowballModule;
 
 pub const AntflyRootImports = struct {
     storage_boundary: @import("storage_boundary.zig").Modules,
+    inference_worker_rpc: *std.Build.Module,
+    inference_embedding_wire: *std.Build.Module,
+    inference_types: *std.Build.Module,
+    inference_work: *std.Build.Module,
+    inference_openai: *std.Build.Module,
     boundary_profile: @import("storage_boundary.zig").Profile = .all,
     build_info: @import("../../../lib/build_info/build_support.zig").BuildInfo,
     build_options: *std.Build.Step.Options,
@@ -201,6 +206,11 @@ pub const AntflyRootImports = struct {
         options.addOption(bool, "bench_minimal_deps", false);
         mod.addOptions("build_options", options);
         mod.addImport("antfly_platform", self.platform);
+        mod.addImport("antfly_inference_worker_rpc", self.inference_worker_rpc);
+        mod.addImport("antfly_inference_embedding_wire", self.inference_embedding_wire);
+        mod.addImport("antfly_inference_types", self.inference_types);
+        mod.addImport("antfly_inference_work", self.inference_work);
+        mod.addImport("antfly_inference_openai", self.inference_openai);
         inline for (.{
             "httpx",              "common_openapi",  "inference_config_openapi", "logging_openapi",
             "middleware_openapi", "scraping",        "scraping_openapi",         "s3_openapi",
@@ -311,6 +321,11 @@ pub const AntflyRootImports = struct {
         self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
         mod.addOptions("build_options", self.build_options);
         mod.addImport("antfly_platform", self.platform);
+        mod.addImport("antfly_inference_worker_rpc", self.inference_worker_rpc);
+        mod.addImport("antfly_inference_embedding_wire", self.inference_embedding_wire);
+        mod.addImport("antfly_inference_types", self.inference_types);
+        mod.addImport("antfly_inference_work", self.inference_work);
+        mod.addImport("antfly_inference_openai", self.inference_openai);
         if (link_libc and !self.platform_link_libc) {
             platform_build.addFilesystemCapacitySource(
                 mod,

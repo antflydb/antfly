@@ -16,7 +16,7 @@
 //! Host-owned replaceable inference process. Only wire values cross the pipes.
 const std = @import("std");
 const builtin = @import("builtin");
-const rpc = @import("inference_worker_rpc.zig");
+const rpc = @import("antfly_inference_worker_rpc");
 pub const wire = @import("inference_worker_wire.zig");
 const bridge = @import("inference_bridge.zig");
 const http = @import("../runtime_http_abi.zig");

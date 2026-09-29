@@ -188,18 +188,14 @@ zig/pkg/antfly/src/graph/work_budget.zig
 zig/pkg/antfly/src/graph/work_budget_diagnostic.zig
 zig/pkg/antfly/src/index.zig
 zig/pkg/antfly/src/inference/bedrock.zig
-zig/pkg/antfly/src/inference/embedding_wire.zig
 zig/pkg/antfly/src/inference/execution_context.zig
 zig/pkg/antfly/src/inference/list_models.zig
 zig/pkg/antfly/src/inference/local.zig
 zig/pkg/antfly/src/inference/managed_embedder.zig
 zig/pkg/antfly/src/inference/mod.zig
-zig/pkg/antfly/src/inference/openai.zig
 zig/pkg/antfly/src/inference/query_embedding_cache.zig
 zig/pkg/antfly/src/inference/remote_capabilities.zig
-zig/pkg/antfly/src/inference/types.zig
 zig/pkg/antfly/src/inference/vertex.zig
-zig/pkg/antfly/src/inference/work.zig
 zig/pkg/antfly/src/inference_connection_abi.zig
 zig/pkg/antfly/src/inference_runtime/runtime.zig
 zig/pkg/antfly/src/introducer.zig
@@ -278,7 +274,6 @@ zig/pkg/antfly/src/standalone/inference_host.zig
 zig/pkg/antfly/src/standalone/inference_host_root.zig
 zig/pkg/antfly/src/standalone/inference_provider.zig
 zig/pkg/antfly/src/standalone/inference_worker.zig
-zig/pkg/antfly/src/standalone/inference_worker_rpc.zig
 zig/pkg/antfly/src/standalone/inference_worker_wire.zig
 zig/pkg/antfly/src/standalone/provider_failure.zig
 zig/pkg/antfly/src/storage/admission_waiter.zig

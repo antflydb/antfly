@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const antfly_image = @import("antfly_image");
-const inference_work = @import("../../../inference/work.zig");
+const inference_work = @import("antfly_inference_work");
 const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
 const request_context = @import("../../../inference/execution_context.zig");
 const RequestContext = request_context.RequestContext;

@@ -1044,7 +1044,7 @@ pub fn inferenceProviderEmbedDensePartsBorrowed(
     deadline_ns: ?u64,
     cancellation: CancellationToken,
 ) ![][]f32 {
-    const embedding_wire = @import("../inference/embedding_wire.zig");
+    const embedding_wire = @import("antfly_inference_embedding_wire");
     const wire_parts = try alloc.alloc(template.ContentPart, parts.len);
     defer alloc.free(wire_parts);
     const payload_storage = try alloc.alloc(inference_bridge.ProviderBinaryPayload, parts.len);
@@ -1115,7 +1115,7 @@ pub fn inferenceProviderRerankDocumentsWithContext(
     context: inference.RequestContext,
 ) anyerror![]f32 {
     try context.check();
-    const embedding_wire = @import("../inference/embedding_wire.zig");
+    const embedding_wire = @import("antfly_inference_embedding_wire");
     var part_count: usize = 0;
     for (documents) |document| part_count += document.len;
     const wire_documents = try alloc.alloc([]template.ContentPart, documents.len);

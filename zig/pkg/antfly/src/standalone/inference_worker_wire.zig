@@ -144,7 +144,7 @@ pub const provider_attachment_limits = attachments.Limits{
     .max_attachments = 1024,
     .max_mime_bytes = 1024,
     // Reserve the complete worst-case envelope, not just the raster payload.
-    .max_total_attachment_bytes = @import("inference_worker_rpc.zig").max_body_bytes - 24 - 1024 * 1024 - 1024 * (16 + 1024),
+    .max_total_attachment_bytes = @import("antfly_inference_worker_rpc").max_body_bytes - 24 - 1024 * 1024 - 1024 * (16 + 1024),
 };
 
 pub fn constrainCapabilities(capabilities: anytype) @TypeOf(capabilities) {
@@ -152,7 +152,7 @@ pub fn constrainCapabilities(capabilities: anytype) @TypeOf(capabilities) {
     const limit = @min(result.attachment_payload_max_bytes orelse provider_attachment_limits.max_total_attachment_bytes, provider_attachment_limits.max_total_attachment_bytes);
     result.attachment_payload_max_bytes = limit;
     result.attachment_metadata_max_bytes = @min(result.attachment_metadata_max_bytes orelse provider_attachment_limits.max_metadata_bytes, provider_attachment_limits.max_metadata_bytes);
-    const envelope_limit = @import("inference_worker_rpc.zig").max_body_bytes;
+    const envelope_limit = @import("antfly_inference_worker_rpc").max_body_bytes;
     result.attachment_envelope_max_bytes = @min(result.attachment_envelope_max_bytes orelse envelope_limit, envelope_limit);
     result.batch.max_encoded_media_bytes = @min(result.batch.max_encoded_media_bytes orelse limit, limit);
     // Keep model pixel limits independent of transport representation.
@@ -203,7 +203,7 @@ pub const ProviderInput = struct {
             if (source.attachment_index >= payloads.len) return error.InvalidInput;
             ref.* = .{ .attachment_index = source.attachment_index, .item_index = source.item_index, .item_id = source.item_id.slice(), .source_fingerprint = source.source_fingerprint.slice(), .page_number = if (source.has_page_number != 0) source.page_number else null };
         }
-        if (try attachments.encodedSize(context.request_json.slice(), payloads) > @import("inference_worker_rpc.zig").max_body_bytes) return error.BodyTooLarge;
+        if (try attachments.encodedSize(context.request_json.slice(), payloads) > @import("antfly_inference_worker_rpc").max_body_bytes) return error.BodyTooLarge;
         return .{
             .options = .{ .operation = context.operation, .deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null, .numeric = context.out_numeric_result != null, .attachment_refs = refs },
             .body = try attachments.encodeSegmentsAlloc(arena, context.request_json.slice(), payloads),
@@ -225,7 +225,7 @@ pub const ProviderOutput = struct {
             length.* = row.len;
             bytes = std.math.add(usize, bytes, std.math.mul(usize, row.len, 4) catch return error.BodyTooLarge) catch return error.BodyTooLarge;
         }
-        if (bytes > @import("inference_worker_rpc.zig").max_body_bytes) return error.BodyTooLarge;
+        if (bytes > @import("antfly_inference_worker_rpc").max_body_bytes) return error.BodyTooLarge;
         const body = try arena.alloc(u8, bytes);
         var offset: usize = 0;
         for (lengths, 0..) |length, i| for (0..length) |j| {
@@ -276,22 +276,22 @@ pub const Reservation = struct { lease: usize = 0, amounts: bridge.AdmissionAmou
 pub const Observation = struct { key: usize, previous: u64, next: u64 };
 
 test "inference worker logical body limit matches the public HTTP contract" {
-    try std.testing.expectEqual(@import("../api/public_limits.zig").max_request_body_bytes, @import("inference_worker_rpc.zig").max_body_bytes);
+    try std.testing.expectEqual(@import("../api/public_limits.zig").max_request_body_bytes, @import("antfly_inference_worker_rpc").max_body_bytes);
 }
 
 test "inference worker raster capability reserves envelope overhead before rendering" {
-    const work = @import("../inference/work.zig");
+    const work = @import("antfly_inference_work");
     const original = work.InferenceCapabilities{ .task = .read, .input_modalities = .{ .image = true }, .input_granularity = .page, .batch = .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_decoded_pixels = 50_000_000 }, .output = .read_result, .borrowed_rasters = true, .borrowed_attachments = true };
     const constrained = constrainCapabilities(original);
     try constrained.validate();
-    try std.testing.expectEqual(@as(?usize, @import("inference_worker_rpc.zig").max_body_bytes), constrained.attachment_envelope_max_bytes);
+    try std.testing.expectEqual(@as(?usize, @import("antfly_inference_worker_rpc").max_body_bytes), constrained.attachment_envelope_max_bytes);
     var lower = original;
     lower.attachment_envelope_max_bytes = 1024 * 1024;
     try std.testing.expectEqual(lower.attachment_envelope_max_bytes, constrainCapabilities(lower).attachment_envelope_max_bytes);
     const pixels = constrained.renderPixelLimit(true);
     const limits = provider_attachment_limits;
     try std.testing.expect(pixels < original.batch.max_decoded_pixels.?);
-    try std.testing.expect(pixels * 4 + limits.max_metadata_bytes + 24 + limits.max_attachments * (16 + limits.max_mime_bytes) <= @import("inference_worker_rpc.zig").max_body_bytes);
+    try std.testing.expect(pixels * 4 + limits.max_metadata_bytes + 24 + limits.max_attachments * (16 + limits.max_mime_bytes) <= @import("antfly_inference_worker_rpc").max_body_bytes);
     try std.testing.expectEqual(original.batch.max_decoded_pixels, constrained.batch.max_decoded_pixels);
     try constrained.validateInvocation(.read, .{ .item_count = 1, .modalities = .{ .image = true }, .decoded_pixels = 25_000_000, .encoded_media_bytes = 100_000, .text_bytes = 100_000 });
     try std.testing.expectError(error.InferenceEncodedBytesExceeded, constrained.validateInvocation(.read, .{ .item_count = 8, .modalities = .{ .image = true }, .decoded_pixels = pixels + 1, .raw_media_bytes = @intCast((pixels + 1) * 4) }));

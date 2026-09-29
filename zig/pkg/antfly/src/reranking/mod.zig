@@ -216,7 +216,7 @@ pub fn normalizeOperationalError(err: anyerror) anyerror {
 }
 
 pub fn statusError(status: u16) anyerror {
-    return @import("../inference/types.zig").rerankStatusError(status);
+    return @import("antfly_inference_types").rerankStatusError(status);
 }
 
 test "reranking runtime failures use stable query dependency classes" {
@@ -1344,7 +1344,7 @@ test "reranking runtime sends image documents to linked rerankers that accept im
             scores[1] = 0.3;
             return scores;
         }
-        fn capabilities(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, task: @import("../inference/work.zig").Task) anyerror!@import("../inference/work.zig").InferenceCapabilities {
+        fn capabilities(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, task: @import("antfly_inference_work").Task) anyerror!@import("antfly_inference_work").InferenceCapabilities {
             const state: *@This() = @ptrCast(@alignCast(ptr));
             return .{ .task = task, .input_modalities = .{ .text = true, .image = state.accepts_images }, .input_granularity = .item, .output = .ranked_items, .result_cardinality = .one_per_request };
         }

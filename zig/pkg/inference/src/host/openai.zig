@@ -21,7 +21,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const openai_api = @import("openai_api");
-const inference = @import("types.zig");
+const inference = @import("antfly_inference_types");
 
 pub const Provider = struct {
     allocator: std.mem.Allocator,

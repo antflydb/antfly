@@ -20,7 +20,7 @@ pub const storage_backend_erased = @import("storage/backend_erased.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 
 test {
-    _ = @import("standalone/inference_worker_rpc.zig");
+    _ = @import("antfly_inference_worker_rpc");
     _ = @import("standalone/inference_worker_wire.zig");
     _ = @import("standalone/inference_worker.zig");
     _ = @import("standalone/provider_failure.zig");

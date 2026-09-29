@@ -20,10 +20,10 @@
 //   - Local inference (ONNX inference, binary embedding format)
 //   - OpenAI (also works with Ollama, vLLM, and any OpenAI-compatible API)
 
-pub const types = @import("types.zig");
+pub const types = @import("antfly_inference_types");
 pub const bedrock = @import("bedrock.zig");
 pub const local = @import("local.zig");
-pub const openai = @import("openai.zig");
+pub const openai = @import("antfly_inference_openai");
 pub const vertex = @import("vertex.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
 pub const execution_context = @import("execution_context.zig");
@@ -32,7 +32,7 @@ pub const execution_context = @import("execution_context.zig");
 pub const request_context = execution_context;
 pub const list_models = @import("list_models.zig");
 pub const query_embedding_cache = @import("query_embedding_cache.zig");
-pub const work = @import("work.zig");
+pub const work = @import("antfly_inference_work");
 pub const remote_capabilities = @import("remote_capabilities.zig");
 const credential_source_identity = @import("../common/credential_source_identity.zig");
 const google_auth = @import("antfly_google").auth;

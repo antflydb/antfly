@@ -17,8 +17,8 @@ const std = @import("std");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
-const inference = @import("types.zig");
-const inference_work = @import("work.zig");
+const inference = @import("antfly_inference_types");
+const inference_work = @import("antfly_inference_work");
 const credential_source_identity = @import("../common/credential_source_identity.zig");
 const provider_defaults = @import("../common/provider_defaults.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)

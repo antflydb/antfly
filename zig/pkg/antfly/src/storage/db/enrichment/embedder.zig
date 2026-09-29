@@ -25,7 +25,7 @@ const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or b
     @import("../template_stub.zig")
 else
     @import("../../../template.zig");
-const inference_work = @import("../../../inference/work.zig");
+const inference_work = @import("antfly_inference_work");
 const antfly_image = @import("antfly_image");
 
 pub const DenseEmbedFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32;

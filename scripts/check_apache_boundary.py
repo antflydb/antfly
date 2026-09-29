@@ -123,6 +123,11 @@ SOURCE_MODULES = {
     "antfly_inference_config_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_inference_config_openapi/root.zig",
     ),
+    "antfly_inference_worker_rpc": ("zig/pkg/inference/src/host/worker_rpc.zig",),
+    "antfly_inference_embedding_wire": ("zig/pkg/inference/src/host/embedding_wire.zig",),
+    "antfly_inference_types": ("zig/pkg/inference/src/host/types.zig",),
+    "antfly_inference_work": ("zig/pkg/inference/src/host/work.zig",),
+    "antfly_inference_openai": ("zig/pkg/inference/src/host/openai.zig",),
     "antfly_jsonschema": ("zig/lib/jsonschema/src/mod.zig",),
     "antfly_logging_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_logging_openapi/root.zig",

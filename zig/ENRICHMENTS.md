@@ -283,7 +283,8 @@ being configured with an unbounded model cache (`max_loaded_models = 0` for
 Lite's `createEmbeddedInferenceNode`, see `standalone/inference_provider.zig`)
 specifically so an interleaved/concurrent extract+embed workload does not
 evict and reload either model between batches. The worker-subprocess RPC
-transport (`standalone/inference_worker.zig`, `inference_worker_rpc.zig`)
+transport (`pkg/antfly/src/standalone/inference_worker.zig`,
+`pkg/inference/src/host/worker_rpc.zig`)
 already multiplexes concurrent in-flight requests by request ID over one
 pipe pair, so the two lanes' provider calls can be genuinely in flight at
 the same time without any transport-level change.

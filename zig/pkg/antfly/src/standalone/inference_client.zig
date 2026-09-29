@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const inference_types = @import("../inference/types.zig");
+const inference_types = @import("antfly_inference_types");
 const template = @import("../template.zig");
 const readers = @import("antfly_readers");
 const transcribing = @import("antfly_transcribing");

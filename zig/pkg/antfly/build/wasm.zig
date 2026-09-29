@@ -175,11 +175,20 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_resolver_mod.addImport("antfly_matcher", wasm_matcher_mod);
     embedded_support_wasm_mod.addImport("antfly_resolver", wasm_resolver_mod);
     embedded_support_wasm_mod.addImport("antfly_matcher", wasm_matcher_mod);
-    embedded_support_wasm_mod.addImport("antfly_data_uri", b.createModule(.{
+    const wasm_data_uri_mod = b.createModule(.{
         .root_source_file = b.path("lib/scraping/src/data_uri.zig"),
         .target = wasm_target,
         .optimize = optimize,
-    }));
+    });
+    embedded_support_wasm_mod.addImport("antfly_data_uri", wasm_data_uri_mod);
+    const inference_work_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/work.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    inference_work_mod.addImport("antfly_data_uri", wasm_data_uri_mod);
+    inference_work_mod.addImport("antfly_image", wasm_image_mod);
+    embedded_support_wasm_mod.addImport("antfly_inference_work", inference_work_mod);
     embedded_support_wasm_mod.addImport("antfly_reader_config", b.createModule(.{
         .root_source_file = b.path("lib/readers/src/config.zig"),
         .target = wasm_target,

@@ -23,7 +23,7 @@ const CancellationToken = @import("../common/cancellation.zig").CancellationToke
 const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
-const inference = @import("types.zig");
+const inference = @import("antfly_inference_types");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
     @import("../storage/db/template_stub.zig")
 else
@@ -1197,7 +1197,7 @@ fn testEmbedPartsRequestRoundTrip(comptime binary_response: bool, comptime requi
 
     const Fiber = struct {
         fn run(a: std.mem.Allocator, test_io: std.Io, base: []const u8, ok_out: *bool, dim_out: *usize, err_out: *anyerror) std.Io.Cancelable!void {
-            var bounded = @import("work.zig").BoundedInvocationAllocator.init(a, 384 * 1024);
+            var bounded = @import("antfly_inference_work").BoundedInvocationAllocator.init(a, 384 * 1024);
             const request_alloc = if (required) bounded.allocator() else a;
             defer std.debug.assert(bounded.live_bytes == 0);
             var client = httpx.Client.initWithConfig(request_alloc, test_io, .{ .keep_alive = false });

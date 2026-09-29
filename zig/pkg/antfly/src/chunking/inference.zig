@@ -25,7 +25,7 @@ const inference_chunker = @import("inference_chunker");
 const chunk_provider = @import("provider.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const remote_capabilities = @import("../inference/remote_capabilities.zig");
-const inference_work = @import("../inference/work.zig");
+const inference_work = @import("antfly_inference_work");
 const execution_context = @import("../inference/execution_context.zig");
 const platform_time = @import("antfly_platform").time;
 

@@ -17,7 +17,7 @@ const std = @import("std");
 const data_uri = @import("antfly_scraping").data_uri;
 const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
-const inference = @import("types.zig");
+const inference = @import("antfly_inference_types");
 const provider_defaults = @import("../common/provider_defaults.zig");
 
 const Allocator = std.mem.Allocator;

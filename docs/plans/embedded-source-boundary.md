@@ -21,15 +21,21 @@ formats, and WASM behavior remain the same.
 ## Migration
 
 1. Move shared generated OpenAPI types and code generation into
-   `antfly-embedded`; move source-text tests with those files. This part is in
-   progress on the licensing branch.
-2. Extract storage and local API owners into `antfly-embedded`, replacing
+   `antfly-embedded`; move source-text tests with those files. Done on the
+   licensing branch.
+2. Extract the inference host and worker into `inference`, starting with
+   transport protocols that have no server-source dependencies. Move their
+   shared runtime and HTTP contracts into Apache modules so the host can
+   compile without relative imports into `antfly`. The server keeps its
+   provider adapter and worker supervision policy. The first extraction moves
+   worker RPC framing, embedding wire formats, inference types, work admission,
+   and the OpenAI provider into `zig/pkg/inference/src/host`; the remaining
+   host and worker still depend on shared runtime contracts in `antfly`.
+3. Extract storage and local API owners into `antfly-embedded`, replacing
    relative server-to-engine imports with explicit module imports. Keep
    backup/restore and the C ABI in the embedded owner.
-3. Extract the Apache raft and metadata contracts needed by the local engine.
+4. Extract the Apache raft and metadata contracts needed by the local engine.
    Server raft, placement, and metadata control stay in `antfly`.
-4. Move the inference host and worker into `inference`; the server retains
-   only its provider adapter and worker supervision policy.
 5. Give `antfly-embedded` an independent build graph for Lite, C ABI, and
    WASM. Remove the Apache per-file exceptions for `zig/pkg/antfly` once no
    Apache owner remains there.

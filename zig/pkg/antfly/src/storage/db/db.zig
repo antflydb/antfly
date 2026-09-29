@@ -111,7 +111,7 @@ else
 const vectorindex_mod = @import("antfly_vectorindex");
 const embedder_mod = @import("enrichment/embedder.zig");
 const asset_producer_mod = @import("enrichment/asset_producer.zig");
-const inference_work = @import("../../inference/work.zig");
+const inference_work = @import("antfly_inference_work");
 const document_extraction_mod = @import("enrichment/document_extraction.zig");
 const runtime_failure_abi = @import("runtime_failure_abi");
 const document_extraction_client = if (!builtin.is_test and build_options.linked_storage)

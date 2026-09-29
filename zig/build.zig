@@ -704,8 +704,49 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     const inference_steps = @import("pkg/inference/build/integration.zig").add(inference_workflow, inference_wasm_jinja, inference_wasm_platform);
 
+    const inference_worker_rpc_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/worker_rpc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_worker_rpc_mod.addImport("httpx", httpx_mod);
+    const inference_embedding_wire_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/embedding_wire.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_embedding_wire_mod.addImport("httpx", httpx_mod);
+    const inference_types_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/types.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_types_mod.addImport("antfly_generating", generating_mod);
+    const inference_work_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/work.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_work_mod.addImport("antfly_scraping", scraping_mod);
+    inference_work_mod.addImport("antfly_image", image_mod);
+    const inference_openai_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/openai.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_openai_mod.addImport("httpx", httpx_mod);
+    inference_openai_mod.addImport("openai_api", openai_api_mod);
+    inference_openai_mod.addImport("antfly_inference_types", inference_types_mod);
+    const inference_openai_tests = b.addTest(.{ .root_module = inference_openai_mod });
+    b.step("antfly-inference-host-openai-test", "Run embedded inference OpenAI provider tests")
+        .dependOn(&b.addRunArtifact(inference_openai_tests).step);
     const antfly_imports = AntflyRootImports{
         .storage_boundary = @import("pkg/antfly/build/storage_boundary.zig").create(b, b.path("pkg/antfly/src"), target, optimize),
+        .inference_worker_rpc = inference_worker_rpc_mod,
+        .inference_embedding_wire = inference_embedding_wire_mod,
+        .inference_types = inference_types_mod,
+        .inference_work = inference_work_mod,
+        .inference_openai = inference_openai_mod,
         .build_info = build_info,
         .build_options = build_options,
         .lite_options = antfly_storage_build.createLiteOptions(b, lite_local_inference_runtime),

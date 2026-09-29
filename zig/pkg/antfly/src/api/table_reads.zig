@@ -19861,7 +19861,7 @@ fn consumerTests() type {
                     scores[1] = 0.9;
                     return scores;
                 }
-                fn capabilities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, task: @import("../inference/work.zig").Task) anyerror!@import("../inference/work.zig").InferenceCapabilities {
+                fn capabilities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, task: @import("antfly_inference_work").Task) anyerror!@import("antfly_inference_work").InferenceCapabilities {
                     return .{ .task = task, .input_modalities = .{ .text = true, .image = true }, .input_granularity = .item, .output = .ranked_items, .result_cardinality = .one_per_request };
                 }
             };
@@ -31090,7 +31090,7 @@ fn implementationTests() type {
                     model: []const u8,
                     roles: []const []const u8,
                     contents: []const []const u8,
-                    _: @import("../inference/types.zig").GenerationOptions,
+                    _: @import("antfly_inference_types").GenerationOptions,
                 ) anyerror![]u8 {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.calls += 1;
