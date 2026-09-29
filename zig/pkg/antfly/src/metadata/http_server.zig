@@ -4260,8 +4260,11 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
     if ((parsed.value.replica_root_incarnation orelse 0) != 0 and (parsed.value.reporter_incarnation orelse 0) == 0)
         return error.InvalidStoreReporterFence;
     if (parsed.value.replica_root_public_key) |public_key| {
-        if (std.mem.allEqual(u8, &public_key, 0) or
-            (parsed.value.replica_root_incarnation orelse 0) == 0 or
+        // StoreRecord's default zero key is serialized by the data client.
+        // It is the wire representation of an unsigned root, not a signing
+        // claim; a nonzero key still requires a fenced physical root.
+        if ((!std.mem.allEqual(u8, &public_key, 0) and
+            (parsed.value.replica_root_incarnation orelse 0) == 0) or
             (parsed.value.reporter_incarnation orelse 0) == 0) return error.InvalidStoreReporterFence;
     }
     if (!metadata_table_manager.artifactSourcesProtocolValid(
@@ -4730,6 +4733,17 @@ test "store registration preserves physical replica root identity" {
     }, .{});
     defer alloc.free(invalid_signing_json);
     try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreRecord(alloc, invalid_signing_json));
+    const unenrolled_json = try std.json.Stringify.valueAlloc(alloc, .{
+        .store_id = @as(u64, 20),
+        .node_id = @as(u64, 20),
+        .reporter_incarnation = @as(u64, 77),
+        .replica_root_public_key = [_]u8{0} ** 32,
+    }, .{});
+    defer alloc.free(unenrolled_json);
+    const unenrolled = try parseStoreRecord(alloc, unenrolled_json);
+    defer metadata_table_manager.freeStore(alloc, unenrolled);
+    try std.testing.expectEqual(@as(u128, 0), unenrolled.replica_root_incarnation);
+    try std.testing.expect(std.mem.allEqual(u8, &unenrolled.replica_root_public_key, 0));
 }
 
 fn parseU64Field(value: std.json.Value) !u64 {

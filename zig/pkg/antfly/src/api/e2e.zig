@@ -3278,6 +3278,8 @@ test "hosted relational parent placement opens a real Raft owner" {
     const alloc = std.testing.allocator;
     const trusted_secret = "hosted-fk-setting-authority-secret";
     const trusted_issuer = "hosted-fk-test";
+    const internal_service_secret = "hosted-fk-internal-service-secret-v1";
+    const internal_service_issuer = "hosted-fk-service";
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const metadata_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-parent-metadata", .{tmp.sub_path});
@@ -3321,7 +3323,12 @@ test "hosted relational parent placement opens a real Raft owner" {
     var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(alloc, .{
         .replica_root_dir = data_root,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data", .failure_domain = "rack-a" },
-        .api_server_cfg = .{ .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = trusted_issuer },
+        .api_server_cfg = .{
+            .trusted_principal_secret = trusted_secret,
+            .trusted_principal_issuer = trusted_issuer,
+            .internal_service_secret = internal_service_secret,
+            .internal_service_issuer = internal_service_issuer,
+        },
     }, metadata_api);
     defer data_server.deinit();
     try data_server.start();
@@ -3340,12 +3347,19 @@ test "hosted relational parent placement opens a real Raft owner" {
     defer alloc.free(trusted_token);
     const trusted_headers = [_]http_common.RequestHeader{.{ .name = http_server.trusted_principal_header, .value = trusted_token }};
 
+    // Store-root readiness durably activates the metadata protocol before
+    // registration. Keep Raft rounds running while that HTTP request waits
+    // for its activation proposal to commit.
+    var metadata_raft_progress = raft_mod.ManagedProgressDriver.init(io, metadataServiceRaftProgressSource(&svc), std.time.ns_per_ms);
+    defer metadata_raft_progress.deinit();
+    try metadata_raft_progress.start();
+
     // The split runtime is deterministic: start() schedules registration,
     // while this production lane and metadata Raft rounds commit it.
     var registered = false;
-    for (0..128) |_| {
+    const registration_deadline_ns = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < registration_deadline_ns) {
         try data_server.runStoreStatusRoundOnly();
-        try svc.runRound();
         var observed = try metadata_client.fetchSnapshot(metadata_api);
         registered = observed.value.stores.len == 1;
         observed.deinit();
@@ -3421,9 +3435,6 @@ test "hosted relational parent placement opens a real Raft owner" {
 
     // A directory and an idle LSM worker do not prove the parent can serve the
     // linearizable topology lookup required by FK generation planning.
-    var metadata_raft_progress = raft_mod.ManagedProgressDriver.init(io, metadataServiceRaftProgressSource(&svc), std.time.ns_per_ms);
-    defer metadata_raft_progress.deinit();
-    try metadata_raft_progress.start();
     var metadata_control_progress = raft_mod.ManagedProgressDriver.init(io, metadataServiceControlProgressSource(&svc), std.time.ns_per_ms);
     defer metadata_control_progress.deinit();
     try metadata_control_progress.start();
