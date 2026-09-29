@@ -76,6 +76,7 @@ pub const Plan = struct {
     definitions: std.AutoHashMapUnmanaged(publication.Digest, u32),
     unit_children: std.StringHashMapUnmanaged(u32) = .empty,
     enrichment_kinds: std.StringHashMapUnmanaged(enrichments.EnrichmentType) = .empty,
+    root_chunk_scopes: std.StringHashMapUnmanaged(RootChunkScope) = .empty,
     native_requirement: u32 = 0,
     has_projection_requirements: bool = false,
 
@@ -113,6 +114,14 @@ pub const Plan = struct {
         return &self.nodes[index];
     }
 
+    pub fn rootChunkScopeClosed(self: *const Plan, artifact: []const u8) !bool {
+        return switch (self.root_chunk_scopes.get(artifact) orelse return error.ArtifactCatalogDrift) {
+            .closed => true,
+            .open => false,
+            .ambiguous => error.ArtifactCatalogDrift,
+        };
+    }
+
     pub fn init(alloc: std.mem.Allocator, catalogs: inventory.Catalogs, templates: []const requests.GeneratedEnrichmentRequest) !Plan {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
@@ -143,6 +152,8 @@ pub const Plan = struct {
         return .{ .nodes = self.nodes[first..end], .cursor = .{ .plan = self.digest, .next = @intCast(end) }, .at_end = end == self.nodes.len };
     }
 };
+
+const RootChunkScope = enum { closed, open, ambiguous };
 
 test "ordered artifact inventory compiles singleton and producer-defined scope once" {
     const Check = struct {
@@ -177,6 +188,15 @@ fn compileWithChildren(alloc: std.mem.Allocator, catalog: publication.Digest, te
     errdefer arena.deinit();
     const a = arena.allocator();
     const nodes = try a.alloc(Node, count);
+    var root_chunk_scopes: std.StringHashMapUnmanaged(RootChunkScope) = .empty;
+    for (templates) |request| {
+        if (request.kind != .chunk_text) continue;
+        if (root_chunk_scopes.getPtr(request.artifact_name)) |existing| {
+            existing.* = .ambiguous;
+        } else {
+            try root_chunk_scopes.put(a, try a.dupe(u8, request.artifact_name), if (request.upstream_artifact_name.len == 0 and request.neighbor_context_json.len == 0) .closed else .open);
+        }
+    }
     var enrichment_kinds: std.StringHashMapUnmanaged(enrichments.EnrichmentType) = .empty;
     for (enrichment_configs) |config| {
         const name = try a.dupe(u8, config.name);
@@ -303,18 +323,38 @@ fn compileWithChildren(alloc: std.mem.Allocator, catalog: publication.Digest, te
         entry.value_ptr.* = @intCast(index);
     };
     var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update("antfly:artifact-completion-plan:v1:");
+    hash.update("antfly:artifact-completion-plan:v2:");
     hash.update(&catalog);
     var encoded_count: [8]u8 = undefined;
     std.mem.writeInt(u64, &encoded_count, requirements.len, .little);
     hash.update(&encoded_count);
     for (requirements) |node| hash.update(&node.id);
+    const RootEntry = struct { name: []const u8, scope: RootChunkScope };
+    const root_entries = try a.alloc(RootEntry, root_chunk_scopes.count());
+    var root_iterator = root_chunk_scopes.iterator();
+    for (root_entries) |*entry| {
+        const next_entry = root_iterator.next() orelse return error.ArtifactCatalogCorrupt;
+        entry.* = .{ .name = next_entry.key_ptr.*, .scope = next_entry.value_ptr.* };
+    }
+    std.mem.sort(RootEntry, root_entries, {}, struct {
+        fn less(_: void, left: RootEntry, right: RootEntry) bool {
+            return std.mem.order(u8, left.name, right.name) == .lt;
+        }
+    }.less);
+    std.mem.writeInt(u64, &encoded_count, root_entries.len, .little);
+    hash.update(&encoded_count);
+    for (root_entries) |entry| {
+        std.mem.writeInt(u64, &encoded_count, entry.name.len, .little);
+        hash.update(&encoded_count);
+        hash.update(entry.name);
+        hash.update(&.{@intFromEnum(entry.scope)});
+    }
     var digest: publication.Digest = undefined;
     hash.final(&digest);
     const native_requirement = for (requirements, 0..) |node, index| {
         if (node.kind == .native_effects) break @as(u32, @intCast(index));
     } else return error.ArtifactCatalogCorrupt;
-    return .{ .arena = arena, .catalog = catalog, .digest = digest, .nodes = requirements, .providers = providers, .definitions = definitions, .unit_children = unit_children, .enrichment_kinds = enrichment_kinds, .native_requirement = native_requirement, .has_projection_requirements = indexes.len != 0 };
+    return .{ .arena = arena, .catalog = catalog, .digest = digest, .nodes = requirements, .providers = providers, .definitions = definitions, .unit_children = unit_children, .enrichment_kinds = enrichment_kinds, .root_chunk_scopes = root_chunk_scopes, .native_requirement = native_requirement, .has_projection_requirements = indexes.len != 0 };
 }
 
 test "ordered artifact inventory completion plan retains extraction-owned children without worker templates" {

@@ -2839,7 +2839,9 @@ following mechanisms are installed behind that gate:
   singleton assets use document scope, document extraction retains its dynamic
   scope requirement, and upstream-unit chunks retain unit scope. Authorization
   shares exact definition lookup and catalog/owner fences with vector producers,
-  eliminating per-row template scans and provider-JSON parsing. Dynamic unit,
+  eliminating per-row template scans and provider-JSON parsing. Root-chunk
+  closure now uses a pinned, O(1) producer-scope lookup bound into the plan
+  digest; duplicate or missing chunk producers remain fail-closed. Dynamic unit,
   extraction and neighbor scope closure remains pending its own verifier.
   Deletion regressions also fixed graph cleanup's tombstone validation: canonical
   empty ownership roots from the owning graph generation are permitted alongside

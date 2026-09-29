@@ -123,7 +123,7 @@ pub fn prepareClosure(alloc: std.mem.Allocator, txn: anytype, root: u128, reques
     try census.requireStreamPlan(alloc, txn, request, plan, authority);
     const completion = if (plan.completion_plan) |*value| value else return error.ArtifactCatalogDrift;
     const requirement = try completion.providerFor(request);
-    if (!try rootScopeClosed(request, plan.generated_templates)) return error.ArtifactPublicationPending;
+    if (!try completion.rootChunkScopeClosed(request.artifact_name)) return error.ArtifactPublicationPending;
     const record = (try load(txn, root, request, plan)) orelse return error.ArtifactPublicationPending;
     if (!record.closed) return error.ArtifactPublicationPending;
     const observation = record.progress.observation;
@@ -464,17 +464,6 @@ test "ordered artifact inventory authored vectors close provider scope without r
     }
 }
 
-fn rootScopeClosed(request: Request, templates: []const Request) !bool {
-    var producer: ?Request = null;
-    for (templates) |candidate| {
-        if (candidate.kind != .chunk_text or !std.mem.eql(u8, candidate.artifact_name, request.artifact_name)) continue;
-        if (producer != null) return error.ArtifactCatalogDrift;
-        producer = candidate;
-    }
-    const definition = producer orelse return error.ArtifactCatalogDrift;
-    return definition.upstream_artifact_name.len == 0 and definition.neighbor_context_json.len == 0;
-}
-
 test "ordered artifact inventory document stream closure requires current outputs including absence" {
     const alloc = std.testing.allocator;
     const db_mod = @import("db.zig");
@@ -754,7 +743,8 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, root: u128, request: Requ
     // The receiver has just checked every member, the selected producer
     // boundary and their complete causal inputs. Only a root-only catalog
     // shape closes here; an upstream unit scope census must close separately.
-    const closed = page.progress.enumerated and try rootScopeClosed(request, plan.generated_templates);
+    const completion = if (plan.completion_plan) |*value| value else return error.ArtifactCatalogDrift;
+    const closed = page.progress.enumerated and try completion.rootChunkScopeClosed(request.artifact_name);
     return try own(alloc, try encodeAlloc(alloc, root, page.progress, page.claim, closed), selected, if (old) |record| record.digest else null, root, request.doc_key);
 }
 
@@ -853,16 +843,24 @@ test "ordered artifact inventory verified census records authenticate root ident
 }
 
 test "ordered artifact inventory stream closure requires an unambiguous fixed root scope" {
-    const request: Request = .{ .kind = .dense_embedding, .index_name = "vector", .artifact_name = "chunks", .doc_key = "doc", .source_field = "body" };
+    const completion = @import("artifact_completion_plan.zig");
     var producer: Request = .{ .kind = .chunk_text, .index_name = "", .artifact_name = "chunks", .doc_key = "", .source_field = "body" };
-    try std.testing.expect(try rootScopeClosed(request, &.{producer}));
+    var plan = try completion.Plan.init(std.testing.allocator, .{}, &.{producer});
+    defer plan.deinit();
+    try std.testing.expect(try plan.rootChunkScopeClosed("chunks"));
     producer.upstream_artifact_name = "document-units";
-    try std.testing.expect(!try rootScopeClosed(request, &.{producer}));
+    var upstream = try completion.Plan.init(std.testing.allocator, .{}, &.{producer});
+    defer upstream.deinit();
+    try std.testing.expect(!try upstream.rootChunkScopeClosed("chunks"));
     producer.upstream_artifact_name = "";
     producer.neighbor_context_json = "{}";
-    try std.testing.expect(!try rootScopeClosed(request, &.{producer}));
+    var neighbor = try completion.Plan.init(std.testing.allocator, .{}, &.{producer});
+    defer neighbor.deinit();
+    try std.testing.expect(!try neighbor.rootChunkScopeClosed("chunks"));
     producer.neighbor_context_json = "";
-    try std.testing.expectError(error.ArtifactCatalogDrift, rootScopeClosed(request, &.{ producer, producer }));
-    producer.artifact_name = "other";
-    try std.testing.expectError(error.ArtifactCatalogDrift, rootScopeClosed(request, &.{producer}));
+    var ambiguous = try completion.Plan.init(std.testing.allocator, .{}, &.{ producer, producer });
+    defer ambiguous.deinit();
+    try std.testing.expectError(error.ArtifactCatalogDrift, ambiguous.rootChunkScopeClosed("chunks"));
+    try std.testing.expect(!std.mem.eql(u8, &plan.digest, &ambiguous.digest));
+    try std.testing.expectError(error.ArtifactCatalogDrift, plan.rootChunkScopeClosed("other"));
 }
