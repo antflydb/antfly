@@ -1809,9 +1809,10 @@ following mechanisms are installed behind that gate:
   a valid checksum alone is not an adoption certificate. Bounded off-lock
   receiver preparation can now recapture every causal primary/artifact input,
   compare its current value and timestamp, and own the receiver's physical
-  revisions; changed inputs yield a stale candidate rather than inheriting
-  donor positions. This remains candidate work until an ordered, replayable
-  receiver transaction revalidates outputs and installs local receipts.
+  revisions. It also checks selected output digests, tombstones and donor-range
+  ownership; changed inputs or outputs yield a stale candidate rather than
+  inheriting donor positions. This remains candidate work until an ordered,
+  replayable receiver transaction revalidates and installs local receipts.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups
