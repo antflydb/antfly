@@ -410,11 +410,15 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     std.crypto.hash.sha2.Sha256.hash(output_value, &output_digest, .{});
     const source = publication.Source{ .document_key = "doc", .content_digest = row_digest, .timestamp = 7, .input_position = .{ .raft = .{ .term = 1, .index = 4 } } };
     const guard = publication.ArtifactSource{ .key = guard_key, .content_digest = guard_digest, .input_position = .{ .raft = .{ .term = 1, .index = 5 } }, .source_index = 0 };
+    // The donor produced `output_key` from absence; the receiver sees its
+    // committed postimage. Historical CAS is authenticated provenance, not a
+    // receiver-side read guard to replay against that postimage.
+    const output_before = publication.ArtifactSource{ .key = output_key, .content_digest = null, .input_position = .{ .raft = .{ .term = 1, .index = 6 } }, .source_index = 0 };
     const effects = [_]provenance.Effect{
         .{ .family = .base_vector, .key = output_key, .source_index = 0, .value_digest = output_digest, .value_bytes = output_value.len },
         .{ .family = .base_vector, .key = tombstone_key, .source_index = 0, .value_digest = null, .value_bytes = 0 },
     };
-    var proof: provenance.Proof = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "output", .publication_digest = @splat(4), .input_digest = undefined, .sources = (&source)[0..1], .artifact_sources = (&guard)[0..1], .effects = &effects };
+    var proof: provenance.Proof = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "output", .publication_digest = @splat(4), .input_digest = undefined, .sources = (&source)[0..1], .artifact_sources = (&guard)[0..1], .mutation_preconditions = (&output_before)[0..1], .effects = &effects };
     proof.input_digest = proof.inputCommand().inputDigest();
     const encoded = try provenance.encodeAlloc(alloc, proof);
     defer alloc.free(encoded);
@@ -422,6 +426,7 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     defer alloc.free(value);
     var decoded = try decodeValue(alloc, proof.namespace, proof.publication_digest, value);
     defer decoded.deinit();
+    try std.testing.expectEqualDeep(output_before, decoded.proof.proof.mutation_preconditions[0]);
     const donor_range: @import("../byte_range.zig").ByteRange = .{ .start = "doc", .end = "dop" };
     var mapped = (try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, decoded)) orelse return error.TestUnexpectedResult;
     defer mapped.deinit();
