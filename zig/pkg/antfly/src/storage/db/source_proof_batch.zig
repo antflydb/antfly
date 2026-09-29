@@ -60,6 +60,74 @@ pub const Decoded = struct {
     }
 };
 
+/// Off-lock candidate inputs for a receiver-local publication. Physical
+/// positions are captured from the destination, never copied from APF2. This
+/// is not an adoption certificate: apply must revalidate these inputs and
+/// current outputs in its own writer transaction before staging receipts.
+pub const ReceiverInputs = struct {
+    arena: std.heap.ArenaAllocator,
+    sources: []const publication.Source,
+    artifact_sources: []const publication.ArtifactSource,
+
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Return null when a donor read-set is no longer exact at the receiver. The
+/// caller can regenerate that stream instead of silently adopting a stale
+/// result. One proof is bounded by the APF2 block limit; the arena owns all
+/// remapped keys so it remains valid after the source buffer is released.
+pub fn prepareReceiverInputs(
+    alloc: std.mem.Allocator,
+    txn: anytype,
+    receiver_namespace: publication.Namespace,
+    decoded: Decoded,
+) !?ReceiverInputs {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    var returned = false;
+    defer if (!returned) arena.deinit();
+    const owned = arena.allocator();
+    const proof = decoded.proof.proof;
+    const sources = try owned.alloc(publication.Source, proof.sources.len);
+    for (proof.sources, sources) |donor, *receiver| {
+        receiver.* = if (donor.exists)
+            publication.capturePrimarySource(owned, txn, receiver_namespace, donor.document_key) catch |err| switch (err) {
+                error.EnrichmentSourceChanged => return null,
+                else => return err,
+            }
+        else
+            publication.capturePrimaryTombstoneSource(owned, txn, receiver_namespace, donor.document_key) catch |err| switch (err) {
+                error.EnrichmentSourceChanged => return null,
+                else => return err,
+            };
+        if (receiver.exists != donor.exists or receiver.timestamp != donor.timestamp or
+            !std.mem.eql(u8, &receiver.content_digest, &donor.content_digest)) return null;
+    }
+    const artifact_sources = try owned.alloc(publication.ArtifactSource, proof.artifact_sources.len);
+    for (proof.artifact_sources, artifact_sources) |donor, *receiver| {
+        const raw = txn.get(donor.key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (raw) |value| {
+            const expected = donor.content_digest orelse return null;
+            var actual: publication.Digest = undefined;
+            std.crypto.hash.sha2.Sha256.hash(value, &actual, .{});
+            if (!std.mem.eql(u8, &actual, &expected)) return null;
+        } else if (donor.content_digest != null) return null;
+        receiver.* = .{
+            .key = try owned.dupe(u8, donor.key),
+            .content_digest = donor.content_digest,
+            .input_position = try publication.artifactRevision(txn, receiver_namespace, donor.key),
+            .source_index = donor.source_index,
+        };
+    }
+    returned = true;
+    return .{ .arena = arena, .sources = sources, .artifact_sources = artifact_sources };
+}
+
 pub fn decodeValue(alloc: std.mem.Allocator, namespace: publication.Namespace, digest: publication.Digest, raw: []const u8) !Decoded {
     if (raw.len < 6 + 40 or raw.len > max_bytes - 44 or !std.mem.eql(u8, raw[0..4], record_magic)) return error.SourceSnapshotCorrupt;
     const bitmap_len = std.mem.readInt(u16, raw[4..6], .little);
@@ -221,6 +289,78 @@ test "ordered artifact inventory source proof batch rejects forged bitmap and co
     defer alloc.free(foreign_value);
     try std.testing.expectError(error.SourceSnapshotCorrupt, decodeValue(alloc, proof.namespace, proof.publication_digest, foreign_value));
     try std.testing.expectError(error.SourceSnapshotCorrupt, Reader.init("\xff\xff\xff\x7f"));
+}
+
+test "ordered artifact inventory receiver inputs remap exact causal revisions without adopting donor authority" {
+    const alloc = std.testing.allocator;
+    const keys = @import("../internal_keys.zig");
+    const Fake = struct {
+        values: std.StringHashMap([]const u8),
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            return self.values.get(key) orelse error.NotFound;
+        }
+    };
+    var receiver: Fake = .{ .values = std.StringHashMap([]const u8).init(alloc) };
+    defer receiver.values.deinit();
+    const row_key = try keys.documentKeyAlloc(alloc, "doc");
+    defer alloc.free(row_key);
+    const ttl_key = try keys.ttlKeyAlloc(alloc, "doc");
+    defer alloc.free(ttl_key);
+    const guard_key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "guard");
+    defer alloc.free(guard_key);
+    const output_key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "output");
+    defer alloc.free(output_key);
+    const row = "{\"v\":1}";
+    const guard_value = "causal input";
+    var timestamp: [8]u8 = undefined;
+    std.mem.writeInt(u64, &timestamp, 7, .little);
+    try receiver.values.put(row_key, row);
+    try receiver.values.put(ttl_key, &timestamp);
+    try receiver.values.put(guard_key, guard_value);
+    const receiver_namespace: publication.Namespace = @splat(2);
+    const row_revision_key = publication.inputRevisionKey(receiver_namespace, "doc");
+    const guard_revision_key = publication.artifactRevisionKey(receiver_namespace, guard_key);
+    const row_position: publication.Position = .{ .raft = .{ .term = 9, .index = 10 } };
+    const guard_position: publication.Position = .{ .raft = .{ .term = 9, .index = 11 } };
+    const row_position_bytes = try row_position.encode();
+    const guard_position_bytes = try guard_position.encode();
+    try receiver.values.put(&row_revision_key, &row_position_bytes);
+    try receiver.values.put(&guard_revision_key, &guard_position_bytes);
+    var row_digest: publication.Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(row, &row_digest, .{});
+    var guard_digest: publication.Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(guard_value, &guard_digest, .{});
+    const source = publication.Source{ .document_key = "doc", .content_digest = row_digest, .timestamp = 7, .input_position = .{ .raft = .{ .term = 1, .index = 4 } } };
+    const guard = publication.ArtifactSource{ .key = guard_key, .content_digest = guard_digest, .input_position = .{ .raft = .{ .term = 1, .index = 5 } }, .source_index = 0 };
+    const effect = provenance.Effect{ .family = .base_vector, .key = output_key, .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    var proof: provenance.Proof = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "output", .publication_digest = @splat(4), .input_digest = undefined, .sources = (&source)[0..1], .artifact_sources = (&guard)[0..1], .effects = (&effect)[0..1] };
+    proof.input_digest = proof.inputCommand().inputDigest();
+    const encoded = try provenance.encodeAlloc(alloc, proof);
+    defer alloc.free(encoded);
+    const value = try encodeValueAlloc(alloc, &.{1}, encoded);
+    defer alloc.free(value);
+    var decoded = try decodeValue(alloc, proof.namespace, proof.publication_digest, value);
+    defer decoded.deinit();
+    var mapped = (try prepareReceiverInputs(alloc, &receiver, receiver_namespace, decoded)) orelse return error.TestUnexpectedResult;
+    defer mapped.deinit();
+    try std.testing.expectEqualDeep(row_position, mapped.sources[0].input_position.?);
+    try std.testing.expectEqualDeep(guard_position, mapped.artifact_sources[0].input_position.?);
+    try std.testing.expectEqualSlices(u8, &row_digest, &mapped.sources[0].content_digest);
+    const AllocationCheck = struct {
+        fn run(a: std.mem.Allocator, txn: *Fake, donor_namespace: publication.Namespace, receiver_ns: publication.Namespace, digest: publication.Digest, encoded_value: []const u8, expected_position: publication.Position) !void {
+            var candidate = try decodeValue(a, donor_namespace, digest, encoded_value);
+            defer candidate.deinit();
+            var receiver_inputs = (try prepareReceiverInputs(a, txn, receiver_ns, candidate)) orelse return error.TestUnexpectedResult;
+            defer receiver_inputs.deinit();
+            try std.testing.expectEqualDeep(expected_position, receiver_inputs.sources[0].input_position.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &receiver, proof.namespace, receiver_namespace, proof.publication_digest, value, row_position });
+    try receiver.values.put(guard_key, "changed");
+    try std.testing.expect((try prepareReceiverInputs(alloc, &receiver, receiver_namespace, decoded)) == null);
+    try receiver.values.put(guard_key, guard_value);
+    try receiver.values.put(row_key, "{\"v\":2}");
+    try std.testing.expect((try prepareReceiverInputs(alloc, &receiver, receiver_namespace, decoded)) == null);
 }
 
 test "ordered artifact inventory source proof descriptor resumes a certified large body" {

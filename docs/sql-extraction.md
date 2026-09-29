@@ -1806,7 +1806,12 @@ following mechanisms are installed behind that gate:
   apparently complete receiver cut. Import now also checks APF2 source order,
   physical position namespace, artifact guard ownership, output key family,
   duplicate outputs and document ownership before storing candidate bytes;
-  a valid checksum alone is not an adoption certificate.
+  a valid checksum alone is not an adoption certificate. Bounded off-lock
+  receiver preparation can now recapture every causal primary/artifact input,
+  compare its current value and timestamp, and own the receiver's physical
+  revisions; changed inputs yield a stale candidate rather than inheriting
+  donor positions. This remains candidate work until an ordered, replayable
+  receiver transaction revalidates outputs and installs local receipts.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups
