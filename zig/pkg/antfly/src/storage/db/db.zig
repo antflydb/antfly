@@ -11212,6 +11212,8 @@ pub const DB = struct {
         var preparation: RequestPreparationContext = undefined;
         preparation.init(self);
         defer preparation.deinit();
+        var proof_witness_arena = std.heap.ArenaAllocator.init(preparation.guard.allocator());
+        defer proof_witness_arena.deinit();
         var page_timestamps: std.StringHashMapUnmanaged(u64) = .empty;
         defer page_timestamps.deinit(self.alloc);
         var apply_opts = opts;
@@ -11237,13 +11239,24 @@ pub const DB = struct {
         };
         if (apply_req.merge_page) |page| if (page.provenance_effects.len != 0) {
             try @import("merge_page_contract.zig").validateRequest(apply_req);
+            const proof_batch = @import("source_proof_batch.zig");
+            const scratch = preparation.guard.allocator();
+            const owned = proof_witness_arena.allocator();
+            const witness_writes = try owned.alloc(docstore_mod.KVPair, apply_opts.extra_store_writes.len + page.provenance_effects.len);
+            @memcpy(witness_writes[0..apply_opts.extra_store_writes.len], apply_opts.extra_store_writes);
             var namespace: @import("artifact_publication.zig").Namespace = undefined;
             doc_identity.encodeNamespace(&namespace, page.source.namespace);
-            for (page.provenance_effects) |effect| {
-                const digest = try @import("source_proof_batch.zig").transferDigest(namespace, page.source.pin_digest, effect.key);
-                var decoded = try @import("source_proof_batch.zig").decodeValue(preparation.guard.allocator(), namespace, digest, effect.value orelse return error.InvalidMergePage);
+            for (page.provenance_effects, 0..) |effect, index| {
+                const digest = try proof_batch.transferDigest(namespace, page.source.pin_digest, effect.key);
+                var decoded = try proof_batch.decodeValue(scratch, namespace, digest, effect.value orelse return error.InvalidMergePage);
+                const witness_key = proof_batch.witnessKey(namespace, page.source.pin_digest, digest);
+                witness_writes[apply_opts.extra_store_writes.len + index] = .{
+                    .key = try owned.dupe(u8, &witness_key),
+                    .value = try owned.dupe(u8, &decoded.record_digest),
+                };
                 decoded.deinit();
             }
+            apply_opts.extra_store_writes = witness_writes;
         };
         if (apply_req.merge_page) |page| if (page.phase == .rows or page.phase == .tail) {
             if (page.chunk) |chunk| {

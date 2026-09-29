@@ -1847,6 +1847,10 @@ following mechanisms are installed behind that gate:
   tombstone revision at its ordered apply position. A lost-response retry is
   accepted only if that revision and proof reference still name the same
   adopted proof; an unrelated same-position write cannot earn a receipt.
+  Certified online-merge proof import now stages a 32-byte witness atomically
+  with each inert APF3 record. It binds the already-verified APF3 checksum to
+  the selected bitmap, avoiding a second multi-megabyte hash; writer
+  revalidation CASes only the witness under the apply lock.
 - Completion verification now reconciles shared graph winner/count outputs
   against their current accepted projection, while keeping private contender
   and stream outputs revision-exact. Replacement proofs and effect lookups

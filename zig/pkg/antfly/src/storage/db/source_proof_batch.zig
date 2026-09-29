@@ -9,6 +9,7 @@ const catalog_view = @import("artifact_catalog_view.zig");
 
 pub const import_prefix = "\x00\x00__metadata__:source_proof:";
 pub const merge_prefix = "\x00\x00__metadata__:merge_source_proof:";
+pub const witness_prefix = "\x00\x00__metadata__:merge_source_proof_witness:";
 pub const max_entries: usize = 65536;
 pub const max_bytes: usize = @import("../backup_codec.zig").max_block_payload_bytes;
 const record_magic = "SPR1";
@@ -30,6 +31,42 @@ pub fn mergeKey(namespace: publication.Namespace, pin: [32]u8, digest: publicati
     @memcpy(result[merge_prefix.len + 24 ..][0..32], &pin);
     @memcpy(result[merge_prefix.len + 56 ..], &digest);
     return result;
+}
+
+/// Small immutable CAS record committed with the certified APF3 body. The
+/// ordered adopter can compare it under the writer lock without rehashing a
+/// potentially large source proof there.
+pub fn witnessKey(namespace: publication.Namespace, pin: [32]u8, digest: publication.Digest) [witness_prefix.len + 24 + 32 + 32]u8 {
+    var result: [witness_prefix.len + 24 + 32 + 32]u8 = undefined;
+    @memcpy(result[0..witness_prefix.len], witness_prefix);
+    @memcpy(result[witness_prefix.len..][0..24], &namespace);
+    @memcpy(result[witness_prefix.len + 24 ..][0..32], &pin);
+    @memcpy(result[witness_prefix.len + 56 ..], &digest);
+    return result;
+}
+
+/// APF3 decode has already verified its physical checksum over the entire
+/// proof. Bind that checksum to the selected bitmap without hashing the large
+/// proof a second time on every source import and candidate read.
+pub fn recordDigest(proof_checksum: publication.Digest, bitmap: []const u8) publication.Digest {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("antfly-source-proof-record-v1\x00");
+    hash.update(&proof_checksum);
+    var size: [8]u8 = undefined;
+    std.mem.writeInt(u64, &size, bitmap.len, .little);
+    hash.update(&size);
+    hash.update(bitmap);
+    var result: publication.Digest = undefined;
+    hash.final(&result);
+    return result;
+}
+
+test "ordered artifact inventory source proof witness binds checksum and selected bitmap" {
+    const checksum: publication.Digest = @splat(1);
+    const original = recordDigest(checksum, &.{1});
+    try std.testing.expectEqualDeep(original, recordDigest(checksum, &.{1}));
+    try std.testing.expect(!std.mem.eql(u8, &original, &recordDigest(checksum, &.{2})));
+    try std.testing.expect(!std.mem.eql(u8, &original, &recordDigest(@splat(2), &.{1})));
 }
 
 /// Only inert evidence keys use this namespace. Donor receipt/authority keys
@@ -57,6 +94,7 @@ pub const Decoded = struct {
     proof: provenance.Owned,
     bitmap: []const u8,
     proof_checksum: publication.Digest,
+    record_digest: publication.Digest,
     pub fn deinit(self: *@This()) void {
         self.proof.deinit();
         self.* = undefined;
@@ -78,6 +116,7 @@ pub const DonorIdentity = struct {
     publication_digest: publication.Digest,
     input_digest: publication.Digest,
     proof_checksum: publication.Digest,
+    record_digest: publication.Digest,
     producer_kind: @FieldType(publication.Command, "producer_kind"),
     producer_name: []const u8,
     producer_generation: u64,
@@ -190,6 +229,11 @@ pub fn prepareReceiverCandidate(
     const donor_binding = producer_plan.donor_binding;
     if (donor_binding.effect_protocol != 15 or donor_binding.epoch != proof.authority_epoch or
         !std.mem.eql(u8, &donor_binding.digest, &proof.catalog_digest)) return error.SourceSnapshotCorrupt;
+    const witness = txn.get(&witnessKey(proof.namespace, source_pin, proof.publication_digest)) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, witness, &decoded.record_digest)) return null;
     var ordered = (try inventory.load(alloc, txn)) orelse return null;
     defer ordered.deinit();
     const receiver_binding = ordered.value.command.binding;
@@ -274,6 +318,7 @@ pub fn prepareReceiverCandidate(
             .publication_digest = proof.publication_digest,
             .input_digest = proof.input_digest,
             .proof_checksum = decoded.proof_checksum,
+            .record_digest = decoded.record_digest,
             .producer_kind = proof.producer_kind,
             .producer_name = producer_name,
             .producer_generation = proof.producer_generation,
@@ -300,6 +345,11 @@ pub fn revalidateReceiverCandidate(
 ) !bool {
     if (!std.mem.eql(u8, &candidate.receiver.namespace, &receiver_namespace) or
         !candidate.donor.binding.compatible(candidate.receiver.binding)) return false;
+    const witness = txn.get(&witnessKey(candidate.donor.namespace, candidate.donor.source_pin, candidate.donor.publication_digest)) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, witness, &candidate.donor.record_digest)) return false;
     var ordered = (try inventory.load(alloc, txn)) orelse return false;
     defer ordered.deinit();
     if (!std.mem.eql(u8, &ordered.value.command.namespace, &receiver_namespace) or
@@ -457,7 +507,8 @@ pub fn decodeValue(alloc: std.mem.Allocator, namespace: publication.Namespace, d
         }
     }
     if (!selected) return error.SourceSnapshotCorrupt;
-    return .{ .proof = proof, .bitmap = bitmap, .proof_checksum = raw[raw.len - 32 ..][0..32].* };
+    const proof_checksum: publication.Digest = raw[raw.len - 32 ..][0..32].*;
+    return .{ .proof = proof, .bitmap = bitmap, .proof_checksum = proof_checksum, .record_digest = recordDigest(proof_checksum, bitmap) };
 }
 
 pub const Entry = struct { digest: publication.Digest, value: []const u8 };
@@ -682,6 +733,8 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     try std.testing.expectEqualDeep(output_before, decoded.proof.proof.mutation_preconditions[0]);
     const donor_range: @import("../byte_range.zig").ByteRange = .{ .start = "doc", .end = "dop" };
     const source_pin: publication.Digest = @splat(9);
+    const witness_key = witnessKey(proof.namespace, source_pin, proof.publication_digest);
+    try receiver.values.put(&witness_key, &decoded.record_digest);
     var mapped = (try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, &plan, decoded)) orelse return error.TestUnexpectedResult;
     defer mapped.deinit();
     try std.testing.expectEqualDeep(receiver_binding, mapped.receiver.binding);
@@ -689,6 +742,7 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     try std.testing.expectEqualDeep(source_pin, mapped.donor.source_pin);
     try std.testing.expectEqualDeep(donor_binding, mapped.donor.binding);
     try std.testing.expectEqualDeep(decoded.proof_checksum, mapped.donor.proof_checksum);
+    try std.testing.expectEqualDeep(decoded.record_digest, mapped.donor.record_digest);
     try std.testing.expectEqualSlices(u8, decoded.bitmap, mapped.donor.selected_bitmap);
     try std.testing.expectEqualStrings("index", mapped.donor.producer_name);
     try std.testing.expectEqualDeep(row_position, mapped.sources[0].input_position.?);
@@ -698,6 +752,11 @@ test "ordered artifact inventory receiver inputs remap exact causal revisions wi
     try std.testing.expect(mapped.effects[1].input_position == null);
     try std.testing.expectEqualSlices(u8, &row_digest, &mapped.sources[0].content_digest);
     try std.testing.expect(try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
+    const wrong_witness: publication.Digest = @splat(0);
+    try receiver.values.put(&witness_key, &wrong_witness);
+    try std.testing.expect(!try revalidateReceiverCandidate(alloc, &receiver, receiver_namespace, mapped));
+    try std.testing.expect((try prepareReceiverCandidate(alloc, &receiver, receiver_namespace, donor_range, source_pin, &plan, decoded)) == null);
+    try receiver.values.put(&witness_key, &decoded.record_digest);
     var adopted = try buildAdoptedProofAlloc(alloc, &mapped);
     defer adopted.deinit(alloc);
     try std.testing.expectEqualDeep(receiver_namespace, adopted.proof.namespace);

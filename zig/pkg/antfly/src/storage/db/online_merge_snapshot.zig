@@ -634,13 +634,20 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
             var namespace: @import("artifact_publication.zig").Namespace = undefined;
             @import("doc_identity.zig").encodeNamespace(&namespace, donor_options.identity_namespace.?);
             const proof_key = @import("source_proof_batch.zig").mergeKey(namespace, source_identity.pin_digest, @splat(5));
+            const witness_key = @import("source_proof_batch.zig").witnessKey(namespace, source_identity.pin_digest, @splat(5));
             if (selected_proof) {
                 const imported = try receiver.core.store.get(alloc, &proof_key);
                 defer alloc.free(imported);
                 var decoded = try @import("source_proof_batch.zig").decodeValue(alloc, namespace, @splat(5), imported);
                 defer decoded.deinit();
                 try std.testing.expectEqualSlices(u8, &.{1}, decoded.bitmap);
-            } else try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, &proof_key));
+                const witness = try receiver.core.store.get(alloc, &witness_key);
+                defer alloc.free(witness);
+                try std.testing.expectEqualSlices(u8, &decoded.record_digest, witness);
+            } else {
+                try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, &proof_key));
+                try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, &witness_key));
+            }
             try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, @import("artifact_publication.zig").authority_key));
             return;
         }
