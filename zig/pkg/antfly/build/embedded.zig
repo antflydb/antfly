@@ -418,13 +418,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "--manifest-path",
         "../rs/Cargo.toml",
         "--package",
-        "antfly-lite",
+        "antfly-embedded",
         "--features",
         "libantfly",
     });
     run_lite_rs_tests.setCwd(b.path("."));
     run_lite_rs_tests.step.dependOn(&install_libantfly.step);
-    const lite_rs_test_step = b.step("lite-rs-test", "Run Rust Antfly Lite binding tests against libantfly");
+    const lite_rs_test_step = b.step("lite-rs-test", "Run Rust Antfly embedded binding tests against libantfly");
     lite_rs_test_step.dependOn(&run_lite_rs_tests.step);
 
     const run_lite_ts_tests = b.addSystemCommand(&.{
