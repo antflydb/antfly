@@ -131,6 +131,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "metadata VOPR merge runtime records doc identity reassignment opt-in",
         "metadata VOPR http cluster drives table placement convergence",
         "metadata VOPR http cluster drives split intent through the control loop",
+        "metadata VOPR recovery skips an isolated candidate",
     };
     const lib_metadata_vopr_virtual_smoke_tests = b.addTest(.{
         .root_module = antfly_test_mod,

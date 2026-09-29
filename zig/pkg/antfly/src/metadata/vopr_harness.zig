@@ -4308,8 +4308,8 @@ pub const MetadataHttpNodeVopr = struct {
                     // A single, up-to-date candidate breaks synchronized
                     // election ties without continuously advancing terms on
                     // different replicas.
-                    self.cluster.campaignBestMetadataCandidate() catch |err| switch (err) {
-                        error.UnknownGroup => {},
+                    _ = self.cluster.campaignBestMetadataCandidate() catch |err| switch (err) {
+                        error.UnknownGroup => false,
                         else => return voprMutationError(err, operation_may_have_been_admitted),
                     };
                     for (0..16) |_| {
@@ -4810,27 +4810,45 @@ pub const MetadataHttpClusterVopr = struct {
         return .{ .cluster = self, .index = index };
     }
 
-    /// Break deterministic election lockstep without inventing authority. The
-    /// replica with the freshest log must campaign in a term strictly newer
-    /// than every observed candidate; otherwise a lagging replica that ticks
-    /// first can repeatedly consume the shared next term without ever being
-    /// eligible for an up-to-date quorum's votes.
-    pub fn campaignBestMetadataCandidate(self: *MetadataHttpClusterVopr) !void {
-        const candidate_index = bestMetadataElectionCandidateIndex(self) orelse
-            return error.UnknownGroup;
-        var max_observed_term: u64 = 0;
-        for (self.cluster.nodes, self.cluster.node_live) |*replica, live| {
-            if (!live) continue;
-            const status = replica.raftStatus(self.metadata_group_id) orelse continue;
-            max_observed_term = @max(max_observed_term, status.hard.current_term);
-        }
-        for (0..self.cluster.nodes.len + 2) |_| {
+    /// Break deterministic election lockstep without inventing authority.
+    /// Campaign the freshest follower with a quorum path, then let the Raft
+    /// driver deliver its vote responses. Leave an ongoing reachable vote
+    /// alone; Raft's election timer owns any retry it needs.
+    pub fn campaignBestMetadataCandidate(self: *MetadataHttpClusterVopr) !bool {
+        self.scheduler_gate.lock();
+        defer self.scheduler_gate.unlock();
+        if (self.currentMetadataLeaderIndex() != null) return false;
+        var skipped = std.ArrayListUnmanaged(usize).empty;
+        defer skipped.deinit(self.alloc);
+        while (skipped.items.len < self.cluster.nodes.len) {
+            const candidate_index = bestMetadataElectionCandidateIndexLocked(self, skipped.items) orelse {
+                if (skipped.items.len == 0 and self.firstMetadataReplicaIndex() == null) return error.UnknownGroup;
+                return false;
+            };
             const status = self.cluster.node(candidate_index).raftStatus(self.metadata_group_id) orelse
                 return error.UnknownGroup;
-            if (status.hard.current_term > max_observed_term) return;
-            try self.cluster.node(candidate_index).campaignGroup(self.metadata_group_id);
+            switch (status.soft.role) {
+                // Restarting a vote discards the candidate's pending replies.
+                .pre_candidate, .candidate => return false,
+                .leader => {
+                    // This local leader lacks quorum support; try another replica.
+                    try skipped.append(self.alloc, candidate_index);
+                    continue;
+                },
+                .follower => {},
+            }
+            self.cluster.node(candidate_index).campaignGroup(self.metadata_group_id) catch |err| switch (err) {
+                // A committed membership change may make an applied voter
+                // ineligible. Try the next freshest follower instead.
+                error.NotPromotable => {
+                    try skipped.append(self.alloc, candidate_index);
+                    continue;
+                },
+                else => return err,
+            };
+            return true;
         }
-        return error.MetadataElectionTermDidNotAdvance;
+        return false;
     }
 
     pub fn backendRuntime(self: *MetadataHttpClusterVopr, index: usize) *db_mod.background_runtime.BackendRuntime {
@@ -5896,24 +5914,30 @@ fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterVopr) ?usize {
     return best_index;
 }
 
-fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterVopr) ?usize {
-    cluster.scheduler_gate.lock();
-    defer cluster.scheduler_gate.unlock();
+// The caller holds scheduler_gate through candidate selection and campaign.
+fn bestMetadataElectionCandidateIndexLocked(cluster: *MetadataHttpClusterVopr, skipped: []const usize) ?usize {
     var best_index: ?usize = null;
+    var best_last_term: u64 = 0;
     var best_last_index: u64 = 0;
     var best_commit: u64 = 0;
     var best_applied: u64 = 0;
     var best_term: u64 = 0;
     for (cluster.cluster.nodes, 0..) |*sim, index| {
         if (!cluster.cluster.node_live[index]) continue;
+        if (std.mem.indexOfScalar(usize, skipped, index) != null) continue;
         const status = sim.raftStatus(cluster.metadata_group_id) orelse continue;
+        if (std.mem.indexOfScalar(u64, status.conf_state.voters, status.id) == null and
+            std.mem.indexOfScalar(u64, status.conf_state.voters_outgoing, status.id) == null) continue;
+        if (!metadataCandidateHasQuorumPath(cluster, status)) continue;
         if (best_index == null or
-            status.last_index > best_last_index or
-            (status.last_index == best_last_index and status.hard.commit_index > best_commit) or
-            (status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index > best_applied) or
-            (status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index == best_applied and status.hard.current_term > best_term))
+            status.last_term > best_last_term or
+            (status.last_term == best_last_term and status.last_index > best_last_index) or
+            (status.last_term == best_last_term and status.last_index == best_last_index and status.hard.commit_index > best_commit) or
+            (status.last_term == best_last_term and status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index > best_applied) or
+            (status.last_term == best_last_term and status.last_index == best_last_index and status.hard.commit_index == best_commit and status.applied_index == best_applied and status.hard.current_term > best_term))
         {
             best_index = index;
+            best_last_term = status.last_term;
             best_last_index = status.last_index;
             best_commit = status.hard.commit_index;
             best_applied = status.applied_index;
@@ -5921,6 +5945,39 @@ fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterVopr) ?usize 
         }
     }
     return best_index;
+}
+
+fn metadataCandidateHasQuorumPath(cluster: *MetadataHttpClusterVopr, status: raft_engine.core.Status) bool {
+    // In the healthy fixture all configured voters can exchange messages.
+    // Keep ordinary election recovery on its existing selection path.
+    if (!cluster.virtual_network.hasConnectivityFaults()) {
+        var all_live = true;
+        for (cluster.cluster.node_live) |live| all_live = all_live and live;
+        if (all_live) return true;
+    }
+    return metadataCandidateCanReachMajority(cluster, status.id, status.conf_state.voters) and
+        (status.conf_state.voters_outgoing.len == 0 or
+            metadataCandidateCanReachMajority(cluster, status.id, status.conf_state.voters_outgoing));
+}
+
+fn metadataCandidateCanReachMajority(cluster: *MetadataHttpClusterVopr, candidate_id: u64, voters: []const u64) bool {
+    var reachable: usize = 0;
+    for (voters) |voter_id| {
+        for (cluster.cluster.configs, cluster.cluster.node_live) |config, live| {
+            if (!live or config.host.http.host.local_node_id != voter_id) continue;
+            if (voter_id == candidate_id or metadataNodesCanExchangeVotes(cluster.virtual_network, candidate_id, voter_id))
+                reachable += 1;
+            break;
+        }
+    }
+    return reachable > voters.len / 2;
+}
+
+fn metadataNodesCanExchangeVotes(network: *const raft_vopr.VirtualHttpNetwork, candidate_id: u64, voter_id: u64) bool {
+    if (network.isPartitioned(candidate_id) or network.isPartitioned(voter_id) or
+        network.isRouteUnavailable(candidate_id) or network.isRouteUnavailable(voter_id)) return false;
+    return !network.isLinkPartitioned(.{ .source_id = candidate_id, .target_id = voter_id }) and
+        !network.isLinkPartitioned(.{ .source_id = voter_id, .target_id = candidate_id });
 }
 
 fn currentGroupLeaderIndex(cluster: *MetadataHttpClusterVopr, group_id: u64) ?usize {
@@ -12295,6 +12352,60 @@ test "metadata VOPR http cluster drops table topology across leader restart" {
     const intents = try cluster.node(new_leader).listProjectedPlacementIntents(std.testing.allocator);
     defer cluster.node(new_leader).freeProjectedPlacementIntents(std.testing.allocator, intents);
     try std.testing.expectEqual(@as(usize, 0), intents.len);
+}
+
+test "metadata VOPR recovery skips an isolated candidate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stores = [_]raft_engine.core.MemoryStorage{
+        raft_engine.core.MemoryStorage.init(std.testing.allocator),
+        raft_engine.core.MemoryStorage.init(std.testing.allocator),
+        raft_engine.core.MemoryStorage.init(std.testing.allocator),
+    };
+    defer for (&stores) |*store| store.deinit();
+    var factories = [_]TestDescriptorFactory{
+        .{ .alloc = std.testing.allocator, .store = &stores[0], .peers = &.{ 1, 2, 3 } },
+        .{ .alloc = std.testing.allocator, .store = &stores[1], .peers = &.{ 1, 2, 3 } },
+        .{ .alloc = std.testing.allocator, .store = &stores[2], .peers = &.{ 1, 2, 3 } },
+    };
+    var roots: [3][]u8 = undefined;
+    var catalogs: [3][]u8 = undefined;
+    for (0..3) |index| {
+        roots[index] = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/isolated-candidate-{d}", .{ tmp.sub_path, index });
+        catalogs[index] = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/isolated-candidate-{d}.txt", .{ tmp.sub_path, index });
+    }
+    defer for (roots, catalogs) |root, catalog| {
+        std.testing.allocator.free(root);
+        std.testing.allocator.free(catalog);
+    };
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
+        makeHostVoprConfig(1, 4300, roots[0], catalogs[0]),
+        makeHostVoprConfig(2, 4300, roots[1], catalogs[1]),
+        makeHostVoprConfig(3, 4300, roots[2], catalogs[2]),
+    };
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
+        makeHostVoprDeps(&factories[0]),
+        makeHostVoprDeps(&factories[1]),
+        makeHostVoprDeps(&factories[2]),
+    };
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4300, &configs, &deps);
+    defer cluster.deinit();
+    try cluster.startAll();
+    defer cluster.stopAll();
+    try cluster.virtual_network.partitionNode(1);
+    try cluster.virtual_network.partitionNode(2);
+    try cluster.bootstrapMetadataReplicas();
+    cluster.virtual_network.healNode(2);
+
+    try cluster.node(0).campaignMetadataGroup();
+    const isolated = cluster.cluster.node(0).raftStatus(4300) orelse return error.MissingRaftStatus;
+    try std.testing.expect(isolated.soft.role == .pre_candidate or isolated.soft.role == .candidate);
+    try std.testing.expect(cluster.currentMetadataLeaderIndex() == null);
+    try std.testing.expect(try cluster.campaignBestMetadataCandidate());
+    const reachable = cluster.cluster.node(1).raftStatus(4300) orelse return error.MissingRaftStatus;
+    try std.testing.expect(reachable.soft.role == .pre_candidate or reachable.soft.role == .candidate or reachable.soft.role == .leader);
+    try std.testing.expect((try cluster.waitForMetadataLeader(32)) != null);
 }
 
 test "metadata VOPR http cluster converges placement after candidate churn" {
