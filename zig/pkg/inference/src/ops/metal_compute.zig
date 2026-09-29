@@ -752,6 +752,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         /// Published immutable model storage is charged to the session owner,
         /// not to a request scope's transient allocation allowance.
         boundary_immutable_f32: bool = false,
+        /// Training state (weights, moments, gradients) the optimizer replaces
+        /// every step. Caches keyed by buffer identity must not retain it: a
+        /// freed buffer's address is reused, so the cache would serve a copy
+        /// of an earlier step's weights.
+        mutable_state: bool = false,
     };
 
     /// The only resident tensors with a retained host representation are
@@ -1143,6 +1148,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     boundary_scope_buffers: std.ArrayListUnmanaged(MetalTensor) = .empty,
     boundary_workspace: ?@import("gliner_boundary_resident.zig").Workspace.Borrow = null,
     boundary_workspace_cursor: ?ops.gliner_boundary_device.ProductWorkspaceCursor = null,
+    /// A resident training transaction owns the active command frame.
+    resident_batch: bool = false,
     boundary_resident_preparation: bool = false,
     boundary_resident_generation: ?u64 = null,
     a4b_mapped_layer0_prewarm_result: ?ops.A4bMappedLayer0PrewarmResult = null,
@@ -1809,6 +1816,39 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// Non-owning CT view over a pooled buffer CT, shaped `dims`. Freeing the
     /// returned view decrements only the borrowed wrapper (release_on_drop=false),
     /// leaving the pooled MTLBuffer alive for reuse.
+    /// A retained reference to the dense device tensor behind `ct`, for
+    /// caches that outlive request-local compute wrappers (the packed Laya
+    /// trunk cache). Null for host-backed tensors, views, and quantized data.
+    pub fn retainDenseDeviceTensor(ct: CT) !?MetalTensor {
+        const buf = toBuf(ct);
+        if (buf.integer_storage or buf.quantized_storage != null or buf.runtime_quantized_storage != null or
+            buf.owned_quantized_storage != null or buf.lazy_multiply != null or buf.view_strides != null or
+            buf.logical_view_strides != null or buf.view_index_map != null or buf.view_base_offset != 0) return null;
+        const tensor = buf.metal_tensor orelse return null;
+        if (!tensor.isDevice()) return null;
+        return try tensor.retainedCopy();
+    }
+
+    /// A new half-precision (2-byte `.i16` storage) device copy of a dense f32
+    /// `ct`, for compact caches. Null when `ct` is not on the device.
+    pub fn deviceHalfCopy(self: *MetalCompute, ct: CT) !?MetalTensor {
+        var source = (try retainDenseDeviceTensor(ct)) orelse return null;
+        defer source.deinit();
+        return metal_runtime.decoderRuntimeCastHalfDevice(self.provider_impl, source, true);
+    }
+
+    /// A request-local f32 tensor converted from a half device tensor.
+    pub fn ctFromHalfDeviceTensor(self: *MetalCompute, tensor: *const MetalTensor) !CT {
+        const converted = (try metal_runtime.decoderRuntimeCastHalfDevice(self.provider_impl, tensor.*, false)) orelse return error.UnsupportedTensorType;
+        return self.ctFromOwnedMetalTensor(converted);
+    }
+
+    /// A request-local tensor over a retained device tensor; the caller keeps
+    /// its own reference and frees the result with the compute backend.
+    pub fn ctFromRetainedDeviceTensor(self: *MetalCompute, tensor: *const MetalTensor) !CT {
+        return self.ctFromOwnedMetalTensor(try tensor.retainedCopy());
+    }
+
     pub fn ctFromPoolCtView(cb: *const ops.ComputeBackend, pool_ct: CT, dims: []const i32) !CT {
         if (cb.kind() != .metal) return error.UnsupportedTensorType;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -5390,6 +5430,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         out_dim: usize,
     ) !?usize {
         if (!self.provider_impl.hasDecoderRuntime()) return null;
+        // Slots hold a private copy of the weight, keyed by buffer identity.
+        if (toBuf(weight).mutable_state or toBuf(bias).mutable_state) return null;
         const key = dynamicLinearSlotKey(weight, bias, in_dim, out_dim);
         if (self.dynamic_linear_slots.get(key)) |slot| return slot;
         const slot = self.nextFreeDynamicLinearSlot() orelse return null;
@@ -6780,6 +6822,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return result;
     }
 
+    fn residentTrainingAdopt(self: *MetalCompute, input: CT, shape: []const i32, limits: ops.resident_training.Limits) !CT {
+        const count = try ops.resident_training.shapeElements(i32, shape, limits);
+        const buf = toBuf(input);
+        if (bufHasAnyQuantizedStorage(buf) or buf.native_dense_bytes != null or buf.lazy_multiply != null or
+            buf.view_strides != null or buf.logical_view_strides != null or buf.view_index_map != null or
+            buf.view_base_offset != 0 or buf.integer_storage)
+            return error.UnsupportedResidentTrainingPrimitive;
+        const source = buf.metal_tensor orelse return error.ResidentTrainingRequiresDeviceTensor;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedResidentTrainingCapture;
+        if (!source.isDevice() or source.dtype != .f32 or source.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime)))
+            return error.ResidentTrainingRequiresDeviceTensor;
+        if (source.elemCount() != count or source.deviceByteLen() != count * 4) return error.InvalidResidentTrainingShape;
+        // A retained view: consumers only read gradients, and the producer
+        // releases rather than overwrites its buffer, so no copy is needed.
+        var view = try source.retainedView(0, count * 4, shape);
+        errdefer view.deinit();
+        return self.ctFromOwnedMetalTensor(view);
+    }
+
     fn residentTrainingGather(self: *MetalCompute, input: CT, indices: CT, input_shape: []const i64, axis: u8, limits: ops.resident_training.Limits) !CT {
         if (axis != 0 or input_shape.len == 0) return error.UnsupportedResidentTrainingPrimitive;
         const source = try self.residentTrainingTensor(input, .f32, limits);
@@ -6860,7 +6921,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (control) |active| try active.check();
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedResidentTrainingPrimitive;
-        if (metal_runtime.hasActiveFrame(runtime)) return error.ResidentTrainingExternalFrame;
+        if (self.residentExternalFrame()) return error.ResidentTrainingExternalFrame;
         if (inputs.len > limits.max_tensors or inputs.len > 16384) return error.ResourceLimitExceeded;
         if (inputs.len == 0) return .{ .sum_squares = 0, .norm = 0, .finite = true, .tensor_count = 0, .partial_bytes = 0, .download_bytes = 0 };
         var total_elements: usize = 0;
@@ -6887,8 +6948,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer output.deinit();
         const summaries = try self.allocator.alloc(f32, inputs.len * 3);
         defer self.allocator.free(summaries);
-        try metal_runtime.beginFrame(runtime);
-        var frame_owned = true;
+        // Inside a transaction's batch, reduce in its frame and synchronize
+        // it; otherwise own a frame for the reduction alone.
+        const batched = self.resident_batch;
+        if (!batched) try metal_runtime.beginFrame(runtime);
+        var frame_owned = !batched;
         errdefer if (frame_owned) metal_runtime.cancelFrame(runtime) catch {};
         for (inputs, 0..) |input, i| {
             if (control) |active| try active.check();
@@ -6907,8 +6971,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, sources, merged))
                 return error.UnsupportedResidentTrainingPrimitive;
         }
-        try metal_runtime.submitFrame(runtime);
-        try metal_runtime.waitFrame(runtime);
+        if (batched) {
+            try metal_runtime.flushActiveFrame(runtime);
+        } else {
+            try metal_runtime.submitFrame(runtime);
+            try metal_runtime.waitFrame(runtime);
+        }
         frame_owned = false;
         if (control) |active| try active.check();
         try output.downloadF32Into(summaries);
@@ -6921,6 +6989,31 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             sum_squares += scale * scale * scaled_sum;
         }
         return .{ .sum_squares = sum_squares, .norm = @sqrt(sum_squares), .finite = finite, .tensor_count = inputs.len, .partial_bytes = partial_bytes, .download_bytes = summaries.len * 4 };
+    }
+
+    /// Resident operations refuse a frame they do not own: their completion
+    /// is otherwise proven per call. A transaction's own batch is allowed.
+    fn residentExternalFrame(self: *const MetalCompute) bool {
+        return metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and !self.resident_batch;
+    }
+
+    fn residentTrainingBeginBatchOp(ctx: *anyopaque) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (self.resident_batch or metal_runtime.hasActiveFrame(runtime)) return error.ResidentTrainingExternalFrame;
+        try metal_runtime.beginFrame(runtime);
+        self.resident_batch = true;
+        return true;
+    }
+
+    fn residentTrainingEndBatchOp(ctx: *anyopaque, commit: bool) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.resident_batch) return error.ResidentTrainingBatchNotOpen;
+        self.resident_batch = false;
+        const runtime = self.provider_impl.raw_decode_runtime;
+        if (!commit) return metal_runtime.cancelFrame(runtime);
+        try metal_runtime.submitFrame(runtime);
+        try metal_runtime.waitFrame(runtime);
     }
 
     fn snapshotTensorShapeOp(ctx: *anyopaque, input: CT, shape: []const i32) anyerror!CT {
@@ -6966,7 +7059,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const geometry = try instruction.validate(limits);
         if (inputs.len != instruction.num_inputs) return error.InvalidResidentProgramShape;
         if (!self.provider_impl.hasDecoderRuntime()) return error.UnsupportedResidentProgramBackend;
-        if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) return error.ResidentTrainingExternalFrame;
+        if (self.residentExternalFrame()) return error.ResidentTrainingExternalFrame;
         var tensors: [4]MetalTensor = undefined;
         for (inputs, 0..) |input, i| {
             const expected = instruction.inputs[i];
@@ -7001,6 +7094,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     control,
                 );
                 return self.boundaryOwnedTensor(output);
+            },
+            .fused_modernbert_training_attention_v1, .fused_modernbert_training_attention_backward_v1 => |attrs| {
+                const backward = instruction.op == .fused_modernbert_training_attention_backward_v1;
+                return self.modernBertTrainingAttention(tensors[0], inputs[1], if (backward) tensors[2] else null, attrs, control);
             },
             .reshape, .stop_gradient, .convert_dtype => return self.residentTrainingReshape(inputs[0], shape, limits.primitive, false),
             .gather => {
@@ -7072,10 +7169,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             .dot_general => blk: {
                 const dot = geometry.dot.?;
+                // The device kernels read the left operand as [rows, contracting]
+                // and take the right operand's contracting axis: 0 for
+                // [contracting, columns], 1 for [columns, contracting]. A
+                // transposed left operand has no kernel; never run it as if it
+                // were untransposed.
+                if (dot.lhs_transposed) return error.UnsupportedResidentProgramInstruction;
+                const rhs_contract_axis: u32 = if (dot.rhs_transposed) 1 else 0;
                 const output = if (instruction.inputs[0].rank_ == 2)
-                    try metal_runtime.decoderRuntimeDotGeneral2DF32Device(self.provider_impl, tensors[0], tensors[1], dot.rows, dot.columns, dot.contracting, 0)
+                    try metal_runtime.decoderRuntimeDotGeneral2DF32Device(self.provider_impl, tensors[0], tensors[1], dot.rows, dot.columns, dot.contracting, rhs_contract_axis)
                 else
-                    try metal_runtime.decoderRuntimeDotGeneralBatchedF32Device(self.provider_impl, tensors[0], tensors[1], dot.batch, dot.rows, dot.columns, dot.contracting, 0, shape);
+                    try metal_runtime.decoderRuntimeDotGeneralBatchedF32Device(self.provider_impl, tensors[0], tensors[1], dot.batch, dot.rows, dot.columns, dot.contracting, rhs_contract_axis, shape);
                 break :blk output orelse return error.UnsupportedResidentProgramInstruction;
             },
             else => return error.UnsupportedResidentProgramInstruction,
@@ -7108,20 +7212,148 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return residentTrainingInstructionOp(ctx, &instruction, &.{ qkv, relative, control_i32, d_out }, .{}, control);
     }
 
+    /// Without active dropout this runs on the ModernBERT device kernels
+    /// (`segmentAttentionOnDevice`). Otherwise it is host-bridged (see
+    /// `models/laya/LAYA.md`, "Long states"): downloads `qkv`/`control` (draining any active frame
+    /// first -- `MetalTensor.toHostSlice` already flushes it, so this is
+    /// safe mid-`executeFramed`), runs the exact same tiled CPU kernel used
+    /// by the native backend (`ops/segment_training_attention.zig`), and
+    /// uploads the result back. No `[tokens, tokens]` tensor is ever
+    /// materialized on either side of the bridge, so Metal jobs get the same
+    /// memory bound as CPU; they do not yet get GPU parallelism for this op.
+    fn segmentTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: @import("ml").graph.SegmentTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (control) |c| try c.check();
+        _ = try attrs.layout();
+        if (try self.segmentAttentionOnDevice(qkv, control_i32, null, attrs, control)) |output| return output;
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+        const qkv_shape = toBuf(qkv).logical_shape;
+        const control_shape = toBuf(control_i32).logical_shape;
+        const n_qkv = try self.importCtToHostNative(&native_ctx, qkv, qkv_shape);
+        defer native_ctx.cb.free(n_qkv);
+        const n_control = try self.importCtToHostNative(&native_ctx, control_i32, control_shape);
+        defer native_ctx.cb.free(n_control);
+        if (control) |c| try c.check();
+        const n_output = try native_ctx.cb.segmentTrainingAttentionV1(n_qkv, n_control, attrs);
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, null);
+    }
+
+    /// See `segmentTrainingAttentionV1Op`: same host bridge, backward.
+    fn segmentTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, d_out: CT, attrs: @import("ml").graph.SegmentTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (control) |c| try c.check();
+        _ = try attrs.layout();
+        if (try self.segmentAttentionOnDevice(qkv, control_i32, d_out, attrs, control)) |output| return output;
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+        const qkv_shape = toBuf(qkv).logical_shape;
+        const control_shape = toBuf(control_i32).logical_shape;
+        const dout_shape = toBuf(d_out).logical_shape;
+        const n_qkv = try self.importCtToHostNative(&native_ctx, qkv, qkv_shape);
+        defer native_ctx.cb.free(n_qkv);
+        const n_control = try self.importCtToHostNative(&native_ctx, control_i32, control_shape);
+        defer native_ctx.cb.free(n_control);
+        const n_dout = try self.importCtToHostNative(&native_ctx, d_out, dout_shape);
+        defer native_ctx.cb.free(n_dout);
+        if (control) |c| try c.check();
+        const n_grad = try native_ctx.cb.segmentTrainingAttentionBackwardV1(n_qkv, n_control, n_dout, attrs);
+        defer native_ctx.cb.free(n_grad);
+        return self.exportCtFromHostNative(&native_ctx, n_grad, null);
+    }
+
+    /// Segment attention without active dropout is the ModernBERT training
+    /// attention (same visibility, window, scale and empty-row contract) with
+    /// row-relative ranges, so it runs on those device kernels. Returns null,
+    /// leaving the host bridge to run it, when dropout applies, the control
+    /// has no retained host copy, or its ranges overlap (the ModernBERT
+    /// kernels require disjoint ranges; the segment kernels do not).
+    fn segmentAttentionOnDevice(self: *MetalCompute, qkv_ct: CT, control_ct: CT, d_out_ct: ?CT, attrs: @import("ml").graph.SegmentTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) !?CT {
+        const segment = @import("segment_training_attention.zig");
+        const modernbert = @import("modernbert_training_attention.zig");
+        // The device kernels hold one head row per 128-lane threadgroup.
+        if (!self.provider_impl.hasDecoderRuntime() or attrs.head_dim > 128) return null;
+        const storage = toBuf(control_ct).resident_index_storage orelse return null;
+        const view = try segment.validateControl(attrs, storage.values, .{ .control = control });
+        if (view.apply_dropout and attrs.dropout_probability > 0) return null;
+        const device_attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs = .{
+            .batch = attrs.batch,
+            .seq_len = attrs.seq_len,
+            .num_heads = attrs.num_heads,
+            .head_dim = attrs.head_dim,
+            .window = attrs.window,
+        };
+        const tokens = view.positions.len;
+        const words = try self.allocator.alloc(i32, tokens * 7);
+        defer self.allocator.free(words);
+        for (0..tokens) |q| {
+            const row_start: i32 = @intCast((q / attrs.seq_len) * attrs.seq_len);
+            for (words[q * 6 ..][0..6], view.ranges[q * 6 ..][0..6]) |*dst, bound| dst.* = row_start + bound;
+        }
+        for (words[tokens * 6 ..], view.positions) |*dst, position| dst.* = position;
+        _ = modernbert.validateControl(device_attrs, words) catch |err| switch (err) {
+            error.InvalidModernBertTrainingAttentionControl => return null,
+            else => return err,
+        };
+        const shape = [_]i32{@intCast(tokens * 7)};
+        const device_control = try self.residentTrainingUpload(i32, words, &shape, .{}, true);
+        defer freeOp(self, device_control);
+        var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
+        defer qkv.deinit();
+        var d_out: ?MetalTensor = if (d_out_ct) |value| try self.ownedDeviceMetalTensorFromCt(value) else null;
+        defer if (d_out) |*value| value.deinit();
+        return try self.modernBertTrainingAttention(qkv, device_control, d_out, device_attrs, control);
+    }
+
+    /// ModernBERT training attention on device. The control's retained host
+    /// copy (every physical i32 upload keeps one) proves each range stays
+    /// inside its row before a kernel reads it. Unlike the strict resident
+    /// instructions this may join an active command frame (Laya's framed
+    /// trainer); the output view keeps the kernel scratch alive.
+    fn modernBertTrainingAttention(self: *MetalCompute, qkv: MetalTensor, control_ct: CT, d_out: ?MetalTensor, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) !CT {
+        if (control) |active| try active.check();
+        const control_buf = toBuf(control_ct);
+        const storage = control_buf.resident_index_storage orelse return error.UnsupportedResidentTrainingIndexProof;
+        _ = try @import("modernbert_training_attention.zig").validateControl(attrs, storage.values);
+        const control_tensor = control_buf.metal_tensor orelse return error.ResidentTrainingRequiresDeviceTensor;
+        const output = try metal_runtime.decoderRuntimeModernBertTrainingAttentionV1Device(self.provider_impl, qkv, control_tensor, d_out, attrs, control);
+        return self.boundaryOwnedTensor(output);
+    }
+
+    fn modernBertTrainingAttentionV1Op(ctx: *anyopaque, qkv_ct: CT, control_i32: CT, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
+        defer qkv.deinit();
+        return self.modernBertTrainingAttention(qkv, control_i32, null, attrs, control);
+    }
+
+    fn modernBertTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv_ct: CT, control_i32: CT, d_out_ct: CT, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
+        defer qkv.deinit();
+        var d_out = try self.ownedDeviceMetalTensorFromCt(d_out_ct);
+        defer d_out.deinit();
+        return self.modernBertTrainingAttention(qkv, control_i32, d_out, attrs, control);
+    }
+
     fn residentTrainingPrimitiveOp(ctx: *anyopaque, request: *const ops.resident_training.Request, limits: ops.resident_training.Limits, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!self.provider_impl.hasDecoderRuntime()) return error.UnsupportedResidentTrainingPrimitive;
         // The initial strict surface owns individual dispatches. A future
         // command-batch interface must pass an explicit owner token.
-        if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) return error.ResidentTrainingExternalFrame;
-        return switch (request.*) {
+        if (self.residentExternalFrame()) return error.ResidentTrainingExternalFrame;
+        const result = try switch (request.*) {
             .upload_f32 => |r| self.residentTrainingUpload(f32, r.values, r.shape, limits, false),
             .upload_i32 => |r| self.residentTrainingUpload(i32, r.values, r.shape, limits, true),
+            .adopt_f32 => |r| self.residentTrainingAdopt(r.input, r.shape, limits),
             .snapshot => |r| self.residentTrainingReshape(r.input, r.shape, limits, true),
             .reshape => |r| self.residentTrainingReshape(r.input, r.shape, limits, false),
             .gather => |r| self.residentTrainingGather(r.input, r.indices, r.input_shape, r.axis, limits),
             .scatter_add => |r| self.residentTrainingScatter(r.values, r.indices, r.input_shape, r.output_shape, r.axis, limits, control),
         };
+        toBuf(result).mutable_state = true;
+        return result;
     }
 
     fn nextBoundaryScopeGeneration() !u64 {
@@ -11718,7 +11950,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 for (resolved[axis + 1 .. input_shape.len], axis + index_tensor.shape().len..) |dim, i| shape[i] = @intCast(dim);
                 var source = if (toBuf(input).integer_storage) try toBuf(input).metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(input);
                 defer source.deinit();
-                const result = (try metal_runtime.decoderRuntimeGatherTypedDevice(self.provider_impl, source, index_tensor, axis, shape[0..rank])) orelse return error.UnsupportedTensorType;
+                var result = (try metal_runtime.decoderRuntimeGatherTypedDevice(self.provider_impl, source, index_tensor, axis, shape[0..rank])) orelse return error.UnsupportedTensorType;
+                errdefer result.deinit();
                 return self.ctFromOwnedMetalTensor(result);
             }
             return self.hostFallbackGather(input, indices, axis, input_shape);
@@ -11917,6 +12150,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
         }
+
+        // Strided slices (a Q/K/V split of `[rows, 3H]`, RoPE halves) stay on
+        // the device through the dtype-generic gather kernel, instead of
+        // downloading the whole input, slicing on the host, and uploading
+        // the result for the next op.
+        if (input_buf.metal_tensor) |*metal_tensor| if (metal_tensor.isDevice() and input_buf.view_strides == null and
+            input_buf.logical_view_strides == null and input_buf.view_index_map == null and input_buf.view_base_offset == 0 and
+            input_buf.lazy_multiply == null and !getenvBool("TERMITE_METAL_DISABLE_DEVICE_STRIDED_SLICE"))
+        {
+            if (@import("slice_plan.zig").Plan.init(in_shape, starts, limits, strides, input_shape)) |plan| {
+                if (plan.input_count == metal_tensor.elemCount()) {
+                    if (try metal_runtime.decoderRuntimeSliceTypedDevice(self.provider_impl, metal_tensor.*, plan)) |device_output| {
+                        return self.ctFromOwnedMetalTensor(device_output);
+                    }
+                }
+            } else |_| {}
+        };
 
         const input_host = try hostSliceForBuf(input_buf);
         const output = try self.allocator.alloc(f32, out_numel);
@@ -12725,6 +12975,28 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (try self.tryScaledDotProductAttentionResident(q_ct, k_ct, v_ct, if (mask.len == 0) null else mask, attn_bias_ct, batch, seq_len, num_heads, head_dim, false)) |output| return output;
         return self.hostFallbackSdpa(q_ct, k_ct, v_ct, mask, attn_bias_ct, batch, seq_len, num_heads, head_dim);
+    }
+
+    /// Tree-packed segment attention on device (see `ops.SegmentAttention`).
+    fn segmentAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, request: *const ops.SegmentAttention) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var q = self.ownedDeviceMetalTensorFromCt(q_ct) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
+        defer q.deinit();
+        var k = self.ownedDeviceMetalTensorFromCt(k_ct) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
+        defer k.deinit();
+        var v = self.ownedDeviceMetalTensorFromCt(v_ct) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
+        defer v.deinit();
+        const output = (try metal_runtime.decoderRuntimeSegmentAttentionF32Device(self.provider_impl, q, k, v, request)) orelse return null;
+        return try self.ctFromOwnedMetalTensor(output);
     }
 
     fn scaledDotProductAttentionQwen3VlVisionOp(
@@ -30361,6 +30633,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.trainingZeroF32 = trainingZeroF32Op;
         vt.trainingAccumulateF32 = trainingAccumulateF32Op;
         vt.trainingAdamWManyF32 = trainingAdamWManyF32Op;
+        vt.residentTrainingBeginBatch = residentTrainingBeginBatchOp;
+        vt.residentTrainingEndBatch = residentTrainingEndBatchOp;
         vt.trainingSumSquaresManyF32 = trainingSumSquaresManyF32Op;
         vt.argmaxLastRow = argmaxLastRowOp;
         vt.linearNoBiasArgmaxLastRow = linearNoBiasArgmaxLastRowOp;
@@ -30399,6 +30673,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.concatPrimOp = concatPrimOp;
         vt.softmaxOp = softmaxOp;
         vt.scaledDotProductAttention = scaledDotProductAttentionOp;
+        vt.segmentAttention = segmentAttentionOp;
         vt.scaledDotProductAttentionQwen3VlVision = scaledDotProductAttentionQwen3VlVisionOp;
         vt.scaledDotProductAttentionFull = scaledDotProductAttentionFullOp;
         vt.maskedBceWithLogitsLoss = maskedBceWithLogitsLossOp;
@@ -30413,6 +30688,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // native hooks would cast this Metal context to NativeCompute.
         vt.debertaTrainingAttentionV1 = debertaTrainingAttentionV1Op;
         vt.debertaTrainingAttentionBackwardV1 = debertaTrainingAttentionBackwardV1Op;
+        vt.modernBertTrainingAttentionV1 = modernBertTrainingAttentionV1Op;
+        vt.modernBertTrainingAttentionBackwardV1 = modernBertTrainingAttentionBackwardV1Op;
+        // Device kernels without active dropout, host bridge otherwise; see
+        // segmentTrainingAttentionV1Op.
+        vt.segmentTrainingAttentionV1 = segmentTrainingAttentionV1Op;
+        vt.segmentTrainingAttentionBackwardV1 = segmentTrainingAttentionBackwardV1Op;
         vt.causalSelfAttention = causalSelfAttentionOp;
         vt.crossAttention = crossAttentionOp;
         vt.logSoftmaxOp = logSoftmaxOp;

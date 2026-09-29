@@ -23,6 +23,7 @@ const publication = @import("../../gliner_boundary_export.zig");
 const Control = @import("../../execution_control.zig").InferenceExecutionControl;
 const Identity = @import("../seeded_gradient_trainer.zig").Identity;
 const export_mod = @import("boundary_training_export.zig");
+const teacher_mod = @import("boundary_distillation_teacher.zig");
 const Allocator = std.mem.Allocator;
 const mib = 1024 * 1024;
 
@@ -43,6 +44,19 @@ pub const Tokenization = struct {
     max_queries: usize = 64,
     word_splitter: processor.WordSplitter = .whitespace,
 };
+/// Antenna feature distillation from a frozen GLiNER2.5 checkpoint
+/// (boundary_distillation.zig). The teacher is loaded like a source and
+/// encoded on the CPU; its weights, sidecars and these settings are bound into
+/// the run fingerprint.
+pub const Distillation = struct {
+    teacher_dir: []const u8,
+    expected_teacher: ?bundle.Identity = null,
+    weight: f32 = 1,
+    /// Also train the heads on the rows' labels; pure distillation freezes them.
+    heads: bool = false,
+    /// Fit an identity neck in closed form on the first rows before training.
+    fit: @import("boundary_distillation_fit.zig").Options = .{},
+};
 pub const Config = struct {
     version: u32,
     source_dir: []const u8,
@@ -60,6 +74,7 @@ pub const Config = struct {
     attention_profile: step.AttentionProfile = .materialized_v1,
     activation_profile: step.ActivationProfile = .retained_v1,
     peft: ?peft.Config = null,
+    distillation: ?Distillation = null,
     tokenization: Tokenization = .{},
     capacities: step.Capacities = .{},
     weights: objectives.Weights = .{},
@@ -166,6 +181,11 @@ pub fn validate(config: Config) !void {
         try peft.validateConfig(p, .{});
     }
     if (config.expected_source) |expected| if (expected.precision != .fp32) return error.QuantizedBoundaryTrainingUnsupported;
+    if (config.distillation) |value| {
+        if (!pathValid(value.teacher_dir) or !std.math.isFinite(value.weight) or value.weight <= 0 or config.activation_profile != .retained_v1 or
+            !std.math.isFinite(value.fit.ridge) or value.fit.ridge <= 0 or (value.fit.rows != 0 and config.peft != null)) return error.InvalidBoundaryTrainingJob;
+        if (value.expected_teacher) |expected| if (expected.precision != .fp32) return error.QuantizedBoundaryTrainingUnsupported;
+    }
     if (config.memory.host_bytes == 0 or config.memory.backend_bytes == 0 or config.memory.combined_bytes == 0 or config.memory.optimizer_state_bytes == 0 or config.memory.optimizer_transaction_bytes == 0 or config.dataset_limits.max_host_bytes == 0) return error.InvalidBoundaryTrainingJob;
     if (config.execution != .native and (config.memory.backend_metadata_bytes == 0 or config.memory.backend_metadata_bytes >= config.memory.backend_bytes)) return error.InvalidBoundaryTrainingJob;
     if (config.run.batch_size == 0 or config.run.batch_size > 64 or config.tokenization.max_text_words == 0 or config.tokenization.max_sequence_tokens == 0 or config.tokenization.max_queries == 0) return error.InvalidBoundaryTrainingJob;
@@ -242,8 +262,11 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
         return error.PathAlreadyExists;
     } else |err| if (err != error.FileNotFound) return err;
     const source_reserved = try source_mod.reservation(io, config.source_dir, config.source_limits, control);
-    const combined = try admissionBytes(config, source_reserved);
-    var lease = try admission.tryAcquire(if (config.execution != .native) .gpu else .cpu, .{ .host_limit_bytes = config.memory.combined_bytes, .backend_limit_bytes = config.memory.backend_bytes, .combined_limit_bytes = config.memory.combined_bytes }, try admissionAmounts(config, source_reserved), true);
+    // A distillation teacher is a second, immutable source owner.
+    const teacher_reserved: usize = if (config.distillation) |value| try source_mod.reservation(io, value.teacher_dir, config.source_limits, control) else 0;
+    const reserved = try std.math.add(usize, source_reserved, teacher_reserved);
+    const combined = try admissionBytes(config, reserved);
+    var lease = try admission.tryAcquire(if (config.execution != .native) .gpu else .cpu, .{ .host_limit_bytes = config.memory.combined_bytes, .backend_limit_bytes = config.memory.backend_bytes, .combined_limit_bytes = config.memory.combined_bytes }, try admissionAmounts(config, reserved), true);
     defer lease.release();
     const scratch = budget.allocator();
     var train = try openDataset(a, config.train_file, config.dataset_limits, .train, control);
@@ -261,6 +284,10 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
     source_limits.max_source_bytes = source_reserved;
     const source = try source_mod.Source.open(a, io, config.source_dir, .{ .limits = source_limits, .expected_identity = config.expected_source }, control);
     defer source.deinit();
+    var teacher_limits = config.source_limits;
+    teacher_limits.max_source_bytes = teacher_reserved;
+    const teacher_source: ?*source_mod.Source = if (config.distillation) |value| try source_mod.Source.open(a, io, value.teacher_dir, .{ .limits = teacher_limits, .expected_identity = value.expected_teacher }, control) else null;
+    defer if (teacher_source) |value| value.deinit();
     const tokenization = processor.Options{
         .max_batch_items = config.run.batch_size,
         .max_text_words = config.tokenization.max_text_words,
@@ -270,8 +297,19 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
         .max_queries = config.tokenization.max_queries,
         .word_splitter = config.tokenization.word_splitter,
     };
-    if (calibration) |*value| try value.preflight(source.tokenizer(), tokenization, .{ .gold_capacity = source.config.head.max_gold_per_query }, control, null);
-    if (heldout) |*value| try value.preflight(source.tokenizer(), tokenization, .{ .gold_capacity = source.config.head.max_gold_per_query }, control, null);
+    const holdout_targets = @import("boundary_targets.zig").Options{ .gold_capacity = source.config.head.max_gold_per_query, .allow_unsupervised = config.distillation != null };
+    if (calibration) |*value| try value.preflight(source.tokenizer(), tokenization, holdout_targets, control, null);
+    if (heldout) |*value| try value.preflight(source.tokenizer(), tokenization, holdout_targets, control, null);
+    const trainer_limits = try trainerLimits(config);
+    // The teacher lives in fixed storage; the optional pointer says whether it
+    // was initialized (an optional assigned `undefined` has no defined tag).
+    var teacher_storage: teacher_mod.SourceTeacher = undefined;
+    var teacher: ?*teacher_mod.SourceTeacher = null;
+    if (teacher_source) |value| {
+        try teacher_storage.init(a, value, tokenization, trainer_limits.step.encoder.input);
+        teacher = &teacher_storage;
+    }
+    defer if (teacher) |value| value.deinit();
     const calibration_sha256: ?[32]u8 = if (calibration) |value| value.sha256 else null;
     const test_sha256: ?[32]u8 = if (heldout) |value| value.sha256 else null;
     if (calibration) |*value| value.deinit();
@@ -294,7 +332,8 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
         .gold_end = config.gold_end,
         .gold_hold_fraction = config.gold_hold_fraction,
         .require_gold_relation_coverage = config.require_gold_relation_coverage,
-        .limits = try trainerLimits(config),
+        .distillation = if (teacher) |value| .{ .teacher = value.teacher(), .weight = config.distillation.?.weight, .heads = config.distillation.?.heads, .fit = config.distillation.?.fit } else null,
+        .limits = trainer_limits,
     }, control);
     defer trainer.deinit();
     const restore_receipt = if (config.resume_from) |path| try trainer.restorePinned(path, config.expected_restore_state_sha256, control) else null;

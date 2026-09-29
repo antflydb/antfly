@@ -176,9 +176,19 @@ test "resident training Metal admission rejects invalid indices storage shapes a
     const bad = (try cb.fromInt32Shape(&.{-4}, &.{1})).?;
     defer cb.free(bad);
     try std.testing.expectError(error.IndexOutOfBounds, cb.primGather(source, bad, 0, &.{ 3, 2 }));
-    try std.testing.expectError(error.UnsupportedResidentTrainingPrimitive, cb.primGather(source, good, 1, &.{ 3, 2 }));
+    // Integer-index gathers run on the device along any axis (#825). Axis 1
+    // has extent 2, so index 2 is out of bounds there.
+    try std.testing.expectError(error.IndexOutOfBounds, cb.primGather(source, good, 1, &.{ 3, 2 }));
+    const columns = (try cb.fromInt32Shape(&.{ 1, 0, 1 }, &.{3})).?;
+    defer cb.free(columns);
+    const by_column = try cb.primGather(source, columns, 1, &.{ 3, 2 });
+    defer cb.free(by_column);
+    try expectFloats(&cb, by_column, &.{ 2, 1, 2, 4, 3, 4, 6, 5, 6 });
     try std.testing.expectError(error.UnsupportedResidentTrainingPrimitive, cb.primTranspose(good, &.{0}, &.{3}));
-    try std.testing.expectError(error.UnsupportedTensorType, cb.add(good, good));
+    // Integer elementwise arithmetic also stays on the device (#825).
+    const doubled = try cb.add(good, good);
+    defer cb.free(doubled);
+    try expectInts(&cb, doubled, &.{ 0, 2, 4 });
     try std.testing.expectError(error.InvalidResidentTrainingShape, cb.fromInt32Shape(&.{1}, &.{2}));
     try std.testing.expectError(error.InvalidResidentTrainingShape, cb.snapshotTensorShape(source, &.{7}));
     try std.testing.expectError(error.ResourceLimitExceeded, cb.residentTrainingPrimitive(&.{ .scatter_add = .{
@@ -401,4 +411,41 @@ test "resident training Metal AdamW failed partial tensor preparation releases r
     }
     const after = metal_tensor.memoryStatsSnapshot();
     try std.testing.expectEqual(before.device_owned_live_bytes, after.device_owned_live_bytes);
+}
+
+test "resident training Metal linears always read the current weight buffer" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    var fixture = try Fixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    const cb = fixture.backend.computeBackend();
+    const rows = 4;
+    const in_dim = 32;
+    const out_dim = 16;
+    var x: [rows * in_dim]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) - 3;
+    const input = try upload(&cb, &x, &.{ rows, in_dim });
+    defer cb.free(input);
+    // Each step replaces the weight, as the optimizer does. Freed buffers
+    // are recycled, so a cache keyed by buffer identity would return an
+    // earlier step's weights.
+    for (0..8) |step| {
+        var w: [out_dim * in_dim]f32 = undefined;
+        for (&w, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i + step * 5) % 11)) * 0.125 - 0.5;
+        var b: [out_dim]f32 = undefined;
+        for (&b, 0..) |*v, i| v.* = @as(f32, @floatFromInt(step)) + @as(f32, @floatFromInt(i)) * 0.01;
+        const weight = try upload(&cb, &w, &.{ out_dim, in_dim });
+        defer cb.free(weight);
+        const bias = try upload(&cb, &b, &.{out_dim});
+        defer cb.free(bias);
+        const y = try cb.linear(input, weight, bias, rows, in_dim, out_dim);
+        defer cb.free(y);
+        const got = try cb.toFloat32(y, std.testing.allocator);
+        defer std.testing.allocator.free(got);
+        for (0..rows) |r| for (0..out_dim) |o| {
+            var want: f32 = b[o];
+            for (0..in_dim) |k| want += x[r * in_dim + k] * w[o * in_dim + k];
+            try std.testing.expectApproxEqAbs(want, got[r * out_dim + o], 1e-3);
+        };
+    }
 }

@@ -312,6 +312,7 @@ pub fn residentTrainingPrimitive(ctx: *anyopaque, request: *const resident.Reque
     return switch (request.*) {
         .upload_f32 => |r| upload(self, f32, r.values, r.shape, limits),
         .upload_i32 => |r| upload(self, i32, r.values, r.shape, limits),
+        .adopt_f32 => error.UnsupportedResidentTrainingPrimitive,
         .snapshot => |r| copy(self, r.input, r.shape, limits),
         .reshape => |r| view(self, r.input, r.shape, limits),
         .gather => |r| gather(self, r.input, r.indices, r.input_shape, r.axis, limits),

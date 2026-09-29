@@ -1,7 +1,8 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 const std = @import("std");
-const job = @import("inference_internal").finetune.laya_job;
+const internal = @import("inference_internal");
+const job = internal.finetune.laya_job;
 
 pub fn main(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
@@ -14,7 +15,14 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(bytes);
     const parsed = try std.json.parseFromSlice(job.Config, init.gpa, bytes, .{});
     defer parsed.deinit();
-    try job.execute(init.gpa, init.io, parsed.value);
+    // One controller for this process: a second training job in the same
+    // process would be admitted against the first's reservation instead of
+    // racing it for GPU/unified memory. `tryAcquire`'s live-memory check also
+    // samples real system-wide available memory, so a concurrent training
+    // process (a separate `antfly-inference finetune train laya` invocation)
+    // is refused here rather than pushing the machine into swap/OOM.
+    var admission = internal.runtime.tier.memory.AdmissionController{};
+    try job.execute(init.gpa, init.io, parsed.value, &admission);
 }
 fn usage() error{InvalidArguments} {
     help();

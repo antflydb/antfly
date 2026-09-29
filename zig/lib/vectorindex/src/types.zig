@@ -85,7 +85,7 @@ pub const HBCConfig = struct {
         flat_exact,
     };
 
-    storage_backend: StorageBackend = .lmdb,
+    storage_backend: StorageBackend = .lsm,
     dims: u32,
     metric: vec.DistanceMetric = .l2_squared,
     split_algo: vec.ClustAlgorithm = .kmeans,
@@ -125,7 +125,6 @@ pub const HBCConfig = struct {
 };
 
 pub const StorageBackend = enum {
-    lmdb,
     lsm,
 };
 

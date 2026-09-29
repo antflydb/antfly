@@ -47,3 +47,24 @@ output directory:
 Keep virtual environments, downloaded checkpoints, executables, reports, and
 captured evidence outside Git. Use `.benchmark-results/gliner25/` or an external
 artifact store for local evidence.
+
+## ModernBERT encoder reference
+
+`modernbert_reference.py` builds a tiny ModernBERT `BoundaryExtractor` with the
+published head settings on the pinned upstream (it reuses `oracle.py`'s
+runtime checks), saves it as a boundary checkpoint, and captures one padded
+batch: token ids and routes, the routed encoder states, and every encoder
+gradient for fixed cotangents. Its output is deterministic.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 <oracle venv>/bin/python zig/pkg/inference/scripts/gliner25/modernbert_reference.py \
+  --upstream <GLiNER2 checkout at the pinned commit> --output <dir outside Git>
+```
+
+The tokenizer and `processor.json` are checked in under
+`testdata/gliner25/modernbert_tokenizer` and pin the per-word tokenization
+(each word is tokenized alone, as upstream does). The checkpoint and
+`reference.safetensors` stay outside Git; set
+`ANTFLY_GLINER25_MODERNBERT_REFERENCE=<dir>` to run the encoder parity test
+(`ANTFLY_GLINER25_MODERNBERT_BACKEND=metal` for Metal) and the resident Metal
+training-job test in `src/finetune/gliner/boundary_modernbert_test.zig`.
