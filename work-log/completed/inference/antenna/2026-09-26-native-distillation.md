@@ -186,7 +186,120 @@ Wikipedia: 274,109 rows, median 19 words, 60% entity schemas. All sources
 are MIT, Apache 2.0 or CC BY(-SA); none is an evaluation set. Types with
 brackets or parentheses are dropped: the native schema compiler reserves them.
 
+### Distillation on the mixed pool
+
+One epoch of the mixed pool (34,264 optimizer steps, 68,528 microbatches,
+run17) from the identity-neck student, with run15's settings otherwise:
+
+| Mean (in-domain / held-out) | Optimizer steps | Classification | NER F1 |
+| --- | --- | --- | --- |
+| Wikipedia pool, run15 | 14,850 | 0.624 / 0.359 | 0.435 / 0.379 |
+| mixed pool, run17 | 12,000 | 0.583 / 0.345 | 0.443 / 0.469 |
+| mixed pool, run17 | 24,000 | 0.632 / 0.363 | 0.502 / 0.507 |
+| mixed pool, run17 | 34,264 | 0.637 / 0.372 | 0.516 / 0.524 |
+| PyTorch stage 2 | 14,000 | 0.662 / 0.378 | 0.449 / 0.364 |
+
+NER passes PyTorch stage 2 on both groups (MIT movie 0.24 to 0.46, CrossNER
+science 0.40 to 0.57); classification dipped early (Banking77 0.44 at 12,000
+steps) and recovered to just above run15, still short of stage 2 on typed
+decisions (0.29 against 0.38). The probe on the final student, own schemas,
+run15 against run17:
+
+| Source | Words | Markers |
+| --- | --- | --- |
+| CLINC150 | 0.513 -> 0.368 | 0.679 -> 0.429 |
+| SST-5 | 0.424 -> 0.335 | 0.858 -> 0.700 |
+| Banking77 | 0.396 -> 0.334 | 0.561 -> 0.556 |
+| AG News | 0.219 -> 0.220 | 0.667 -> 0.593 |
+| CrossNER (5 domains) | 0.33-0.36 -> 0.26-0.29 | 0.23-0.32 -> 0.18-0.24 |
+| MIT restaurant | 0.470 -> 0.330 | 0.268 -> 0.191 |
+| MIT movie | 0.456 -> 0.337 | 0.401 -> 0.206 |
+
+Short text and unseen type names closed most of their gap; classification
+markers (0.43-0.70) remain the largest error. Marker errors depend on which
+label names a draw samples: a second draw of the same probe put CLINC150's
+at 0.59, so compare them loosely. The probe is now
+`scripts/antenna/gap_probe.py`.
+
+The run stopped at microbatch 57,505 on the trainer's fixed 64 MiB
+`progress.jsonl` cap (about 1.2 KB per report) and resumed from the
+microbatch-48,000 checkpoint with identical state; the cap now sizes itself
+to the run (#915). Resuming needed host 8.5 GiB and backend 11 GiB to pass
+the Studio's live-memory admission. The epoch took about 23 hours.
+
+### Stage 3 from the mixed-pool student
+
+The same stage-3 job as before (pilot rows, hard labels, 2 epochs, resident
+Metal), run18:
+
+| Mean (in-domain / held-out) | Classification | NER F1 |
+| --- | --- | --- |
+| from PyTorch stage 2 | 0.743 / 0.345 | 0.684 / 0.511 |
+| from the Wikipedia-pool student (run16) | 0.740 / 0.316 | 0.696 / 0.497 |
+| from the mixed-pool student (run18) | 0.734 / 0.368 | 0.719 / 0.629 |
+| gliner2.5-base + the same recipe (upstream trainer) | 0.808 / 0.467 | 0.723 / 0.624 |
+
+Trained entirely natively, the ModernBERT student now matches its teacher
+fine-tuned the same way on NER, in-domain and held out (CrossNER science
+0.69, politics 0.71, MIT movie 0.49). Classification trails by 0.07
+in-domain and 0.10 held out: typed decisions 0.25, CLINC150 0.47, SST-5
+0.38.
+
+### Second pool: real label sets and typed decisions
+
+`distill_pool.py --label-sets` now draws each classification row's labels
+from one real set: the source's own (MASSIVE intents, GoEmotions emotions,
+DBpedia and AG News topics, Banking77 intents) or one of 65 hand-written sets
+in `scripts/antenna/label_sets.json` (sentiment and rating scales, stance,
+urgency, departments, document and question types, and so on; none
+reproduces an evaluation label list). `--source openjev` adds Open-Jev's
+CC0 typed decisions (release-v2-redistributable train, without
+customer-control-v1), each question a task over its options, rendered as
+Laya's converter renders them; a third of the yes/no questions and a quarter
+of the synthetic game rows are kept, and 9,665 decision rows fit the 128-word
+limit. Rows sharing a text stay in one split. The pool has 252,352 training
+rows, 43% classification with 795 task names and 1,138 labels; run19 distills
+on it with run17's settings.
+
+### A Laya decision head on the Antenna trunk
+
+`scripts/antenna/init_decision_head.py` builds a Laya-format checkpoint from
+the run17 student: its `encoder.*` tensors copy across unchanged (the names
+already match Laya's), the GLiNER heads and neck are dropped, and a fresh
+decision head (`type_emb`, `scorer`, `act_head`, two `head.layers`) is
+initialized at width 768 as upstream Laya's modules initialize it, with the
+released checkpoint's decision settings. Laya's loader, trainer and
+evaluator take it unchanged. `freeze_layers = num_hidden_layers + 1` now
+freezes the whole encoder, final norm included (without a new job field, so
+existing Laya run identities hold), so only the head trains and the trunk
+stays exact for the GLiNER heads; the exported encoder tensors are
+bit-identical to the source's.
+
+Accuracy on Laya's step-0 eval split (760 typed decisions), RLCD, head
+learning rate 1e-4, batch 1, resident Metal:
+
+| | Overall | Choice | Score | Yes/no |
+| --- | --- | --- | --- | --- |
+| untrained head | 0.286 | | | |
+| released Laya (ModernBERT-large, not fine-tuned) | 0.387 | 0.34 | 0.35 | 0.48 |
+| step-0 split, 2,000 decisions, 3 epochs (15 min) | 0.434 | 0.39 | 0.34 | 0.61 |
+| plus Open-Jev (64,450 decisions), 1 epoch (4 h) | 0.404 | 0.41 | 0.25 | 0.61 |
+| that head, then the step-0 split for 3 epochs | 0.476 | 0.49 | 0.39 | 0.59 |
+
+A head on the frozen base-size trunk beats released Laya-large, but trails
+Laya's full step-0 fine-tune (about 0.62, encoder trained). Mixed in for one
+epoch, Open-Jev hurts score questions, as it left Laya's own eval unchanged
+(LAYA.md, "Scaling packed training on Open-Jev"); as a first stage followed
+by three epochs on the step-0 split it helps (0.476 against 0.434, soft
+cross-entropy 1.094 against 1.135), mostly on choice and score questions.
+
 ## Next
 
-- Distill on the mixed pool (one epoch, 34,264 optimizer steps, run17),
-  rerun the probe, then stage 3.
+- Evaluate run19 and its stage 3 against run18.
+- Decision head on run19's trunk, with the same curriculum.
+- Classification markers are the remaining gap. The mixed pool has 216 real
+  class names and fills the rest of each label list from entity types; add
+  many real label sets (intents, topics, sentiment and stance scales,
+  decision questions) and rerun the probe and stage 3.
+- Typed decisions sit below every other student here; the pool has no
+  decision-style questions.

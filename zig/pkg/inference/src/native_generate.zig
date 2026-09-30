@@ -852,6 +852,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .kv_dtype = kv_dtype,
         .config = gpt_config,
         .kv_capacity_policy = kv_capacity_policy,
+        .workspace_capacity = model.session.generationWorkspaceCapacity(),
     };
     var budget_component_count: usize = 1;
     if (draft_gpt_config) |draft_cfg| {
@@ -860,6 +861,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 .backend = draft_backend_kind.?,
                 .kv_dtype = draft_kv_dtype.?,
                 .config = draft_cfg,
+                .workspace_capacity = draft_model.?.session.generationWorkspaceCapacity(),
             };
             budget_component_count = 2;
         }
