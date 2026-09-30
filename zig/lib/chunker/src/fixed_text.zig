@@ -546,3 +546,25 @@ test "fixed text chunker omits tokenizer empty sections" {
         }
     }
 }
+
+test "fixed text chunker counts unspaced CJK paragraphs per character" {
+    const alloc = std.testing.allocator;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    // #933: before the fix, a paragraph with no ASCII whitespace/punctuation
+    // was one giant "word" and became a single [UNK] token regardless of
+    // length, so 20 such paragraphs fit in one "256-token" chunk.
+    const para = "東京の図書館で本を読みました。今日は晴れています。";
+    var text = std.ArrayListUnmanaged(u8).empty;
+    defer text.deinit(alloc);
+    for (0..20) |i| {
+        if (i > 0) try text.appendSlice(alloc, "\n\n");
+        try text.appendSlice(alloc, para);
+    }
+    const chunks = try chunkText(alloc, text.items, .{ .target_tokens = 256, .overlap_tokens = 32, .max_chunks = 1000 });
+    defer alloc.free(chunks);
+    try std.testing.expect(chunks.len >= 3);
+    for (chunks) |chunk| {
+        try std.testing.expect(try countTokens(alloc, tokenizer, chunk.text.?) <= 256);
+    }
+}
