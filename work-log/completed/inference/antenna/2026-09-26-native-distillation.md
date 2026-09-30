@@ -245,8 +245,25 @@ fine-tuned the same way on NER, in-domain and held out (CrossNER science
 in-domain and 0.10 held out: typed decisions 0.25, CLINC150 0.47, SST-5
 0.38.
 
+### Second pool: real label sets and typed decisions
+
+`distill_pool.py --label-sets` now draws each classification row's labels
+from one real set: the source's own (MASSIVE intents, GoEmotions emotions,
+DBpedia and AG News topics, Banking77 intents) or one of 65 hand-written sets
+in `scripts/antenna/label_sets.json` (sentiment and rating scales, stance,
+urgency, departments, document and question types, and so on; none
+reproduces an evaluation label list). `--source openjev` adds Open-Jev's
+CC0 typed decisions (release-v2-redistributable train, without
+customer-control-v1), each question a task over its options, rendered as
+Laya's converter renders them; a third of the yes/no questions and a quarter
+of the synthetic game rows are kept, and 9,665 decision rows fit the 128-word
+limit. Rows sharing a text stay in one split. The pool has 252,352 training
+rows, 43% classification with 795 task names and 1,138 labels; run19 distills
+on it with run17's settings.
+
 ## Next
 
+- Evaluate run19 and its stage 3 against run18.
 - Classification markers are the remaining gap. The mixed pool has 216 real
   class names and fills the rest of each label list from entity types; add
   many real label sets (intents, topics, sentiment and stance scales,

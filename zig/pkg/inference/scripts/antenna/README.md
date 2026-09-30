@@ -157,6 +157,20 @@ ANTFLY_ANTENNA_DATA=<cache> python distill_pool.py --upstream <GLiNER2> --output
   --source go_emotions=50000 --source squad=40000 --source dbpedia=25000
 ```
 
+`--label-sets label_sets.json` gives every classification row one real label
+set (the source's own, else one of the hand-written sets in
+`label_sets.json`) instead of mixed label and entity-type names, and
+`--source openjev=ROWS` adds typed-decision states from Open-Jev (CC0), each
+question a task over its options. The second pool adds both:
+
+```sh
+ANTFLY_ANTENNA_DATA=<cache> python distill_pool.py --upstream <GLiNER2> --output <pool> \
+  --wikipedia <wiki-articles-10k-v001.json> --label-sets label_sets.json \
+  --source nuner=80000 --source ag_news=20000 --source banking77=20000 \
+  --source wikipedia=30000 --source massive=20000 --source go_emotions=50000 \
+  --source squad=40000 --source dbpedia=25000 --source openjev=40000
+```
+
 `gap_probe.py` measures where a distilled student departs from its teacher:
 the distillation loss's z-space error per evaluation dataset (own and
 pool-style schemas) and pool, word rows and marker rows apart:
