@@ -23,6 +23,7 @@ pub const ReplicaCatalog = impl.ReplicaCatalog;
 pub const ReplicaCatalogToken = impl.ReplicaCatalogToken;
 pub const PreparedReplicaCatalogBatch = impl.PreparedReplicaCatalogBatch;
 pub const ReplicaCatalogSnapshot = impl.ReplicaCatalogSnapshot;
+pub const ReplicaCatalogPoint = impl.ReplicaCatalogPoint;
 pub const MemoryReplicaCatalog = impl.MemoryReplicaCatalog;
 pub const FileReplicaCatalog = impl.FileReplicaCatalog;
 pub const freeReplicaRecords = impl.freeReplicaRecords;

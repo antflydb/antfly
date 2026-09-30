@@ -15,6 +15,11 @@ pub fn isIndexQuery(alloc: Allocator, json: []const u8) !bool {
     return parsed.value.index != null;
 }
 
+pub fn isIndexScan(alloc: Allocator, opts: @import("../storage/db/types.zig").ScanOptions) !bool {
+    if (opts.relational_query) |query| return query.index != null;
+    return isIndexQuery(alloc, opts.relational_query_json);
+}
+
 const Row = struct {
     line: []u8,
     token: []u8,

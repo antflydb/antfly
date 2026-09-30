@@ -328,11 +328,12 @@ const Compiler = struct {
                 const kind = input.object.get("type") orelse return error.InvalidRelationalExpression;
                 if (kind != .string) return error.InvalidRelationalExpression;
                 node.kind = std.meta.stringToEnum(Kind, kind.string) orelse return error.InvalidRelationalExpression;
+                const value = input.object.get("value") orelse .null;
                 switch (node.kind) {
                     .string, .blob, .boolean, .datetime, .integer, .number => {},
+                    .json => if (value != .null) return error.InvalidRelationalExpressionType,
                     else => return error.InvalidRelationalExpressionType,
                 }
-                const value = input.object.get("value") orelse .null;
                 if (node.kind == .blob and value == .string and value.string.len > std.base64.standard.Encoder.calcSize(max_output_bytes)) return error.RelationalExpressionBudgetExceeded;
                 node.literal = checks.valueFromJson(self.alloc, node.kind, value, true) catch |err| switch (err) {
                     error.OutOfMemory => return err,

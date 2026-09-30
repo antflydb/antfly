@@ -29,10 +29,24 @@ pub const SourceArtifact = struct {
 };
 
 pub const ProvisioningProjection = struct {
+    pub const InitialFkOwner = struct {
+        plan_id: [16]u8,
+        plan_digest: [32]u8,
+        child_table_id: u64,
+        child_group_id: u64,
+        namespace: @import("../storage/db/doc_identity_namespace.zig").Namespace,
+        schema_version: u32,
+        schema_digest: [32]u8,
+        public_schema_json_digest: [32]u8,
+        catalog_digest: [32]u8,
+    };
     tables: []records.TableRecord,
     ranges: []records.RangeRecord,
     /// Immutable plans prove the authority for each hidden owner.
     jobs_json: []const []const u8 = &.{},
+    /// Plan-bound owner admission marker. A projected hidden child is never
+    /// created as an ordinary writable group before this gate is installed.
+    initial_fk_owners: []const InitialFkOwner = &.{},
 
     pub fn jsonStringify(self: ProvisioningProjection, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
@@ -42,6 +56,8 @@ pub const ProvisioningProjection = struct {
         try @import("../storage/db/relational_integrity_json.zig").write(self.ranges, stream);
         try stream.objectField("jobs_json");
         try stream.write(self.jobs_json);
+        try stream.objectField("initial_fk_owners");
+        try stream.write(self.initial_fk_owners);
         try stream.endObject();
     }
 
@@ -54,6 +70,7 @@ pub const ProvisioningProjection = struct {
         alloc.free(self.ranges);
         for (self.jobs_json) |job| alloc.free(job);
         if (self.jobs_json.len != 0) alloc.free(self.jobs_json);
+        if (self.initial_fk_owners.len != 0) alloc.free(self.initial_fk_owners);
         self.* = undefined;
     }
 };

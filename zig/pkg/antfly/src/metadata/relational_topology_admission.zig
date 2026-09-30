@@ -47,7 +47,7 @@ pub fn requireStoreAtFloor(floor: u16, incoming: tables.StoreRecord) !void {
 test "relational topology admission requires complete distributed rollout and pins read mappings" {
     const alloc = std.testing.allocator;
     var contract: transitions.TransitionTableContract = .{ .schema_json = "{\"unique_constraints\":[{\"name\":\"pk\"}]}" };
-    const capable: tables.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 9, .relational_topology_protocol_version = 1 };
+    const capable: tables.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 9, .relational_topology_protocol_version = tables.relational_topology_protocol_version };
     const old: tables.StoreRecord = .{ .store_id = 2, .node_id = 2 };
     try std.testing.expectError(error.RelationalTopologyProtocolUpgradeRequired, prepare(alloc, &contract, &.{ capable, old }));
     try std.testing.expectEqual(.none, contract.integrity_protocol);

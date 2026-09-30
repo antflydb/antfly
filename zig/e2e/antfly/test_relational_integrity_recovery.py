@@ -398,7 +398,7 @@ def test_fk_cascade_recovers_claims_references_and_rows(
                 )
                 if response.status_code == 200:
                     return response.json().get("state") == "enforced"
-                assert response.status_code in (409, 503), response.text
+                assert response.status_code in (404, 409, 503), response.text
                 return False
 
             assert wait_until(enforced, timeout_s=90), cluster.debug_logs()

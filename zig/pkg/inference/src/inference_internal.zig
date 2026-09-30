@@ -45,6 +45,7 @@ pub const server = struct {
 };
 pub const pipelines = struct {
     pub const embedding = @import("pipelines/embedding.zig");
+    pub const gliner = @import("pipelines/gliner.zig");
     pub const extraction_schema = @import("pipelines/extraction_schema.zig");
     pub const gliner_boundary_processor = @import("pipelines/gliner_boundary_processor.zig");
     pub const gliner_boundary_pipeline = @import("pipelines/gliner_boundary_pipeline.zig");

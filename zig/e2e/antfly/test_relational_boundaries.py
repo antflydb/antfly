@@ -21,6 +21,7 @@ def _ready(api, table):
             api.get(f"/tables/{table}/constraints/status").get("state") == "enforced"
         ),
         timeout_s=30,
+        retry_not_found=True,
     )
 
 

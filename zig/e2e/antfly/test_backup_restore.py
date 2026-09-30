@@ -33,6 +33,7 @@ import pytest
 import requests
 from conftest import (
     ANTFLY_PUBLIC_API_ROOT,
+    AUTH_BOOTSTRAP_PASSWORD,
     DEFAULT_ANTFLY_BIN,
     REPO_ROOT,
     _read_log_tail,
@@ -314,6 +315,11 @@ def _create_cluster_table_when_admitted(
     last_observation: requests.Response | None = None
     table_url = f"{cluster.data_api_urls[0]}/tables/{table_name}"
 
+    def remember_table(table: dict) -> dict:
+        if hasattr(cluster, "table_ids"):
+            cluster.table_ids[table_name] = int(table["table_id"])
+        return table
+
     def canonical_schema(value):
         # Only backend-managed generation and documented omitted defaults are
         # normalized. Do not use a subset match: an unexpected FK, default,
@@ -431,7 +437,7 @@ def _create_cluster_table_when_admitted(
                         if observed.status_code == 200:
                             table = _check_response(observed)
                             verify_observed_definition(table)
-                            return table
+                            return remember_table(table)
                         if observed.status_code not in (404, 503):
                             _check_response(observed)
                             raise AssertionError("unexpected table create observation")
@@ -462,7 +468,7 @@ def _create_cluster_table_when_admitted(
                 result = _check_response(last_response)
                 if attempts > 1:
                     print(f"backup table create admitted after {attempts} attempts")
-                return result
+                return remember_table(result)
             # This response advertises Retry-After: 1. Keep backoff and every
             # subsequent request within the original create request budget.
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
@@ -983,6 +989,7 @@ class ThreeByThreeBackupCluster:
         self.binary = binary
         self.online_merge_enabled = online_merge_enabled
         self.host = "127.0.0.1"
+        self.table_ids: dict[str, int] = {}
         with ExitStack() as setup:
             self.tempdir = tempfile.TemporaryDirectory(
                 prefix="antfly-zig-metadata-backup-e2e-"
@@ -998,8 +1005,11 @@ class ThreeByThreeBackupCluster:
                 f"http://{self.host}:{port}" for port in self.metadata_admin_ports
             ]
             self.metadata_public_urls = [
-                antfly_public_api_url(url, root=ANTFLY_PUBLIC_API_ROOT)
-                for url in self.metadata_admin_urls
+                antfly_public_api_url(
+                    f"http://admin:{AUTH_BOOTSTRAP_PASSWORD}@{self.host}:{port}",
+                    root=ANTFLY_PUBLIC_API_ROOT,
+                )
+                for port in self.metadata_admin_ports
             ]
             self.data_ports = list(self.port_reservations.reserve_many(3))
             self.data_raft_ports = list(self.port_reservations.reserve_many(3))
@@ -1097,6 +1107,8 @@ class ThreeByThreeBackupCluster:
             str(self.metadata_admin_ports[node_id - 1]),
             "--health",
             "false",
+            "--auth",
+            "true",
             "--data-dir",
             str(self.root / f"metadata-{node_id}"),
             "--replica-root-dir",
@@ -1156,6 +1168,10 @@ class ThreeByThreeBackupCluster:
                 lambda command=command, log_file=self.metadata_log_files[i]: (
                     subprocess.Popen(
                         debuggable_command(command),
+                        env={
+                            **os.environ,
+                            "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+                        },
                         stdout=log_file,
                         stderr=subprocess.STDOUT,
                         cwd=REPO_ROOT,
@@ -1237,6 +1253,38 @@ class ThreeByThreeBackupCluster:
                 "data nodes did not register on every metadata node\n"
                 f"{self.debug_logs()}"
             )
+        self._enroll_store_roots()
+
+    def _enroll_store_roots(self) -> None:
+        incarnation = self.metadata_snapshot(0)["status"]["metadata_incarnation"]
+        for node_id in range(4, 7):
+            proof = subprocess.run(
+                [
+                    self.binary,
+                    "internal",
+                    "store-root",
+                    "proof",
+                    "--replica-root-dir",
+                    str(self.root / f"data-{node_id}-replicas"),
+                    "--metadata-incarnation",
+                    incarnation,
+                    "--node-id",
+                    str(node_id),
+                    "--store-id",
+                    str(node_id),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=REPO_ROOT,
+            )
+            response = requests.post(
+                f"{self.metadata_public_urls[0]}/store-roots/enroll",
+                json=json.loads(proof.stdout),
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=30,
+            )
+            _check_response(response)
 
     def metadata_snapshot(self, index: int, *, request_timeout_s: float = 1.0) -> dict:
         response = requests.get(
@@ -1308,7 +1356,7 @@ class ThreeByThreeBackupCluster:
         topology = None
         for snapshot in snapshots:
             assert snapshot is not None
-            table_id = next(
+            table_id = self.table_ids.get(table_name) or next(
                 (
                     int(table.get("table_id", 0))
                     for table in snapshot.get("tables", [])
@@ -2158,7 +2206,7 @@ def _exercise_online_document_merge(
             )
             if response.status_code == 200:
                 return response.json().get("state") == "enforced"
-            assert response.status_code in (409, 503), response.text
+            assert response.status_code in (404, 409, 503), response.text
             return False
 
         assert wait_until(enforced, timeout_s=90), cluster.debug_logs()
@@ -2312,9 +2360,40 @@ def _exercise_online_document_merge(
             timeout_s=30.0,
             interval_s=0.25,
         )
-        assert actual is not None and all(
+        matches = actual is not None and all(
             actual.get(field) == value for field, value in expected.items()
-        ), f"restored online row mismatch {key!r}\n{cluster.debug_logs()}"
+        )
+        if not matches:
+            observations = []
+            for api_url in cluster.data_api_urls:
+                try:
+                    response = session.get(
+                        f"{api_url}/tables/{table_name}/documents/{key}", timeout=5
+                    )
+                    value = response.json() if response.status_code == 200 else None
+                    observations.append(
+                        {
+                            "url": api_url,
+                            "status": response.status_code,
+                            "keys": sorted(value) if isinstance(value, dict) else None,
+                            "title": value.get("title")
+                            if isinstance(value, dict)
+                            else None,
+                            "payload_length": len(value.get("payload", ""))
+                            if isinstance(value, dict)
+                            else None,
+                            "expected_payload_length": len(expected.get("payload", "")),
+                            "id": value.get("_id") if isinstance(value, dict) else None,
+                            "error": response.text[:256]
+                            if response.status_code != 200
+                            else None,
+                        }
+                    )
+                except (requests.RequestException, ValueError) as exc:
+                    observations.append({"url": api_url, "error": repr(exc)[:256]})
+            assert matches, (
+                f"restored online row mismatch {key!r}: {observations}\n{cluster.debug_logs()}"
+            )
     session.close()
     return table_name
 

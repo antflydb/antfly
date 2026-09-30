@@ -59,6 +59,7 @@ pub fn validate(alloc: std.mem.Allocator, child_json: []const u8, parent_name: [
     for (try child.relationalForeignKeyDefinitions(owned)) |fk| {
         if (!std.mem.eql(u8, fk.parent_table, parent_name)) continue;
         const unique_found = for (uniques) |unique| {
+            if (unique.keys.len != 0 or unique.where.len != 0 or unique.deferrable) continue;
             if (sameColumns(fk.parent_columns, unique.columns)) break true;
         } else false;
         if (!unique_found) return error.ForeignKeyTargetNotUnique;
