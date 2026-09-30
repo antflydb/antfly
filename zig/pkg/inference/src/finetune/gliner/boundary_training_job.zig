@@ -89,9 +89,24 @@ pub const Config = struct {
     training_limits: limits_mod.Config = .{},
     checkpoint_every_microbatches: u32 = 100,
     timeout_seconds: u32 = 4 * 60 * 60,
-    max_progress_bytes: usize = 64 * mib,
+    /// Cap on `progress.jsonl`. Null sizes it to the run: every remaining
+    /// report at the per-line maximum, so the log can never stop a run early.
+    /// Not part of the run fingerprint; a resume may change it.
+    max_progress_bytes: ?usize = null,
     disk_headroom_bytes: u64 = 256 * mib,
 };
+/// Largest single `progress.jsonl` report line, newline included.
+const max_progress_line = 8192;
+
+/// Bytes for every report left in the run at the per-line maximum. Each
+/// optimizer step takes `accumulation` microbatch reports; the extra one per
+/// step covers end-of-epoch flushes of a partial window.
+fn progressBudget(total_optimizer_steps: u64, accumulation: u32, microbatch_step: u64) !usize {
+    const reports = try std.math.mul(u64, total_optimizer_steps, @as(u64, accumulation) + 1);
+    const remaining = reports -| microbatch_step;
+    return std.math.cast(usize, try std.math.mul(u64, @max(remaining, 1), max_progress_line)) orelse error.BoundaryTrainingProgressLimitExceeded;
+}
+
 pub const Result = struct { version: u32 = 1, status: enum { paused, complete }, identity: Identity, accumulated_microbatches: u32, run_fingerprint: [32]u8, state_sha256: [32]u8, portable_model: ?export_mod.Result = null };
 pub const Execution = struct {
     /// A cooperative pause saves the exact unfinished accumulation window.
@@ -168,7 +183,7 @@ fn pathValid(path: []const u8) bool {
 }
 pub fn validate(config: Config) !void {
     try limits_mod.validate(config.training_limits);
-    if (config.version != 1 or config.checkpoint_every_microbatches == 0 or config.timeout_seconds == 0 or config.max_progress_bytes < 8192 or config.memory.job_bytes < 4 * mib) return error.InvalidBoundaryTrainingJob;
+    if (config.version != 1 or config.checkpoint_every_microbatches == 0 or config.timeout_seconds == 0 or (config.max_progress_bytes != null and config.max_progress_bytes.? < max_progress_line) or config.memory.job_bytes < 4 * mib) return error.InvalidBoundaryTrainingJob;
     if (try std.math.add(usize, config.export_limits.max_scratch_bytes, 4 * mib) > config.memory.job_bytes) return error.BoundaryTrainingRunLimitExceeded;
     for ([_][]const u8{ config.source_dir, config.train_file, config.output_dir }) |path| if (!pathValid(path)) return error.InvalidBoundaryTrainingJobPath;
     for ([_]?[]const u8{ config.calibration_file, config.test_file, config.resume_from }) |path| if (path) |value| if (!pathValid(value)) return error.InvalidBoundaryTrainingJobPath;
@@ -341,11 +356,12 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
     defer scratch.free(executable_path);
     const executable_digest = try snapshots.digest(io, std.Io.Dir.cwd(), executable_path, 1024 * mib, control);
     const checkpoint_bytes = try checkpointSize(trainer);
+    const progress_budget = config.max_progress_bytes orelse try progressBudget(trainer.run_plan.total_optimizer_steps, trainer.run_plan.config.accumulation, trainer.optimizer.identity().microbatch_step);
     // Old and replacement checkpoint coexist until atomic publication. The
     // final model/adapter is separately staged; include its conservative size.
     const export_plan = try trainer.estimateExportSnapshot(scratch, source, config.source_dir, config.export_limits, control);
     const export_bytes = export_plan.output_bytes_upper_bound;
-    try disk(config.output_dir, try std.math.add(u64, try std.math.mul(u64, checkpoint_bytes, 2), export_bytes), config.disk_headroom_bytes);
+    try disk(config.output_dir, try std.math.add(u64, try std.math.add(u64, try std.math.mul(u64, checkpoint_bytes, 2), export_bytes), progress_budget), config.disk_headroom_bytes);
     try check(control);
     try std.Io.Dir.cwd().createDir(io, config.output_dir, .default_dir);
     // Do not erase a failed run: its immutable manifest and last checkpoint are
@@ -399,11 +415,11 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
             try writeJson(scratch, io, result_path, result, control);
             return result;
         }
-        if (config.max_progress_bytes - log_bytes < 8192) return error.BoundaryTrainingProgressLimitExceeded;
+        if (progress_budget - log_bytes < max_progress_line) return error.BoundaryTrainingProgressLimitExceeded;
         const report = try trainer.next(control) orelse break;
         const bytes = try std.json.Stringify.valueAlloc(scratch, report, .{});
         defer scratch.free(bytes);
-        if (bytes.len + 1 > 8192) return error.BoundaryTrainingProgressLimitExceeded;
+        if (bytes.len + 1 > max_progress_line) return error.BoundaryTrainingProgressLimitExceeded;
         try progress.writeStreamingAll(io, bytes);
         try progress.writeStreamingAll(io, "\n");
         log_bytes += bytes.len + 1;
@@ -632,6 +648,21 @@ test "boundary training job admission retains every preflight split and checks a
     overflow = config;
     overflow.dataset_limits.max_host_bytes = (std.math.maxInt(usize) - config.memory.job_bytes) / 3;
     try std.testing.expectError(error.Overflow, admissionAmounts(overflow, 0));
+}
+
+test "boundary training job sizes the progress log to the remaining run" {
+    // 34,264 steps of 2 microbatches: the run that a fixed 64 MiB cap stopped
+    // at 57,505 microbatches (about 1.2 KB per report).
+    const whole = try progressBudget(34_264, 2, 0);
+    try std.testing.expectEqual(@as(usize, 34_264 * 3 * max_progress_line), whole);
+    try std.testing.expect(whole > 68_528 * 1200);
+    try std.testing.expectEqual(@as(usize, (34_264 * 3 - 48_000) * max_progress_line), try progressBudget(34_264, 2, 48_000));
+    // A finished or overshot position still admits one line (the loop exits).
+    try std.testing.expectEqual(@as(usize, max_progress_line), try progressBudget(10, 1, 50));
+    try std.testing.expectError(error.Overflow, progressBudget(std.math.maxInt(u64), 1, 0));
+    const tiny = try std.json.parseFromSlice(Config, std.testing.allocator, "{\"version\":1,\"run\":{\"mode\":\"full\"},\"source_dir\":\"s\",\"train_file\":\"t\",\"output_dir\":\"o\",\"max_progress_bytes\":100}", .{ .ignore_unknown_fields = true });
+    defer tiny.deinit();
+    try std.testing.expectEqual(@as(?usize, 100), tiny.value.max_progress_bytes);
 }
 
 test "boundary training job forwards resource overrides without changing semantic run options" {
