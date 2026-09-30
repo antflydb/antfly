@@ -22210,7 +22210,7 @@ pub const ApiHttpServer = struct {
         } else null;
         return .{
             .job_id = try std.fmt.allocPrint(arena, "{d}", .{state.job_id}),
-            .idempotency_key = state.idempotency_key,
+            .idempotency_key = try arena.dupe(u8, state.idempotency_key),
             .attempt_id = state.attempt_id,
             .scope = state.scope,
             .table_name = if (state.table_name) |table_name| try (try system_catalog.Target.parse(try names.resolve(table_name))).displayNameAlloc(arena) else null,
