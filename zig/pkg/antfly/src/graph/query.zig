@@ -786,7 +786,7 @@ pub const GraphMetricStatus = struct {
     }
 };
 
-fn cloneGraphMetricStatus(alloc: Allocator, source: graph_mod.GraphIndex.GraphMetricStatus) !GraphMetricStatus {
+pub fn cloneGraphMetricStatus(alloc: Allocator, source: graph_mod.GraphIndex.GraphMetricStatus) !GraphMetricStatus {
     const name = try alloc.dupe(u8, source.name);
     errdefer alloc.free(name);
     var edge_filter = try source.edge_filter.cloneAlloc(alloc);
@@ -874,6 +874,7 @@ pub const GraphQueryResult = struct {
 /// vtables so the storage layer, which knows neither its table's name nor
 /// its group count, can apply the caller's routing knowledge.
 pub const ExecutionScope = struct {
+    ttl_now_ns: ?u64 = null,
     /// Physical name of the index-owning table. A `target_table` tag naming
     /// it canonicalizes to the local (null) identity, mirroring the
     /// distributed coordinator's canonicalGraphNodeTable, so a self-table
@@ -893,6 +894,9 @@ pub const GraphQueryEngine = struct {
     /// Public request coordinators install one shared budget here. Internal
     /// callers may omit it and retain the graph algorithms' standalone limit.
     work_budget: ?*work_budget_mod.WorkBudget = null,
+    /// A coordinator can supply one expiration time for all operations and
+    /// shards. A standalone execution captures it for that call.
+    ttl_now_ns: ?u64 = null,
     /// See ExecutionScope; defaults keep the historical terminal behavior at
     /// cross-table tagged nodes.
     scope: ExecutionScope = .{},
@@ -905,6 +909,9 @@ pub const GraphQueryEngine = struct {
         gq: GraphQuery,
         resolved_keys: []const []const u8,
     ) !GraphQueryResult {
+        const supplied_time = self.ttl_now_ns;
+        if (supplied_time == null) self.ttl_now_ns = self.scope.ttl_now_ns orelse graph_index.clock.nowRealtimeNs();
+        defer self.ttl_now_ns = supplied_time;
         try validateGraphMetricQueryShape(gq);
         const defer_result_limit = graphMetricPostProcessingNeedsFullCandidateSet(gq);
         var execution_params = gq.params;
@@ -1552,6 +1559,7 @@ pub const GraphQueryEngine = struct {
             .include_paths = params.include_paths,
             .node_admission = self.node_admission,
             .work_budget = self.work_budget,
+            .ttl_now_ns = self.ttl_now_ns,
             .owning_table = self.scope.owning_table,
             .expand_cross_table_local = self.scope.expand_cross_table_local,
             .result_admission = .{
@@ -1687,6 +1695,7 @@ pub const GraphQueryEngine = struct {
 
         const opts = paths_mod.PathFindOptions{
             .weight_mode = gq.params.weight_mode,
+            .ttl_now_ns = self.ttl_now_ns,
             .edge_types = gq.params.edge_types,
             .direction = gq.params.direction,
             .max_depth = gq.params.max_depth,
@@ -1812,6 +1821,7 @@ pub const GraphQueryEngine = struct {
 
         const opts = paths_mod.PathFindOptions{
             .weight_mode = gq.params.weight_mode,
+            .ttl_now_ns = self.ttl_now_ns,
             .edge_types = gq.params.edge_types,
             .direction = gq.params.direction,
             .max_depth = gq.params.max_depth,
@@ -1889,6 +1899,7 @@ pub const GraphQueryEngine = struct {
                 .return_aliases = gq.return_aliases,
                 .node_admission = self.node_admission,
                 .work_budget = self.work_budget,
+                .ttl_now_ns = self.ttl_now_ns,
                 .owning_table = self.scope.owning_table,
                 .expand_cross_table_local = self.scope.expand_cross_table_local,
             },

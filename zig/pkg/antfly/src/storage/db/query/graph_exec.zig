@@ -543,6 +543,9 @@ pub fn executeGraphQueriesWithSets(
     // into that expired stack frame. Keep their charges consumptive until all
     // named operations have run, then detach only at the ownership boundary.
     for (results[0..initialized]) |*result| result.consumeRetainedState();
+    if (req.graph_physical_scan_observation) |observed| {
+        observed.* = req.graph_execution_limits.max_explored_edges - request_work_budget.remaining_physical_edges;
+    }
     return results;
 }
 
@@ -1717,7 +1720,7 @@ fn buildPathGraphSearchResult(
     };
 }
 
-fn cloneGraphMetricStatusesFromGraph(
+pub fn cloneGraphMetricStatusesFromGraph(
     alloc: Allocator,
     statuses: []const graph_query_mod.GraphMetricStatus,
 ) ![]types.GraphMetricStatus {

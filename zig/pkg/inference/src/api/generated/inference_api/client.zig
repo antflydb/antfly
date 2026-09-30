@@ -127,6 +127,17 @@ pub const Client = struct {
         return ApiResponse(types.ChunkResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Answer named choice, ordinal score, and Boolean questions
+    /// POST /decide
+    pub fn decide(self: *@This(), body: types.DecideRequest) !ApiResponse(types.DecideResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/decide", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.DecideResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Dictate speech into clean written text
     /// POST /dictate
     pub fn dictate(self: *@This(), body: types.DictateRequest) !RawResponse {

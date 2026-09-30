@@ -354,6 +354,8 @@ zig/pkg/antfly/src/storage/db/enrichment/utf8_text.zig
 zig/pkg/antfly/src/storage/db/generation_lifecycle.zig
 zig/pkg/antfly/src/storage/db/graph_asset_state.zig
 zig/pkg/antfly/src/storage/db/graph_edge_contender.zig
+zig/pkg/antfly/src/storage/db/graph_edge_ttl_expiration.zig
+zig/pkg/antfly/src/storage/db/graph_edge_ttl_tombstone.zig
 zig/pkg/antfly/src/storage/db/graph_edge_types.zig
 zig/pkg/antfly/src/storage/db/graph_state_name.zig
 zig/pkg/antfly/src/storage/db/ha_contract.zig
@@ -484,6 +486,7 @@ zig/pkg/antfly/src/storage/hot_standby/effects.zig
 zig/pkg/antfly/src/storage/hot_standby/fencing.zig
 zig/pkg/antfly/src/storage/hot_standby/mutation_barrier.zig
 zig/pkg/antfly/src/storage/hot_standby/primary.zig
+zig/pkg/antfly/src/storage/hot_standby/primary_effect.zig
 zig/pkg/antfly/src/storage/hot_standby/public_gate_state.zig
 zig/pkg/antfly/src/storage/hot_standby/read_gate.zig
 zig/pkg/antfly/src/storage/hot_standby/replication_log.zig

@@ -730,7 +730,7 @@ func resolveWorkloadType(operation OperationType, headers map[string]string) Wor
 	}
 
 	switch semanticTaskForOperation(operation) {
-	case "embed", "rerank", "extract":
+	case "embed", "rerank", "extract", "decide":
 		return WorkloadTypeReadHeavy
 	case "chunk", "generate":
 		return WorkloadTypeWriteHeavy

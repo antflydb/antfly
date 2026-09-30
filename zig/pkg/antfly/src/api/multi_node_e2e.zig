@@ -6804,6 +6804,7 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
         &roots,
         "docs",
         &.{source_group_id},
+        null,
     );
     try cluster.stepAll();
 
@@ -6878,6 +6879,7 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
         &roots,
         "docs",
         &.{ left_group, right_group },
+        null,
     );
 
     var churn_executor = GraphTopologyChurnExecutor{
@@ -7080,6 +7082,7 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
         &roots,
         "docs",
         &.{source_group_id},
+        null,
     );
     try cluster.stepAll();
 
@@ -7151,6 +7154,7 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
         &roots,
         "docs",
         &.{ left_group, right_group },
+        null,
     );
 
     var churn_executor = GraphTopologyChurnExecutor{

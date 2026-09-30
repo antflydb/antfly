@@ -258,6 +258,7 @@ pub const MatchOptions = struct {
     /// reached nodes, and examined edges have independent dimensions so a cheap
     /// anchor scan cannot consume the expansion allowance or run unbounded.
     work_budget: ?*WorkBudget = null,
+    ttl_now_ns: ?u64 = null,
     /// Optional request-scoped budget for the exact identity sets retained by
     /// count(distinct alias). The budget is shared across aggregate specs and
     /// cursor pages so exact aggregation either completes or fails closed with
@@ -660,12 +661,14 @@ const ReachableCollector = struct {
 /// canonicalizeTable hook.
 const LocalGraphIndexEdgeReader = struct {
     graph_index: *graph_mod.GraphIndex,
+    now_ns: u64,
     owning_table: []const u8 = "",
     expand_cross_table_local: bool = false,
 
     fn init(graph_index: *graph_mod.GraphIndex, opts: MatchOptions) @This() {
         return .{
             .graph_index = graph_index,
+            .now_ns = opts.ttl_now_ns orelse graph_index.clock.nowRealtimeNs(),
             .owning_table = opts.owning_table,
             .expand_cross_table_local = opts.expand_cross_table_local,
         };
@@ -683,7 +686,7 @@ const LocalGraphIndexEdgeReader = struct {
 
     pub fn openPatternEdgeStream(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, _: bool) !edge_stream.Stream {
         if (!self.servesTable(table)) return edge_stream.Stream.empty(a);
-        return edge_stream.openGraph(a, self.graph_index, key, kinds, direction);
+        return edge_stream.openGraphAt(a, self.graph_index, key, kinds, direction, self.now_ns);
     }
 
     pub fn getEdges(
@@ -695,7 +698,7 @@ const LocalGraphIndexEdgeReader = struct {
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
         if (!self.servesTable(table)) return try a.alloc(graph_mod.Edge, 0);
-        return try self.graph_index.getEdgesByTypes(a, key, edge_types, direction);
+        return try self.graph_index.getEdgesByTypesAt(a, key, edge_types, direction, self.now_ns);
     }
 
     pub fn getEdgesBounded(
@@ -709,7 +712,7 @@ const LocalGraphIndexEdgeReader = struct {
         max_bytes: usize,
     ) ![]graph_mod.Edge {
         if (!self.servesTable(table)) return try a.alloc(graph_mod.Edge, 0);
-        return try self.graph_index.getEdgesByTypesBounded(a, key, edge_types, direction, max_edges, max_bytes);
+        return try self.graph_index.getEdgesByTypesBoundedAt(a, key, edge_types, direction, max_edges, max_bytes, self.now_ns);
     }
 
     pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
@@ -728,7 +731,12 @@ const LocalGraphIndexEdgeReader = struct {
             @memset(empty, null);
             return empty;
         }
-        return try self.graph_index.probeEdgesAllocBounded(a, probes, max_owned_bytes);
+        return try self.graph_index.probeEdgesAllocBoundedAt(a, probes, max_owned_bytes, self.now_ns);
+    }
+
+    pub fn probeEdgesBoundedWithBudget(self: @This(), a: Allocator, table: ?[]const u8, probes: []const graph_mod.EdgeProbe, max_owned_bytes: usize, budget: *work_budget_mod.WorkBudget) ![]?graph_mod.Edge {
+        if (!self.servesTable(table)) return self.probeEdgesBounded(a, table, probes, max_owned_bytes);
+        return self.graph_index.probeEdgesAllocBoundedAtWithBudget(a, probes, max_owned_bytes, self.now_ns, budget);
     }
 
     pub fn freeProbedEdges(_: @This(), a: Allocator, edges: []?graph_mod.Edge) void {
@@ -805,10 +813,10 @@ pub fn matchPatternFromRefsWithEdgeReader(
         );
 
     // Fast-plan discovery is speculative. A reader may reveal a cross-table
-    // edge that makes the plan inapplicable; never charge that abandoned work
-    // to the generic fallback's public query budget.
+    // edge that makes the plan inapplicable. Discard its logical admission on
+    // fallback, while retaining the physical scan work already performed.
     var exact_budget = work_budget.*;
-    if (try matchExactTwoEdgePattern(
+    if (matchExactTwoEdgePattern(
         alloc,
         edge_reader,
         start_nodes,
@@ -816,11 +824,15 @@ pub fn matchPatternFromRefsWithEdgeReader(
         opts,
         intermediate_limit,
         &exact_budget,
-    )) |matches| {
+    ) catch |err| {
+        work_budget.* = exact_budget;
+        return err;
+    }) |matches| {
         work_budget.* = exact_budget;
         if (opts.stats) |stats| stats.plan = .exact_two_edge_probe;
         return matches;
     }
+    work_budget.remaining_physical_edges = exact_budget.remaining_physical_edges;
 
     var current = std.ArrayListUnmanaged(MatchState).empty;
     defer {
@@ -1143,16 +1155,16 @@ fn matchExactTwoEdgePattern(
                 .both => unreachable,
             };
         }
-        const probed_edges = edge_reader.probeEdgesBounded(
-            alloc,
-            null,
-            probes,
-            work_budget.edgeByteLimit(),
-        ) catch |err| {
+        const probed_edges = (if (comptime @hasDecl(@TypeOf(edge_reader), "probeEdgesBoundedWithBudget"))
+            edge_reader.probeEdgesBoundedWithBudget(alloc, null, probes, work_budget.edgeByteLimit(), work_budget)
+        else
+            edge_reader.probeEdgesBounded(alloc, null, probes, work_budget.edgeByteLimit())) catch |err| {
             const widened: anyerror = err;
             if (widened == error.GraphExploredEdgeBytesBudgetExceeded or
                 widened == error.QueryCandidateBudgetExceeded)
                 return work_budget.exhaust(.explored_edge_bytes, work_budget.max_edge_bytes);
+            if (widened == error.GraphExploredEdgesBudgetExceeded)
+                return work_budget.exhaust(.explored_edges, work_budget.max_edges);
             return err;
         };
         defer edge_reader.freeProbedEdges(alloc, probed_edges);
@@ -5499,4 +5511,54 @@ test "pattern match supports linear alias bindings and cycles" {
     try std.testing.expectEqualStrings("b", matches[0].bindings[1].key);
     try std.testing.expectEqual(@as(u32, 1), matches[0].bindings[1].depth);
     try std.testing.expectEqual(@as(usize, 3), matches[0].path.len);
+}
+
+test "exact two-edge probe shares request physical budget" {
+    const Reader = struct {
+        const forward = [_]graph_mod.Edge{
+            .{ .source = "forum", .target = "post", .edge_type = "CONTAINER_OF", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+        };
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return @constCast(&forward);
+        }
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+        pub fn probeEdgesBounded(_: @This(), _: Allocator, _: ?[]const u8, _: []const graph_mod.EdgeProbe, _: usize) ![]?graph_mod.Edge {
+            return error.TestUnexpectedResult;
+        }
+        pub fn probeEdgesBoundedWithBudget(_: @This(), alloc: Allocator, _: ?[]const u8, probes: []const graph_mod.EdgeProbe, _: usize, work: *WorkBudget) ![]?graph_mod.Edge {
+            // One physical lookup plus three contribution rows. Budget must be
+            // the caller's shared instance, rather than a fresh per-batch limit.
+            try work.consumePhysicalEdges(4);
+            const results = try alloc.alloc(?graph_mod.Edge, probes.len);
+            for (results) |*result| result.* = .{ .source = "post", .target = "tag", .edge_type = "HAS_TAG", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" };
+            return results;
+        }
+        pub fn freeProbedEdges(_: @This(), alloc: Allocator, edges: []?graph_mod.Edge) void {
+            alloc.free(edges);
+        }
+    };
+    const pattern = [_]PatternStep{
+        .{ .alias = "forum" },
+        .{ .alias = "post", .edge = .{ .types = &.{"CONTAINER_OF"} } },
+        .{ .alias = "tag", .edge = .{ .types = &.{"HAS_TAG"} } },
+    };
+    var budget = WorkBudget.init(10, 3);
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, matchPatternWithEdgeReader(std.testing.allocator, Reader{}, &.{"forum"}, &pattern, .{
+        .target_nodes = &.{.{ .table = null, .key = "tag" }},
+        .target_required = true,
+        .work_budget = &budget,
+    }));
+    try std.testing.expectEqual(work_budget_mod.Dimension.explored_edges, budget.exhaustion().?.dimension);
+    budget = WorkBudget.init(10, 4);
+    var stats = MatchStats{};
+    const matches = try matchPatternWithEdgeReader(std.testing.allocator, Reader{}, &.{"forum"}, &pattern, .{
+        .target_nodes = &.{.{ .table = null, .key = "tag" }},
+        .target_required = true,
+        .work_budget = &budget,
+        .stats = &stats,
+    });
+    defer freeMatches(std.testing.allocator, matches);
+    try std.testing.expectEqual(MatchPlan.exact_two_edge_probe, stats.plan);
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqual(@as(usize, 0), budget.remaining_physical_edges);
 }

@@ -33,6 +33,8 @@ pub const Envelope = struct {
     /// SearchRequest.graph_index_complete_snapshot). Old peers ignore the
     /// field and keep the terminal behavior.
     graph_index_complete_snapshot: bool = false,
+    /// Coordinator-selected expiration time for the whole graph request.
+    graph_ttl_now_ns: u64 = 0,
 };
 pub fn encode(alloc: std.mem.Allocator, table: []const u8, req: types.SearchRequest) !?[]u8 {
     if (req.prepared_read_table_id == 0) return null;
@@ -42,6 +44,7 @@ pub fn encode(alloc: std.mem.Allocator, table: []const u8, req: types.SearchRequ
         .index_name = req.index_name,
         .primary_text_index_name = req.primary_text_index_name,
         .graph_index_complete_snapshot = req.graph_index_complete_snapshot,
+        .graph_ttl_now_ns = req.graph_ttl_now_ns,
     }, .{});
 }
 pub fn apply(alloc: std.mem.Allocator, table: []const u8, encoded: ?[]const u8, fence_json: ?[]const u8, req: *types.SearchRequest) !bool {
@@ -64,6 +67,7 @@ pub fn apply(alloc: std.mem.Allocator, table: []const u8, encoded: ?[]const u8, 
     req.primary_text_index_name = primary;
     if (index) |name| req.index_name = name;
     req.prepared_read_table_id = value.table_id;
+    req.graph_ttl_now_ns = value.graph_ttl_now_ns;
     if (value.graph_index_complete_snapshot) {
         req.graph_index_complete_snapshot = true;
         // The handler's table name outlives the request; the fence above
@@ -105,12 +109,14 @@ test "prepared query routing carries the graph complete-snapshot scope" {
     const encoded = (try encode(alloc, "docs", .{
         .prepared_read_table_id = 7,
         .graph_index_complete_snapshot = true,
+        .graph_ttl_now_ns = 5_000_000_000,
     })).?;
     defer alloc.free(encoded);
     var req: types.SearchRequest = .{};
     try std.testing.expect(try apply(alloc, "docs", encoded, fence_json, &req));
     try std.testing.expect(req.graph_index_complete_snapshot);
     try std.testing.expectEqualStrings("docs", req.graph_owning_table);
+    try std.testing.expectEqual(@as(u64, 5_000_000_000), req.graph_ttl_now_ns);
 }
 
 test "prepared query routing keeps a vector worker's selected retrieval index" {

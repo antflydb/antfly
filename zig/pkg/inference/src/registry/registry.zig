@@ -621,7 +621,7 @@ pub const ModelRegistry = struct {
                 progress_sink,
             );
         }
-        try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
+        try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv, std.mem.eql(u8, ref.owner, "fastino") and std.mem.eql(u8, ref.name, "GLiNER2.5-Decide"));
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
 
         // Gemma4 QAT gguf checkpoints ship a sibling MTP assistant repo that
@@ -728,12 +728,26 @@ pub const ModelRegistry = struct {
         dest_dir: []const u8,
         tasks_csv: ?[]const u8,
         capabilities_csv: ?[]const u8,
+        fastino_decide: bool,
     ) !void {
         var existing = try manifest_mod.loadFromManagedPlanDir(self.allocator, dest_dir);
         defer existing.deinit();
-        if (existing.model_manifest_path != null and tasks_csv == null and capabilities_csv == null) return;
+        if (existing.model_manifest_path != null and tasks_csv == null and capabilities_csv == null and
+            !fastino_decide and !try isKnownDecideStagingSource(self.allocator, dest_dir))
+        {
+            if (!existing.laya_declared or !existing.hasCapability("typed_decisions") or existing.hasTask("decide")) return;
 
-        const manifest_json = try synthesizePulledModelManifestJsonFromPlan(self.allocator, dest_dir, tasks_csv, capabilities_csv);
+            // Keep the published manifest's other fields intact. Re-synthesizing
+            // it would discard model-specific metadata supplied by its author.
+            const original = try Dir.cwd().readFileAlloc(io, existing.model_manifest_path.?, self.allocator, .limited(c_file.default_read_file_max_bytes));
+            defer self.allocator.free(original);
+            const updated = try addDecideTaskToManifest(self.allocator, original);
+            defer self.allocator.free(updated);
+            try download.writeManagedArtifactAndUpdatePlan(self.allocator, io, dest_dir, "model_manifest.json", updated);
+            return;
+        }
+
+        const manifest_json = try synthesizePulledModelManifestJsonFromPlan(self.allocator, dest_dir, tasks_csv, capabilities_csv, fastino_decide);
         defer self.allocator.free(manifest_json);
         try download.writeManagedArtifactAndUpdatePlan(
             self.allocator,
@@ -742,6 +756,24 @@ pub const ModelRegistry = struct {
             "model_manifest.json",
             manifest_json,
         );
+    }
+
+    fn addDecideTaskToManifest(allocator: std.mem.Allocator, original: []const u8) ![]u8 {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, original, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidModelManifest;
+        if (parsed.value.object.getPtr("tasks")) |tasks| {
+            if (tasks.* != .array) return error.InvalidModelManifest;
+            try tasks.array.append(.{ .string = "decide" });
+        } else {
+            var tasks: std.array_list.Managed(std.json.Value) = .init(a);
+            try tasks.append(.{ .string = "decide" });
+            try parsed.value.object.put(a, "tasks", .{ .array = tasks });
+        }
+        return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
     }
 
     fn resolveModelsDirForWriteAlloc(allocator: std.mem.Allocator, io: std.Io, models_dir: []const u8) ![]u8 {
@@ -1098,6 +1130,58 @@ fn boundaryIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const ma
     return gliner_qualification.hasQualifiedIdentity(identity);
 }
 
+const gliner_decide_weight_pin = boundary_bundle.FilePin{
+    .path = "model.safetensors",
+    .size_bytes = 1_945_828_140,
+    .sha256 = "40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997",
+};
+
+const gliner_decide_sidecar_pins = [_]boundary_bundle.FilePin{
+    .{ .path = "config.json", .size_bytes = 594, .sha256 = "e748e5b80575471c91b3f0dd00f513ba58242544fcb7e1236e0021e61abd7673" },
+    .{ .path = "encoder_config/config.json", .size_bytes = 920, .sha256 = "bd32f1484ba5a199f7a63df44df3814b839fffcf6e64478323c4689868ef6015" },
+    .{ .path = "special_tokens_map.json", .size_bytes = 2414, .sha256 = "84ea70143f533d7e99b393d87f20010887a9ac2cba955828ef313886e4e83f4f" },
+    .{ .path = "tokenizer.json", .size_bytes = 8333952, .sha256 = "3ad87d9ffe669147063e70850927dd2da90249e2acc5c8527f1eb65df467bcc8" },
+    .{ .path = "tokenizer_config.json", .size_bytes = 3356, .sha256 = "323199a4e946039410899f3779f2aa3eaef1500213c512727ad0f623d4f21309" },
+};
+
+fn decideSidecarsQualified(allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    for (gliner_decide_sidecar_pins) |pin| {
+        const bytes = c_file.readFileFromDir(allocator, model_dir, pin.path) catch return false;
+        defer allocator.free(bytes);
+        boundary_bundle.Digest.of(bytes).verify(pin) catch return false;
+    }
+    return true;
+}
+
+/// The published Decide contract is granted only to the reviewed checkpoint
+/// bytes. Repository/path spelling is intentionally irrelevant: local copies
+/// of the same immutable artifact qualify, while changed weights fail closed.
+fn decideIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) bool {
+    if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or
+        manifest.gliner_architecture != .span or manifest.hidden_size != 1024 or
+        manifest.intermediate_size != 4096 or manifest.num_hidden_layers != 24 or
+        manifest.num_attention_heads != 16 or manifest.bert_vocab_size != 128011 or
+        manifest.gliner_token_l != 128007 or manifest.gliner_token_sep_struct != 128001)
+        return false;
+    const weight_path = manifest.safetensors_path orelse return false;
+    var reader = safetensors_mod.MMapReader.openFileAbsolute(allocator, weight_path) catch return false;
+    defer reader.deinit();
+    boundary_bundle.Digest.of(reader.file_bytes).verify(gliner_decide_weight_pin) catch return false;
+    return decideSidecarsQualified(allocator, std.fs.path.dirname(weight_path) orelse return false);
+}
+
+fn isKnownDecideSource(source: managed_receipt.DownloadSource) bool {
+    return std.ascii.eqlIgnoreCase(source.owner, "fastino") and
+        std.ascii.eqlIgnoreCase(source.name, "GLiNER2.5-Decide");
+}
+
+fn isKnownDecideStagingSource(allocator: std.mem.Allocator, dest_dir: []const u8) !bool {
+    var plan = try managed_receipt.loadValidatedPlan(allocator, std.Options.debug_io, dest_dir);
+    defer plan.deinit();
+    const source = plan.parsed.value.source orelse return false;
+    return isKnownDecideSource(source);
+}
+
 fn appendManifestTasks(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
@@ -1129,11 +1213,18 @@ fn appendSupplementalTasks(
     qualified_boundary: bool,
 ) !void {
     if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary) return;
+    if (manifest.gliner_classification_head == .label_marker_mlp) {
+        try appendUniqueOwnedString(allocator, tasks, "extract");
+        return;
+    }
     if (manifest.hasCapability("extraction")) {
         try appendUniqueOwnedString(allocator, tasks, "extract");
     }
     if (std.mem.eql(u8, manifest.gliner_model_type, "gliner2")) {
         try appendUniqueOwnedString(allocator, tasks, "extract");
+    }
+    if (manifest.laya_declared and manifest.hasCapability("typed_decisions")) {
+        try appendUniqueOwnedString(allocator, tasks, "decide");
     }
 }
 
@@ -1255,6 +1346,11 @@ fn appendInferredCapabilities(
 ) !void {
     if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary) return;
     for (manifest.capabilities) |cap| try appendUniqueOwnedString(allocator, capabilities, cap);
+
+    if (manifest.gliner_classification_head == .label_marker_mlp) {
+        try appendUniqueOwnedString(allocator, capabilities, "classification");
+        return;
+    }
 
     if (taskListContains(tasks, "embed") and manifest.sparse_3d_output_layout != null) {
         try appendUniqueOwnedString(allocator, capabilities, "sparse");
@@ -1482,6 +1578,7 @@ pub fn synthesizePulledModelManifestJson(
         tasks_csv,
         capabilities_csv,
         .published,
+        false,
     );
 }
 
@@ -1490,6 +1587,7 @@ fn synthesizePulledModelManifestJsonFromPlan(
     dest_dir: []const u8,
     tasks_csv: ?[]const u8,
     capabilities_csv: ?[]const u8,
+    fastino_decide: bool,
 ) ![]u8 {
     return synthesizePulledModelManifestJsonInternal(
         allocator,
@@ -1497,6 +1595,7 @@ fn synthesizePulledModelManifestJsonFromPlan(
         tasks_csv,
         capabilities_csv,
         .staging_plan,
+        fastino_decide,
     );
 }
 
@@ -1508,6 +1607,7 @@ fn synthesizePulledModelManifestJsonInternal(
     tasks_csv: ?[]const u8,
     capabilities_csv: ?[]const u8,
     source: PulledManifestSource,
+    fastino_decide: bool,
 ) ![]u8 {
     var manifest = switch (source) {
         .published => try manifest_mod.loadFromDir(allocator, dest_dir),
@@ -1520,6 +1620,10 @@ fn synthesizePulledModelManifestJsonInternal(
     // run on the per-request listing path (loadListingFromDir), only here,
     // where the artifact was just staged to disk.
     const qualified_boundary = boundaryIdentityIsQualified(allocator, &manifest);
+    const qualified_decide = decideIdentityIsQualified(allocator, &manifest);
+    if (source == .staging_plan and (fastino_decide or try isKnownDecideStagingSource(allocator, dest_dir)) and !qualified_decide)
+        return error.UnsupportedGlinerDecisionArtifact;
+    if (qualified_decide) manifest.gliner_classification_head = .label_marker_mlp;
 
     if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary and (tasks_csv != null or capabilities_csv != null))
         return error.UnsupportedGlinerBoundaryRuntime;
@@ -1535,6 +1639,7 @@ fn synthesizePulledModelManifestJsonInternal(
     } else {
         try appendManifestTasks(allocator, &manifest, &tasks, qualified_boundary);
     }
+    if (qualified_decide) try appendUniqueOwnedString(allocator, &tasks, "decide");
 
     const manifest_type = manifestTypeFromTasks(tasks.items, manifest.model_type);
 
@@ -1555,6 +1660,11 @@ fn synthesizePulledModelManifestJsonInternal(
     }
     try appendInferredCapabilities(allocator, &manifest, tasks.items, &capabilities, qualified_boundary);
     if (capabilities_csv) |csv| try appendCsvCapabilities(allocator, &capabilities, csv);
+    if (qualified_decide) {
+        for (tasks.items) |task| if (!std.mem.eql(u8, task, "extract") and !std.mem.eql(u8, task, "decide")) return error.InvalidModelManifest;
+        for (capabilities.items) |capability| if (!std.mem.eql(u8, capability, "classification") and !std.mem.eql(u8, capability, "typed_decisions")) return error.InvalidModelManifest;
+        try appendUniqueOwnedString(allocator, &capabilities, "typed_decisions");
+    }
 
     const sparse_3d_output_layout = inferredSparse3DOutputLayout(&manifest);
 
@@ -1574,6 +1684,8 @@ fn synthesizePulledModelManifestJsonInternal(
         try body.appendSlice(allocator, ",\"inputs\":");
         try appendJsonStringArray(&body, allocator, inputs.items);
     }
+    if (qualified_decide)
+        try body.appendSlice(allocator, ",\"gliner_classification_head\":\"label_marker_mlp\"");
     if (sparse_3d_output_layout) |layout| {
         try body.appendSlice(allocator, ",\"sparse_3d_output_layout\":");
         try appendJsonString(&body, allocator, sparse3DOutputLayoutName(layout));
@@ -1792,7 +1904,7 @@ test "pull manifest synthesis operates on private staging and remains receipted"
     });
 
     var registry = ModelRegistry.init(allocator, model_dir);
-    try registry.writePulledModelManifest(io, model_dir, "generate", null);
+    try registry.writePulledModelManifest(io, model_dir, "generate", null, false);
     var plan = try managed_receipt.loadValidatedPlan(allocator, io, model_dir);
     defer plan.deinit();
     try std.testing.expect(plan.find("model_manifest.json") != null);
@@ -1801,6 +1913,73 @@ test "pull manifest synthesis operates on private staging and remains receipted"
     var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
     defer manifest.deinit();
     try std.testing.expectEqual(manifest_mod.ModelType.generator, manifest.model_type);
+}
+
+test "pull upgrades a large Laya manifest without tasks and preserves metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "staging" });
+    defer allocator.free(model_dir);
+    try download.beginManagedDownload(allocator, io, model_dir);
+    const config = "{\"model_type\":\"modernbert\",\"laya\":{}}";
+    const vendor_data = try allocator.alloc(u8, 4 * 1024 * 1024);
+    defer allocator.free(vendor_data);
+    @memset(vendor_data, 'x');
+    const source_manifest = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"classifier\",\"capabilities\":[\"classification\",\"typed_decisions\"],\"source\":{{\"vendor_field\":\"{s}\"}}}}",
+        .{vendor_data},
+    );
+    defer allocator.free(source_manifest);
+    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
+    defer allocator.free(config_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config });
+    const manifest_path = try std.fs.path.join(allocator, &.{ model_dir, "model_manifest.json" });
+    defer allocator.free(manifest_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = source_manifest });
+    const weight_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(weight_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = weight_path, .data = "payload" });
+    const plan_path = try std.fs.path.join(allocator, &.{ model_dir, download.managed_download_plan_filename });
+    defer allocator.free(plan_path);
+    const plan_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"version\":1,\"artifacts\":[{{\"path\":\"config.json\",\"size\":{d}}},{{\"path\":\"model_manifest.json\",\"size\":{d}}},{{\"path\":\"model.safetensors\",\"size\":7}}]}}",
+        .{ config.len, source_manifest.len },
+    );
+    defer allocator.free(plan_json);
+    try Dir.cwd().writeFile(io, .{ .sub_path = plan_path, .data = plan_json });
+
+    var registry = ModelRegistry.init(allocator, model_dir);
+    try registry.writePulledModelManifest(io, model_dir, null, null, false);
+    var manifest = try manifest_mod.loadFromManagedPlanDir(allocator, model_dir);
+    defer manifest.deinit();
+    try std.testing.expect(manifest.hasTask("decide"));
+    const first = try Dir.cwd().readFileAlloc(io, manifest.model_manifest_path.?, allocator, .limited(c_file.default_read_file_max_bytes));
+    defer allocator.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"vendor_field\":\"xxxx") != null);
+
+    try registry.writePulledModelManifest(io, model_dir, null, null, false);
+    const second = try Dir.cwd().readFileAlloc(io, manifest.model_manifest_path.?, allocator, .limited(c_file.default_read_file_max_bytes));
+    defer allocator.free(second);
+    try std.testing.expectEqualStrings(first, second);
+    var plan = try managed_receipt.loadValidatedPlan(allocator, io, model_dir);
+    defer plan.deinit();
+    try std.testing.expect(plan.find("model_manifest.json") != null);
+}
+
+test "decision task augmentation keeps existing manifest tasks" {
+    const source = "{\"type\":\"classifier\",\"tasks\":[\"extract\"],\"capabilities\":[\"typed_decisions\"]}";
+    const updated = try ModelRegistry.addDecideTaskToManifest(std.testing.allocator, source);
+    defer std.testing.allocator.free(updated);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, updated, .{});
+    defer parsed.deinit();
+    const tasks = parsed.value.object.get("tasks").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), tasks.len);
+    try std.testing.expectEqualStrings("extract", tasks[0].string);
+    try std.testing.expectEqualStrings("decide", tasks[1].string);
 }
 
 test "managed discovery recognizes receipted nested payloads" {
@@ -2325,7 +2504,7 @@ test "pull preserves the pinned Qwen3 BF16 executable profile through manifest f
     const manifest = qwen3_embedding_catalog.bundles[2].generated_model_manifest.?;
     try download.writeManagedArtifactAndUpdatePlan(alloc, io, model_dir, "model_manifest.json", manifest);
     var registry = ModelRegistry.init(alloc, model_dir);
-    try registry.writePulledModelManifest(io, model_dir, null, null);
+    try registry.writePulledModelManifest(io, model_dir, null, null, false);
     var plan = try managed_receipt.loadValidatedPlan(alloc, io, model_dir);
     defer plan.deinit();
     const artifact = plan.find("model_manifest.json").?;

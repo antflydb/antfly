@@ -86,7 +86,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, request: wire.Request, cancellatio
     };
     if (!std.mem.eql(u8, persisted, expected_receipt)) return error.MergePageSequenceGap;
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(expected_receipt, &digest, .{});
+    @import("antfly_hash").Sha256.hash(expected_receipt, &digest, .{});
     if (cache.receipt_digest == null or !std.mem.eql(u8, &cache.receipt_digest.?, &digest)) {
         cache.clear();
         cache.alloc = db.alloc;
@@ -126,11 +126,13 @@ pub fn executeJson(db: *DB, alloc: Allocator, request: wire.Request, cancellatio
         if (row.key.len > 2 * pages.max_cursor_bytes) return error.InvalidMergePage;
         visited += 1;
         scanned_bytes +|= row.key.len;
-        if (keys.isStoredDocumentRowKey(row.key)) {
-            const logical = (try keys.decodeStoredDocumentRowKeyAlloc(db.alloc, row.key)).?;
+        if (try keys.decodeDocumentComponentAlloc(db.alloc, row.key)) |logical| {
             var owned = true;
             defer if (owned) db.alloc.free(logical);
-            if (receipt.cursor.len == 0 or std.mem.order(u8, logical, receipt.cursor) == .gt) {
+            if (!keys.isInternalUserKey(logical) and
+                (receipt.cursor.len == 0 or std.mem.order(u8, logical, receipt.cursor) == .gt) and
+                (cache.deletes.items.len == 0 or !std.mem.eql(u8, logical, cache.deletes.items[cache.deletes.items.len - 1])))
+            {
                 if (cache.deletes.items.len == pages.max_rows or (cache.deletes.items.len > 0 and logical.len > pages.max_bytes -| cache.bytes)) {
                     exhausted = false;
                     break;
@@ -222,6 +224,11 @@ test "relational index system online receiver bounds cleanup and uses shared che
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
     try db.batch(.{ .writes = &.{ .{ .key = "b", .value = "{\"old\":1}" }, .{ .key = "c", .value = "{\"old\":2}" }, .{ .key = "m", .value = "{\"base\":true}" } } });
+    try db.addIndex(.{ .name = "direct_graph", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"}}" });
+    try db.batch(.{ .graph_writes = &.{.{ .index_name = "direct_graph", .source = "d", .target = "m", .edge_type = "links" }} });
+    const orphan_edge = try keys.graphEdgeArtifactKeyAlloc(alloc, "d", "direct_graph", "links", "m");
+    defer alloc.free(orphan_edge);
+    try std.testing.expect((try db.get(alloc, "d")) == null);
     // Hundreds of non-row keys must yield without a false EOF or loading the
     // artifacts' payloads; their physical continuation remains advisory.
     for (0..600) |i| {
@@ -272,8 +279,14 @@ test "relational index system online receiver bounds cleanup and uses shared che
         var parsed = try std.json.parseFromSlice(wire.Prepared, alloc, output, .{});
         defer parsed.deinit();
         if (parsed.value.request) |batch| {
-            try std.testing.expectEqual(@as(usize, 2), batch.deletes.len);
+            try std.testing.expectEqual(@as(usize, 3), batch.deletes.len);
+            try std.testing.expectEqualStrings("d", batch.deletes[2]);
             try std.testing.expect(batch.merge_page.?.exhausted);
+            var skipped = batch;
+            skipped.deletes = batch.deletes[0..2];
+            skipped.merge_page.?.next = "c";
+            skipped.merge_page.?.digest = pages.commandDigest(skipped);
+            try std.testing.expectError(error.InvalidMergePage, db.batch(skipped));
             try db.batch(batch);
             break;
         }
@@ -281,6 +294,10 @@ test "relational index system online receiver bounds cleanup and uses shared che
         try std.testing.expect(pending <= 4);
     }
     try std.testing.expect(pending >= 2);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, orphan_edge));
+    const due_after_cleanup = try db.core.store.scanPrefix(alloc, &keys.graph_edge_expiration_index_prefix);
+    defer @import("../docstore.zig").DocStore.freeResults(alloc, due_after_cleanup);
+    try std.testing.expectEqual(@as(usize, 0), due_after_cleanup.len);
     try std.testing.expectEqual(@as(?u64, 1), try @import("range_cardinality.zig").load(alloc, db.core.store));
     try std.testing.expectError(error.MergePageSequenceGap, executeJson(&db, alloc, .{ .scope = scope, .operation = .{ .cleanup = receipt.value } }, .none));
     const base = (try db.get(alloc, "m")).?;

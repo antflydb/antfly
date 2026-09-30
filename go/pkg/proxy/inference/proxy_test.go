@@ -2133,6 +2133,22 @@ func TestExtractModelOperationsPreservesTaskIdentity(t *testing.T) {
 	}
 }
 
+func TestDecideCatalogOperationRequiresDeciderMembership(t *testing.T) {
+	operations, err := extractModelOperations(strings.NewReader(`{
+		"extractors": {"extract-only": {}, "shared": {}},
+		"deciders": {"shared": {}}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operations["extract-only"]["decide"] || !operations["extract-only"]["extract"] {
+		t.Fatalf("extract-only operations = %#v", operations["extract-only"])
+	}
+	if !operations["shared"]["decide"] || !operations["shared"]["extract"] {
+		t.Fatalf("shared operations = %#v", operations["shared"])
+	}
+}
+
 func TestResolveFiltersDiscoveredModelByOperation(t *testing.T) {
 	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, RefreshInterval: time.Minute, Logger: zap.NewNop()})
 	p.RegisterEndpoint("http://generator.internal", "primary", WorkloadTypeGeneral)

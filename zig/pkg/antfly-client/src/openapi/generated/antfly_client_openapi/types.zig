@@ -5434,6 +5434,10 @@ pub const CreateGraphIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Creation-based edge expiration for this graph index. The duration is immutable within an index incarnation.
+    ttl: ?GraphTtlConfig = null,
+    /// Compatibility alias for ttl.duration. Do not specify together with ttl.
+    ttl_duration: ?[]const u8 = null,
     /// Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name.
     metrics: ?std.json.ArrayHashMap(GraphMetricConfig) = null,
     /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
@@ -5459,6 +5463,8 @@ pub const CreateGraphIndexRequest = struct {
         .{ "description", "description", true },
         .{ "version", "version", true },
         .{ "enrichments", "enrichments", true },
+        .{ "ttl", "ttl", true },
+        .{ "ttl_duration", "ttl_duration", true },
         .{ "metrics", "metrics", true },
         .{ "sources", "sources", true },
         .{ "summarizer", "summarizer", true },
@@ -5492,6 +5498,14 @@ pub const CreateGraphIndexRequest = struct {
         }
         if (self.enrichments) |value| {
             try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.ttl) |value| {
+            try jw.objectField("ttl");
+            try jw.write(value);
+        }
+        if (self.ttl_duration) |value| {
+            try jw.objectField("ttl_duration");
             try jw.write(value);
         }
         if (self.metrics) |value| {
@@ -16392,6 +16406,10 @@ pub const GraphIdentityNodeSelector = struct {
 
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
+    /// Creation-based edge expiration for this graph index. The duration is immutable within an index incarnation.
+    ttl: ?GraphTtlConfig = null,
+    /// Compatibility alias for ttl.duration. Do not specify together with ttl.
+    ttl_duration: ?[]const u8 = null,
     /// Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name.
     metrics: ?std.json.ArrayHashMap(GraphMetricConfig) = null,
     /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
@@ -16413,6 +16431,8 @@ pub const GraphIndexConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "ttl", "ttl", true },
+        .{ "ttl_duration", "ttl_duration", true },
         .{ "metrics", "metrics", true },
         .{ "sources", "sources", true },
         .{ "summarizer", "summarizer", true },
@@ -16435,6 +16455,14 @@ pub const GraphIndexConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.ttl) |value| {
+            try jw.objectField("ttl");
+            try jw.write(value);
+        }
+        if (self.ttl_duration) |value| {
+            try jw.objectField("ttl_duration");
+            try jw.write(value);
+        }
         if (self.metrics) |value| {
             try jw.objectField("metrics");
             try jw.write(value);
@@ -19554,6 +19582,11 @@ pub const GraphTraverseQuery = struct {
     traverse: GraphTraversal,
 };
 
+pub const GraphTtlConfig = struct {
+    /// Expiration duration using Antfly's integer-component duration format (ns, us, ms, s, m, h, d).
+    duration: []const u8,
+};
+
 pub const GraphWhereAnd = struct {
     @"and": []const GraphWhereExpression,
 };
@@ -20288,6 +20321,10 @@ pub const IndexConfig = struct {
     chunk_size: ?i64 = null,
     /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
     execution: ?IndexExecutionConfig = null,
+    /// Creation-based edge expiration for this graph index. The duration is immutable within an index incarnation.
+    ttl: ?GraphTtlConfig = null,
+    /// Compatibility alias for ttl.duration. Do not specify together with ttl.
+    ttl_duration: ?[]const u8 = null,
     /// Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name.
     metrics: ?std.json.ArrayHashMap(GraphMetricConfig) = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
@@ -20337,6 +20374,8 @@ pub const IndexConfig = struct {
         .{ "min_weight", "min_weight", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "execution", "execution", true },
+        .{ "ttl", "ttl", true },
+        .{ "ttl_duration", "ttl_duration", true },
         .{ "metrics", "metrics", true },
         .{ "summarizer", "summarizer", true },
         .{ "edge_types", "edge_types", true },
@@ -20455,6 +20494,14 @@ pub const IndexConfig = struct {
         }
         if (self.execution) |value| {
             try jw.objectField("execution");
+            try jw.write(value);
+        }
+        if (self.ttl) |value| {
+            try jw.objectField("ttl");
+            try jw.write(value);
+        }
+        if (self.ttl_duration) |value| {
+            try jw.objectField("ttl_duration");
             try jw.write(value);
         }
         if (self.metrics) |value| {
@@ -22186,6 +22233,107 @@ pub const InferenceCredentials = struct {
         }
         try jw.endObject();
     }
+};
+
+pub const InferenceDecideAnswer = struct {
+    type: []const u8,
+    choice: ?[]const u8 = null,
+    score: ?f64 = null,
+    noul: ?f64 = null,
+    legend: ?std.json.ArrayHashMap([]const u8) = null,
+    probabilities: ?std.json.ArrayHashMap(f64) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "choice", "choice", true },
+        .{ "score", "score", true },
+        .{ "noul", "noul", true },
+        .{ "legend", "legend", true },
+        .{ "probabilities", "probabilities", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.choice) |value| {
+            try jw.objectField("choice");
+            try jw.write(value);
+        }
+        if (self.score) |value| {
+            try jw.objectField("score");
+            try jw.write(value);
+        }
+        if (self.noul) |value| {
+            try jw.objectField("noul");
+            try jw.write(value);
+        }
+        if (self.legend) |value| {
+            try jw.objectField("legend");
+            try jw.write(value);
+        }
+        if (self.probabilities) |value| {
+            try jw.objectField("probabilities");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InferenceDecideQuestion = struct {
+    type: []const u8,
+    instructions: []const u8,
+    /// Choice uses option IDs mapped to descriptions; score uses ordered descriptions; noul omits criteria.
+    criteria: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "instructions", "instructions", false },
+        .{ "criteria", "criteria", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("instructions");
+        try jw.write(self.instructions);
+        if (self.criteria) |value| {
+            try jw.objectField("criteria");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InferenceDecideRequest = struct {
+    model: []const u8,
+    state: []const u8,
+    questions: std.json.ArrayHashMap(InferenceDecideQuestion),
+};
+
+pub const InferenceDecideResponse = struct {
+    model: []const u8,
+    answers: std.json.ArrayHashMap(InferenceDecideAnswer),
+    usage: std.json.Value,
 };
 
 pub const InferenceDictateRequest = struct {
@@ -24103,6 +24251,8 @@ pub const InferenceModelsResponse = struct {
     embedders: std.json.ArrayHashMap(InferenceModelInfo),
     /// Available extractor models (models with 'extraction' capability)
     extractors: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Models declaring the decide task and typed_decisions capability
+    deciders: std.json.ArrayHashMap(InferenceModelInfo),
     /// Available generator/LLM models from models_dir/generators/
     generators: std.json.ArrayHashMap(InferenceModelInfo),
     /// Available Seq2Seq rewriter models from models_dir/rewriters/

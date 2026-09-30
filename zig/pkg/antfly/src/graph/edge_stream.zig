@@ -25,6 +25,7 @@ pub const Stream = struct {
     alloc: A,
     ptr: *anyopaque,
     next_fn: *const fn (*anyopaque, A, usize, usize) anyerror!?[]graph.Edge,
+    set_budget_fn: *const fn (*anyopaque, *@import("work_budget.zig").WorkBudget) void,
     destroy_fn: *const fn (*anyopaque, A) void,
 
     /// Takes ownership on success only.
@@ -37,7 +38,14 @@ pub const Stream = struct {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return self.nextPage(a, count, bytes);
             }
-        }.next, .destroy_fn = struct {
+        }.next, .set_budget_fn = struct {
+            fn set(ptr: *anyopaque, budget: *@import("work_budget.zig").WorkBudget) void {
+                if (@hasDecl(T, "setWorkBudget")) {
+                    const self: *T = @ptrCast(@alignCast(ptr));
+                    self.setWorkBudget(budget);
+                }
+            }
+        }.set, .destroy_fn = struct {
             fn destroy(ptr: *anyopaque, a: A) void {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 self.deinit(a);
@@ -50,6 +58,7 @@ pub const Stream = struct {
         return self.next_fn(self.ptr, self.alloc, @min(batch_records, @max(1, count)), @max(1, bytes));
     }
     pub fn nextBudget(self: *Stream, budget: *@import("work_budget.zig").WorkBudget, demand: usize) !?[]graph.Edge {
+        self.set_budget_fn(self.ptr, budget);
         return self.next(@min(demand, budget.edgeLimit()), budget.edgeByteLimit()) catch |err| switch (err) {
             error.GraphExploredEdgesBudgetExceeded => budget.exhaust(.explored_edges, budget.max_edges),
             // An admitted source may have already recorded retained-memory
@@ -107,4 +116,8 @@ test "graph maintenance edge streams preserve source admission diagnostics" {
 
 pub fn openGraph(alloc: A, index: *graph.GraphIndex, key: []const u8, kinds: []const []const u8, direction: graph.EdgeDirection) !Stream {
     return Stream.init(alloc, index.nativeEdgeScan(key, kinds, direction));
+}
+
+pub fn openGraphAt(alloc: A, index: *graph.GraphIndex, key: []const u8, kinds: []const []const u8, direction: graph.EdgeDirection, now_ns: u64) !Stream {
+    return Stream.init(alloc, index.nativeEdgeScanAt(key, kinds, direction, now_ns));
 }

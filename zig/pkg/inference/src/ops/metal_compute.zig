@@ -13750,7 +13750,46 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (try self.tryDeviceDotGeneral2D(lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch)) |device| return device;
         if (try self.tryDeviceDotGeneralBatched(lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch)) |device| return device;
+        if (try self.tryDeviceDotGeneralTransposedLhs(lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch)) |device| return device;
         return self.hostFallbackDotGeneral(lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch);
+    }
+
+    /// A left operand contracted over its row axis (`Aᵀ·B`, which autodiff
+    /// emits for weight gradients instead of materializing the transpose).
+    /// The device kernels read the left operand as `[rows, contracting]`, so
+    /// transpose its last two axes on the device and run them; otherwise this
+    /// dot fell back to the single-threaded host loop.
+    fn tryDeviceDotGeneralTransposedLhs(
+        self: *MetalCompute,
+        lhs: CT,
+        rhs: CT,
+        lhs_shape: []const i64,
+        rhs_shape: []const i64,
+        lhs_contracting: []const u8,
+        rhs_contracting: []const u8,
+        lhs_batch: []const u8,
+        rhs_batch: []const u8,
+    ) !?CT {
+        const rank = lhs_shape.len;
+        if (rank < 2 or rank > metal_tensor_mod.max_dims or lhs_contracting.len != 1 or lhs_contracting[0] != rank - 2) return null;
+        if (lhs_batch.len != rank - 2) return null;
+        for (lhs_batch, 0..) |axis, i| if (axis != i) return null;
+        if (toBuf(lhs).integer_storage or bufHasAnyQuantizedStorage(toBuf(lhs))) return null;
+        var perm: [metal_tensor_mod.max_dims]u8 = undefined;
+        var shape: [metal_tensor_mod.max_dims]i64 = undefined;
+        for (0..rank) |i| {
+            perm[i] = @intCast(i);
+            shape[i] = lhs_shape[i];
+        }
+        perm[rank - 2] = @intCast(rank - 1);
+        perm[rank - 1] = @intCast(rank - 2);
+        shape[rank - 2] = lhs_shape[rank - 1];
+        shape[rank - 1] = lhs_shape[rank - 2];
+        const transposed = primTransposeOp(self, lhs, perm[0..rank], lhs_shape) catch return null;
+        defer freeOp(self, transposed);
+        const contracting = [_]u8{@intCast(rank - 1)};
+        if (try self.tryDeviceDotGeneral2D(transposed, rhs, shape[0..rank], rhs_shape, &contracting, rhs_contracting, lhs_batch, rhs_batch)) |device| return device;
+        return self.tryDeviceDotGeneralBatched(transposed, rhs, shape[0..rank], rhs_shape, &contracting, rhs_contracting, lhs_batch, rhs_batch);
     }
 
     fn tryDeviceDotGeneral2D(
@@ -35666,6 +35705,48 @@ test "metal_compute: broadcast of stride view with rebound logical_shape uses re
     try std.testing.expectEqual(@as(usize, 48), bc_data.len);
     for (bc_data, 0..) |value, i| {
         try std.testing.expectApproxEqAbs(logical_expected[i % 24], value, 0.0);
+    }
+}
+
+test "metal_compute: dot_general with a transposed left operand stays on the device" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    // Weight-gradient shape: Aᵀ·B with A [rows=3, m=2] and B [rows=3, n=2].
+    const a_values = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const b_values = [_]f32{ 1, 0, 0, 1, 1, 1 };
+    // Batched: two copies, the second scaled by 2 on the right.
+    const a_batched = a_values ++ a_values;
+    const b_batched = b_values ++ [_]f32{ 2, 0, 0, 2, 2, 2 };
+    const cases = [_]struct { a: []const f32, b: []const f32, a_shape: []const i32, b_shape: []const i32, a_dims: []const i64, b_dims: []const i64, lc: []const u8, rc: []const u8, batch: []const u8, want: []const f32, out: []const i64 }{
+        .{ .a = &a_values, .b = &b_values, .a_shape = &.{ 3, 2 }, .b_shape = &.{ 3, 2 }, .a_dims = &.{ 3, 2 }, .b_dims = &.{ 3, 2 }, .lc = &.{0}, .rc = &.{0}, .batch = &.{}, .want = &.{ 6, 8, 8, 10 }, .out = &.{ 2, 2 } },
+        .{ .a = &a_batched, .b = &b_batched, .a_shape = &.{ 2, 3, 2 }, .b_shape = &.{ 2, 3, 2 }, .a_dims = &.{ 2, 3, 2 }, .b_dims = &.{ 2, 3, 2 }, .lc = &.{1}, .rc = &.{1}, .batch = &.{0}, .want = &.{ 6, 8, 8, 10, 12, 16, 16, 20 }, .out = &.{ 2, 2, 2 } },
+    };
+    for (cases) |case| {
+        const a_host = try metal_cb.fromFloat32Shape(case.a, case.a_shape);
+        defer metal_cb.free(a_host);
+        const b_host = try metal_cb.fromFloat32Shape(case.b, case.b_shape);
+        defer metal_cb.free(b_host);
+        const a = try metal_compute.ctFromOwnedMetalTensor(try metal_compute.ownedDeviceMetalTensorFromCt(a_host));
+        defer metal_cb.free(a);
+        const b = try metal_compute.ctFromOwnedMetalTensor(try metal_compute.ownedDeviceMetalTensorFromCt(b_host));
+        defer metal_cb.free(b);
+        const out = try metal_cb.primDotGeneral(a, b, case.a_dims, case.b_dims, case.lc, case.rc, case.batch, case.batch);
+        defer metal_cb.free(out);
+        try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+        const out_shape = try metal_cb.tensorShape(out, allocator);
+        defer allocator.free(out_shape);
+        try std.testing.expectEqualSlices(i64, case.out, out_shape);
+        const out_data = try metal_cb.toFloat32(out, allocator);
+        defer allocator.free(out_data);
+        try std.testing.expectEqualSlices(f32, case.want, out_data);
     }
 }
 

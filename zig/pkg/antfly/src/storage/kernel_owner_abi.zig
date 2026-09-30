@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 66;
+pub const abi_version: u32 = 67;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -2207,6 +2207,11 @@ pub extern fn antfly_storage_owner_relational_transition_read(
     out_result: *OwnedBytes,
 ) callconv(.c) Status;
 pub extern fn antfly_storage_owner_merge_artifacts_page(
+    owner: ?*anyopaque,
+    request: *const MergeArtifactsPageRequest,
+    out_result: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_storage_owner_merge_cleanup_keys_page(
     owner: ?*anyopaque,
     request: *const MergeArtifactsPageRequest,
     out_result: *OwnedBytes,

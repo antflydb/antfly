@@ -327,9 +327,10 @@ test "laya packed questions are isolated and share one exact trunk encoding" {
     }
 }
 
-// A batched row of several states runs as one call while cold; once any of
-// its trunks is cached it runs per tree, reusing hot trunks, with the same
-// decisions. Also prints the latency of a fully hot batch both ways.
+// A batched row of several states runs as one call while cold; on the CPU,
+// once any of its trunks is cached it runs per tree, reusing hot trunks, with
+// the same decisions (Metal keeps the batch). Also prints the latency of a
+// fully hot batch both ways.
 test "laya packed multi-state rows reuse cached trunks and match the batched forward" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -362,13 +363,17 @@ test "laya packed multi-state rows reuse cached trunks and match the batched for
     // Cold: one batched call, nothing cached.
     try std.testing.expect(try maxError(batched[0], try Run.once(a, &cb, &fixture, merged.row, &cache)) < 1e-5);
     try std.testing.expectEqual(@as(usize, 0), cache.snapshot().entries);
-    // Warm one state; the batch now runs per tree, hitting that trunk and
-    // filling the rest.
+    // Warm one state. On the CPU the batch now runs per tree, hitting that
+    // trunk and filling the rest; on Metal it stays one batched call.
     _ = try Run.once(a, &cb, &fixture, rows[1], &cache);
     try std.testing.expect(try maxError(batched[0], try Run.once(a, &cb, &fixture, merged.row, &cache)) < 1e-5);
     const stats = cache.snapshot();
-    try std.testing.expectEqual(texts.len, stats.entries);
-    try std.testing.expect(stats.hits >= 1);
+    if (cb.kind() == .metal) {
+        try std.testing.expectEqual(@as(usize, 1), stats.entries);
+    } else {
+        try std.testing.expectEqual(texts.len, stats.entries);
+        try std.testing.expect(stats.hits >= 1);
+    }
     // Fully hot: per-tree cached vs one uncached batched call.
     const repeats = 5;
     const platform = @import("antfly_platform");
@@ -407,6 +412,11 @@ test "laya question-first positions put every question before the state" {
             worst = @max(worst, try maxError(single[0][0..q.labels.len], together[0][qi * all.width ..][0..q.labels.len]));
         }
         try std.testing.expect(worst < 1e-5);
+        // Moving the questions ahead of the state changes the model's view.
+        var plain_cfg = fixture.cfg;
+        plain_cfg.packing.question_first = false;
+        const plain = try runRow(a, &fixture, (try tree.build(a, tok, plain_cfg, state_text, &questions, null))[0]);
+        try std.testing.expect(try maxError(plain[0], together[0]) > 1e-4);
         // The trunk cache encodes the state at its shifted positions: a miss
         // fills it, a hit reuses it, and both match the uncached forward.
         var cache = @import("../architectures/laya_trunk_cache.zig").Cache.init(std.testing.allocator, 64 << 20);
@@ -429,11 +439,6 @@ test "laya question-first positions put every question before the state" {
         try std.testing.expectEqual(@as(u64, 1), stats.hits);
         std.debug.print("Laya question-first {s}: isolation max error={d}, cached vs uncached={d}\n", .{ packing, worst, cache_error });
         try std.testing.expect(cache_error < 1e-5);
-        // Moving the questions ahead of the state changes the model's view.
-        var plain_cfg = fixture.cfg;
-        plain_cfg.packing.question_first = false;
-        const plain = try runRow(a, &fixture, (try tree.build(a, tok, plain_cfg, state_text, &questions, null))[0]);
-        try std.testing.expect(try maxError(plain[0], together[0]) > 1e-4);
     }
 }
 

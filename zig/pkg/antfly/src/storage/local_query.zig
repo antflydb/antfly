@@ -17,6 +17,8 @@
 
 const std = @import("std");
 const graph_mod = @import("../graph/graph.zig");
+const graph_query_mod = @import("../graph/query.zig");
+const graph_exec_mod = @import("db/query/graph_exec.zig");
 const query_api = @import("../api/query.zig");
 const query_contract = @import("../api/query_contract.zig");
 const distributed_graph = @import("../api/local_graph.zig");
@@ -141,16 +143,68 @@ pub fn executeStorageKernelGraphHydrate(
         if (hits.len > 0) alloc.free(hits);
     }
     try checkQueryDeadline(search_req);
-    const has_incoming = if (req.incoming_index_name.len > 0)
-        try db.graphHasIncomingEdgesForInternalRead(alloc, req.incoming_index_name, req.keys, .{ .generation = req.incoming_index_identity.incarnation, .config_fingerprint = req.incoming_index_identity.config_hash }, req.identity_read_generation)
+    const incoming = if (req.incoming_index_name.len > 0)
+        try db.graphHasIncomingEdgesForInternalReadBoundedAt(alloc, req.incoming_index_name, req.keys, .{ .generation = req.incoming_index_identity.incarnation, .config_fingerprint = req.incoming_index_identity.config_hash }, req.identity_read_generation, req.incoming_ttl_now_ns, @min(req.incoming_max_scanned_rows, @import("../graph/work_budget.zig").default_max_explored_edges))
     else
-        @constCast((&[_]bool{})[0..]);
-    errdefer if (has_incoming.len > 0) alloc.free(has_incoming);
+        null;
+    const has_incoming = if (incoming) |probe| probe.has_incoming else @constCast((&[_]bool{})[0..]);
+    errdefer if (incoming) |probe| probe.deinit(alloc);
+    if (req.metric_reads.len > 0 and req.metric_index_name.len == 0) return error.InvalidQueryRequest;
+    var metric_scores: []?f64 = @constCast((&[_]?f64{})[0..]);
+    errdefer if (metric_scores.len > 0) alloc.free(metric_scores);
+    var metric_status: []db_mod.types.GraphMetricStatus = @constCast((&[_]db_mod.types.GraphMetricStatus{})[0..]);
+    errdefer db_mod.types.freeGraphMetricStatuses(alloc, metric_status);
+    if (req.metric_reads.len > 0) {
+        try distributed_graph.validateGraphMetricReadsForDistributedTransport(req.metric_reads);
+        if (!req.metric_index_identity.valid()) return error.IndexGenerationMismatch;
+        const identity = db.core.index_manager.coverageIdentityForIndex(req.metric_index_name) orelse
+            return error.IndexGenerationMismatch;
+        if (identity.generation != req.metric_index_identity.incarnation or
+            identity.config_fingerprint == null or
+            identity.config_fingerprint.? != req.metric_index_identity.config_hash)
+            return error.IndexGenerationMismatch;
+        const entry = db.core.graphIndex(req.metric_index_name) orelse return error.IndexNotFound;
+        const names = try alloc.alloc([]const u8, req.metric_reads.len);
+        defer alloc.free(names);
+        const policies = try alloc.alloc(graph_mod.GraphIndex.GraphMetricColumnReadPolicy, req.metric_reads.len);
+        defer alloc.free(policies);
+        for (req.metric_reads, names, policies) |read, *name, *policy| {
+            name.* = read.name;
+            policy.* = .{ .require_fresh = read.freshness == .fresh };
+        }
+        var session = try entry.index.openGraphMetricReadSessionAlloc(alloc, names, policies);
+        defer session.deinit();
+        const score_count = std.math.mul(usize, req.keys.len, req.metric_reads.len) catch return error.GraphWorkBudgetExceeded;
+        metric_scores = if (score_count > 0)
+            try alloc.alloc(?f64, score_count)
+        else
+            @constCast((&[_]?f64{})[0..]);
+        const columns = try alloc.alloc([]?f64, req.metric_reads.len);
+        defer alloc.free(columns);
+        for (columns, 0..) |*column, i| column.* = metric_scores[i * req.keys.len ..][0..req.keys.len];
+        try session.readColumns(alloc, names, req.keys, columns);
+        const graph_statuses = try alloc.alloc(graph_query_mod.GraphMetricStatus, session.statuses.len);
+        var initialized: usize = 0;
+        defer {
+            for (graph_statuses[0..initialized]) |*status| status.deinit(alloc);
+            alloc.free(graph_statuses);
+        }
+        for (session.statuses, graph_statuses) |status, *out| {
+            out.* = try graph_query_mod.cloneGraphMetricStatus(alloc, status);
+            initialized += 1;
+        }
+        metric_status = try graph_exec_mod.cloneGraphMetricStatusesFromGraph(alloc, graph_statuses);
+    }
     try checkQueryDeadline(search_req);
     return .{
         .hits = hits,
         .has_incoming = has_incoming,
+        .metric_scores = metric_scores,
+        .metric_status = metric_status,
         .incoming_index_identity = req.incoming_index_identity,
+        .has_physical_incoming = if (incoming) |probe| probe.has_physical_incoming else @constCast((&[_]bool{})[0..]),
+        .incoming_ttl_now_ns = if (incoming != null) req.incoming_ttl_now_ns else null,
+        .incoming_scanned_rows = if (incoming) |probe| @intCast(probe.scanned_rows) else null,
     };
 }
 

@@ -278,8 +278,9 @@ pub fn mmapTempCopy(allocator: std.mem.Allocator, prefix: []const u8, bytes: []c
 
 /// Read an entire file into an allocated buffer.
 /// Max size is configurable (default 100MB for SafeTensors weights).
+pub const default_read_file_max_bytes: usize = 100 * 1024 * 1024;
 pub fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return readFileMax(allocator, path, 100 * 1024 * 1024);
+    return readFileMax(allocator, path, default_read_file_max_bytes);
 }
 
 /// Read an entire file with a custom max size limit.

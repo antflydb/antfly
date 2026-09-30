@@ -21,6 +21,7 @@ pub const GraphEdgeWrite = struct {
     weight: f64 = 1.0,
     created_at: u64 = 0,
     updated_at: u64 = 0,
+    ttl_created_ns: u64 = 0,
     metadata_json: []const u8 = "",
     /// Owning document for artifact-key routing, retirement, replacement
     /// manifests, and split ranges when it differs from the topological

@@ -104,6 +104,7 @@ def test_last(cli_server, setup_probe):
     assert phase != "call", "injected call failure"
 """)
     env = os.environ.copy()
+    # The nested pytest run must not add its repeated probe names to a CI lane.
     env.update(
         PYTHONPATH=str(Path(e2e_conftest.__file__).parent),
         PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
@@ -114,9 +115,7 @@ def test_last(cli_server, setup_probe):
     nested_duration_file = tmp_path / "nested-durations.json"
     env["ANTFLY_E2E_DURATION_FILE"] = str(nested_duration_file)
     env.pop("PYTEST_ADDOPTS", None)
-    # The nested probe is not a CI shard. Inheriting the parent duration file
-    # records its synthetic node IDs in every shard and makes aggregation fail.
-    env.pop("ANTFLY_E2E_DURATION_FILE", None)
+    env.pop("ANTFLY_E2E_REPORT_DIR", None)
     env.pop("ANTFLY_E2E_SHARD_PLAN", None)
     result = subprocess.run(
         [

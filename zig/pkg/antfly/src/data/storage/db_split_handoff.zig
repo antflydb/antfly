@@ -415,6 +415,8 @@ pub const Destination = struct {
             defer arena.deinit();
             const page_alloc = arena.allocator();
             var deletes: std.ArrayList([]const u8) = .empty;
+            var seen_owners = std.StringHashMapUnmanaged(void).empty;
+            defer seen_owners.deinit(page_alloc);
             var next: ?[]const u8 = null;
             var exhausted = true;
             {
@@ -440,8 +442,14 @@ pub const Destination = struct {
                     visited += 1;
                     key_bytes +|= entry.key.len;
                     next = try page_alloc.dupe(u8, entry.key);
-                    if (try internal_keys.decodeStoredDocumentRowKeyAlloc(page_alloc, entry.key)) |key|
-                        try deletes.append(page_alloc, key);
+                    // A direct graph write can own artifacts without a
+                    // primary document row. Include every document-owned
+                    // physical key so a retry also retires orphan artifacts.
+                    if (try internal_keys.decodeDocumentComponentAlloc(page_alloc, entry.key)) |key| {
+                        if (internal_keys.isInternalUserKey(key)) continue;
+                        const owner = try seen_owners.getOrPut(page_alloc, key);
+                        if (!owner.found_existing) try deletes.append(page_alloc, key);
+                    }
                 }
             }
             if (deletes.items.len != 0) try self.db.batch(.{ .deletes = deletes.items });
@@ -2338,6 +2346,38 @@ test "db merge coordinator offline copy bounds memory and retries partial pages 
         defer alloc.free(preserved);
         try std.testing.expectEqualStrings("{}", preserved);
     }
+}
+
+test "db merge receiver cleanup retires orphan graph ttl artifacts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-orphan-graph", .{tmp.sub_path});
+    defer alloc.free(root);
+
+    var receiver = try Destination.init(alloc, .{ .root_dir = root });
+    defer receiver.deinit();
+    try receiver.db.updateRange(.{ .start = "doc:a", .end = "doc:z" });
+    try receiver.db.addIndex(.{ .name = "links", .kind = .graph, .config_json =
+        \\{"ttl":{"duration":"1h"}}
+    });
+    try receiver.db.batch(.{ .graph_writes = &.{.{
+        .index_name = "links",
+        .source = "doc:m",
+        .target = "doc:n",
+        .edge_type = "related",
+    }}, .sync_level = .full_index });
+    try std.testing.expect((try receiver.db.get(alloc, "doc:m")) == null);
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:m", "links", "related", "doc:n");
+    defer alloc.free(artifact_key);
+    const before = try receiver.db.core.store.get(alloc, artifact_key);
+    defer alloc.free(before);
+
+    try receiver.deleteDocsInRange(alloc, .{ .start = "doc:m", .end = "doc:z" });
+    try std.testing.expectError(error.NotFound, receiver.db.core.store.get(alloc, artifact_key));
+    const due = try receiver.db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
+    defer @import("../../storage/docstore.zig").DocStore.freeResults(alloc, due);
+    try std.testing.expectEqual(@as(usize, 0), due.len);
 }
 
 test "db merge coordinator bootstraps receiver for donor range" {

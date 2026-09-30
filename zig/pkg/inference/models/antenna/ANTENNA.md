@@ -152,7 +152,7 @@ together, where the state sees every question.
 | Reusable across requests (state cache) | no | yes |
 | Questions isolated from each other | no | yes |
 | Early fusion (text sees the question) | yes | no |
-| Needs retraining to get the property | no, native | yes, and qualified: packed fine-tune 0.574 vs unpacked 0.572 on typed-decisions ([LAYA.md, Accuracy](../laya/LAYA.md#accuracy-step-0)) |
+| Needs retraining to get the property | no, native | yes, and **not qualified**: over three seeds packed scores 0.450 against 0.621 unpacked on typed-decisions (the first single-seed 0.574 vs 0.572 was a lucky run); see [LAYA.md, Packed vs unpacked at equal budget](../laya/LAYA.md#packed-vs-unpacked-at-equal-budget-2026-09-26) |
 
 ## Decisions
 
@@ -305,8 +305,14 @@ options:
    is deterministic and cacheable. Extraction loses early fusion. A middle
    option keeps the trunk schema-blind in the lower layers, pools the
    embedding there, and runs full attention in the top few layers only.
-   Laya's question-mode result (packed matched unpacked) is encouraging but
-   covers decisions, not span extraction.
+   Laya's decision results so far are discouraging, and they cover
+   decisions, not span extraction:
+   - Packed trails unpacked by 0.17 over three seeds.
+   - The middle option did not help. Laya's per-question upper layers
+     (`packing.fuse_layers`) with the top 10 of 30 layers fused scored the
+     same as plain packed.
+   - Fusing every layer closed only a fraction of the gap
+     ([LAYA.md](../laya/LAYA.md#scaling-packed-training-on-open-jev-2026-09-27)).
 3. **Separate pass** for embedding and chunking. Always correct, no shared
    compute.
 

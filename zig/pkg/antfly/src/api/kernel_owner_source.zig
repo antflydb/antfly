@@ -698,6 +698,23 @@ pub const ProvisionedKernelOwnerSource = struct {
             return rows;
         }
 
+        pub fn mergeCleanupKeysPage(self: *TransitionLease, alloc: std.mem.Allocator, range: db_types.ByteRange, after_key: ?[]const u8) ![]db_types.BatchWrite {
+            var response: abi.OwnedBytes = .{};
+            try @import("kernel_error_identity").statusToError(abi.antfly_storage_owner_merge_cleanup_keys_page(self.lease.owner().handle, &.{
+                .table_name = .fromSlice(self.lease.entry.table_name),
+                .range_start = .fromSlice(range.start),
+                .range_end = .fromSlice(range.end),
+                .after_key = .fromSlice(after_key orelse ""),
+            }, &response));
+            defer abi.antfly_storage_owner_buffer_destroy(&response);
+            var page = try @import("../storage/data_raft_projection_wire.zig").decodeGroupStatePageAlloc(alloc, response.slice());
+            errdefer page.deinit(alloc);
+            const rows = try alloc.alloc(db_types.BatchWrite, page.entries.len);
+            for (page.entries, 0..) |entry, i| rows[i] = .{ .key = entry.key, .value = entry.value };
+            alloc.free(page.entries);
+            return rows;
+        }
+
         fn relationalRead(self: *TransitionLease, comptime T: type, alloc: std.mem.Allocator, request: @import("../storage/db/relational_transition_contract.zig").Request) !T {
             var encoded: std.Io.Writer.Allocating = .init(alloc);
             defer encoded.deinit();

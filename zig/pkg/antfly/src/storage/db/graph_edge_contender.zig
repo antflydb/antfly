@@ -27,6 +27,11 @@ pub const View = struct {
     payload: []const u8,
 };
 
+pub fn coverageGeneration(raw: []const u8) !u64 {
+    if (raw.len < header_len or !std.mem.eql(u8, raw[0..magic.len], magic)) return error.InvalidGraphEdgeContender;
+    return std.mem.readInt(u64, raw[magic.len..][0..@sizeOf(u64)], .big);
+}
+
 /// Contender records are deliberately one-record-per-(edge, source-state).
 /// Document-local membership records use an empty payload; globally keyed
 /// records retain the edge payload used for winner selection. Updating a

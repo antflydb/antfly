@@ -21,6 +21,7 @@ const edge_weight = @import("../../../graph/edge_weight.zig");
 
 pub const codec_version: u16 = 1;
 pub const graph_edge_codec_version: u16 = 2;
+pub const graph_edge_ttl_codec_version: u16 = 3;
 pub const magic: [8]u8 = .{ 'A', 'F', 'E', 'N', 'R', 'C', 'H', 0 };
 pub const header_len: usize = magic.len + @sizeOf(u16) + @sizeOf(u8) + @sizeOf(u8) + @sizeOf(u64) + @sizeOf(u32);
 
@@ -174,6 +175,8 @@ pub const GraphEdge = struct {
     weight: f64,
     created_at: u64,
     updated_at: u64,
+    /// Server-assigned contribution creation time; zero denotes a legacy edge.
+    ttl_created_ns: u64 = 0,
     metadata_json: []u8,
 
     pub fn deinit(self: *GraphEdge, alloc: Allocator) void {
@@ -275,14 +278,27 @@ pub fn encodeGraphEdgeAlloc(
     updated_at: u64,
     metadata_json: []const u8,
 ) ![]u8 {
+    return encodeGraphEdgeWithTtlAlloc(alloc, source_hash, generation, weight, created_at, updated_at, 0, metadata_json);
+}
+
+pub fn encodeGraphEdgeWithTtlAlloc(
+    alloc: Allocator,
+    source_hash: ?u64,
+    generation: u64,
+    weight: f64,
+    created_at: u64,
+    updated_at: u64,
+    ttl_created_ns: u64,
+    metadata_json: []const u8,
+) ![]u8 {
     try edge_weight.validateStored(weight);
-    const payload_len = @sizeOf(u64) * 4 + @sizeOf(u32) + metadata_json.len;
+    const payload_len = @sizeOf(u64) * (if (ttl_created_ns == 0) @as(usize, 4) else 5) + @sizeOf(u32) + metadata_json.len;
     const total_len = header_len + payload_len;
     const out = try alloc.alloc(u8, total_len);
     errdefer alloc.free(out);
 
     writeHeader(out[0..header_len], .{
-        .version = graph_edge_codec_version,
+        .version = if (ttl_created_ns == 0) graph_edge_codec_version else graph_edge_ttl_codec_version,
         .kind = .graph_edge,
         .flags = .{ .has_source_hash = source_hash != null, .has_graph_generation = true },
         .source_hash = source_hash orelse 0,
@@ -298,6 +314,10 @@ pub fn encodeGraphEdgeAlloc(
     pos += @sizeOf(u64);
     std.mem.writeInt(u64, out[pos..][0..8], updated_at, .little);
     pos += @sizeOf(u64);
+    if (ttl_created_ns != 0) {
+        std.mem.writeInt(u64, out[pos..][0..8], ttl_created_ns, .little);
+        pos += @sizeOf(u64);
+    }
     std.mem.writeInt(u32, out[pos..][0..4], @intCast(metadata_json.len), .little);
     pos += @sizeOf(u32);
     @memcpy(out[pos .. pos + metadata_json.len], metadata_json);
@@ -322,7 +342,18 @@ pub fn encodePortableUnboundGraphEdgeAlloc(
     updated_at: u64,
     metadata_json: []const u8,
 ) ![]u8 {
-    const out = try encodeGraphEdgeAlloc(alloc, null, 0, weight, created_at, updated_at, metadata_json);
+    return encodePortableUnboundGraphEdgeWithTtlAlloc(alloc, weight, created_at, updated_at, 0, metadata_json);
+}
+
+pub fn encodePortableUnboundGraphEdgeWithTtlAlloc(
+    alloc: Allocator,
+    weight: f64,
+    created_at: u64,
+    updated_at: u64,
+    ttl_created_ns: u64,
+    metadata_json: []const u8,
+) ![]u8 {
+    const out = try encodeGraphEdgeWithTtlAlloc(alloc, null, 0, weight, created_at, updated_at, ttl_created_ns, metadata_json);
     var header = try decodeHeader(out);
     header.flags.portable_unbound_graph_generation = true;
     writeHeader(out[0..header_len], header);
@@ -357,13 +388,14 @@ pub fn bindGraphEdgeGenerationAlloc(alloc: Allocator, data: []const u8, generati
     const header = try decodeHeader(data);
     var decoded = try decodeGraphEdgeAlloc(alloc, data);
     defer decoded.deinit(alloc);
-    return encodeGraphEdgeAlloc(
+    return encodeGraphEdgeWithTtlAlloc(
         alloc,
         if (header.flags.has_source_hash) header.source_hash else null,
         generation,
         decoded.weight,
         decoded.created_at,
         decoded.updated_at,
+        decoded.ttl_created_ns,
         decoded.metadata_json,
     );
 }
@@ -394,7 +426,7 @@ pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
 
     const payload = data[header_len..][0..header.payload_len];
     var pos: usize = 0;
-    const generation: u64 = if (header.version == graph_edge_codec_version) blk: {
+    const generation: u64 = if (header.version == graph_edge_codec_version or header.version == graph_edge_ttl_codec_version) blk: {
         if (!header.flags.has_graph_generation or header.payload_len < @sizeOf(u64) * 4 + @sizeOf(u32)) return error.InvalidArtifactPayload;
         const value = std.mem.readInt(u64, payload[pos..][0..8], .little);
         pos += @sizeOf(u64);
@@ -410,6 +442,13 @@ pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
     pos += @sizeOf(u64);
     const updated_at = std.mem.readInt(u64, payload[pos..][0..8], .little);
     pos += @sizeOf(u64);
+    const ttl_created_ns: u64 = if (header.version == graph_edge_ttl_codec_version) blk: {
+        if (payload.len - pos < @sizeOf(u64) + @sizeOf(u32)) return error.InvalidArtifactPayload;
+        const value = std.mem.readInt(u64, payload[pos..][0..8], .little);
+        pos += @sizeOf(u64);
+        if (value == 0) return error.InvalidArtifactPayload;
+        break :blk value;
+    } else 0;
     const metadata_len = std.mem.readInt(u32, payload[pos..][0..4], .little);
     pos += @sizeOf(u32);
     if (payload.len != pos + metadata_len) return error.InvalidArtifactPayload;
@@ -419,6 +458,7 @@ pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
         .weight = weight,
         .created_at = created_at,
         .updated_at = updated_at,
+        .ttl_created_ns = ttl_created_ns,
         .metadata_json = try alloc.dupe(u8, payload[pos..]),
     };
 }
@@ -448,7 +488,7 @@ pub fn decodeHeaderPrefix(data: []const u8) !Header {
         @intFromEnum(Kind.graph_edge) => .graph_edge,
         else => return error.InvalidArtifactKind,
     };
-    if (version != codec_version and !(version == graph_edge_codec_version and kind == .graph_edge)) {
+    if (version != codec_version and !((version == graph_edge_codec_version or version == graph_edge_ttl_codec_version) and kind == .graph_edge)) {
         return error.UnsupportedArtifactCodecVersion;
     }
 
@@ -628,6 +668,19 @@ test "artifact codec encodes graph edge with version and source hash" {
     try std.testing.expectEqual(@as(u64, 10), decoded.created_at);
     try std.testing.expectEqual(@as(u64, 20), decoded.updated_at);
     try std.testing.expectEqualStrings("{\"k\":1}", decoded.metadata_json);
+}
+
+test "graph edge ttl creation survives portable generation binding" {
+    const alloc = std.testing.allocator;
+    const portable = try encodePortableUnboundGraphEdgeWithTtlAlloc(alloc, 1.5, 10, 20, 123_456_789, "{}");
+    defer alloc.free(portable);
+    try std.testing.expectEqual(graph_edge_ttl_codec_version, (try decodeHeader(portable)).version);
+    const bound = try bindGraphEdgeGenerationAlloc(alloc, portable, 42);
+    defer alloc.free(bound);
+    var decoded = try decodeGraphEdgeAlloc(alloc, bound);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 42), decoded.generation);
+    try std.testing.expectEqual(@as(u64, 123_456_789), decoded.ttl_created_ns);
 }
 
 test "artifact codec rejects weights outside the durable domain" {

@@ -635,6 +635,7 @@ from .graph_shortest_path_query import GraphShortestPathQuery
 from .graph_traversal import GraphTraversal
 from .graph_traversal_metric_freshness import GraphTraversalMetricFreshness
 from .graph_traverse_query import GraphTraverseQuery
+from .graph_ttl_config import GraphTtlConfig
 from .graph_where_and import GraphWhereAnd
 from .graph_where_not_equal import GraphWhereNotEqual
 from .graph_where_not_exists import GraphWhereNotExists
@@ -723,6 +724,18 @@ from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
+from .inference_decide_answer import InferenceDecideAnswer
+from .inference_decide_answer_legend import InferenceDecideAnswerLegend
+from .inference_decide_answer_probabilities import InferenceDecideAnswerProbabilities
+from .inference_decide_answer_type import InferenceDecideAnswerType
+from .inference_decide_question import InferenceDecideQuestion
+from .inference_decide_question_criteria_type_0 import InferenceDecideQuestionCriteriaType0
+from .inference_decide_question_type import InferenceDecideQuestionType
+from .inference_decide_request import InferenceDecideRequest
+from .inference_decide_request_questions import InferenceDecideRequestQuestions
+from .inference_decide_response import InferenceDecideResponse
+from .inference_decide_response_answers import InferenceDecideResponseAnswers
+from .inference_decide_response_usage import InferenceDecideResponseUsage
 from .inference_dictate_request import InferenceDictateRequest
 from .inference_dictate_response import InferenceDictateResponse
 from .inference_dictate_response_object import InferenceDictateResponseObject
@@ -796,6 +809,7 @@ from .inference_model_ref import InferenceModelRef
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
 from .inference_models_response_data_item import InferenceModelsResponseDataItem
+from .inference_models_response_deciders import InferenceModelsResponseDeciders
 from .inference_models_response_embedders import InferenceModelsResponseEmbedders
 from .inference_models_response_extractors import InferenceModelsResponseExtractors
 from .inference_models_response_generators import InferenceModelsResponseGenerators
@@ -1964,6 +1978,7 @@ __all__ = (
     "GraphTraversal",
     "GraphTraversalMetricFreshness",
     "GraphTraverseQuery",
+    "GraphTtlConfig",
     "GraphWhereAnd",
     "GraphWhereNotEqual",
     "GraphWhereNotExists",
@@ -2052,6 +2067,18 @@ __all__ = (
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
+    "InferenceDecideAnswer",
+    "InferenceDecideAnswerLegend",
+    "InferenceDecideAnswerProbabilities",
+    "InferenceDecideAnswerType",
+    "InferenceDecideQuestion",
+    "InferenceDecideQuestionCriteriaType0",
+    "InferenceDecideQuestionType",
+    "InferenceDecideRequest",
+    "InferenceDecideRequestQuestions",
+    "InferenceDecideResponse",
+    "InferenceDecideResponseAnswers",
+    "InferenceDecideResponseUsage",
     "InferenceDictateRequest",
     "InferenceDictateResponse",
     "InferenceDictateResponseObject",
@@ -2125,6 +2152,7 @@ __all__ = (
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
     "InferenceModelsResponseDataItem",
+    "InferenceModelsResponseDeciders",
     "InferenceModelsResponseEmbedders",
     "InferenceModelsResponseExtractors",
     "InferenceModelsResponseGenerators",

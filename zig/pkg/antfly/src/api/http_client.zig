@@ -1828,6 +1828,7 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            400 => return error.InvalidGraphExpandWireRequest,
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
@@ -1878,6 +1879,7 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            400 => return error.InvalidGraphHydrateWireRequest,
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
@@ -1928,6 +1930,7 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            400 => return error.InvalidGraphEdgesWireRequest,
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),

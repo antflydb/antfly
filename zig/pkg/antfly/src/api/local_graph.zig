@@ -63,6 +63,14 @@ pub const GraphExpandRequest = struct {
     tensor_access_path: ?OwnedGraphTensorAccessPath = null,
     tensor_program: ?query_contract.OwnedAlgebraicTensorProgramEnvelope = null,
     topology_epoch: u64 = 0,
+    ttl_now_ns: u64 = 0,
+    max_scanned_rows: u32 = graph_pattern_mod.default_max_explored_edges,
+    /// Only non-TTL expansion may retry an older worker's wire contract.
+    allow_legacy_wire_fallback: bool = false,
+    /// Parsed from a request that predates physical-scan accounting.
+    legacy_wire_request: bool = false,
+    /// Local-only synchronous observer, never serialized on this RPC.
+    physical_scan_observation: ?*usize = null,
     identity_read_generation: ?u64 = null,
     resolved_doc_filter: ?*const anyopaque = null,
     resolved_doc_filter_owned: bool = false,
@@ -153,6 +161,7 @@ pub const GraphFrontierItem = struct {
 
 pub const GraphExpandResponse = struct {
     expansions: []GraphExpansion,
+    scanned_rows: u32 = 0,
 
     pub fn deinit(self: *GraphExpandResponse, alloc: std.mem.Allocator) void {
         for (self.expansions) |*expansion| expansion.deinit(alloc);
@@ -163,6 +172,11 @@ pub const GraphExpandResponse = struct {
 
 pub const GraphHydrateRequest = struct {
     keys: [][]u8,
+    metric_index_name: []const u8 = "",
+    metric_index_name_owned: bool = false,
+    metric_index_identity: GraphIndexIdentity = .{},
+    metric_reads: []graph_query_mod.GraphMetricRead = &.{},
+    legacy_wire_request: bool = false,
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
     filter_query_json: []const u8 = "",
@@ -177,6 +191,9 @@ pub const GraphHydrateRequest = struct {
     incoming_index_name: []const u8 = "",
     incoming_index_identity: GraphIndexIdentity = .{},
     incoming_index_name_owned: bool = false,
+    /// Applies only to incoming existence reads; ordinary hydration is unchanged.
+    incoming_ttl_now_ns: u64 = 0,
+    incoming_max_scanned_rows: u32 = graph_pattern_mod.default_max_explored_edges,
     resolved_doc_filter: ?*const anyopaque = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext = null,
@@ -187,6 +204,9 @@ pub const GraphHydrateRequest = struct {
     pub fn deinit(self: *GraphHydrateRequest, alloc: std.mem.Allocator) void {
         for (self.keys) |key| alloc.free(key);
         if (self.keys.len > 0) alloc.free(self.keys);
+        if (self.metric_index_name_owned and self.metric_index_name.len > 0)
+            alloc.free(@constCast(self.metric_index_name));
+        freeGraphMetricReads(alloc, self.metric_reads);
         if (self.fields_owned) freeConstStrings(alloc, self.fields);
         if (self.filter_query_json_owned and self.filter_query_json.len > 0) {
             alloc.free(@constCast(self.filter_query_json));
@@ -207,12 +227,22 @@ pub const GraphHydrateRequest = struct {
 pub const GraphHydrateResponse = struct {
     hits: []db_mod.types.SearchHit = &.{},
     has_incoming: []bool = &.{},
+    has_physical_incoming: []bool = &.{},
+    metric_scores: []?f64 = &.{},
+    metric_status: []db_mod.types.GraphMetricStatus = &.{},
     incoming_index_identity: GraphIndexIdentity = .{},
+
+    /// Missing fields identify a peer without bounded, pinned incoming reads.
+    incoming_ttl_now_ns: ?u64 = null,
+    incoming_scanned_rows: ?u32 = null,
 
     pub fn deinit(self: *GraphHydrateResponse, alloc: std.mem.Allocator) void {
         for (self.hits) |*hit| hit.deinit(alloc);
         if (self.hits.len > 0) alloc.free(self.hits);
         if (self.has_incoming.len > 0) alloc.free(self.has_incoming);
+        if (self.has_physical_incoming.len > 0) alloc.free(self.has_physical_incoming);
+        if (self.metric_scores.len > 0) alloc.free(self.metric_scores);
+        db_mod.types.freeGraphMetricStatuses(alloc, self.metric_status);
         self.* = undefined;
     }
 };
@@ -225,9 +255,13 @@ pub const GraphEdgesRequest = struct {
     tensor_access_path: ?OwnedGraphTensorAccessPath = null,
     tensor_program: ?query_contract.OwnedAlgebraicTensorProgramEnvelope = null,
     topology_epoch: u64 = 0,
+    ttl_now_ns: u64 = 0,
     identity_read_generation: ?u64 = null,
     max_edges: u32 = graph_pattern_mod.default_max_explored_edges,
     max_owned_bytes: u32 = graph_pattern_mod.default_max_explored_edge_bytes,
+    max_scanned_rows: u32 = graph_pattern_mod.default_max_explored_edges,
+    allow_legacy_wire_fallback: bool = false,
+    legacy_wire_request: bool = false,
     timeout_ms: ?u32 = null,
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
@@ -244,6 +278,7 @@ pub const GraphEdgesRequest = struct {
 
 pub const GraphEdgesResponse = struct {
     edges: []graph_mod.Edge,
+    scanned_rows: u32 = 0,
 
     pub fn deinit(self: *GraphEdgesResponse, alloc: std.mem.Allocator) void {
         for (self.edges) |e| graph_mod.GraphIndex.freeEdge(alloc, e);
@@ -275,6 +310,8 @@ pub const GraphExpandRequestJson = struct {
     include_metric_status: bool = false,
     defer_result_limit: bool = false,
     topology_epoch: u64 = 0,
+    ttl_now_ns: ?u64 = null,
+    max_scanned_rows: ?u32 = null,
     identity_read_generation: ?u64 = null,
     _resolved_doc_filter: ?std.json.Value = null,
     params: GraphExpandParamsJson,
@@ -311,6 +348,8 @@ pub const GraphExpandParamsJson = struct {
 pub const GraphMetricReadJson = struct {
     name: []const u8,
     freshness: []const u8 = "published",
+    seed_nodes: ?[]const []const u8 = null,
+    damping: ?f64 = null,
 };
 
 pub const GraphTensorAccessPathJson = struct {
@@ -323,6 +362,7 @@ pub const GraphTensorAccessPathJson = struct {
 
 pub const GraphExpandResponseJson = struct {
     expansions: []const GraphExpansionJson,
+    scanned_rows: ?u32 = null,
 };
 
 pub const GraphExpansionJson = struct {
@@ -337,6 +377,10 @@ pub const GraphExpansionJson = struct {
 
 pub const GraphHydrateRequestJson = struct {
     keys: []const []const u8,
+    metric_index_name: ?[]const u8 = null,
+    metric_index_incarnation: ?u64 = null,
+    metric_index_config_hash: ?u64 = null,
+    metric_reads: ?[]const GraphMetricReadJson = null,
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
     _filter_query_json: []const u8 = "",
@@ -348,12 +392,19 @@ pub const GraphHydrateRequestJson = struct {
     incoming_index_name: []const u8 = "",
     incoming_index_incarnation: u64 = 0,
     incoming_index_config_hash: u64 = 0,
+    incoming_ttl_now_ns: ?u64 = null,
+    incoming_max_scanned_rows: ?u32 = null,
     _resolved_doc_filter: ?std.json.Value = null,
 };
 
 pub const GraphHydrateResponseJson = struct {
+    has_physical_incoming: ?[]const bool = null,
+    incoming_ttl_now_ns: ?u64 = null,
+    incoming_scanned_rows: ?u32 = null,
     hits: []const db_mod.types.SearchHit = &.{},
     has_incoming: []const bool = &.{},
+    metric_scores: ?[]const ?f64 = null,
+    metric_status: ?[]const db_mod.types.GraphMetricStatus = null,
     incoming_index_incarnation: u64 = 0,
     incoming_index_config_hash: u64 = 0,
 };
@@ -364,9 +415,11 @@ pub const GraphEdgesRequestJson = struct {
     edge_types: []const []const u8 = &.{},
     direction: []const u8 = "out",
     topology_epoch: u64 = 0,
+    ttl_now_ns: ?u64 = null,
     identity_read_generation: ?u64 = null,
     max_edges: u32 = graph_pattern_mod.default_max_explored_edges,
     max_owned_bytes: u32 = graph_pattern_mod.default_max_explored_edge_bytes,
+    max_scanned_rows: ?u32 = null,
     tensor_access_path: GraphTensorAccessPathJson,
     tensor_program: std.json.Value,
 };
@@ -379,10 +432,13 @@ pub const GraphEdgeJson = struct {
     created_at: u64,
     updated_at: u64,
     metadata: []const u8 = "",
+    winner_rank: u64 = std.math.maxInt(u64),
+    winner_key_hex: []const u8 = "",
 };
 
 pub const GraphEdgesResponseJson = struct {
     edges: []const GraphEdgeJson,
+    scanned_rows: ?u32 = null,
 };
 
 pub fn jsonStringifyAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
@@ -419,9 +475,24 @@ pub fn parseGraphHydrateRequest(alloc: std.mem.Allocator, body: []const u8) !Gra
     errdefer if (incoming_index_name.len > 0) alloc.free(incoming_index_name);
     const fields = try dupConstStrings(alloc, parsed.value.fields);
     errdefer freeConstStrings(alloc, fields);
+    const metric_index_name = if (parsed.value.metric_index_name != null and parsed.value.metric_index_name.?.len > 0)
+        try alloc.dupe(u8, parsed.value.metric_index_name.?)
+    else
+        "";
+    errdefer if (metric_index_name.len > 0) alloc.free(@constCast(metric_index_name));
+    const metric_reads = try parseGraphMetricReads(alloc, parsed.value.metric_reads orelse &.{});
+    errdefer freeGraphMetricReads(alloc, metric_reads);
 
     const out = GraphHydrateRequest{
         .keys = keys,
+        .metric_index_name = metric_index_name,
+        .metric_index_name_owned = metric_index_name.len > 0,
+        .metric_index_identity = .{
+            .incarnation = parsed.value.metric_index_incarnation orelse 0,
+            .config_hash = parsed.value.metric_index_config_hash orelse 0,
+        },
+        .metric_reads = metric_reads,
+        .legacy_wire_request = parsed.value.metric_index_name == null and parsed.value.metric_index_incarnation == null and parsed.value.metric_index_config_hash == null and parsed.value.metric_reads == null,
         .topology_epoch = parsed.value.topology_epoch,
         .identity_read_generation = identity_read_generation,
         .filter_query_json = filter_query_json,
@@ -439,6 +510,8 @@ pub fn parseGraphHydrateRequest(alloc: std.mem.Allocator, body: []const u8) !Gra
             .config_hash = parsed.value.incoming_index_config_hash,
         },
         .incoming_index_name_owned = incoming_index_name.len > 0,
+        .incoming_ttl_now_ns = parsed.value.incoming_ttl_now_ns orelse 0,
+        .incoming_max_scanned_rows = @min(parsed.value.incoming_max_scanned_rows orelse graph_pattern_mod.default_max_explored_edges, graph_pattern_mod.default_max_explored_edges),
         .resolved_doc_filter = if (parsed_filter) |filter| filter.resolved_doc_filter else null,
         .resolved_doc_filter_owned = parsed_filter != null,
         .resolved_doc_filter_wire_context = if (parsed_filter) |filter| filter.context else null,
@@ -448,12 +521,7 @@ pub fn parseGraphHydrateRequest(alloc: std.mem.Allocator, body: []const u8) !Gra
 }
 
 pub fn encodeGraphHydrateResponse(alloc: std.mem.Allocator, res: GraphHydrateResponse) ![]u8 {
-    return try jsonStringifyAlloc(alloc, GraphHydrateResponseJson{
-        .hits = res.hits,
-        .has_incoming = res.has_incoming,
-        .incoming_index_incarnation = res.incoming_index_identity.incarnation,
-        .incoming_index_config_hash = res.incoming_index_identity.config_hash,
-    });
+    return encodeGraphHydrateResponseForWire(alloc, res, false);
 }
 
 pub fn identityGenerationFromResolvedFilterEnvelope(
@@ -481,7 +549,8 @@ pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !Graph
         tensor_access_path,
         &tensor_program,
     );
-    try validateGraphEdgesReadLimits(parsed.value.max_edges, parsed.value.max_owned_bytes);
+    const max_scanned_rows = parsed.value.max_scanned_rows orelse @as(u32, graph_pattern_mod.default_max_explored_edges);
+    try validateGraphEdgesReadLimits(parsed.value.max_edges, parsed.value.max_owned_bytes, max_scanned_rows);
     return .{
         .index_name = try alloc.dupe(u8, parsed.value.index_name),
         .key = try alloc.dupe(u8, parsed.value.key),
@@ -493,35 +562,26 @@ pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !Graph
         else
             .out,
         .topology_epoch = parsed.value.topology_epoch,
+        .ttl_now_ns = parsed.value.ttl_now_ns orelse 0,
         .identity_read_generation = parsed.value.identity_read_generation,
         .max_edges = parsed.value.max_edges,
         .max_owned_bytes = parsed.value.max_owned_bytes,
+        .max_scanned_rows = max_scanned_rows,
+        .legacy_wire_request = parsed.value.ttl_now_ns == null and parsed.value.max_scanned_rows == null,
         .tensor_access_path = tensor_access_path,
         .tensor_program = tensor_program,
     };
 }
 
-pub fn validateGraphEdgesReadLimits(max_edges: u32, max_owned_bytes: u32) !void {
+pub fn validateGraphEdgesReadLimits(max_edges: u32, max_owned_bytes: u32, max_scanned_rows: u32) !void {
     if (max_edges == 0 or max_edges > graph_pattern_mod.default_max_explored_edges or
-        max_owned_bytes == 0 or max_owned_bytes > graph_pattern_mod.default_max_explored_edge_bytes)
+        max_owned_bytes == 0 or max_owned_bytes > graph_pattern_mod.default_max_explored_edge_bytes or
+        max_scanned_rows == 0 or max_scanned_rows > graph_pattern_mod.default_max_explored_edges)
         return error.InvalidQueryRequest;
 }
 
 pub fn encodeGraphEdgesResponse(alloc: std.mem.Allocator, res: GraphEdgesResponse) ![]u8 {
-    const edges = try alloc.alloc(GraphEdgeJson, res.edges.len);
-    defer alloc.free(edges);
-    for (res.edges, 0..) |edge, i| {
-        edges[i] = .{
-            .source = edge.source,
-            .target = edge.target,
-            .edge_type = edge.edge_type,
-            .weight = edge.weight,
-            .created_at = edge.created_at,
-            .updated_at = edge.updated_at,
-            .metadata = edge.metadata,
-        };
-    }
-    return try jsonStringifyAlloc(alloc, GraphEdgesResponseJson{ .edges = edges });
+    return encodeGraphEdgesResponseForWire(alloc, res, false);
 }
 
 pub fn cloneGraphPath(
@@ -786,6 +846,9 @@ pub fn frontierItemToSearchRequest(
     return .{
         .query = .{ .match_all = {} },
         .graph_queries = graph_queries,
+        .graph_ttl_now_ns = req.ttl_now_ns,
+        .graph_execution_limits = .{ .max_explored_edges = req.max_scanned_rows },
+        .graph_physical_scan_observation = req.physical_scan_observation,
         .limit = 0,
         .include_stored = true,
         .identity_read_generation = req.identity_read_generation,
@@ -879,6 +942,8 @@ pub fn parseGraphMetricReads(
         alloc.free(out);
     }
     for (metrics, 0..) |metric, i| {
+        if (metric.damping != null or (metric.seed_nodes != null and metric.seed_nodes.?.len != 0))
+            return error.GraphMetricPersonalizationUnsupported;
         out[i] = .{
             .name = try alloc.dupe(u8, metric.name),
             .freshness = if (std.mem.eql(u8, metric.freshness, "fresh"))
@@ -897,6 +962,7 @@ pub fn dupGraphMetricReads(
     alloc: std.mem.Allocator,
     metrics: []const graph_query_mod.GraphMetricRead,
 ) ![]graph_query_mod.GraphMetricRead {
+    try validateGraphMetricReadsForDistributedTransport(metrics);
     if (metrics.len == 0) return @constCast((&[_]graph_query_mod.GraphMetricRead{})[0..]);
     const out = try alloc.alloc(graph_query_mod.GraphMetricRead, metrics.len);
     var initialized: usize = 0;
@@ -925,6 +991,9 @@ pub fn freeGraphMetricReads(
 pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !GraphExpandRequest {
     var parsed = try std.json.parseFromSlice(GraphExpandRequestJson, alloc, body, .{});
     defer parsed.deinit();
+    const max_scanned_rows: u32 = parsed.value.max_scanned_rows orelse @intCast(graph_pattern_mod.default_max_explored_edges);
+    if (max_scanned_rows == 0 or max_scanned_rows > graph_pattern_mod.default_max_explored_edges)
+        return error.InvalidQueryRequest;
 
     if (parsed.value.params.algebraic_semiring and parsed.value.tensor_access_path == null) return error.InvalidQueryRequest;
     if (parsed.value.params.algebraic_semiring and parsed.value.tensor_program == null) return error.InvalidQueryRequest;
@@ -1012,6 +1081,9 @@ pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !Grap
         .include_metric_status = parsed.value.include_metric_status,
         .defer_result_limit = parsed.value.defer_result_limit,
         .topology_epoch = parsed.value.topology_epoch,
+        .ttl_now_ns = parsed.value.ttl_now_ns orelse 0,
+        .max_scanned_rows = max_scanned_rows,
+        .legacy_wire_request = parsed.value.ttl_now_ns == null and parsed.value.max_scanned_rows == null,
         .identity_read_generation = identity_read_generation,
         .resolved_doc_filter = if (parsed_filter) |filter| filter.resolved_doc_filter else null,
         .resolved_doc_filter_owned = parsed_filter != null,
@@ -1046,20 +1118,7 @@ pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !Grap
 }
 
 pub fn encodeGraphExpandResponse(alloc: std.mem.Allocator, res: GraphExpandResponse) ![]u8 {
-    const expansions = try alloc.alloc(GraphExpansionJson, res.expansions.len);
-    defer alloc.free(expansions);
-    for (res.expansions, 0..) |expansion, i| {
-        expansions[i] = .{
-            .frontier_id = expansion.frontier_id,
-            .frontier_key = expansion.frontier_key,
-            .name = expansion.graph_result.name,
-            .total = @intCast(expansion.graph_result.total_hits),
-            .nodes = expansion.graph_result.nodes,
-            .hits = expansion.graph_result.hits,
-            .metric_status = expansion.graph_result.metric_status,
-        };
-    }
-    return try jsonStringifyAlloc(alloc, GraphExpandResponseJson{ .expansions = expansions });
+    return encodeGraphExpandResponseForWire(alloc, res, false);
 }
 
 pub fn cloneGraphSearchResult(
@@ -1817,4 +1876,86 @@ pub fn freeOwnedPathEdge(alloc: std.mem.Allocator, edge: graph_query_mod.PathEdg
     alloc.free(edge.target);
     alloc.free(edge.edge_type);
     if (edge.metadata.len > 0) alloc.free(edge.metadata);
+}
+
+const LegacyGraphEdgeJson = struct {
+    source: []const u8,
+    target: []const u8,
+    edge_type: []const u8,
+    weight: f64,
+    created_at: u64,
+    updated_at: u64,
+    metadata: []const u8 = "",
+};
+
+pub fn encodeGraphHydrateResponseForWire(alloc: std.mem.Allocator, res: GraphHydrateResponse, legacy: bool) ![]u8 {
+    return try jsonStringifyAlloc(alloc, GraphHydrateResponseJson{
+        .hits = res.hits,
+        .has_incoming = res.has_incoming,
+        .has_physical_incoming = if (legacy or res.incoming_ttl_now_ns == null) null else res.has_physical_incoming,
+        .metric_scores = if (legacy) null else res.metric_scores,
+        .metric_status = if (legacy) null else res.metric_status,
+        .incoming_index_incarnation = res.incoming_index_identity.incarnation,
+        .incoming_index_config_hash = res.incoming_index_identity.config_hash,
+        .incoming_ttl_now_ns = if (legacy) null else res.incoming_ttl_now_ns,
+        .incoming_scanned_rows = if (legacy) null else res.incoming_scanned_rows,
+    });
+}
+
+pub fn encodeGraphEdgesResponseForWire(alloc: std.mem.Allocator, res: GraphEdgesResponse, legacy: bool) ![]u8 {
+    if (res.scanned_rows < res.edges.len) return error.InvalidGraphEdgesResponse;
+    if (legacy) {
+        const edges = try alloc.alloc(LegacyGraphEdgeJson, res.edges.len);
+        defer alloc.free(edges);
+        for (res.edges, 0..) |edge, i| edges[i] = .{
+            .source = edge.source,
+            .target = edge.target,
+            .edge_type = edge.edge_type,
+            .weight = edge.weight,
+            .created_at = edge.created_at,
+            .updated_at = edge.updated_at,
+            .metadata = edge.metadata,
+        };
+        return jsonStringifyAlloc(alloc, .{ .edges = edges });
+    }
+    const edges = try alloc.alloc(GraphEdgeJson, res.edges.len);
+    defer alloc.free(edges);
+    for (res.edges, 0..) |edge, i| {
+        edges[i] = .{
+            .source = edge.source,
+            .target = edge.target,
+            .edge_type = edge.edge_type,
+            .weight = edge.weight,
+            .created_at = edge.created_at,
+            .updated_at = edge.updated_at,
+            .metadata = edge.metadata,
+            .winner_rank = edge.winner_rank,
+            .winner_key_hex = edge.winner_key_hex,
+        };
+    }
+    return try jsonStringifyAlloc(alloc, GraphEdgesResponseJson{ .edges = edges, .scanned_rows = res.scanned_rows });
+}
+
+pub fn encodeGraphExpandResponseForWire(alloc: std.mem.Allocator, res: GraphExpandResponse, legacy: bool) ![]u8 {
+    const expansions = try alloc.alloc(GraphExpansionJson, res.expansions.len);
+    defer alloc.free(expansions);
+    for (res.expansions, 0..) |expansion, i| {
+        expansions[i] = .{
+            .frontier_id = expansion.frontier_id,
+            .frontier_key = expansion.frontier_key,
+            .name = expansion.graph_result.name,
+            .total = @intCast(expansion.graph_result.total_hits),
+            .nodes = expansion.graph_result.nodes,
+            .hits = expansion.graph_result.hits,
+            .metric_status = expansion.graph_result.metric_status,
+        };
+    }
+    return try jsonStringifyAlloc(alloc, GraphExpandResponseJson{ .expansions = expansions, .scanned_rows = if (legacy) null else res.scanned_rows });
+}
+
+pub fn validateGraphMetricReadsForDistributedTransport(metrics: []const graph_query_mod.GraphMetricRead) !void {
+    for (metrics) |metric| {
+        if (metric.seed_nodes.len != 0 or metric.damping != null)
+            return error.GraphMetricPersonalizationUnsupported;
+    }
 }

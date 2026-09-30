@@ -111,6 +111,8 @@ pub const WorkBudget = struct {
     max_retained_state_bytes: usize,
     remaining_nodes: usize,
     remaining_edges: usize,
+    /// Physical adjacency, probe, and contribution rows visited, including TTL-hidden rows.
+    remaining_physical_edges: usize,
     remaining_edge_bytes: usize,
     remaining_anchors: usize,
     retained_state_bytes: usize = 0,
@@ -133,6 +135,7 @@ pub const WorkBudget = struct {
             .max_retained_state_bytes = limits.max_retained_state_bytes,
             .remaining_nodes = limits.max_explored_nodes,
             .remaining_edges = limits.max_explored_edges,
+            .remaining_physical_edges = limits.max_explored_edges,
             .remaining_edge_bytes = limits.max_explored_edge_bytes,
             .remaining_anchors = limits.max_scanned_anchors,
         };
@@ -167,6 +170,11 @@ pub const WorkBudget = struct {
     pub fn consumeEdges(self: *WorkBudget, count: usize) !void {
         if (count > self.remaining_edges) return self.exhaust(.explored_edges, self.max_edges);
         self.remaining_edges -= count;
+    }
+
+    pub fn consumePhysicalEdges(self: *WorkBudget, count: usize) !void {
+        if (count > self.remaining_physical_edges) return self.exhaust(.explored_edges, self.max_edges);
+        self.remaining_physical_edges -= count;
     }
 
     pub fn consumeEdgeBytes(self: *WorkBudget, bytes: usize) !void {
