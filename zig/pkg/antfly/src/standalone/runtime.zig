@@ -11433,6 +11433,9 @@ test "standalone initial external MATCH PARTIAL FK cancellation retires private 
 fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
     const alloc = std.testing.allocator;
     const publication = @import("../metadata/fk_generation_publication.zig");
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
     var tmp = std.testing.tmpDir(.{});
     var preserve = false;
     defer if (!preserve) tmp.cleanup();
@@ -11465,6 +11468,15 @@ fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
     };
     try std.testing.expect(metadata.localFkPublicationSupported());
     try server.initApiServer();
+    // The data server's control round schedules session maintenance in the
+    // background, which independently drives this same FK initial-create
+    // publication via advanceFkInitialCreateBackgroundOnce. Left unpaused,
+    // that background driver races the explicit FkInitialCreateTestDriver
+    // steps below and can finish (or publish) the whole flow before the
+    // loop observes the phase it means to act on, exactly how the
+    // cancellation path intermittently missed its .staging_parents window.
+    // Pause it, matching the hosted FK fault-injection e2e tests.
+    try antfly.public_api.ApiHttpServer.FkInitialCreateTestDriver.pauseBackground(&server.http_server.?, io);
 
     const parent_schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"parent_key","columns":["a","b"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"],"additionalProperties":false}}}}
@@ -11500,9 +11512,6 @@ fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
     defer metadata.lifecycle_store.?.freeTables(alloc, before);
     try std.testing.expectEqual(@as(usize, 1), before.len);
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
     var lost_parent_reply = false;
     var cancel_requested = false;
     var terminal = false;
@@ -11575,6 +11584,9 @@ fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
             metadata.attachRestoreRetirementOwnership();
             opened = true;
             try server.initApiServer();
+            // The restart replaces http_server with a fresh instance whose
+            // background session-maintenance scheduler starts unpaused.
+            try antfly.public_api.ApiHttpServer.FkInitialCreateTestDriver.pauseBackground(&server.http_server.?, io);
         } else antfly.public_api.ApiHttpServer.FkInitialCreateTestDriver.step(&server.http_server.?, .none) catch |err| switch (err) {
             // The background driver can advance the same durable intent
             // between work selection and its revision-fenced acknowledgement.
