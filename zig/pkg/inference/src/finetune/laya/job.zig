@@ -36,6 +36,9 @@ pub const Config = struct {
     gradient_accumulation: u32 = 1,
     encoder_lr: f32 = 2.5e-5,
     head_lr: f32 = 1e-4,
+    /// Learning rate of a pointer head (`decision_head: .pointer`), which
+    /// starts from scratch rather than from the released scorer.
+    pointer_lr: f32 = 1e-3,
     weight_decay: f32 = 0.01,
     max_grad_norm: f32 = 1,
     head_dropout: f32 = 0.1,
@@ -136,7 +139,7 @@ pub fn validate(c: Config) !void {
         c.checkpoint_every_steps == 0 or c.max_host_bytes < 64 * 1024 * 1024 or c.max_host_bytes > 128 * 1024 * 1024 * 1024 or
         c.max_backend_bytes < 256 * 1024 * 1024 or c.max_backend_bytes > 64 * 1024 * 1024 * 1024)
         return error.InvalidLayaJob;
-    for ([_]f32{ c.encoder_lr, c.head_lr, c.sigma_start, c.sigma_end, c.max_grad_norm }) |v| if (!std.math.isFinite(v) or v <= 0) return error.InvalidLayaJob;
+    for ([_]f32{ c.encoder_lr, c.head_lr, c.pointer_lr, c.sigma_start, c.sigma_end, c.max_grad_norm }) |v| if (!std.math.isFinite(v) or v <= 0) return error.InvalidLayaJob;
     if (!std.math.isFinite(c.weight_decay) or c.weight_decay < 0 or !std.math.isFinite(c.head_dropout) or c.head_dropout < 0 or c.head_dropout >= 1) return error.InvalidLayaJob;
     for ([_][]const u8{ c.model_dir, c.train_file, c.eval_file, c.output_dir }) |value| if (!std.fs.path.isAbsolute(value)) return error.LayaJobRequiresAbsolutePaths;
     if (c.resume_from) |value| if (!std.fs.path.isAbsolute(value)) return error.LayaJobRequiresAbsolutePaths;
@@ -766,6 +769,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         .groups = &.{
             .{ .optimizer = .{ .weight_decay = c.weight_decay }, .schedule = .{ .cosine = .{ .initial_lr = c.encoder_lr, .min_lr = @min(c.encoder_lr, 1e-6), .total_steps = steps } } },
             .{ .optimizer = .{ .weight_decay = c.weight_decay }, .schedule = .{ .cosine = .{ .initial_lr = c.head_lr, .min_lr = @min(c.head_lr, 1e-6), .total_steps = steps } } },
+            .{ .optimizer = .{ .weight_decay = c.weight_decay }, .schedule = .{ .cosine = .{ .initial_lr = c.pointer_lr, .min_lr = @min(c.pointer_lr, 1e-6), .total_steps = steps } } },
         },
         .grad_accum_steps = c.gradient_accumulation,
         .max_grad_norm = c.max_grad_norm,

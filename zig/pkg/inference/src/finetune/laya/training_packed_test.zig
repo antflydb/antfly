@@ -50,7 +50,7 @@ const Harness = struct {
         errdefer owner.deinit();
         const vtable = try scratch.create(@import("../../ops/ops.zig").ComputeBackend.VTable);
         @import("cpu.zig").install(&owner.cb, vtable);
-        const trainer = try train.controller.Trainer.init(a, &owner.cb, parameters, .{ .execution = .native, .limits = .{ .max_state_bytes = 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } } } });
+        const trainer = try train.controller.Trainer.init(a, &owner.cb, parameters, .{ .execution = .native, .limits = .{ .max_state_bytes = 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } } } });
         return .{ .program = program, .owner = owner, .trainer = trainer, .store = store, .vtable = vtable };
     }
     fn deinit(self: *Harness) void {
@@ -132,6 +132,73 @@ test "laya packed training graph matches packed serving logits, alone and in a p
     };
 }
 
+// Resident Metal training gathers the requested rows of a LayerNorm output,
+// as it does of any other tensor (it used to return row 0 for every index).
+test "laya resident Metal gathers rows of a LayerNorm output" {
+    if (!@import("build_options").enable_metal or !@import("../../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const interpreter = @import("../../graph/interpreter.zig");
+    const ml = @import("ml").graph;
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const rows = 6;
+    const width = 64;
+    const table_values = try scratch.alloc(f32, rows * width);
+    for (table_values, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 37) % 23)) * 0.1 - 1 + @as(f32, @floatFromInt(i / width));
+    const gamma_values = try scratch.alloc(f32, width);
+    @memset(gamma_values, 1);
+    const beta_values = try scratch.alloc(f32, width);
+    @memset(beta_values, 0);
+    const picks = [_]i32{ 4, 1, 5, 2 };
+    var outputs: [2][2][]f32 = undefined;
+    for ([_]train.controller.Execution{ .native, .resident_metal }, &outputs) |execution, *out| {
+        var graph = ml.Graph.init(a);
+        defer graph.deinit();
+        var b = ml.Builder.init(&graph);
+        const table = try b.parameter("table", ml.Shape.init(.f32, &.{ rows, width }));
+        const gamma = try b.parameter("gamma", ml.Shape.init(.f32, &.{width}));
+        const beta = try b.parameter("beta", ml.Shape.init(.f32, &.{width}));
+        const indices = try b.parameter("__indices", ml.Shape.init(.i32, &.{picks.len}));
+        const normalized = b.graph.node(try b.layerNorm(table, gamma, beta, width, 1e-5)).vjp_alternate;
+        const direct = try b.gather(table, indices, ml.Shape.init(.f32, &.{ picks.len, width }));
+        const of_norm = try b.gather(normalized, indices, ml.Shape.init(.f32, &.{ picks.len, width }));
+        try graph.markOutput(direct);
+        try graph.markOutput(of_norm);
+        const names = [_][]const u8{ "table", "gamma", "beta" };
+        const dims = [_][]const i32{ &.{ rows, width }, &.{width}, &.{width} };
+        const values = [_][]const f32{ table_values, gamma_values, beta_values };
+        const originals = try scratch.alloc(run.Parameter, 3);
+        const selected = try scratch.alloc(train.controller.Parameter, 3);
+        for (names, dims, values, originals, selected) |name, d, v, *o, *sel| {
+            o.* = .{ .name = name, .canonical_name = name, .dimensions = d, .values = v, .kind = .original };
+            sel.* = .{ .name = name, .dimensions = d, .values = v, .group = 0 };
+        }
+        var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        const owner = try backend.Owner.init(a, &store, originals, selected, execution, .{}, null);
+        defer owner.deinit();
+        var cpu_vtable: @import("../../ops/ops.zig").ComputeBackend.VTable = undefined;
+        @import("cpu.zig").install(&owner.cb, &cpu_vtable);
+        const cb = &owner.cb;
+        var trainer = try train.controller.Trainer.init(a, cb, selected, .{ .execution = execution, .limits = .{ .max_state_bytes = 64 * 1024 * 1024 }, .groups = &.{.{ .schedule = .{ .constant = 0 } }} });
+        defer trainer.deinit();
+        var binding = try trainer.bind(&graph, null);
+        defer binding.deinit();
+        const index_value = (try cb.fromInt32Shape(&picks, &.{picks.len})) orelse return error.SkipZigTest;
+        defer cb.free(index_value);
+        const combined = try std.mem.concat(scratch, interpreter.RuntimeInput, &.{ binding.inputs, &.{.{ .node_id = indices, .value = index_value }} });
+        var result = try train.executeFramed(a, &graph, cb, combined);
+        defer result.deinit(cb);
+        for (out, result.outputs[0..2]) |*dst, output| dst.* = try cb.toFloat32(output, scratch);
+    }
+    for (0..2) |which| {
+        var worst: f32 = 0;
+        for (outputs[0][which], outputs[1][which]) |want, got| worst = @max(worst, @abs(want - got));
+        std.debug.print("Laya resident gather {s}: native vs Metal max error={d}\n", .{ if (which == 0) "of the table" else "of a LayerNorm output", worst });
+        try std.testing.expect(worst < 1e-4);
+    }
+}
+
 // Every parameter gradient of a packed pointer-head model agrees between the
 // native and the resident Metal training backends. Guards the resident Metal
 // gather-from-LayerNorm fault that made every pointer score identical.
@@ -168,7 +235,7 @@ test "laya pointer head gradients agree between native and resident Metal" {
         var cpu_vtable: @import("../../ops/ops.zig").ComputeBackend.VTable = undefined;
         @import("cpu.zig").install(&owner.cb, &cpu_vtable);
         const cb = &owner.cb;
-        var trainer = try train.controller.Trainer.init(a, cb, parameters, .{ .execution = execution, .limits = .{ .max_state_bytes = 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } } } });
+        var trainer = try train.controller.Trainer.init(a, cb, parameters, .{ .execution = execution, .limits = .{ .max_state_bytes = 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } } } });
         defer trainer.deinit();
         var prng = std.Random.DefaultPrng.init(715);
         const runtime = try train.inputs(scratch, cb, &program.graph, program.built, config, &examples, prng.random(), false, false);

@@ -141,8 +141,8 @@ fn loraInitA(a: std.mem.Allocator, dims: []const i32, seed: u64, name: []const u
 /// A LoRA `.lora_A`/`.lora_B` parameter has no source tensor: `A` gets a
 /// Kaiming-uniform draw and `B` is zero, so training starts identical to the
 /// unmodified base model (`graph.zig`'s `Lora` doc comment). A pointer head
-/// missing from the source (`laya.decision_head`) starts the same way: its
-/// query projection is zero, so it starts as a uniform decision.
+/// missing from the source (`laya.decision_head`) gets Kaiming-uniform
+/// projections, zero biases and an identity `pointer.norm`.
 pub fn parameters(a: std.mem.Allocator, graph: *const ml.Graph, reader: *const tensors.MMapReader, freeze_layers: u32, lora: ?architecture.Lora, seed: u64) ![]controller.Parameter {
     var out: std.ArrayListUnmanaged(controller.Parameter) = .empty;
     for (graph.parameters.items) |id| {
@@ -160,17 +160,14 @@ pub fn parameters(a: std.mem.Allocator, graph: *const ml.Graph, reader: *const t
             @memset(zeros, 0);
             break :blk zeros;
         } else if (std.mem.startsWith(u8, name, "pointer.") and reader.header.tensors.get(name) == null) blk: {
-            // A new pointer head on a scorer checkpoint. `pointer.norm`
-            // starts as the identity; `pointer.k` gets a seeded
-            // Kaiming-uniform draw and `pointer.q` zeros, so every logit
-            // starts at 0 (a uniform decision) and still gets a gradient,
-            // as a LoRA adapter's `B` does. Biases start at zero.
+            // A new pointer head on a scorer checkpoint: `pointer.norm`
+            // starts as the identity, and both projections get a seeded
+            // Kaiming-uniform draw (`nn.Linear`'s default) with zero biases.
+            // Over normalized rows that gives modest starting logits; a zero
+            // query would sit at a saddle where the keys get no gradient.
+            if (std.mem.endsWith(u8, name, ".weight") and !std.mem.eql(u8, name, "pointer.norm.weight")) break :blk try loraInitA(a, dims, seed, name);
             const count = shape.numElements() orelse return error.InvalidLayaTrainingWeightShape;
             const values = try a.alloc(f32, @intCast(count));
-            if (std.mem.eql(u8, name, "pointer.k.weight")) {
-                a.free(values);
-                break :blk try loraInitA(a, dims, seed, name);
-            }
             @memset(values, if (std.mem.eql(u8, name, "pointer.norm.weight")) 1 else 0);
             break :blk values;
         } else blk: {
@@ -179,9 +176,18 @@ pub fn parameters(a: std.mem.Allocator, graph: *const ml.Graph, reader: *const t
             if (!std.mem.eql(i64, tensor.shape, shape.dims[0..shape.rank()])) return error.InvalidLayaTrainingWeightShape;
             break :blk try floatValues(a, tensor);
         };
-        try out.append(a, .{ .name = try a.dupe(u8, name), .values = values, .dimensions = dims, .group = if (std.mem.startsWith(u8, name, "encoder.")) 0 else 1 });
+        try out.append(a, .{ .name = try a.dupe(u8, name), .values = values, .dimensions = dims, .group = parameterGroup(name) });
     }
     return out.toOwnedSlice(a);
+}
+
+/// Optimizer group of a parameter: 0 encoder, 1 decision and action heads,
+/// 2 a pointer head (`laya.decision_head`), which starts from scratch and
+/// gets its own learning rate (`job.Config.pointer_lr`).
+pub fn parameterGroup(name: []const u8) u8 {
+    if (std.mem.startsWith(u8, name, "encoder.")) return 0;
+    if (std.mem.startsWith(u8, name, "pointer.")) return 2;
+    return 1;
 }
 
 pub fn layout(examples: []const Example) !architecture.Layout {

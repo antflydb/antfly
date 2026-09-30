@@ -11890,6 +11890,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const bias_metal = bias_buf.metal_tensor orelse return null;
         const indices_metal = indices_buf.metal_tensor orelse return null;
         if (!input_metal.isDevice() or !bias_metal.isDevice() or !indices_metal.isDevice()) return null;
+        // The fused kernel reads float indices. Integer indices (training's
+        // i32 runtime inputs) would be read as float bit patterns, which
+        // truncate to row 0; leave them to the typed gather and a separate add.
+        if (indices_buf.integer_storage or indices_metal.dtype != .f32 or input_metal.dtype != .f32 or bias_metal.dtype != .f32) return null;
         if (bias_metal.elemCount() != cols) return null;
         const index_count = indices_metal.elemCount();
         if (index_count == 0) return null;
