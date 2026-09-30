@@ -264,7 +264,7 @@ fn advanceOwner(host: anytype, alloc: std.mem.Allocator, plan: stages.Plan, plan
         },
         .fencing => {
             if (source_status.fence == null) {
-                try host.submitRewriteSource(target.table.name, .{ .relational_topology = .{ .fence = source_scope.fence, .action = .begin } }, context);
+                try host.submitRewriteSource(target.table.name, .{ .relational_topology = .{ .fence = source_scope.fence, .action = .begin, .generation_handoff = if (target.generation_handoffs.len != 0) .{ .plan_id = plan.id, .plan_digest = plan_digest } else null } }, context);
                 pending = true;
             } else {
                 if (!source_status.fence.?.eql(source_scope.fence)) return error.RestoreStagingScopeChanged;

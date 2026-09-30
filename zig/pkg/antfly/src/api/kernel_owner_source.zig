@@ -4691,7 +4691,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             var parsed = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, descriptor.descriptor.restore_bootstrap_json, .{});
             defer parsed.deinit();
             try parsed.value.validate();
-            if (!parsed.value.scope.empty_generation or parsed.value.empty_generation_handoff == null)
+            if (parsed.value.empty_generation_handoff == null)
                 return error.RestoreStagingScopeChanged;
         }
         const identity = descriptor.view().identity;

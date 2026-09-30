@@ -141,6 +141,7 @@ pub fn build(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.
     defer owned_support.deinit();
     const targets = try alloc.alloc(stages.Target, selected.len);
     var range_count: usize = 0;
+    var handoff_entries: usize = 0;
     var schema_bytes: usize = 0;
     for (selected, targets) |before, *target| {
         if (before.relational_retirement_json.len != 0 or before.restore_backup_id.len != 0) return error.TableTransitionActive;
@@ -174,7 +175,8 @@ pub fn build(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.
         const ranges = try alloc.alloc(records.RangeRecord, original_ranges.items.len);
         const scopes = try alloc.alloc(source.Scope, ranges.len);
         const fences = try alloc.alloc(topology.Fence, ranges.len);
-        for (original_ranges.items, ranges, scopes, fences, 0..) |original, *range, *scope, *fence, ordinal| {
+        const handoffs = try alloc.alloc(stages.GenerationHandoffRange, ranges.len);
+        for (original_ranges.items, ranges, scopes, fences, handoffs, 0..) |original, *range, *scope, *fence, *handoff, ordinal| {
             const group = identity(id, before.table_id, ordinal, "group");
             range.* = .{ .table_id = table_id, .group_id = group, .range_id = group, .doc_identity_shard_id = group, .doc_identity_range_id = group, .start_key = original.start_key, .end_key = original.end_key };
             scope.* = .{ .fence = .{ .role = .rewrite_source, .transition_id = std.mem.readInt(u64, id[0..8], .little), .attempt = 0, .admission_epoch = 0, .owner_group_id = original.group_id, .peer_group_id = group, .namespace = .{ .table_id = before.table_id, .shard_id = metadata.rangeDocIdentityShardId(original), .range_id = metadata.rangeDocIdentityRangeId(original) }, .catalog_digest = @splat(0) }, .receiver_namespace = .{ .table_id = table_id, .shard_id = group, .range_id = group }, .consumer_epoch = 0, .copy_attempt = .{} };
@@ -194,6 +196,21 @@ pub fn build(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.
             scope.copy_attempt = .{ .donor_term = facts.donor_term, .sequence = facts.next_copy_sequence };
             try scope.validate();
             fence.* = scope.fence;
+            const summary = facts.generation_handoff orelse return error.RestoreSourceProofMissing;
+            if (summary.admissions.len > @import("../storage/portable_backup.zig").max_source_generation_admissions)
+                return error.TransactionTooLarge;
+            handoff_entries += summary.admissions.len;
+            if (handoff_entries > 4096) return error.TransactionTooLarge;
+            if (!summary.namespace.eql(scope.fence.namespace) or summary.intent != null or summary.seal != null)
+                return error.TableTransitionActive;
+            // The observer owns its decoded RPC response. Retain only a
+            // bounded independent proof projection in the admitted plan.
+            const entries = try alloc.dupe(@import("../storage/portable_backup.zig").SourceGenerationAdmissionSummaryEntry, summary.admissions);
+            for (entries) |*entry| {
+                entry.child_table_name = try alloc.dupe(u8, entry.child_table_name);
+                entry.constraint_name = try alloc.dupe(u8, entry.constraint_name);
+            }
+            handoff.* = .{ .source_group_id = original.group_id, .target_group_id = group, .source_namespace = summary.namespace, .admissions = entries, .admissions_digest = summary.admissions_digest, .retired_digest = summary.retired_digest, .retired_count = summary.retired_count };
         }
         const source_schemas = source_manifest.definitions.items;
         schema_bytes +|= source_manifest.bytes +| table.schema_json.len +| table.read_schema_json.len +| table.indexes_json.len;
@@ -205,8 +222,9 @@ pub fn build(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.
         defer programs.deinit();
         table.table_id = table_id;
         table.min_ranges = @intCast(ranges.len);
-        target.* = .{ .source_table_id = before.table_id, .table = table, .ranges = ranges, .rewrite = .{ .preserve_document = document, .source_schemas = source_schemas, .target_schema = table.schema_json, .target_read_schema = if (document) table.read_schema_json else "", .program_digest = programs.identity }, .rewrite_sources = scopes, .replace = .{ .table = try metadata.cloneTable(alloc, before), .ranges = original_ranges.items, .fences = fences } };
+        target.* = .{ .source_table_id = before.table_id, .table = table, .ranges = ranges, .generation_handoffs = handoffs, .rewrite = .{ .preserve_document = document, .source_schemas = source_schemas, .target_schema = table.schema_json, .target_read_schema = if (document) table.read_schema_json else "", .program_digest = programs.identity }, .rewrite_sources = scopes, .replace = .{ .table = try metadata.cloneTable(alloc, before), .ranges = original_ranges.items, .fences = fences } };
     }
+    try stages.prepareEmptyGenerationHandoffMappingsAlloc(alloc, targets);
     var result: stages.Plan = .{ .id = id, .cohort_digest = @splat(0), .targets = targets, .preparing_sources = true };
     result.cohort_digest = try result.rewriteIntentDigest(alloc);
     try result.validate(alloc);
@@ -248,20 +266,27 @@ test "distributed txn rewrite admission closes current and historical dependenci
         released: usize = 0,
         eligible: bool = true,
         tables: []const records.TableRecord,
+        alloc: std.mem.Allocator,
         one_schema: [1][]const u8 = undefined,
+        entries: [1]@import("../storage/portable_backup.zig").SourceGenerationAdmissionSummaryEntry = undefined,
         fn readFacts(self: *@This(), name: []const u8, request: wire.Request) !wire.AdmissionFacts {
             try request.validate();
             self.calls += 1;
             self.one_schema[0] = for (self.tables) |table| {
                 if (std.mem.eql(u8, table.name, name)) break tables_api.effectiveSchemaJson(table.schema_json);
             } else return error.TableNotFound;
-            return .{ .namespace = request.scope.fence.namespace, .eligible = self.eligible, .source_schemas = &self.one_schema, .catalog_digest = @splat(5), .next_topology_epoch = 1, .next_consumer_epoch = 1, .donor_term = 1, .next_copy_sequence = 1 };
+            const admissions = if (std.mem.eql(u8, name, "parents")) entries: {
+                const before = self.tables[1];
+                self.entries[0] = .{ .child_table_id = before.table_id, .child_table_name = before.name, .constraint_name = "fk", .active_generation = try stages.plannedForeignGeneration(self.alloc, .{ .source_table_id = before.table_id, .table = before, .ranges = &.{} }, "fk"), .source_scope_digest = @splat(3) };
+                break :entries self.entries[0..];
+            } else self.entries[0..0];
+            return .{ .namespace = request.scope.fence.namespace, .eligible = self.eligible, .source_schemas = &self.one_schema, .generation_handoff = .{ .namespace = request.scope.fence.namespace, .admissions = admissions, .admissions_digest = try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(request.scope.fence.namespace, admissions), .retired_digest = @splat(7), .retired_count = 0, .intent = null, .seal = null }, .catalog_digest = @splat(5), .next_topology_epoch = 1, .next_consumer_epoch = 1, .donor_term = 1, .next_copy_sequence = 1 };
         }
         fn releaseFacts(self: *@This(), _: wire.AdmissionFacts) void {
             self.released += 1;
         }
     };
-    var observer = Observer{ .tables = &tables };
+    var observer = Observer{ .tables = &tables, .alloc = alloc };
     const plan = try build(alloc, try stages.idForAttempt(19, 1), cohort, &ranges, "parents", proposed, &observer);
     try std.testing.expect(plan.preparing_sources);
     try std.testing.expectEqual(@as(usize, 3), observer.calls);
@@ -300,6 +325,34 @@ test "distributed txn rewrite admission closes current and historical dependenci
         target.source_artifacts = artifacts;
     }
     try frozen.validate(alloc);
+    const frozen_digest = try frozen.digest(alloc);
+    for (frozen.targets) |target| {
+        const descriptor = try stages.ownerBootstrapForRangeIndex(alloc, frozen, frozen_digest, target, 0);
+        try std.testing.expect(!descriptor.scope.empty_generation);
+        try std.testing.expect(descriptor.empty_generation_handoff != null);
+        const mapped = (try stages.mappedEmptyGenerationHandoffForGroup(alloc, frozen, frozen_digest, target.ranges[0].group_id)).?;
+        try std.testing.expectEqual(mapped.expected_receipt_digest, descriptor.empty_generation_handoff.?.expected_install_receipt_digest);
+    }
+    const pinned_handoffs = frozen_targets[0].generation_handoffs;
+    frozen_targets[0].generation_handoffs = &.{};
+    try std.testing.expectError(error.RestoreSourceProofMissing, frozen.validate(alloc));
+    frozen_targets[0].generation_handoffs = pinned_handoffs;
+    var removed = frozen;
+    const removed_targets = try alloc.dupe(stages.Target, frozen_targets);
+    removed.targets = removed_targets;
+    for (removed_targets) |*target| if (target.source_table_id == 11) {
+        target.table.schema_json = parent;
+        target.rewrite.?.target_schema = parent;
+    };
+    try stages.prepareEmptyGenerationHandoffMappingsAlloc(alloc, removed_targets);
+    try removed.validate(alloc);
+    for (removed_targets) |target| if (target.source_table_id == 10) {
+        // Removing the declaration retires its old authority. Its complete
+        // source proof survives, but no acceptance is installed on the new
+        // parent namespace for that removed FK.
+        try std.testing.expectEqual(@as(usize, 1), target.generation_handoffs[0].admissions.len);
+        try std.testing.expectEqual(@as(usize, 0), target.generation_handoffs[0].mappings.len);
+    };
     const unbound = try alloc.dupe(stages.SourceArtifact, frozen.targets[0].source_artifacts);
     unbound[0].rewrite = null;
     frozen_targets[0].source_artifacts = unbound;

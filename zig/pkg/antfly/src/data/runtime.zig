@@ -11550,35 +11550,15 @@ pub const DataServer = struct {
         if (!std.mem.eql(u8, &job.plan_digest, &(try job.plan.digest(alloc)))) return error.RestoreStagingScopeChanged;
         for (job.plan.targets) |target| {
             if (!std.mem.eql(u8, target.table.name, table_name)) continue;
-            for (target.ranges) |range| {
+            for (target.ranges, 0..) |range, range_index| {
                 if (range.group_id != group_id) continue;
-                const scope = try stages.ownerScope(alloc, job.plan, job.plan_digest, target, range);
+                const bootstrap = try stages.ownerBootstrapForRangeIndex(alloc, job.plan, job.plan_digest, target, range_index);
+                const scope = bootstrap.scope;
                 if (!std.mem.eql(u8, &scope.digest(), &digest)) return error.RestoreStagingScopeChanged;
                 const schema_json = try alloc.dupe(u8, target.table.schema_json);
                 errdefer alloc.free(schema_json);
                 const indexes_json = try alloc.dupe(u8, target.table.indexes_json);
                 errdefer alloc.free(indexes_json);
-                const handoff = if (scope.empty_generation)
-                    (try stages.mappedEmptyGenerationHandoffForGroup(alloc, job.plan, job.plan_digest, range.group_id)) orelse return error.RestoreStagingScopeChanged
-                else
-                    null;
-                const bootstrap: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap = .{
-                    .scope = scope,
-                    .table_name = table_name,
-                    .schema_json = target.table.schema_json,
-                    .read_schema_json = target.table.read_schema_json,
-                    .indexes_json = target.table.indexes_json,
-                    .byte_range = .{ .start = range.start_key, .end = range.end_key orelse "" },
-                    .source_generation_proof_digest = try stages.sourceGenerationProofDigestForGroup(job.plan, range.group_id),
-                    .generation_admission = try stages.expectedGenerationAdmissionReceiptForGroup(alloc, job.plan, job.plan_digest, range.group_id),
-                    .empty_generation_handoff = if (handoff) |mapped| .{
-                        .source_summary_digest = mapped.command.source_summary_digest,
-                        .retired_digest = mapped.command.retired_digest,
-                        .retired_count = mapped.command.retired_count,
-                        .expected_install_receipt_digest = mapped.expected_receipt_digest,
-                    } else null,
-                };
-                try bootstrap.validate();
                 const encoded = try std.json.Stringify.valueAlloc(alloc, bootstrap, .{});
                 return .{ .descriptor = .{ .lsm_root_generation = self.provisioned_storage.groupVisibleRootGenerationSource().visibleRootGenerationForGroup(group_id), .identity = .{ .table_id = scope.target_namespace.table_id, .shard_id = scope.target_namespace.shard_id, .range_id = scope.target_namespace.range_id }, .schema_json = schema_json, .indexes_json = indexes_json, .table_storage = target.table.storage, .restore_bootstrap_json = encoded } };
             }

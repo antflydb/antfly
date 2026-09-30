@@ -3931,9 +3931,14 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         .replace = .{ .table = original, .ranges = &.{original_range}, .fences = &.{source.fence} },
         .rewrite_sources = &.{source},
         .rewrite = .{ .preserve_document = true, .source_schemas = &.{schema_json}, .target_schema = schema_json, .program_digest = @splat(6) },
+        .generation_handoffs = &.{.{ .source_group_id = 301, .target_group_id = 401, .source_namespace = source.fence.namespace, .admissions = &.{}, .admissions_digest = try @import("../../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(source.fence.namespace, &.{}), .retired_digest = @splat(8), .retired_count = 0 }},
     }};
     var draft: restore_staging.Plan = .{ .id = id, .cohort_digest = @splat(7), .targets = &targets, .preparing_sources = true };
     try draft.validate(alloc);
+    const handoffs = targets[0].generation_handoffs;
+    targets[0].generation_handoffs = &.{};
+    try std.testing.expectError(error.RestoreSourceProofMissing, draft.validate(alloc));
+    targets[0].generation_handoffs = handoffs;
     const draft_digest = try draft.digest(alloc);
     {
         var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
@@ -15039,7 +15044,7 @@ pub const RaftApplyStore = struct {
                     const receipt = command.receipt.?;
                     if (!std.mem.eql(u8, &receipt.plan_digest, &job.value.plan_digest)) return;
                     const expected = outer: for (job.value.plan.targets) |target| {
-                        if (!target.empty_generation) continue;
+                        if (target.generation_handoffs.len == 0) continue;
                         const old = target.replace orelse return;
                         for (old.ranges) |range| {
                             if (range.group_id != receipt.group_id or (if (range.range_id == 0) range.group_id else range.range_id) != receipt.range_id) continue;
@@ -15060,7 +15065,7 @@ pub const RaftApplyStore = struct {
                 .begin_cutover => {
                     if (next.state != .validating or next.completed_owners != total or old_total == 0) return;
                     for (job.value.plan.targets) |target| {
-                        if (!target.empty_generation) continue;
+                        if (target.generation_handoffs.len == 0) continue;
                         const old = target.replace orelse return;
                         for (old.ranges) |range| {
                             var receipt_buf: [256]u8 = undefined;

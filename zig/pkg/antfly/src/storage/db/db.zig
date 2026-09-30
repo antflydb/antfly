@@ -30813,7 +30813,7 @@ pub const DB = struct {
                     var bootstrap = try contract.OwnerBootstrap.decode(alloc, raw);
                     defer bootstrap.deinit();
                     try bootstrap.value.validate();
-                    if (!bootstrap.value.scope.empty_generation or bootstrap.value.empty_generation_handoff == null or
+                    if (bootstrap.value.empty_generation_handoff == null or
                         !bootstrap.value.scope.target_namespace.eql(self.core.identity_namespace) or
                         !std.mem.eql(u8, &scope, &bootstrap.value.scope.digest()) or
                         !std.mem.eql(u8, &plan_id, &bootstrap.value.scope.plan_id)) return error.RestoreStagingScopeChanged;
@@ -32693,8 +32693,7 @@ pub const DB = struct {
                 const raw_progress = txn.get(contract.key) catch return error.RestoreStagingScopeChanged;
                 var progress = try contract.Progress.decode(self.alloc, raw_progress);
                 defer progress.deinit();
-                if (!bootstrap.value.scope.empty_generation or
-                    !bootstrap.value.scope.target_namespace.eql(command.fence.namespace) or
+                if (!bootstrap.value.scope.target_namespace.eql(command.fence.namespace) or
                     !std.mem.eql(u8, &bootstrap.value.scope.plan_id, &expected_plan_id) or
                     !std.mem.eql(u8, &bootstrap.value.scope.digest(), &install.scope) or
                     !std.mem.eql(u8, &progress.value.scope.digest(), &install.scope) or

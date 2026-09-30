@@ -16343,15 +16343,21 @@ pub const ApiHttpServer = struct {
         }
         const Observer = struct {
             server: *ApiHttpServer,
+            facts: ?std.json.Parsed(@import("../storage/db/online_merge_io_contract.zig").AdmissionFacts) = null,
             context: api_operation.RequestContext,
             pub fn readFacts(observer: *@This(), table: []const u8, request: @import("../storage/db/online_merge_io_contract.zig").Request) !@import("../storage/db/online_merge_io_contract.zig").AdmissionFacts {
                 try ensureTableOperationActive(observer.context);
                 const scratch = observer.server.alloc;
                 const raw = try observer.server.executeRewriteSource(scratch, table, request, observer.context);
                 defer scratch.free(raw);
-                var parsed = try std.json.parseFromSlice(@import("../storage/db/online_merge_io_contract.zig").AdmissionFacts, scratch, raw, .{});
-                defer parsed.deinit();
-                var facts = parsed.value;
+                std.debug.assert(observer.facts == null);
+                // Retain one owned response until the builder copies its
+                // bounded proof and interns unique schema definitions. Keeping
+                // every owner's duplicated history in the request arena would
+                // make memory grow with owners times history size.
+                var parsed = try std.json.parseFromSlice(@import("../storage/db/online_merge_io_contract.zig").AdmissionFacts, scratch, raw, .{ .allocate = .alloc_always });
+                errdefer parsed.deinit();
+                const facts = parsed.value;
                 const limits = @import("../storage/db/relational_rewrite_contract.zig");
                 if (facts.source_schemas.len > limits.max_source_schemas) return error.RelationalRewriteBudgetExceeded;
                 var size: usize = 0;
@@ -16359,20 +16365,12 @@ pub const ApiHttpServer = struct {
                     size +|= definition.len;
                     if (size > limits.max_schema_bytes) return error.RelationalRewriteBudgetExceeded;
                 }
-                const definitions = try scratch.alloc([]const u8, facts.source_schemas.len);
-                errdefer scratch.free(definitions);
-                var initialized: usize = 0;
-                errdefer for (definitions[0..initialized]) |definition| scratch.free(definition);
-                for (facts.source_schemas, definitions) |definition, *owned| {
-                    owned.* = try scratch.dupe(u8, definition);
-                    initialized += 1;
-                }
-                facts.source_schemas = definitions;
+                observer.facts = parsed;
                 return facts;
             }
-            pub fn releaseFacts(observer: *@This(), facts: @import("../storage/db/online_merge_io_contract.zig").AdmissionFacts) void {
-                for (facts.source_schemas) |definition| observer.server.alloc.free(definition);
-                observer.server.alloc.free(facts.source_schemas);
+            pub fn releaseFacts(observer: *@This(), _: @import("../storage/db/online_merge_io_contract.zig").AdmissionFacts) void {
+                if (observer.facts) |*parsed| parsed.deinit();
+                observer.facts = null;
             }
         };
         var observer: Observer = .{ .server = self, .context = context };
@@ -17745,7 +17743,7 @@ pub const ApiHttpServer = struct {
                     graph_scope: ?@import("../storage/db/graph_retirement_seal.zig").Scope,
                 } = handoff_scan: for (job.value.plan.targets) |target| {
                     if (owner_cursor < validation_owner_count) break :handoff_scan null;
-                    if (!target.empty_generation) continue;
+                    if (target.generation_handoffs.len == 0) continue;
                     const old = target.replace orelse return error.RestoreSourceProofMissing;
                     for (old.ranges) |range| {
                         if (handoff_index != 0) {
@@ -17876,7 +17874,7 @@ pub const ApiHttpServer = struct {
                     if (phase == .activating) {
                         var admission_index = parent_index;
                         const handoff_owner: ?struct { target: stages.Target, range: metadata_table_manager.RangeRecord, handoff: stages.GenerationHandoffRange } = handoff_target: for (job.value.plan.targets) |target| {
-                            if (!target.empty_generation) continue;
+                            if (target.generation_handoffs.len == 0) continue;
                             for (target.ranges, target.generation_handoffs) |range, handoff| {
                                 if (admission_index == 0) break :handoff_target .{ .target = target, .range = range, .handoff = handoff };
                                 admission_index -= 1;
@@ -22276,12 +22274,11 @@ pub const ApiHttpServer = struct {
 
     fn restoreJobViewFromStateAlloc(arena: std.mem.Allocator, state: restore_jobs.JobState, names: *RestoreCatalogNames) !RestoreJobView {
         const result: ?std.json.Value = if (state.result_json) |raw| blk: {
-            const value = try std.json.parseFromSlice(std.json.Value, arena, raw, .{});
-            break :blk value.value;
+            break :blk try std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{ .allocate = .alloc_always });
         } else null;
         return .{
             .job_id = try std.fmt.allocPrint(arena, "{d}", .{state.job_id}),
-            .idempotency_key = state.idempotency_key,
+            .idempotency_key = try arena.dupe(u8, state.idempotency_key),
             .attempt_id = state.attempt_id,
             .scope = state.scope,
             .table_name = if (state.table_name) |table_name| try (try system_catalog.Target.parse(try names.resolve(table_name))).displayNameAlloc(arena) else null,
@@ -49399,6 +49396,40 @@ test "restore job list paginates after authorization filtering" {
     try std.testing.expectEqual(@as(usize, 1), second_jobs.len);
     try std.testing.expectEqualStrings("docs-old", second_jobs[0].object.get("backup_id").?.string);
     try std.testing.expect(second_json.value.object.get("next_cursor") == null);
+}
+
+test "restore job list paginates after authorization filtering owns response strings" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const key = try alloc.dupe(u8, "retained-key");
+    defer alloc.free(key);
+    const result = try alloc.dupe(u8, "{\"nested\":{\"name\":\"completed-owner\"},\"items\":[\"receipt\"]}");
+    defer alloc.free(result);
+    var names = ApiHttpServer.RestoreCatalogNames{ .source = undefined, .arena = arena };
+    const view = try ApiHttpServer.restoreJobViewFromStateAlloc(arena, .{
+        .format_version = 1,
+        .job_id = 1,
+        .enqueue_sequence = 1,
+        .dispatch_sequence = 1,
+        .scope = .cluster,
+        .backup_id = "backup",
+        .location = "file:///backups",
+        .connection = "archive",
+        .idempotency_namespace = "principal:operator:cluster",
+        .idempotency_key = key,
+        .request_fingerprint = "fingerprint",
+        .result_json = result,
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .expires_at_ms = 3,
+    }, &names);
+    @memset(key, 0xaa);
+    @memset(result, 0xaa);
+    try std.testing.expectEqualStrings("retained-key", view.idempotency_key.?);
+    try std.testing.expectEqualStrings("completed-owner", view.result.?.object.get("nested").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("receipt", view.result.?.object.get("items").?.array.items[0].string);
 }
 
 test "restore job list bounds authorization scans with an empty continuation page" {
