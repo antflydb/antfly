@@ -11351,6 +11351,51 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+  /ai/v1/decide:
+    post:
+      summary: Answer named choice, ordinal score, and Boolean questions
+      operationId: decide
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceDecideRequest'
+      responses:
+        '200':
+          description: Decision distributions and derived answers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceDecideResponse'
+        '400':
+          description: Invalid question or unsupported decision model
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '404':
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: State, schema, or output exceeds an executor limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/extract:
     post:
       summary: Extract entities, relations, classifications, and structures
@@ -36048,6 +36093,112 @@ components:
           items:
             type: string
           description: List of input modalities this model accepts, such as `text`, `image`, or `audio`
+    InferenceDecideRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - model
+        - state
+        - questions
+      properties:
+        model:
+          type: string
+          minLength: 1
+        state:
+          type: string
+          minLength: 1
+          maxLength: 1048576
+        questions:
+          type: object
+          minProperties: 1
+          maxProperties: 64
+          additionalProperties:
+            $ref: '#/components/schemas/InferenceDecideQuestion'
+    InferenceDecideQuestion:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - instructions
+      properties:
+        type:
+          type: string
+          enum:
+            - choice
+            - score
+            - noul
+        instructions:
+          type: string
+          minLength: 1
+        criteria:
+          description: Choice uses option IDs mapped to descriptions; score uses ordered descriptions;
+            noul omits criteria.
+          oneOf:
+            - type: object
+              minProperties: 2
+              maxProperties: 64
+              additionalProperties:
+                type: string
+            - type: array
+              minItems: 2
+              maxItems: 64
+              items:
+                type: string
+    InferenceDecideResponse:
+      type: object
+      required:
+        - model
+        - answers
+        - usage
+      properties:
+        model:
+          type: string
+        answers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/InferenceDecideAnswer'
+        usage:
+          type: object
+          required:
+            - input_tokens
+            - output_tokens
+          properties:
+            input_tokens:
+              type: integer
+              description: Encoded prompt tokens consumed by the executor, including repeated state text
+                for split GLiNER tasks.
+            output_tokens:
+              type: integer
+              description: Zero for classifier executors, which emit no generated tokens.
+    InferenceDecideAnswer:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - choice
+            - score
+            - noul
+        choice:
+          type: string
+        score:
+          type: number
+        noul:
+          type: number
+          minimum: 0
+          maximum: 1
+        legend:
+          type: object
+          additionalProperties:
+            type: string
+        probabilities:
+          type: object
+          additionalProperties:
+            type: number
+            minimum: 0
+            maximum: 1
     InferenceModelsResponse:
       type: object
       required:
@@ -36060,6 +36211,7 @@ components:
         - embedders
         - generators
         - extractors
+        - deciders
         - rewriters
         - readers
         - transcribers
@@ -36101,6 +36253,11 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/InferenceModelInfo'
           description: Available extractor models (models with 'extraction' capability)
+        deciders:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/InferenceModelInfo'
+          description: Models declaring the decide task and typed_decisions capability
         generators:
           type: object
           additionalProperties:

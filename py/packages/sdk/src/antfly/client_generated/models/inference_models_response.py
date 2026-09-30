@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from ..models.inference_backend_runtimes import InferenceBackendRuntimes
     from ..models.inference_models_response_chunkers import InferenceModelsResponseChunkers
     from ..models.inference_models_response_data_item import InferenceModelsResponseDataItem
+    from ..models.inference_models_response_deciders import InferenceModelsResponseDeciders
     from ..models.inference_models_response_embedders import InferenceModelsResponseEmbedders
     from ..models.inference_models_response_extractors import InferenceModelsResponseExtractors
     from ..models.inference_models_response_generators import InferenceModelsResponseGenerators
@@ -36,6 +37,7 @@ class InferenceModelsResponse:
         rerankers (InferenceModelsResponseRerankers): Available reranking models
         embedders (InferenceModelsResponseEmbedders): Available embedding models from models_dir/embedders/
         extractors (InferenceModelsResponseExtractors): Available extractor models (models with 'extraction' capability)
+        deciders (InferenceModelsResponseDeciders): Models declaring the decide task and typed_decisions capability
         generators (InferenceModelsResponseGenerators): Available generator/LLM models from models_dir/generators/
         rewriters (InferenceModelsResponseRewriters): Available Seq2Seq rewriter models from models_dir/rewriters/
         readers (InferenceModelsResponseReaders): Available reader/OCR models from models_dir/readers/
@@ -50,6 +52,7 @@ class InferenceModelsResponse:
     rerankers: InferenceModelsResponseRerankers
     embedders: InferenceModelsResponseEmbedders
     extractors: InferenceModelsResponseExtractors
+    deciders: InferenceModelsResponseDeciders
     generators: InferenceModelsResponseGenerators
     rewriters: InferenceModelsResponseRewriters
     readers: InferenceModelsResponseReaders
@@ -77,6 +80,8 @@ class InferenceModelsResponse:
 
         extractors = self.extractors.to_dict()
 
+        deciders = self.deciders.to_dict()
+
         generators = self.generators.to_dict()
 
         rewriters = self.rewriters.to_dict()
@@ -97,6 +102,7 @@ class InferenceModelsResponse:
                 "rerankers": rerankers,
                 "embedders": embedders,
                 "extractors": extractors,
+                "deciders": deciders,
                 "generators": generators,
                 "rewriters": rewriters,
                 "readers": readers,
@@ -111,6 +117,7 @@ class InferenceModelsResponse:
         from ..models.inference_backend_runtimes import InferenceBackendRuntimes
         from ..models.inference_models_response_chunkers import InferenceModelsResponseChunkers
         from ..models.inference_models_response_data_item import InferenceModelsResponseDataItem
+        from ..models.inference_models_response_deciders import InferenceModelsResponseDeciders
         from ..models.inference_models_response_embedders import InferenceModelsResponseEmbedders
         from ..models.inference_models_response_extractors import InferenceModelsResponseExtractors
         from ..models.inference_models_response_generators import InferenceModelsResponseGenerators
@@ -141,6 +148,8 @@ class InferenceModelsResponse:
 
         extractors = InferenceModelsResponseExtractors.from_dict(d.pop("extractors"))
 
+        deciders = InferenceModelsResponseDeciders.from_dict(d.pop("deciders"))
+
         generators = InferenceModelsResponseGenerators.from_dict(d.pop("generators"))
 
         rewriters = InferenceModelsResponseRewriters.from_dict(d.pop("rewriters"))
@@ -158,6 +167,7 @@ class InferenceModelsResponse:
             rerankers=rerankers,
             embedders=embedders,
             extractors=extractors,
+            deciders=deciders,
             generators=generators,
             rewriters=rewriters,
             readers=readers,

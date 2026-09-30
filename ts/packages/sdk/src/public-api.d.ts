@@ -3995,6 +3995,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ai/v1/decide": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Answer named choice, ordinal score, and Boolean questions */
+        post: operations["decide"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ai/v1/extract": {
         parameters: {
             query?: never;
@@ -18413,6 +18430,47 @@ export interface components {
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
             inputs?: string[];
         };
+        InferenceDecideRequest: {
+            model: string;
+            state: string;
+            questions: {
+                [key: string]: components["schemas"]["InferenceDecideQuestion"];
+            };
+        };
+        InferenceDecideQuestion: {
+            /** @enum {string} */
+            type: "choice" | "score" | "noul";
+            instructions: string;
+            /** @description Choice uses option IDs mapped to descriptions; score uses ordered descriptions; noul omits criteria. */
+            criteria?: {
+                [key: string]: string;
+            } | string[];
+        };
+        InferenceDecideResponse: {
+            model: string;
+            answers: {
+                [key: string]: components["schemas"]["InferenceDecideAnswer"];
+            };
+            usage: {
+                /** @description Encoded prompt tokens consumed by the executor, including repeated state text for split GLiNER tasks. */
+                input_tokens: number;
+                /** @description Zero for classifier executors, which emit no generated tokens. */
+                output_tokens: number;
+            };
+        };
+        InferenceDecideAnswer: {
+            /** @enum {string} */
+            type: "choice" | "score" | "noul";
+            choice?: string;
+            score?: number;
+            noul?: number;
+            legend?: {
+                [key: string]: string;
+            };
+            probabilities?: {
+                [key: string]: number;
+            };
+        };
         InferenceModelsResponse: {
             /**
              * @description OpenAI-compatible response object type.
@@ -18443,6 +18501,10 @@ export interface components {
             };
             /** @description Available extractor models (models with 'extraction' capability) */
             extractors: {
+                [key: string]: components["schemas"]["InferenceModelInfo"];
+            };
+            /** @description Models declaring the decide task and typed_decisions capability */
+            deciders: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available generator/LLM models from models_dir/generators/ */
@@ -28406,6 +28468,68 @@ export interface operations {
             };
             /** @description Internal server error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    decide: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceDecideRequest"];
+            };
+        };
+        responses: {
+            /** @description Decision distributions and derived answers */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceDecideResponse"];
+                };
+            };
+            /** @description Invalid question or unsupported decision model */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description State, schema, or output exceeds an executor limit */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
