@@ -886,7 +886,12 @@ fn publishSourceChildSchema(alloc: std.mem.Allocator, parent: *db.DB, source: *d
     try std.testing.expect((try source.relationalTopologyStatus()).fence == null);
 }
 pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http.StatusSource, persistence: ?restore_jobs.ReplicatedPersistence, policy: Policy) !void {
-    const alloc = std.testing.allocator;
+    // This corpus benchmark measures restore work, not Mach-O/DWARF stack
+    // unwinding for every allocation. Keep safety and leak checks enabled;
+    // ordinary correctness fixtures retain the testing allocator's traces.
+    var benchmark_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer if (policy.benchmark_rows > 1) std.debug.assert(benchmark_allocator.deinit() == .ok);
+    const alloc = if (policy.benchmark_rows > 1) benchmark_allocator.allocator() else std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();

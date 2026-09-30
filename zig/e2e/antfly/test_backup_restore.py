@@ -2248,12 +2248,14 @@ def _exercise_online_document_merge(
     leader = cluster.metadata_stable_leader_id(timeout_s=20.0)
     assert leader is not None, cluster.debug_logs()
     snapshot = cluster.metadata_snapshot(leader - 1)
+    # Creation records the authoritative identity; logical-name annotations on
+    # diagnostic snapshots are best effort and can be absent during recovery.
+    table_id = cluster.table_ids[table_name]
     catalog_table = next(
         value
         for value in snapshot["tables"]
-        if value.get("logical_name", value["name"]) == table_name
+        if int(value["table_id"]) == table_id
     )
-    table_id = int(catalog_table["table_id"])
     physical_name = quote(catalog_table["name"], safe="")
     ranges = sorted(
         (value for value in snapshot["ranges"] if int(value["table_id"]) == table_id),

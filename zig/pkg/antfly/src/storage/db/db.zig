@@ -24575,7 +24575,10 @@ pub const DB = struct {
             if (key.len == 0 or key.len > 512 or internal_keys.isInternalUserKey(key)) return error.InvalidIntegrityAddress;
             if (!self.core.byteRange().contains(key)) return error.PreparedGenerationChanged;
             try @import("online_integrity_shadow.zig").requireServing(&serving, self.core.byteRange(), key);
-            const row = try self.lookupPrimarySnapshot(scratch, key, .{ .include_primary_digest = true, .execution_deadline_ns = outer.execution_deadline_ns, .execution_io = outer.execution_io, .cancellation = outer.cancellation }, &probe);
+            var options = outer;
+            options.relational_integrity_jobs_json = "";
+            options.include_primary_digest = true;
+            const row = try self.lookupPrimarySnapshot(scratch, key, options, &probe);
             if (row) |value| {
                 retained = std.math.add(usize, retained, value.json.len) catch return error.TransactionTooLarge;
                 if (retained > 16 * 1024 * 1024) return error.TransactionTooLarge;
@@ -27151,7 +27154,8 @@ pub const DB = struct {
         try derived_writes.append(self.alloc, .{ .key = graph_merge_import_recovery_key, .value = recovery_record });
         try derived_writes.append(self.alloc, .{ .key = graph_edge_ttl_due_rebuild_marker, .value = "1" });
         {
-            const raw_writes: []const docstore_mod.KVPair = @ptrCast(derived_writes.items);
+            const raw_writes = try rawStoreWritesAlloc(self.alloc, derived_writes.items);
+            defer self.alloc.free(raw_writes);
             try self.core.store.putBatch(raw_writes, stale_artifact_keys.items);
             primary_published = true;
             self.graph_merge_import_recovery_pending.store(true, .release);
@@ -33034,6 +33038,34 @@ pub const DB = struct {
             resolved_finalized += 1;
         }
         return resolved_finalized;
+    }
+
+    /// Physical graph reads retain the same admission, identity fence, and
+    /// scan budget through selection and the owned result.
+    pub fn graphEdgesForInternalReadBoundedAt(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        identity_read_generation: ?u64,
+        ttl_now_ns: u64,
+        max_edges: usize,
+        max_owned_bytes: usize,
+        max_scanned_rows: usize,
+    ) !graph_mod.GraphIndex.BoundedEdgeResult {
+        var row_policy_lease = try self.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        _ = try self.currentIdentityReadGenerationForRequest(identity_read_generation);
+        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        const result = try entry.index.getEdgesByTypesBoundedWithStatsAt(alloc, key, edge_types, direction, max_edges, max_owned_bytes, max_scanned_rows, if (ttl_now_ns == 0) entry.index.clock.nowRealtimeNs() else ttl_now_ns);
+        errdefer graph_mod.GraphIndex.freeEdges(alloc, result.edges);
+        try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        return result;
     }
 
     pub fn getEdges(
@@ -75948,6 +75980,14 @@ fn copyGraphEdgeRangeIntoSplitDestination(
     if (writes.items.len > 0) try dest_store.putBatch(writes.items, &.{});
 }
 
+// Mutation planning fields are not part of physical key/value storage. An
+// explicit borrowed projection keeps these layers independent of Zig layout.
+fn rawStoreWritesAlloc(alloc: Allocator, writes: []const types.BatchWrite) ![]docstore_mod.KVPair {
+    const raw = try alloc.alloc(docstore_mod.KVPair, writes.len);
+    for (writes, raw) |write, *item| item.* = .{ .key = write.key, .value = write.value };
+    return raw;
+}
+
 fn putIndexedSplitBatchDirect(
     dest_store: *docstore_mod.DocStore,
     dest_indexes: *index_manager_mod.IndexManager,
@@ -75958,7 +75998,8 @@ fn putIndexedSplitBatchDirect(
 ) !void {
     if (writes.len == 0) return;
 
-    const raw_writes: []const docstore_mod.KVPair = @ptrCast(writes);
+    const raw_writes = try rawStoreWritesAlloc(dest_indexes.alloc, writes);
+    defer dest_indexes.alloc.free(raw_writes);
     try dest_store.putBatch(raw_writes, &.{});
 
     try applySplitEmbeddingArtifactsFromBatch(dest_store, dest_indexes, writes, dense_handoffs, sparse_handoffs);
@@ -134841,6 +134882,70 @@ test "db enrichment graph ttl replay honors source tombstone" {
     defer graph_mod.GraphIndex.freeEdges(alloc, visible);
     try std.testing.expectEqual(@as(usize, 1), visible.len);
     try std.testing.expectEqual(@as(f64, 3), visible[0].weight);
+}
+
+test "db storage kernel graph edges retain typed filters and physical scan budgets" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db-kernel-graph-edge-budgets");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "relations", .content_type = "application/json" });
+    try db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json =
+        \\{"sources":[{"artifact":"relations"}]}
+    });
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value =
+        \\{"relations":[{"type":"links","target":{"document_id":"doc:b"},"weight":2},{"type":"mentions","target":{"document_id":"doc:c"},"weight":3}]}
+    }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    const graph = @import("../../api/distributed_graph.zig");
+    const access = algebraic_mod.ir.graphEdgeAccessPath("relations_graph");
+    var request = graph.GraphEdgesRequest{
+        .index_name = try alloc.dupe(u8, "relations_graph"),
+        .key = try alloc.dupe(u8, "doc:a"),
+        .direction = .out,
+        .tensor_access_path = .{
+            .owner = try alloc.dupe(u8, access.owner),
+            .layout = access.layout,
+            .fragments = try alloc.dupe(algebraic_mod.ir.TensorFragment, access.fragments),
+            .output_dims = try alloc.dupe(algebraic_mod.ir.Dimension, access.output_dims),
+            .law_ids = try alloc.dupe(@typeInfo(@TypeOf(access.law_ids)).pointer.child, access.law_ids),
+        },
+        .tensor_program = try graph.graphEdgesTensorProgramEnvelopeAlloc(alloc, "relations_graph"),
+        .max_edges = 2,
+        .max_owned_bytes = 4096,
+        .max_scanned_rows = 4,
+    };
+    defer request.deinit(alloc);
+    const local = @import("../local_query.zig");
+    {
+        var result = try local.executeStorageKernelGraphEdges(alloc, &db, request);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), result.edges.len);
+        try std.testing.expectEqual(@as(u32, 4), result.scanned_rows);
+        const wire = try graph.encodeGraphEdgesResponse(alloc, result);
+        defer alloc.free(wire);
+        var decoded = try graph.parseGraphEdgesResponse(alloc, wire);
+        defer decoded.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 4), decoded.scanned_rows);
+    }
+    request.max_scanned_rows = 1;
+    try std.testing.expectError(error.GraphExploredEdgesBudgetExceeded, local.executeStorageKernelGraphEdges(alloc, &db, request));
+    request.max_scanned_rows = 4;
+    request.max_edges = 1;
+    try std.testing.expectError(error.GraphExploredEdgesBudgetExceeded, local.executeStorageKernelGraphEdges(alloc, &db, request));
+    request.max_edges = 2;
+    request.max_owned_bytes = 1;
+    try std.testing.expectError(error.GraphExploredEdgeBytesBudgetExceeded, local.executeStorageKernelGraphEdges(alloc, &db, request));
+    request.max_owned_bytes = 4096;
+    request.edge_types = try alloc.alloc([]const u8, 1);
+    request.edge_types[0] = try alloc.dupe(u8, "mentions");
+    request.max_edges = 1;
+    var filtered = try local.executeStorageKernelGraphEdges(alloc, &db, request);
+    defer filtered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), filtered.edges.len);
+    try std.testing.expectEqualStrings("mentions", filtered.edges[0].edge_type);
+    try std.testing.expectEqual(@as(u32, 2), filtered.scanned_rows);
 }
 
 test "db document deletion retires graph source contender and due entry" {

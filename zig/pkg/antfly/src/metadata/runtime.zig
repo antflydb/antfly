@@ -2738,6 +2738,22 @@ fn awaitMetadataTestPrefix(server: *Server) !void {
     }
 }
 
+fn awaitMetadataTestControlProjection(server: *Server) !void {
+    const svc = server.metadataHttpService();
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        try server.runRound();
+        try awaitMetadataTestPrefix(server);
+        // Applying a lease/placement entry is distinct from the control
+        // owner's observing it. Assert readiness only after both milestones.
+        if (svc.reconcileLeaseStats().held_by_local and
+            svc.local_placement_epoch != null and
+            svc.local_placement_epoch.? == svc.placement_epoch.load(.monotonic)) return;
+        if (platform_time.monotonicNs() >= deadline) return error.MetadataTestControlProjectionTimeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
 test "metadata runtime preserves projected tables across restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2943,7 +2959,7 @@ test "metadata ownership excludes colliding data placements across control round
                 .peer_node_ids = &.{},
             }, null, 0, false);
             for (0..8) |_| try svc.runRaftRoundOnly();
-            try awaitMetadataTestPrefix(&server);
+            try awaitMetadataTestControlProjection(&server);
         }
         for (0..8) |_| try server.runRound();
         try awaitMetadataTestPrefix(&server);
@@ -2996,7 +3012,7 @@ test "metadata ownership never provisions data roots on repeated control rounds"
     try server.bootstrapLocal(group_ids.main_metadata_group_id, 3);
     try std.testing.expectEqual(@as(usize, 0), hook.calls);
     for (0..8) |_| try server.runRound();
-    try awaitMetadataTestPrefix(&server);
+    try awaitMetadataTestControlProjection(&server);
     std.debug.print("OWNERSHIP_RED provisioning expects zero calls; actual={d}\n", .{hook.calls});
     try std.testing.expectEqual(@as(usize, 0), hook.calls);
     const svc = server.metadataHttpService();

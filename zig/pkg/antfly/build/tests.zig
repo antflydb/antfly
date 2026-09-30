@@ -5399,6 +5399,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     relational_index_lifecycle_step.dependOn(&addFilteredTestRunArtifact(b, relational_index_lifecycle_tests).step);
 
     const graph_runtime_filters = [_][]const u8{
+        "db storage kernel graph edges retain typed filters and physical scan budgets",
         "graph artifact rebuild lease drains scheduler pins",
         "db direct merge import",
         "db paged merge",

@@ -547,6 +547,19 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
     defer store.freeTables(alloc, visible);
     try std.testing.expectEqual(@as(usize, 1), visible.len);
     try std.testing.expectEqualStrings(bound_schema, visible[0].schema_json);
+    const listed = try store.listSystemCatalogTables(alloc, group_id, .{});
+    defer alloc.free(listed);
+    var listing = try std.json.parseFromSlice(@import("../../system_catalog/projection.zig").TableListing, alloc, listed, .{});
+    defer listing.deinit();
+    try std.testing.expectEqual(@as(usize, 1), listing.value.entries.len);
+    try std.testing.expectEqualStrings("nodes", listing.value.entries[0].name);
+    var listing_txn = try store.store.beginReadTxn();
+    defer listing_txn.abort();
+    const prefix = try RaftApplyStore.legacyListingPrefix(alloc, group_id);
+    defer alloc.free(prefix);
+    const stale = try docstore.DocStore.scanPrefixTxn(alloc, &listing_txn, prefix);
+    defer RaftApplyStore.freeKvs(alloc, stale);
+    try std.testing.expectEqual(@as(usize, 0), stale.len);
     const published_placements = try store.listPlacementIntents(alloc, group_id);
     defer store.freePlacementIntents(alloc, published_placements);
     try std.testing.expectEqual(@as(usize, 1), published_placements.len);
@@ -6417,7 +6430,7 @@ pub const RaftApplyStore = struct {
         if (create.binding) |binding| {
             const meta = try system_catalog_storage.readMeta(self.alloc, &txn, group);
             if (meta.revision == binding.previous_revision) {
-                try system_catalog_storage.applyDelta(self.alloc, &txn, group, binding.delta, meta, @splat(0));
+                try self.applySystemCatalogDeltaTxn(self.alloc, &txn, group, binding.delta, meta, @splat(0));
             } else {
                 if (meta.revision <= binding.previous_revision or meta.next_id < binding.delta.next_id) return error.HACatalogReplayConflict;
                 for (binding.delta.upserts) |expected| {
@@ -6856,7 +6869,7 @@ pub const RaftApplyStore = struct {
             if (bootstrap or update.import_catalog != null or update.setting_command != null or update.policy_command != null) return error.InvalidStandaloneCatalog;
             const meta = try system_catalog_storage.readMeta(self.alloc, &txn, group_id);
             if (meta.revision != logical.previous_revision) return error.CatalogGenerationChanged;
-            try system_catalog_storage.applyDelta(self.alloc, &txn, group_id, logical.delta, meta, @splat(0));
+            try self.applySystemCatalogDeltaTxn(self.alloc, &txn, group_id, logical.delta, meta, @splat(0));
         }
         if (update.setting_command) |command| {
             if (bootstrap or update.import_catalog != null or update.replace or update.policy_command != null) return error.InvalidStandaloneCatalog;
@@ -8943,7 +8956,7 @@ pub const RaftApplyStore = struct {
             var empty: [0]system_catalog.Resource = .{};
             var command_hash: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &command_hash, .{});
-            try system_catalog_storage.applyDelta(a, txn, group_id, .{ .upserts = &empty, .removes = &empty, .next_id = meta.next_id + 1 }, meta, command_hash);
+            try self.applySystemCatalogDeltaTxn(a, txn, group_id, .{ .upserts = &empty, .removes = &empty, .next_id = meta.next_id + 1 }, meta, command_hash);
             if (plan.support_pending) for (plan.parents) |parent| {
                 if (parent.support_after) |after| {
                     try self.putTableRecordTxnMode(txn, group_id, try tableKeyForGroup(&key_buf, group_id, after.table_id), after, true);
@@ -9026,7 +9039,7 @@ pub const RaftApplyStore = struct {
                 var command_hash: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(bytes, &command_hash, .{});
                 const next_id = std.math.add(u64, publication.plan.catalog_id, 1) catch return error.InvalidGenerationPublication;
-                try system_catalog_storage.applyDelta(a, txn, group_id, .{ .upserts = &upserts, .removes = &empty, .next_id = @max(meta.next_id, next_id) }, meta, command_hash);
+                try self.applySystemCatalogDeltaTxn(a, txn, group_id, .{ .upserts = &upserts, .removes = &empty, .next_id = @max(meta.next_id, next_id) }, meta, command_hash);
             }
             if (publication.phase == .published or publication.phase == .canceled) {
                 try self.terminalizeInitialFkReplicasTxn(txn, group_id, publication);
@@ -9635,10 +9648,26 @@ pub const RaftApplyStore = struct {
         }
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
-        try system_catalog_storage.applyDelta(self.alloc, txn, group_id, delta, meta, hash);
-        for (delta.upserts) |resource| if (resource.kind == .table) try self.deleteLegacyListingTxn(txn, group_id, resource.storage_name);
+        try self.applySystemCatalogDeltaTxn(self.alloc, txn, group_id, delta, meta, hash);
         // Invalidate metadata readers through the existing catalog event path.
         self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id });
+    }
+
+    fn applySystemCatalogDeltaTxn(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        delta: system_catalog.Delta,
+        meta: system_catalog_storage.Meta,
+        hash: [32]u8,
+    ) !void {
+        try system_catalog_storage.applyDelta(alloc, txn, group_id, delta, meta, hash);
+        // Physical rows can be installed before their binding (initial FK
+        // publication) or afterward (restore). Bindings and the legacy-only
+        // listing must always become visible in the same transaction.
+        for (delta.upserts) |resource| if (resource.kind == .table)
+            try self.deleteLegacyListingTxn(txn, group_id, resource.storage_name);
     }
 
     fn removeSystemCatalogTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !void {
@@ -9647,7 +9676,7 @@ pub const RaftApplyStore = struct {
             defer binding.deinit();
             const previous = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
             var removes = [_]system_catalog.Resource{binding.value};
-            try system_catalog_storage.applyDelta(self.alloc, txn, group_id, .{ .upserts = &.{}, .removes = &removes, .next_id = previous.next_id }, previous, @splat(0));
+            try self.applySystemCatalogDeltaTxn(self.alloc, txn, group_id, .{ .upserts = &.{}, .removes = &removes, .next_id = previous.next_id }, previous, @splat(0));
         }
     }
 
@@ -15146,7 +15175,7 @@ pub const RaftApplyStore = struct {
                         };
                         if (delta.upserts.len != 0) {
                             const meta = try system_catalog_storage.readMeta(catalog_arena.allocator(), txn, group_id);
-                            try system_catalog_storage.applyDelta(catalog_arena.allocator(), txn, group_id, delta, meta, @splat(0));
+                            try self.applySystemCatalogDeltaTxn(catalog_arena.allocator(), txn, group_id, delta, meta, @splat(0));
                         }
                     }
                     if (command.action == .publish) for (job.value.plan.targets) |target| {

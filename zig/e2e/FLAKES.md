@@ -1,5 +1,65 @@
 # Zig E2E flakes
 
+## 2026-09-29: receipt-driven recovery and native graph read budgets (#918)
+
+Rewrite source preparation, owner replay, validation and final owner publication
+use windows of at most four independent owners. A window never crosses a cohort
+phase barrier. Authoritative owner receipts survive a lost scheduling checkpoint;
+successful publication prefixes are saved before returning a later owner's
+failure. Metadata progress notifications wake cooperative continuations, with
+periodic reconciliation retained for lost notifications and restart. Durable
+failure backoff remains separate from these in-memory wakeups.
+
+Fresh ordinary integrity writes first perform generation-fenced claim reads to
+reject definite statement-wide conflicts without creating transaction state.
+Successful writes still perform transactional prepare and retain row versions,
+content digests and generation predicates. Explicit retained transaction IDs
+keep their existing recovery path. Preparation batches up to eight primary
+observations or claims per owner under one ReadIndex gate and immutable owner
+snapshot; proofs are not retained across RPCs. Dirty topology reports reuse a
+fresh immutable baseline, while registration, expired baselines and periodic
+reconciliation still obtain a current metadata snapshot.
+
+Run 36648393361 also failed the quickstart progressive first-result gate. Its
+last observation had six completed provider calls and a seventh still executing;
+the logs do not identify that call's blocking stage. The unchanged frozen server
+passed 20 isolated repetitions and 20 shared-process sequences including the
+preceding managed-index tests. The provider fixture now owns its kernel-assigned
+port and reports accepted, decoded, completed and active requests on failure.
+The 30-second first-result deadline and serving assertions are unchanged.
+These reproductions do not establish that the CI stall is fixed.
+
+Merging the newer graph and SQL changes exposed a separate native graph-boundary
+defect: local graph requests used an unbounded edge reader and omitted physical
+scan counts, which the response encoder now requires. They now use the bounded
+reader with edge-type filters, TTL, identity fences, admission and physical scan
+accounting. A native regression covers successful response encoding and edge,
+byte and scan limits. The graph suite also exposed split/merge imports casting
+expanded mutation records to smaller storage records; both paths now explicitly
+project key/value fields. The complete graph suite passed 73/73 after these fixes.
+
+Qualification of the final merged executable remains pending; earlier frozen
+600/600 recovery runs do not qualify these subsequent architectural changes.
+
+The post-main smoke also exposed a shared metadata availability defect: initial
+FK creation wrote its physical table before publishing the logical binding,
+leaving a bound table in the legacy-only listing. Listing then failed with
+`InvalidDerivedCatalogIndex`, so merge and rewrite recovery could not reach the
+injected owner fault. Every binding writer now uses one transaction helper that
+removes newly bound tables from that derived listing. This performs point updates
+per changed binding, without a catalog sweep. The initial-FK regression checks
+the public listing and absence of legacy aliases; 20 admission/placement tests
+and 146 catalog persistence tests passed. The FK fixture also resolves its table
+from the immutable ID retained at creation, rather than diagnostic display-name
+annotations that are allowed to be absent.
+
+The restore corpus benchmark uses a checked allocator without per-allocation
+stack traces, while ordinary correctness fixtures keep the testing allocator.
+Debug safety, leak checks and the original 30-second deadline remain enabled.
+All 10 staged restore regressions passed; native and portable 768-row benchmark
+work completed in 1.3–1.4 seconds locally. This removes allocator instrumentation
+overhead from the fixture; it is not a measured production latency improvement.
+
 ## 2026-09-29: Autograph and metadata recovery signatures (#919)
 
 [Run 36609343247](https://github.com/antflydb/antfly/actions/runs/36609343247)
