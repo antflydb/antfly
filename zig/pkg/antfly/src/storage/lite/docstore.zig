@@ -222,6 +222,36 @@ test "lite reclamation automatic worker bounds sustained overwrite history" {
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
+test "lite reclamation staged generation joins maintenance before owner adoption" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const live_path = try testPath(alloc, tmp, "reclamation-adopt-live.aflite");
+    defer alloc.free(live_path);
+    const staged_path = try testPath(alloc, tmp, "reclamation-adopt-stage.aflite");
+    defer alloc.free(staged_path);
+    var live = try Store.createWithOptions(alloc, live_path, .{ .no_sync = true, .io = std.testing.io });
+    defer live.close();
+    var staged = try Store.createWithOptions(alloc, staged_path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{
+        .assessment_bytes = 4096,
+        .minimum_reclaim_bytes = 4 * 4096,
+        .retry_ms = 1,
+    } });
+    defer staged.close();
+    var write = try staged.beginWrite();
+    try write.put("doc", "staged");
+    try write.commit();
+    try std.testing.expect(staged.maintenance_future != null);
+    _ = try live.replaceWithPreparedGeneration(&staged);
+    try std.testing.expect(staged.maintenance_future == null);
+    staged.startMaintenance();
+    try std.testing.expect(staged.maintenance_future == null);
+    var read = try live.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("staged", try read.get("doc"));
+    try std.testing.expect((try live.checkWithCancel(null)).valid);
+}
+
 pub const OpenOptions = struct {
     reclamation: reclamation.Options = .{},
     read_only: bool = false,
@@ -345,10 +375,15 @@ pub const Store = struct {
         };
     }
 
-    pub fn close(self: *Store) void {
+    fn stopMaintenance(self: *Store) void {
         self.maintenance_cancel.request();
         self.maintenance_wake.set(self.file.runtime());
         if (self.maintenance_future) |*future| future.await(self.file.runtime());
+        self.maintenance_future = null;
+    }
+
+    pub fn close(self: *Store) void {
+        self.stopMaintenance();
         std.debug.assert(self.retired_generations == null);
         if (self.read_generation) |generation| std.debug.assert(generation.references == 0);
         self.retireReadGeneration(0);
@@ -414,7 +449,8 @@ pub const Store = struct {
     pub fn startMaintenance(self: *Store) void {
         lockStore(self);
         defer self.mutex.unlock();
-        if (self.read_only or !self.maintenance_policy.options.enabled or self.maintenance_future != null) return;
+        if (self.read_only or self.maintenance_cancel.requested.load(.acquire) or
+            !self.maintenance_policy.options.enabled or self.maintenance_future != null) return;
         if (self.file.activeCheckpoint().page_count *| self.file.header.page_size < self.maintenance_policy.options.minimum_reclaim_bytes) return;
         self.maintenance_future = self.file.runtime().concurrent(maintenanceLoop, .{self}) catch |err| {
             self.maintenance_policy.status.state = .deferred;
@@ -828,6 +864,10 @@ pub const Store = struct {
     /// its retired descriptor can be closed by normal teardown.
     pub fn replaceWithPreparedGeneration(self: *Store, prepared: *Store) !native.GenerationPublicationOutcome {
         if (self == prepared) return error.InvalidArgument;
+        // The finalized disposable owner is about to surrender its descriptor.
+        // Join before taking its mutex: maintenance can need that mutex while
+        // canceling capture/copy or finishing an atomic publication boundary.
+        prepared.stopMaintenance();
         try self.reserveWriterSlot();
         defer self.releaseWriterSlot();
 

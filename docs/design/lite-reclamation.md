@@ -59,7 +59,9 @@ reopen assesses outstanding debt synchronously, preventing repeated short CLI
 sessions from discarding a newly launched background task forever. Close requests
 cancellation, wakes and joins the task, then closes the storage runtime. The
 publication boundary retains the existing atomic adoption and directory-sync
-semantics; shutdown does not asynchronously interrupt a header/rename operation.
+semantics. A finalized disposable restore owner cancels and joins its maintenance
+before surrendering its generation; shutdown does not asynchronously interrupt a
+header/rename operation.
 
 If the runtime cannot provide concurrency, the status reports it. Reopen and the
 cooperative owner operation can still service debt; the implementation does not
