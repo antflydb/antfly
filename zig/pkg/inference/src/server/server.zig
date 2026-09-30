@@ -10928,8 +10928,10 @@ pub const Node = struct {
             };
         }
 
+        // Report usage in the tokens `target_tokens` is measured in; a
+        // whitespace word count undercounts unspaced scripts such as CJK.
         const prompt_tokens = switch (input.value) {
-            .text => |text| estimateTextTokens(text),
+            .text => |text| lib_chunker.fixed_text.countTextTokens(ctx.allocator, text) catch estimateTextTokens(text),
             .binary => 0,
         };
 

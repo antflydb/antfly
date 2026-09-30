@@ -33,7 +33,6 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
     const overlap_tokens = cfg.overlap_tokens;
     const max_chunks = cfg.max_chunks; // 0 = unlimited (chunk the whole unit)
     const separator = if (cfg.separator.len > 0) cfg.separator else "\n\n";
-    if (overlap_tokens >= target_tokens) return error.InvalidChunkOverlap;
 
     var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
     defer tokenizer.deinitSelf();
@@ -324,6 +323,15 @@ fn buildChunk(full_text: []const u8, sections: []const PositionedSection, chunk_
     return types.Chunk.initText(chunk_id, full_text[start..end], start, end);
 }
 
+/// Token count of `text` under the fixed chunker's own tokenizer, the same
+/// measure `target_tokens` is applied against.
+pub fn countTextTokens(alloc: Allocator, text: []const u8) !usize {
+    if (text.len == 0) return 0;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    return countTokens(alloc, tokenizer, text);
+}
+
 fn countTokens(alloc: Allocator, tokenizer: *HfTokenizer, text: []const u8) !usize {
     const ids = try tokenizer.tokenizer().encode(alloc, text);
     defer alloc.free(ids);
@@ -396,10 +404,18 @@ test "fixed text chunker still honors an explicit max_chunks cap" {
 
 test "fixed text chunker rejects invalid overlap" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidChunkOverlap, chunkText(alloc, "alpha beta", .{
+    try std.testing.expectError(error.InvalidChunkOverlapTokens, chunkText(alloc, "alpha beta", .{
         .target_tokens = 4,
         .overlap_tokens = 4,
     }));
+}
+
+test "fixed text token count measures unspaced CJK per character" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 0), try countTextTokens(alloc, ""));
+    try std.testing.expectEqual(@as(usize, 3), try countTextTokens(alloc, "alpha beta gamma"));
+    // Three CJK ideographs are three tokens, not one whitespace-delimited word.
+    try std.testing.expectEqual(@as(usize, 3), try countTextTokens(alloc, "東京館"));
 }
 
 test "token window fallback clamps to source bounds" {
