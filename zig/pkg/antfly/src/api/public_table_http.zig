@@ -153,6 +153,7 @@ pub const TableApi = struct {
         ModelNotFound,
         UnsupportedExactSort,
         GraphMetricGlobalMaterializationRequired,
+        GraphMetricPersonalizationUnsupported,
         GraphMetricFeatureNotEnabled,
         GraphMetricMaterializationRejected,
         GraphMetricQueryBudgetExceeded,
@@ -1039,6 +1040,14 @@ pub fn graphMetricGlobalMaterializationRequiredBody(alloc: std.mem.Allocator) ![
     return try std.json.Stringify.valueAlloc(alloc, .{
         .code = "graph_metric_global_materialization_required",
         .message = "graph metric scoring is unavailable for multi-shard tables until a globally coordinated metric snapshot is published",
+        .retryable = false,
+    }, .{});
+}
+
+pub fn graphMetricPersonalizationUnsupportedBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .code = "graph_metric_personalization_unsupported",
+        .message = "seeded graph metric reads require a distributed graph computation that is not available for this query",
         .retryable = false,
     }, .{});
 }
@@ -1989,6 +1998,9 @@ pub fn handleTableQueryRequest(
             error.GraphMetricGlobalMaterializationRequired => {
                 std.log.info("public table query requires global graph metric materialization table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphMetricGlobalMaterializationRequiredBody(alloc), .json = true };
+            },
+            error.GraphMetricPersonalizationUnsupported => {
+                return .{ .status = 422, .body = try graphMetricPersonalizationUnsupportedBody(alloc), .json = true };
             },
             error.GraphMetricFeatureNotEnabled => {
                 std.log.info("public table query graph metric publication is not enabled table={s}", .{table_name});

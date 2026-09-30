@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from ..models.graph_artifact_source_config import GraphArtifactSourceConfig
     from ..models.graph_index_config_metrics import GraphIndexConfigMetrics
     from ..models.graph_resolver_config import GraphResolverConfig
+    from ..models.graph_ttl_config import GraphTtlConfig
 
 
 T = TypeVar("T", bound="CreateGraphIndexRequest")
@@ -32,6 +33,8 @@ class CreateGraphIndexRequest:
         description (str | Unset): Optional description of the index and its purpose
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
+        ttl (GraphTtlConfig | Unset):
+        ttl_duration (str | Unset): Compatibility alias for ttl.duration. Do not specify together with ttl.
         metrics (GraphIndexConfigMetrics | Unset): Named published graph metrics. Serverless supports background refresh
             only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128
             UTF-8 bytes per metric name.
@@ -64,6 +67,8 @@ class CreateGraphIndexRequest:
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[EnrichmentConfig] | Unset = UNSET
+    ttl: GraphTtlConfig | Unset = UNSET
+    ttl_duration: str | Unset = UNSET
     metrics: GraphIndexConfigMetrics | Unset = UNSET
     sources: list[GraphArtifactSourceConfig] | Unset = UNSET
     summarizer: GeneratorConfig | Unset = UNSET
@@ -89,6 +94,12 @@ class CreateGraphIndexRequest:
             for enrichments_item_data in self.enrichments:
                 enrichments_item = enrichments_item_data.to_dict()
                 enrichments.append(enrichments_item)
+
+        ttl: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.ttl, Unset):
+            ttl = self.ttl.to_dict()
+
+        ttl_duration = self.ttl_duration
 
         metrics: dict[str, Any] | Unset = UNSET
         if not isinstance(self.metrics, Unset):
@@ -148,6 +159,10 @@ class CreateGraphIndexRequest:
             field_dict["version"] = version
         if enrichments is not UNSET:
             field_dict["enrichments"] = enrichments
+        if ttl is not UNSET:
+            field_dict["ttl"] = ttl
+        if ttl_duration is not UNSET:
+            field_dict["ttl_duration"] = ttl_duration
         if metrics is not UNSET:
             field_dict["metrics"] = metrics
         if sources is not UNSET:
@@ -181,6 +196,7 @@ class CreateGraphIndexRequest:
         from ..models.graph_artifact_source_config import GraphArtifactSourceConfig
         from ..models.graph_index_config_metrics import GraphIndexConfigMetrics
         from ..models.graph_resolver_config import GraphResolverConfig
+        from ..models.graph_ttl_config import GraphTtlConfig
 
         d = dict(src_dict)
         type_ = CreateGraphIndexRequestType(d.pop("type"))
@@ -197,6 +213,15 @@ class CreateGraphIndexRequest:
                 enrichments_item = EnrichmentConfig.from_dict(enrichments_item_data)
 
                 enrichments.append(enrichments_item)
+
+        _ttl = d.pop("ttl", UNSET)
+        ttl: GraphTtlConfig | Unset
+        if isinstance(_ttl, Unset):
+            ttl = UNSET
+        else:
+            ttl = GraphTtlConfig.from_dict(_ttl)
+
+        ttl_duration = d.pop("ttl_duration", UNSET)
 
         _metrics = d.pop("metrics", UNSET)
         metrics: GraphIndexConfigMetrics | Unset
@@ -269,6 +294,8 @@ class CreateGraphIndexRequest:
             description=description,
             version=version,
             enrichments=enrichments,
+            ttl=ttl,
+            ttl_duration=ttl_duration,
             metrics=metrics,
             sources=sources,
             summarizer=summarizer,

@@ -53,6 +53,8 @@ pub const TraversalRules = struct {
     /// Shared request budget for expansion work. Omit only for internal callers
     /// that want the standard standalone graph limits.
     work_budget: ?*work_budget_mod.WorkBudget = null,
+    /// Captured at the public request boundary and reused by every expansion.
+    ttl_now_ns: ?u64 = null,
     /// Maximum number of pending traversal states. Kept configurable for
     /// request policy and deterministic low-limit testing.
     max_intermediate_states: usize = work_budget_mod.default_max_intermediate_states,
@@ -208,13 +210,14 @@ const QueueEntry = struct {
 pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u8, rules: TraversalRules) ![]TraversalResult {
     const Reader = struct {
         graph_index: *GraphIndex,
+        now_ns: u64,
 
         pub fn openEdgeStream(self: @This(), a: Allocator, key: []const u8, kinds: []const []const u8, direction: EdgeDirection) !edge_stream.Stream {
-            return edge_stream.openGraph(a, self.graph_index, key, kinds, direction);
+            return edge_stream.openGraphAt(a, self.graph_index, key, kinds, direction, self.now_ns);
         }
 
         pub fn getEdges(self: @This(), a: Allocator, key: []const u8, direction: EdgeDirection) ![]Edge {
-            return try self.graph_index.getEdges(a, key, "", direction);
+            return try self.graph_index.getEdgesAt(a, key, "", direction, self.now_ns);
         }
 
         pub fn getEdgesBoundedForTraversal(
@@ -226,14 +229,14 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
             max_edges: usize,
             max_bytes: usize,
         ) ![]Edge {
-            return try self.graph_index.getEdgesByTypesBounded(a, key, edge_types, direction, max_edges, max_bytes);
+            return try self.graph_index.getEdgesByTypesBoundedAt(a, key, edge_types, direction, max_edges, max_bytes, self.now_ns);
         }
 
         pub fn freeEdges(_: @This(), a: Allocator, edges: []Edge) void {
             GraphIndex.freeEdges(a, edges);
         }
     };
-    return try traverseWithEdgeReader(alloc, Reader{ .graph_index = graph_index }, start_key, rules);
+    return try traverseWithEdgeReader(alloc, Reader{ .graph_index = graph_index, .now_ns = rules.ttl_now_ns orelse graph_index.clock.nowRealtimeNs() }, start_key, rules);
 }
 
 /// Reader-generic traversal over an immutable graph snapshot. The reader owns

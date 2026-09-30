@@ -32,7 +32,11 @@ const resource_manager_mod = @import("../../resource_manager.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
 const graph_asset_state = @import("../graph_asset_state.zig");
 const graph_mod = @import("../../../graph/graph.zig");
+const graph_work_budget = @import("../../../graph/work_budget.zig");
 const graph_edge_contender = @import("../graph_edge_contender.zig");
+const graph_edge_ttl_expiration = @import("../graph_edge_ttl_expiration.zig");
+const graph_edge_ttl_tombstone = @import("../graph_edge_ttl_tombstone.zig");
+const GraphTtlSha256 = @import("antfly_hash").Sha256;
 const graph_state_name = @import("../graph_state_name.zig");
 const replay_source_mod = @import("../derived/replay_source.zig");
 const derived_types = @import("../derived/derived_types.zig");
@@ -11907,13 +11911,16 @@ fn neighborContextBlockAlloc(
             .in => .in,
             .both => .both,
         };
-        const page_limits = graph_mod.EdgePageLimits{
+        var remaining_scanned_rows = graph_work_budget.default_max_explored_edges;
+        var page_limits = graph_mod.EdgePageLimits{
             .max_edges = 256,
             .max_owned_bytes = 512 * 1024,
         };
         var cursor: ?graph_mod.EdgeScanCursor = null;
         defer if (cursor) |*value| value.deinit(alloc);
         scan: while (true) {
+            if (remaining_scanned_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
+            page_limits.max_scanned_rows = @min(4096, remaining_scanned_rows);
             var page = entry.index.getEdgesByTypesPage(
                 alloc,
                 request.doc_key,
@@ -11923,11 +11930,13 @@ fn neighborContextBlockAlloc(
                 page_limits,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return err,
+                error.GraphExploredEdgesBudgetExceeded => return err,
                 // Unreadable local graph state renders empty neighbors rather
                 // than parking the producer behind a sidecar dependency.
                 else => break :scan,
             };
             defer graph_mod.GraphIndex.freeEdges(alloc, page.edges);
+            remaining_scanned_rows -= page.scanned_rows;
             for (page.edges) |edge| {
                 const outgoing = std.mem.eql(u8, edge.source, request.doc_key);
                 try insertBoundedNeighbor(alloc, &selected, config.limit, .{
@@ -20724,6 +20733,10 @@ fn materializeGraphAssetForRuntime(
     window: *GeneratedReplayWindow,
 ) !void {
     if (!runtime.index_manager.hasGraphIndexes()) return;
+    if (runtime.coverage_apply_mutex) |lock| lock.lockExclusive();
+    defer if (runtime.coverage_apply_mutex) |lock| lock.unlockExclusive();
+    var graph_publication = runtime.index_manager.beginGraphPrimaryMutation();
+    defer graph_publication.release();
     const artifact_name = requestArtifactName(request);
 
     for (runtime.index_manager.graphIndexes()) |graph_entry| {
@@ -20747,7 +20760,11 @@ fn materializeGraphAssetForRuntime(
             const key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(runtime.alloc, if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source);
             var key_owned = true;
             errdefer if (key_owned) runtime.alloc.free(key);
-            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(runtime.alloc, null, graph_entry.config.coverage_generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
+            // This is a source candidate, so the visible artifact's lifetime
+            // may belong to another source. Reconciliation below restores this
+            // exact source state's durable timestamp when it already exists.
+            const ttl_created_ns: u64 = if (graph_entry.ttl_duration_ns != 0) runtime.clock.nowRealtimeNs() else 0;
+            const payload = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(runtime.alloc, null, graph_entry.config.coverage_generation, write.weight, write.created_at, write.updated_at, ttl_created_ns, write.metadata_json);
             var payload_owned = true;
             errdefer if (payload_owned) runtime.alloc.free(payload);
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
@@ -20769,6 +20786,11 @@ fn materializeGraphAssetForRuntime(
         const previous_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key, graph_entry.config.coverage_generation);
         defer if (previous_keys) |keys| freeOwnedConstKeySlice(runtime.alloc, keys);
         try appendRuntimeGraphAssetStateSegmentDeletes(runtime, state_key, &deletes);
+        if (previous_keys) |keys| for (keys) |edge_key| {
+            if (runtimeContainsKVKey(writes.items, edge_key)) continue;
+            try deletes.append(runtime.alloc, try internal_keys.graphEdgeTtlLifetimeKeyAlloc(runtime.alloc, edge_key, graph_entry.config.name, graph_entry.config.coverage_generation, state_key));
+            try deletes.append(runtime.alloc, try internal_keys.graphEdgeTtlTombstoneKeyAlloc(runtime.alloc, edge_key, graph_entry.config.name, graph_entry.config.coverage_generation, state_key));
+        };
         if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
@@ -20832,8 +20854,14 @@ fn materializeGraphAssetForRuntime(
             if (runtimeContainsKVKey(writes.items, key) or runtimeContainsConstKey(deletes.items, key)) continue;
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, key));
         }
-        if (writes.items.len > 0 or deletes.items.len > 0) {
-            try storePutBatchWithRetry(runtime, writes.items, deletes.items);
+        var visible_writes = std.ArrayListUnmanaged(KVPair).empty;
+        defer visible_writes.deinit(runtime.alloc);
+        for (writes.items[0..graph_write_count]) |write| {
+            if (reconciled.winners.map.contains(write.key)) try visible_writes.append(runtime.alloc, write);
+        }
+        try visible_writes.appendSlice(runtime.alloc, writes.items[graph_write_count..]);
+        if (visible_writes.items.len > 0 or deletes.items.len > 0) {
+            try storePutBatchWithRetry(runtime, visible_writes.items, deletes.items);
         }
     }
 }
@@ -20844,6 +20872,10 @@ fn materializeGraphAssetDeleteForRuntime(
     window: *GeneratedReplayWindow,
 ) !void {
     if (!runtime.index_manager.hasGraphIndexes()) return;
+    if (runtime.coverage_apply_mutex) |lock| lock.lockExclusive();
+    defer if (runtime.coverage_apply_mutex) |lock| lock.unlockExclusive();
+    var graph_publication = runtime.index_manager.beginGraphPrimaryMutation();
+    defer graph_publication.release();
     const artifact_name = requestArtifactName(request);
 
     for (runtime.index_manager.graphIndexes()) |graph_entry| {
@@ -20862,6 +20894,10 @@ fn materializeGraphAssetDeleteForRuntime(
         const previous_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key, graph_entry.config.coverage_generation);
         defer if (previous_keys) |keys| freeOwnedConstKeySlice(runtime.alloc, keys);
         try appendRuntimeGraphAssetStateSegmentDeletes(runtime, state_key, &deletes);
+        if (previous_keys) |keys| for (keys) |edge_key| {
+            try deletes.append(runtime.alloc, try internal_keys.graphEdgeTtlLifetimeKeyAlloc(runtime.alloc, edge_key, graph_entry.config.name, graph_entry.config.coverage_generation, state_key));
+            try deletes.append(runtime.alloc, try internal_keys.graphEdgeTtlTombstoneKeyAlloc(runtime.alloc, edge_key, graph_entry.config.name, graph_entry.config.coverage_generation, state_key));
+        };
         if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
@@ -21069,7 +21105,7 @@ fn runtimeConsiderGraphEdgeWinner(
     payload: []const u8,
 ) !void {
     if (winners.map.getPtr(edge_key)) |winner| {
-        if (source_priority > winner.source_priority or
+        if (graph_mod.sourcePriorityRank(@intCast(source_priority)) > graph_mod.sourcePriorityRank(@intCast(winner.source_priority)) or
             (source_priority == winner.source_priority and std.mem.order(u8, state_key, winner.owner_state_key) != .lt)) return;
         const owner = try alloc.dupe(u8, state_key);
         errdefer alloc.free(owner);
@@ -21097,6 +21133,7 @@ fn runtimeReconcileGlobalGraphEdgeWinner(
     result: *RuntimeGraphContenderResult,
 ) !void {
     const alloc = runtime.alloc;
+    const ttl_duration_ns = (runtime.index_manager.graphIndex(index_name) orelse return error.IndexNotFound).ttl_duration_ns;
     const prefix = try internal_keys.graphGlobalEdgeContenderEdgePrefixAlloc(alloc, index_name, expected_generation, edge_key);
     defer alloc.free(prefix);
     const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
@@ -21131,6 +21168,31 @@ fn runtimeReconcileGlobalGraphEdgeWinner(
             return .stop;
         }
     };
+    {
+        if (ttl_duration_ns != 0 and runtime.artifact_store == null) return error.InvalidIndexConfig;
+        const direct_doc_key = (try internal_keys.decodeDocumentComponentAlloc(alloc, edge_key)) orelse return error.InvalidGraphEdgeArtifact;
+        defer alloc.free(direct_doc_key);
+        const direct_state_key = try internal_keys.graphDirectStateKeyAlloc(alloc, direct_doc_key, index_name);
+        defer alloc.free(direct_state_key);
+        const direct_contender_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, index_name, expected_generation, edge_key, @intCast(graph_mod.direct_source_priority), direct_state_key);
+        defer alloc.free(direct_contender_key);
+        if (!runtimeGraphContenderStateChanged(edge_changes, direct_state_key)) {
+            const direct_raw = if (runtime.artifact_store) |artifact_store| artifact_store.get(alloc, direct_contender_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            } else try storeGetOptionalAllocWithRetry(runtime, direct_contender_key);
+            defer if (direct_raw) |raw| alloc.free(raw);
+            if (direct_raw) |raw| {
+                const direct = (try graph_edge_contender.decode(raw, expected_generation)) orelse return error.InvalidGraphEdgeContender;
+                if (!std.mem.eql(u8, direct.edge_key, edge_key) or
+                    !std.mem.eql(u8, direct.state_key, direct_state_key) or
+                    direct.source_priority != graph_mod.direct_source_priority) return error.InvalidGraphEdgeContender;
+                const authenticated = (try enrichment_artifact_codec.authenticateGraphEdgeGenerationAlloc(alloc, direct.payload, expected_generation)) orelse return error.InvalidGraphEdgeContender;
+                defer alloc.free(authenticated);
+                try runtimeConsiderGraphEdgeWinner(alloc, &result.winners, edge_key, direct_state_key, @intCast(graph_mod.direct_source_priority), authenticated);
+            }
+        }
+    }
     var scan_state = ScanState{
         .alloc = alloc,
         .index_name = index_name,
@@ -21143,12 +21205,119 @@ fn runtimeReconcileGlobalGraphEdgeWinner(
 
     for (edge_changes) |change| {
         const contender_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, index_name, expected_generation, edge_key, change.source_priority, change.state_key);
+        if (ttl_duration_ns != 0) {
+            const artifact_store = runtime.artifact_store orelse return error.InvalidIndexConfig;
+            const previous_raw = artifact_store.get(alloc, contender_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (previous_raw) |raw| alloc.free(raw);
+            if (previous_raw) |raw| {
+                const previous = (try graph_edge_contender.decode(raw, expected_generation)) orelse return error.InvalidGraphEdgeContender;
+                var previous_edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, previous.payload);
+                defer previous_edge.deinit(alloc);
+                if (previous_edge.ttl_created_ns == 0) return error.GraphEdgeTtlMigrationRequired;
+                const old_deadline = std.math.add(u64, previous_edge.ttl_created_ns, ttl_duration_ns) catch std.math.maxInt(u64);
+                try result.deletes.append(alloc, try graph_edge_ttl_expiration.indexKeyAlloc(alloc, old_deadline, contender_key));
+            }
+        }
         if (change.payload) |payload| {
             const authenticated = (try enrichment_artifact_codec.authenticateGraphEdgeGenerationAlloc(alloc, payload, expected_generation)) orelse return error.InvalidGraphEdgeContender;
             defer alloc.free(authenticated);
-            const contender_value = try graph_edge_contender.encodeAlloc(alloc, expected_generation, change.source_priority, edge_key, change.state_key, authenticated);
+            var incoming = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, authenticated);
+            defer incoming.deinit(alloc);
+            var selected_payload: []const u8 = authenticated;
+            var retimestamped: ?[]u8 = null;
+            defer if (retimestamped) |value| alloc.free(value);
+            if (incoming.ttl_created_ns != 0) {
+                const artifact_store = runtime.artifact_store orelse return error.InvalidIndexConfig;
+                const tombstone_key = try internal_keys.graphEdgeTtlTombstoneKeyAlloc(alloc, edge_key, index_name, expected_generation, change.state_key);
+                defer alloc.free(tombstone_key);
+                const tombstone_raw = artifact_store.get(alloc, tombstone_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                defer if (tombstone_raw) |value| alloc.free(value);
+                const changed_source_revision = if (tombstone_raw) |raw| blk: {
+                    const tombstone = try graph_edge_ttl_tombstone.Tombstone.decode(raw);
+                    const digest = try graph_edge_ttl_tombstone.sourceDigest(alloc, authenticated);
+                    if (std.mem.eql(u8, &digest, &tombstone.source_digest)) return error.InvalidGraphEdgeTtlTombstone;
+                    break :blk true;
+                } else false;
+                if (changed_source_revision) try result.deletes.append(alloc, try alloc.dupe(u8, tombstone_key));
+                const lifetime_key = try internal_keys.graphEdgeTtlLifetimeKeyAlloc(alloc, edge_key, index_name, expected_generation, change.state_key);
+                var lifetime_key_owned = true;
+                errdefer if (lifetime_key_owned) alloc.free(lifetime_key);
+                const lifetime_raw = artifact_store.get(alloc, lifetime_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                defer if (lifetime_raw) |value| alloc.free(value);
+                var source_timestamp = incoming.ttl_created_ns;
+                if (lifetime_raw != null and !changed_source_revision) {
+                    const raw = lifetime_raw.?;
+                    if (raw.len != 8) return error.InvalidGraphEdgeTtlLifetime;
+                    source_timestamp = std.mem.readInt(u64, raw[0..8], .big);
+                    if (source_timestamp == 0) return error.InvalidGraphEdgeTtlLifetime;
+                } else if (!changed_source_revision) {
+                    const previous_raw = artifact_store.get(alloc, contender_key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    defer if (previous_raw) |value| alloc.free(value);
+                    if (previous_raw) |raw| {
+                        const previous = (try graph_edge_contender.decode(raw, expected_generation)) orelse return error.InvalidGraphEdgeContender;
+                        if (!std.mem.eql(u8, previous.edge_key, edge_key) or !std.mem.eql(u8, previous.state_key, change.state_key) or previous.source_priority != change.source_priority)
+                            return error.InvalidGraphEdgeContender;
+                        var previous_edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, previous.payload);
+                        defer previous_edge.deinit(alloc);
+                        if (previous_edge.ttl_created_ns == 0) return error.GraphEdgeTtlMigrationRequired;
+                        source_timestamp = previous_edge.ttl_created_ns;
+                    }
+                }
+                var timestamp_buf: [8]u8 = undefined;
+                std.mem.writeInt(u64, &timestamp_buf, source_timestamp, .big);
+                const lifetime_value = try alloc.dupe(u8, &timestamp_buf);
+                var lifetime_value_owned = true;
+                errdefer if (lifetime_value_owned) alloc.free(lifetime_value);
+                try result.writes.append(alloc, .{ .key = lifetime_key, .value = lifetime_value });
+                lifetime_value_owned = false;
+                lifetime_key_owned = false;
+                if (source_timestamp != incoming.ttl_created_ns) {
+                    const header = try enrichment_artifact_codec.decodeHeader(authenticated);
+                    retimestamped = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(alloc, if (header.flags.has_source_hash) header.source_hash else null, expected_generation, incoming.weight, incoming.created_at, incoming.updated_at, source_timestamp, incoming.metadata_json);
+                    selected_payload = retimestamped.?;
+                }
+            }
+            const contender_value = try graph_edge_contender.encodeAlloc(alloc, expected_generation, change.source_priority, edge_key, change.state_key, selected_payload);
+            if (ttl_duration_ns != 0) {
+                var final_edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, selected_payload);
+                defer final_edge.deinit(alloc);
+                if (final_edge.ttl_created_ns == 0) return error.GraphEdgeTtlMigrationRequired;
+                const deadline = std.math.add(u64, final_edge.ttl_created_ns, ttl_duration_ns) catch std.math.maxInt(u64);
+                var digest: [32]u8 = undefined;
+                GraphTtlSha256.hash(contender_value, &digest, .{});
+                const candidate: graph_edge_ttl_expiration.Candidate = .{
+                    .index_name = index_name,
+                    .generation = expected_generation,
+                    .edge_key = edge_key,
+                    .state_key = change.state_key,
+                    .source_priority = change.source_priority,
+                    .deadline_ns = deadline,
+                    .contender_digest = digest,
+                };
+                const expiration_key = try graph_edge_ttl_expiration.indexKeyAlloc(alloc, deadline, contender_key);
+                var expiration_key_owned = true;
+                errdefer if (expiration_key_owned) alloc.free(expiration_key);
+                const expiration_value = try graph_edge_ttl_expiration.encodeAlloc(alloc, candidate);
+                var expiration_value_owned = true;
+                errdefer if (expiration_value_owned) alloc.free(expiration_value);
+                try result.writes.append(alloc, .{ .key = expiration_key, .value = expiration_value });
+                expiration_key_owned = false;
+                expiration_value_owned = false;
+            }
             try result.writes.append(alloc, .{ .key = contender_key, .value = contender_value });
-            try runtimeConsiderGraphEdgeWinner(alloc, &result.winners, edge_key, change.state_key, change.source_priority, authenticated);
+            try runtimeConsiderGraphEdgeWinner(alloc, &result.winners, edge_key, change.state_key, change.source_priority, selected_payload);
         } else {
             try result.deletes.append(alloc, contender_key);
         }
@@ -21179,7 +21348,24 @@ fn runtimeReconcileGraphEdgeContenders(
     for (previous_keys) |edge_key| {
         try runtimeAppendGraphContenderChange(alloc, &changes, edge_key, state_key, source_priority, null);
     }
-    for (graph_writes) |write| try runtimeAppendGraphContenderChange(alloc, &changes, write.key, state_key, source_priority, write.value);
+    for (graph_writes) |write| {
+        const tombstone_key = try internal_keys.graphEdgeTtlTombstoneKeyAlloc(alloc, write.key, index_name, expected_generation, state_key);
+        defer alloc.free(tombstone_key);
+        const tombstone_raw = if (runtime.artifact_store) |artifact_store|
+            artifact_store.get(alloc, tombstone_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            }
+        else
+            null;
+        defer if (tombstone_raw) |raw| alloc.free(raw);
+        const suppressed = if (tombstone_raw) |raw| blk: {
+            const tombstone = try graph_edge_ttl_tombstone.Tombstone.decode(raw);
+            const digest = try graph_edge_ttl_tombstone.sourceDigest(alloc, write.value);
+            break :blk std.mem.eql(u8, &digest, &tombstone.source_digest);
+        } else false;
+        try runtimeAppendGraphContenderChange(alloc, &changes, write.key, state_key, source_priority, if (suppressed) null else write.value);
+    }
 
     const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, doc_key, index_name);
     defer alloc.free(count_key);
@@ -21200,6 +21386,7 @@ fn runtimeReconcileGraphEdgeContenders(
         defer backend_scan.freeResults(alloc, existing);
         for (existing) |contender| {
             if (std.mem.eql(u8, contender.key, count_key)) continue;
+            if (internal_keys.isGraphEdgeTtlLifetimeKey(contender.key) or internal_keys.isGraphEdgeTtlTombstoneKey(contender.key)) continue;
             const view = (try graph_edge_contender.decode(contender.value, expected_generation)) orelse continue;
             const edge_key = changes.getKey(view.edge_key) orelse continue;
             const edge_changes = changes.get(edge_key).?;
