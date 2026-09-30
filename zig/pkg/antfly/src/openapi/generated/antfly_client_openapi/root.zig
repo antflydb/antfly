@@ -402,6 +402,7 @@ pub const GraphShortestPathQuery = types.GraphShortestPathQuery;
 pub const GraphTemplateValue = types.GraphTemplateValue;
 pub const GraphTraversal = types.GraphTraversal;
 pub const GraphTraverseQuery = types.GraphTraverseQuery;
+pub const GraphTtlConfig = types.GraphTtlConfig;
 pub const GraphWhereAnd = types.GraphWhereAnd;
 pub const GraphWhereExpression = types.GraphWhereExpression;
 pub const GraphWhereNotEqual = types.GraphWhereNotEqual;

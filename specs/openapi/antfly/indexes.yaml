@@ -2851,7 +2851,14 @@ components:
       description: "Configuration for graph index type"
       x-antfly-mutually-exclusive:
         - [sources, source]
+        - [ttl, ttl_duration]
       properties:
+        ttl:
+          $ref: "#/components/schemas/GraphTtlConfig"
+          description: "Creation-based edge expiration for this graph index. The duration is immutable within an index incarnation."
+        ttl_duration:
+          type: string
+          description: "Compatibility alias for ttl.duration. Do not specify together with ttl."
         metrics:
           type: object
           description: "Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name."
@@ -2899,6 +2906,14 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/GraphResolverConfig"
+    GraphTtlConfig:
+      type: object
+      additionalProperties: false
+      required: [duration]
+      properties:
+        duration:
+          type: string
+          description: "Expiration duration using Antfly's integer-component duration format (ns, us, ms, s, m, h, d)."
     GraphMetricConfig:
       type: object
       additionalProperties: false

@@ -35,6 +35,7 @@ pub const globMatch = impl.globMatch;
 pub const patternPropertyMatches = impl.patternPropertyMatches;
 pub const shouldIgnoreSchemaValidationField = impl.shouldIgnoreSchemaValidationField;
 pub const pathContainsSchemaIgnoredField = impl.pathContainsSchemaIgnoredField;
+pub const parseTtlDurationNs = impl.parseTtlDurationNs;
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     return try impl.parseSchemaUpdateRequest(alloc, body);
