@@ -888,13 +888,26 @@ pub fn fuseNamedSets(
     var ranked_results = try alloc.alloc(fusion_mod.RankedResult, named_sets.len);
     defer alloc.free(ranked_results);
 
-    const ordinal_complete = namedSetsHaveCompleteOrdinals(named_sets);
+    // Member/chunk mode hits intentionally share their parent document's
+    // ordinal (see reshapeChunkBackedResult), so ordinal-keyed fusion would
+    // collapse every distinct chunk of one parent into a single fused hit.
+    // Force identity (hit.id) keying there; it is already correct because
+    // the same chunk id returned by two arms fuses via the id-equality path
+    // below, while distinct chunks of the same parent keep distinct ids.
+    const member_mode = req.return_mode == .member or req.return_mode == .chunk;
+    const ordinal_complete = !member_mode and namedSetsHaveCompleteOrdinals(named_sets);
     var ordinal_fusion_keys = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, OrdinalFusionEntry).empty;
     defer freeOrdinalFusionKeys(alloc, &ordinal_fusion_keys);
     var fusion_key_entries = std.StringHashMapUnmanaged(OrdinalFusionEntry).empty;
     defer fusion_key_entries.deinit(alloc);
     var ordinal_by_id = std.StringHashMapUnmanaged(?doc_set.DocOrdinal).empty;
     defer ordinal_by_id.deinit(alloc);
+    // Ancestor payloads hydrated per-arm (single-arm postprocessing) before
+    // fusion rebuilds hits from scratch; carried forward by fusion key so the
+    // materialized fused hit doesn't silently drop them (issue #930). Values
+    // borrow named_sets' hit memory, which outlives this call.
+    var ancestor_payloads = std.StringHashMapUnmanaged(AncestorPayload).empty;
+    defer ancestor_payloads.deinit(alloc);
 
     for (named_sets, 0..) |set, i| {
         var ranked_hits = try alloc.alloc(fusion_mod.RankedHit, set.hits.len);
@@ -914,6 +927,7 @@ pub fn fuseNamedSets(
                 }
                 break :blk hit.id;
             };
+            try recordAncestorPayload(alloc, &ancestor_payloads, ranked_doc_id, hit);
             const raw_score = if (hit.score) |score| score else 0.0;
             ranked_hits[j] = .{
                 .doc_id = ranked_doc_id,
@@ -958,6 +972,7 @@ pub fn fuseNamedSets(
         else
             null;
         const output_doc_id = if (representative) |entry| entry.representative_doc_id else hit.doc_id;
+        const ancestors = ancestor_payloads.get(hit.doc_id);
         const materialized = blk: {
             const owned_id = try alloc.dupe(u8, output_doc_id);
             errdefer alloc.free(owned_id);
@@ -968,12 +983,18 @@ pub fn fuseNamedSets(
             else
                 null;
             errdefer if (stored_data) |value| alloc.free(value);
+            const ancestor_source_data = if (ancestors) |a| (if (a.source) |s| try alloc.dupe(u8, s) else null) else null;
+            errdefer if (ancestor_source_data) |value| alloc.free(value);
+            const ancestor_unit_data = if (ancestors) |a| (if (a.unit) |u| try alloc.dupe(u8, u) else null) else null;
+            errdefer if (ancestor_unit_data) |value| alloc.free(value);
             break :blk types.SearchHit{
                 .id = owned_id,
                 .doc_ordinal = if (representative) |entry| entry.ordinal else if (ordinal_by_id.get(hit.doc_id)) |ordinal| ordinal else null,
                 .score = @floatCast(hit.score),
                 .index_scores = owned_index_scores,
                 .stored_data = stored_data,
+                .ancestor_source_data = ancestor_source_data,
+                .ancestor_unit_data = ancestor_unit_data,
             };
         };
         hits[i] = materialized;
@@ -1004,6 +1025,35 @@ const OrdinalFusionEntry = struct {
     representative_doc_id: []const u8,
     ordinal: doc_set.DocOrdinal,
 };
+
+/// Ancestor payloads hydrated by single-arm postprocessing
+/// (hydrateDirectChunkAncestors) before fusion runs. Borrowed byte slices
+/// from the source named_sets' hits; fuseNamedSets dupes them into the
+/// materialized fused hit rather than taking ownership here.
+const AncestorPayload = struct {
+    source: ?[]const u8 = null,
+    unit: ?[]const u8 = null,
+};
+
+/// Records the ancestor payload (if any) carried by a pre-fusion hit under
+/// its fusion key, preferring any arm's hit that actually hydrated one for
+/// this member (issue #930: fusion previously rebuilt hits from scratch and
+/// silently dropped ancestor_source_data/ancestor_unit_data).
+fn recordAncestorPayload(
+    alloc: Allocator,
+    map: *std.StringHashMapUnmanaged(AncestorPayload),
+    key: []const u8,
+    hit: types.SearchHit,
+) !void {
+    if (hit.ancestor_source_data == null and hit.ancestor_unit_data == null) return;
+    const gop = try map.getOrPut(alloc, key);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{ .source = hit.ancestor_source_data, .unit = hit.ancestor_unit_data };
+        return;
+    }
+    if (gop.value_ptr.source == null) gop.value_ptr.source = hit.ancestor_source_data;
+    if (gop.value_ptr.unit == null) gop.value_ptr.unit = hit.ancestor_unit_data;
+}
 
 fn namedSetsHaveCompleteOrdinals(named_sets: []const NamedResultSet) bool {
     for (named_sets, 0..) |set, set_index| {
@@ -6570,6 +6620,73 @@ test "fuseNamedSets preserves fused per-index scores" {
     try std.testing.expectEqual(@as(usize, 2), result.hits[0].index_scores.len);
     try std.testing.expectEqualStrings("dense", result.hits[0].index_scores[0].index_name);
     try std.testing.expectEqualStrings("sparse", result.hits[0].index_scores[1].index_name);
+}
+
+test "fuseNamedSets carries ancestor payloads through fusion (#930)" {
+    const alloc = std.testing.allocator;
+
+    // Only the full-text arm's hit carries the hydrated source ancestor;
+    // fusion must still surface it on the merged member-mode hit rather than
+    // rebuilding a bare {"id": ...} hit from scratch.
+    const text_hits = [_]types.SearchHit{
+        .{ .id = @constCast("chunk:a#0"), .score = 1.0, .ancestor_source_data = @constCast("{\"filename\":\"a.txt\"}") },
+    };
+    const vec_hits = [_]types.SearchHit{
+        .{ .id = @constCast("chunk:a#0"), .score = 0.5 },
+    };
+    const named_sets = [_]NamedResultSet{
+        .{ .name = "$full_text_results", .hits = &text_hits, .total_hits = 1 },
+        .{ .name = "$embeddings_results", .hits = &vec_hits, .total_hits = 1 },
+    };
+
+    const Harness = struct {
+        fn loadProjectedDocument(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror!?[]u8 {
+            return null;
+        }
+    };
+
+    var result = try fuseNamedSets(alloc, .{
+        .return_mode = .member,
+        .limit = 5,
+        .include_stored = false,
+    }, &named_sets, .{ .ctx = null, .load_projected_document = Harness.loadProjectedDocument });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("{\"filename\":\"a.txt\"}", result.hits[0].ancestor_source_data.?);
+}
+
+test "fuseNamedSets keeps distinct member-mode chunks sharing a parent ordinal (#931)" {
+    const alloc = std.testing.allocator;
+
+    const text_hits = [_]types.SearchHit{
+        .{ .id = @constCast("chunk:a#0"), .doc_ordinal = 7, .score = 1.0 },
+    };
+    const vec_hits = [_]types.SearchHit{
+        .{ .id = @constCast("chunk:a#0"), .doc_ordinal = 7, .score = 0.9 },
+        .{ .id = @constCast("chunk:a#1"), .doc_ordinal = 7, .score = 0.8 },
+    };
+    const named_sets = [_]NamedResultSet{
+        .{ .name = "$full_text_results", .hits = &text_hits, .total_hits = 1 },
+        .{ .name = "$embeddings_results", .hits = &vec_hits, .total_hits = 2 },
+    };
+
+    const Harness = struct {
+        fn loadProjectedDocument(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror!?[]u8 {
+            return null;
+        }
+    };
+
+    var result = try fuseNamedSets(alloc, .{
+        .return_mode = .member,
+        .limit = 5,
+        .include_stored = false,
+    }, &named_sets, .{ .ctx = null, .load_projected_document = Harness.loadProjectedDocument });
+    defer result.deinit();
+
+    // Without the fix this collapses to one hit: both chunks share ordinal 7
+    // and ordinal-keyed fusion (used for non-member modes) would merge them.
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
 }
 
 test "executeGraphQueries projects base hits to resolved doc-set for unbounded selectors" {
