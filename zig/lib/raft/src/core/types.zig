@@ -569,6 +569,7 @@ pub const Status = struct {
     hard: HardState,
     conf_state: ConfState,
     last_index: Index = 0,
+    last_term: Term = 0,
     applied_index: Index = 0,
     election_elapsed: u32 = 0,
     randomized_election_timeout: u32 = 0,

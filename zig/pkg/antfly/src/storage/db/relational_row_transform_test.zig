@@ -18,6 +18,44 @@ const mapper = @import("document_mapper.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const alloc = std.testing.allocator;
 
+test "SQL primary-key rewrite retains a present key across nullable-to-required row mapping" {
+    const compiler = @import("../../sql/compiler.zig");
+    var create = try compiler.compile(alloc, "CREATE TABLE pk_good (id BIGINT, note TEXT)", .{});
+    defer create.deinit();
+    const before = try @import("../../sql/ddl_runtime.zig").createSchemaAlloc(alloc, create.statement.create_table);
+    defer alloc.free(before);
+    var alter = try compiler.compile(alloc, "ALTER TABLE pk_good ADD CONSTRAINT pk_good_key PRIMARY KEY (id)", .{});
+    defer alter.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var candidate = try std.json.parseFromSlice(std.json.Value, a, before, .{ .parse_numbers = false });
+    defer candidate.deinit();
+    try std.testing.expect(try @import("../../sql/schema_ddl.zig").apply(a, &candidate.value, alter.statement.catalog_ddl));
+    try candidate.value.object.put(a, "version", .{ .integer = 1 });
+    const after = try std.json.Stringify.valueAlloc(alloc, candidate.value, .{});
+    defer alloc.free(after);
+    var program = try transform.Program.init(alloc, before, after, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(@as(?usize, 0), program.source.physicalLayout().ordinalForName(program.source.tableSchema().relational_columns, "id"));
+    try std.testing.expectEqual(@as(?usize, 0), program.target.physicalLayout().ordinalForName(program.target.tableSchema().relational_columns, "id"));
+    var source = try mapper.PreparedRelationalWrite.initFromIntent(alloc, "row-a", "{\"id\":1,\"note\":\"first\"}", program.source.validator(), program.source.tableSchema().*, program.source.physicalLayout(), null);
+    defer source.deinit(alloc);
+    try source.finalizeMetadata(123);
+    const source_view = try codec.ordinalRowView(source.packed_row, program.source.tableSchema().*, program.source.physicalLayout());
+    const source_id = (try source_view.findCell(0)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!source_id.is_null);
+    var result = try program.transform(alloc, source.packed_row);
+    defer result.deinit(alloc);
+    const target_view = try codec.ordinalRowView(result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
+    const target_id = (try target_view.findCell(0)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!target_id.is_null);
+    var null_source = try mapper.PreparedRelationalWrite.initFromIntent(alloc, "row-null", "{\"id\":null,\"note\":\"missing\"}", program.source.validator(), program.source.tableSchema().*, program.source.physicalLayout(), null);
+    defer null_source.deinit(alloc);
+    try null_source.finalizeMetadata(123);
+    try std.testing.expectError(error.InvalidRelationalRow, program.transform(alloc, null_source.packed_row));
+}
+
 const source_schema =
     \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"n","expression":{"op":"literal","type":"integer","value":2}}],"generated_columns":[{"column":"g","expression":{"op":"add","args":[{"op":"column","column":"x"},{"op":"literal","type":"integer","value":1}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"x":{"type":"integer"},"n":{"type":["integer","null"]},"g":{"type":"integer"},"wide":{"type":"string"}},"required":["x","g"],"additionalProperties":false}}}}
 ;

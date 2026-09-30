@@ -85,7 +85,7 @@ fn projectValue(alloc: Allocator, root: std.json.Value, opts: types.LookupOption
     }
 
     for (excludes.items) |pattern| {
-        applyExcludePattern(alloc, &result.object, pattern);
+        try applyExcludePattern(alloc, &result.object, pattern);
     }
 
     return result;
@@ -141,7 +141,7 @@ fn includeField(
     depth: usize,
 ) Allocator.Error!void {
     if (depth == parts.len - 1) {
-        try putOwnedValue(alloc, dst, key, try cloneJsonValue(alloc, value));
+        try @import("../../common/owned_json.zig").putClone(alloc, dst, key, value);
         return;
     }
 
@@ -163,7 +163,8 @@ fn includeField(
 
                     const item = arr.items[idx];
                     if (depth + 1 == parts.len - 1) {
-                        try projected_items.append(try cloneJsonValue(alloc, item));
+                        try projected_items.ensureTotalCapacity(1);
+                        projected_items.appendAssumeCapacity(try cloneJsonValue(alloc, item));
                     } else switch (item) {
                         .object => |item_obj| {
                             var projected_item = std.json.Value{ .object = std.json.ObjectMap.empty };
@@ -217,11 +218,11 @@ fn applyExcludePattern(
     alloc: Allocator,
     doc: *std.json.ObjectMap,
     pattern: []const u8,
-) void {
+) Allocator.Error!void {
     var parts_iter = std.mem.tokenizeScalar(u8, pattern, '.');
     var parts = std.ArrayListUnmanaged([]const u8).empty;
     defer parts.deinit(alloc);
-    while (parts_iter.next()) |part| parts.append(alloc, part) catch return;
+    while (parts_iter.next()) |part| try parts.append(alloc, part);
     if (parts.items.len == 0) return;
 
     applyExcludeRecursive(alloc, doc, parts.items, 0);
@@ -316,79 +317,14 @@ fn ensureObjectValue(
         return &existing.object;
     }
 
-    try dst.put(alloc, try alloc.dupe(u8, key), .{ .object = std.json.ObjectMap.empty });
+    try putOwnedValue(alloc, dst, key, .{ .object = std.json.ObjectMap.empty });
     return &dst.getPtr(key).?.object;
 }
 
-fn putOwnedValue(
-    alloc: Allocator,
-    obj: *std.json.ObjectMap,
-    key: []const u8,
-    value: std.json.Value,
-) !void {
-    if (obj.getPtr(key)) |existing| {
-        freeJsonValue(alloc, existing);
-        existing.* = value;
-        return;
-    }
-    try obj.put(alloc, try alloc.dupe(u8, key), value);
-}
-
-fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
-    return switch (value) {
-        .null => .null,
-        .bool => |b| .{ .bool = b },
-        .integer => |i| .{ .integer = i },
-        .float => |f| .{ .float = f },
-        .number_string => |s| .{ .number_string = try alloc.dupe(u8, s) },
-        .string => |s| .{ .string = try alloc.dupe(u8, s) },
-        .array => |arr| blk: {
-            var cloned = std.json.Array.init(alloc);
-            errdefer {
-                for (cloned.items) |*item| freeJsonValue(alloc, item);
-                cloned.deinit();
-            }
-            for (arr.items) |item| try cloned.append(try cloneJsonValue(alloc, item));
-            break :blk .{ .array = cloned };
-        },
-        .object => |obj| blk: {
-            var cloned = std.json.ObjectMap.empty;
-            errdefer {
-                var it = cloned.iterator();
-                while (it.next()) |entry| {
-                    alloc.free(entry.key_ptr.*);
-                    freeJsonValue(alloc, entry.value_ptr);
-                }
-                cloned.deinit(alloc);
-            }
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                try cloned.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try cloneJsonValue(alloc, entry.value_ptr.*));
-            }
-            break :blk .{ .object = cloned };
-        },
-    };
-}
-
-fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
-    switch (value.*) {
-        .null, .bool, .integer, .float => {},
-        .number_string => |s| alloc.free(s),
-        .string => |s| alloc.free(s),
-        .array => |*arr| {
-            for (arr.items) |*item| freeJsonValue(alloc, item);
-            arr.deinit();
-        },
-        .object => |*obj| {
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                alloc.free(entry.key_ptr.*);
-                freeJsonValue(alloc, entry.value_ptr);
-            }
-            obj.deinit(alloc);
-        },
-    }
-}
+const owned_json = @import("../../common/owned_json.zig");
+const putOwnedValue = owned_json.put;
+const cloneJsonValue = owned_json.clone;
+const freeJsonValue = owned_json.deinit;
 
 test "document query lookupJson projects nested fields and exclusions" {
     const alloc = std.testing.allocator;

@@ -6,6 +6,7 @@ from typing import Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.transaction_session_status_disposition import TransactionSessionStatusDisposition
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="TransactionSessionStatus")
@@ -22,6 +23,8 @@ class TransactionSessionStatus:
         lease_expires_at (int):
         lease_state (str):
         sync_level (str):
+        disposition (TransactionSessionStatusDisposition): Durable read-only transaction outcome. outcome_unknown is not
+            permission to replay a mutation with another ID.
         staged_table_count (int):
         staged_read_count (int):
         staged_write_count (int):
@@ -40,6 +43,7 @@ class TransactionSessionStatus:
     lease_expires_at: int
     lease_state: str
     sync_level: str
+    disposition: TransactionSessionStatusDisposition
     staged_table_count: int
     staged_read_count: int
     staged_write_count: int
@@ -65,6 +69,8 @@ class TransactionSessionStatus:
         lease_state = self.lease_state
 
         sync_level = self.sync_level
+
+        disposition = self.disposition.value
 
         staged_table_count = self.staged_table_count
 
@@ -103,6 +109,7 @@ class TransactionSessionStatus:
                 "lease_expires_at": lease_expires_at,
                 "lease_state": lease_state,
                 "sync_level": sync_level,
+                "disposition": disposition,
                 "staged_table_count": staged_table_count,
                 "staged_read_count": staged_read_count,
                 "staged_write_count": staged_write_count,
@@ -135,6 +142,8 @@ class TransactionSessionStatus:
         lease_state = d.pop("lease_state")
 
         sync_level = d.pop("sync_level")
+
+        disposition = TransactionSessionStatusDisposition(d.pop("disposition"))
 
         staged_table_count = d.pop("staged_table_count")
 
@@ -176,6 +185,7 @@ class TransactionSessionStatus:
             lease_expires_at=lease_expires_at,
             lease_state=lease_state,
             sync_level=sync_level,
+            disposition=disposition,
             staged_table_count=staged_table_count,
             staged_read_count=staged_read_count,
             staged_write_count=staged_write_count,

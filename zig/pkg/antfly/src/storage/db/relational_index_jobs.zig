@@ -531,6 +531,10 @@ pub const Page = struct {
         var manager = try core.initTxnManager();
         defer manager.deinit();
         try manager.checkOrdinaryWriteConflict(&maintenance.controlKey(self.next.id));
+        // A generation must not become queryable while a writer prepared
+        // before that generation existed can still publish a new tuple. Apply
+        // serializes this drain check with later intent admission.
+        if (self.next.state == .ready and try manager.hasPendingIntents()) return error.IntentConflict;
         var txn = try core.store.beginWriteTxn();
         errdefer txn.abort();
         if (!std.mem.eql(u8, &self.next.owner, &(try ownership(&txn)))) return error.PreparedGenerationChanged;

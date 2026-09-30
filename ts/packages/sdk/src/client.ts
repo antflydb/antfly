@@ -80,6 +80,14 @@ import type {
   RetrievalAgentStreamCallbacks,
   RunResearchJobOptions,
   ScanKeysRequest,
+  SQLConnectionOpenRequest,
+  SQLConnectionResponse,
+  SQLDiagnostic,
+  SQLPreparedExecutionRequest,
+  SQLPreparedResponse,
+  SQLPrepareRequest,
+  SQLRequest,
+  SQLResponse,
   Table,
   TableArtifactEnrichmentList,
   TableQueryRequest,
@@ -92,6 +100,16 @@ import type {
 export interface RestoreOptions {
   /** Stable key used to safely retry creation of the same restore job. */
   idempotencyKey?: string;
+}
+
+export class SQLExecutionError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly diagnostic: SQLDiagnostic
+  ) {
+    super(`SQL execution failed (${diagnostic.code}): ${diagnostic.message}`);
+    this.name = "SQLExecutionError";
+  }
 }
 
 export interface SchemaMutationOptions {
@@ -614,33 +632,48 @@ export class AntflyClient {
     options: WriteOptions | undefined,
     errorPrefix: string,
     marshalErrorPrefix: string,
-    relational = false
+    relational = false,
+    errorFactory?: (status: number, body: unknown) => Error | undefined,
+    redirect?: RequestRedirect,
+    method: "POST" | "DELETE" = "POST",
+    credentials?: RequestCredentials,
+    extraHeaders?: Record<string, string>
   ): Promise<{ data?: T; text: string; status: number }> {
     const opts = normalizedWriteOptions(options);
-    let encodedBody: string;
-    try {
-      encodedBody = encodeBoundedJSON(body, opts.maxRequestBytes, relational);
-    } catch (error) {
-      throw new Error(`${marshalErrorPrefix}: ${(error as Error).message}`);
+    let encodedBody: string | undefined;
+    if (method === "POST") {
+      try {
+        encodedBody = encodeBoundedJSON(body, opts.maxRequestBytes, relational);
+      } catch (error) {
+        throw new Error(`${marshalErrorPrefix}: ${(error as Error).message}`);
+      }
     }
 
     const response = await fetch(this.url(path), {
-      method: "POST",
-      headers: this.requestHeaders(),
+      method,
+      headers: this.requestHeaders(extraHeaders),
       body: encodedBody,
       signal: opts.signal,
+      ...(redirect ? { redirect } : {}),
+      ...(credentials ? { credentials } : {}),
     });
 
     if (!response.ok) {
       const { text, truncated } = await readLimitedResponseText(response, MAX_ERROR_RESPONSE_BYTES);
       let message = apiErrorMessage(text);
+      let errorBody: unknown;
       try {
-        message = apiErrorMessage(parseJSON<unknown>(text), message);
+        errorBody = parseJSON<unknown>(text);
+        message = apiErrorMessage(errorBody, message);
       } catch {
         // Non-JSON error bodies are reported as-is below.
       }
       if (truncated) {
         message = `${message} (response body exceeded ${MAX_ERROR_RESPONSE_BYTES} bytes)`;
+      }
+      if (!truncated && errorFactory) {
+        const structured = errorFactory(response.status, errorBody);
+        if (structured) throw structured;
       }
       throw new Error(`${errorPrefix}: ${response.status} ${message}`);
     }
@@ -788,6 +821,178 @@ export class AntflyClient {
       if (error) throw queryError("Multi-query failed", error, response);
       validateGraphQueryResponses(data as QueryResponses, requests);
       return data as QueryResponses;
+    }
+  }
+
+  private async sqlRequest<T>(
+    path: string,
+    request: unknown,
+    options?: WriteOptions,
+    method: "POST" | "DELETE" = "POST",
+    extraHeaders?: Record<string, string>
+  ): Promise<T | undefined> {
+    const { data } = await this.postBoundedJSON<T>(
+      path,
+      request,
+      {
+        ...options,
+        maxRequestBytes: Math.min(normalizedWriteOptions(options).maxRequestBytes, 4 << 20),
+        maxResponseBytes: Math.min(
+          options?.maxResponseBytes && options.maxResponseBytes > 0
+            ? options.maxResponseBytes
+            : 16 << 20,
+          16 << 20
+        ),
+      },
+      "SQL execution failed",
+      "Invalid SQL request",
+      true,
+      (status, body) => {
+        if (typeof body !== "object" || body === null) return undefined;
+        const diagnostic = body as SQLDiagnostic;
+        if (
+          typeof diagnostic.code !== "string" ||
+          diagnostic.code.length !== 5 ||
+          typeof diagnostic.message !== "string"
+        )
+          return undefined;
+        return new SQLExecutionError(status, diagnostic);
+      },
+      "error",
+      method,
+      "omit",
+      extraHeaders
+    );
+    return data;
+  }
+
+  private sqlResponse(data: SQLResponse | undefined): SQLResponse {
+    if (!data || !Array.isArray(data.columns) || !Array.isArray(data.rows)) {
+      throw new Error("Invalid SQL response");
+    }
+    if (data.rows.length > 4096) throw new Error("SQL response exceeds 4096 rows");
+    for (const row of data.rows) {
+      if (!Array.isArray(row) || row.length !== data.columns.length) {
+        throw new Error("SQL row width differs from column metadata");
+      }
+    }
+    return data;
+  }
+
+  /** Execute one statement with bounded transport and no automatic mutation retries. */
+  async executeSQL(request: SQLRequest, options?: WriteOptions): Promise<SQLResponse> {
+    return this.sqlResponse(await this.sqlRequest<SQLResponse>("/db/v1/sql", request, options));
+  }
+
+  /** Open a durable, principal-bound SQL connection on this API node. Keep its owner for routing. */
+  async openSQLConnection(
+    request: SQLConnectionOpenRequest = {},
+    options?: WriteOptions
+  ): Promise<SQLConnectionResponse> {
+    const data = await this.sqlRequest<SQLConnectionResponse>(
+      "/db/v1/sql/connections",
+      request,
+      options
+    );
+    if (
+      !data ||
+      typeof data.connection_id !== "string" ||
+      !/^[0-9a-f]{32}$/.test(data.connection_id) ||
+      typeof data.owner_node_id !== "string" ||
+      !/^(0|[1-9][0-9]{0,19})$/.test(data.owner_node_id) ||
+      !Number.isSafeInteger(data.expires_at_ms) ||
+      data.expires_at_ms <= 0 ||
+      typeof data.database !== "string" ||
+      !data.database ||
+      typeof data.namespace !== "string" ||
+      !data.namespace
+    )
+      throw new Error("Invalid SQL connection response");
+    return data;
+  }
+
+  /** Close an idle SQL connection on its owner. Unknown mutation outcomes are never replayed. */
+  async closeSQLConnection(connectionId: string, options?: WriteOptions): Promise<void> {
+    if (!/^[0-9a-f]{32}$/.test(connectionId))
+      throw new Error("SQL connection ID must be 32 lowercase hexadecimal characters");
+    const data = await this.sqlRequest<Record<string, never>>(
+      `/db/v1/sql/connections/${encodeURIComponent(connectionId)}`,
+      undefined,
+      options,
+      "DELETE"
+    );
+    if (!data || Array.isArray(data) || typeof data !== "object" || Object.keys(data).length !== 0)
+      throw new Error("Invalid SQL connection close response");
+  }
+
+  /**
+   * Bind a durable, owner-bound statement without executing it. The resource survives
+   * transaction commit; keep its owner_node_id and expires_at_ms for routing and cleanup.
+   * Creation is never retried or redirected automatically.
+   */
+  async prepareSQL(
+    request: SQLPrepareRequest,
+    options?: WriteOptions
+  ): Promise<SQLPreparedResponse> {
+    const data = await this.sqlRequest<SQLPreparedResponse>(
+      "/db/v1/sql/prepared",
+      request,
+      options
+    );
+    if (
+      !data ||
+      typeof data.prepared_id !== "string" ||
+      !data.prepared_id ||
+      !Number.isSafeInteger(data.expires_at_ms) ||
+      typeof data.owner_node_id !== "string" ||
+      !/^[0-9]{1,20}$/.test(data.owner_node_id) ||
+      !Array.isArray(data.parameter_types) ||
+      !Array.isArray(data.columns)
+    )
+      throw new Error("Invalid prepared SQL response");
+    return data;
+  }
+
+  /** Execute on the resource owner; reconcile ambiguous outcomes instead of replaying. */
+  async executePreparedSQL(
+    preparedId: string,
+    request: SQLPreparedExecutionRequest = {},
+    options?: WriteOptions
+  ): Promise<SQLResponse> {
+    if (!preparedId) throw new Error("Prepared SQL resource ID is required");
+    return this.sqlResponse(
+      await this.sqlRequest<SQLResponse>(
+        `/db/v1/sql/prepared/${encodeURIComponent(preparedId)}/execute`,
+        request,
+        options
+      )
+    );
+  }
+
+  /** Release an owner-bound resource; connection-bound resources require their connection ID. */
+  async closePreparedSQL(
+    preparedId: string,
+    options?: WriteOptions & { connectionId?: string }
+  ): Promise<void> {
+    if (!preparedId) throw new Error("Prepared SQL resource ID is required");
+    if (options?.connectionId !== undefined && !/^[0-9a-fA-F]{32}$/.test(options.connectionId))
+      throw new Error("SQL connection ID must be 32 hexadecimal characters");
+    const data = await this.sqlRequest<Record<string, never>>(
+      `/db/v1/sql/prepared/${encodeURIComponent(preparedId)}`,
+      undefined,
+      options,
+      "DELETE",
+      options?.connectionId !== undefined
+        ? { "X-Antfly-SQL-Connection-Id": options.connectionId }
+        : undefined
+    );
+    if (
+      !data ||
+      Array.isArray(data) ||
+      typeof data !== "object" ||
+      Object.keys(data).length !== 0
+    ) {
+      throw new Error("Invalid prepared SQL close response");
     }
   }
 

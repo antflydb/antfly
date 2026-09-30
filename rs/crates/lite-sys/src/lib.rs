@@ -669,6 +669,12 @@ unsafe extern "C" {
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
+    pub fn antfly_db_sql_json(
+        db: *mut antfly_db,
+        table_name: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
     pub fn antfly_db_search_dense(
         db: *mut antfly_db,
         index_name: antfly_slice,

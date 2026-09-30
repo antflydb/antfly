@@ -13,38 +13,16 @@
 // limitations.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("backend_erased.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const posting_segment_store = @import("posting_segment_store.zig");
-const supports_native_lmdb_backend = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
-const lmdb_backend = if (supports_native_lmdb_backend) @import("lmdb_backend.zig") else struct {
-    pub const Backend = struct {
-        pub fn close(_: *@This()) void {}
-
-        pub fn sync(_: *@This(), _: bool) !void {
-            return error.UnsupportedPlatform;
-        }
-
-        pub fn runtimeNamespaceStore(_: *@This(), _: Allocator) !backend_erased.NamespaceStore {
-            return error.UnsupportedPlatform;
-        }
-    };
-};
-
 pub const OpenedBackend = union(enum) {
-    lmdb: *lmdb_backend.Backend,
     lsm: lsm_backend.BackendHandle,
     native: *NativeBackend,
 
     pub fn close(self: *OpenedBackend, alloc: Allocator) void {
         switch (self.*) {
-            .lmdb => |backend| {
-                backend.close();
-                alloc.destroy(backend);
-            },
             .lsm => |*handle| handle.close(),
             .native => |backend| backend.close(alloc),
         }
@@ -53,12 +31,6 @@ pub const OpenedBackend = union(enum) {
 
     pub fn abandonAfterCrash(self: *OpenedBackend, alloc: Allocator) void {
         switch (self.*) {
-            // LMDB has no modeled unclean-close hook. Closing releases process
-            // resources without adding an HBC publication transition.
-            .lmdb => |backend| {
-                backend.close();
-                alloc.destroy(backend);
-            },
             .lsm => |*handle| handle.abandonAfterCrash(),
             .native => |backend| backend.close(alloc),
         }
@@ -67,7 +39,6 @@ pub const OpenedBackend = union(enum) {
 
     pub fn sync(self: *OpenedBackend, force: bool) !void {
         switch (self.*) {
-            .lmdb => |backend| try backend.sync(force),
             .lsm => |*handle| try handle.backend.sync(force),
             // HBC WAL appends and CURRENT replacement sync their own files and
             // parent namespace at the publication boundary.
@@ -77,7 +48,6 @@ pub const OpenedBackend = union(enum) {
 
     pub fn syncReplayState(self: *OpenedBackend) !void {
         switch (self.*) {
-            .lmdb => |backend| try backend.sync(false),
             .lsm => |*handle| try handle.backend.syncReplayState(),
             .native => {},
         }
@@ -85,7 +55,6 @@ pub const OpenedBackend = union(enum) {
 
     pub fn runtimeNamespaceStore(self: OpenedBackend, allocator: Allocator) !backend_erased.NamespaceStore {
         return switch (self) {
-            .lmdb => |backend| try backend.runtimeNamespaceStore(allocator),
             .lsm => |handle| try handle.backend.runtimeNamespaceStore(allocator),
             .native => return error.HbcNativeGenerationRequired,
         };
@@ -192,23 +161,6 @@ pub const LsmOptions = struct {
 
 pub fn openBackendWithLsmOptions(alloc: Allocator, path: [*:0]const u8, config: anytype, lsm_options: LsmOptions) !OpenedBackend {
     return switch (config.storage_backend) {
-        .lmdb => blk: {
-            if (!supports_native_lmdb_backend) return error.UnsupportedPlatform;
-            const backend = try alloc.create(lmdb_backend.Backend);
-            errdefer alloc.destroy(backend);
-            backend.* = try lmdb_backend.Backend.open(alloc, path, .{
-                .env = .{
-                    .max_dbs = 5,
-                    .map_size = config.map_size,
-                    .no_sync = config.no_sync,
-                    .no_meta_sync = config.no_meta_sync,
-                    .no_tls = true,
-                    .defer_page_mutation = config.defer_page_mutation,
-                },
-            });
-            errdefer backend.close();
-            break :blk .{ .lmdb = backend };
-        },
         .lsm => blk: {
             if (try NativeBackend.openIfAuthoritative(alloc, std.mem.span(path), lsm_options)) |native| {
                 break :blk .{ .native = native };

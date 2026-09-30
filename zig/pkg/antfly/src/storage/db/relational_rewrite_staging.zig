@@ -68,7 +68,7 @@ pub fn prepareTailFrame(target: *DB, alloc: Allocator, scope: staging.Scope, fra
     if (frame.len < 16 or frame.len > 16 * 1024 * 1024) return error.InvalidRestoreStagingCommand;
     var verified = try VerifiedFrame.init(alloc, frame, std.mem.readInt(u64, frame[4..12], .little));
     defer verified.deinit();
-    if (!std.mem.eql(u8, &verified.reader.frame_digest, &expected_digest)) return error.RetainedEffectsCorrupt;
+    if (!std.mem.eql(u8, &verified.digest(), &expected_digest)) return error.RetainedEffectsCorrupt;
     return prepareTailVerified(target, alloc, scope, &verified, programs, max_effects, cancellation);
 }
 
@@ -98,16 +98,23 @@ fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, sour
     var namespace: [24]u8 = undefined;
     @import("doc_identity.zig").encodeNamespace(&namespace, scope.source_namespace);
     const binding = scope.rewrite.?;
-    if (frame) |value| if (std.mem.readInt(u64, value.reader.bytes[4..12], .little) != try std.math.add(u64, previous.sequence, 1)) return error.RetainedEffectsCorrupt;
-    var reader = if (frame) |value| try value.readerAt(previous.frame_offset, previous.frame_remaining) else (try retained.read(&source_txn.?, namespace, binding.retained_epoch, binding.retained_pin, previous.sequence)) orelse
-        return .{ .arena = arena, .phase = next.phase, .batch = null };
+    var local_frame: ?VerifiedFrame = null;
+    defer if (local_frame) |*value| value.deinit();
+    var chunk_cache: @import("../retained_frame.zig").View.ChunkCache = .{ .bytes = &.{} };
+    if (frame == null) {
+        chunk_cache.bytes = try owned.alloc(u8, @import("../retained_frame.zig").chunk_bytes);
+        const retained_frame = (try retained.readFrame(&source_txn.?, namespace, binding.retained_epoch, binding.retained_pin, previous.sequence, &chunk_cache)) orelse
+            return .{ .arena = arena, .phase = next.phase, .batch = null };
+        local_frame = switch (retained_frame) {
+            .contiguous => |value| try VerifiedFrame.fromReader(owned, value),
+            .chunked => |value| try VerifiedFrame.fromStream(value, &chunk_cache),
+        };
+    }
+    const active_frame = frame orelse &local_frame.?;
+    if (active_frame.sequence() != try std.math.add(u64, previous.sequence, 1)) return error.RetainedEffectsCorrupt;
+    var reader = try active_frame.cursorAt(previous.frame_offset, previous.frame_remaining);
     if (previous.frame_offset != 0) {
         if (!std.mem.eql(u8, &reader.frame_digest, &previous.frame_digest)) return error.RestoreStagingProgressChanged;
-        // Validate the stored byte offset against an actual frame boundary,
-        // rather than trusting a cursor to skip or reinterpret committed bytes.
-        if (frame == null) while (reader.pos < previous.frame_offset) {
-            _ = (try reader.next()) orelse return error.InvalidRestoreStagingRecord;
-        };
         if (reader.pos != previous.frame_offset or reader.remaining != previous.frame_remaining) return error.InvalidRestoreStagingRecord;
     }
     var writes: std.ArrayList(types.BatchWrite) = .empty;
@@ -117,19 +124,25 @@ fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, sour
     var source_effects: u32 = 0;
     while (reader.remaining != 0 and writes.items.len + deletes.items.len < max_effects and source_effects < 1024) {
         try cancellation.check();
+        // Skipped integrity records must not accumulate their keys/values in
+        // the output arena. Only one bounded input row is resident at a time.
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
         const before = reader;
-        const effect = (try reader.next()).?;
+        const effect = (try reader.next(temporary)).?;
         if (effect.isIntegrity()) {
             source_effects += 1;
             continue;
         }
         if (keys.isRelationalRowKey(effect.key) == (programs.document_validator != null)) return error.InvalidRestoreStagingCommand;
-        const key = (try keys.decodeStoredDocumentRowKeyAlloc(owned, effect.key)) orelse return error.InvalidRestoreStagingCommand;
+        const key = (try keys.decodeStoredDocumentRowKeyAlloc(temporary, effect.key)) orelse return error.InvalidRestoreStagingCommand;
         if (!target.core.byteRange().contains(key)) return error.RestoreStagingScopeChanged;
-        const transformed: ?LogicalRow = if (effect.value) |value| if (programs.document_validator != null)
-            .{ .json = try programs.preserveDocument(owned, value), .timestamp = effect.timestamp }
+        if (effect.value_len) |len| if (len > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
+        const transformed: ?LogicalRow = if (try effect.valueAlloc(temporary)) |value| if (programs.document_validator != null)
+            .{ .json = try programs.preserveDocument(temporary, value), .timestamp = effect.timestamp }
         else
-            try programs.transformJson(owned, value) else null;
+            try programs.transformJson(temporary, value) else null;
         const size = key.len +| if (transformed) |value| value.json.len else @as(usize, 0);
         if (size > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
         if (output_bytes != 0 and output_bytes +| size > 1024 * 1024) {
@@ -138,11 +151,12 @@ fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, sour
         }
         output_bytes += size;
         source_effects += 1;
+        const output_key = try owned.dupe(u8, key);
         if (transformed) |value| {
             if (effect.timestamp == 0 or value.timestamp != effect.timestamp) return error.RetainedEffectsCorrupt;
-            try writes.append(owned, .{ .key = key, .value = value.json });
-            try timestamps.append(owned, .{ .key = key, .timestamp = value.timestamp });
-        } else try deletes.append(owned, key);
+            try writes.append(owned, .{ .key = output_key, .value = try owned.dupe(u8, value.json) });
+            try timestamps.append(owned, .{ .key = output_key, .timestamp = value.timestamp });
+        } else try deletes.append(owned, output_key);
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update(&next.logical_digest);
         hash.update(&reader.frame_digest);
@@ -153,7 +167,7 @@ fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, sour
         next.rows = std.math.add(u64, next.rows, 1) catch return error.InvalidRestoreStagingCommand;
     }
     if (reader.remaining == 0) {
-        _ = try reader.next();
+        _ = try reader.next(owned);
         next.rewrite.?.sequence = std.math.add(u64, previous.sequence, 1) catch return error.InvalidRestoreStagingCommand;
         next.rewrite.?.frame_digest = @splat(0);
         next.rewrite.?.frame_offset = 0;

@@ -50,7 +50,10 @@ pub fn chunkText(
         const backward_end = utf8_text.snapToBoundary(source_text, raw_end, .backward);
         const end = if (backward_end > start) backward_end else utf8_text.snapToBoundary(source_text, raw_end, .forward);
         if (end <= start) break;
-        try chunks.append(alloc, .{
+        // Reserve the destination before allocating its owned payload. A
+        // failed list growth must not strand the text outside cleanup's slice.
+        try chunks.ensureUnusedCapacity(alloc, 1);
+        chunks.appendAssumeCapacity(.{
             .chunk_id = chunk_id,
             .text = try alloc.dupe(u8, source_text[start..end]),
             .start_offset = mapOffset(&sanitized, start, .start),

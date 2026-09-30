@@ -14,6 +14,8 @@ import type {
   ChunkConfig,
   ChunkResponse,
   ClassificationResult,
+  DecideRequest,
+  DecideResponse,
   EmbedInput,
   EmbedResponse,
   EntityExtractionResult,
@@ -458,6 +460,16 @@ export class InferenceClient {
   /** Strict mixed-task extraction with complete per-input schema/options replacements. */
   async extractV2(request: ExtractV2Request): Promise<ExtractResponse> {
     return this.extractRaw({ ...request, schema_version: 2 });
+  }
+
+  /** Answer named typed questions about one state. */
+  async decide(request: DecideRequest): Promise<DecideResponse> {
+    const { data, error, response } = await this.client.POST("/ai/v1/decide", {
+      body: request,
+    });
+    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!data) throw new Error("Decide failed: unexpected empty response");
+    return data;
   }
 
   /**

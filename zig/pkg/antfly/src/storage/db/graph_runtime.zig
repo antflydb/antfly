@@ -96,14 +96,16 @@ test "db graph runtime expansion waits for retirement before range and merge rec
         try std.testing.expect(stats.indexes[0].graph_counts_pending);
         try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].edge_count);
     }
+    try std.testing.expectError(
+        error.GraphMaintenanceInProgress,
+        DB.open(a, std.mem.span(path), .{ .open_mode = .query_readonly }),
+    );
     {
         var db = try DB.open(a, std.mem.span(path), .{});
         defer db.close();
         try std.testing.expectEqualStrings("m", db.getRange().end);
         const index = &db.core.index_manager.graphIndex("g").?.index;
-        try std.testing.expect(index.ownershipCleanupPending());
-        try std.testing.expectError(error.RaftApplyWriterUnavailable, db.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 }));
-        try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+        try std.testing.expect(!index.ownershipCleanupPending());
         try std.testing.expect(!index.ownershipTransitionPending());
         try db.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 });
         try std.testing.expectEqualStrings("", db.getRange().end);

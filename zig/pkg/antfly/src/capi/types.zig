@@ -15,6 +15,10 @@
 const std = @import("std");
 
 pub const Slice = extern struct {
+    pub fn fromSlice(value: []const u8) Slice {
+        return .{ .ptr = value.ptr, .len = value.len };
+    }
+
     ptr: ?[*]const u8 = null,
     len: usize = 0,
 
@@ -389,8 +393,19 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.PortableImportPublicationInProgress,
         error.PortableRuntimeActivationPending,
         error.GenerationTransitionActive,
+        error.RowPolicyCatalogChanged,
+        error.RowPolicyReadersActive,
+        error.InvalidRowPolicyReceipt,
+        error.InvalidRowPolicyBundle,
         => .busy,
-        error.FileLocksUnsupported, error.GenerationFileLocksUnsupported => .unsupported,
+        error.FileLocksUnsupported,
+        error.GenerationFileLocksUnsupported,
+        error.RowPolicyAuthenticationRequired,
+        error.RowPolicyAuthorityUnavailable,
+        error.RowPolicyDenied,
+        error.RowPolicyTopologyUnsupported,
+        error.RowPolicyMutationUnsupported,
+        error.RowPolicyUnsupported,
         // The inference runtime needs a sandboxed worker process on this
         // backend and no `antfly` executable was found to run it.
         error.InferenceWorkerExecutableNotConfigured,
@@ -400,7 +415,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         => .unsupported,
         error.InferenceProviderCallCapacityExhausted => .busy,
         error.DurabilityOutcomeUnknown => .outcome_unknown,
-        error.RunUntilIdleNoProgress => .stalled,
+        error.RunUntilIdleNoProgress, error.EnrichmentWaitTimeout => .stalled,
         // A dimension probe against a live embedder hit an operational
         // (network/transport) failure rather than a malformed request --
         // matches `managed_embedder.isOperationalEmbeddingProbeError`'s
@@ -419,10 +434,20 @@ test "run until idle no-progress error maps to a dedicated stalled ABI code, not
     // Regression guard for the dogfood ingest livelock follow-up: a bounded
     // stall must be distinguishable at the C ABI from an opaque server fault.
     try std.testing.expectEqual(ErrorCode.stalled, mapError(error.RunUntilIdleNoProgress));
+    try std.testing.expectEqual(ErrorCode.stalled, mapError(error.EnrichmentWaitTimeout));
     try std.testing.expect(ErrorCode.stalled != ErrorCode.internal);
     try std.testing.expectEqualStrings("ANTFLY_STALLED", std.mem.span(errorCodeName(@intFromEnum(ErrorCode.stalled))));
     try std.testing.expectEqualStrings(
         "ANTFLY_INTERNAL",
         std.mem.span(errorCodeName(@intFromEnum(ErrorCode.internal))),
     );
+}
+
+test "unauthenticated Lite access to an RLS table is a nonretryable capability error" {
+    try std.testing.expectEqual(ErrorCode.unsupported, mapError(error.RowPolicyAuthenticationRequired));
+    try std.testing.expectEqual(ErrorCode.busy, mapError(error.RowPolicyCatalogChanged));
+    try std.testing.expectEqual(ErrorCode.busy, mapError(error.RowPolicyReadersActive));
+    try std.testing.expectEqual(ErrorCode.unsupported, mapError(error.RowPolicyDenied));
+    try std.testing.expectEqual(ErrorCode.unsupported, mapError(error.RowPolicyTopologyUnsupported));
+    try std.testing.expectEqual(ErrorCode.busy, mapError(error.InvalidRowPolicyReceipt));
 }

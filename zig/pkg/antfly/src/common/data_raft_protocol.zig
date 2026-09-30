@@ -33,8 +33,23 @@
 /// authority. Older decoders must not reinterpret its clock or pin identity.
 /// Version 13 batches coordinator acknowledgements. All applying replicas
 /// must cross the durable activation barrier before this command is admitted.
-pub const batch_protocol_version: u16 = 13;
 pub const batch_acknowledge_many_protocol_version: u16 = 13;
+/// Version 14 includes typed direct-vector snapshot/tail payloads and their
+/// retained-transaction admission accounting. Ordered artifact merges require
+/// the complete decoder before admission, even for an empty first page.
+pub const batch_protocol_version: u16 = 14;
+pub const batch_artifact_catalog_protocol_version: u16 = 14;
+/// Full producer publications require a separate all-member barrier; the
+/// direct-vector decoder proof does not authorize asynchronous effect writes.
+pub const batch_artifact_publication_protocol_version: u16 = 15;
+/// Version 16 carries bounded authenticated publication uploads and the
+/// ordered finalize control. Version 15 peers cannot ignore stage entries or
+/// reinterpret a missing final payload as an ordinary empty batch.
+pub const batch_artifact_publication_transport_protocol_version: u16 = 16;
+/// Receiver-local imported-proof adoption is a distinct ordered decision.
+/// It cannot be replayed as an empty legacy batch or admitted before every
+/// applying member understands its evidence fence and standby envelope.
+pub const batch_merge_proof_adoption_protocol_version: u16 = 17;
 pub const batch_timestamp_protocol_version: u16 = 1;
 pub const batch_activation_barrier_protocol_version: u16 = 2;
 pub const batch_merge_transition_protocol_version: u16 = 3;

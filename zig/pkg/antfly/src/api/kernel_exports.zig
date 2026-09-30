@@ -183,6 +183,11 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         }
     else
         server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, imported_cfg, source.*, reads.*, writes.*);
+    state.server.startPgwire() catch |err| {
+        std.log.err("API pgwire listener startup failed: error.{s}", .{@errorName(err)});
+        state.server.deinit();
+        return fail(err);
+    };
     if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(&state.server.incoming_graph_routes);
     state.request_alloc_abi = .fromStd(&state.server.alloc);
     context.out_handle.* = state;
@@ -994,46 +999,52 @@ test "API kernel failed fallible create releases unpublished state" {
     file.close(std.testing.io);
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/not-a-directory/store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var accounting = std.testing.FailingAllocator.init(arena.allocator(), .{});
-    var allocator = accounting.allocator();
-    const owner_alloc = abi.memory_abi.Allocator.fromStd(&allocator);
-    const cfg: server_mod.ApiHttpServerConfig = .{ .session_store_path = path };
-    var token: u8 = 0;
-    const Stub = struct {
-        fn status(_: *anyopaque) anyerror!metadata_api.MetadataStatus {
-            return error.UnsupportedOperation;
-        }
-    };
-    const source: server_mod.StatusSource = .{ .ptr = &token, .vtable = &.{ .status = Stub.status } };
-    const reads: ?table_reads.TableReadSource = null;
-    const writes: ?table_writes.TableWriteSource = null;
-    var handle: ?*anyopaque = null;
-    var request_alloc: ?*const abi.memory_abi.Allocator = null;
-    @import("../test_error_logs.zig").expectErrorLogs(1);
-    const result = create(&.{
-        .abi_version = abi.abi_version,
-        .owner_alloc = &owner_alloc,
-        .cfg = &cfg,
-        .cfg_contract = .of(server_mod.ApiHttpServerConfig),
-        .source = &source,
-        .source_contract = .of(server_mod.StatusSource),
-        .table_reads = &reads,
-        .table_reads_contract = .of(?table_reads.TableReadSource),
-        .table_writes = &writes,
-        .table_writes_contract = .of(?table_writes.TableWriteSource),
-        .flags = CreateContext.fallible_init,
-        .out_handle = &handle,
-        .out_request_alloc = &request_alloc,
-    });
-    defer if (handle) |created| destroy(created);
-    try std.testing.expect(!result.isOk());
-    try std.testing.expect(handle == null);
-    try std.testing.expect(request_alloc == null);
-    try std.testing.expect(accounting.allocated_bytes > 0);
-    std.debug.print("API_CREATE_CLEANUP expects all owner bytes freed\n", .{});
-    try std.testing.expectEqual(accounting.allocated_bytes, accounting.freed_bytes);
+    // Listener startup can fail after server initialization too. Both paths
+    // must release the unpublished API owner and leave outputs untouched.
+    for ([_]server_mod.ApiHttpServerConfig{
+        .{ .session_store_path = path },
+        .{ .pgwire = .{ .enabled = true } },
+    }) |cfg| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var accounting = std.testing.FailingAllocator.init(arena.allocator(), .{});
+        var allocator = accounting.allocator();
+        const owner_alloc = abi.memory_abi.Allocator.fromStd(&allocator);
+        var token: u8 = 0;
+        const Stub = struct {
+            fn status(_: *anyopaque) anyerror!metadata_api.MetadataStatus {
+                return error.UnsupportedOperation;
+            }
+        };
+        const source: server_mod.StatusSource = .{ .ptr = &token, .vtable = &.{ .status = Stub.status } };
+        const reads: ?table_reads.TableReadSource = null;
+        const writes: ?table_writes.TableWriteSource = null;
+        var handle: ?*anyopaque = null;
+        var request_alloc: ?*const abi.memory_abi.Allocator = null;
+        @import("../test_error_logs.zig").expectErrorLogs(1);
+        const result = create(&.{
+            .abi_version = abi.abi_version,
+            .owner_alloc = &owner_alloc,
+            .cfg = &cfg,
+            .cfg_contract = .of(server_mod.ApiHttpServerConfig),
+            .source = &source,
+            .source_contract = .of(server_mod.StatusSource),
+            .table_reads = &reads,
+            .table_reads_contract = .of(?table_reads.TableReadSource),
+            .table_writes = &writes,
+            .table_writes_contract = .of(?table_writes.TableWriteSource),
+            .flags = CreateContext.fallible_init,
+            .out_handle = &handle,
+            .out_request_alloc = &request_alloc,
+        });
+        defer if (handle) |created| destroy(created);
+        try std.testing.expect(!result.isOk());
+        try std.testing.expect(handle == null);
+        try std.testing.expect(request_alloc == null);
+        try std.testing.expect(accounting.allocated_bytes > 0);
+        std.debug.print("API_CREATE_CLEANUP expects all owner bytes freed\n", .{});
+        try std.testing.expectEqual(accounting.allocated_bytes, accounting.freed_bytes);
+    }
 }
 
 test "API kernel runtime I/O receivers validate capability layout and domains" {

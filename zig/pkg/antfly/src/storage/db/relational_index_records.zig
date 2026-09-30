@@ -285,7 +285,8 @@ pub const Writer = struct {
             if (try index.tuple.prefixLen(old_tuple) != old_tuple.len) return error.InvalidRelationalIndexTuple;
             // The reverse record is authoritative under the atomic pair
             // invariant. Integrity scrubs verify forward existence separately.
-            // An unchanged tuple must not create index WAL/LSM churn.
+            // An unchanged tuple must not rewrite the forward/reverse pair.
+            // A staged primary mutation separately advances its span guard.
             if (std.mem.eql(u8, old_tuple, tuple) and payload.len == 0) return .unchanged;
             try appendForwardFromReverse(self.alloc, &self.old_forward, self.reverse_key.items, value);
         } else if (presence == .indexed) return error.MissingRelationalIndexReverse else if (presence == .ready_generation) {
@@ -540,6 +541,8 @@ pub const Staged = struct {
     arena: std.heap.ArenaAllocator,
     base: *docstore.DocStore.Txn,
     pending: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    range_active: ?bool = null,
+    touched_unchanged_spans: std.AutoHashMapUnmanaged([@import("../range_protection.zig").index_span_digest_bytes]u8, void) = .empty,
     state: enum { open, failed, sealed } = .open,
 
     pub const Effects = struct {
@@ -589,12 +592,37 @@ pub const Staged = struct {
         try self.pending.put(alloc, owned_key, owned_value);
     }
 
+    /// A primary row can change without changing an index tuple or covering
+    /// payload. The exact tuple reader observes that row, so its counter must
+    /// still advance with the primary write even though no forward key moves.
+    fn touchUnchangedSpan(self: *Staged, id: Id, tuple: []const u8) !void {
+        const tracking = @import("../range_protection.zig");
+        if (self.range_active == null) self.range_active = try tracking.isActive(self.base);
+        if (!self.range_active.?) return;
+        const digest = try tracking.indexTupleSpanDigest(id.encode(), tuple);
+        const seen = try self.touched_unchanged_spans.getOrPut(self.arena.allocator(), digest);
+        if (seen.found_existing) return;
+        const key = tracking.indexCounterKey(digest);
+        const current = try tracking.indexGeneration(self, digest) orelse 0;
+        const next = std.math.add(u64, current, 1) catch return error.RangeTrackingGenerationExhausted;
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, next, .little);
+        try self.put(&key, &bytes);
+    }
+
     /// Any row-level failure poisons the whole stage, including effects from
     /// earlier indexes. The caller cannot accidentally seal a partial row.
     pub fn upsertPrepared(self: *Staged, writer: *Writer, current: plans.View, batch: *const plans.Batch, row: usize, document: []const u8, presence: Presence) !void {
         try self.requireOpen();
         errdefer self.state = .failed;
-        try writer.upsertPrepared(self, current, batch, row, document, presence);
+        if (!batch.isForPlan(current)) return error.PreparedGenerationChanged;
+        for (current.boundIndexes(), 0..) |index, i| {
+            const key = try batch.key(row, i);
+            if (key.member) {
+                if (try writer.upsertCovered(self, index, document, key.bytes, key.payload, presence) == .unchanged)
+                    try self.touchUnchangedSpan(index.id(), key.bytes);
+            } else _ = try writer.delete(self, index.id(), document, presence);
+        }
     }
 
     pub fn upsertPreparedWithReadiness(self: *Staged, writer: *Writer, current: plans.View, batch: *const plans.Batch, row: usize, document: []const u8, ready: []const bool) !void {
@@ -613,7 +641,8 @@ pub const Staged = struct {
                 break :blk if (is_ready and prior_members[i]) .indexed else .new_or_building;
             } else if (is_ready) .ready_generation else .new_or_building;
             if (key.member) {
-                _ = try writer.upsertCovered(self, index, document, key.bytes, key.payload, presence);
+                if (try writer.upsertCovered(self, index, document, key.bytes, key.payload, presence) == .unchanged)
+                    try self.touchUnchangedSpan(index.id(), key.bytes);
             } else _ = try writer.delete(self, index.id(), document, presence);
         }
     }

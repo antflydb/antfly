@@ -167,6 +167,14 @@ pub const Parser = struct {
             op.security = try self.parseSecurityRequirements(sec_val);
         }
 
+        if (obj.get("x-antfly-client-request-policy")) |policy| {
+            op.client_request_policy = std.json.parseFromValueLeaky(types.ClientRequestPolicy, self.arena, policy, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return ParseError.InvalidValue,
+            };
+            if (op.client_request_policy.?.max_response_size == 0) return ParseError.InvalidValue;
+        }
+
         return op;
     }
 
@@ -660,6 +668,23 @@ test "parse minimal document" {
     try std.testing.expectEqualStrings("3.0.3", doc.openapi);
     try std.testing.expectEqualStrings("Test API", doc.info.title);
     try std.testing.expectEqual(@as(usize, 0), doc.paths.count());
+}
+
+test "parse client operation policy strictly preserves zero false and response ceilings" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    var parser = Parser.init(arena_impl.allocator());
+    const prefix = "{\"openapi\":\"3.0.3\",\"info\":{\"title\":\"test\",\"version\":\"1\"},\"paths\":{\"/operation\":{\"post\":{\"operationId\":\"arbitrary\",\"x-antfly-client-request-policy\":";
+    const suffix = "}}}}";
+    const doc = try parser.parseDocument(prefix ++ "{\"max_retries\":0,\"follow_redirects\":false,\"cookies_enabled\":false,\"max_response_size\":16777216}" ++ suffix);
+    const policy = doc.paths.get("/operation").?.post.?.client_request_policy.?;
+    try std.testing.expectEqual(@as(?u32, 0), policy.max_retries);
+    try std.testing.expectEqual(@as(?bool, false), policy.follow_redirects);
+    try std.testing.expectEqual(@as(?bool, false), policy.cookies_enabled);
+    try std.testing.expectEqual(@as(?u32, 16777216), policy.max_response_size);
+    inline for (.{ "{\"max_retries\":-1}", "{\"follow_redirects\":\"false\"}", "{\"max_response_size\":0}", "{\"misspelled_policy\":0}" }) |invalid| {
+        try std.testing.expectError(error.InvalidValue, parser.parseDocument(prefix ++ invalid ++ suffix));
+    }
 }
 
 test "parse schema with properties" {

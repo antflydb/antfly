@@ -26,6 +26,7 @@ const query_graph = @import("query/graph_exec.zig");
 const query_result_shape = @import("query/result_shape.zig");
 
 pub const types = @import("types.zig");
+pub const ArtifactPublicationDispatcher = @import("artifact_publication.zig").Dispatcher;
 pub const merge_state = @import("merge_state.zig");
 pub const docstore = @import("../docstore.zig");
 pub const lease = @import("lease.zig");
@@ -196,6 +197,9 @@ pub const testing = if (builtin.is_test) struct {
 } else struct {};
 
 test {
+    _ = @import("artifact_publication_transport.zig");
+    _ = @import("artifact_publication_transport_codec.zig");
+    _ = @import("root_signing_identity.zig");
     _ = types;
     _ = merge_state;
     _ = docstore;

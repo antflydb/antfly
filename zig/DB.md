@@ -1619,9 +1619,9 @@ The current shape is:
 
 - higher-level runtimes, indexing, query, and most tooling no longer depend on
   `std.c`
-- the remaining dense POSIX surface is concentrated in the LMDB backend
+- durable storage uses the LSM backend, with an in-memory backend for local fixtures
 - shared backend contracts and adapters exist
-- concrete backends exist for LMDB, in-memory KV, and durable prefix/LSM
+- concrete backends exist for in-memory KV and durable prefix/LSM
 - backend conformance coverage exists
 - top-level DB primary-backend selection exists
 - snapshot export/restore and split semantics are backend-neutral, with
@@ -1641,13 +1641,6 @@ DB-level durable-LSM coverage now proves the backend seam across:
 - TTL lease-owned cleanup
 - named-query fusion and graph expansion
 - chunked dense-index and chunk-enrichment reopen flows
-
-That means the remaining work is mostly confidence and product-boundary work,
-not backend abstraction bring-up.
-
-The goal is not to remove LMDB now. The goal is to keep LMDB as one backend
-while making a future portable pure-Zig backend possible without leaking LMDB
-assumptions upward.
 
 ### Backend Contract
 
@@ -1680,7 +1673,6 @@ The first backend-neutral code pieces are in:
 
 - [pkg/antfly/src/storage/backend_types.zig](pkg/antfly/src/storage/backend_types.zig)
 - [pkg/antfly/src/storage/backend_adapter.zig](pkg/antfly/src/storage/backend_adapter.zig)
-- [pkg/antfly/src/storage/backend_lmdb_adapter.zig](pkg/antfly/src/storage/backend_lmdb_adapter.zig)
 
 Those model:
 
@@ -1693,73 +1685,16 @@ Those model:
 - write-batch capability hints
 - cursor start/seek/iteration semantics
 
-### LMDB Boundary
-
-The intentional LMDB/POSIX surface is concentrated in:
-
-- [pkg/antfly/src/lmdb/env.zig](pkg/antfly/src/lmdb/env.zig)
-- [pkg/antfly/src/lmdb/commit_support.zig](pkg/antfly/src/lmdb/commit_support.zig)
-- [pkg/antfly/src/lmdb/readers.zig](pkg/antfly/src/lmdb/readers.zig)
-- [pkg/antfly/src/lmdb/split_support.zig](pkg/antfly/src/lmdb/split_support.zig)
-- [pkg/antfly/src/lmdb/writer_lock.zig](pkg/antfly/src/lmdb/writer_lock.zig)
-- [pkg/antfly/src/storage/lmdb.zig](pkg/antfly/src/storage/lmdb.zig)
-
-These files encode real storage semantics:
-
-- mmap-backed page storage
-- read snapshot visibility
-- single-writer coordination
-- durability and fsync behavior
-- file growth and publication
-- lock-table and reader-table behavior
-
-Higher layers should depend on the backend contract instead of those details:
-
-- [pkg/antfly/src/storage/docstore.zig](pkg/antfly/src/storage/docstore.zig)
-- [pkg/antfly/src/storage/persistent.zig](pkg/antfly/src/storage/persistent.zig)
-- [pkg/antfly/src/storage/wal.zig](pkg/antfly/src/storage/wal.zig)
-- [pkg/antfly/src/storage/db/db.zig](pkg/antfly/src/storage/db/db.zig)
-- [pkg/antfly/src/storage/hbc_adapter.zig](pkg/antfly/src/storage/hbc_adapter.zig)
-
-They can use transactions and range scans, but should not depend on LMDB reader
-tables, mmap assumptions, env refresh mechanics, file naming, or lock-file
-details.
-
-LMDB commit/publication stats are useful operational hooks, but they are
-backend-specific extensions, not required backend-neutral semantics. The neutral
-contract should cover correctness, durability policy, visibility, range access,
-and split/export/import semantics.
-
 ### Backend Contract Adoption
 
-The boundary is frozen: non-backend code stays off direct POSIX where
-practical, transaction/scan/durability/visibility semantics are documented
-above, and shared backend types exist (a shared durability enum, backend
-options, namespace concept, write-batch capability, an explicit
-transaction/cursor capability surface, and backend-independent error mapping
-where possible).
+`docstore.zig`, `persistent.zig`, and `wal.zig` use the shared runtime store
+contract. Antfly's durable backend is LSM; in-memory storage supports local
+fixtures and constrained runtimes. Full-text segments can be published as
+immutable files on host storage and are tracked by the LSM metadata catalog.
 
-Higher layers have moved onto the contract: `docstore.zig`, `persistent.zig`,
-and `wal.zig` were the first adopters, and `hbc_adapter.zig` now carries
-almost no direct LMDB calls. The abstraction is proven across three concrete
-backends: LMDB remains the mmap/single-writer backend, in-memory KV stays
-useful for tests and constrained environments, and a durable prefix/LSM
-backend is the portable backend direction.
-
-The Zig shape stayed intentionally narrow:
-
-- a small backend module with shared option and durability enums
-- a vtable-backed runtime object for environment open/close, transaction begin,
-  namespace selection or binding, and sync/reopen helpers
-- backend-specific transaction and cursor handles stored behind opaque pointers
-
-This avoids forcing the whole codebase into a large generic type cascade while
-still making backend behavior explicit.
-
-Specialized engines such as the text persistent index, HBC, sparse, and graph
-reverse index may continue to carry backend assumptions while the primary DB
-store remains backend-selectable. Replatforming them onto the same backend
-family is a follow-on decision, not a blocker for the primary store contract.
+The standalone Zig LMDB port and its C differential oracle live in
+[lib/lmdb/src/LMDB.md](lib/lmdb/src/LMDB.md). They are not Antfly storage
+backends.
 
 ## Hot-Path Search Wire
 
@@ -1823,8 +1758,8 @@ every split:
 
 Current state:
 
-- child docstore creation is page-level on Zig LMDB
-- parent docstore reclaim is page-level on Zig LMDB
+- child docstore creation and parent cleanup use the runtime store's generic
+  split path
 - text indexes use segment handoff and mixed-segment rewrite instead of full
   child rebuild and per-doc parent text deletion
 - the remaining split cost classes are non-text indexes, especially dense
@@ -1834,8 +1769,7 @@ Principles:
 
 1. Copy immutable state; do not replay documents unless forced.
 2. Rewrite only mixed ranges.
-3. Keep parent cleanup separate from child image construction in the first
-   page-level implementation.
+3. Keep parent cleanup separate from child image construction.
 4. Add metadata first so split planning is cheap and deterministic.
 5. Prefer subtree, block, or segment handoff over whole-index rebuild.
 6. If rebuild is required, rebuild only the mixed remainder, not the full child
@@ -1963,21 +1897,6 @@ Child text indexes are built mostly by manifest/segment handoff, only mixed
 segments are rebuilt, and a split can defer clean mixed-segment rewrite when
 correctness is preserved.
 
-### Page-Level LMDB Child Image
-
-The child shard's main LMDB image is built without logical KV replay: open a
-read snapshot on the source env, descend once to the split key, clone fully
-right-hand subtrees page-for-page into a fresh child env image, rebuild only
-the mixed branch spine and split leaf, and emit fresh child meta and freeDB
-state. The current scope covers the unnamed main DB only, prioritizes
-correctness, and keeps parent cleanup separate from child image construction.
-The child docstore image is created from pages/subtrees rather than logical
-key replay, and only the mixed path is rebuilt logically.
-
-Parent finalize avoiding whole-range logical prune where metadata or page
-structure can answer the same question, and reclaiming retired page ranges
-and retired segment manifests, is tracked in [Open work](#open-work).
-
 ### Graph Split
 
 Graph split uses edge ownership and direct reverse-index rebuild instead of
@@ -2063,7 +1982,7 @@ routing metadata.
 
 ### Remaining DB roadmap items
 
-- keep backend-neutral DB behavior covered across LMDB, memory, and durable LSM
+- keep DB behavior covered across in-memory and durable runtime storage
 - use `hbc_bench` split planning output on more realistic dense datasets
 - prototype dense subtree handoff for clearly right-only cases while assuming
   mixed rebuild remains important
@@ -2086,7 +2005,5 @@ routing metadata.
   enrichment failures do not advance a clean checkpoint past missing durable
   outcomes; metrics expose checkpoint applied sequence, status, replay tail
   size, and repair-scan counts per projection
-- parent finalize avoiding whole-range logical prune where metadata or page
-  structure can answer the same question, and reclaiming retired page ranges
-  and retired segment manifests cleanly (see [Page-Level LMDB Child
-  Image](#page-level-lmdb-child-image) above)
+- avoid whole-range logical prune during parent finalize where runtime storage
+  metadata can answer the same question, and reclaim retired segments cleanly

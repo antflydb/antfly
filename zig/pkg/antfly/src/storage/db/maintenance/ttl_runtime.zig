@@ -27,6 +27,7 @@ const types = @import("../types.zig");
 const ownership_mod = @import("../ownership.zig");
 const platform_clock = @import("antfly_platform").clock;
 const background_runtime_mod = @import("../../background_runtime.zig");
+const graph_expiration = @import("../graph_edge_ttl_expiration.zig");
 
 pub const Config = struct {
     enabled: bool = builtin.os.tag != .freestanding and !builtin.is_test,
@@ -57,6 +58,8 @@ pub const DeleteCandidate = struct {
 };
 
 pub const DeleteFn = *const fn (ctx_ptr: *anyopaque, candidates: []const DeleteCandidate) anyerror!u32;
+pub const GraphExpireCounts = struct { sources: u32 = 0, direct_artifacts: u32 = 0 };
+pub const GraphExpireFn = *const fn (ctx_ptr: *anyopaque, candidates: []const graph_expiration.Due) anyerror!GraphExpireCounts;
 
 pub const default_lease_key = "\x00\x00__metadata__:ttl_cleanup_lease";
 
@@ -89,6 +92,8 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn deinit(self: *@This()) void {
         self.* = undefined;
     }
+
+    pub fn setGraphExpireFn(_: *@This(), _: GraphExpireFn) void {}
 
     pub fn start(self: *@This()) !void {
         if (self.config.enabled) return error.UnsupportedPlatform;
@@ -128,6 +133,7 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
     owns_store: bool,
     delete_ctx: *anyopaque,
     delete_fn: DeleteFn,
+    graph_expire_fn: ?GraphExpireFn = null,
     config: Config,
     defer_flag: ?*const std.atomic.Value(bool),
     ownership: ownership_mod.State,
@@ -141,6 +147,7 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
     future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
     scan_after: ?[]u8 = null,
+    graph_scan_after: ?[]u8 = null,
 
     pub fn init(
         alloc: Allocator,
@@ -179,9 +186,14 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn deinit(self: *TtlRuntime) void {
         _ = self.stop();
         if (self.scan_after) |key| self.alloc.free(key);
+        if (self.graph_scan_after) |key| self.alloc.free(key);
         self.ownership.deinit(self.alloc);
         if (self.owns_store) self.store.deinit();
         self.* = undefined;
+    }
+
+    pub fn setGraphExpireFn(self: *TtlRuntime, callback: GraphExpireFn) void {
+        self.graph_expire_fn = callback;
     }
 
     pub fn start(self: *TtlRuntime) !void {
@@ -284,6 +296,9 @@ const ScanSummary = struct {
     more: bool = false,
     scanned_timestamps: u64 = 0,
     deleted_docs: u32 = 0,
+    scanned_graph_candidates: u64 = 0,
+    expired_graph_sources: u32 = 0,
+    expired_graph_artifacts: u32 = 0,
 };
 
 fn workerStep(runtime: *TtlRuntime) ?u64 {
@@ -329,7 +344,7 @@ fn collectAndDelete(runtime: *TtlRuntime, now_ns: u64) !ScanSummary {
         schema.ttl_duration_ns
     else
         0;
-    if (duration_ns == 0) return .{};
+    if (duration_ns == 0) return collectGraphAndExpire(runtime, now_ns);
 
     var candidates = std.ArrayListUnmanaged(DeleteCandidate).empty;
     defer {
@@ -416,8 +431,123 @@ fn collectAndDelete(runtime: *TtlRuntime, now_ns: u64) !ScanSummary {
     }
     summary.more = state.stopped;
 
+    if (candidates.items.len != 0) {
+        summary.deleted_docs = runtime.delete_fn(runtime.delete_ctx, candidates.items) catch |err| switch (err) {
+            error.CoordinatedTtlBackpressure => blk: {
+                admitted = false;
+                summary.more = true;
+                // Preserve this document page for retry and still service the
+                // independent graph page during coordinator admission pressure.
+                break :blk 0;
+            },
+            else => return err,
+        };
+    }
+    const graph_summary = try collectGraphAndExpire(runtime, now_ns);
+    summary.more = summary.more or graph_summary.more;
+    summary.scanned_graph_candidates = graph_summary.scanned_graph_candidates;
+    summary.expired_graph_sources = graph_summary.expired_graph_sources;
+    summary.expired_graph_artifacts = graph_summary.expired_graph_artifacts;
+    return summary;
+}
+
+fn collectGraphAndExpire(runtime: *TtlRuntime, now_ns: u64) !ScanSummary {
+    const callback = runtime.graph_expire_fn orelse return .{};
+    const prefix = &internal_keys.graph_edge_expiration_index_prefix;
+    const upper = try internal_keys.nextPrefixAlloc(runtime.alloc, prefix);
+    defer if (upper) |key| runtime.alloc.free(key);
+    var raw_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (raw_values.items) |raw| runtime.alloc.free(raw);
+        raw_values.deinit(runtime.alloc);
+    }
+    var candidates = std.ArrayListUnmanaged(graph_expiration.Due).empty;
+    defer candidates.deinit(runtime.alloc);
+    var summary = ScanSummary{};
+    const ScanState = struct {
+        runtime: *TtlRuntime,
+        now_ns: u64,
+        raw_values: *std.ArrayListUnmanaged([]u8),
+        candidates: *std.ArrayListUnmanaged(graph_expiration.Due),
+        summary: *ScanSummary,
+        visited: usize = 0,
+        visited_bytes: usize = 0,
+        stopped: bool = false,
+        next_after: std.ArrayList(u8) = .empty,
+        threadlocal var active: ?*@This() = null;
+
+        fn cb(key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
+            const self = active.?;
+            if (self.runtime.graph_scan_after) |after| {
+                if (std.mem.eql(u8, key, after)) return .@"continue";
+            }
+            if (self.visited >= @max(1, self.runtime.config.scan_key_budget) or
+                self.visited_bytes >= @max(1, self.runtime.config.scan_byte_budget) or
+                self.candidates.items.len >= @min(128, @max(1, self.runtime.config.batch_size)))
+            {
+                self.stopped = true;
+                return .stop;
+            }
+            const deadline = try graph_expiration.deadlineFromKey(key);
+            if (!ttl_mod.isExpiredWithGrace(deadline, 0, self.runtime.config.grace_period_ns, self.now_ns)) return .stop;
+            self.visited += 1;
+            self.visited_bytes +|= key.len +| value.len;
+            self.summary.scanned_graph_candidates += 1;
+            self.next_after.clearRetainingCapacity();
+            try self.next_after.appendSlice(self.runtime.alloc, key);
+            const raw = try self.runtime.alloc.dupe(u8, value);
+            errdefer self.runtime.alloc.free(raw);
+            const candidate = try graph_expiration.decodeDue(raw);
+            const expected_key = switch (candidate) {
+                .source => |source| blk: {
+                    if (source.deadline_ns != deadline) return error.InvalidGraphTtlCandidate;
+                    const contender_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(
+                        self.runtime.alloc,
+                        source.index_name,
+                        source.generation,
+                        source.edge_key,
+                        source.source_priority,
+                        source.state_key,
+                    );
+                    defer self.runtime.alloc.free(contender_key);
+                    break :blk try graph_expiration.indexKeyAlloc(self.runtime.alloc, deadline, contender_key);
+                },
+                .direct => |direct| blk: {
+                    if (direct.deadline_ns != deadline) return error.InvalidGraphTtlCandidate;
+                    break :blk try graph_expiration.directIndexKeyAlloc(self.runtime.alloc, deadline, direct.artifact_key);
+                },
+            };
+            defer self.runtime.alloc.free(expected_key);
+            if (!std.mem.eql(u8, key, expected_key)) return error.InvalidGraphTtlCandidate;
+            try self.raw_values.ensureUnusedCapacity(self.runtime.alloc, 1);
+            try self.candidates.ensureUnusedCapacity(self.runtime.alloc, 1);
+            self.raw_values.appendAssumeCapacity(raw);
+            self.candidates.appendAssumeCapacity(candidate);
+            return .@"continue";
+        }
+    };
+    var state = ScanState{
+        .runtime = runtime,
+        .now_ns = now_ns,
+        .raw_values = &raw_values,
+        .candidates = &candidates,
+        .summary = &summary,
+    };
+    ScanState.active = &state;
+    defer ScanState.active = null;
+    defer state.next_after.deinit(runtime.alloc);
+    try backend_scan.scanCurrent(&runtime.store, runtime.graph_scan_after orelse prefix, upper orelse "", .{}, &ScanState.cb);
+    const next_after = if (state.stopped) try state.next_after.toOwnedSlice(runtime.alloc) else null;
+    var admitted = true;
+    defer {
+        if (admitted) {
+            if (runtime.graph_scan_after) |key| runtime.alloc.free(key);
+            runtime.graph_scan_after = next_after;
+        } else if (next_after) |key| runtime.alloc.free(key);
+    }
+    summary.more = state.stopped;
     if (candidates.items.len == 0) return summary;
-    summary.deleted_docs = runtime.delete_fn(runtime.delete_ctx, candidates.items) catch |err| switch (err) {
+    const expired = callback(runtime.delete_ctx, candidates.items) catch |err| switch (err) {
         error.CoordinatedTtlBackpressure => {
             admitted = false;
             summary.more = true;
@@ -425,6 +555,8 @@ fn collectAndDelete(runtime: *TtlRuntime, now_ns: u64) !ScanSummary {
         },
         else => return err,
     };
+    summary.expired_graph_sources = expired.sources;
+    summary.expired_graph_artifacts = expired.direct_artifacts;
     return summary;
 }
 
@@ -481,6 +613,9 @@ fn recordRun(runtime: *TtlRuntime, now_ns: u64, summary: ScanSummary, failed: bo
     runtime.stats_value.runs += 1;
     runtime.stats_value.scanned_timestamps += summary.scanned_timestamps;
     runtime.stats_value.deleted_docs += summary.deleted_docs;
+    runtime.stats_value.scanned_graph_candidates += summary.scanned_graph_candidates;
+    runtime.stats_value.expired_graph_sources += summary.expired_graph_sources;
+    runtime.stats_value.expired_graph_artifacts += summary.expired_graph_artifacts;
     runtime.stats_value.last_run_ns = now_ns;
     if (failed) runtime.stats_value.error_count += 1;
 }
@@ -778,4 +913,66 @@ test "ttl runtime executes production pass on borrowed VoprIo" {
     }
     try std.testing.expect(lifecycle_ok);
     try vopr_io.ensureNoCapabilityViolation();
+}
+
+test "db graph ttl shared GC serves graphs during document admission pressure" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    _ = try schema_mod.saveSchema(store, alloc, .{ .version = 1, .ttl_duration_ns = 1_000 });
+    try putTestDoc(&store, alloc, "doc:a", "{}", 1_000);
+    const artifact = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "g", "links", "doc:b");
+    defer alloc.free(artifact);
+    const due_key = try graph_expiration.directIndexKeyAlloc(alloc, 2_000, artifact);
+    defer alloc.free(due_key);
+    const due = try graph_expiration.encodeDirectAlloc(alloc, .{ .index_name = "g", .generation = 1, .artifact_key = artifact, .deadline_ns = 2_000, .artifact_digest = @splat(0) });
+    defer alloc.free(due);
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(due_key, due);
+        try txn.commit();
+    }
+    const Capture = struct {
+        store: *backend_erased.Store,
+        due_key: []const u8,
+        pressure: bool = true,
+        doc_calls: usize = 0,
+        graph_calls: usize = 0,
+        fn docs(ptr: *anyopaque, rows: []const DeleteCandidate) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.doc_calls += 1;
+            if (self.pressure) return error.CoordinatedTtlBackpressure;
+            var delete_ctx = TestDeleteContext{ .alloc = std.testing.allocator, .store = self.store };
+            return TestDeleteContext.deleteCandidates(&delete_ctx, rows);
+        }
+        fn graph(ptr: *anyopaque, _: []const graph_expiration.Due) !GraphExpireCounts {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.graph_calls += 1;
+            var txn = try self.store.beginWrite();
+            errdefer txn.abort();
+            try txn.delete(self.due_key);
+            try txn.commit();
+            return .{ .direct_artifacts = 1 };
+        }
+    };
+    var capture = Capture{ .store = &store, .due_key = due_key };
+    var backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var clock = platform_clock.ManualClock{};
+    clock.setRealtimeNs(10_000);
+    var runtime = try TtlRuntime.init(alloc, store, &capture, Capture.docs, null, backend_runtime.ptr(), .{ .enabled = true, .clock = clock.clock(), .grace_period_ns = 0 });
+    defer runtime.deinit();
+    runtime.setGraphExpireFn(Capture.graph);
+    for (0..3) |_| try runtime.runOnce();
+    try std.testing.expectEqual(@as(usize, 3), capture.doc_calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.graph_calls);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().expired_graph_artifacts);
+    try std.testing.expect(runtime.scan_after == null);
+    capture.pressure = false;
+    try runtime.runOnce();
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().deleted_docs);
+    try expectMissingDoc(&store, alloc, "doc:a");
 }

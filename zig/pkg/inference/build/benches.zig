@@ -218,6 +218,17 @@ pub fn createBge(ctx: Context) CreateBgeResult {
 /// Return the trained worker module so its protocol tests use the same imports.
 pub fn addGliner25(ctx: Context) *std.Build.Module {
     const b = ctx.b;
+    const decide_bench = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-decide-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/bench/gliner25_decide.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    decide_bench.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    decide_bench.root_module.link_libc = true;
+    ctx.step("bench-gliner25-decide-build", "Build the loaded-model GLiNER2.5-Decide request benchmark").dependOn(&b.addInstallArtifact(decide_bench, .{}).step);
     // Use the shared optimize value for the entire dependency graph. The
     // worker refuses to compile unless that graph is ReleaseFast; forcing
     // only this executable root would leave imported kernels unoptimized.

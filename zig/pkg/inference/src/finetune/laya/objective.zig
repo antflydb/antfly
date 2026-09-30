@@ -5,6 +5,8 @@
 //! policy-gradient estimator. The returned logit cotangent seeds native VJPs.
 const std = @import("std");
 const Kind = @import("../../models/laya.zig").QuestionType;
+/// Candidate-branch packing admits up to 255 options per question.
+const max_width = @import("../../models/laya.zig").max_packed_options;
 pub const Config = struct {
     group_size: usize = 4,
     sigma: f32 = 0.4,
@@ -24,7 +26,7 @@ pub const Result = struct {
 };
 
 pub fn validateTarget(kind: Kind, target: []const f32) !void {
-    if (target.len < 2 or target.len > 20 or (kind == .noul and target.len != 2)) return error.InvalidLayaTarget;
+    if (target.len < 2 or target.len > max_width or (kind == .noul and target.len != 2)) return error.InvalidLayaTarget;
     var sum: f64 = 0;
     for (target) |p| {
         if (!std.math.isFinite(p) or p < 0 or p > 1) return error.InvalidLayaTarget;
@@ -68,7 +70,7 @@ pub fn properReward(kind: Kind, p: []const f64, target: []const f32) f64 {
 /// noise is G*B*K independent standard normal draws, shared with an oracle
 /// when testing. Invalid padded option entries are ignored and have zero VJP.
 pub fn evaluate(a: std.mem.Allocator, cfg: Config, rows: []const Row, width: usize, logits: []const f32, noise: []const f32) !Result {
-    if (rows.len == 0 or rows.len > 512 or width < 2 or width > 20 or logits.len != rows.len * width or
+    if (rows.len == 0 or rows.len > 512 or width < 2 or width > max_width or logits.len != rows.len * width or
         cfg.group_size < 2 or cfg.group_size > 64 or !std.math.isFinite(cfg.sigma) or cfg.sigma <= 0 or
         !std.math.isFinite(cfg.rl_weight) or cfg.rl_weight < 0 or !std.math.isFinite(cfg.ce_weight) or cfg.ce_weight < 0 or
         cfg.rl_weight + cfg.ce_weight == 0 or (cfg.rl_weight > 0 and noise.len != cfg.group_size * logits.len))
@@ -82,7 +84,7 @@ pub fn evaluate(a: std.mem.Allocator, cfg: Config, rows: []const Row, width: usi
     @memset(grad, 0);
     const batch: f64 = @floatFromInt(rows.len);
     var ce: f64 = 0;
-    var pbuf: [20]f64 = undefined;
+    var pbuf: [max_width]f64 = undefined;
     for (rows, 0..) |row, r| {
         const z = logits[r * width ..][0..row.target.len];
         const p = pbuf[0..row.target.len];
@@ -113,7 +115,7 @@ pub fn evaluate(a: std.mem.Allocator, cfg: Config, rows: []const Row, width: usi
             mean += v;
         }
         mean /= @as(f64, @floatFromInt(row.target.len));
-        var z: [20]f32 = undefined;
+        var z: [max_width]f32 = undefined;
         for (0..row.target.len) |k| {
             eps[offset + k] = cfg.sigma * (@as(f64, noise[offset + k]) - mean);
             z[k] = @floatCast(@as(f64, logits[r * width + k]) + eps[offset + k]);

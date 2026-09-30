@@ -126,6 +126,42 @@ pub fn coverageGeneration(raw: []const u8) !u64 {
     return std.mem.readInt(u64, raw[version_4_magic.len..][0..@sizeOf(u64)], .big);
 }
 
+/// Tombstone cleanup may preserve only a canonical empty root. This fixed
+/// width check never allocates or walks an untrusted edge/segment list.
+pub fn isEmptyForGeneration(raw: []const u8, generation: u64) bool {
+    if (generation == 0) return false;
+    if (raw.len == header_len + @sizeOf(u32) and std.mem.startsWith(u8, raw, version_4_magic)) {
+        return std.mem.readInt(u64, raw[version_4_magic.len..header_len], .big) == generation and
+            std.mem.readInt(u32, raw[header_len..][0..4], .big) == 0;
+    }
+    if (raw.len == header_len + 2 * @sizeOf(u32) and std.mem.startsWith(u8, raw, version_5_magic)) {
+        return std.mem.readInt(u64, raw[version_5_magic.len..header_len], .big) == generation and
+            std.mem.readInt(u32, raw[header_len..][0..4], .big) == 0 and
+            std.mem.readInt(u32, raw[header_len + 4 ..][0..4], .big) == 0;
+    }
+    return false;
+}
+
+/// A merge copies source manifests rather than regenerating their outputs.
+/// Validate the complete record before binding its identity to the receiver.
+pub fn rebindGenerationAlloc(alloc: Allocator, raw: []const u8, expected: u64, replacement: u64, segment: bool) ![]u8 {
+    if (try recordGeneration(alloc, raw, segment) != expected) return error.InvalidGraphAssetState;
+    const out = try alloc.dupe(u8, raw);
+    std.mem.writeInt(u64, out[version_4_magic.len..header_len], replacement, .big);
+    return out;
+}
+
+pub fn recordGeneration(alloc: Allocator, raw: []const u8, segment: bool) !u64 {
+    if (segment) {
+        if (raw.len < header_len) return error.InvalidGraphAssetState;
+        const generation = std.mem.readInt(u64, raw[segment_magic.len..header_len], .big);
+        const keys = try decodeSegmentKeysAlloc(alloc, raw, generation);
+        defer freeKeys(alloc, keys);
+        return generation;
+    }
+    return coverageGeneration(raw);
+}
+
 /// A v5 root is intentionally small and is published only after every
 /// deterministic segment is durable. The root therefore acts as the commit
 /// record for a resumable restore while ordinary readers can load segments in

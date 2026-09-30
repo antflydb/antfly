@@ -623,20 +623,38 @@ merge cannot silently execute an online record. An enabled-by-default
 the complete adapter at the service's stable address using its shared HTTP
 executor. Operators can disable new online merges on every metadata process with
 `antfly metadata --online-merge-enabled false` (default `true`). Disabling admission
-retains the recovery driver so already-admitted online merges can finish and
-release their durable fences. The adapter requires the compiled native
+retains the recovery driver so already-admitted online merges can finish or
+durably cancel and release their fences. The adapter requires the compiled native
 bundle, non-serverless mode and internal service authentication; unsupported
-deployments retain the guarded ordinary workflow without failing startup. When enabled,
-eligible newly queued document and typed relational merges automatically use
-the online path. Coordinated UNIQUE/FK merges additionally require matching
+deployments retain the guarded ordinary workflow without failing startup.
+Currently Raft-backed donor and receiver admission deliberately reports
+ineligible, even when this switch is enabled: index, resolver and enrichment
+catalogs are replica-local, and a group can add a learner after a singleton
+admission. Newly queued distributed document and relational merges therefore
+use the guarded ordinary path. Direct private Raft proposals for a new source
+pin or an online receiver begin-copy checkpoint fail before append with
+`OnlineMergeArtifactCatalogUncoordinated`. Existing receiver pages remain
+proposable only against a committed exact source/attempt checkpoint. A
+pre-gate metadata attempt whose next source admission or receiver checkpoint
+is rejected durably enters receiver rollback, then source revocation/release;
+already-committed entries remain replayable. Before
+re-enabling online Raft merges, both groups need a Raft-ordered artifact-catalog
+epoch and a membership barrier lasting through terminal release/finalization.
+This guard is a property of upgraded metadata admission and data proposal
+processes, not a fleet-wide feature flag during a rolling upgrade: an older
+metadata leader paired with an older data leader can still start an online
+attempt. Operators must disable online admission on every metadata process
+or drain old leaders before relying on the guarded ordinary fallback across
+the fleet; replay of already-committed attempts remains supported.
+The intended online protocol additionally requires matching
 catalog/generation proofs and enforced coverage on both owners. Leader-fenced
 native facts bind the actual namespaces, catalog digest, topology/consumer
 epochs and copy attempt before a lease-fenced metadata CAS admits the exact
 ordinary record. Only positively unsupported or already-started ordinary
 candidates continue through the existing guarded path; transient discovery
-errors retry without ordinary side effects. All current owner voters/learners
-must positively advertise Raft v12: known older versions use the guarded
-ordinary path; unreachable peers or unknown version zero retry discovery.
+errors retry without ordinary side effects. Once the catalog/membership
+barrier exists, all current owner voters/learners must positively advertise
+the required Raft protocol version before admission.
 Metadata may authorize logical
 identity reconstruction, but online checkpoints never request arbitrary raw
 identity reassignment. Online-I/O

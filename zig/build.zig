@@ -122,8 +122,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const vopr_dep = b.dependency("vopr", .{ .target = target, .optimize = optimize });
     const vopr_mod = vopr_dep.module("vopr");
     const strip = b.option(bool, "strip", "Omit debug information from release artifacts") orelse false;
-    const lmdb_backend = b.option(LmdbBackend, "lmdb_backend", "Select the LMDB backend scaffold (c or zig)") orelse .zig;
-    const lmdb_evented_async_io = b.option(bool, "lmdb_evented_async_io", "Use std.Io.Evented for the Zig LMDB async_io backend") orelse false;
+    const lmdb_backend = b.option(LmdbBackend, "lmdb_backend", "Select the LMDB implementation for test and benchmark fixtures (c or zig)") orelse .zig;
+    const lmdb_evented_async_io = b.option(bool, "lmdb_evented_async_io", "Use std.Io.Evented for standalone Zig LMDB test and benchmark fixtures") orelse false;
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
@@ -199,9 +199,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     if (platform_tests.one_shot_process) |process| platform_test_step.dependOn(process);
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, true, false);
-    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, true, false);
-    const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, false, true);
+    const build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, false);
+    const standalone_runtime_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, true, false);
+    const production_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, true);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
         .root_source_file = b.path("lib/raft/src/root.zig"),
@@ -260,6 +260,49 @@ pub fn create(b: *std.Build) ?Artifacts {
     sql_generated_check.dependOn(&yacc_steps.run_generated.step);
     b.step("lib-sql-parser-test", "Run the storage-independent SQL lexer and parser tests").dependOn(&yacc_steps.run_parser_tests.step);
     b.step("lib-sql-parser-bench", "Build and install lib-sql-parser-bench").dependOn(&b.addInstallArtifact(yacc_steps.benchmark, .{}).step);
+    const sql_parser_mod = b.createModule(.{
+        .root_source_file = b.path("lib/sql/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const sql_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/sql_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Native SQL fixtures import storage and API contracts whose unrelated
+    // transitive tests require different owner roots. Select the SQL and
+    // row-policy contract namespaces at compile time, while allowing explicit
+    // caller filters.
+    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "system_catalog.policies" }) });
+    const run_sql_tests = b.addRunArtifact(sql_tests);
+    // The native SQL contract corpus is larger than the parser-only owner but
+    // remains below the full database compilation and integration test roots.
+    sql_tests.step.max_rss = 1536 * 1024 * 1024;
+    // The complete compiler/executor corpus includes exhaustive allocation-fault
+    // runs (about 137 MiB process RSS in ReleaseSafe). This scheduling estimate
+    // is independent of the executor's per-statement memory admission tests.
+    run_sql_tests.step.max_rss = 192 * 1024 * 1024;
+    b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
+    const pgwire_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/pgwire_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    pgwire_test_mod.addImport("sql_parser", sql_parser_mod);
+    // This intentionally remains a storage-independent test root. Every
+    // pgwire-owned test has the pgwire prefix; without a compile filter Zig
+    // also discovers transitive storage tests through the SQL binder and
+    // requires unrelated native imports this module does not provide.
+    const pgwire_tests = b.addTest(.{
+        .root_module = pgwire_test_mod,
+        .filters = b.args orelse &.{"pgwire"},
+    });
+    const run_pgwire_tests = b.addRunArtifact(pgwire_tests);
+    pgwire_tests.step.max_rss = 1024 * 1024 * 1024;
+    run_pgwire_tests.step.max_rss = 64 * 1024 * 1024;
+    b.step("pgwire-test", "Run PostgreSQL wire framing, session, and lifecycle tests").dependOn(&run_pgwire_tests.step);
     const openapi_root_check = addOpenApiRootCheckStep(b);
     openapi_check_step.dependOn(&openapi_root_check.step);
     const openapi_modules = pkg_antfly_build_codegen.createCommittedModules(b, .{
@@ -697,6 +740,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const inference_steps = @import("pkg/inference/build/integration.zig").add(inference_workflow, inference_wasm_jinja, inference_wasm_platform);
 
     const antfly_imports = AntflyRootImports{
+        .sql_parser = sql_parser_mod,
         .storage_boundary = @import("pkg/antfly/build/storage_boundary.zig").create(b, b.path("pkg/antfly/src"), target, optimize),
         .build_info = build_info,
         .build_options = build_options,
@@ -780,20 +824,29 @@ pub fn create(b: *std.Build) ?Artifacts {
         .platform_target = target,
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
+    // SQL shape fixtures reach native schema and storage contracts, but do not
+    // need the inference/API module graph of a full storage owner.
+    antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
+    sql_test_mod.addImport("sql_parser", sql_parser_mod);
+    sql_test_mod.addImport("antfly_platform", platform_mod);
+    sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    sql_test_mod.addImport("antfly_regex", regex_mod);
+    sql_test_mod.addImport("antfly_hash", hash_mod);
+    sql_test_mod.addImport("bloom", bloom_mod);
+    sql_test_mod.link_libc = link_libc;
     antfly_imports.storage_boundary.configureSources(storage_mod, false, false);
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;
 
-    // Library module
+    // The public package has the same storage boundary as the linked server:
+    // LMDB is retained only by explicitly configured test/benchmark modules.
     const antfly_mod = b.addModule("antfly-zig", .{
         .root_source_file = b.path("pkg/antfly/src/root.zig"),
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
     });
-    // The full package exports simulation APIs as well as its runtime surface.
-    antfly_imports.configure(b, antfly_mod, link_libc);
-    antfly_storage_build.configureLmdb(b, antfly_mod, lmdb_engine_mod, false);
+    production_antfly_imports.configure(b, antfly_mod, link_libc);
     antfly_mod.addImport("vopr", vopr_mod);
     antfly_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
@@ -807,7 +860,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .vopr = vopr_mod,
         .optimize = optimize,
         .strip = strip,
-        .antfly_imports = antfly_imports,
+        .antfly_imports = production_antfly_imports,
         .antfly_mod = antfly_mod,
     });
     const embedded_mod = embedded.embedded_mod;
@@ -1237,6 +1290,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(&run_sql_tests.step);
+    unit_test_step.dependOn(&run_pgwire_tests.step);
     unit_test_step.dependOn(&pdf_integration.run.step);
     // HTTP client lifecycle tests belong to lib-test; keep their focused target.
     const vopr_test_step = owner_tests.vopr_test_step;
@@ -1398,8 +1453,34 @@ pub fn create(b: *std.Build) ?Artifacts {
         inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
             tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     }
+    const standalone_initial_fk_tests = owner_tests.standalone_initial_fk_tests;
+    standalone_initial_fk_tests.root_module.addObject(consumer_test_metadata.object);
+    inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+        standalone_initial_fk_tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
+    const run_standalone_initial_fk_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_initial_fk_tests);
+    b.step("antfly-standalone-initial-fk-test", "Run linked native standalone initial-FK owner publication tests").dependOn(&run_standalone_initial_fk_tests.step);
+    const graph_transfer_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/graph_transfer_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_graph_transfer_tests = b.addRunArtifact(graph_transfer_tests);
+    b.step("antfly-graph-transfer-test", "Validate certified graph artifact generation transfer").dependOn(&run_graph_transfer_tests.step);
+    owner_tests.unit_test_step.dependOn(&run_graph_transfer_tests.step);
+    const standalone_policy_ha_tests = owner_tests.standalone_policy_ha_tests;
+    standalone_policy_ha_tests.root_module.addObject(consumer_test_metadata.object);
+    inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+        standalone_policy_ha_tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
+    const run_standalone_policy_ha_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_policy_ha_tests);
+    b.step("antfly-standalone-policy-ha-test", "Run native standalone and HA row-policy publication regressions").dependOn(&run_standalone_policy_ha_tests.step);
+    // Native activation must remain covered by the existing physical-owner
+    // CI gates, not only by developer-invoked focused targets.
+    for ([_]*std.Build.Step.Run{ run_standalone_initial_fk_tests, run_standalone_policy_ha_tests }) |run| {
+        owner_tests.storage_test_step.dependOn(&run.step);
+        owner_tests.integration_test_step.dependOn(&run.step);
+    }
 
-    const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, runtime_library_artifacts);
+    const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, lmdb_engine_mod, runtime_library_artifacts);
     b.step("antfly-storage-owner-test", "Run real compiled storage owner ABI regressions").dependOn(&storage_owner_runs.runs[0].step);
     b.step("antfly-storage-owner-source-test", "Run compiled owner source and callback regressions").dependOn(&storage_owner_runs.runs[1].step);
     for (storage_owner_runs.runs) |run| {

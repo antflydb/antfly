@@ -356,6 +356,8 @@ pub fn reconcileReleased(db: *DB) !void {
 }
 
 pub fn reconcileReleasedWithBudget(db: *DB, budget: CleanupBudget) !CleanupWork {
+    // Replica-local source pins are native filesystem artifacts.
+    if (comptime @import("builtin").os.tag == .freestanding) return CleanupWork.init(.failing, budget);
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     var work = CleanupWork.init(io, budget);
     const epoch = db.source_pin_gc_epoch.load(.acquire);
@@ -793,13 +795,40 @@ test "relational index system source pin prepared crash blocks markers then reop
     for ([_]FailurePoint{ .after_prepare, .after_seal }, 0..) |point, trial| {
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source-{d}", .{ tmp.sub_path, trial });
         defer alloc.free(path);
-        const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+        const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+        const graph_key = try @import("../internal_keys.zig").graphEdgeArtifactKeyAlloc(alloc, "a", "g", "links", "neighbor");
+        defer alloc.free(graph_key);
+        const graph_value = try @import("enrichment/artifact_codec.zig").encodeGraphEdgeAlloc(alloc, null, 1, 1, 0, 0, "");
+        defer alloc.free(graph_value);
         var scope: ledger.Scope = undefined;
         {
             var db = try db_mod.DB.open(alloc, path, options);
             defer db.close();
             try db.setSchemaJson(alloc, schema);
             try db.batchRaftReplicatedApply(.{ .timestamp_ns = 111, .writes = &.{.{ .key = "a", .value = "{\"id\":1}" }} }, .{ .term = 1, .index = 1 });
+            if (trial == 0) {
+                try db.core.store.putBatch(&.{.{ .key = graph_key, .value = graph_value }}, &.{});
+                const publication = @import("artifact_publication.zig");
+                const provenance = @import("artifact_producer_provenance.zig");
+                var namespace: publication.Namespace = undefined;
+                @import("doc_identity.zig").encodeNamespace(&namespace, options.identity_namespace.?);
+                const source = publication.Source{ .document_key = "a", .content_digest = @splat(3), .timestamp = 111, .input_position = .{ .raft = .{ .term = 1, .index = 1 } } };
+                const mutation = publication.Mutation{ .family = .graph, .key = graph_key, .value = graph_value, .source_index = 0 };
+                const command: publication.Command = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .graph, .producer_name = "g", .producer_generation = 1, .producer_artifact_name = "g", .sources = (&source)[0..1], .mutations = (&mutation)[0..1], .publication_digest = @splat(5) };
+                var value_digest: publication.Digest = undefined;
+                std.crypto.hash.sha2.Sha256.hash(graph_value, &value_digest, .{});
+                const effect = provenance.Effect{ .family = .graph, .key = graph_key, .source_index = 0, .value_digest = value_digest, .value_bytes = graph_value.len };
+                const logical: provenance.Proof = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .graph, .producer_name = "g", .producer_generation = 1, .producer_artifact_name = "g", .publication_digest = command.publication_digest, .input_digest = command.inputDigest(), .sources = (&source)[0..1], .artifact_sources = &.{}, .effects = (&effect)[0..1] };
+                const encoded = try provenance.encodeAlloc(alloc, logical);
+                defer alloc.free(encoded);
+                var indexed = try provenance.prepareDocumentReferences(alloc, command);
+                defer indexed.deinit();
+                var writer = try db.core.store.beginWriteTxn();
+                errdefer writer.abort();
+                try publication.stageAuthority(&writer, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+                try provenance.stageIndexed(&writer, command, encoded, .{ .raft = .{ .term = 1, .index = 1 } }, &indexed);
+                try writer.commit();
+            }
             const owner = try db.relationalTopologyIdentity();
             scope = .{ .fence = .{ .role = .merge_source, .transition_id = 77, .attempt = 1, .admission_epoch = owner.next_epoch, .peer_group_id = 3, .owner_group_id = 2, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest }, .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
             test_failure = point;
@@ -850,6 +879,23 @@ test "relational index system source pin prepared crash blocks markers then reop
         const proof: portable.SourceCopyProof = .{ .scope = scope, .applied_index = 2, .retained_start = certificate.cut.retained_start };
         const artifact = try std.fmt.allocPrint(alloc, "{s}/source.afb2", .{root});
         defer alloc.free(artifact);
+        if (trial == 0) {
+            // The online reader must accept the same certified source-proof
+            // block as the one-pass and checkpointed restore paths.
+            const verifier = @import("../portable_source_verifier.zig");
+            const verified_file = try std.Io.Dir.cwd().openFile(std.testing.io, artifact, .{});
+            defer verified_file.close(std.testing.io);
+            for (0..256) |_| {
+                if ((try verifier.step(alloc, std.testing.io, verified_file, root, scope.pin(), certificate, .none, .{})).complete) break;
+            } else return error.TestExpectedSourceVerificationCompletion;
+            var objects = try verifier.ObjectReader.open(alloc, std.testing.io, verified_file, root, scope.pin(), certificate);
+            defer objects.deinit();
+            var proof_seen = false;
+            for (0..objects.objectCount()) |ordinal| {
+                if ((try objects.object(@intCast(ordinal))).kind == .source_proof_batch) proof_seen = true;
+            }
+            try std.testing.expect(proof_seen);
+        }
         const bytes = try backup.readFileAlloc(alloc, std.testing.io, artifact, 8 * 1024 * 1024);
         defer alloc.free(bytes);
         const decoder_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/decoder-{d}", .{ tmp.sub_path, trial });
@@ -859,6 +905,34 @@ test "relational index system source pin prepared crash blocks markers then reop
         try std.testing.expectError(error.SourceCopyRestoreUnsupported, portable.importPortableWithOptions(alloc, decoder.core.store, bytes, .{}));
         try portable.importPortableWithOptions(alloc, decoder.core.store, bytes, .{ .source_copy = proof, .unpublished_staging = true });
         try portable.validateCompleteSourceCopyImage(alloc, decoder.core.store, proof);
+        if (trial == 0) {
+            const restored_graph = try decoder.core.store.get(alloc, graph_key);
+            defer alloc.free(restored_graph);
+            try std.testing.expectEqualSlices(u8, graph_value, restored_graph);
+            var namespace: @import("artifact_publication.zig").Namespace = undefined;
+            @import("doc_identity.zig").encodeNamespace(&namespace, options.identity_namespace.?);
+            const imported_key = @import("source_proof_batch.zig").importKey(namespace, @splat(5));
+            const imported = try decoder.core.store.get(alloc, &imported_key);
+            defer alloc.free(imported);
+            var decoded = try @import("source_proof_batch.zig").decodeValue(alloc, namespace, @splat(5), imported);
+            defer decoded.deinit();
+            try std.testing.expectEqualSlices(u8, &.{1}, decoded.bitmap);
+            try std.testing.expectError(error.NotFound, decoder.core.store.get(alloc, @import("artifact_publication.zig").authority_key));
+            const paged_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/paged-proof", .{tmp.sub_path});
+            defer alloc.free(paged_path);
+            var paged = try db_mod.DB.open(alloc, paged_path, .{ .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+            defer paged.close();
+            const source_file = try std.Io.Dir.cwd().openFile(std.testing.io, artifact, .{});
+            defer source_file.close(std.testing.io);
+            const source_size = (try source_file.stat(std.testing.io)).size;
+            for (0..128) |_| {
+                if (try portable.importSourceCopyFilePage(alloc, paged.core.store, std.testing.io, source_file, source_size, proof, scope.pin(), 1, .none)) break;
+            } else return error.TestExpectedSourceImportCompletion;
+            const paged_proof = try paged.core.store.get(alloc, &imported_key);
+            defer alloc.free(paged_proof);
+            try std.testing.expectEqualSlices(u8, imported, paged_proof);
+            try std.testing.expectError(error.NotFound, paged.core.store.get(alloc, @import("artifact_publication.zig").authority_key));
+        }
         try std.testing.expectError(error.SourceCopyRestoreUnsupported, portable.validateCompleteDatabaseImageAlloc(alloc, decoder.core.store));
         const primary_key = try @import("../internal_keys.zig").relationalRowKeyAlloc(alloc, "a");
         defer alloc.free(primary_key);

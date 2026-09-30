@@ -35,6 +35,20 @@ pub const globMatch = impl.globMatch;
 pub const patternPropertyMatches = impl.patternPropertyMatches;
 pub const shouldIgnoreSchemaValidationField = impl.shouldIgnoreSchemaValidationField;
 pub const pathContainsSchemaIgnoredField = impl.pathContainsSchemaIgnoredField;
+pub const parseTtlDurationNs = impl.parseTtlDurationNs;
+
+fn relationalUuidColumns(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(alloc);
+    if (schema.storage_mode == .relational) {
+        for (schema.document_schemas) |document| {
+            for (document.properties) |property| {
+                if (property.format != null and std.mem.eql(u8, property.format.?, "uuid")) try names.append(alloc, property.name);
+            }
+        }
+    }
+    return names.toOwnedSlice(alloc);
+}
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     return try impl.parseSchemaUpdateRequest(alloc, body);
@@ -73,6 +87,8 @@ pub const CompiledTableValidator = struct {
     physical_fields: []impl.PhysicalFieldValidation,
     execution: impl.CompiledValidationPlan,
     restore: impl.RelationalRestorePlan,
+    /// Borrowed names from the immutable parsed schema; only the slice is owned.
+    uuid_columns: []const []const u8,
     owns_schema: bool,
 
     pub fn init(alloc: std.mem.Allocator, schema_json: []const u8) !CompiledTableValidator {
@@ -86,11 +102,14 @@ pub const CompiledTableValidator = struct {
         errdefer freePhysicalFieldValidations(alloc, physical_fields);
         var restore = try impl.RelationalRestorePlan.init(alloc, schema, physical_fields);
         errdefer restore.deinit(alloc);
+        const uuid_columns = try relationalUuidColumns(alloc, schema);
+        errdefer alloc.free(uuid_columns);
         return .{
             .schema = schema,
             .physical_fields = physical_fields,
             .execution = try impl.CompiledValidationPlan.init(alloc, schema),
             .restore = restore,
+            .uuid_columns = uuid_columns,
             .owns_schema = false,
         };
     }
@@ -104,6 +123,7 @@ pub const CompiledTableValidator = struct {
     pub fn deinit(self: *CompiledTableValidator, alloc: std.mem.Allocator) void {
         self.execution.deinit(alloc);
         self.restore.deinit(alloc);
+        alloc.free(self.uuid_columns);
         freePhysicalFieldValidations(alloc, self.physical_fields);
         if (self.owns_schema) self.schema.deinit(alloc);
         self.* = undefined;
@@ -115,10 +135,54 @@ pub const CompiledTableValidator = struct {
 
     pub fn validateValue(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
         try impl.validateDocumentValueWithPlan(alloc, self.schema, value, self.physical_fields, &self.execution);
+        try self.requireCanonicalUuid(value.*);
     }
 
     pub fn prepareValue(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value) !void {
+        try self.canonicalizeUuid(owned_alloc, value);
         try impl.prepareDocumentValueWithPlan(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution);
+        if (self.execution.expressions != null) try self.canonicalizeUuid(owned_alloc, value);
+    }
+
+    pub fn prepareTypedValue(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value, json_null_fields: []const []const u8, preserve: bool) !void {
+        if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
+        try impl.prepareTypedDocumentValueWithPlan(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution, json_null_fields, preserve);
+        if (self.execution.expressions != null) {
+            if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
+        }
+    }
+
+    fn canonicalizeUuid(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
+        if (value.* != .object) return;
+        for (self.uuid_columns) |name| {
+            const cell = value.object.getPtr(name) orelse continue;
+            if (cell.* != .string) continue;
+            const parsed = @import("../common/uuid.zig").parse(cell.string) catch return error.InvalidBatchRequest;
+            const canonical = @import("../common/uuid.zig").format(parsed);
+            if (!std.mem.eql(u8, cell.string, &canonical)) cell.string = try alloc.dupe(u8, &canonical);
+        }
+    }
+
+    fn requireCanonicalUuid(self: CompiledTableValidator, value: std.json.Value) !void {
+        if (value != .object) return;
+        for (self.uuid_columns) |name| {
+            const cell = value.object.get(name) orelse continue;
+            if (cell != .string) continue;
+            const parsed = @import("../common/uuid.zig").parse(cell.string) catch return error.InvalidBatchRequest;
+            const canonical = @import("../common/uuid.zig").format(parsed);
+            if (!std.mem.eql(u8, cell.string, &canonical)) return error.InvalidBatchRequest;
+        }
+    }
+
+    pub fn validateTypedStoredRoot(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value, row: anytype) !void {
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(alloc);
+        for (row.table_schema.relational_columns, 0..) |column, ordinal| {
+            if (!column.is_json or column.json_kind != .any) continue;
+            const cell = (try row.findCell(@intCast(ordinal))) orelse continue;
+            if (!cell.is_null and std.mem.eql(u8, cell.value.bytes_val, "null")) try names.append(alloc, column.name);
+        }
+        try self.prepareTypedValue(alloc, alloc, value, names.items, true);
     }
 
     /// The caller must first validate canonical bytes/hash against the runtime
@@ -135,10 +199,33 @@ pub const CompiledTableValidator = struct {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const value = try row.materializeCellAlloc(arena.allocator(), cell);
-            try impl.validateRelationalRestoreProperty(alloc, self.schema, index, &value, &self.execution);
+            try impl.validateRelationalRestoreProperty(alloc, self.schema, index, &value, &self.execution, !cell.is_null and cell.is_json and value == .null);
         }
     }
 };
+
+test "relational UUID preparation canonicalizes before durable row and index extraction" {
+    const alloc = std.testing.allocator;
+    var validator = try CompiledTableValidator.init(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","format":"uuid"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"id\":\"{A0EEBC999C0B4EF8BB6D6BB9BD380A11}\"}", .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, validator.validateValue(alloc, &parsed.value));
+    try validator.prepareValue(parsed.arena.allocator(), alloc, &parsed.value);
+    try std.testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", parsed.value.object.get("id").?.string);
+    try validator.validateValue(alloc, &parsed.value);
+
+    var document_validator = try CompiledTableValidator.init(alloc,
+        \\{"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"id":{"type":"keyword","format":"uuid"}},"additionalProperties":false}}}}
+    );
+    defer document_validator.deinit(alloc);
+    var document = try std.json.parseFromSlice(std.json.Value, alloc, "{\"id\":\"A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11\"}", .{});
+    defer document.deinit();
+    try document_validator.prepareValue(document.arena.allocator(), alloc, &document.value);
+    try std.testing.expectEqualStrings("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11", document.value.object.get("id").?.string);
+}
 
 const compiled_check_fixture =
     \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":"9007199254740992"},{"name":"known","column":"name","op":"is_not_null"},{"name":"active","column":"name","op":"eq","value":"ACTIVE","collation":"ci"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"keyword"}},"additionalProperties":false}}}}

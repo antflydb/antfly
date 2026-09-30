@@ -116,17 +116,21 @@ pub const RetainedBlock = struct {
                 @memcpy(out, bytes_value[offset..][0..out.len]);
             },
             .mapped => |value| {
-                var read_len: usize = 0;
-                while (read_len < out.len) {
-                    const rc = std.posix.system.pread(value.fd, out.ptr + read_len, out.len - read_len, @intCast(offset + read_len));
-                    switch (std.posix.errno(rc)) {
-                        .SUCCESS => {
-                            const n: usize = @intCast(rc);
-                            if (n == 0) return error.EndOfStream;
-                            read_len += n;
-                        },
-                        .INTR => continue,
-                        else => |err| return std.posix.unexpectedErrno(err),
+                if (comptime builtin.os.tag == .freestanding) {
+                    return error.UnsupportedPlatform;
+                } else {
+                    var read_len: usize = 0;
+                    while (read_len < out.len) {
+                        const rc = std.posix.system.pread(value.fd, out.ptr + read_len, out.len - read_len, @intCast(offset + read_len));
+                        switch (std.posix.errno(rc)) {
+                            .SUCCESS => {
+                                const n: usize = @intCast(rc);
+                                if (n == 0) return error.EndOfStream;
+                                read_len += n;
+                            },
+                            .INTR => continue,
+                            else => |err| return std.posix.unexpectedErrno(err),
+                        }
                     }
                 }
             },
@@ -138,10 +142,11 @@ pub const RetainedBlock = struct {
     /// query can fault the page back without observing different bytes. Heap
     /// test/fallback blocks are allocator demand and must not be discarded.
     fn discardResidentPages(self: RetainedBlock) void {
-        if (comptime builtin.os.tag == .freestanding) return;
-        switch (self.shared.payload) {
-            .mapped => |mapped| std.posix.madvise(mapped.bytes.ptr, mapped.bytes.len, std.posix.MADV.DONTNEED) catch {},
-            .heap => {},
+        if (comptime builtin.os.tag != .freestanding) {
+            switch (self.shared.payload) {
+                .mapped => |mapped| std.posix.madvise(mapped.bytes.ptr, mapped.bytes.len, std.posix.MADV.DONTNEED) catch {},
+                .heap => {},
+            }
         }
     }
 
@@ -151,9 +156,12 @@ pub const RetainedBlock = struct {
         if (shared.refs.fetchSub(1, .acq_rel) != 1) return;
         switch (shared.payload) {
             .mapped => |mapped| {
-                if (comptime builtin.os.tag == .freestanding) unreachable;
-                std.posix.munmap(mapped.bytes);
-                _ = std.posix.system.close(mapped.fd);
+                if (comptime builtin.os.tag == .freestanding) {
+                    unreachable;
+                } else {
+                    std.posix.munmap(mapped.bytes);
+                    _ = std.posix.system.close(mapped.fd);
+                }
             },
             .heap => |heap| shared.alloc.free(heap),
         }
@@ -4943,18 +4951,21 @@ fn readBlockValidated(store: *const Store, descriptor: vector_manifest.Segment) 
 }
 
 fn mapBlockFile(path: []const u8) !RetainedBlock.MappedPayload {
-    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.UnsupportedPlatform;
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    errdefer _ = std.posix.system.close(fd);
-    const size_raw = std.posix.system.lseek(fd, 0, std.posix.SEEK.END);
-    if (size_raw <= 0) return error.EmptyVectorBlock;
-    const size = std.math.cast(usize, size_raw) orelse return error.VectorBlockTooLarge;
-    const mapped = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
-    // Vector point reads are physically sorted within a request but sparse
-    // across the corpus. Disable broad kernel read-ahead so a recall-parity
-    // workload does not pull the complete multi-GiB projection into RSS.
-    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.RANDOM) catch {};
-    return .{ .bytes = mapped, .fd = fd };
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.UnsupportedPlatform;
+    } else {
+        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        errdefer _ = std.posix.system.close(fd);
+        const size_raw = std.posix.system.lseek(fd, 0, std.posix.SEEK.END);
+        if (size_raw <= 0) return error.EmptyVectorBlock;
+        const size = std.math.cast(usize, size_raw) orelse return error.VectorBlockTooLarge;
+        const mapped = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+        // Vector point reads are physically sorted within a request but sparse
+        // across the corpus. Disable broad kernel read-ahead so a recall-parity
+        // workload does not pull the complete multi-GiB projection into RSS.
+        std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.RANDOM) catch {};
+        return .{ .bytes = mapped, .fd = fd };
+    }
 }
 
 fn boundedReadLimit(max_bytes: usize) usize {

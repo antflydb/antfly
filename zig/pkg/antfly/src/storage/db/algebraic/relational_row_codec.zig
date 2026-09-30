@@ -1249,6 +1249,48 @@ pub const OrdinalRowView = struct {
         }
         return try projectParsedOrdinalPlanAlloc(alloc, self.parsed, self.table_schema, plan);
     }
+
+    /// Owned typed projection for native consumers. Absence stays absent;
+    /// explicit NULL remains a present null cell. Selective checksum checks
+    /// follow exactly the same findCell path as textual projection.
+    pub fn projectTypedAlloc(self: OrdinalRowView, alloc: Allocator, plan: OrdinalProjectionPlan) !std.json.Value {
+        return (try self.projectSqlTypedAlloc(alloc, plan)).value;
+    }
+
+    pub const TypedProjection = struct {
+        value: std.json.Value,
+        /// Aligned with object insertion order, not schema ordinals. Missing
+        /// columns stay absent. JSON payload null is not SQL NULL.
+        sql_nulls: []const bool,
+    };
+
+    pub fn projectSqlTypedAlloc(self: OrdinalRowView, alloc: Allocator, plan: OrdinalProjectionPlan) !TypedProjection {
+        if (plan.schema_version != self.table_schema.version) return error.RelationalRowSchemaMismatch;
+        var object: std.json.ObjectMap = .empty;
+        const sql_nulls = try alloc.alloc(bool, plan.ordinals.len);
+        // The caller supplies a page arena and reclaims the whole page on error.
+        for (plan.ordinals) |ordinal| {
+            const cell = (try self.findCell(ordinal)) orelse continue;
+            try object.put(alloc, try alloc.dupe(u8, self.table_schema.relational_columns[ordinal].name), try self.materializeCellAlloc(alloc, cell));
+            sql_nulls[object.count() - 1] = cell.is_null;
+        }
+        return .{ .value = .{ .object = object }, .sql_nulls = sql_nulls[0..object.count()] };
+    }
+
+    /// Wire projections carry only the ambiguous top-level JSON-null names.
+    /// Inspect canonical typed cells directly; do not parse projected JSON a
+    /// second time or materialize unrelated wide columns.
+    pub fn projectJsonNullFieldsAlloc(self: OrdinalRowView, alloc: Allocator, plan: OrdinalProjectionPlan) ![]const []const u8 {
+        if (plan.schema_version != self.table_schema.version) return error.RelationalRowSchemaMismatch;
+        var names: std.ArrayList([]const u8) = .empty;
+        for (plan.ordinals) |ordinal| {
+            const column = self.table_schema.relational_columns[ordinal];
+            if (!column.is_json) continue;
+            const cell = (try self.findCell(ordinal)) orelse continue;
+            if (!cell.is_null and cell.is_json and std.mem.eql(u8, cell.value.bytes_val, "null")) try names.append(alloc, try alloc.dupe(u8, column.name));
+        }
+        return names.items;
+    }
 };
 
 pub fn ordinalRowView(
@@ -2493,6 +2535,55 @@ test "ordinal rows use sparse slots for wide optional schemas" {
     );
     const decoded_null = (try findCellByOrdinal(encoded_null, schema, 15)).?;
     try std.testing.expect(decoded_null.is_null);
+}
+
+test "ordinal typed projection preserves SQL types null absence and exact JSON" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "s", .path = "s", .column_type = .string },
+        .{ .name = "i", .path = "i", .column_type = .integer },
+        .{ .name = "f", .path = "f", .column_type = .number },
+        .{ .name = "b", .path = "b", .column_type = .boolean },
+        .{ .name = "d", .path = "d", .column_type = .datetime },
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true },
+        .{ .name = "n", .path = "n", .column_type = .string, .allows_null = true },
+        .{ .name = "absent", .path = "absent", .column_type = .string },
+        .{ .name = "json_null", .path = "json_null", .column_type = .json, .is_json = true },
+    };
+    const schema: runtime_schema.TableSchema = .{ .version = 2, .storage_mode = .relational, .relational_columns = &columns };
+    const cells = [_]Cell{
+        .{ .ordinal = 0, .path = "s", .value_type = .bytes_val, .value = .{ .bytes_val = "hello\nworld" } },
+        .{ .ordinal = 1, .path = "i", .value_type = .i64_val, .value = .{ .i64_val = 9007199254740993 } },
+        .{ .ordinal = 2, .path = "f", .value_type = .f64_val, .value = .{ .f64_val = 1.25 } },
+        .{ .ordinal = 3, .path = "b", .value_type = .bool_val, .value = .{ .bool_val = true } },
+        .{ .ordinal = 4, .path = "d", .value_type = .u64_val, .value = .{ .u64_val = std.math.maxInt(u64) } },
+        .{ .ordinal = 5, .path = "j", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{\"exact\":9007199254740993}" } },
+        .{ .ordinal = 6, .path = "n", .value_type = .bytes_val, .is_null = true, .value = .{ .bytes_val = "" } },
+        .{ .ordinal = 8, .path = "json_null", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "null" } },
+    };
+    const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0} ** semantic_hash_len);
+    defer alloc.free(encoded);
+    var layout = try PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    var plan = try OrdinalProjectionPlan.init(alloc, schema, &layout, &.{ "s", "i", "f", "b", "d", "j", "n", "absent", "json_null" });
+    defer plan.deinit();
+    const row = try ordinalRowViewSelective(encoded, schema, &layout);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const projection = try row.projectSqlTypedAlloc(arena.allocator(), plan);
+    const value = projection.value;
+    const text = try row.projectAlloc(arena.allocator(), plan);
+    const typed_text = try std.json.Stringify.valueAlloc(arena.allocator(), value, .{});
+    try std.testing.expectEqualStrings(text, typed_text);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), value.object.get("i").?.integer);
+    try std.testing.expectEqualStrings("18446744073709551615", value.object.get("d").?.number_string);
+    try std.testing.expectEqualStrings("9007199254740993", value.object.get("j").?.object.get("exact").?.number_string);
+    try std.testing.expect(value.object.get("n").? == .null);
+    try std.testing.expect(value.object.get("absent") == null);
+    try std.testing.expect(value.object.get("json_null").? == .null);
+    try std.testing.expectEqual(value.object.count(), projection.sql_nulls.len);
+    try std.testing.expect(projection.sql_nulls[value.object.getIndex("n").?]);
+    try std.testing.expect(!projection.sql_nulls[value.object.getIndex("json_null").?]);
 }
 
 test "ordinal root materialization preserves exact nested JSON numbers" {

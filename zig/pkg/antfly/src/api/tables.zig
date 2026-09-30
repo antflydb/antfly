@@ -22,6 +22,7 @@ const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/selected_root.zig").db;
 const indexes_openapi = @import("antfly_indexes_openapi");
+const indexes_api = @import("indexes.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const schema_openapi = @import("antfly_schema_openapi");
 const schema_mod = @import("../schema/mod.zig");
@@ -1751,20 +1752,76 @@ pub fn applySchemaUpdateRecord(
     table: *const metadata_table_manager.TableRecord,
     schema_json: []const u8,
 ) !metadata_table_manager.TableRecord {
-    return applySchemaRecord(alloc, table, schema_json, false);
+    return applySchemaRecord(alloc, table, schema_json, false, false, null);
+}
+
+/// Recompute an already prepared schema update without minting a second index
+/// incarnation. Only trusted validation paths may supply the pinned token;
+/// ordinary DDL always mints a fresh one above.
+pub fn applySchemaUpdateRecordWithIncarnation(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    schema_json: []const u8,
+    incarnation: u64,
+) !metadata_table_manager.TableRecord {
+    if (!@import("../storage/coverage_identity.zig").isValid(incarnation)) return error.InvalidIndexConfig;
+    return applySchemaRecord(alloc, table, schema_json, false, false, incarnation);
 }
 
 /// Only the fresh-generation rewrite reservation may use this constructor.
 /// It does not publish the schema or permit changing existing stored rows.
 pub fn prepareSchemaRewriteRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8) !metadata_table_manager.TableRecord {
-    return applySchemaRecord(alloc, table, schema_json, true);
+    return applySchemaRecord(alloc, table, schema_json, true, false, null);
 }
 
-fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool) !metadata_table_manager.TableRecord {
+/// Construct the immutable candidate for a coordinated FK generation plan.
+/// This does not publish the table: metadata's dedicated fenced state machine
+/// is the only consumer allowed to commit the returned record.
+pub fn prepareForeignKeyPublicationRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8) !metadata_table_manager.TableRecord {
+    return applySchemaRecord(alloc, table, schema_json, false, true, null);
+}
+
+/// Recompute the only index-catalog delta a generation publication may carry.
+/// The next full-text index has a freshly allocated private incarnation, so
+/// take that one value from the candidate; every other byte must be derived
+/// from the old catalog and accepted successor schema by the normal DDL path.
+pub fn foreignKeyPublicationIndexesValid(alloc: std.mem.Allocator, table_name: []const u8, before_indexes_json: []const u8, after_indexes_json: []const u8, after_schema_json: []const u8, next_version: u32) !bool {
+    if (next_version == 0) return false;
+    var candidate = try std.json.parseFromSlice(std.json.Value, alloc, after_indexes_json, .{});
+    defer candidate.deinit();
+    if (candidate.value != .object) return false;
+    const next_name = try std.fmt.allocPrint(alloc, "full_text_index_v{d}", .{next_version});
+    defer alloc.free(next_name);
+    const incarnation = if (candidate.value.object.get(next_name)) |value|
+        coverage_policy_mod.incarnation(value) orelse return false
+    else
+        null;
+    if (incarnation) |next_incarnation| {
+        var prior = try std.json.parseFromSlice(std.json.Value, alloc, before_indexes_json, .{});
+        defer prior.deinit();
+        if (prior.value != .object) return false;
+        var entries = prior.value.object.iterator();
+        while (entries.next()) |entry| {
+            if (coverage_policy_mod.incarnation(entry.value_ptr.*)) |old_incarnation|
+                if (old_incarnation == next_incarnation) return false;
+        }
+    }
+    const regenerated = try regenerateAlgebraicIndexesFromSchemaAlloc(alloc, table_name, before_indexes_json, after_schema_json);
+    defer alloc.free(regenerated);
+    const expected = try upsertVersionedFullTextIndex(alloc, regenerated, next_version - 1, next_version, incarnation);
+    defer alloc.free(expected);
+    return std.mem.eql(u8, expected, after_indexes_json);
+}
+
+fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool, pinned_incarnation: ?u64) !metadata_table_manager.TableRecord {
     try @import("../schema/relational_index_namespace.zig").validate(alloc, schema_json, table.indexes_json);
     const current_version = try schemaVersion(table.schema_json);
     const schema_changed = !try schemasSemanticallyEqual(alloc, table.schema_json, schema_json);
-    if (schema_changed and !rewrite) try @import("../schema/relational_expression.zig").validateSchemaUpdate(alloc, table.schema_json, schema_json);
+    if (schema_changed and !rewrite) {
+        try @import("../schema/relational_expression.zig").validateSchemaUpdate(alloc, table.schema_json, schema_json);
+        if (!fk_publication and !try foreignKeyDefinitionsUnchanged(alloc, table.schema_json, schema_json))
+            return error.ForeignKeyGenerationPublicationRequired;
+    }
     const next_version = if (schema_changed)
         std.math.add(u32, current_version, 1) catch return error.SchemaVersionExhausted
     else
@@ -1803,10 +1860,74 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
         updated.read_schema_json = normalized_read_schema_json;
     }
 
-    const next_indexes_json = try upsertVersionedFullTextIndex(alloc, updated.indexes_json, current_version, next_version);
+    const next_indexes_json = try upsertVersionedFullTextIndex(alloc, updated.indexes_json, current_version, next_version, pinned_incarnation);
     alloc.free(updated.indexes_json);
     updated.indexes_json = next_indexes_json;
     return updated;
+}
+
+/// A regular schema update cannot publish a new child FK identity before its
+/// parent owners have durably accepted that generation. Compare the same
+/// canonical fingerprints as the owner catalog, so JSON spelling/order and
+/// unrelated layout changes do not turn a safe update into a false conflict.
+pub fn foreignKeyDefinitionsUnchanged(alloc: std.mem.Allocator, previous_json: []const u8, next_json: []const u8) !bool {
+    const schema_api = @import("../schema/mod.zig");
+    const native = @import("../storage/schema.zig");
+    const declarations = @import("../schema/relational_declarations.zig");
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var previous = try schema_api.parseValidatedTableSchema(a, if (previous_json.len == 0) "{}" else previous_json);
+    defer previous.deinit(a);
+    var next = try schema_api.parseValidatedTableSchema(a, if (next_json.len == 0) "{}" else next_json);
+    defer next.deinit(a);
+    const previous_fk_count = if (previous.foreign_keys) |list| list.value.len else 0;
+    const next_fk_count = if (next.foreign_keys) |list| list.value.len else 0;
+    if (previous_fk_count == 0 and next_fk_count == 0) return true;
+    const previous_runtime = try schema_api.deriveRuntimeTableSchema(a, previous);
+    defer native.freeSchema(a, previous_runtime);
+    const next_runtime = try schema_api.deriveRuntimeTableSchema(a, next);
+    defer native.freeSchema(a, next_runtime);
+    const prior = try declarations.definitionFingerprints(a, previous, previous_runtime);
+    defer declarations.freeDefinitions(a, prior);
+    const candidate = try declarations.definitionFingerprints(a, next, next_runtime);
+    defer declarations.freeDefinitions(a, candidate);
+    var prior_count: usize = 0;
+    var next_count: usize = 0;
+    for (prior) |definition| {
+        if (definition.kind != .foreign_key) continue;
+        prior_count += 1;
+        const matching = for (candidate) |other| {
+            if (other.kind == .foreign_key and std.mem.eql(u8, definition.name, other.name)) break other;
+        } else return false;
+        if (!std.mem.eql(u8, &definition.fingerprint, &matching.fingerprint)) return false;
+    }
+    for (candidate) |definition| if (definition.kind == .foreign_key) {
+        next_count += 1;
+    };
+    return prior_count == next_count;
+}
+
+test "ordinary schema update rejects unacknowledged FK generation but permits unrelated columns" {
+    const alloc = std.testing.allocator;
+    const previous =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const changed_fk =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"],"on_delete":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const added_column =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"note":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 11, .name = "children", .schema_json = previous };
+    try std.testing.expectError(error.ForeignKeyGenerationPublicationRequired, applySchemaUpdateRecord(alloc, &table, changed_fk));
+    const candidate = try prepareForeignKeyPublicationRecord(alloc, &table, changed_fk);
+    defer metadata_table_manager.freeTable(alloc, candidate);
+    try std.testing.expectEqual(@as(u32, 2), try schemaVersion(candidate.schema_json));
+    try std.testing.expect(std.mem.indexOf(u8, candidate.schema_json, "cascade") != null);
+    const updated = try applySchemaUpdateRecord(alloc, &table, added_column);
+    defer metadata_table_manager.freeTable(alloc, updated);
+    try std.testing.expectEqual(@as(u32, 2), try schemaVersion(updated.schema_json));
 }
 
 fn validateRuntimeDerivableSchemaJson(alloc: std.mem.Allocator, schema_json: []const u8) !void {
@@ -2410,7 +2531,9 @@ fn parseTableIndexes(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
 ) !std.json.ArrayHashMap(indexes_openapi.CreatedIndex) {
-    const canonical_json = try encodeTableIndexesObject(alloc, indexes_json);
+    // Use the same credential-free, legacy-aware projection as index reads.
+    // Stored optional metadata may not satisfy the current CreatedIndex schema.
+    const canonical_json = try indexes_api.encodeIndexConfigMap(alloc, indexes_json);
     defer alloc.free(canonical_json);
     return try std.json.parseFromSliceLeaky(std.json.ArrayHashMap(indexes_openapi.CreatedIndex), alloc, canonical_json, .{
         .allocate = .alloc_always,
@@ -2575,34 +2698,6 @@ fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }
 
-fn encodeTableIndexesObject(alloc: std.mem.Allocator, indexes_json: []const u8) ![]u8 {
-    const source = if (indexes_json.len > 0) indexes_json else default_indexes_json;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidTableIndexMetadata,
-    };
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(alloc);
-    try out.append(alloc, '{');
-    var first = true;
-    var it = root.iterator();
-    while (it.next()) |entry| {
-        // Reserved metadata sections are not index configs; the provisioner
-        // reads them from the stored indexes_json.
-        if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
-        if (!first) try out.append(alloc, ',');
-        first = false;
-        try appendJsonString(alloc, &out, entry.key_ptr.*);
-        try out.append(alloc, ':');
-        try appendCanonicalIndexConfig(alloc, &out, entry.key_ptr.*, entry.value_ptr.*);
-    }
-    try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
-}
-
 fn isReservedIndexMetadataEntry(name: []const u8) bool {
     return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
 }
@@ -2640,44 +2735,6 @@ const ApiIndexType = enum {
     graph,
     algebraic,
 };
-
-fn appendCanonicalIndexConfig(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    index_name: []const u8,
-    config: std.json.Value,
-) !void {
-    if (config != .object) return error.InvalidTableIndexMetadata;
-    const index_type = inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata;
-
-    try out.append(alloc, '{');
-    try appendJsonString(alloc, out, "name");
-    try out.append(alloc, ':');
-    try appendJsonString(alloc, out, index_name);
-    if (config.object.get("type") == null) {
-        try out.append(alloc, ',');
-        try appendJsonString(alloc, out, "type");
-        try out.append(alloc, ':');
-        try appendJsonString(alloc, out, switch (index_type) {
-            .full_text => "full_text",
-            .embeddings => "embeddings",
-            .graph => "graph",
-            .algebraic => "algebraic",
-        });
-    }
-
-    var it = config.object.iterator();
-    while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "name")) continue;
-        try out.append(alloc, ',');
-        try appendJsonString(alloc, out, entry.key_ptr.*);
-        try out.append(alloc, ':');
-        const encoded = try stringifyJsonValue(alloc, entry.value_ptr.*);
-        defer alloc.free(encoded);
-        try out.appendSlice(alloc, encoded);
-    }
-    try out.append(alloc, '}');
-}
 
 fn buildCanonicalIndexConfigValue(
     alloc: std.mem.Allocator,
@@ -3871,6 +3928,7 @@ fn upsertVersionedFullTextIndex(
     current_indexes_json: []const u8,
     current_version: u32,
     next_version: u32,
+    pinned_incarnation: ?u64,
 ) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer parsed.deinit();
@@ -3918,7 +3976,10 @@ fn upsertVersionedFullTextIndex(
         // readiness for the newly built index.
         removeOwnedJsonObjectField(alloc, &next_config.object, coverage_policy_mod.incarnation_field);
         removeOwnedJsonObjectField(alloc, &next_config.object, coverage_policy_mod.legacy_coverage_incarnation_field);
-        const encoded_next_config = try coverage_policy_mod.withFreshIncarnationAlloc(alloc, next_config);
+        const encoded_next_config = if (pinned_incarnation) |incarnation|
+            try coverage_policy_mod.withIncarnationAlloc(alloc, next_config, incarnation)
+        else
+            try coverage_policy_mod.withFreshIncarnationAlloc(alloc, next_config);
         defer alloc.free(encoded_next_config);
 
         if (!first) try out.append(alloc, ',');
@@ -4464,6 +4525,69 @@ test "metadata.table status encoder honors storage status overrides" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_direct_entry_count\":118") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_fallback_backend_mutable_count\":128") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_fallback_below_threshold_count\":129") != null);
+}
+
+test "metadata.table status uses public index projection for legacy graph artifacts" {
+    const indexes_json =
+        \\{
+        \\  "full_text_index_v0": {"type":"full_text"},
+        \\  "enrichments": [{"name":"units","kind":"asset","field":"url","producer_json":"private-producer"}],
+        \\  "legacy_graph": {"type":"graph","artifact":{"name":"units","kind":"asset","field":"url","producer_json":"private-producer"},"source":{"artifact":"units","format":"extraction_relation","path":"$.edges[*]"},"edge_types":[{"name":"mentions"}]},
+        \\  "canonical_graph": {"type":"graph","artifact":{"name":"relations","kind":"asset","source":{"type":"field","value":"body"},"producer_json":"private-producer"},"sources":[{"artifact":"relations"}],"edge_types":[{"name":"mentions"}]},
+        \\  "vectors": {"type":"embeddings","dimension":3,"embedding_name":"dense","enrichments":[{"name":"dense","kind":"embedding","field":"body","producer_json":"private-producer"}],"embedder":{"provider":"openai","model":"example","api_key":"private-key"}}
+        \\}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+            .{ .table_id = 7, .name = "docs", .indexes_json = indexes_json, .replication_sources_json = "[]", .placement_role = "data" },
+            .{ .table_id = 8, .name = "plain", .indexes_json = default_indexes_json, .replication_sources_json = "[]", .placement_role = "data" },
+        })[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const single = (try encodeSingleTableStatus(std.testing.allocator, &snapshot, "docs")).?;
+    defer std.testing.allocator.free(single);
+    const listed = try encodeTableList(std.testing.allocator, &snapshot, null);
+    defer std.testing.allocator.free(listed);
+    for ([_][]const u8{ single, listed }) |response| {
+        try std.testing.expect(std.mem.indexOf(u8, response, "private-producer") == null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "private-key") == null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "producer_json") == null);
+    }
+    var parsed_single = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, single, .{});
+    defer parsed_single.deinit();
+    var parsed_list = try std.json.parseFromSlice([]metadata_openapi.TableStatus, std.testing.allocator, listed, .{});
+    defer parsed_list.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_list.value.len);
+    try std.testing.expectEqualStrings("plain", parsed_list.value[1].name);
+    try std.testing.expectEqualStrings("docs", parsed_list.value[0].name);
+    const listed_configs = parsed_list.value[0].indexes.map;
+    try std.testing.expectEqual(parsed_single.value.indexes.map.count(), listed_configs.count());
+    var configs_iter = parsed_single.value.indexes.map.iterator();
+    while (configs_iter.next()) |entry| {
+        try std.testing.expectEqualDeep(entry.value_ptr.*, listed_configs.get(entry.key_ptr.*).?);
+    }
+
+    const configs = parsed_single.value.indexes.map;
+    try std.testing.expectEqual(@as(usize, 4), configs.count());
+    const legacy = configs.get("legacy_graph").?.created_graph_index;
+    // Match index GET/list: omit the incompatible optional producer object,
+    // retain the canonical graph source, and leave stored/runtime config alone.
+    try std.testing.expect(legacy.artifact == null);
+    try std.testing.expectEqualStrings("units", legacy.sources.?[0].artifact);
+    try std.testing.expectEqualStrings("$.edges[*]", legacy.sources.?[0].path.?);
+    try std.testing.expectEqualStrings("mentions", legacy.edge_types.?[0].name);
+    const canonical = configs.get("canonical_graph").?.created_graph_index;
+    try std.testing.expectEqualStrings("field", canonical.artifact.?.source.type);
+    try std.testing.expectEqualStrings("body", canonical.artifact.?.source.value);
+    const vectors = configs.get("vectors").?.created_embeddings_index;
+    try std.testing.expectEqualStrings("dense", vectors.enrichments.?[0].name);
+    try std.testing.expectEqual(indexes_openapi.EnrichmentKind.embedding, vectors.enrichments.?[0].kind);
 }
 
 test "metadata.table status encoder canonicalizes embeddings indexes independent of JSON key order" {
@@ -5680,6 +5804,11 @@ test "metadata.schema update preserves read schema and adds versioned full-text 
         "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"}}}}},\"dynamic_templates\":{\"body\":{\"mapping\":{\"type\":\"text\"}}}}",
     );
     defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expect(try foreignKeyPublicationIndexesValid(std.testing.allocator, table.name, table.indexes_json, updated.indexes_json, updated.schema_json, 1));
+    const forged = try std.fmt.allocPrint(std.testing.allocator, "{s},\"rogue\":{{\"type\":\"full_text\"}}}}", .{updated.indexes_json[0 .. updated.indexes_json.len - 1]});
+    defer std.testing.allocator.free(forged);
+    try std.testing.expect(!try foreignKeyPublicationIndexesValid(std.testing.allocator, table.name, table.indexes_json, forged, updated.schema_json, 1));
 
     try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.read_schema_json, "\"version\":0") != null);

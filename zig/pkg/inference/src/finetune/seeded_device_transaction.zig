@@ -621,9 +621,9 @@ test "seeded device transaction control preserves worker carrier both cancellati
 }
 
 /// Prepare independent resident replacements without modifying any borrowed
-/// state. Metal's AdamWMany ABI outside an external frame calls
-/// finish_command_buffer (metal_kernels.m), which submits and waits before
-/// returning, including on device failure. Every batch is <=256 items and is
+/// state. On Metal the transaction owns one command batch: every read-back
+/// reduction synchronizes it, and it is submitted and waited on (including on
+/// device failure) before prepare returns. Every batch is <=256 items and is
 /// followed by a cancellation check. trainingSynchronize is intentionally not
 /// used: its Metal vtable entry is optional and cannot prove completion.
 pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, request: Request, limits: Limits, control: ?Control) !*Pending {
@@ -642,6 +642,12 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
     }, .accumulated_microbatches = if (admission.optimizer_stepped) 0 else nextAccumulation(state, request), .optimizer_stepped = admission.optimizer_stepped, .grad_norm = 0, .loss = request.loss, .selected_slots = admission.selected_slots } };
     pending.backend.execution_control = combined.control();
     errdefer pending.deinit();
+    // Encode the whole transaction into one backend batch where supported.
+    // Only reductions that read results back synchronize it, and it commits
+    // before the transaction is returned. On failure it is discarded; any
+    // work already executed wrote only replacement buffers.
+    const batched = try pending.backend.residentTrainingBeginBatch();
+    errdefer if (batched) pending.backend.residentTrainingEndBatch(false) catch {};
     const scratch = pending.budget.allocator();
     pending.replacements = try scratch.alloc(Replacement, admission.selected_slots);
     for (pending.replacements) |*replacement| replacement.* = .{ .slot = 0, .grad_accum = null, .adam_step = 0, .present = false };
@@ -819,6 +825,7 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
             if (!try validateValues(pending, norms[0..norm_used], limits)) return error.InvalidDeviceOptimizerResult;
         }
     }
+    if (batched) try pending.backend.residentTrainingEndBatch(true);
     if (pending.receipt.scalar_upload_bytes + pending.receipt.scalar_download_bytes > admission.scalar_transfer_upper_bound_bytes)
         return error.InvalidDeviceOptimizerResult;
     try pending.backend.checkExecutionControl();

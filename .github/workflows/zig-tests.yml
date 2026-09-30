@@ -216,6 +216,7 @@ jobs:
             ':(glob)scripts/ci/zig-*.sh' \
             scripts/ci/zig_e2e_shard.py \
             scripts/ci/test_zig_e2e_shard.py scripts/ci/merge_e2e_durations.py scripts/ci/summarize_e2e_timings.py scripts/ci/antfly_e2e_durations.json \
+            scripts/ci/test_zig_hosted_fk_recovery.py \
             ':(glob)scripts/ci/*vopr*.py' \
             .github/workflows/zig-vopr-soak.yml \
             scripts/ci/check_zig_checksum_usage.py \
@@ -256,6 +257,7 @@ jobs:
             ':(glob)scripts/ci/zig-*.sh' \
             scripts/ci/zig_e2e_shard.py \
             scripts/ci/test_zig_e2e_shard.py scripts/ci/merge_e2e_durations.py scripts/ci/summarize_e2e_timings.py scripts/ci/antfly_e2e_durations.json \
+            scripts/ci/test_zig_hosted_fk_recovery.py \
             scripts/ci/toolchain-policy.json \
             ':(glob)go/pkg/operator/**' \
             ':(glob)go/pkg/sdk/admin/**' \
@@ -538,8 +540,8 @@ jobs:
         working-directory: zig
         run: |
           node pkg/antfly-embedded/wasm_client_test.mjs
-          zig build wasm-test inference-wasm -Dmetal=false -j1 --summary all
-          zig build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 --summary all
+          zig build wasm-test inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
+          zig build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
           cd pkg/inference
           zig build wasm -Dwasm=true -j1 --summary all
           node web/test-wasm-abi.mjs wasm32
@@ -1370,6 +1372,7 @@ jobs:
       ANTFLY_CI_ZIG_OPTIMIZE: ${{ inputs.full_validation && 'ReleaseSafe' || 'ReleaseFast' }}
       ANTFLY_CI_ZIG_STRIP: "true"
       ANTFLY_CI_BUILD_CAPI: "true"
+      ANTFLY_CI_BUILD_FK_RECOVERY: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1404,7 +1407,7 @@ jobs:
         run: scripts/ci/zig-build-e2e-binaries.sh
 
       - name: Package E2E executable
-        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-base.tar.gz" zig-out/bin/antfly
+        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-base.tar.gz" zig-out/bin/antfly zig-out/bin/antfly-hosted-initial-fk-recovery zig-out/bin/antfly-hosted-self-fk-recovery zig-out/bin/antfly-hosted-truncate-fk-recovery
 
       - name: Upload E2E executable
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1485,6 +1488,12 @@ jobs:
             shard: recovery-1
           - suite: antfly-recovery-2
             shard: recovery-2
+          - suite: fk-initial
+            shard: all
+          - suite: fk-self
+            shard: all
+          - suite: fk-truncate
+            shard: all
           - suite: inference
             shard: all
     env:
@@ -1596,9 +1605,12 @@ jobs:
 
       - name: Test exhaustive E2E shard partition
         if: matrix.suite == 'antfly-ordinary-0'
-        run: python3 -m unittest discover -s scripts/ci -p test_zig_e2e_shard.py
+        run: |
+          python3 -m unittest discover -s scripts/ci -p test_zig_e2e_shard.py
+          python3 -m unittest discover -s scripts/ci -p test_zig_hosted_fk_recovery.py
 
       - name: Run base E2E
+        if: ${{ !startsWith(matrix.suite, 'fk-') }}
         env:
           SKIP_BUILD: "1"
           ANTFLY_E2E_SUITE: ${{ matrix.suite }}
@@ -1610,6 +1622,22 @@ jobs:
             exit 1
           fi
           taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
+
+      - name: Run prebuilt hosted FK recovery
+        if: startsWith(matrix.suite, 'fk-')
+        timeout-minutes: 16
+        env:
+          FK_SUITE: ${{ matrix.suite }}
+        run: taskset -c ${{ steps.e2e_cpus.outputs.list }} bash scripts/ci/zig-hosted-fk-recovery.sh "${FK_SUITE#fk-}"
+
+      - name: Retain hosted FK recovery logs
+        if: always() && startsWith(matrix.suite, 'fk-')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hosted-fk-base-${{ matrix.suite }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/antfly-fk-recovery/*.log
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Run inference config contract with a real CPU model
         if: matrix.suite == 'inference'
@@ -1862,6 +1890,7 @@ jobs:
       # Keep production optimization while preserving runtime-safety checks and
       # std.debug.assert invariants exercised by the full E2E suite.
       ANTFLY_CI_ZIG_OPTIMIZE: ReleaseSafe
+      ANTFLY_CI_BUILD_FK_RECOVERY: "true"
       # Match release artifact symbol handling without disabling ReleaseSafe
       # checks or std.debug.assert invariants.
       ANTFLY_CI_ZIG_STRIP: "true"
@@ -1899,7 +1928,7 @@ jobs:
         run: scripts/ci/zig-build-e2e-binaries.sh
 
       - name: Package E2E executable
-        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly
+        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly zig-out/bin/antfly-hosted-initial-fk-recovery zig-out/bin/antfly-hosted-self-fk-recovery zig-out/bin/antfly-hosted-truncate-fk-recovery
 
       - name: Upload E2E executable
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1928,12 +1957,12 @@ jobs:
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full / ${{ matrix.suite }}
     needs: [admission, changes, e2e-base-build, e2e-full-build]
-    runs-on: ${{ matrix.suite == 'antfly' && 'arc-antfly-heavy-runtime' || 'arc-antfly-heavy' }}
+    runs-on: ${{ matrix.suite != 'inference' && 'arc-antfly-heavy-runtime' || 'arc-antfly-heavy' }}
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
-        suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference"]' || '["inference","antfly"]') }}
+        suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference"]' || '["inference","antfly","fk-initial","fk-self","fk-truncate"]') }}
     env:
       # Full Antfly E2E has the same multi-process groups as the base shards.
       # Keep one process-owning worker per runner while lightweight tests may
@@ -2104,6 +2133,22 @@ jobs:
         run: |
           chmod +x ./zig-out/bin/antfly
           taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly
+
+      - name: Run prebuilt hosted FK recovery
+        if: startsWith(matrix.suite, 'fk-')
+        timeout-minutes: 16
+        env:
+          FK_SUITE: ${{ matrix.suite }}
+        run: taskset -c ${{ steps.e2e_cpus.outputs.list }} bash scripts/ci/zig-hosted-fk-recovery.sh "${FK_SUITE#fk-}"
+
+      - name: Retain hosted FK recovery logs
+        if: always() && startsWith(matrix.suite, 'fk-')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hosted-fk-full-${{ matrix.suite }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/antfly-fk-recovery/*.log
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Retain full inference server logs
         if: always() && matrix.suite == 'inference'

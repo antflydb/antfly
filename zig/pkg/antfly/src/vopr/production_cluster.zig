@@ -2464,9 +2464,8 @@ pub const Fixture = struct {
 
     fn recoverMetadataLeadership(self: *Fixture, round: usize) !void {
         if (self.metadata.?.cluster.currentMetadataLeaderIndex() != null or round % 8 != 7) return;
-        const campaign_index = (round / 8) % node_count;
-        try self.metadata.?.cluster.node(campaign_index).campaignMetadataGroup();
-        self.metadata_recovery_campaigns +|= 1;
+        if (try self.metadata.?.cluster.campaignBestMetadataCandidate())
+            self.metadata_recovery_campaigns +|= 1;
     }
 
     fn waitForDataRaftTopology(self: *Fixture) !void {
@@ -2564,11 +2563,8 @@ pub const Fixture = struct {
         self.noteStandbyScalingWait("metadata quorum progress", 0);
         try self.metadata.?.cluster.stepAll();
         if (self.metadata.?.cluster.currentMetadataLeaderIndex() == null and self.driver_rounds % 8 == 7) {
-            // The metadata VOPR harness intentionally uses deterministic timers,
-            // so a long data-plane outage can align every healthy candidate.
-            // A production deployment gets the equivalent symmetry break from
-            // randomized election timeouts. Campaign one rotating healthy
-            // replica as a real Raft input; never fabricate leader state.
+            // Use the same candidate selection as the metadata Raft driver so
+            // control rounds cannot restart another replica's active vote.
             try self.recoverMetadataLeadership(@intCast(self.driver_rounds));
         }
     }
@@ -2615,12 +2611,12 @@ pub const Fixture = struct {
             };
             rounds +|= 1;
             if (rounds % 8 == 0 and self.metadata.?.cluster.currentMetadataLeaderIndex() == null) {
-                self.metadata.?.cluster.campaignBestMetadataCandidate() catch |err| {
+                const campaigned = self.metadata.?.cluster.campaignBestMetadataCandidate() catch |err| {
                     self.driver_failure = err;
                     self.driver_stop = true;
                     return;
                 };
-                self.metadata_recovery_campaigns +|= 1;
+                if (campaigned) self.metadata_recovery_campaigns +|= 1;
             }
             self.sim.io().sleep(.fromMilliseconds(raft_runtime_loop.RuntimeCadence.default_raft_tick_ms), .awake) catch |err| {
                 if (err == error.Canceled and self.driver_stop) return;
@@ -2958,8 +2954,8 @@ pub const Fixture = struct {
                 error.StoreRegistrationNotVisible,
                 => {
                     if (self.metadata.?.cluster.currentMetadataLeaderIndex() == null) {
-                        try self.metadata.?.cluster.campaignBestMetadataCandidate();
-                        self.metadata_recovery_campaigns +|= 1;
+                        if (try self.metadata.?.cluster.campaignBestMetadataCandidate())
+                            self.metadata_recovery_campaigns +|= 1;
                     }
                     // Keep the restart fencing handshake metadata-only. A
                     // full data-control round publishes more competing status

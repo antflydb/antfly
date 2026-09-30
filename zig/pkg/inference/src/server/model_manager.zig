@@ -2985,10 +2985,16 @@ pub const LoadedModel = struct {
                 .relation_threshold = self.manifest.gliner_relation_threshold,
                 .model_type = self.manifest.gliner_model_type,
                 .capabilities = self.manifest.capabilities,
+                .classification_head = switch (self.manifest.gliner_classification_head) {
+                    .none => .none,
+                    .label_marker_mlp => .label_marker_mlp,
+                },
                 .token_p = self.manifest.gliner_token_p,
                 .token_c = self.manifest.gliner_token_c,
+                .token_l = self.manifest.gliner_token_l,
                 .token_e = self.manifest.gliner_token_e,
                 .token_r = self.manifest.gliner_token_r,
+                .token_sep_struct = self.manifest.gliner_token_sep_struct,
                 .token_sep_text = self.manifest.gliner_token_sep_text,
                 .distributed = runtime.distributed.configFromEnv(),
             },
@@ -8843,13 +8849,16 @@ fn estimateModelLoadAdmission(
     man: manifest_mod.ModelManifest,
     backend_runtime: backends.BackendRuntime,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
+    laya_packed: bool,
 ) !ModelLoadAdmissionPlan {
     const weights = try estimateModelArtifactBytes(man, backend_runtime.backend);
     const uses_onnx_artifact = backend_runtime.backend == .onnx or !manifestHasNativeAssets(man);
     if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend_runtime);
     if (backend_runtime.backend == .metal) {
-        if (try session_factory.layaResidentLoadAmounts(man, weights)) |resident| {
-            return .{ .peak = resident.peak, .resident = resident.resident };
+        if (!laya_packed) {
+            if (try session_factory.layaResidentLoadAmounts(man, weights)) |resident| {
+                return .{ .peak = resident.peak, .resident = resident.resident };
+            }
         }
         if (try session_factory.glinerBoundaryResidentLoadAmounts(man, weights)) |resident| {
             return .{ .peak = resident.peak, .resident = resident.resident };
@@ -9190,11 +9199,12 @@ fn loadSessionForPreferredBackends(
     // MissingRequiredWeights, and callers were being told the file did not exist.
     var first_err: ?anyerror = null;
     var laya_resident_attempted = false;
+    const laya_packed = man.hasCapability("typed_decisions") and session_factory.isPackedLayaModel(manager.allocator, model_dir);
     for (effective_backends) |backend| {
         // Once opted-in Metal residency is attempted, preserve its actionable
         // admission/load error rather than silently publishing a CPU session.
         if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
-        if (backend == .metal and man.hasCapability("typed_decisions") and @import("../ops/laya_metal.zig").enabled()) laya_resident_attempted = true;
+        if (backend == .metal and man.hasCapability("typed_decisions") and !laya_packed and @import("../ops/laya_metal.zig").enabled()) laya_resident_attempted = true;
         if (control) |active| try active.check();
         if (modelBackendIsUnhealthy(manager, model_dir, backend)) {
             rememberPreferredLoadError(&first_err, error.ModelBackendUnhealthy);
@@ -9246,6 +9256,7 @@ fn loadSessionForPreferredBackends(
                 man,
                 backend_runtime,
                 source_session_manager.a4b_inference_request,
+                laya_packed,
             ) catch |err| {
                 rememberPreferredLoadError(&first_err, err);
                 continue;

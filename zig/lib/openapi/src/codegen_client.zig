@@ -336,34 +336,35 @@ pub const ClientGenerator = struct {
 
         // Make request
         const headers_expr = if (params.header.len > 0) "request_headers.items" else "self.authHeaders()";
+        const policy_options = try requestPolicyOptions(self.arena, op.client_request_policy);
         if (is_binary_request) {
             if (is_body_required) {
-                try self.w.line("var resp = try self.http.{s}(url, .{{ .body = body, .headers = {s} }});", .{ http_method, headers_expr });
+                try self.w.line("var resp = try self.http.{s}(url, .{{ .body = body, .headers = {s}{s} }});", .{ http_method, headers_expr, policy_options });
             } else {
                 try self.w.line("var resp = if (body) |value|", .{});
                 self.w.indent();
-                try self.w.line("try self.http.{s}(url, .{{ .body = value, .headers = {s} }})", .{ http_method, headers_expr });
+                try self.w.line("try self.http.{s}(url, .{{ .body = value, .headers = {s}{s} }})", .{ http_method, headers_expr, policy_options });
                 self.w.dedent();
                 try self.w.line("else", .{});
                 self.w.indent();
-                try self.w.line("try self.http.{s}(url, .{{ .headers = {s} }});", .{ http_method, headers_expr });
+                try self.w.line("try self.http.{s}(url, .{{ .headers = {s}{s} }});", .{ http_method, headers_expr, policy_options });
                 self.w.dedent();
             }
         } else if (body_type != null) {
             if (is_body_required) {
-                try self.w.line("var resp = try self.http.{s}(url, .{{ .json = json_body, .headers = {s} }});", .{ http_method, headers_expr });
+                try self.w.line("var resp = try self.http.{s}(url, .{{ .json = json_body, .headers = {s}{s} }});", .{ http_method, headers_expr, policy_options });
             } else {
                 try self.w.line("var resp = if (json_body) |value|", .{});
                 self.w.indent();
-                try self.w.line("try self.http.{s}(url, .{{ .json = value, .headers = {s} }})", .{ http_method, headers_expr });
+                try self.w.line("try self.http.{s}(url, .{{ .json = value, .headers = {s}{s} }})", .{ http_method, headers_expr, policy_options });
                 self.w.dedent();
                 try self.w.line("else", .{});
                 self.w.indent();
-                try self.w.line("try self.http.{s}(url, .{{ .headers = {s} }});", .{ http_method, headers_expr });
+                try self.w.line("try self.http.{s}(url, .{{ .headers = {s}{s} }});", .{ http_method, headers_expr, policy_options });
                 self.w.dedent();
             }
         } else {
-            try self.w.line("var resp = try self.http.{s}(url, .{{ .headers = {s} }});", .{ http_method, headers_expr });
+            try self.w.line("var resp = try self.http.{s}(url, .{{ .headers = {s}{s} }});", .{ http_method, headers_expr, policy_options });
         }
 
         // Return response
@@ -532,6 +533,45 @@ fn methodBody(generated: []const u8, signature: []const u8) []const u8 {
 fn encodedPathParamName(allocator: Allocator, name: []const u8) ![]u8 {
     const prefixed = try std.fmt.allocPrint(allocator, "encoded_{s}", .{name});
     return naming.zigFieldName(allocator, prefixed);
+}
+
+fn requestPolicyOptions(arena: Allocator, policy: ?types.ClientRequestPolicy) ![]const u8 {
+    const value = policy orelse return "";
+    var rendered = std.Io.Writer.Allocating.init(arena);
+    defer rendered.deinit();
+    if (value.max_retries) |limit| try rendered.writer.print(", .max_retries = {d}", .{limit});
+    if (value.follow_redirects) |allowed| try rendered.writer.print(", .follow_redirects = {}", .{allowed});
+    if (value.cookies_enabled) |allowed| try rendered.writer.print(", .cookies_enabled = {}", .{allowed});
+    if (value.max_response_size) |limit| try rendered.writer.print(", .max_response_size = {d}", .{limit});
+    return rendered.toOwnedSlice();
+}
+
+test "client operation policy disables replay independent of operation name and body shape" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var doc = types.OpenApiDoc{ .openapi = "3.0.3", .info = .{ .title = "Test", .version = "1.0" } };
+    const policy: types.ClientRequestPolicy = .{ .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 };
+    for ([_][]const u8{ "application/json", "application/octet-stream" }, 0..) |mime, i| {
+        var content = std.StringArrayHashMapUnmanaged(types.MediaType){};
+        try content.put(arena, mime, .{ .schema = .{ .schema = .{ .schema_type = .{ .single = "string" } } } });
+        for ([_]bool{ false, true }) |required| {
+            const name = try std.fmt.allocPrint(arena, "body{d}{}", .{ i, required });
+            const path = try std.fmt.allocPrint(arena, "/{s}", .{name});
+            try doc.paths.put(arena, path, .{ .post = .{ .operation_id = name, .request_body = .{ .request_body = .{ .required = required, .content = content } }, .client_request_policy = policy } });
+        }
+    }
+    try doc.paths.put(arena, "/no-body", .{ .post = .{ .operation_id = "withoutBody", .client_request_policy = policy } });
+    try doc.paths.put(arena, "/ambient", .{ .get = .{ .operation_id = "ambient" } });
+    var resolver = Resolver.init(arena, &doc);
+    var writer = SourceWriter.init(arena);
+    var type_gen = TypeGenerator.init(arena, &writer, &resolver);
+    var generator = ClientGenerator.init(arena, &writer, &resolver, &type_gen);
+    try generator.generate(&doc);
+    // Each optional body has two branches; all seven calls must be bounded.
+    const suffix = ".max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216";
+    try std.testing.expectEqual(@as(usize, 7), std.mem.count(u8, writer.toSlice(), suffix));
+    try std.testing.expect(std.mem.indexOf(u8, writer.toSlice(), "self.http.get(url, .{ .headers = self.authHeaders() });") != null);
 }
 
 fn encodedQueryParamValueName(allocator: Allocator, field_name: []const u8) ![]u8 {

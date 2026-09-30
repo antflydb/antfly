@@ -112,6 +112,27 @@ pub fn requireCoverage(parent: anytype, columns: []const []const u8) !void {
     }
 }
 
+/// The exact selectable index identities for an FK parent. A child-generation
+/// owner receipt may only be staged after each selected index is ready in the
+/// same pinned parent schema. Repeated columns share one proof.
+pub fn supportNames(alloc: std.mem.Allocator, parent: anytype, columns: []const []const u8) ![]const []const u8 {
+    const indexes = parent.relational_indexes orelse return error.ForeignKeyPartialSupportIndexRequired;
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(alloc);
+    for (columns) |column| {
+        const selected = for (indexes.value) |index| {
+            if (eligible(index) and std.mem.eql(u8, index.keys[0].column.?, column)) break index.name;
+        } else return error.ForeignKeyPartialSupportIndexRequired;
+        var seen = false;
+        for (names.items) |existing| if (std.mem.eql(u8, existing, selected)) {
+            seen = true;
+            break;
+        };
+        if (!seen) try names.append(alloc, selected);
+    }
+    return names.toOwnedSlice(alloc);
+}
+
 pub const Selection = struct { name: []const u8, values: []const std.json.Value };
 
 /// Choose the longest exact equality prefix; residual typed predicates verify

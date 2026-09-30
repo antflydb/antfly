@@ -1973,20 +1973,22 @@ pub const Backend = struct {
     }
 
     pub fn prepareWalOperationLockFile(self: *Backend) !void {
-        if (!self.options.wal_enabled or self.root_dir == null or !self.storage.?.supportsNativePathLocks()) return;
-        if (self.wal_operation_lock_file != null) return;
+        if (comptime builtin.os.tag != .freestanding) {
+            if (!self.options.wal_enabled or self.root_dir == null or !self.storage.?.supportsNativePathLocks()) return;
+            if (self.wal_operation_lock_file != null) return;
 
-        const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
-        defer self.allocator.free(lock_path);
-        self.wal_operation_lock_file = storage_io.openNativePathLockFileWithPool(
-            self.allocator,
-            lock_path,
-            .{ .create_if_missing = true },
-            self.options.native_storage_pool,
-        ) catch |err| switch (err) {
-            error.FileNotFound => if (self.options.backend.read_only) return else return err,
-            else => return err,
-        };
+            const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
+            defer self.allocator.free(lock_path);
+            self.wal_operation_lock_file = storage_io.openNativePathLockFileWithPool(
+                self.allocator,
+                lock_path,
+                .{ .create_if_missing = true },
+                self.options.native_storage_pool,
+            ) catch |err| switch (err) {
+                error.FileNotFound => if (self.options.backend.read_only) return else return err,
+                else => return err,
+            };
+        }
     }
 
     pub fn closeWalOperationLockFile(self: *Backend) void {
@@ -2265,7 +2267,7 @@ pub const Backend = struct {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
 
-        try self.flushMutable();
+        try self.flushCheckpointCutLocked();
         if (self.manifest_dirty or self.obsolete_manifest_dirty or self.manifest_backing == null) {
             try self.writeManifestSnapshotLocked(root_dir, self.writeStatsNowNs());
         }
@@ -4756,6 +4758,27 @@ pub const Backend = struct {
         try self.flushAllImmutableMemtables();
     }
 
+    /// Unlike a maintenance step, a self-contained checkpoint cannot yield
+    /// with committed data still in a memtable. An unlocked background build
+    /// temporarily owns the oldest epoch; wait for its publication, then drain
+    /// the remaining epochs and any mutable tail added while the lock was
+    /// released. Never certify a manifest-only image of a partial cut.
+    fn flushCheckpointCutLocked(self: *Backend) !void {
+        while (true) {
+            if (self.closing.load(.acquire)) return error.BackendClosing;
+            if (self.mutable.entryCount() > 0) try self.rotateMutableToImmutable();
+            if (self.activeImmutableMemtableCount() == 0) return;
+            if (self.immutable_flush_build_in_flight) {
+                if (!self.waitForImmutableFlushBuildLocked()) return error.WouldBlock;
+                continue;
+            }
+            // Explicit checkpoint work is outside background admission. Pass
+            // that distinction down rather than overriding the shared budget
+            // across an unlocked build, where maintenance can run concurrently.
+            _ = try self.flushImmutableMemtableWindowWithAdmission(true, false);
+        }
+    }
+
     fn directIngestMutableAtBulkFinishIfPossible(self: *Backend) !bool {
         if (!self.options.direct_bulk_ingest) return false;
         if (self.mutable.entryCount() == 0) return false;
@@ -4975,6 +4998,10 @@ pub const Backend = struct {
     }
 
     fn flushImmutableMemtableWindow(self: *Backend, force: bool) !bool {
+        return self.flushImmutableMemtableWindowWithAdmission(force, true);
+    }
+
+    fn flushImmutableMemtableWindowWithAdmission(self: *Backend, force: bool, charge_maintenance: bool) !bool {
         const window_count = self.immutableFlushWindowCount(force);
         if (window_count == 0) return false;
         const state = self.immutable_memtables.items[self.immutable_head];
@@ -4982,7 +5009,7 @@ pub const Backend = struct {
         for (self.activeImmutableMemtables()[0..window_count]) |window_state| {
             estimated_io_bytes +|= estimatedFlushIoBytes(window_state);
         }
-        if (!self.tryReserveMaintenanceIoBudget(estimated_io_bytes)) return false;
+        if (charge_maintenance and !self.tryReserveMaintenanceIoBudget(estimated_io_bytes)) return false;
         if (self.root_dir != null and self.storage != null) {
             return try self.flushOldestImmutableMemtableUnlockedBuild(window_count);
         }
@@ -22981,6 +23008,87 @@ fn implementationTests() type {
                 try std.testing.expectEqualStrings("old", batch_values[0][0].?);
                 try std.testing.expectEqualStrings("old", batch_values[1][0].?);
             }
+        }
+
+        test "lsm native checkpoint waits for in-flight immutable publication and includes the mutable tail" {
+            if (!supports_waitable_immutable_flush or builtin.single_threaded) return;
+            const alloc = std.testing.allocator;
+            var storage = storage_io.MemoryStorage.init(alloc);
+            defer storage.deinit();
+            var backend = try Backend.open(alloc, "/checkpoint-inflight-cut", .{
+                .storage = storage.storage(),
+                .flush_threshold = 1024 * 1024,
+                .compact_threshold_runs = 10000,
+            });
+            defer backend.close();
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{}, "older", "immutable");
+                try write.commit();
+            }
+            {
+                const locked = runtime_mod.lockBackend(Backend, &backend);
+                defer runtime_mod.unlockBackend(Backend, &backend, locked);
+                try backend.rotateMutableToImmutable();
+            }
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{}, "retention", "committed-tail");
+                try write.commit();
+            }
+            // Model the exclusive oldest-epoch build owner. Completion waits
+            // for the checkpoint to rotate the committed tail, so this tests
+            // the contested cut deterministically, not a scheduling race.
+            backend.immutable_flush_build_in_flight = true;
+            backend.maintenance_io_budget_remaining = 11;
+            const Builder = struct {
+                fn complete(target: *Backend) !void {
+                    const deadline = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+                    while (true) {
+                        const locked = runtime_mod.lockBackend(Backend, target);
+                        const ready = target.activeImmutableMemtableCount() >= 2;
+                        const expired = platform_time.monotonicNs() >= deadline;
+                        if (ready or expired) {
+                            target.maintenance_io_budget_remaining = 23;
+                            target.finishImmutableFlushBuildLocked();
+                        }
+                        runtime_mod.unlockBackend(Backend, target, locked);
+                        if (ready) return;
+                        if (expired) return error.TestCheckpointDidNotRotateTail;
+                        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    }
+                }
+            };
+            var completion = std.testing.io.concurrent(Builder.complete, .{&backend}) catch |err| {
+                backend.finishImmutableFlushBuildLocked();
+                return err;
+            };
+            var completion_awaited = false;
+            defer if (!completion_awaited) {
+                completion.await(std.testing.io) catch {};
+            };
+            var checkpoint = try backend.pinNativeCheckpoint();
+            defer checkpoint.deinit();
+            const completed = completion.await(std.testing.io);
+            completion_awaited = true;
+            try completed;
+            try std.testing.expectEqual(@as(?u64, 23), backend.maintenance_io_budget_remaining);
+            try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+            try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
+            try std.testing.expect(checkpoint.run_ids.len > 0);
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const restored_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/checkpoint", .{tmp.sub_path});
+            defer alloc.free(restored_path);
+            _ = try checkpoint.materialize(std.testing.io, restored_path, .none);
+            var restored = try Backend.open(alloc, restored_path, .{ .backend = .{ .read_only = true } });
+            defer restored.close();
+            var read = try Backend.BoundReadTxn.open(&restored, .{});
+            defer read.abort();
+            try std.testing.expectEqualStrings("immutable", try read.get("older"));
+            try std.testing.expectEqualStrings("committed-tail", try read.get("retention"));
         }
 
         test "lsm journal checkpoints bound replay and backups export standalone manifests" {
