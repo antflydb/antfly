@@ -44,6 +44,7 @@ const resolver_catalog = @import("resolver_catalog.zig");
 pub const ResolverConfig = resolver_catalog.ResolverConfig;
 const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("../enrichment/artifact_codec.zig");
+const graph_edge_contender = @import("../graph_edge_contender.zig");
 const enrichment_config_validation = @import("../enrichment/config_validation.zig");
 const enrichment_neighbor_context = @import("../enrichment/neighbor_context.zig");
 const asset_producer_mod = @import("../enrichment/asset_producer.zig");
@@ -1432,6 +1433,12 @@ pub const IndexManager = struct {
     /// page quanta, while unrelated catalog readers and writers no longer wait
     /// for an entire maintenance drain.
     graph_metric_schedule_pins: std.atomic.Value(usize) = .init(0),
+    /// Workers acquire shared before catalog/index apply; primary publishers
+    /// acquire exclusive under DB apply, without retaining a catalog lease. This fences
+    /// primary contributor reads through commit while preserving worker
+    /// parallelism across indexes. Never acquire DB apply from a shared holder.
+    graph_primary_publication: apply_rw_lock_mod.ApplyRwLock = .{},
+    graph_artifact_rebuild_pending: bool = false, // protected by catalog_mutex
     graph_metric_schedule_pin_mutex: std.Io.Mutex = .init,
     graph_metric_schedule_pins_drained: std.Io.Condition = .init,
     algebraic_indexes: std.ArrayListUnmanaged(AlgebraicIndex),
@@ -2818,6 +2825,7 @@ pub const IndexManager = struct {
         metric_configs: []graph_mod.GraphMetricConfig,
         artifact_sources: []GraphArtifactSource = &.{},
         max_edges_per_document: u32 = 0,
+        ttl_duration_ns: u64 = 0,
         rebuild_root_path: []u8,
         index: graph_mod.GraphIndex,
     };
@@ -2858,6 +2866,35 @@ pub const IndexManager = struct {
 
     pub fn init(alloc: Allocator, base_path: []const u8) !IndexManager {
         return try initWithOptions(alloc, base_path, .{});
+    }
+
+    /// A primary publisher must hold DB apply (or exclusive lifecycle admission)
+    /// before acquiring exclusive publication. Source replay acquires shared
+    /// before catalog/index apply and never acquires DB apply inside the lease.
+    /// Release exclusive publication before projection or visibility waits.
+    pub const GraphPrimaryPublicationLease = struct {
+        manager: *IndexManager,
+        mode: enum { primary, replay },
+        active: bool = true,
+
+        pub fn release(self: *@This()) void {
+            if (!self.active) return;
+            self.active = false;
+            switch (self.mode) {
+                .primary => self.manager.graph_primary_publication.unlockExclusive(),
+                .replay => self.manager.graph_primary_publication.unlockShared(),
+            }
+        }
+    };
+
+    pub fn beginGraphPrimaryMutation(self: *IndexManager) GraphPrimaryPublicationLease {
+        self.graph_primary_publication.lockExclusive();
+        return .{ .manager = self, .mode = .primary };
+    }
+
+    pub fn beginGraphSourceReplay(self: *IndexManager) GraphPrimaryPublicationLease {
+        self.graph_primary_publication.lockShared();
+        return .{ .manager = self, .mode = .replay };
     }
 
     pub const ManagedIndexApplyGuard = struct {
@@ -6376,41 +6413,40 @@ pub const IndexManager = struct {
         });
     }
 
+    /// Blocks new catalog readers/scheduler snapshots and drains workers that
+    /// already released the catalog lock while retaining graph lifetime pins.
+    /// Keep this lease until replay, sync and durable publication complete.
+    pub const GraphArtifactRebuildLease = struct {
+        manager: *IndexManager,
+
+        pub fn reset(self: *@This(), index_name: []const u8) !void {
+            const entry = self.manager.graphIndex(index_name) orelse return error.IndexNotFound;
+            try entry.index.resetForArtifactRebuild();
+            entry.index.reconcileOwnershipRange(self.manager.byte_range.start, self.manager.byte_range.end);
+        }
+
+        pub fn complete(self: *@This()) void {
+            self.manager.graph_artifact_rebuild_pending = false;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.manager.catalog_mutex.unlockExclusive();
+            self.* = undefined;
+        }
+    };
+
+    pub fn beginGraphArtifactRebuild(self: *IndexManager) GraphArtifactRebuildLease {
+        self.catalog_mutex.lockExclusive();
+        self.waitForGraphMetricSchedulePins();
+        self.graph_artifact_rebuild_pending = true;
+        return .{ .manager = self };
+    }
+
     pub fn resetGraphIndexForArtifactRebuild(self: *IndexManager, index_name: []const u8) !void {
-        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
-        const path = try self.activeIndexPath(index_name);
-        defer self.alloc.free(path);
-
-        var graph_cfg = try parseGraphConfig(self.alloc, entry.config.config_json);
-        defer graph_cfg.deinit(self.alloc);
-
-        const forward_path = try std.fmt.allocPrint(self.alloc, "{s}/forward", .{path});
-        defer self.alloc.free(forward_path);
-        const reverse_path = try std.fmt.allocPrint(self.alloc, "{s}/reverse", .{path});
-        defer self.alloc.free(reverse_path);
-        const zforward = try self.alloc.dupeZ(u8, forward_path);
-        defer self.alloc.free(zforward);
-        const zreverse = try self.alloc.dupeZ(u8, reverse_path);
-        defer self.alloc.free(zreverse);
-
-        entry.index.close();
-        deleteIndexDirIfPresent(path);
-
-        entry.index = try graph_mod.GraphIndex.openWithPrivateStores(self.alloc, zforward, zreverse, entry.config.name, .{
-            .managed_ownership_range = true,
-            .no_sync = self.relaxed_split_durability,
-            .no_meta_sync = self.relaxed_split_durability,
-            .reverse_backend = self.graph_reverse_backend,
-            .reverse_lsm_storage = self.effectiveGraphStorage(),
-            .reverse_lsm_cache = self.lsm_cache,
-            .reverse_lsm_options = self.graph_reverse_lsm_options,
-            .reverse_lsm_root_generation = self.lsm_root_generation,
-            .edge_type_configs = entry.edge_type_configs,
-            .rebuild_root_path = path,
-            .rebuild_owner_generation = coverageGenerationForConfig(entry.config),
-            .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
-        });
-        entry.index.reconcileOwnershipRange(self.byte_range.start, self.byte_range.end);
+        var lease = self.beginGraphArtifactRebuild();
+        defer lease.deinit();
+        try lease.reset(index_name);
+        lease.complete();
     }
 
     pub fn resetFullTextIndexForArtifactRebuild(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8) !u64 {
@@ -8076,6 +8112,10 @@ pub const IndexManager = struct {
         for (self.algebraic_indexes.items) |*entry| try entry.index.sync(force);
     }
 
+    pub fn syncGraphIndexes(self: *IndexManager, force: bool) !void {
+        for (self.graph_indexes.items) |*entry| try entry.index.sync(force);
+    }
+
     pub fn nativeBackupBackendId(self: *IndexManager, name: []const u8, kind: types.IndexKind) []const u8 {
         return switch (kind) {
             .full_text => @tagName(self.text_main_backend),
@@ -9522,6 +9562,13 @@ pub const IndexManager = struct {
     fn graphMetricWorkerSnapshotAlloc(self: *IndexManager) !GraphMetricWorkerSnapshot {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
+        if (self.graph_artifact_rebuild_pending) {
+            const entries = try self.alloc.alloc(GraphMetricWorkerSnapshotEntry, 0);
+            errdefer self.alloc.free(entries);
+            const names = try self.alloc.alloc(u8, 0);
+            _ = self.graph_metric_schedule_pins.fetchAdd(1, .acq_rel);
+            return .{ .manager = self, .entries = entries, .names = names };
+        }
         const metric_count = self.graphMetricScheduleEntryCount();
         const entry_count = metric_count + self.graph_indexes.items.len;
         const entries = try self.alloc.alloc(GraphMetricWorkerSnapshotEntry, entry_count);
@@ -9803,6 +9850,9 @@ pub const IndexManager = struct {
         self: *IndexManager,
         options: GraphMetricDegreeCanaryOptions,
     ) !GraphMetricDegreeCanaryDecision {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        if (self.graph_artifact_rebuild_pending) return .{};
         var decision = GraphMetricDegreeCanaryDecision{
             .max_control_records = options.max_control_records,
         };
@@ -9847,6 +9897,7 @@ pub const IndexManager = struct {
     ) !GraphMetricPlannedAutoIdleDecision {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
+        if (self.graph_artifact_rebuild_pending) return .{};
         var decision = GraphMetricPlannedAutoIdleDecision{};
         for (self.graph_indexes.items) |*entry| {
             const index_active_builds = try graphMetricIndexActiveBuilds(entry);
@@ -9962,6 +10013,7 @@ pub const IndexManager = struct {
     ) !GraphMetricPlannedSchedulerSweepResult {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
+        if (self.graph_artifact_rebuild_pending) return .{};
         return try self.runGraphMetricPlannedCoordinatorSweepUnlocked(options);
     }
 
@@ -11246,6 +11298,7 @@ pub const IndexManager = struct {
 
     pub fn setIo(self: *IndexManager, io: ?std.Io) void {
         self.io = io;
+        self.graph_primary_publication.io = io;
         for (self.text_indexes.items) |*entry| {
             entry.io = self.checkpointIo();
             entry.persistent.io = io;
@@ -15261,6 +15314,13 @@ pub const IndexManager = struct {
         return false;
     }
 
+    pub fn graphOwnershipCleanupPending(self: *const IndexManager) bool {
+        for (self.graph_indexes.items) |*entry| {
+            if (entry.index.ownershipCleanupPending()) return true;
+        }
+        return false;
+    }
+
     pub fn textChunkName(self: *const IndexManager, name: []const u8) ?[]const u8 {
         for (self.text_indexes.items) |*entry| {
             if (std.mem.eql(u8, entry.config.name, name)) return entry.chunk_name;
@@ -18069,6 +18129,15 @@ pub const IndexManager = struct {
         }
     }
 
+    /// Split retirement runs before the owner's primary artifact leaves this
+    /// shard. Its TTL snapshot must be withdrawn explicitly: ordinary deletes
+    /// re-read that artifact to reconcile concurrent contender updates.
+    pub fn retireSplitGraphOwners(self: *IndexManager, deletes: []const types.GraphEdgeDelete) !void {
+        for (self.graph_indexes.items) |*entry| {
+            try self.applyGraphMutationsEntryMode(entry, &.{}, deletes, .retire_owner);
+        }
+    }
+
     pub fn applyGraphMutations(self: *IndexManager, writes: []const types.GraphEdgeWrite, deletes: []const types.GraphEdgeDelete) !void {
         if (writes.len == 0 and deletes.len == 0) return;
 
@@ -20851,6 +20920,7 @@ pub const IndexManager = struct {
                     .rebuild_root_path = path,
                     .rebuild_owner_generation = coverageGenerationForConfig(cfg),
                     .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
+                    .ttl_duration_ns = graph_cfg.ttl_duration_ns,
                 });
                 var index_moved = false;
                 errdefer if (!index_moved) index.close();
@@ -20866,6 +20936,7 @@ pub const IndexManager = struct {
                     .metric_configs = graph_cfg.metric_configs,
                     .artifact_sources = graph_cfg.artifact_sources,
                     .max_edges_per_document = graph_cfg.max_edges_per_document,
+                    .ttl_duration_ns = graph_cfg.ttl_duration_ns,
                     .rebuild_root_path = try self.alloc.dupe(u8, path),
                     .index = index,
                 };
@@ -20904,6 +20975,13 @@ pub const IndexManager = struct {
                         resume_from,
                     );
                     backfill_ns += elapsedSince(backfill_started_ns);
+                }
+
+                if (graphEntryHasContributors(&entry) and !try entry.index.contributionOrderingReady()) {
+                    if (read_only) return error.GraphContributorMigrationRequired;
+                    const ordering_started_ns = nowNs();
+                    try self.backfillGraphContributorOrdering(self.primary_store orelse return error.MissingPrimaryStore, &entry);
+                    backfill_ns += elapsedSince(ordering_started_ns);
                 }
 
                 if (openProfileEnabled()) {
@@ -24633,7 +24711,7 @@ pub const IndexManager = struct {
         }
 
         for (keys) |key| {
-            const edges = try entry.index.getEdges(self.alloc, key, "", .both);
+            const edges = try entry.index.getPhysicalEdgesForDeletion(self.alloc, key, "", .both);
             defer graph_mod.GraphIndex.freeEdges(self.alloc, edges);
 
             for (edges) |edge| {
@@ -24641,6 +24719,7 @@ pub const IndexManager = struct {
                     .source = try self.alloc.dupe(u8, edge.source),
                     .target = try self.alloc.dupe(u8, edge.target),
                     .edge_type = try self.alloc.dupe(u8, edge.edge_type),
+                    .clear_all_private_state = true,
                 });
             }
         }
@@ -24661,6 +24740,129 @@ pub const IndexManager = struct {
         entry: *GraphIndex,
         writes: []const types.GraphEdgeWrite,
         deletes: []const types.GraphEdgeDelete,
+    ) !void {
+        return self.applyGraphMutationsEntryMode(entry, writes, deletes, .reconcile);
+    }
+
+    const GraphSnapshotMode = enum { reconcile, retire_owner };
+
+    fn graphEntryHasContributors(entry: *const GraphIndex) bool {
+        if (entry.artifact_sources.len != 0) return true;
+        for (entry.edge_type_configs) |edge_type| {
+            if (edge_type.field_name != null) return true;
+        }
+        return false;
+    }
+
+    /// Older non-TTL projections did not retain contributor order. Populate
+    /// it before publishing the opened index, using bounded per-artifact
+    /// scratch space. Interrupted opens repeat this idempotent scan; the
+    /// completion marker never precedes durable contributor snapshots.
+    fn backfillGraphContributorOrdering(self: *IndexManager, primary: *docstore_mod.DocStore, entry: *GraphIndex) !void {
+        const State = struct {
+            manager: *IndexManager,
+            primary: *docstore_mod.DocStore,
+            entry: *GraphIndex,
+
+            fn visit(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                if (!internal_keys.isGraphEdgeArtifactKey(key)) return .@"continue";
+                var scratch = std.heap.ArenaAllocator.init(state.manager.alloc);
+                defer scratch.deinit();
+                const alloc = scratch.allocator();
+                const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, key)) orelse return .@"continue";
+                if (!std.mem.eql(u8, parsed.index_name, state.entry.config.name) or
+                    !state.manager.keyInRange(parsed.doc_key)) return .@"continue";
+                const edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, value);
+                if (edge.generation != state.entry.config.coverage_generation) return .@"continue";
+                try migrateLegacyDirectGraphContribution(alloc, state.primary, state.entry, parsed.doc_key, key, value);
+                var snapshots = std.ArrayListUnmanaged(graph_mod.ContributionSnapshot).empty;
+                try appendGraphContributionSnapshot(
+                    alloc,
+                    state.primary,
+                    state.entry,
+                    parsed.source_node orelse parsed.doc_key,
+                    parsed.edge_type,
+                    parsed.target_doc_key,
+                    parsed.doc_key,
+                    &snapshots,
+                );
+                try state.entry.index.replaceContributionSnapshots(snapshots.items);
+                return .@"continue";
+            }
+        };
+        var state = State{ .manager = self, .primary = primary, .entry = entry };
+        try primary.scanWithContext("", "", .{}, &state, State.visit);
+        // Recovered contributors are primary state, not disposable projection
+        // metadata. They must survive before publishing migration completion.
+        try primary.sync(true);
+        try entry.index.publishContributionOrderingReady();
+    }
+
+    fn migrateLegacyDirectGraphContribution(
+        alloc: Allocator,
+        primary: *docstore_mod.DocStore,
+        entry: *GraphIndex,
+        owner: []const u8,
+        artifact_key: []const u8,
+        artifact: []const u8,
+    ) !void {
+        if (entry.ttl_duration_ns != 0 or entry.artifact_sources.len == 0) return;
+        const generation = entry.config.coverage_generation;
+        const prefix = try internal_keys.graphGlobalEdgeContenderEdgePrefixAlloc(alloc, entry.config.name, generation, artifact_key);
+        const rows = try primary.scanPrefix(alloc, prefix);
+        const projected = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, artifact);
+        var matches_source = false;
+        for (rows) |row| {
+            const contender = (try graph_edge_contender.decode(row.value, generation)) orelse return error.InvalidGraphEdgeContender;
+            const expected = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, entry.config.name, generation, artifact_key, contender.source_priority, contender.state_key);
+            if (!std.mem.eql(u8, expected, row.key) or !std.mem.eql(u8, contender.edge_key, artifact_key)) return error.InvalidGraphEdgeContender;
+            if (contender.source_priority == graph_mod.direct_source_priority) return;
+            const source = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, contender.payload);
+            if (source.generation != generation) return error.InvalidGraphEdgeContender;
+            if (projected.weight == source.weight and projected.created_at == source.created_at and
+                projected.updated_at == source.updated_at and projected.ttl_created_ns == source.ttl_created_ns and
+                std.mem.eql(u8, projected.metadata_json, source.metadata_json)) matches_source = true;
+        }
+        // Legacy writes recorded no direct provenance. A visible artifact
+        // unexplained by any source is retained as an independent direct
+        // contributor. Matching source payloads retain their source identity.
+        if (matches_source) return;
+        const state_key = try internal_keys.graphDirectStateKeyAlloc(alloc, owner, entry.config.name);
+        const local_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, owner, entry.config.name, artifact_key, state_key);
+        const global_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, entry.config.name, generation, artifact_key, @intCast(graph_mod.direct_source_priority), state_key);
+        const local_value = try graph_edge_contender.encodeAlloc(alloc, generation, @intCast(graph_mod.direct_source_priority), artifact_key, state_key, "");
+        const global_value = try graph_edge_contender.encodeAlloc(alloc, generation, @intCast(graph_mod.direct_source_priority), artifact_key, state_key, artifact);
+        const local_prefix = try internal_keys.graphEdgeContenderEdgePrefixAlloc(alloc, owner, entry.config.name, artifact_key);
+        const local_rows = try primary.scanPrefix(alloc, local_prefix);
+        var existing_member = false;
+        for (local_rows) |row| {
+            if ((try graph_edge_contender.decode(row.value, generation)) != null) existing_member = true;
+        }
+        const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, owner, entry.config.name);
+        const count_raw = primary.get(alloc, count_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const visible_count = if (count_raw) |raw| (try graph_edge_contender.decodeVisibleCount(raw, generation)) orelse 0 else 0;
+        if (existing_member and visible_count == 0) return error.InvalidGraphEdgeContenderCount;
+        const next_count = if (existing_member) visible_count else try std.math.add(usize, visible_count, 1);
+        const count_value = try graph_edge_contender.encodeVisibleCount(generation, next_count);
+        // Membership, payload, and cardinality commit together. Repeating an
+        // interrupted migration observes the direct contender and is a no-op.
+        try primary.putBatch(&.{
+            .{ .key = local_key, .value = local_value },
+            .{ .key = global_key, .value = global_value },
+            .{ .key = count_key, .value = &count_value },
+        }, &.{});
+    }
+
+    fn applyGraphMutationsEntryMode(
+        self: *IndexManager,
+        entry: *GraphIndex,
+        writes: []const types.GraphEdgeWrite,
+        deletes: []const types.GraphEdgeDelete,
+        snapshot_mode: GraphSnapshotMode,
     ) !void {
         var batch_writes = std.ArrayListUnmanaged(graph_mod.BatchWrite).empty;
         defer batch_writes.deinit(self.alloc);
@@ -24683,6 +24885,7 @@ pub const IndexManager = struct {
                 .weight = write.weight,
                 .created_at = write.created_at,
                 .updated_at = write.updated_at,
+                .ttl_created_ns = write.ttl_created_ns,
                 .metadata_json = write.metadata_json,
                 .owner = write.owner,
             });
@@ -24697,10 +24900,96 @@ pub const IndexManager = struct {
                 .target = delete.target,
                 .edge_type = delete.edge_type,
                 .owner = delete.owner,
+                .preserve_if_member = snapshot_mode == .retire_owner and delete.owner.len == 0,
             });
         }
 
         try entry.index.batchApply(batch_writes.items, batch_deletes.items);
+        if (entry.ttl_duration_ns != 0 or graphEntryHasContributors(entry)) {
+            const primary = self.primary_store orelse return error.MissingPrimaryStore;
+            var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var snapshots = std.ArrayListUnmanaged(graph_mod.ContributionSnapshot).empty;
+            for (batch_writes.items) |write| {
+                try appendGraphContributionSnapshot(arena, primary, entry, write.source, write.edge_type, write.target, write.owner, &snapshots);
+            }
+            for (batch_deletes.items) |delete| {
+                if (snapshot_mode == .retire_owner) {
+                    try snapshots.append(arena, .{
+                        .source = delete.source,
+                        .target = delete.target,
+                        .edge_type = delete.edge_type,
+                        .owner = if (delete.owner.len > 0) delete.owner else delete.source,
+                        .contributions = &.{},
+                    });
+                } else {
+                    try appendGraphContributionSnapshot(arena, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, &snapshots);
+                }
+            }
+            try entry.index.replaceContributionSnapshots(snapshots.items);
+        }
+    }
+
+    fn appendGraphContributionSnapshot(
+        alloc: Allocator,
+        primary: *docstore_mod.DocStore,
+        entry: *GraphIndex,
+        source: []const u8,
+        edge_type: []const u8,
+        target: []const u8,
+        owner: []const u8,
+        snapshots: *std.ArrayListUnmanaged(graph_mod.ContributionSnapshot),
+    ) !void {
+        const artifact_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, if (owner.len > 0) owner else source, entry.config.name, edge_type, target, source);
+        const raw = primary.get(alloc, artifact_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        var contributors = std.ArrayListUnmanaged(graph_mod.EdgeContribution).empty;
+        if (raw) |artifact| {
+            const prefix = try internal_keys.graphGlobalEdgeContenderEdgePrefixAlloc(alloc, entry.config.name, entry.config.coverage_generation, artifact_key);
+            const rows = try primary.scanPrefix(alloc, prefix);
+            if (rows.len > 0) {
+                for (rows) |row| {
+                    const contender = (try graph_edge_contender.decode(row.value, entry.config.coverage_generation)) orelse continue;
+                    if (!std.mem.eql(u8, contender.edge_key, artifact_key)) return error.InvalidGraphEdgeContender;
+                    const edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, contender.payload);
+                    if (edge.generation != entry.config.coverage_generation) return error.InvalidGraphEdgeContender;
+                    if (entry.ttl_duration_ns != 0 and edge.ttl_created_ns == 0) return error.GraphEdgeTtlMigrationRequired;
+                    try contributors.append(alloc, .{
+                        .state_key = try alloc.dupe(u8, contender.state_key),
+                        .source_priority = @intCast(contender.source_priority),
+                        .weight = edge.weight,
+                        .created_at = edge.created_at,
+                        .updated_at = edge.updated_at,
+                        .ttl_created_ns = edge.ttl_created_ns,
+                        .metadata_json = edge.metadata_json,
+                    });
+                }
+            } else {
+                const edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, artifact);
+                if (edge.generation == entry.config.coverage_generation) {
+                    if (entry.ttl_duration_ns != 0 and edge.ttl_created_ns == 0) return error.GraphEdgeTtlMigrationRequired;
+                    try contributors.append(alloc, .{
+                        .state_key = "",
+                        .source_priority = std.math.maxInt(u64),
+                        .weight = edge.weight,
+                        .created_at = edge.created_at,
+                        .updated_at = edge.updated_at,
+                        .ttl_created_ns = edge.ttl_created_ns,
+                        .metadata_json = edge.metadata_json,
+                    });
+                }
+            }
+        }
+        try snapshots.append(alloc, .{
+            .source = source,
+            .edge_type = edge_type,
+            .target = target,
+            .owner = if (owner.len > 0) owner else source,
+            .contributions = try contributors.toOwnedSlice(alloc),
+        });
     }
 
     fn applyDenseEmbeddingWritesEntry(
@@ -30015,6 +30304,7 @@ pub const GraphArtifactSource = struct {
 const GraphConfig = struct {
     edge_type_configs: []graph_mod.EdgeTypeConfig,
     metric_configs: []graph_mod.GraphMetricConfig,
+    ttl_duration_ns: u64 = 0,
     artifact_sources: []GraphArtifactSource = &.{},
     shorthand_asset: ?enrichment_catalog.EnrichmentConfig = null,
     max_edges_per_document: u32 = 0,
@@ -31207,6 +31497,19 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
+    if (root.object.get("ttl") != null and root.object.get("ttl_duration") != null)
+        return error.InvalidIndexConfig;
+    const ttl_duration_ns: u64 = if (root.object.get("ttl")) |ttl| blk: {
+        if (ttl != .object or ttl.object.count() != 1) return error.InvalidIndexConfig;
+        const duration = ttl.object.get("duration") orelse return error.InvalidIndexConfig;
+        if (duration != .string) return error.InvalidIndexConfig;
+        break :blk schema_api.parseTtlDurationNs(duration.string) catch return error.InvalidIndexConfig;
+    } else if (root.object.get("ttl_duration")) |duration| blk: {
+        if (duration != .string) return error.InvalidIndexConfig;
+        break :blk schema_api.parseTtlDurationNs(duration.string) catch return error.InvalidIndexConfig;
+    } else 0;
+    if (ttl_duration_ns == 0 and (root.object.get("ttl") != null or root.object.get("ttl_duration") != null))
+        return error.InvalidIndexConfig;
     if (root.object.get("execution") != null) return error.InvalidIndexConfig;
     if (root.object.get("nodes") != null or root.object.get("edge") != null or root.object.get("context") != null)
         return error.InvalidIndexConfig;
@@ -31246,6 +31549,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
         return .{
             .edge_type_configs = try alloc.alloc(graph_mod.EdgeTypeConfig, 0),
             .metric_configs = metric_configs,
+            .ttl_duration_ns = ttl_duration_ns,
             .artifact_sources = artifact_sources,
             .shorthand_asset = shorthand_asset,
             .max_edges_per_document = max_edges_per_document,
@@ -31300,6 +31604,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     return .{
         .edge_type_configs = configs,
         .metric_configs = metric_configs,
+        .ttl_duration_ns = ttl_duration_ns,
         .artifact_sources = artifact_sources,
         .shorthand_asset = shorthand_asset,
         .max_edges_per_document = max_edges_per_document,
@@ -31732,6 +32037,18 @@ test "graph config declares algebraic provenance semiring traversal law" {
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"algebraic_planning":{"bounded_traversal":{"law":"min_plus_semiring"}}}
     ));
+}
+
+test "graph config parses edge ttl with document duration syntax" {
+    const alloc = std.testing.allocator;
+    var canonical = try parseGraphConfig(alloc, "{\"ttl\":{\"duration\":\"1h30m\"}}");
+    defer canonical.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 90 * 60 * std.time.ns_per_s), canonical.ttl_duration_ns);
+    var alias = try parseGraphConfig(alloc, "{\"ttl_duration\":\"7d\"}");
+    defer alias.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 7 * 24 * 60 * 60 * std.time.ns_per_s), alias.ttl_duration_ns);
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc, "{\"ttl\":{\"duration\":\"1s\"},\"ttl_duration\":\"1s\"}"));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc, "{\"ttl\":{\"duration\":\"0s\"}}"));
 }
 
 test "graph config bounds iterative metric work" {
@@ -44820,4 +45137,40 @@ test "detached posting input pins native references across source replacement an
     try std.testing.expect(prepared.input == null);
     const result = try manager.publishPreparedDensePostingRefresh(prepared);
     try std.testing.expectEqual(@as(usize, 0), result.repaired);
+}
+
+test "graph artifact rebuild lease drains scheduler pins and excludes new snapshots" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var manager = try IndexManager.init(std.testing.allocator, ".");
+    defer manager.deinit();
+    var snapshot = try manager.graphMetricWorkerSnapshotAlloc();
+    const Pending = struct {
+        manager: *IndexManager,
+        acquired: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        fn run(ctx: *@This()) void {
+            var lease = ctx.manager.beginGraphArtifactRebuild();
+            defer lease.deinit();
+            ctx.acquired.store(true, .release);
+            while (!ctx.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            lease.complete();
+        }
+    };
+    var pending = Pending{ .manager = &manager };
+    const thread = try std.Thread.spawn(.{}, Pending.run, .{&pending});
+    defer {
+        pending.release.store(true, .release);
+        thread.join();
+    }
+    // Once the writer owns the catalog it must still wait for this pin.
+    while (manager.catalog_mutex.tryLockShared()) {
+        manager.catalog_mutex.unlockShared();
+        @import("antfly_platform").time.yieldNow();
+    }
+    const acquired_while_pinned = pending.acquired.load(.acquire);
+    snapshot.deinit();
+    try std.testing.expect(!acquired_while_pinned);
+    while (!pending.acquired.load(.acquire)) @import("antfly_platform").time.yieldNow();
+    try std.testing.expect(!manager.catalog_mutex.tryLockShared());
+    pending.release.store(true, .release);
 }

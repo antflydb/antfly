@@ -52,6 +52,7 @@ comptime {
     // owner and restore-staging entry points.
     _ = storage_kernel_exports;
     exportInternal(&storage_kernel_exports.storageOwnerMergeArtifactsPage, "antfly_storage_owner_merge_artifacts_page");
+    exportInternal(&storage_kernel_exports.storageOwnerMergeCleanupKeysPage, "antfly_storage_owner_merge_cleanup_keys_page");
     exportInternal(&storage_kernel_exports.storageOwnerRelationalTransitionRead, "antfly_storage_owner_relational_transition_read");
     exportInternal(&storage_kernel_exports.storageOwnerHiddenRestoreJson, "antfly_storage_owner_hidden_restore_json");
     exportInternal(&storage_kernel_exports.storageOwnerRestoreControlJson, "antfly_storage_owner_restore_control_json");
