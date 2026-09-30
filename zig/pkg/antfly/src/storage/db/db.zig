@@ -47116,12 +47116,63 @@ pub const DB = struct {
         return null;
     }
 
+    /// Composed (fused/hybrid) search resolves filter_text/exclusion_text and
+    /// filter_query_json/exclusion_query_json exactly once, against a single
+    /// shared doc-number/ordinal space, before fanning out to the text/dense/
+    /// sparse arms (see `searchComposed`). Each per-arm search (searchTextQuery,
+    /// searchDense) already lifts these into applyStoredSearchPatternFilters'
+    /// parent-aware matcher for its OWN chunk-backed member/chunk-mode index,
+    /// but a single shared resolution can never be correct for more than one
+    /// doc-number space at once: whenever any arm in this composed request is
+    /// chunk-backed and returns member/chunk-level hits, the clauses must be
+    /// left unresolved here so each arm's own per-arm handling covers it
+    /// instead (issue #931 - fused/hybrid filter_query, exclusion_query, and
+    /// query.bool.filter/must_not).
+    fn composedRequestTouchesChunkBackedMemberModeArm(self: *DB, alloc: Allocator, req: types.SearchRequest) !bool {
+        if (req.return_mode != .member and req.return_mode != .chunk) return false;
+
+        if (req.full_text_queries.len > 0) {
+            for (req.full_text_queries) |named| {
+                if (try self.core.textIndexIsChunkBacked(alloc, named.index_name)) return true;
+            }
+        } else if (req.full_text != null or (!db_query_search.isDefaultMatchAll(req.query) and db_query_search.isTextQuery(req.query))) {
+            if (try self.core.textIndexIsChunkBacked(alloc, req.index_name)) return true;
+        }
+
+        if (req.dense_queries.len > 0) {
+            for (req.dense_queries) |named| {
+                if (self.core.denseIndex(named.index_name)) |entry| {
+                    if (entry.chunk_name != null) return true;
+                }
+            }
+        } else if (req.dense != null) {
+            if (self.core.denseIndex(req.index_name)) |entry| {
+                if (entry.chunk_name != null) return true;
+            }
+        }
+
+        if (req.sparse_queries.len > 0) {
+            for (req.sparse_queries) |named| {
+                if (self.core.sparseIndex(named.index_name)) |entry| {
+                    if (entry.chunk_name != null) return true;
+                }
+            }
+        } else if (req.sparse != null) {
+            if (self.core.sparseIndex(req.index_name)) |entry| {
+                if (entry.chunk_name != null) return true;
+            }
+        }
+
+        return false;
+    }
+
     fn resolveStructuredDocFilterForComposedCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
         req: types.SearchRequest,
     ) anyerror!?doc_set.ResolvedDocFilter {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (try self.composedRequestTouchesChunkBackedMemberModeArm(alloc, req)) return null;
         return try db_query_search.resolveStructuredDocFilterForComposedAlloc(alloc, req, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -47140,6 +47191,7 @@ pub const DB = struct {
         req: types.SearchRequest,
     ) anyerror!?db_query_search.ResolvedTextDocNumFilter {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (try self.composedRequestTouchesChunkBackedMemberModeArm(alloc, req)) return null;
         return try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, req, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -48198,26 +48250,39 @@ pub const DB = struct {
         var prove_ns: u64 = 0;
         var inner_ns: u64 = 0;
         const algebraic_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
+        // Chunk members are a separate vector member from their parent row
+        // and share only its ordinal, not its own fields. Resolving
+        // filter_query_json/exclusion_query_json (and filter_text/
+        // exclusion_text, i.e. query.bool.filter/must_not) against the
+        // algebraic/parent doc-number space here - same as against the
+        // chunk-backed index's own doc set - can never see a parent-only
+        // field: a positive clause would match nothing, a negative one would
+        // exclude nothing. Skip the algebraic resolution entirely for
+        // chunk-backed member/chunk-mode dense search (mirroring
+        // searchTextQuery's `suppress_text_doc_num_filter` gate) so the JSON
+        // filters survive unresolved into the lift step below, which folds
+        // them into applyStoredSearchPatternFilters' parent-aware matcher
+        // instead (issue #931).
+        const chunk_backed_for_filter = if (self.core.denseIndex(req.index_name)) |entry|
+            entry.chunk_name != null
+        else
+            false;
+        const member_mode_for_filter = req.return_mode == .member or req.return_mode == .chunk;
+        const suppress_dense_doc_num_filter = chunk_backed_for_filter and member_mode_for_filter;
+        var algebraic_filter = if (suppress_dense_doc_num_filter)
+            AlgebraicDocFilterRequest{ .req = req }
+        else
+            try self.searchRequestWithAlgebraicDocFilterAlloc(req);
         defer algebraic_filter.deinit();
         if (bench_profile) algebraic_ns = platform_time.monotonicNs() - algebraic_start_ns;
-        // Chunk members are a separate vector member from their parent row
-        // and share only its ordinal, not its own fields. query.bool.filter/
-        // must_not (filter_text/exclusion_text) resolve against the
-        // chunk-backed index's own doc set the same way filter_query/
-        // exclusion_query would without the parent-aware path built for the
-        // text arm: lift the representable clauses into filter_query_json/
-        // exclusion_query_json so the same parent-aware matcher covers this
-        // arm too (issue #931).
+        // query.bool.filter/must_not (filter_text/exclusion_text) resolve the
+        // same wrong way via native TextQuery resolution; lift the
+        // representable clauses into filter_query_json/exclusion_query_json
+        // so the same parent-aware matcher covers this arm too (issue #931).
         var lifted_dense_bool_filter = ChunkBoolFilterLowering{};
         defer lifted_dense_bool_filter.deinit(alloc);
         {
-            const chunk_backed_for_filter = if (self.core.denseIndex(algebraic_filter.req.index_name)) |entry|
-                entry.chunk_name != null
-            else
-                false;
-            const member_mode_for_filter = algebraic_filter.req.return_mode == .member or algebraic_filter.req.return_mode == .chunk;
-            if (chunk_backed_for_filter and member_mode_for_filter) {
+            if (suppress_dense_doc_num_filter) {
                 algebraic_filter.req.resolved_doc_filter = null;
                 lifted_dense_bool_filter = try liftChunkBoolFilterClausesAlloc(
                     alloc,
@@ -48317,8 +48382,37 @@ pub const DB = struct {
     fn searchDenseProfiledAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         var identity_prefix_filter = try self.searchRequestWithIdentityPrefixFilterAlloc(req);
         defer identity_prefix_filter.deinit();
-        var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(identity_prefix_filter.req);
+        // See searchDense: the algebraic resolver would resolve filter_query_json/
+        // exclusion_query_json/filter_text/exclusion_text against the parent
+        // doc-number space, which never matches a chunk-backed member/chunk-mode
+        // dense index's own doc set (issue #931).
+        const chunk_backed_for_filter = if (self.core.denseIndex(identity_prefix_filter.req.index_name)) |entry|
+            entry.chunk_name != null
+        else
+            false;
+        const member_mode_for_filter = identity_prefix_filter.req.return_mode == .member or identity_prefix_filter.req.return_mode == .chunk;
+        const suppress_dense_doc_num_filter = chunk_backed_for_filter and member_mode_for_filter;
+        var algebraic_filter = if (suppress_dense_doc_num_filter)
+            AlgebraicDocFilterRequest{ .req = identity_prefix_filter.req }
+        else
+            try self.searchRequestWithAlgebraicDocFilterAlloc(identity_prefix_filter.req);
         defer algebraic_filter.deinit();
+        var lifted_dense_bool_filter = ChunkBoolFilterLowering{};
+        defer lifted_dense_bool_filter.deinit(alloc);
+        if (suppress_dense_doc_num_filter) {
+            algebraic_filter.req.resolved_doc_filter = null;
+            lifted_dense_bool_filter = try liftChunkBoolFilterClausesAlloc(
+                alloc,
+                algebraic_filter.req.filter_text,
+                algebraic_filter.req.exclusion_text,
+                algebraic_filter.req.filter_query_json,
+                algebraic_filter.req.exclusion_query_json,
+            );
+            if (lifted_dense_bool_filter.filter_query_json) |json| algebraic_filter.req.filter_query_json = json;
+            if (lifted_dense_bool_filter.exclusion_query_json) |json| algebraic_filter.req.exclusion_query_json = json;
+            algebraic_filter.req.filter_text = null;
+            algebraic_filter.req.exclusion_text = null;
+        }
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
         const profiled = db_query_search.searchDenseProfiled(alloc, algebraic_filter.req, dense, .{
             .ctx = self,
