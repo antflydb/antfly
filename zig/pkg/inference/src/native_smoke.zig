@@ -196,7 +196,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     budget_limits = try applyBudgetOverrides(budget_limits, opts);
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
-        .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config },
+        .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config, .workspace_capacity = model.session.generationWorkspaceCapacity() },
     };
     const scheduler_prefill_ceiling = if (native_generate_lease) |lease|
         lease.prefill_chunk_size

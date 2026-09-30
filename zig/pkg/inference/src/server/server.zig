@@ -5385,6 +5385,7 @@ pub const Node = struct {
                 .kv_dtype = kv_dtype,
                 .config = gpt_config,
                 .kv_capacity_policy = kv_capacity_policy,
+                .workspace_capacity = model.session.generationWorkspaceCapacity(),
             },
         };
         const direct_prefill_ceiling = @min(
@@ -5431,11 +5432,14 @@ pub const Node = struct {
                 ),
             );
         }
-        var admission_lease = try self.model_manager.acquireRunResourceAmounts(
-            budget_backend_class,
-            budget_limits,
-            admission_amounts,
-        );
+        var admission_lease = try self.model_manager.acquireGenerationResources(&.{.{
+            .session = model.session,
+            .resources = .{
+                .backend_class = budget_backend_class,
+                .limits = budget_limits,
+                .amounts = admission_amounts,
+            },
+        }});
         defer admission_lease.release();
 
         const execution_mode = batchExecutionMode(backend_kind);
@@ -12513,6 +12517,7 @@ pub const Node = struct {
             .kv_dtype = kv_dtype,
             .config = gpt_config,
             .kv_capacity_policy = target_kv_capacity_policy,
+            .workspace_capacity = model.session.generationWorkspaceCapacity(),
         };
         var budget_component_count: usize = 1;
         if (draft_model_for_generation != null) {
@@ -12520,6 +12525,7 @@ pub const Node = struct {
                 .backend = draft_backend_kind.?,
                 .kv_dtype = draft_kv_dtype.?,
                 .config = draft_gpt_config.?,
+                .workspace_capacity = draft_model_for_generation.?.session.generationWorkspaceCapacity(),
             };
             budget_component_count = 2;
         }
@@ -12630,14 +12636,17 @@ pub const Node = struct {
                 self.defaultGenerationLimits(target_backend_class),
             ),
         );
-        var admission_requests: [2]runtime.tier.memory.AdmissionRequest = undefined;
+        var admission_requests: [2]model_manager_mod.GenerationAdmissionRequest = undefined;
         admission_requests[0] = .{
-            .backend_class = target_backend_class,
-            .limits = target_admission_limits,
-            .amounts = .fromEstimate(resource_estimate),
+            .session = model.session,
+            .resources = .{
+                .backend_class = target_backend_class,
+                .limits = target_admission_limits,
+                .amounts = .fromEstimate(resource_estimate),
+            },
         };
         if (generation.messagesHaveImages(messages.items) or generation.messagesHaveAudio(messages.items)) {
-            admission_requests[0].amounts = try admission_requests[0].amounts.merge(
+            admission_requests[0].resources.amounts = try admission_requests[0].resources.amounts.merge(
                 try model_manager_mod.projectorRunAdmissionAmounts(
                     model.manifest,
                     backend_kind,
@@ -12649,18 +12658,21 @@ pub const Node = struct {
             const draft_backend_class: runtime.tier.memory.BackendClass =
                 if (draft_backend_kind.? == .native) .cpu else .gpu;
             admission_requests[1] = .{
-                .backend_class = draft_backend_class,
-                .limits = self.config.generation_budget_overrides.apply(
-                    session_factory.widenBudgetLimitsForSession(
-                        draft_model_for_generation.?.session,
-                        self.defaultGenerationLimits(draft_backend_class),
+                .session = draft_model_for_generation.?.session,
+                .resources = .{
+                    .backend_class = draft_backend_class,
+                    .limits = self.config.generation_budget_overrides.apply(
+                        session_factory.widenBudgetLimitsForSession(
+                            draft_model_for_generation.?.session,
+                            self.defaultGenerationLimits(draft_backend_class),
+                        ),
                     ),
-                ),
-                .amounts = .fromEstimate(estimate),
+                    .amounts = .fromEstimate(estimate),
+                },
             };
             break :blk 2;
         } else 1;
-        var admission_lease = self.model_manager.acquireRunResourceEstimates(
+        var admission_lease = self.model_manager.acquireGenerationResources(
             admission_requests[0..admission_request_count],
         ) catch |err| {
             if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
@@ -13790,7 +13802,7 @@ pub const Node = struct {
     };
 
     const BatchAdmission = struct {
-        lease: runtime.tier.memory.AdmissionLease,
+        lease: model_manager_mod.GenerationAdmissionLease,
         estimate: runtime.tier.memory.Estimate,
     };
 
@@ -13813,6 +13825,7 @@ pub const Node = struct {
 
     fn acquireBatchAdmission(
         self: *Node,
+        session: backends_mod.Session,
         backend_class: runtime.tier.memory.BackendClass,
         limits: runtime.tier.memory.Limits,
         run_budget: *runtime.tier.memory.RunBudget,
@@ -13821,11 +13834,14 @@ pub const Node = struct {
         try run_budget.reserveEstimate(estimate);
         errdefer run_budget.releaseEstimate(estimate);
         return .{
-            .lease = try self.model_manager.acquireRunResources(
-                backend_class,
-                limits,
-                estimate,
-            ),
+            .lease = try self.model_manager.acquireGenerationResources(&.{.{
+                .session = session,
+                .resources = .{
+                    .backend_class = backend_class,
+                    .limits = limits,
+                    .amounts = .fromEstimate(estimate),
+                },
+            }}),
             .estimate = estimate,
         };
     }
@@ -14519,7 +14535,7 @@ pub const Node = struct {
                 }
                 var runnable_count: usize = 0;
                 const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
-                    .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config },
+                    .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config, .workspace_capacity = model.session.generationWorkspaceCapacity() },
                 };
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
@@ -14627,6 +14643,7 @@ pub const Node = struct {
                         continue;
                     }
                     admissions[pos] = self.acquireBatchAdmission(
+                        model.session,
                         budget_backend_class,
                         budget_limits,
                         &task_run_budgets[pos],
@@ -14667,6 +14684,7 @@ pub const Node = struct {
                         }
                         const estimate = combined orelse break;
                         shared_batch_admission = self.acquireBatchAdmission(
+                            model.session,
                             budget_backend_class,
                             budget_limits,
                             &shared_run_budget,
