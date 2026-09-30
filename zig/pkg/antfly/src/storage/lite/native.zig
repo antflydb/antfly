@@ -40,6 +40,34 @@ pub const magic = "AFLITE\x03P";
 const unpacked_v3_magic = "AFLITE\x03N";
 pub const format_version: u32 = 3;
 pub const default_page_size: u32 = 4096;
+
+test "lite reclamation catalog snapshots visit live indexes rather than history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "reclamation-catalog-scan.aflite");
+    defer alloc.free(path);
+    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    for (0..512) |revision| {
+        var value: [32]u8 = undefined;
+        try file.putCatalogRecord("key", try std.fmt.bufPrint(&value, "{d}", .{revision}));
+        try file.putIndexCatalogRecord("index", try std.fmt.bufPrint(&value, "{d}", .{revision}));
+    }
+    try file.putCatalogRecord("deleted", "gone");
+    try file.deleteCatalogRecord("deleted");
+    file.page_cache.clear(alloc);
+    file.test_page_reads.store(0, .monotonic);
+    const metadata = try file.snapshotCatalogRecordsAlloc(alloc);
+    defer NativeFile.freeSnapshotCatalogRecords(alloc, metadata);
+    const indexes = try file.snapshotIndexCatalogRecordsAlloc(alloc);
+    defer NativeFile.freeSnapshotCatalogRecords(alloc, indexes);
+    try std.testing.expectEqual(@as(usize, 1), metadata.len);
+    try std.testing.expectEqual(@as(usize, 1), indexes.len);
+    try std.testing.expectEqualStrings("511", metadata[0].value);
+    try std.testing.expectEqualStrings("511", indexes[0].value);
+    try std.testing.expect(file.test_page_reads.load(.monotonic) < 32);
+}
 pub const header_size: usize = 4096;
 pub const checkpoint_slot_count = 2;
 pub const checkpoint_slot_size: usize = 72;
@@ -706,14 +734,7 @@ const IndexEditor = struct {
     fn prepareRead(self: *IndexEditor, reference: u64) !void {
         const pages = self.streaming_pages orelse return;
         const page = physicalPage(reference);
-        // The free map is validated in strictly ascending order.
-        var low: usize = 0;
-        var high = pages.next_free_index;
-        while (low < high) {
-            const mid = low + (high - low) / 2;
-            if (pages.free_pages[mid] < page) low = mid + 1 else high = mid;
-        }
-        const reused = low < pages.next_free_index and pages.free_pages[low] == page;
+        const reused = pages.wasReused(page);
         if (page >= self.original_page_count or reused) {
             try pages.flush();
             self.checkpoint.page_count = pages.next_page_id;
@@ -1192,6 +1213,9 @@ const PageAllocator = struct {
         }
 
         const page_id = self.next_page_id;
+        if (self.file.max_file_bytes) |limit| {
+            if (page_id >= limit / self.file.header.page_size) return error.LiteStorageBudgetExceeded;
+        }
         self.next_page_id = try std.math.add(u64, self.next_page_id, 1);
         return page_id;
     }
@@ -1201,6 +1225,16 @@ const PageAllocator = struct {
     /// remain safe to advertise without re-walking every historical chain.
     fn remainingFreePages(self: *const PageAllocator) []const u64 {
         return self.free_pages[self.next_free_index..];
+    }
+
+    fn wasReused(self: *const PageAllocator, page: u64) bool {
+        var low: usize = 0;
+        var high = self.next_free_index;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (self.free_pages[mid] < page) low = mid + 1 else high = mid;
+        }
+        return low < self.next_free_index and self.free_pages[low] == page;
     }
 };
 
@@ -1964,6 +1998,10 @@ pub const NativeFile = struct {
     // An error after slot publication may leave disk ahead of header. Do not
     // elide a subsequent write based on the old in-memory checkpoint then.
     checkpoint_publication_uncertain: bool = false,
+    /// Owner admission budget. Reuse remains permitted at the file-size cap.
+    /// Null means unlimited; the owner subtracts retired/workspace capacity.
+    max_file_bytes: ?u64 = null,
+    vacuum_workspace_limit: ?u64 = null,
     page_cache_enabled: std.atomic.Value(bool) = .init(true),
     /// Maintenance readers and private images retain navigation pages only.
     page_cache_policy: enum { normal, metadata_only } = .normal,
@@ -3105,33 +3143,9 @@ pub const NativeFile = struct {
     }
 
     fn snapshotCatalogRecordsFromRootAlloc(self: *NativeFile, allocator: Allocator, root: CatalogRoot) ![]OwnedCatalogRecord {
-        try self.flushTransactionWrites();
-        var map = std.StringHashMapUnmanaged(?[]u8).empty;
-        defer {
-            var it = map.iterator();
-            while (it.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                if (entry.value_ptr.*) |value| allocator.free(value);
-            }
-            map.deinit(allocator);
-        }
-
-        var page_id = try self.catalogHistoryRoot(self.activeCheckpoint(), root);
-        while (page_id != 0) {
-            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .catalog);
-            defer allocator.free(payload);
-            const entry = try decodeCatalogEntry(payload);
-
-            if (!map.contains(entry.key)) {
-                const owned_key = try allocator.dupe(u8, entry.key);
-                errdefer allocator.free(owned_key);
-                const owned_value = if (entry.is_delete) null else try self.catalogEntryValueAlloc(allocator, entry);
-                errdefer if (owned_value) |value| allocator.free(value);
-                try map.put(allocator, owned_key, owned_value);
-            }
-            page_id = entry.previous_page;
-        }
-
+        const checkpoint = try self.materializeTransactionCheckpoint();
+        var cursor = try self.catalogCursor(checkpoint, root, "");
+        defer cursor.deinit();
         var records = std.ArrayListUnmanaged(OwnedCatalogRecord).empty;
         errdefer {
             for (records.items) |record| {
@@ -3140,21 +3154,11 @@ pub const NativeFile = struct {
             }
             records.deinit(allocator);
         }
-        var it = map.iterator();
-        while (it.next()) |entry| {
-            const stored_value = entry.value_ptr.* orelse continue;
-            const key = try allocator.dupe(u8, entry.key_ptr.*);
-            errdefer allocator.free(key);
-            const value = try allocator.dupe(u8, stored_value);
-            errdefer allocator.free(value);
-            try records.append(allocator, .{ .key = key, .value = value });
+        while (try cursor.nextRecordAlloc(allocator)) |record| {
+            errdefer allocator.free(record.key);
+            errdefer allocator.free(record.value);
+            try records.append(allocator, record);
         }
-
-        std.mem.sort(OwnedCatalogRecord, records.items, {}, struct {
-            fn lessThan(_: void, lhs: OwnedCatalogRecord, rhs: OwnedCatalogRecord) bool {
-                return std.mem.order(u8, lhs.key, rhs.key) == .lt;
-            }
-        }.lessThan);
 
         return try records.toOwnedSlice(allocator);
     }
@@ -4352,6 +4356,7 @@ pub const NativeFile = struct {
             .header = .{ .page_size = self.header.page_size },
             .no_sync = true,
             .page_cache_enabled = .init(false),
+            .max_file_bytes = self.vacuum_workspace_limit,
         };
         var pages = PageAllocator{ .file = &writer, .free_pages = &.{}, .next_page_id = next_page.* };
         var builder = ExtentAppender{ .file = &writer, .pages = &pages, .tail = undefined, .batch = .{ .file = &writer } };
@@ -4430,7 +4435,7 @@ pub const NativeFile = struct {
         defer cursor.deinit();
 
         const io = self.runtimeIo();
-        var writer = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(""), .file = compact_file, .header = self.header, .page_cache_enabled = .init(false) };
+        var writer = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(""), .file = compact_file, .header = self.header, .page_cache_enabled = .init(false), .max_file_bytes = self.vacuum_workspace_limit };
         var pages = PageAllocator{ .file = &writer, .free_pages = &.{}, .next_page_id = next_page_id.*, .pack_records = true };
         defer pages.deinit();
         var key_index = DocumentIndexBulkBuilder{ .owner = self, .file = compact_file, .next_page_id = &pages.next_page_id };
@@ -4473,7 +4478,7 @@ pub const NativeFile = struct {
         defer cursor.deinit();
 
         const io = self.runtimeIo();
-        var writer = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(""), .file = compact_file, .header = self.header, .page_cache_enabled = .init(false) };
+        var writer = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(""), .file = compact_file, .header = self.header, .page_cache_enabled = .init(false), .max_file_bytes = self.vacuum_workspace_limit };
         var pages = PageAllocator{ .file = &writer, .free_pages = &.{}, .next_page_id = next_page_id.*, .pack_records = true };
         defer pages.deinit();
         var document_index = DocumentIndexBulkBuilder{
@@ -4691,7 +4696,7 @@ pub const NativeFile = struct {
         live_record_count += document_count;
 
         if (document_count > 0) {
-            var writer = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(""), .file = compact_file, .header = self.header, .page_cache_enabled = .init(false) };
+            var writer = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(""), .file = compact_file, .header = self.header, .page_cache_enabled = .init(false), .max_file_bytes = self.vacuum_workspace_limit };
             var pages = PageAllocator{ .file = &writer, .free_pages = &.{}, .next_page_id = next_page_id, .pack_records = true };
             defer pages.deinit();
             namespace_directory_root_page = (try writer.writeNamespaceIndex(&pages, previous, .{ .history = 0 }, &namespace_directory)).page;
@@ -4699,6 +4704,9 @@ pub const NativeFile = struct {
             next_page_id = pages.next_page_id;
         }
 
+        if (self.vacuum_workspace_limit) |limit| {
+            if (next_page_id >= limit / self.header.page_size) return error.LiteStorageBudgetExceeded;
+        }
         free_map_root_page = try appendFreeMapPageToFile(self.allocator, compact_file, io, page_size, &next_page_id, next_page_id + 1, &.{});
 
         const checkpoint = CheckpointSlot{
@@ -4725,7 +4733,7 @@ pub const NativeFile = struct {
         if (!self.no_sync) try compact_file.sync(io);
         if (cancel) |token| try token.check();
         compact_file_open = false;
-        return .{ .prepared = .{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = tmp_path, .file = compact_file, .header = compact_header, .no_sync = self.no_sync, .page_cache_policy = .metadata_only, .page_cache = .{ .resource_manager = self.page_cache.resource_manager } }, .report = .{
+        return .{ .prepared = .{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = tmp_path, .file = compact_file, .header = compact_header, .no_sync = self.no_sync, .page_cache_policy = .metadata_only, .page_cache = .{ .resource_manager = self.page_cache.resource_manager }, .max_file_bytes = self.vacuum_workspace_limit }, .report = .{
             .before_size = before_size,
             .after_size = after_size,
             .reclaimed_bytes = if (before_size > after_size) before_size - after_size else 0,
@@ -5770,7 +5778,7 @@ pub const NativeFile = struct {
         try self.validateFreePagesSafeForCheckpointSlots(free_map.free_pages);
     }
 
-    const LiveStats = struct {
+    pub const LiveStats = struct {
         record_count: u64,
         bytes: u64,
         compact_size: u64,
@@ -5778,7 +5786,7 @@ pub const NativeFile = struct {
 
     /// Compact-layout accounting uses only record metadata and ordered keys.
     /// Integrity checking separately visits and validates all reachable payloads.
-    fn liveStats(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !LiveStats {
+    pub fn liveStats(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !LiveStats {
         var live_bytes: u64 = 0;
         var compact_pages: u64 = 2; // header and the vacuum's empty free map
         var record_count: u64 = 0;
@@ -6294,6 +6302,9 @@ const DocumentIndexBulkBuilder = struct {
     }
 
     fn appendNode(self: *DocumentIndexBulkBuilder, node: DocumentIndexNode) !u64 {
+        if (self.owner.vacuum_workspace_limit) |limit| {
+            if (self.next_page_id.* >= limit / self.owner.header.page_size) return error.LiteStorageBudgetExceeded;
+        }
         if (self.count_only) {
             const page = self.next_page_id.*;
             self.next_page_id.* += 1;

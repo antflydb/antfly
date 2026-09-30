@@ -40,6 +40,7 @@ pub const native = @import("native.zig");
 pub const CheckReport = native.CheckReport;
 pub const StableSnapshotReport = native.StableSnapshotReport;
 pub const VacuumReport = native.VacuumReport;
+pub const ReclamationOptions = docstore.reclamation.Options;
 
 pub const Profile = capabilities.Profile;
 pub const supported_inference_modes = capabilities.supported_inference_modes;
@@ -68,6 +69,7 @@ pub const EngineSelection = enum {
 };
 
 pub const OpenOptions = struct {
+    reclamation: docstore.reclamation.Options = .{},
     engine: EngineSelection = .auto,
     read_only: bool = false,
     no_sync: bool = false,
@@ -78,6 +80,7 @@ pub const OpenOptions = struct {
 };
 
 pub const CreateOptions = struct {
+    reclamation: docstore.reclamation.Options = .{},
     exclusive: bool = false,
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -90,6 +93,7 @@ pub fn isAflitePath(path: []const u8) bool {
 }
 
 pub const StorageStatus = struct {
+    reclamation: ?docstore.reclamation.Status = null,
     format: []const u8 = "aflite",
     engine: []const u8,
     primary_layout: []const u8,
@@ -198,6 +202,7 @@ pub const Handle = struct {
     pub fn openOrCreate(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
         return open(allocator, path, opts) catch |err| switch (err) {
             error.FileNotFound => createWithOptions(allocator, path, .{
+                .reclamation = opts.reclamation,
                 .exclusive = true,
                 .no_sync = opts.no_sync,
                 .resource_manager = opts.resource_manager,
@@ -488,11 +493,14 @@ pub const Handle = struct {
     }
 
     pub fn storageStatus(self: *Handle) StorageStatus {
+        if (self.native_docstore) |store| platform_sync.lockYielding(&store.mutex);
+        defer if (self.native_docstore) |store| store.mutex.unlock();
         return switch (self.engine) {
             .native_single_file => blk: {
                 const file = &self.native_docstore.?.file;
                 const checkpoint = file.activeCheckpoint();
                 break :blk .{
+                    .reclamation = self.native_docstore.?.reclamationStatusAssumeLocked() catch null,
                     .engine = @tagName(self.engine),
                     .primary_layout = "native_document_pages",
                     .replay_layout = "native_replay_lanes_in_document_catalog",
@@ -560,8 +568,6 @@ pub const Handle = struct {
 
     fn maintenanceStatus(ptr: *anyopaque) maintenance.Status {
         const self: *Handle = @ptrCast(@alignCast(ptr));
-        if (self.native_docstore) |store| platform_sync.lockYielding(&store.mutex);
-        defer if (self.native_docstore) |store| store.mutex.unlock();
         const status = self.storageStatus();
         return .{
             .engine = "lite",
@@ -671,6 +677,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
     };
 
     const initial_store = try docstore.Store.openWithOptions(allocator, path, .{
+        .reclamation = opts.reclamation,
         .read_only = opts.read_only,
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
@@ -693,6 +700,7 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
     };
 
     const initial_store = try docstore.Store.createWithOptions(allocator, path, .{
+        .reclamation = opts.reclamation,
         .exclusive = opts.exclusive,
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
