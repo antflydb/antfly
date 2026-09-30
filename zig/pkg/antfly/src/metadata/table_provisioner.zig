@@ -1610,7 +1610,18 @@ fn runtimeHasReadySchemaVersionIndex(
         std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version}) catch return false;
     if (target_full_text) {
         const target = findReadyRuntimeFullTextIndex(runtime.indexes, target_name) orelse return false;
-        if (target.doc_count != runtime.doc_identity.live_ordinals) return false;
+        // A chunk/artifact-sourced full-text index routes member documents
+        // (e.g. chunks) into the same index, so its doc_count is primary rows
+        // plus members and can never equal live_ordinals once a chunk
+        // enrichment targets it. The equality check historically existed only
+        // to reject a freshly-created or catalog-only placeholder index that
+        // looks idle before its own rebuild starts; findReadyRuntimeFullTextIndex
+        // above already requires backfill_active=false and replay caught up,
+        // which is the real proof that this incarnation's rebuild finished. A
+        // placeholder that has not started yet still reports doc_count=0 and
+        // is rejected by this bound; a 1:1 (no member documents) index still
+        // satisfies it at equality.
+        if (target.doc_count < runtime.doc_identity.live_ordinals) return false;
     } else {
         // An explicitly indexless relational table has no full-text rebuild
         // to wait for. Only a fresh owner observation of the exact applied
@@ -4357,6 +4368,54 @@ fn implementationTests() type {
             runtime.doc_identity.live_ordinals = 0;
             indexes[1].doc_count = 0;
             try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
+        }
+
+        test "table provisioner accepts chunk-inflated target full-text doc count" {
+            const range = table_manager.RangeRecord{ .group_id = 7, .table_id = 11, .start_key = "" };
+            var indexes = [_]table_manager.RuntimeIndexStatusReport{
+                .{
+                    .name = "full_text_index_v0",
+                    .kind = "full_text",
+                    .doc_count = 1000,
+                    .replay_applied_sequence = 7,
+                    .replay_target_sequence = 7,
+                },
+                .{
+                    // 1000 primary rows + 500 chunk members routed in by a chunk
+                    // enrichment with full_text_index: true.
+                    .name = "full_text_index_v1",
+                    .kind = "full_text",
+                    .doc_count = 1500,
+                    .replay_applied_sequence = 7,
+                    .replay_target_sequence = 7,
+                },
+            };
+            const runtime = table_manager.RuntimeGroupStatusReport{
+                .table_id = range.table_id,
+                .group_id = range.group_id,
+                .freshness = "fresh",
+                .doc_count = 1000,
+                .doc_identity = .{
+                    .namespace_table_id = range.table_id,
+                    .namespace_shard_id = range.group_id,
+                    .namespace_range_id = range.group_id,
+                    .next_ordinal = 1001,
+                    .allocated_ordinals = 1000,
+                    .live_ordinals = 1000,
+                },
+                .indexes = &indexes,
+            };
+
+            try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
+
+            // A rebuild still genuinely in progress (fewer full-text docs than
+            // primary identities) must still be rejected.
+            indexes[1].doc_count = 400;
+            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
+
+            // A brand-new placeholder index (nothing written yet) is still rejected.
+            indexes[1].doc_count = 0;
+            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
         }
 
         test "table provisioner indexless relational schema cutover requires exact fresh owner epoch" {
