@@ -40043,6 +40043,56 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "writer cache distinguishes borrowed publisher callbacks and synchronization" {
+            const contract = @import("../storage/db/ha_contract.zig");
+            const outbox = @import("../storage/db/durable_outbox.zig");
+            const Namespace = @import("../storage/db/doc_identity_namespace.zig").Namespace;
+            const Stub = struct {
+                fn next(_: *anyopaque) u64 {
+                    return 0;
+                }
+                fn identity(_: *anyopaque) contract.Publisher.Identity {
+                    return .{ .table_id = 0, .shard_id = 0, .timeline_id = 0, .epoch = 0 };
+                }
+                fn publish(_: contract.AsyncEffectMirror, _: outbox.Kind, _: []const u8, _: Namespace) !u64 {
+                    return error.UnexpectedPublication;
+                }
+                fn recover(_: contract.AsyncEffectMirror, _: outbox.Kind, _: outbox.DurableHAOutbox, _: Namespace) !u64 {
+                    return error.UnexpectedRecovery;
+                }
+                fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {
+                    return error.UnexpectedAdmission;
+                }
+                fn complete(_: contract.AsyncEffectMirror, _: u64) !void {
+                    return error.UnexpectedCompletion;
+                }
+                fn allow(_: *const anyopaque) !void {}
+                fn reject(_: *const anyopaque) !void {
+                    return error.HAFencedPrimary;
+                }
+                const vtable: contract.Publisher.VTable = .{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete };
+            };
+            var context: u8 = 0;
+            var mirror: contract.AsyncEffectMirror = .{ .publisher = .{ .ptr = &context, .vtable = &Stub.vtable } };
+            const original = mirror;
+            try std.testing.expect(ProvisionedTableWriteCache.haAsyncMirrorsEqual(original, mirror));
+            var transition: std.atomic.Mutex = .unlocked;
+            mirror.transition_mutex = &transition;
+            try std.testing.expect(!ProvisionedTableWriteCache.haAsyncMirrorsEqual(original, mirror));
+            mirror = original;
+            var barrier: ha_mutation_barrier_mod.MutationBarrier = .{};
+            mirror.mutation_barrier = &barrier;
+            try std.testing.expect(!ProvisionedTableWriteCache.haAsyncMirrorsEqual(original, mirror));
+            mirror = original;
+            var alternate_vtable = Stub.vtable;
+            mirror.publisher.vtable = &alternate_vtable;
+            try std.testing.expect(!ProvisionedTableWriteCache.haAsyncMirrorsEqual(original, mirror));
+            const allowed: db_mod.HAWriteGate = .{ .primary = .{ .ptr = &context, .check_fn = Stub.allow } };
+            const rejected: db_mod.HAWriteGate = .{ .primary = .{ .ptr = &context, .check_fn = Stub.reject } };
+            try std.testing.expect(!ProvisionedTableWriteCache.haWriteGatesEqual(allowed, rejected));
+            try std.testing.expect(ProvisionedTableWriteCache.haWriteGatesEqual(allowed, allowed));
+        }
+
         test "private initial child retirement requires canceled local publication" {
             try testPrivateInitialChildRetirementProof();
         }
@@ -62424,53 +62474,3 @@ pub const executeBackupPinControl = @import("../storage/db/backup_pin_control.zi
 pub const RestoreTerminalAdmission = local_write_contract.RestoreTerminalAdmission;
 
 pub const exportPortableBackupShardWithSeal = @import("local_table_writes.zig").exportPortableBackupShardWithSeal;
-
-test "storage.hot_standby writer cache distinguishes borrowed publisher callbacks and synchronization" {
-    const contract = @import("../storage/db/ha_contract.zig");
-    const outbox = @import("../storage/db/durable_outbox.zig");
-    const Namespace = @import("../storage/db/doc_identity_namespace.zig").Namespace;
-    const Stub = struct {
-        fn next(_: *anyopaque) u64 {
-            return 0;
-        }
-        fn identity(_: *anyopaque) contract.Publisher.Identity {
-            return .{ .table_id = 0, .shard_id = 0, .timeline_id = 0, .epoch = 0 };
-        }
-        fn publish(_: contract.AsyncEffectMirror, _: outbox.Kind, _: []const u8, _: Namespace) !u64 {
-            return error.UnexpectedPublication;
-        }
-        fn recover(_: contract.AsyncEffectMirror, _: outbox.Kind, _: outbox.DurableHAOutbox, _: Namespace) !u64 {
-            return error.UnexpectedRecovery;
-        }
-        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {
-            return error.UnexpectedAdmission;
-        }
-        fn complete(_: contract.AsyncEffectMirror, _: u64) !void {
-            return error.UnexpectedCompletion;
-        }
-        fn allow(_: *const anyopaque) !void {}
-        fn reject(_: *const anyopaque) !void {
-            return error.HAFencedPrimary;
-        }
-        const vtable: contract.Publisher.VTable = .{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete };
-    };
-    var context: u8 = 0;
-    var mirror: contract.AsyncEffectMirror = .{ .publisher = .{ .ptr = &context, .vtable = &Stub.vtable } };
-    const original = mirror;
-    try std.testing.expect(ProvisionedTableWriteCache.haAsyncMirrorsEqual(original, mirror));
-    var transition: std.atomic.Mutex = .unlocked;
-    mirror.transition_mutex = &transition;
-    try std.testing.expect(!ProvisionedTableWriteCache.haAsyncMirrorsEqual(original, mirror));
-    mirror = original;
-    var barrier: ha_mutation_barrier_mod.MutationBarrier = .{};
-    mirror.mutation_barrier = &barrier;
-    try std.testing.expect(!ProvisionedTableWriteCache.haAsyncMirrorsEqual(original, mirror));
-    mirror = original;
-    var alternate_vtable = Stub.vtable;
-    mirror.publisher.vtable = &alternate_vtable;
-    try std.testing.expect(!ProvisionedTableWriteCache.haAsyncMirrorsEqual(original, mirror));
-    const allowed: db_mod.HAWriteGate = .{ .primary = .{ .ptr = &context, .check_fn = Stub.allow } };
-    const rejected: db_mod.HAWriteGate = .{ .primary = .{ .ptr = &context, .check_fn = Stub.reject } };
-    try std.testing.expect(!ProvisionedTableWriteCache.haWriteGatesEqual(allowed, rejected));
-    try std.testing.expect(ProvisionedTableWriteCache.haWriteGatesEqual(allowed, allowed));
-}
